@@ -27,7 +27,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 
 ### Embeddings
 
-- [ ] **`domains/embeddings`: fastembed wrapper for bge-small-en-v1.5.** `embeddings/index.rs` with `Embedder` struct holding a `TextEmbedding`. Constructor accepts model name (`"bge-small-en-v1.5"` default, `"all-minilm-l6-v2"` opt-in) and cache dir. `embed_batch(&[String]) -> Vec<[f32; 384]>` L2-normalizes each vector. Persist model name into `meta` table on first init; refuse to mix vectors when stored model differs (refuse with clear error pointing at `--reset`). Unit test (gated on env var or `#[ignore]` so CI without model download stays green): same input → bit-identical bytes.
+- [x] **`domains/embeddings`: fastembed wrapper for bge-small-en-v1.5.** `embeddings/index.rs` with `Embedder` struct holding a `TextEmbedding`. Constructor accepts model name (`"bge-small-en-v1.5"` default, `"all-minilm-l6-v2"` opt-in) and cache dir. `embed_batch(&[String]) -> Vec<[f32; 384]>` L2-normalizes each vector. Persist model name into `meta` table on first init; refuse to mix vectors when stored model differs (refuse with clear error pointing at `--reset`). Unit test (gated on env var or `#[ignore]` so CI without model download stays green): same input → bit-identical bytes.
 
 ### Indexer
 
