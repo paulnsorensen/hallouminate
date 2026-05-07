@@ -87,6 +87,38 @@ pub fn all_files_for_corpus(conn: &Connection, corpus: &str) -> Result<Vec<FileR
     Ok(rows)
 }
 
+#[derive(Debug, Clone)]
+pub struct NewChunk<'a> {
+    pub file_id: i64,
+    pub ord: i64,
+    pub heading_path_json: &'a str,
+    pub line_start: i64,
+    pub line_end: i64,
+    pub text: &'a str,
+}
+
+pub fn insert_chunk(conn: &Connection, chunk: &NewChunk<'_>) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO chunks \
+            (file_id, ord, heading_path, line_start, line_end, text) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            chunk.file_id,
+            chunk.ord,
+            chunk.heading_path_json,
+            chunk.line_start,
+            chunk.line_end,
+            chunk.text,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn delete_chunks_for_file(conn: &Connection, file_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM chunks WHERE file_id = ?1", params![file_id])?;
+    Ok(())
+}
+
 fn row_to_file(row: &Row<'_>) -> rusqlite::Result<FileRow> {
     Ok(FileRow {
         file_id: row.get(0)?,
@@ -182,6 +214,65 @@ mod tests {
         assert!(get_file_by_ref(&conn, "/tmp/c.md")
             .expect("query")
             .is_none());
+    }
+
+    fn fts_match_count(conn: &Connection, term: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1",
+            params![term],
+            |row| row.get(0),
+        )
+        .expect("fts query")
+    }
+
+    fn sample_chunk(file_id: i64, text: &str) -> NewChunk<'_> {
+        NewChunk {
+            file_id,
+            ord: 0,
+            heading_path_json: "[\"Arrakis\"]",
+            line_start: 1,
+            line_end: 4,
+            text,
+        }
+    }
+
+    #[test]
+    fn insert_chunk_makes_text_searchable_via_fts() {
+        let conn = fresh_conn();
+        let file_id = upsert_file(&conn, &sample("/tmp/melange.md", "docs")).expect("upsert");
+        let chunk_id = insert_chunk(&conn, &sample_chunk(file_id, "the spice melange flows"))
+            .expect("insert chunk");
+        assert!(chunk_id > 0);
+        assert_eq!(fts_match_count(&conn, "melange"), 1);
+        assert_eq!(fts_match_count(&conn, "sandworm"), 0);
+    }
+
+    #[test]
+    fn delete_chunks_for_file_removes_fts_rows() {
+        let conn = fresh_conn();
+        let file_id = upsert_file(&conn, &sample("/tmp/spice.md", "docs")).expect("upsert");
+        insert_chunk(&conn, &sample_chunk(file_id, "fremen ride sandworms")).expect("chunk");
+        assert_eq!(fts_match_count(&conn, "fremen"), 1);
+        delete_chunks_for_file(&conn, file_id).expect("delete chunks");
+        assert_eq!(fts_match_count(&conn, "fremen"), 0);
+    }
+
+    #[test]
+    fn delete_file_cascade_purges_chunks_and_fts_rows() {
+        let conn = fresh_conn();
+        let file_id = upsert_file(&conn, &sample("/tmp/citadel.md", "docs")).expect("upsert");
+        insert_chunk(&conn, &sample_chunk(file_id, "witness me chrome warriors")).expect("chunk");
+        assert_eq!(fts_match_count(&conn, "chrome"), 1);
+        delete_file_cascade(&conn, file_id).expect("cascade");
+        let chunks_left: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM chunks WHERE file_id = ?1",
+                params![file_id],
+                |row| row.get(0),
+            )
+            .expect("count chunks");
+        assert_eq!(chunks_left, 0);
+        assert_eq!(fts_match_count(&conn, "chrome"), 0);
     }
 
     #[test]
