@@ -1,8 +1,9 @@
 use std::path::{Path, PathBuf};
 
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, OptionalExtension};
 
+use crate::adapters::sqlite::DbConn;
 use crate::domain::common::{HallouminateError, Result};
 
 pub const EMBEDDING_DIM: usize = 384;
@@ -10,13 +11,17 @@ pub const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
 const ALT_MODEL: &str = "all-minilm-l6-v2";
 const META_KEY_MODEL: &str = "embeddings.model";
 
+pub trait EmbedBatch {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>>;
+}
+
 pub struct Embedder {
     inner: TextEmbedding,
     model_name: String,
 }
 
 impl Embedder {
-    pub fn try_new(model_name: &str, cache_dir: &Path, conn: &Connection) -> Result<Self> {
+    pub fn try_new(model_name: &str, cache_dir: &Path, conn: &DbConn) -> Result<Self> {
         check_or_set_model(conn, model_name)?;
         let model = resolve_model(model_name)?;
         let opts = TextInitOptions::new(model)
@@ -33,8 +38,10 @@ impl Embedder {
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
+}
 
-    pub fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+impl EmbedBatch for Embedder {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -79,8 +86,9 @@ fn resolve_model(name: &str) -> Result<EmbeddingModel> {
     }
 }
 
-pub(crate) fn check_or_set_model(conn: &Connection, requested: &str) -> Result<()> {
+pub(crate) fn check_or_set_model(conn: &DbConn, requested: &str) -> Result<()> {
     let stored: Option<String> = conn
+        .raw()
         .query_row(
             "SELECT value FROM meta WHERE key = ?1",
             params![META_KEY_MODEL],
@@ -93,7 +101,7 @@ pub(crate) fn check_or_set_model(conn: &Connection, requested: &str) -> Result<(
         ))),
         Some(_) => Ok(()),
         None => {
-            conn.execute(
+            conn.raw().execute(
                 "INSERT INTO meta (key, value) VALUES (?1, ?2)",
                 params![META_KEY_MODEL, requested],
             )?;
@@ -107,10 +115,9 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::adapters::sqlite::pool::open_db;
-    use crate::adapters::sqlite::schema::apply_schema;
+    use crate::adapters::sqlite::{apply_schema, open_db};
 
-    fn fresh_conn() -> Connection {
+    fn fresh_conn() -> DbConn {
         let conn = open_db(Path::new(":memory:")).expect("open :memory:");
         apply_schema(&conn).expect("apply schema");
         conn
@@ -151,6 +158,7 @@ mod tests {
         let conn = fresh_conn();
         check_or_set_model(&conn, DEFAULT_MODEL).expect("first call");
         let stored: String = conn
+            .raw()
             .query_row(
                 "SELECT value FROM meta WHERE key = ?1",
                 params![META_KEY_MODEL],
@@ -166,6 +174,7 @@ mod tests {
         check_or_set_model(&conn, DEFAULT_MODEL).expect("first");
         check_or_set_model(&conn, DEFAULT_MODEL).expect("second must succeed");
         let count: i64 = conn
+            .raw()
             .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
             .expect("count");
         assert_eq!(count, 1, "must not insert duplicate meta rows");
