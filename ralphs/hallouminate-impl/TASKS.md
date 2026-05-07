@@ -41,7 +41,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 - [x] **`domains/search::vector`: cosine KNN over `chunks_vec`.** `vector.rs` with `vec_search(&Connection, query_embedding: &[f32; 384], limit: usize) -> Vec<(ChunkId, f64)>` using `vec_distance_cosine`. Unit test on two normalized vectors verifies ordering matches dot-product expectation.
 - [x] **`domains/search::rrf`: Reciprocal Rank Fusion port.** `rrf.rs` with `rrf_fuse(fts: &[(ChunkId, _)], vec: &[(ChunkId, _)], k: u32) -> Vec<FusedHit>` where `FusedHit { chunk_id, score, fts_rank, vec_rank }`. Port the math from `tern-codebase/search.rs`. Unit tests: chunk-only-in-fts, chunk-only-in-vec, chunk-in-both; tunable k changes ordering predictably.
 - [x] **`domains/search::convex`: Convex Combination fusion (α=0.5).** `convex.rs` with `convex_fuse(fts, vec, alpha: f32)`. Unit test: with α=1.0 falls back to FTS ordering; with α=0.0 falls back to vec ordering.
-- [ ] **`domains/search`: crust facade.** `search/index.rs` exposes a `search(query, fusion: Fusion, limit) -> Vec<FusedHit>` that delegates to fts+vec+chosen fuse. Hide siblings.
+- [x] **`domains/search`: crust facade.** `search/index.rs` exposes a `search(query, fusion: Fusion, limit) -> Vec<FusedHit>` that delegates to fts+vec+chosen fuse. Hide siblings.
 
 ### Ground response orchestration
 
