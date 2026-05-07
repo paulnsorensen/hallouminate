@@ -21,25 +21,38 @@ impl Default for Fusion {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SearchHits {
+    pub fts_hits: usize,
+    pub vec_hits: usize,
+    pub fused: Vec<FusedHit>,
+}
+
 pub fn search(
     conn: &DbConn,
     embedder: &mut dyn EmbedBatch,
     query: &str,
     fusion: Fusion,
     limit: usize,
-) -> Result<Vec<FusedHit>> {
+) -> Result<SearchHits> {
     let mut embeds = embedder.embed_batch(&[query.to_string()])?;
     let query_vec = embeds
         .pop()
         .ok_or_else(|| HallouminateError::Embed("empty embedding for query".into()))?;
     let fts = fts_search(conn, query, limit)?;
     let vec = vec_search(conn, &query_vec, limit)?;
+    let fts_hits = fts.len();
+    let vec_hits = vec.len();
     let mut fused = match fusion {
         Fusion::Rrf { k } => rrf_fuse(&fts, &vec, k),
         Fusion::Convex { alpha } => convex_fuse(&fts, &vec, alpha),
     };
     fused.truncate(limit);
-    Ok(fused)
+    Ok(SearchHits {
+        fts_hits,
+        vec_hits,
+        fused,
+    })
 }
 
 #[cfg(test)]
@@ -114,14 +127,17 @@ mod tests {
         let mut embedder = FakeEmbedder {
             vector: unit_basis(0),
         };
-        let hits =
+        let result =
             search(&conn, &mut embedder, "spice", Fusion::Rrf { k: 60 }, 10).expect("search");
 
-        assert_eq!(hits[0].chunk_id, ChunkId(strong));
+        assert_eq!(result.fused[0].chunk_id, ChunkId(strong));
         assert!(
-            hits[0].fts_rank.is_some() && hits[0].vec_rank.is_some(),
-            "winner must appear in both modalities: {hits:?}"
+            result.fused[0].fts_rank.is_some() && result.fused[0].vec_rank.is_some(),
+            "winner must appear in both modalities: {:?}",
+            result.fused
         );
+        assert_eq!(result.fts_hits, 1);
+        assert_eq!(result.vec_hits, 2);
     }
 
     #[test]
@@ -135,8 +151,9 @@ mod tests {
         let mut embedder = FakeEmbedder {
             vector: unit_basis(0),
         };
-        let hits = search(&conn, &mut embedder, "spice", Fusion::Rrf { k: 60 }, 2).expect("search");
-        assert_eq!(hits.len(), 2);
+        let result =
+            search(&conn, &mut embedder, "spice", Fusion::Rrf { k: 60 }, 2).expect("search");
+        assert_eq!(result.fused.len(), 2);
     }
 
     #[test]
@@ -153,7 +170,7 @@ mod tests {
         let mut embedder = FakeEmbedder {
             vector: unit_basis(0),
         };
-        let hits = search(
+        let result = search(
             &conn,
             &mut embedder,
             "spice",
@@ -161,7 +178,7 @@ mod tests {
             5,
         )
         .expect("search");
-        assert_eq!(hits[0].chunk_id, ChunkId(fts_winner));
+        assert_eq!(result.fused[0].chunk_id, ChunkId(fts_winner));
     }
 
     #[test]
@@ -178,7 +195,7 @@ mod tests {
         let mut embedder = FakeEmbedder {
             vector: unit_basis(0),
         };
-        let hits = search(
+        let result = search(
             &conn,
             &mut embedder,
             "spice",
@@ -186,7 +203,7 @@ mod tests {
             5,
         )
         .expect("search");
-        assert_eq!(hits[0].chunk_id, ChunkId(vec_winner));
+        assert_eq!(result.fused[0].chunk_id, ChunkId(vec_winner));
     }
 
     #[test]
