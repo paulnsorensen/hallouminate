@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileRef(PathBuf);
 
@@ -35,11 +37,14 @@ pub struct ChunkId(pub i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Mtime(pub i64);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusConfig {
     pub name: String,
+    #[serde(default)]
     pub paths: Vec<String>,
+    #[serde(default)]
     pub globs: Vec<String>,
+    #[serde(default)]
     pub exclude: Vec<String>,
 }
 

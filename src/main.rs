@@ -1,6 +1,7 @@
 use clap::Parser;
 
 pub mod adapters;
+pub mod app;
 pub mod domains;
 
 #[derive(Parser)]
