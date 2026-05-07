@@ -67,10 +67,14 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 - [x] **Integration test: fusion config switch.** With `[search].fusion = "convex"` and `"rrf"`, top-1 result for a fixture query is identical.
 - [x] **Integration test: embedding determinism + model-mismatch refuse.** Re-open DB after switching embeddings.model; expect a clear error pointing at `--reset` and no writes.
 
-## Phase 2 — `--include-code` / tilth fan-out
+## Deferred to follow-up PRs
 
-- [ ] **Phase 2 placeholder.** Implement `domains/tilth` (subprocess fan-out with semaphore + timeout + soft-fail), `--include-code` flag on `ground`, soft-warn on empty `[[code_repo]]`, integration test with PATH-stripped tilth.
+Phase 1 ships standalone; the items below are tracked here but live outside the Phase 1 PR. Each will be decomposed into ralphify-sized atoms in its own loop when picked up.
 
-## Phase 3 — `--watch`
+### Phase 2 — `--include-code` / tilth fan-out
 
-- [ ] **Phase 3 placeholder.** Implement `index --watch` with `notify-debouncer-full` (FileIdMap, ≥500 ms debounce, catch-up scan on start). macOS symlink caveat documented in `--help`.
+- Implement `domains/tilth` (subprocess fan-out with semaphore + timeout + soft-fail), `--include-code` flag on `ground`, soft-warn on empty `[[code_repo]]`, integration test with PATH-stripped tilth.
+
+### Phase 3 — `--watch`
+
+- Implement `index --watch` with `notify-debouncer-full` (FileIdMap, ≥500 ms debounce, catch-up scan on start). macOS symlink caveat documented in `--help`.
