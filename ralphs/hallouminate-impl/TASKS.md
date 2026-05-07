@@ -64,7 +64,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 - [x] **Integration test: fixture corpus end-to-end.** `tests/ground_fixture.rs` writes 3 markdown fixtures, runs `index`, runs `ground`, asserts top hit is the targeted file and that chunk `line_range` matches. Use a real DB on tempdir; embeddings via real fastembed (gate behind feature or env if first-run download is too slow for CI).
 - [x] **Integration test: idempotency.** Re-run `index` on the same fixture; assert `embeddings_inserted_total == 0` on second run.
 - [x] **Integration test: cascade-delete.** Delete a fixture file, re-run `index`, assert `files`/`chunks`/`chunks_fts`/`chunks_vec` rows for that path are gone.
-- [ ] **Integration test: fusion config switch.** With `[search].fusion = "convex"` and `"rrf"`, top-1 result for a fixture query is identical.
+- [x] **Integration test: fusion config switch.** With `[search].fusion = "convex"` and `"rrf"`, top-1 result for a fixture query is identical.
 - [ ] **Integration test: embedding determinism + model-mismatch refuse.** Re-open DB after switching embeddings.model; expect a clear error pointing at `--reset` and no writes.
 
 ## Phase 2 — `--include-code` / tilth fan-out
