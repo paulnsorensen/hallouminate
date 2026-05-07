@@ -45,7 +45,7 @@ fn seed_fixtures(root: &Path) {
 
 #[test]
 #[ignore = "downloads ~33MB embedding model on first run; opt-in via --ignored"]
-fn cmd_ground_returns_targeted_file_as_top_hit() {
+fn ground_fixture_corpus_returns_targeted_file_as_top_hit() {
     let dir = tempfile::tempdir().expect("tempdir");
     let corpus_root = dir.path().join("corpus");
     fs::create_dir_all(&corpus_root).unwrap();
@@ -69,7 +69,7 @@ fn cmd_ground_returns_targeted_file_as_top_hit() {
     })
     .expect("run ground");
 
-    assert!(!response.docs.is_empty(), "ground returned no docs");
+    assert_eq!(response.docs.len(), 3, "all 3 fixtures should appear");
     let (top_path, top_doc) = response
         .docs
         .iter()
@@ -79,18 +79,19 @@ fn cmd_ground_returns_targeted_file_as_top_hit() {
         top_path.ends_with("arrakis.md"),
         "expected arrakis.md as top hit, got {top_path}"
     );
+
     let chunk = top_doc
         .chunks
         .first()
         .expect("top doc has at least one chunk");
-    assert!(
-        chunk.line_range[0] >= 1 && chunk.line_range[1] >= chunk.line_range[0],
-        "line_range looks malformed: {:?}",
-        chunk.line_range
+    assert_eq!(
+        chunk.heading_path,
+        vec!["Arrakis".to_string(), "Spice melange".to_string()],
+        "chunk should be anchored at the targeted H2 heading"
     );
-    assert!(
-        chunk.line_range[1] <= 5,
-        "expected chunk inside the small fixture file, got {:?}",
-        chunk.line_range
+    assert_eq!(
+        chunk.line_range,
+        [3, 5],
+        "Spice melange section spans lines 3..=5 in the fixture"
     );
 }
