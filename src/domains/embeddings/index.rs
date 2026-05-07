@@ -1,1 +1,1 @@
-pub use super::embedder::{Embedder, DEFAULT_MODEL, EMBEDDING_DIM};
+pub use super::embedder::{EmbedBatch, Embedder, DEFAULT_MODEL, EMBEDDING_DIM};

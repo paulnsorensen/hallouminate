@@ -10,6 +10,10 @@ pub const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
 const ALT_MODEL: &str = "all-minilm-l6-v2";
 const META_KEY_MODEL: &str = "embeddings.model";
 
+pub trait EmbedBatch {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>>;
+}
+
 pub struct Embedder {
     inner: TextEmbedding,
     model_name: String,
@@ -33,8 +37,10 @@ impl Embedder {
     pub fn model_name(&self) -> &str {
         &self.model_name
     }
+}
 
-    pub fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+impl EmbedBatch for Embedder {
+    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
