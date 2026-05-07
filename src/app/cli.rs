@@ -1,4 +1,10 @@
-use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand};
+
+mod index;
+
+pub use index::{cmd_index, IndexArgs};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -9,7 +15,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Index,
+    Index(IndexCli),
     Ground,
     Hook {
         #[command(subcommand)]
@@ -19,6 +25,26 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct IndexCli {
+    #[arg(long)]
+    pub corpus: Option<String>,
+    #[arg(long, value_name = "FILE")]
+    pub paths_from: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+}
+
+impl From<IndexCli> for IndexArgs {
+    fn from(cli: IndexCli) -> Self {
+        Self {
+            corpus: cli.corpus,
+            paths_from: cli.paths_from,
+            config: cli.config,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -33,18 +59,27 @@ pub enum ConfigAction {
     Show,
 }
 
-pub fn dispatch(cli: Cli) {
+pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Index => println!("todo: index"),
-        Command::Ground => println!("todo: ground"),
-        Command::Hook { action } => match action {
-            HookAction::Install => println!("todo: hook install"),
-            HookAction::Uninstall => println!("todo: hook uninstall"),
-        },
-        Command::Config { action } => match action {
-            ConfigAction::Init => println!("todo: config init"),
-            ConfigAction::Show => println!("todo: config show"),
-        },
+        Command::Index(args) => cmd_index(args.into()),
+        Command::Ground => {
+            println!("todo: ground");
+            Ok(())
+        }
+        Command::Hook { action } => {
+            match action {
+                HookAction::Install => println!("todo: hook install"),
+                HookAction::Uninstall => println!("todo: hook uninstall"),
+            }
+            Ok(())
+        }
+        Command::Config { action } => {
+            match action {
+                ConfigAction::Init => println!("todo: config init"),
+                ConfigAction::Show => println!("todo: config show"),
+            }
+            Ok(())
+        }
     }
 }
 
@@ -55,7 +90,27 @@ mod tests {
     #[test]
     fn parses_index_subcommand() {
         let cli = Cli::try_parse_from(["hallouminate", "index"]).expect("parse index");
-        assert!(matches!(cli.command, Command::Index));
+        assert!(matches!(cli.command, Command::Index(_)));
+    }
+
+    #[test]
+    fn parses_index_with_corpus_and_paths_from() {
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "index",
+            "--corpus",
+            "docs",
+            "--paths-from",
+            "/tmp/p.txt",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Index(args) => {
+                assert_eq!(args.corpus.as_deref(), Some("docs"));
+                assert_eq!(args.paths_from, Some(PathBuf::from("/tmp/p.txt")));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

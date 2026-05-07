@@ -1,3 +1,3 @@
-fn main() {
-    hallouminate::app::run();
+fn main() -> anyhow::Result<()> {
+    hallouminate::app::run()
 }

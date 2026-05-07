@@ -1,0 +1,210 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, Context};
+use serde::Serialize;
+
+use crate::adapters::sqlite::{apply_schema, open_db, DbConn};
+use crate::app::config::{self, Config};
+use crate::domain::common::{expand_tilde, CorpusConfig};
+use crate::domain::embeddings::Embedder;
+use crate::domain::indexer::index_corpus;
+
+const AD_HOC_CORPUS_NAME: &str = "ad-hoc";
+
+#[derive(Debug, Default, Clone)]
+pub struct IndexArgs {
+    pub corpus: Option<String>,
+    pub paths_from: Option<PathBuf>,
+    pub config: Option<PathBuf>,
+}
+
+pub fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
+    let cfg = config::load(args.config.as_deref())?;
+    let corpora = select_corpora(&cfg, &args)?;
+    let conn = open_database(&cfg)?;
+    apply_schema(&conn)?;
+    let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
+    let mut embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir, &conn)
+        .with_context(|| format!("init embedder ({})", cfg.embeddings.model))?;
+    let report = run_indexing(&corpora, &conn, &mut embedder)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusConfig>> {
+    if let Some(file) = args.paths_from.as_deref() {
+        return Ok(vec![ad_hoc_corpus(file)?]);
+    }
+    if let Some(name) = args.corpus.as_deref() {
+        let hit = cfg
+            .corpora
+            .iter()
+            .find(|c| c.name == name)
+            .ok_or_else(|| anyhow!("corpus {name:?} not found in config"))?;
+        return Ok(vec![hit.clone()]);
+    }
+    if cfg.corpora.is_empty() {
+        return Err(anyhow!("no corpora configured; add [[corpus]] to config"));
+    }
+    Ok(cfg.corpora.clone())
+}
+
+fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
+    let text = fs::read_to_string(file)
+        .with_context(|| format!("read paths-from file {}", file.display()))?;
+    let paths: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if paths.is_empty() {
+        return Err(anyhow!("paths-from file {} is empty", file.display()));
+    }
+    Ok(CorpusConfig {
+        name: AD_HOC_CORPUS_NAME.into(),
+        paths,
+        globs: vec![],
+        exclude: vec![],
+    })
+}
+
+fn open_database(cfg: &Config) -> anyhow::Result<DbConn> {
+    let db_path = expand_tilde(&cfg.storage.db_path);
+    if let Some(parent) = db_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create db parent {}", parent.display()))?;
+    }
+    open_db(&db_path)
+        .with_context(|| format!("open db at {}", db_path.display()))
+        .map_err(Into::into)
+}
+
+fn run_indexing(
+    corpora: &[CorpusConfig],
+    conn: &DbConn,
+    embedder: &mut Embedder,
+) -> anyhow::Result<IndexReport> {
+    let mut report = IndexReport::default();
+    for corpus in corpora {
+        let stats = index_corpus(corpus, conn, embedder)
+            .with_context(|| format!("index corpus {:?}", corpus.name))?;
+        report.corpora.push(CorpusReport {
+            name: corpus.name.clone(),
+            files_upserted: stats.files_upserted,
+            files_touched: stats.files_touched,
+            files_deleted: stats.files_deleted,
+            chunks_inserted: stats.chunks_inserted,
+            embeddings_inserted: stats.embeddings_inserted,
+        });
+    }
+    Ok(report)
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct IndexReport {
+    pub corpora: Vec<CorpusReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CorpusReport {
+    pub name: String,
+    pub files_upserted: usize,
+    pub files_touched: usize,
+    pub files_deleted: usize,
+    pub chunks_inserted: usize,
+    pub embeddings_inserted: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_corpora_uses_paths_from_when_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("paths.txt");
+        fs::write(&list, "/some/path\n  /another/path  \n\n").unwrap();
+        let cfg = Config::default();
+        let args = IndexArgs {
+            paths_from: Some(list),
+            ..Default::default()
+        };
+        let out = select_corpora(&cfg, &args).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, AD_HOC_CORPUS_NAME);
+        assert_eq!(out[0].paths, vec!["/some/path", "/another/path"]);
+    }
+
+    #[test]
+    fn select_corpora_filters_by_name_when_corpus_arg_set() {
+        let cfg = Config {
+            corpora: vec![
+                CorpusConfig {
+                    name: "docs".into(),
+                    paths: vec!["/d".into()],
+                    ..Default::default()
+                },
+                CorpusConfig {
+                    name: "notes".into(),
+                    paths: vec!["/n".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let args = IndexArgs {
+            corpus: Some("notes".into()),
+            ..Default::default()
+        };
+        let out = select_corpora(&cfg, &args).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "notes");
+    }
+
+    #[test]
+    fn select_corpora_errors_when_named_corpus_missing() {
+        let cfg = Config::default();
+        let args = IndexArgs {
+            corpus: Some("ghost".into()),
+            ..Default::default()
+        };
+        let err = select_corpora(&cfg, &args).unwrap_err();
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn select_corpora_errors_when_no_corpora_and_no_filters() {
+        let cfg = Config::default();
+        let args = IndexArgs::default();
+        let err = select_corpora(&cfg, &args).unwrap_err();
+        assert!(err.to_string().contains("no corpora"), "{err}");
+    }
+
+    #[test]
+    fn select_corpora_returns_all_when_no_filters_set() {
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "alpha".into(),
+                paths: vec!["/a".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = select_corpora(&cfg, &IndexArgs::default()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "alpha");
+    }
+
+    #[test]
+    fn ad_hoc_corpus_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("empty.txt");
+        fs::write(&list, "\n  \n").unwrap();
+        let err = ad_hoc_corpus(&list).unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+    }
+}
