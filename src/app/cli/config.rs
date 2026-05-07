@@ -1,0 +1,146 @@
+use std::fs;
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Context};
+
+use crate::app::config::{self, xdg_config_path, Config};
+
+const DEFAULT_TEMPLATE: &str = include_str!("config-default.toml");
+
+#[derive(Debug, Default)]
+pub struct ConfigInitArgs {
+    pub force: bool,
+    pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+pub struct ConfigShowArgs {
+    pub config: Option<PathBuf>,
+}
+
+pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
+    let target = args.path.unwrap_or_else(xdg_config_path);
+    if target.exists() && !args.force {
+        return Err(anyhow!(
+            "config already exists at {}; pass --force to overwrite",
+            target.display()
+        ));
+    }
+    if let Some(parent) = target.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&target, DEFAULT_TEMPLATE)
+        .with_context(|| format!("write {}", target.display()))?;
+    println!("wrote {}", target.display());
+    Ok(())
+}
+
+pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
+    let cfg = config::load(args.config.as_deref())?;
+    print!("{}", render_config(&cfg)?);
+    Ok(())
+}
+
+fn render_config(cfg: &Config) -> anyhow::Result<String> {
+    toml::to_string_pretty(cfg).context("render config as TOML")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_writes_default_template_to_explicit_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("config.toml");
+        cmd_config_init(ConfigInitArgs {
+            force: false,
+            path: Some(target.clone()),
+        })
+        .expect("init writes file");
+        let written = fs::read_to_string(&target).expect("read written config");
+        assert_eq!(written, DEFAULT_TEMPLATE);
+    }
+
+    #[test]
+    fn init_creates_missing_parent_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("a/b/c/config.toml");
+        cmd_config_init(ConfigInitArgs {
+            force: false,
+            path: Some(nested.clone()),
+        })
+        .expect("init creates parents");
+        assert!(nested.exists(), "nested file not created");
+    }
+
+    #[test]
+    fn init_refuses_to_overwrite_existing_without_force() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "# pre-existing").expect("seed");
+        let err = cmd_config_init(ConfigInitArgs {
+            force: false,
+            path: Some(target.clone()),
+        })
+        .expect_err("must refuse overwrite");
+        assert!(err.to_string().contains("--force"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "# pre-existing",
+            "must not clobber"
+        );
+    }
+
+    #[test]
+    fn init_overwrites_existing_when_force_is_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "# pre-existing").expect("seed");
+        cmd_config_init(ConfigInitArgs {
+            force: true,
+            path: Some(target.clone()),
+        })
+        .expect("force overwrite");
+        assert_eq!(fs::read_to_string(&target).unwrap(), DEFAULT_TEMPLATE);
+    }
+
+    #[test]
+    fn default_template_parses_to_valid_config() {
+        let cfg: Config =
+            toml::from_str(DEFAULT_TEMPLATE).expect("template must be valid TOML");
+        assert!(cfg.corpora.is_empty(), "corpora must start commented-out");
+        assert_eq!(cfg.embeddings.model, "bge-small-en-v1.5");
+        assert_eq!(cfg.search.rrf_k, 60);
+    }
+
+    #[test]
+    fn show_renders_loaded_config_as_toml_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        cmd_config_init(ConfigInitArgs {
+            force: false,
+            path: Some(path.clone()),
+        })
+        .expect("seed");
+        let cfg = config::load(Some(&path)).expect("load");
+        let rendered = render_config(&cfg).expect("render");
+        let reparsed: Config = toml::from_str(&rendered).expect("rendered TOML reparses");
+        assert_eq!(reparsed, cfg);
+    }
+
+    #[test]
+    fn show_returns_defaults_when_path_does_not_exist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.toml");
+        let cfg = config::load(Some(&missing)).expect("missing → defaults");
+        let rendered = render_config(&cfg).expect("render defaults");
+        assert!(
+            rendered.contains("bge-small-en-v1.5"),
+            "missing model in defaults: {rendered}"
+        );
+    }
+}

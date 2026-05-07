@@ -2,9 +2,11 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+mod config;
 mod ground;
 mod index;
 
+pub use config::{cmd_config_init, cmd_config_show, ConfigInitArgs, ConfigShowArgs};
 pub use ground::{cmd_ground, run_ground, FusionChoice, GroundArgs};
 pub use index::{cmd_index, IndexArgs};
 
@@ -88,8 +90,16 @@ pub enum HookAction {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigAction {
-    Init,
-    Show,
+    Init {
+        #[arg(long)]
+        force: bool,
+        #[arg(long, value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
+    Show {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -103,13 +113,12 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Command::Config { action } => {
-            match action {
-                ConfigAction::Init => println!("todo: config init"),
-                ConfigAction::Show => println!("todo: config show"),
+        Command::Config { action } => match action {
+            ConfigAction::Init { force, path } => {
+                cmd_config_init(ConfigInitArgs { force, path })
             }
-            Ok(())
-        }
+            ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
+        },
     }
 }
 
@@ -218,20 +227,63 @@ mod tests {
     fn parses_config_init_and_show() {
         let init =
             Cli::try_parse_from(["hallouminate", "config", "init"]).expect("parse config init");
-        assert!(matches!(
-            init.command,
+        match init.command {
             Command::Config {
-                action: ConfigAction::Init
+                action: ConfigAction::Init { force, path },
+            } => {
+                assert!(!force);
+                assert_eq!(path, None);
             }
-        ));
+            other => panic!("wrong variant: {other:?}"),
+        }
         let show =
             Cli::try_parse_from(["hallouminate", "config", "show"]).expect("parse config show");
-        assert!(matches!(
-            show.command,
+        match show.command {
             Command::Config {
-                action: ConfigAction::Show
+                action: ConfigAction::Show { config },
+            } => assert_eq!(config, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_config_init_with_force_and_path() {
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "config",
+            "init",
+            "--force",
+            "--path",
+            "/tmp/cfg.toml",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Config {
+                action: ConfigAction::Init { force, path },
+            } => {
+                assert!(force);
+                assert_eq!(path, Some(PathBuf::from("/tmp/cfg.toml")));
             }
-        ));
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_config_show_with_explicit_config_path() {
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "config",
+            "show",
+            "--config",
+            "/tmp/c.toml",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Config {
+                action: ConfigAction::Show { config },
+            } => assert_eq!(config, Some(PathBuf::from("/tmp/c.toml"))),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
