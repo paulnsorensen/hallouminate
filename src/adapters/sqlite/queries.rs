@@ -2,6 +2,10 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::domains::common::Result;
 
+pub mod vec;
+
+pub use vec::{delete_vec_for_chunk, insert_vec, knn_chunks, EMBEDDING_DIM};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRow {
     pub file_id: i64,
