@@ -1,0 +1,29 @@
+# Hallouminate configuration. Edit corpus and code_repo entries to point at
+# the markdown trees and code repos you want indexed.
+
+# [[corpus]]
+# name = "claude-config"
+# paths = ["~/.claude/skills", "~/.claude/agents", "~/.claude/CLAUDE.md"]
+# globs = ["**/*.md"]
+# exclude = ["**/.git/**", "**/node_modules/**"]
+
+# [[code_repo]]
+# name = "tern"
+# path = "~/Dev/tern"
+
+[search]
+top_files_default       = 10
+chunks_per_file_default = 3
+fusion                  = "rrf"
+rrf_k                   = 60
+convex_alpha            = 0.5
+
+[embeddings]
+model     = "bge-small-en-v1.5"
+cache_dir = "~/.cache/hallouminate/fastembed"
+
+[watch]
+debounce_ms = 500
+
+[storage]
+db_path = "~/.local/share/hallouminate/index.db"
