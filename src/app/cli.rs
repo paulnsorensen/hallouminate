@@ -10,7 +10,7 @@ mod index;
 pub use config::{cmd_config_init, cmd_config_show, ConfigInitArgs, ConfigShowArgs};
 pub use ground::{cmd_ground, run_ground, FusionChoice, GroundArgs};
 pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
-pub use index::{cmd_index, IndexArgs};
+pub use index::{cmd_index, run_index, CorpusReport, IndexArgs, IndexReport};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]

@@ -21,6 +21,12 @@ pub struct IndexArgs {
 }
 
 pub fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
+    let report = run_index(args)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+pub fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
     let cfg = config::load(args.config.as_deref())?;
     let corpora = select_corpora(&cfg, &args)?;
     let restrict = args
@@ -32,9 +38,7 @@ pub fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
     let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
     let mut embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir, &conn)
         .with_context(|| format!("init embedder ({})", cfg.embeddings.model))?;
-    let report = run_indexing(&corpora, &conn, &mut embedder, restrict.as_deref())?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    run_indexing(&corpora, &conn, &mut embedder, restrict.as_deref())
 }
 
 fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusConfig>> {
