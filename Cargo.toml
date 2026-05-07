@@ -1,0 +1,13 @@
+[package]
+name = "hallouminate"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A bare-bones Rust CLI tool."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/paulnsorensen/hallouminate"
+authors = ["Paul Sorensen <paulnsorensen@gmail.com>"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
