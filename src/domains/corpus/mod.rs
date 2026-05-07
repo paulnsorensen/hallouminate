@@ -1,6 +1,10 @@
-pub mod chunker;
-pub mod hasher;
-pub mod keywords;
-pub mod snippet;
-pub mod summary;
-pub mod walker;
+mod chunker;
+mod hasher;
+mod keywords;
+mod snippet;
+mod summary;
+mod walker;
+
+pub mod index;
+
+pub use index::*;
