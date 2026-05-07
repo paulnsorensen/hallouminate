@@ -22,7 +22,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 - [x] **`domains/corpus::chunker`: markdown heading-aware chunking.** `chunker.rs` with `chunk_markdown(text: &str) -> Vec<Chunk>` where `Chunk { ord, heading_path: Vec<String>, line_start, line_end, text }`. Split on H1/H2/H3 boundaries, carry heading stack, preserve exact `line_start..=line_end` 1-indexed. Unit tests for: nested headings, code-fence-spanning chunks, file with no heading.
 - [x] **`domains/corpus::summary`: H1 + first paragraph summary, capped 280 chars.** `summary.rs` with `extract_summary(text: &str, fallback_filename: &str) -> String`. Unit tests: H1-present, no-H1 (uses filename), paragraph cap behavior.
 - [x] **`domains/corpus::keywords`: top-8 frequency tokens with stopwords.** `keywords.rs` with `extract_keywords(text: &str) -> Vec<String>`. Strip code fences, lowercase, alphanum-only, filter built-in stopword list, frequency-rank, return top 8. Unit test: deterministic for a fixture.
-- [ ] **`domains/corpus::snippet`: 240-char chunk snippet at word boundary.** `snippet.rs` with `make_snippet(text: &str) -> String` collapsing whitespace and truncating at last word boundary <= 240 chars. Unit tests for short, long, multi-whitespace input.
+- [x] **`domains/corpus::snippet`: 240-char chunk snippet at word boundary.** `snippet.rs` with `make_snippet(text: &str) -> String` collapsing whitespace and truncating at last word boundary <= 240 chars. Unit tests for short, long, multi-whitespace input.
 - [ ] **`domains/corpus`: crust facade.** `index.rs` re-exports the public surface (`scan`, `chunk_markdown`, `extract_summary`, `extract_keywords`, `make_snippet`, `blake3_file`, `Chunk`). All siblings stay private to the slice.
 
 ### Embeddings
