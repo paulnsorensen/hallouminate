@@ -4,10 +4,12 @@ use clap::{Args, Parser, Subcommand};
 
 mod config;
 mod ground;
+mod hook;
 mod index;
 
 pub use config::{cmd_config_init, cmd_config_show, ConfigInitArgs, ConfigShowArgs};
 pub use ground::{cmd_ground, run_ground, FusionChoice, GroundArgs};
+pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
 pub use index::{cmd_index, IndexArgs};
 
 #[derive(Debug, Parser)]
@@ -84,8 +86,14 @@ impl From<GroundCli> for GroundArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum HookAction {
-    Install,
-    Uninstall,
+    Install {
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+    },
+    Uninstall {
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -106,13 +114,10 @@ pub fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Index(args) => cmd_index(args.into()),
         Command::Ground(args) => cmd_ground(args.into()),
-        Command::Hook { action } => {
-            match action {
-                HookAction::Install => println!("todo: hook install"),
-                HookAction::Uninstall => println!("todo: hook uninstall"),
-            }
-            Ok(())
-        }
+        Command::Hook { action } => match action {
+            HookAction::Install { repo } => cmd_hook_install(HookArgs { repo }),
+            HookAction::Uninstall { repo } => cmd_hook_uninstall(HookArgs { repo }),
+        },
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => {
                 cmd_config_init(ConfigInitArgs { force, path })
@@ -207,20 +212,38 @@ mod tests {
     fn parses_hook_install_and_uninstall() {
         let install =
             Cli::try_parse_from(["hallouminate", "hook", "install"]).expect("parse hook install");
-        assert!(matches!(
-            install.command,
+        match install.command {
             Command::Hook {
-                action: HookAction::Install
-            }
-        ));
+                action: HookAction::Install { repo },
+            } => assert_eq!(repo, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
         let uninstall = Cli::try_parse_from(["hallouminate", "hook", "uninstall"])
             .expect("parse hook uninstall");
-        assert!(matches!(
-            uninstall.command,
+        match uninstall.command {
             Command::Hook {
-                action: HookAction::Uninstall
-            }
-        ));
+                action: HookAction::Uninstall { repo },
+            } => assert_eq!(repo, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hook_install_with_repo_path() {
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "hook",
+            "install",
+            "--repo",
+            "/tmp/r",
+        ])
+        .expect("parse hook install --repo");
+        match cli.command {
+            Command::Hook {
+                action: HookAction::Install { repo },
+            } => assert_eq!(repo, Some(PathBuf::from("/tmp/r"))),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]
