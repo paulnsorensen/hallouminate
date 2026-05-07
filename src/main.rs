@@ -1,10 +1,8 @@
 use clap::Parser;
 
-pub mod adapters;
-pub mod app;
-pub mod domains;
+use hallouminate::app;
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let cli = app::cli::Cli::parse();
-    app::cli::dispatch(cli);
+    app::cli::dispatch(cli)
 }
