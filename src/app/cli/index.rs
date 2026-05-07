@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::adapters::sqlite::{apply_schema, open_db, DbConn};
 use crate::app::config::{self, Config};
-use crate::domain::common::{expand_tilde, CorpusConfig};
+use crate::domain::common::{canonicalize_or_passthrough, expand_tilde, CorpusConfig};
 use crate::domain::embeddings::Embedder;
 use crate::domain::indexer::index_corpus;
 
@@ -16,18 +16,23 @@ const AD_HOC_CORPUS_NAME: &str = "ad-hoc";
 pub struct IndexArgs {
     pub corpus: Option<String>,
     pub paths_from: Option<PathBuf>,
+    pub restrict_to: Option<PathBuf>,
     pub config: Option<PathBuf>,
 }
 
 pub fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
     let cfg = config::load(args.config.as_deref())?;
     let corpora = select_corpora(&cfg, &args)?;
+    let restrict = args
+        .restrict_to
+        .as_deref()
+        .map(|p| canonicalize_or_passthrough(p).into_path_buf());
     let conn = open_database(&cfg)?;
     apply_schema(&conn)?;
     let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
     let mut embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir, &conn)
         .with_context(|| format!("init embedder ({})", cfg.embeddings.model))?;
-    let report = run_indexing(&corpora, &conn, &mut embedder)?;
+    let report = run_indexing(&corpora, &conn, &mut embedder, restrict.as_deref())?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
@@ -87,10 +92,11 @@ fn run_indexing(
     corpora: &[CorpusConfig],
     conn: &DbConn,
     embedder: &mut Embedder,
+    restrict_to: Option<&Path>,
 ) -> anyhow::Result<IndexReport> {
     let mut report = IndexReport::default();
     for corpus in corpora {
-        let stats = index_corpus(corpus, conn, embedder)
+        let stats = index_corpus(corpus, conn, embedder, restrict_to)
             .with_context(|| format!("index corpus {:?}", corpus.name))?;
         report.corpora.push(CorpusReport {
             name: corpus.name.clone(),

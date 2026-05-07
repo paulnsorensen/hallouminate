@@ -40,6 +40,8 @@ pub struct IndexCli {
     #[arg(long, value_name = "FILE")]
     pub paths_from: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
+    pub restrict_to: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 }
 
@@ -48,6 +50,7 @@ impl From<IndexCli> for IndexArgs {
         Self {
             corpus: cli.corpus,
             paths_from: cli.paths_from,
+            restrict_to: cli.restrict_to,
             config: cli.config,
         }
     }
@@ -152,6 +155,23 @@ mod tests {
             Command::Index(args) => {
                 assert_eq!(args.corpus.as_deref(), Some("docs"));
                 assert_eq!(args.paths_from, Some(PathBuf::from("/tmp/p.txt")));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_index_with_restrict_to() {
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "index",
+            "--restrict-to",
+            "/work/repo",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Index(args) => {
+                assert_eq!(args.restrict_to, Some(PathBuf::from("/work/repo")));
             }
             _ => panic!("wrong variant"),
         }
