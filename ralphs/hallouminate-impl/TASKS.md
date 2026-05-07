@@ -33,7 +33,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 
 - [x] **`domains/indexer::plan`: disk-vs-db diff.** `plan.rs` with `plan(disk: Vec<(FileRef, Mtime)>, db: HashMap<FileRef, FileRow>) -> IndexPlan { upserts, mtime_touches, deletes }`. No IO. Unit-test the matrix: new file, unchanged mtime, mtime-changed-but-same-hash placeholder, vanished file.
 - [x] **`domains/indexer::apply`: upsert + cascade-delete pipeline.** `apply.rs` with `apply(plan, &mut Connection, &Embedder, &CorpusConfig)`: re-chunk + re-embed for upserts, `touch_mtime` for mtime-only, `delete_file_cascade` for deletes. Wraps each file in a SQLite transaction. Maintain `embeddings_inserted_total` debug counter via `tracing` for idempotency assertions.
-- [ ] **`domains/indexer`: crust facade.** `indexer/index.rs` exposes `index_corpus(&CorpusConfig, &mut Connection, &Embedder) -> IndexStats`. Slice integration test on a 3-file tempdir corpus: first run upserts all, second run reports zero embedding inserts, deleting one file then re-running prunes its rows from `files`/`chunks`/`chunks_fts`/`chunks_vec`.
+- [x] **`domains/indexer`: crust facade.** `indexer/index.rs` exposes `index_corpus(&CorpusConfig, &mut Connection, &Embedder) -> IndexStats`. Slice integration test on a 3-file tempdir corpus: first run upserts all, second run reports zero embedding inserts, deleting one file then re-running prunes its rows from `files`/`chunks`/`chunks_fts`/`chunks_vec`.
 
 ### Search
 
