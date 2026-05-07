@@ -32,6 +32,17 @@ impl From<PathBuf> for FileRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkId(pub i64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Mtime(pub i64);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CorpusConfig {
+    pub name: String,
+    pub paths: Vec<String>,
+    pub globs: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Corpus(pub String);
 
