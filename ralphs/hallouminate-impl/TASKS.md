@@ -57,7 +57,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 - [x] **`app/cli::ground`: wire `ground` to ground orchestration.** Implement `cmd_ground(query, opts)` that loads config, opens DB, instantiates Embedder, calls `ground::ground(...)`, prints JSON (or `--pretty`). Integration test (`#[ignore]`-gated if needed) on the same fixture corpus: query targeting one fixture file is the top hit; chunk's `line_range` matches the source heading.
 - [x] **`app/cli::config`: `config init` and `config show`.** `init` writes a default config.toml to XDG path (refuses overwrite without `--force`). `show` resolves the merged config and pretty-prints TOML. Unit test on a tempdir XDG override.
 - [x] **`app/cli::hook`: `hook install` / `hook uninstall`.** `install` writes `.git/hooks/post-commit` and `.git/hooks/post-merge` invoking `hallouminate index --restrict-to "$PWD"` (or `--all`). Idempotent: reruns leave a single hook entry (delimited by `# hallouminate-managed-block`). `uninstall` strips the managed block. Unit test in a tempdir git repo: install twice, count managed blocks == 1; uninstall, count == 0.
-- [ ] **`app/cli::index --restrict-to`.** Add `--restrict-to <path>` flag re-indexing only configured files under the given root. Unit test: restrict to subdir leaves files outside untouched in the DB.
+- [x] **`app/cli::index --restrict-to`.** Add `--restrict-to <path>` flag re-indexing only configured files under the given root. Unit test: restrict to subdir leaves files outside untouched in the DB.
 
 ### Acceptance gates
 

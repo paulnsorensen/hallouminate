@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
@@ -17,15 +17,27 @@ pub fn index_corpus(
     corpus: &CorpusConfig,
     conn: &mut Connection,
     embedder: &mut dyn EmbedBatch,
+    restrict_to: Option<&Path>,
 ) -> Result<IndexStats> {
-    let disk = scan(corpus)?;
+    let disk = scan(corpus)?
+        .into_iter()
+        .filter(|(file, _)| under_root(file.as_path(), restrict_to))
+        .collect();
     let db_rows = all_files_for_corpus(conn, &corpus.name)?;
     let db = db_rows
         .into_iter()
+        .filter(|row| under_root(Path::new(&row.file_ref), restrict_to))
         .map(|row| (FileRef::new(PathBuf::from(&row.file_ref)), row))
         .collect::<HashMap<_, _>>();
     let p = plan(disk, db);
     apply(p, conn, embedder, corpus)
+}
+
+fn under_root(path: &Path, restrict_to: Option<&Path>) -> bool {
+    match restrict_to {
+        None => true,
+        Some(root) => path.starts_with(root),
+    }
 }
 
 #[cfg(test)]
@@ -89,7 +101,7 @@ mod tests {
         let mut conn = fresh_conn();
         let mut emb = ZeroEmbedder;
 
-        let stats = index_corpus(&corpus_at(tmp.path()), &mut conn, &mut emb).unwrap();
+        let stats = index_corpus(&corpus_at(tmp.path()), &mut conn, &mut emb, None).unwrap();
 
         assert_eq!(stats.files_upserted, 3);
         assert_eq!(stats.files_touched, 0);
@@ -105,9 +117,9 @@ mod tests {
         let corpus = corpus_at(tmp.path());
         let mut conn = fresh_conn();
         let mut emb = ZeroEmbedder;
-        index_corpus(&corpus, &mut conn, &mut emb).unwrap();
+        index_corpus(&corpus, &mut conn, &mut emb, None).unwrap();
 
-        let stats = index_corpus(&corpus, &mut conn, &mut emb).unwrap();
+        let stats = index_corpus(&corpus, &mut conn, &mut emb, None).unwrap();
 
         assert_eq!(stats.files_upserted, 0);
         assert_eq!(stats.files_touched, 0);
@@ -122,11 +134,11 @@ mod tests {
         let corpus = corpus_at(tmp.path());
         let mut conn = fresh_conn();
         let mut emb = ZeroEmbedder;
-        index_corpus(&corpus, &mut conn, &mut emb).unwrap();
+        index_corpus(&corpus, &mut conn, &mut emb, None).unwrap();
         assert_eq!(fts_match_count(&conn, "third"), 1);
 
         fs::remove_file(tmp.path().join("c.md")).unwrap();
-        let stats = index_corpus(&corpus, &mut conn, &mut emb).unwrap();
+        let stats = index_corpus(&corpus, &mut conn, &mut emb, None).unwrap();
 
         assert_eq!(stats.files_deleted, 1);
         assert_eq!(stats.files_upserted, 0);
@@ -142,5 +154,30 @@ mod tests {
             chunks_total
         );
         assert_eq!(fts_match_count(&conn, "third"), 0);
+    }
+
+    #[test]
+    fn index_corpus_with_restrict_to_skips_files_outside_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inside = tmp.path().join("inside");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(inside.join("i.md"), "# Inside\n\nfoo\n").unwrap();
+        fs::write(outside.join("o.md"), "# Outside\n\nbar\n").unwrap();
+        let corpus = corpus_at(tmp.path());
+        let mut conn = fresh_conn();
+        let mut emb = ZeroEmbedder;
+        index_corpus(&corpus, &mut conn, &mut emb, None).unwrap();
+        assert_eq!(count(&conn, "SELECT count(*) FROM files"), 2);
+
+        fs::remove_file(outside.join("o.md")).unwrap();
+        let canonical_inside = std::fs::canonicalize(&inside).unwrap();
+        let stats = index_corpus(&corpus, &mut conn, &mut emb, Some(&canonical_inside)).unwrap();
+
+        assert_eq!(stats.files_deleted, 0);
+        assert_eq!(stats.files_upserted, 0);
+        assert_eq!(stats.files_touched, 0);
+        assert_eq!(count(&conn, "SELECT count(*) FROM files"), 2);
     }
 }
