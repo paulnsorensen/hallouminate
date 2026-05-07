@@ -18,7 +18,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 ### Corpus pipeline
 
 - [x] **`domains/corpus::walker`: glob-aware path expansion.** `walker.rs` with `scan(corpus: &CorpusConfig) -> Vec<(FileRef, Mtime)>` using `walkdir` + `globset`. Honor `paths`, `globs`, `exclude` from spec config. Unit test on a tempdir fixture with included/excluded files.
-- [ ] **`domains/corpus::hasher`: blake3 file hashing.** `hasher.rs` with `blake3_file(&Path) -> Result<String>` (hex). Unit test: hash known content matches `blake3` CLI golden value.
+- [x] **`domains/corpus::hasher`: blake3 file hashing.** `hasher.rs` with `blake3_file(&Path) -> Result<String>` (hex). Unit test: hash known content matches `blake3` CLI golden value.
 - [ ] **`domains/corpus::chunker`: markdown heading-aware chunking.** `chunker.rs` with `chunk_markdown(text: &str) -> Vec<Chunk>` where `Chunk { ord, heading_path: Vec<String>, line_start, line_end, text }`. Split on H1/H2/H3 boundaries, carry heading stack, preserve exact `line_start..=line_end` 1-indexed. Unit tests for: nested headings, code-fence-spanning chunks, file with no heading.
 - [ ] **`domains/corpus::summary`: H1 + first paragraph summary, capped 280 chars.** `summary.rs` with `extract_summary(text: &str, fallback_filename: &str) -> String`. Unit tests: H1-present, no-H1 (uses filename), paragraph cap behavior.
 - [ ] **`domains/corpus::keywords`: top-8 frequency tokens with stopwords.** `keywords.rs` with `extract_keywords(text: &str) -> Vec<String>`. Strip code fences, lowercase, alphanum-only, filter built-in stopword list, frequency-rank, return top 8. Unit test: deterministic for a fixture.
