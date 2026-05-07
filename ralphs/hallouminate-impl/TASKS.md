@@ -47,7 +47,7 @@ Source of truth for the Ralphify loop. One unchecked item per iteration; one com
 
 - [x] **`domains/ground::types`: response shapes.** `types.rs` with `GroundResponse`, `DocFile`, `DocChunk`, `Stats`, `Warning` matching the spec JSON. Derive `Serialize`. Unit test: snapshot serialize a fixture into the documented shape.
 - [x] **`domains/ground::orchestrate`: assemble per-file rollup.** `orchestrate.rs` with `ground(query, &Connection, &Embedder, opts: GroundOpts) -> GroundResponse`. Computes stats, fuses, groups chunks under their `file_ref`, file-level score = best chunk's RRF score, sorts files, caps to `top_files`, caps chunks per file to `chunks_per_file`. Unit test on seeded fixture.
-- [ ] **`domains/ground`: crust facade.** `ground/index.rs` re-exports `ground`, `GroundOpts`, `GroundResponse`.
+- [x] **`domains/ground`: crust facade.** `ground/index.rs` re-exports `ground`, `GroundOpts`, `GroundResponse`.
 
 ### Config + CLI + hook installer
 
