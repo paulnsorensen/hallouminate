@@ -1,10 +1,7 @@
-use rusqlite::Connection;
-
+use crate::adapters::sqlite::pool::DbConn;
 use crate::domains::common::Result;
 
 const SCHEMA_SQL: &str = r#"
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS files (
     file_id       INTEGER PRIMARY KEY,
     file_ref      TEXT NOT NULL UNIQUE,
@@ -62,10 +59,16 @@ CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
     INSERT INTO chunks_fts(rowid, text, heading_path)
     VALUES (new.chunk_id, new.text, new.heading_path);
 END;
+
+-- vec0 is a virtual table; SQLite FK cascades do not reach it.
+-- Mirror chunk deletion explicitly so KNN never returns ghost chunk_ids.
+CREATE TRIGGER IF NOT EXISTS chunks_ad_vec AFTER DELETE ON chunks BEGIN
+    DELETE FROM chunks_vec WHERE chunk_id = old.chunk_id;
+END;
 "#;
 
-pub fn apply_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(SCHEMA_SQL)?;
+pub fn apply_schema(conn: &DbConn) -> Result<()> {
+    conn.raw().execute_batch(SCHEMA_SQL)?;
     Ok(())
 }
 
@@ -76,12 +79,13 @@ mod tests {
     use super::*;
     use crate::adapters::sqlite::pool::open_db;
 
-    fn fresh_conn() -> Connection {
+    fn fresh_conn() -> DbConn {
         open_db(Path::new(":memory:")).expect("open :memory:")
     }
 
-    fn table_names(conn: &Connection) -> Vec<String> {
-        let mut stmt = conn
+    fn table_names(db: &DbConn) -> Vec<String> {
+        let mut stmt = db
+            .raw()
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .expect("prepare sqlite_master query");
         stmt.query_map([], |row| row.get::<_, String>(0))
@@ -92,16 +96,16 @@ mod tests {
 
     #[test]
     fn apply_schema_is_idempotent() {
-        let conn = fresh_conn();
-        apply_schema(&conn).expect("first apply");
-        apply_schema(&conn).expect("second apply must not error");
+        let db = fresh_conn();
+        apply_schema(&db).expect("first apply");
+        apply_schema(&db).expect("second apply must not error");
     }
 
     #[test]
     fn apply_schema_creates_required_tables() {
-        let conn = fresh_conn();
-        apply_schema(&conn).expect("apply");
-        let names = table_names(&conn);
+        let db = fresh_conn();
+        apply_schema(&db).expect("apply");
+        let names = table_names(&db);
         for required in ["files", "chunks", "chunks_fts", "chunks_vec", "meta"] {
             assert!(
                 names.iter().any(|n| n == required),
@@ -112,23 +116,26 @@ mod tests {
 
     #[test]
     fn fts_insert_trigger_indexes_chunk_text() {
-        let conn = fresh_conn();
-        apply_schema(&conn).expect("apply");
-        conn.execute(
-            "INSERT INTO files \
-             (file_id, file_ref, corpus, mtime_ms, content_hash, indexed_at_ms) \
-             VALUES (1, '/tmp/a.md', 'docs', 0, 'deadbeef', 0)",
-            [],
-        )
-        .expect("insert file");
-        conn.execute(
-            "INSERT INTO chunks \
-             (chunk_id, file_id, ord, line_start, line_end, text) \
-             VALUES (1, 1, 0, 1, 1, 'sandworm rides on Arrakis')",
-            [],
-        )
-        .expect("insert chunk");
-        let hits: i64 = conn
+        let db = fresh_conn();
+        apply_schema(&db).expect("apply");
+        db.raw()
+            .execute(
+                "INSERT INTO files \
+                 (file_id, file_ref, corpus, mtime_ms, content_hash, indexed_at_ms) \
+                 VALUES (1, '/tmp/a.md', 'docs', 0, 'deadbeef', 0)",
+                [],
+            )
+            .expect("insert file");
+        db.raw()
+            .execute(
+                "INSERT INTO chunks \
+                 (chunk_id, file_id, ord, line_start, line_end, text) \
+                 VALUES (1, 1, 0, 1, 1, 'sandworm rides on Arrakis')",
+                [],
+            )
+            .expect("insert chunk");
+        let hits: i64 = db
+            .raw()
             .query_row(
                 "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'sandworm'",
                 [],

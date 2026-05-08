@@ -51,7 +51,7 @@ pub enum HallouminateError {
     Io(#[from] std::io::Error),
 
     #[error("db: {0}")]
-    Db(#[from] rusqlite::Error),
+    Db(String),
 
     #[error("embed: {0}")]
     Embed(String),

@@ -1,32 +1,25 @@
-use rusqlite::{params, Connection};
+use rusqlite::params;
 
+use crate::adapters::sqlite::pool::DbConn;
 use crate::domains::common::Result;
 
 pub const EMBEDDING_DIM: usize = 384;
 
 fn vec_to_bytes(v: &[f32; EMBEDDING_DIM]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(EMBEDDING_DIM * std::mem::size_of::<f32>());
-    for f in v {
-        bytes.extend_from_slice(&f.to_le_bytes());
-    }
-    bytes
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
-pub fn insert_vec(
-    conn: &Connection,
-    chunk_id: i64,
-    embedding: &[f32; EMBEDDING_DIM],
-) -> Result<()> {
+pub fn insert_vec(conn: &DbConn, chunk_id: i64, embedding: &[f32; EMBEDDING_DIM]) -> Result<()> {
     let bytes = vec_to_bytes(embedding);
-    conn.execute(
+    conn.raw().execute(
         "INSERT INTO chunks_vec (chunk_id, embedding) VALUES (?1, ?2)",
         params![chunk_id, bytes],
     )?;
     Ok(())
 }
 
-pub fn delete_vec_for_chunk(conn: &Connection, chunk_id: i64) -> Result<()> {
-    conn.execute(
+pub fn delete_vec_for_chunk(conn: &DbConn, chunk_id: i64) -> Result<()> {
+    conn.raw().execute(
         "DELETE FROM chunks_vec WHERE chunk_id = ?1",
         params![chunk_id],
     )?;
@@ -34,12 +27,13 @@ pub fn delete_vec_for_chunk(conn: &Connection, chunk_id: i64) -> Result<()> {
 }
 
 pub fn knn_chunks(
-    conn: &Connection,
+    conn: &DbConn,
     query: &[f32; EMBEDDING_DIM],
     k: usize,
 ) -> Result<Vec<(i64, f64)>> {
+    debug_assert!(k > 0, "knn_chunks: k must be >= 1");
     let bytes = vec_to_bytes(query);
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.raw().prepare(
         "SELECT chunk_id, vec_distance_cosine(embedding, ?1) AS distance \
          FROM chunks_vec \
          ORDER BY distance ASC \
@@ -61,10 +55,10 @@ mod tests {
     use crate::adapters::sqlite::pool::open_db;
     use crate::adapters::sqlite::schema::apply_schema;
 
-    fn fresh_conn() -> Connection {
-        let conn = open_db(Path::new(":memory:")).expect("open :memory:");
-        apply_schema(&conn).expect("apply schema");
-        conn
+    fn fresh_conn() -> DbConn {
+        let db = open_db(Path::new(":memory:")).expect("open :memory:");
+        apply_schema(&db).expect("apply schema");
+        db
     }
 
     fn unit_basis(idx: usize) -> [f32; EMBEDDING_DIM] {
@@ -75,10 +69,10 @@ mod tests {
 
     #[test]
     fn knn_chunks_ranks_matching_vector_first() {
-        let conn = fresh_conn();
-        insert_vec(&conn, 1, &unit_basis(0)).expect("insert e0");
-        insert_vec(&conn, 2, &unit_basis(1)).expect("insert e1");
-        let hits = knn_chunks(&conn, &unit_basis(0), 2).expect("knn");
+        let db = fresh_conn();
+        insert_vec(&db, 1, &unit_basis(0)).expect("insert e0");
+        insert_vec(&db, 2, &unit_basis(1)).expect("insert e1");
+        let hits = knn_chunks(&db, &unit_basis(0), 2).expect("knn");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, 1, "matching basis vector must rank first");
         assert_eq!(hits[1].0, 2);
@@ -95,23 +89,32 @@ mod tests {
 
     #[test]
     fn knn_chunks_respects_k_limit() {
-        let conn = fresh_conn();
-        insert_vec(&conn, 1, &unit_basis(0)).expect("a");
-        insert_vec(&conn, 2, &unit_basis(1)).expect("b");
-        insert_vec(&conn, 3, &unit_basis(2)).expect("c");
-        let hits = knn_chunks(&conn, &unit_basis(0), 1).expect("knn");
+        let db = fresh_conn();
+        insert_vec(&db, 1, &unit_basis(0)).expect("a");
+        insert_vec(&db, 2, &unit_basis(1)).expect("b");
+        insert_vec(&db, 3, &unit_basis(2)).expect("c");
+        let hits = knn_chunks(&db, &unit_basis(0), 1).expect("knn");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 1);
     }
 
     #[test]
     fn delete_vec_for_chunk_purges_row() {
-        let conn = fresh_conn();
-        insert_vec(&conn, 7, &unit_basis(0)).expect("insert");
-        delete_vec_for_chunk(&conn, 7).expect("delete");
-        let count: i64 = conn
+        let db = fresh_conn();
+        insert_vec(&db, 7, &unit_basis(0)).expect("insert");
+        delete_vec_for_chunk(&db, 7).expect("delete");
+        let count: i64 = db
+            .raw()
             .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
             .expect("count");
         assert_eq!(count, 0);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "k must be >= 1")]
+    fn knn_chunks_rejects_zero_k_in_debug() {
+        let db = fresh_conn();
+        let _ = knn_chunks(&db, &unit_basis(0), 0);
     }
 }
