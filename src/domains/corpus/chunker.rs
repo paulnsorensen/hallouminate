@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn chunk_markdown_returns_empty_for_empty_input() {
-        assert!(chunk_markdown("").is_empty());
+        assert_eq!(chunk_markdown(""), Vec::<Chunk>::new());
     }
 
     #[test]
@@ -91,7 +91,7 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         let c = &chunks[0];
         assert_eq!(c.ord, 0);
-        assert!(c.heading_path.is_empty());
+        assert_eq!(c.heading_path, Vec::<String>::new());
         assert_eq!((c.line_start, c.line_end), (1, 3));
         assert_eq!(c.text, text);
     }
@@ -140,7 +140,7 @@ mod tests {
         let text = "preamble\n\n# Title\nbody\n";
         let chunks = chunk_markdown(text);
         assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].heading_path.is_empty());
+        assert_eq!(chunks[0].heading_path, Vec::<String>::new());
         assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 2));
         assert_eq!(chunks[1].heading_path, vec!["Title".to_string()]);
         assert_eq!((chunks[1].line_start, chunks[1].line_end), (3, 4));
