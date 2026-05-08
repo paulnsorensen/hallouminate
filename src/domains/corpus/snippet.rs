@@ -9,15 +9,15 @@ fn collapse_whitespace(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut prev_space = false;
     for c in text.chars() {
-        if c.is_whitespace() {
-            if !prev_space && !out.is_empty() {
-                out.push(' ');
-            }
-            prev_space = true;
-        } else {
+        if !c.is_whitespace() {
             out.push(c);
             prev_space = false;
+            continue;
         }
+        if !prev_space && !out.is_empty() {
+            out.push(' ');
+        }
+        prev_space = true;
     }
     if out.ends_with(' ') {
         out.pop();

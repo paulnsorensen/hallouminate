@@ -1,3 +1,5 @@
+use super::fences::FenceTracker;
+
 const SUMMARY_CAP: usize = 280;
 
 pub fn extract_summary(text: &str, fallback_filename: &str) -> String {
@@ -8,38 +10,41 @@ pub fn extract_summary(text: &str, fallback_filename: &str) -> String {
         Some(p) => format!("{title} — {p}"),
         None => title,
     };
-    cap_chars(&combined, SUMMARY_CAP)
+    combined.chars().take(SUMMARY_CAP).collect()
 }
 
 fn find_title(lines: &[&str], fallback: &str) -> (String, usize) {
-    let mut in_fence = false;
+    let mut fence = FenceTracker::new();
     for (idx, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
+        if fence.skip_line(trimmed) {
             continue;
         }
-        if in_fence {
+        let Some(title) = trimmed
+            .strip_prefix("# ")
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        else {
             continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("# ") {
-            let title = rest.trim();
-            if !title.is_empty() {
-                return (title.to_string(), idx + 1);
-            }
-        }
+        };
+        return (title.to_string(), idx + 1);
     }
     (fallback.to_string(), 0)
 }
 
 fn first_paragraph(lines: &[&str], start: usize) -> Option<String> {
+    let mut fence = FenceTracker::new();
     let mut paragraph_lines: Vec<&str> = Vec::new();
     for line in lines.iter().skip(start) {
+        if fence.skip_line(line) {
+            continue;
+        }
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            if paragraph_lines.is_empty() {
-                continue;
-            }
+        let is_break = trimmed.is_empty() || trimmed.starts_with('#');
+        if is_break && paragraph_lines.is_empty() {
+            continue;
+        }
+        if is_break {
             break;
         }
         paragraph_lines.push(trimmed);
@@ -49,10 +54,6 @@ fn first_paragraph(lines: &[&str], start: usize) -> Option<String> {
     } else {
         Some(paragraph_lines.join(" "))
     }
-}
-
-fn cap_chars(s: &str, max: usize) -> String {
-    s.chars().take(max).collect()
 }
 
 #[cfg(test)]
@@ -104,5 +105,12 @@ mod tests {
         let text = "```\n# Not Title\n```\n# Real\nbody.\n";
         let summary = extract_summary(text, "f.md");
         assert_eq!(summary, "Real — body.");
+    }
+
+    #[test]
+    fn extract_summary_skips_code_fence_in_paragraph_search() {
+        let text = "# Title\n```\nfn fenced() {}\n```\nreal paragraph.\n";
+        let summary = extract_summary(text, "f.md");
+        assert_eq!(summary, "Title — real paragraph.");
     }
 }

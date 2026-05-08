@@ -1,4 +1,5 @@
 mod chunker;
+mod fences;
 mod hasher;
 mod keywords;
 mod snippet;

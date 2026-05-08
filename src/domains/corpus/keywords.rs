@@ -1,23 +1,21 @@
 use std::collections::HashMap;
 
+use super::fences::FenceTracker;
+
 const TOP_K: usize = 8;
 const MIN_LEN: usize = 2;
 
 pub fn extract_keywords(text: &str) -> Vec<String> {
     let cleaned = strip_code_fences(text);
     let tokens = tokenize(&cleaned);
-    rank_top(tokens, TOP_K)
+    rank_top(tokens)
 }
 
 fn strip_code_fences(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_fence = false;
+    let mut fence = FenceTracker::new();
     for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if !in_fence {
+        if !fence.skip_line(line) {
             out.push_str(line);
         }
     }
@@ -41,10 +39,10 @@ fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
-fn rank_top(tokens: Vec<String>, k: usize) -> Vec<String> {
+fn rank_top(tokens: Vec<String>) -> Vec<String> {
     let mut counts: HashMap<String, (u32, usize)> = HashMap::new();
     for (i, tok) in tokens.into_iter().enumerate() {
-        if tok.len() < MIN_LEN || is_stopword(&tok) {
+        if tok.chars().count() < MIN_LEN || STOPWORDS.contains(&tok.as_str()) {
             continue;
         }
         counts.entry(tok).and_modify(|e| e.0 += 1).or_insert((1, i));
@@ -52,11 +50,7 @@ fn rank_top(tokens: Vec<String>, k: usize) -> Vec<String> {
     let mut entries: Vec<(String, u32, usize)> =
         counts.into_iter().map(|(t, (c, p))| (t, c, p)).collect();
     entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
-    entries.into_iter().take(k).map(|(t, _, _)| t).collect()
-}
-
-fn is_stopword(s: &str) -> bool {
-    STOPWORDS.contains(&s)
+    entries.into_iter().take(TOP_K).map(|(t, _, _)| t).collect()
 }
 
 const STOPWORDS: &[&str] = &[

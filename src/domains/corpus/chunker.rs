@@ -1,3 +1,5 @@
+use super::fences::FenceTracker;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub ord: usize,
@@ -16,15 +18,11 @@ pub fn chunk_markdown(text: &str) -> Vec<Chunk> {
     let mut path: Vec<String> = Vec::new();
     let mut stack: [Option<String>; 3] = [None, None, None];
     let mut start: usize = 1;
-    let mut in_fence = false;
+    let mut fence = FenceTracker::new();
     for (i, raw) in lines.iter().enumerate() {
         let lineno = i + 1;
         let trimmed = trim_line(raw);
-        if trimmed.starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
+        if fence.skip_line(trimmed) {
             continue;
         }
         let Some((level, title)) = parse_heading(trimmed) else {
