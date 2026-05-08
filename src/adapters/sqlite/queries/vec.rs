@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use rusqlite::params;
 
 use crate::adapters::sqlite::pool::DbConn;
@@ -29,10 +31,13 @@ pub fn delete_vec_for_chunk(conn: &DbConn, chunk_id: i64) -> Result<()> {
 pub fn knn_chunks(
     conn: &DbConn,
     query: &[f32; EMBEDDING_DIM],
-    k: usize,
+    k: NonZeroUsize,
 ) -> Result<Vec<(i64, f64)>> {
-    debug_assert!(k > 0, "knn_chunks: k must be >= 1");
     let bytes = vec_to_bytes(query);
+    // Saturate to i64::MAX rather than wrapping; only matters on 64-bit
+    // platforms where usize > i64::MAX, and "give me everything" is the
+    // sensible interpretation in that regime.
+    let k_sql = i64::try_from(k.get()).unwrap_or(i64::MAX);
     let mut stmt = conn.raw().prepare(
         "SELECT chunk_id, vec_distance_cosine(embedding, ?1) AS distance \
          FROM chunks_vec \
@@ -40,7 +45,7 @@ pub fn knn_chunks(
          LIMIT ?2",
     )?;
     let rows = stmt
-        .query_map(params![bytes, k as i64], |row| {
+        .query_map(params![bytes, k_sql], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -67,12 +72,16 @@ mod tests {
         v
     }
 
+    fn k(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).expect("k must be > 0 in tests")
+    }
+
     #[test]
     fn knn_chunks_ranks_matching_vector_first() {
         let db = fresh_conn();
         insert_vec(&db, 1, &unit_basis(0)).expect("insert e0");
         insert_vec(&db, 2, &unit_basis(1)).expect("insert e1");
-        let hits = knn_chunks(&db, &unit_basis(0), 2).expect("knn");
+        let hits = knn_chunks(&db, &unit_basis(0), k(2)).expect("knn");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0, 1, "matching basis vector must rank first");
         assert_eq!(hits[1].0, 2);
@@ -93,7 +102,7 @@ mod tests {
         insert_vec(&db, 1, &unit_basis(0)).expect("a");
         insert_vec(&db, 2, &unit_basis(1)).expect("b");
         insert_vec(&db, 3, &unit_basis(2)).expect("c");
-        let hits = knn_chunks(&db, &unit_basis(0), 1).expect("knn");
+        let hits = knn_chunks(&db, &unit_basis(0), k(1)).expect("knn");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 1);
     }
@@ -108,13 +117,5 @@ mod tests {
             .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
             .expect("count");
         assert_eq!(count, 0);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "k must be >= 1")]
-    fn knn_chunks_rejects_zero_k_in_debug() {
-        let db = fresh_conn();
-        let _ = knn_chunks(&db, &unit_basis(0), 0);
     }
 }

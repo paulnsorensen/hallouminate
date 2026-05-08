@@ -15,6 +15,6 @@ pub use schema::apply_schema;
 
 impl From<rusqlite::Error> for HallouminateError {
     fn from(err: rusqlite::Error) -> Self {
-        HallouminateError::Db(err.to_string())
+        HallouminateError::Db(Box::new(err))
     }
 }

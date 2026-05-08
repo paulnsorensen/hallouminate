@@ -1,9 +1,13 @@
 use std::path::Path;
-use std::sync::Once;
+use std::sync::OnceLock;
 
 use rusqlite::Connection;
 
-use crate::domains::common::Result;
+use crate::domains::common::{HallouminateError, Result};
+
+#[derive(Debug, thiserror::Error)]
+#[error("sqlite-vec auto_extension registration failed: rc={0}")]
+struct VecExtensionError(i32);
 
 const MEMORY_DB: &str = ":memory:";
 
@@ -18,18 +22,18 @@ impl DbConn {
     }
 }
 
-fn ensure_sqlite_vec_registered() {
-    static VEC_INIT: Once = Once::new();
-    VEC_INIT.call_once(|| unsafe {
+fn ensure_sqlite_vec_registered() -> Result<()> {
+    static VEC_INIT_RC: OnceLock<i32> = OnceLock::new();
+    let rc = *VEC_INIT_RC.get_or_init(|| unsafe {
         // SAFETY: `sqlite3_vec_init` is the canonical sqlite3 extension
         // entry point with the
         // `(*mut sqlite3, *mut *mut c_char, *const sqlite3_api_routines) -> c_int`
         // ABI. The Rust binding exposes it as a bare `fn()` for FFI import
         // convenience, so we transmute the function pointer back to its
-        // real signature. The `Once` guard ensures single registration;
+        // real signature. The `OnceLock` guard ensures single registration;
         // the underlying C function is reentrant-safe per the sqlite3
         // extension contract.
-        let rc = rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
             *const (),
             unsafe extern "C" fn(
                 *mut rusqlite::ffi::sqlite3,
@@ -37,16 +41,17 @@ fn ensure_sqlite_vec_registered() {
                 *const rusqlite::ffi::sqlite3_api_routines,
             ) -> std::ffi::c_int,
         >(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-        if rc != 0 {
-            tracing::error!("sqlite-vec auto_extension registration failed: rc={rc}");
-        }
+            sqlite_vec::sqlite3_vec_init as *const ()
+        )))
     });
+    if rc != 0 {
+        return Err(HallouminateError::Db(Box::new(VecExtensionError(rc))));
+    }
+    Ok(())
 }
 
 pub fn open_db(path: &Path) -> Result<DbConn> {
-    ensure_sqlite_vec_registered();
+    ensure_sqlite_vec_registered()?;
     let conn = if path == Path::new(MEMORY_DB) {
         Connection::open_in_memory()?
     } else {
