@@ -1,5 +1,8 @@
 use clap::Parser;
 
+pub mod adapters;
+pub mod domains;
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
