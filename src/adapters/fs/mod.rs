@@ -58,6 +58,37 @@ mod tests {
         let resolved = canonicalize_or_passthrough(&tmp);
         let expected = std::fs::canonicalize(&tmp).expect("temp dir canonicalizes");
         assert_eq!(resolved.as_path(), expected.as_path());
+        assert!(
+            resolved.as_path().is_absolute(),
+            "canonical path must be absolute: {}",
+            resolved.as_path().display()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_resolves_symlink() {
+        use std::os::unix::fs::symlink;
+        let temp = std::env::temp_dir();
+        let pid = std::process::id();
+        let target = temp.join(format!("hallouminate-target-{}", pid));
+        let link = temp.join(format!("hallouminate-link-{}", pid));
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&target);
+        std::fs::create_dir(&target).expect("create target dir");
+        symlink(&target, &link).expect("create symlink");
+
+        let resolved = canonicalize_or_passthrough(&link);
+        let expected = std::fs::canonicalize(&target).expect("canonicalize target");
+        assert_eq!(resolved.as_path(), expected.as_path());
+        assert_ne!(
+            resolved.as_path(),
+            link.as_path(),
+            "symlink path should be resolved away"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&target);
     }
 
     #[test]
