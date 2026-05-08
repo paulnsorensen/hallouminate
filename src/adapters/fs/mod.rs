@@ -20,17 +20,18 @@ mod tests {
     #[test]
     fn expand_tilde_resolves_home() {
         let expanded = expand_tilde("~/foo");
-        let home = std::env::var("HOME").expect("HOME must be set for tests");
+        let base_dirs = directories::BaseDirs::new().expect("home directory not available");
+        let home = base_dirs.home_dir();
         assert!(
             !expanded.to_string_lossy().starts_with('~'),
             "tilde should be replaced: {}",
             expanded.display()
         );
         assert!(
-            expanded.starts_with(&home),
-            "{} should start with $HOME ({})",
+            expanded.starts_with(home),
+            "{} should start with home ({})",
             expanded.display(),
-            home
+            home.display()
         );
         assert!(
             expanded.ends_with("foo"),
@@ -61,8 +62,9 @@ mod tests {
 
     #[test]
     fn canonicalize_nonexistent_passes_through_unchanged() {
-        let path = Path::new("/this/path/definitely/does/not/exist/abc123");
-        let resolved = canonicalize_or_passthrough(path);
-        assert_eq!(resolved.as_path(), path);
+        let path =
+            std::env::temp_dir().join(format!("hallouminate-nonexistent-{}", std::process::id()));
+        let resolved = canonicalize_or_passthrough(&path);
+        assert_eq!(resolved.as_path(), path.as_path());
     }
 }
