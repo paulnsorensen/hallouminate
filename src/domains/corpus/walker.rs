@@ -3,8 +3,10 @@ use std::time::UNIX_EPOCH;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use walkdir::WalkDir;
 
-use crate::adapters::fs::{canonicalize_or_passthrough, expand_tilde};
-use crate::domains::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
+use crate::domains::common::{
+    canonicalize_or_passthrough, expand_tilde, CorpusConfig, FileRef, HallouminateError, Mtime,
+    Result,
+};
 
 pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
     let include = build_globset(&corpus.globs)?;
@@ -12,15 +14,24 @@ pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
     let mut out = Vec::new();
     for raw in &corpus.paths {
         let root = expand_tilde(raw);
-        for entry in WalkDir::new(&root).follow_links(false) {
-            let entry =
-                entry.map_err(|e| HallouminateError::Indexer(format!("walk error: {e}")))?;
-            if let Some(hit) = visit_entry(&entry, include.as_ref(), exclude.as_ref())? {
-                out.push(hit);
-            }
-        }
+        walk_root(&root, include.as_ref(), exclude.as_ref(), &mut out)?;
     }
     Ok(out)
+}
+
+fn walk_root(
+    root: &std::path::Path,
+    include: Option<&GlobSet>,
+    exclude: Option<&GlobSet>,
+    out: &mut Vec<(FileRef, Mtime)>,
+) -> Result<()> {
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry.map_err(|e| HallouminateError::Indexer(format!("walk error: {e}")))?;
+        if let Some(hit) = visit_entry(&entry, include, exclude)? {
+            out.push(hit);
+        }
+    }
+    Ok(())
 }
 
 fn visit_entry(
@@ -63,7 +74,9 @@ fn entry_mtime_ms(entry: &walkdir::DirEntry) -> Result<i64> {
         .metadata()
         .map_err(|e| HallouminateError::Indexer(format!("metadata: {e}")))?;
     let mtime = meta.modified()?;
-    let dur = mtime.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let dur = mtime.duration_since(UNIX_EPOCH).map_err(|_| {
+        HallouminateError::Indexer(format!("pre-epoch mtime on {}", entry.path().display()))
+    })?;
     Ok(dur.as_millis() as i64)
 }
 
@@ -112,8 +125,14 @@ mod tests {
         let result = scan(&corpus_for(root)).expect("scan");
         let names = file_names(&result);
         assert_eq!(result.len(), 2, "names = {names:?}");
-        assert!(names.contains(&"foo.md".to_string()));
-        assert!(names.contains(&"bar.md".to_string()));
+        assert!(
+            names.contains(&"foo.md".to_string()),
+            "expected foo.md in {names:?}"
+        );
+        assert!(
+            names.contains(&"bar.md".to_string()),
+            "expected bar.md in {names:?}"
+        );
     }
 
     #[test]

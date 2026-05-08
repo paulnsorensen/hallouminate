@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::domains::common::FileRef;
+use super::FileRef;
 
 pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).into_owned())

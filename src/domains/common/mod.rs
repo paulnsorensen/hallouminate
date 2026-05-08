@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+mod paths;
+
+pub use paths::{canonicalize_or_passthrough, expand_tilde};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileRef(PathBuf);
 
