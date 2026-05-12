@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use crate::domains::common::Result;
+use crate::domain::common::Result;
 
 pub fn blake3_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
@@ -64,7 +64,7 @@ mod tests {
     fn blake3_file_missing_path_returns_io_error() {
         let err = blake3_file(Path::new("/no/such/file/aaa")).expect_err("must fail");
         assert!(
-            matches!(err, crate::domains::common::HallouminateError::Io(_)),
+            matches!(err, crate::domain::common::HallouminateError::Io(_)),
             "expected Io variant, got {err:?}"
         );
     }

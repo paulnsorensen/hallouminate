@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use rusqlite::Connection;
 
-use crate::domains::common::{HallouminateError, Result};
+use crate::domain::common::{HallouminateError, Result};
 
 #[derive(Debug, thiserror::Error)]
 #[error("sqlite-vec auto_extension registration failed: rc={0}")]

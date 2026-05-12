@@ -1,7 +1,7 @@
 use rusqlite::params;
 
 use crate::adapters::sqlite::pool::DbConn;
-use crate::domains::common::Result;
+use crate::domain::common::Result;
 
 #[derive(Debug, Clone)]
 pub struct NewChunk<'a> {
@@ -43,8 +43,8 @@ mod tests {
 
     use super::*;
     use crate::adapters::sqlite::pool::open_db;
-    use crate::adapters::sqlite::queries::vec::{insert_vec, EMBEDDING_DIM};
-    use crate::adapters::sqlite::queries::{delete_file_cascade, upsert_file, NewFile};
+    use crate::adapters::sqlite::queries::vec::{EMBEDDING_DIM, insert_vec};
+    use crate::adapters::sqlite::queries::{NewFile, delete_file_cascade, upsert_file};
     use crate::adapters::sqlite::schema::apply_schema;
 
     fn fresh_conn() -> DbConn {

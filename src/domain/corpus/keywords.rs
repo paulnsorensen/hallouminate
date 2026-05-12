@@ -104,7 +104,9 @@ vector vector vector vector vector
         assert_eq!(kws.len(), 8);
         assert_eq!(
             kws,
-            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",]
+            vec![
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            ]
         );
     }
 
