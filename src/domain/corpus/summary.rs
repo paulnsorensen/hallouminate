@@ -37,7 +37,10 @@ fn first_paragraph(lines: &[&str], start: usize) -> Option<String> {
     let mut paragraph_lines: Vec<&str> = Vec::new();
     for line in lines.iter().skip(start) {
         if fence.skip_line(line) {
-            continue;
+            if paragraph_lines.is_empty() {
+                continue;
+            }
+            break;
         }
         let trimmed = line.trim();
         let is_break = trimmed.is_empty() || trimmed.starts_with('#');
@@ -112,5 +115,12 @@ mod tests {
         let text = "# Title\n```\nfn fenced() {}\n```\nreal paragraph.\n";
         let summary = extract_summary(text, "f.md");
         assert_eq!(summary, "Title — real paragraph.");
+    }
+
+    #[test]
+    fn extract_summary_terminates_paragraph_at_code_fence() {
+        let text = "# Title\nintro line\n```\nfn fenced() {}\n```\nafter line.\n";
+        let summary = extract_summary(text, "f.md");
+        assert_eq!(summary, "Title — intro line");
     }
 }

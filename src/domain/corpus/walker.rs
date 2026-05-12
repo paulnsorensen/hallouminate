@@ -196,9 +196,18 @@ mod tests {
             exclude: vec![],
         };
         let err = scan(&corpus).expect_err("invalid glob must fail");
+        let msg = err.to_string();
         assert!(
             matches!(err, HallouminateError::Config(_)),
             "expected Config variant, got {err:?}"
+        );
+        assert!(
+            msg.contains("[invalid"),
+            "error message should name the offending pattern, got: {msg}"
+        );
+        assert!(
+            msg.starts_with("config: glob"),
+            "error message should identify the source as a glob config error, got: {msg}"
         );
     }
 }

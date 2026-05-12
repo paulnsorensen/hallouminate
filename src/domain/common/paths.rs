@@ -6,6 +6,16 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).into_owned())
 }
 
+/// Resolve symlinks and collapse `..` via [`std::fs::canonicalize`], falling
+/// back to the original path on failure (typically: path does not exist, is
+/// on a non-traversable mount, or the process lacks permission).
+///
+/// The error is intentionally swallowed: callers (the walker, the indexer)
+/// need a stable [`FileRef`] for paths that may legitimately fail to
+/// canonicalize, and there is no recovery the caller could perform with the
+/// `io::Error` here. The unit tests pin both branches: `canonicalize_existing_dir_resolves`
+/// exercises the success path, `canonicalize_nonexistent_passes_through_unchanged`
+/// exercises the fallback.
 pub fn canonicalize_or_passthrough(path: &Path) -> FileRef {
     match std::fs::canonicalize(path) {
         Ok(canonical) => FileRef::new(canonical),

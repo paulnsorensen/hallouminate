@@ -48,7 +48,7 @@ pub struct CorpusConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Corpus(pub String);
+pub struct Corpus(String);
 
 impl Corpus {
     pub fn new(name: impl Into<String>) -> Self {
