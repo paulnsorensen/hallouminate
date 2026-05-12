@@ -4,8 +4,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use walkdir::WalkDir;
 
 use crate::domain::common::{
-    CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
-    expand_tilde,
+    canonicalize_or_passthrough, expand_tilde, CorpusConfig, FileRef, HallouminateError, Mtime,
+    Result,
 };
 
 pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
@@ -25,7 +25,14 @@ fn walk_root(
     exclude: Option<&GlobSet>,
     out: &mut Vec<(FileRef, Mtime)>,
 ) -> Result<()> {
-    for entry in WalkDir::new(root).follow_links(false) {
+    let walker = WalkDir::new(root).follow_links(false).into_iter();
+    for entry in walker.filter_entry(|e| {
+        // Prune excluded directories before descending into them.
+        if e.file_type().is_dir() {
+            return !matches!(exclude, Some(ex) if ex.is_match(e.path().join("_")));
+        }
+        true
+    }) {
         let entry = entry.map_err(|e| HallouminateError::Indexer(format!("walk error: {e}")))?;
         if let Some(hit) = visit_entry(&entry, include, exclude)? {
             out.push(hit);
@@ -208,6 +215,34 @@ mod tests {
         assert!(
             msg.starts_with("config: glob"),
             "error message should identify the source as a glob config error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn excluded_directory_is_not_descended_into() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join("excluded_dir")).unwrap();
+        // A .md file inside the excluded dir that would match the include glob.
+        fs::write(root.join("excluded_dir/keepme.md"), "should not appear").unwrap();
+        // A file outside the excluded dir to confirm the walker still works.
+        fs::write(root.join("visible.md"), "should appear").unwrap();
+        let corpus = CorpusConfig {
+            name: "prune".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec!["**/excluded_dir/**".into()],
+        };
+        let result = scan(&corpus).expect("scan");
+        let names = file_names(&result);
+        assert_eq!(result.len(), 1, "names = {names:?}");
+        assert!(
+            names.contains(&"visible.md".to_string()),
+            "expected visible.md in {names:?}"
+        );
+        assert!(
+            !names.contains(&"keepme.md".to_string()),
+            "keepme.md inside excluded_dir should not be visited, got {names:?}"
         );
     }
 }
