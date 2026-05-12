@@ -1,4 +1,6 @@
-use super::fences::FenceTracker;
+use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Parser, Tag, TagEnd};
+
+const MAX_HEADING_LEVEL: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -10,69 +12,107 @@ pub struct Chunk {
 }
 
 pub fn chunk_markdown(text: &str) -> Vec<Chunk> {
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
-    if lines.is_empty() {
+    if text.is_empty() {
         return Vec::new();
     }
+    let line_starts = build_line_starts(text);
+    let total_lines = line_starts.len() - 1;
     let mut chunks: Vec<Chunk> = Vec::new();
+    let mut stack: [Option<String>; MAX_HEADING_LEVEL] = Default::default();
     let mut path: Vec<String> = Vec::new();
-    let mut stack: [Option<String>; 3] = [None, None, None];
     let mut start: usize = 1;
-    let mut fence = FenceTracker::new();
-    for (i, raw) in lines.iter().enumerate() {
-        let lineno = i + 1;
-        let trimmed = trim_line(raw);
-        if fence.skip_line(trimmed) {
-            continue;
-        }
-        let Some((level, title)) = parse_heading(trimmed) else {
+
+    let mut iter = Parser::new(text).into_offset_iter();
+    while let Some((event, range)) = iter.next() {
+        let Some(level_idx) = heading_level_idx(&event) else {
             continue;
         };
-        push_chunk(&mut chunks, &path, &lines, (start, lineno - 1));
-        for slot in &mut stack[level - 1..] {
+        let title = collect_heading_text(&mut iter);
+        let heading_line = byte_to_line(range.start, &line_starts);
+        push_chunk(
+            &mut chunks,
+            &path,
+            text,
+            &line_starts,
+            start,
+            heading_line - 1,
+        );
+        for slot in &mut stack[level_idx..] {
             *slot = None;
         }
-        stack[level - 1] = Some(title);
+        stack[level_idx] = Some(title);
         path = stack.iter().flatten().cloned().collect();
-        start = lineno;
+        start = heading_line;
     }
-    push_chunk(&mut chunks, &path, &lines, (start, lines.len()));
+    push_chunk(&mut chunks, &path, text, &line_starts, start, total_lines);
     chunks
 }
 
-fn push_chunk(out: &mut Vec<Chunk>, path: &[String], lines: &[&str], range: (usize, usize)) {
-    let (start, end) = range;
+fn heading_level_idx(event: &Event<'_>) -> Option<usize> {
+    let Event::Start(Tag::Heading { level, .. }) = event else {
+        return None;
+    };
+    match level {
+        HeadingLevel::H1 => Some(0),
+        HeadingLevel::H2 => Some(1),
+        HeadingLevel::H3 => Some(2),
+        _ => None,
+    }
+}
+
+fn collect_heading_text(iter: &mut OffsetIter<'_>) -> String {
+    let mut buf = String::new();
+    for (event, _) in iter.by_ref() {
+        match event {
+            Event::End(TagEnd::Heading(_)) => break,
+            Event::Text(t) | Event::Code(t) => buf.push_str(&t),
+            _ => {}
+        }
+    }
+    buf.trim().to_string()
+}
+
+fn push_chunk(
+    out: &mut Vec<Chunk>,
+    path: &[String],
+    text: &str,
+    line_starts: &[usize],
+    start: usize,
+    end: usize,
+) {
     if end < start {
         return;
     }
+    let byte_start = line_starts[start - 1];
+    let byte_end = line_starts[end];
     out.push(Chunk {
         ord: out.len(),
         heading_path: path.to_vec(),
         line_start: start,
         line_end: end,
-        text: lines[start - 1..end].concat(),
+        text: text[byte_start..byte_end].to_string(),
     });
 }
 
-fn trim_line(raw: &str) -> &str {
-    raw.trim_end_matches('\n')
-        .trim_end_matches('\r')
-        .trim_start()
+fn build_line_starts(text: &str) -> Vec<usize> {
+    let mut starts = Vec::with_capacity(64);
+    starts.push(0);
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    if !text.ends_with('\n') {
+        starts.push(text.len());
+    }
+    starts
 }
 
-fn parse_heading(line: &str) -> Option<(usize, String)> {
-    let bytes = line.as_bytes();
-    let mut level = 0usize;
-    while level < bytes.len() && bytes[level] == b'#' {
-        level += 1;
+fn byte_to_line(byte: usize, line_starts: &[usize]) -> usize {
+    match line_starts.binary_search(&byte) {
+        Ok(idx) => idx + 1,
+        Err(idx) => idx,
     }
-    if level == 0 || level > 3 {
-        return None;
-    }
-    if level >= bytes.len() || bytes[level] != b' ' {
-        return None;
-    }
-    Some((level, line[level + 1..].trim().to_string()))
 }
 
 #[cfg(test)]
@@ -81,7 +121,7 @@ mod tests {
 
     #[test]
     fn chunk_markdown_returns_empty_for_empty_input() {
-        assert_eq!(chunk_markdown(""), Vec::<Chunk>::new());
+        assert!(chunk_markdown("").is_empty());
     }
 
     #[test]
@@ -91,7 +131,7 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         let c = &chunks[0];
         assert_eq!(c.ord, 0);
-        assert_eq!(c.heading_path, Vec::<String>::new());
+        assert!(c.heading_path.is_empty());
         assert_eq!((c.line_start, c.line_end), (1, 3));
         assert_eq!(c.text, text);
     }
@@ -140,7 +180,7 @@ mod tests {
         let text = "preamble\n\n# Title\nbody\n";
         let chunks = chunk_markdown(text);
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].heading_path, Vec::<String>::new());
+        assert!(chunks[0].heading_path.is_empty());
         assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 2));
         assert_eq!(chunks[1].heading_path, vec!["Title".to_string()]);
         assert_eq!((chunks[1].line_start, chunks[1].line_end), (3, 4));
@@ -173,5 +213,33 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 2));
         assert_eq!(chunks[0].text, text);
+    }
+
+    #[test]
+    fn chunk_markdown_splits_on_setext_h1_and_h2() {
+        let text = "Top\n===\n\nintro\n\nSub\n---\n\nbody\n";
+        let chunks = chunk_markdown(text);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].heading_path, vec!["Top".to_string()]);
+        assert_eq!(
+            chunks[1].heading_path,
+            vec!["Top".to_string(), "Sub".to_string()]
+        );
+    }
+
+    #[test]
+    fn chunk_markdown_strips_inline_formatting_from_heading_title() {
+        let text = "# **Bold** title\nbody\n";
+        let chunks = chunk_markdown(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Bold title".to_string()]);
+    }
+
+    #[test]
+    fn chunk_markdown_strips_atx_closing_hashes_from_title() {
+        let text = "## Title ##\nbody\n";
+        let chunks = chunk_markdown(text);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].heading_path, vec!["Title".to_string()]);
     }
 }

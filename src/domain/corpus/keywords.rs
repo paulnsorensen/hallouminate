@@ -1,48 +1,56 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
-use super::fences::FenceTracker;
+use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use stop_words::{get, LANGUAGE};
+use unicode_segmentation::UnicodeSegmentation;
 
 const TOP_K: usize = 8;
 const MIN_LEN: usize = 2;
 
+static STOPWORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    get(LANGUAGE::English)
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+});
+
 pub fn extract_keywords(text: &str) -> Vec<String> {
-    let cleaned = strip_code_fences(text);
-    let tokens = tokenize(&cleaned);
+    let prose = strip_code_blocks(text);
+    let tokens = tokenize(&prose);
     rank_top(tokens)
 }
 
-fn strip_code_fences(text: &str) -> String {
+fn strip_code_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut fence = FenceTracker::new();
-    for line in text.split_inclusive('\n') {
-        if !fence.skip_line(line) {
-            out.push_str(line);
+    let mut in_code = false;
+    for event in Parser::new(text) {
+        match event {
+            Event::Start(Tag::CodeBlock(_)) => in_code = true,
+            Event::End(TagEnd::CodeBlock) => in_code = false,
+            Event::Text(t) if !in_code => {
+                out.push_str(&t);
+                out.push(' ');
+            }
+            Event::Code(t) => {
+                out.push_str(&t);
+                out.push(' ');
+            }
+            Event::SoftBreak | Event::HardBreak => out.push(' '),
+            _ => {}
         }
     }
     out
 }
 
 fn tokenize(text: &str) -> Vec<String> {
-    let lower = text.to_lowercase();
-    let mut tokens: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for c in lower.chars() {
-        if c.is_alphanumeric() {
-            current.push(c);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
+    text.unicode_words().map(|w| w.to_lowercase()).collect()
 }
 
 fn rank_top(tokens: Vec<String>) -> Vec<String> {
     let mut counts: HashMap<String, (u32, usize)> = HashMap::new();
     for (i, tok) in tokens.into_iter().enumerate() {
-        if tok.chars().count() < MIN_LEN || STOPWORDS.contains(&tok.as_str()) {
+        if tok.chars().count() < MIN_LEN || STOPWORDS.contains(&tok) {
             continue;
         }
         counts.entry(tok).and_modify(|e| e.0 += 1).or_insert((1, i));
@@ -52,21 +60,6 @@ fn rank_top(tokens: Vec<String>) -> Vec<String> {
     entries.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)));
     entries.into_iter().take(TOP_K).map(|(t, _, _)| t).collect()
 }
-
-const STOPWORDS: &[&str] = &[
-    "an", "the", "and", "or", "but", "if", "then", "else", "for", "while", "to", "of", "in", "on",
-    "at", "by", "from", "with", "into", "onto", "over", "under", "up", "down", "out", "off", "as",
-    "is", "are", "was", "were", "be", "been", "being", "am", "do", "does", "did", "doing", "done",
-    "have", "has", "had", "having", "this", "that", "these", "those", "you", "he", "she", "it",
-    "we", "they", "them", "us", "him", "her", "my", "your", "his", "its", "our", "their", "mine",
-    "yours", "ours", "theirs", "not", "no", "nor", "so", "such", "can", "could", "will", "would",
-    "should", "may", "might", "must", "shall", "what", "which", "who", "whom", "whose", "where",
-    "when", "why", "how", "all", "any", "both", "each", "few", "more", "most", "other", "some",
-    "than", "too", "very", "just", "only", "also", "about", "above", "below", "after", "before",
-    "between", "during", "through", "again", "further", "there", "here", "now", "ever", "never",
-    "often", "always", "yes", "ok", "use", "used", "using", "see", "via", "let", "like", "much",
-    "many", "own", "same",
-];
 
 #[cfg(test)]
 mod tests {
@@ -104,9 +97,7 @@ vector vector vector vector vector
         assert_eq!(kws.len(), 8);
         assert_eq!(
             kws,
-            vec![
-                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-            ]
+            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",]
         );
     }
 
@@ -124,9 +115,9 @@ vector vector vector vector vector
 
     #[test]
     fn extract_keywords_filters_short_tokens() {
-        let text = "a b c d e ai ml ai ml ai";
+        let text = "a b c xj qz xj qz xj";
         let kws = extract_keywords(text);
-        assert_eq!(kws, vec!["ai", "ml"]);
+        assert_eq!(kws, vec!["xj", "qz"]);
     }
 
     #[test]

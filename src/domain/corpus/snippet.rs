@@ -1,39 +1,33 @@
+use unicode_segmentation::UnicodeSegmentation;
+
 const SNIPPET_CAP: usize = 240;
 
 pub fn make_snippet(text: &str) -> String {
-    let collapsed = collapse_whitespace(text);
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_at_word_boundary(&collapsed, SNIPPET_CAP)
 }
 
-fn collapse_whitespace(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut prev_space = false;
-    for c in text.chars() {
-        if !c.is_whitespace() {
-            out.push(c);
-            prev_space = false;
-            continue;
-        }
-        if !prev_space && !out.is_empty() {
-            out.push(' ');
-        }
-        prev_space = true;
-    }
-    if out.ends_with(' ') {
-        out.pop();
-    }
-    out
-}
-
 fn truncate_at_word_boundary(s: &str, max_chars: usize) -> String {
-    let total: usize = s.chars().count();
-    if total <= max_chars {
+    if s.chars().count() <= max_chars {
         return s.to_string();
     }
-    let head: String = s.chars().take(max_chars).collect();
-    match head.rfind(' ') {
-        Some(byte_idx) => head[..byte_idx].to_string(),
-        None => head,
+    let mut last_boundary: Option<usize> = None;
+    let mut chars_so_far = 0usize;
+    for (byte_idx, word) in s.split_word_bound_indices() {
+        let word_chars = word.chars().count();
+        if chars_so_far + word_chars > max_chars {
+            break;
+        }
+        chars_so_far += word_chars;
+        if word.chars().all(char::is_whitespace) {
+            last_boundary = Some(byte_idx);
+        } else {
+            last_boundary = Some(byte_idx + word.len());
+        }
+    }
+    match last_boundary {
+        Some(idx) => s[..idx].trim_end().to_string(),
+        None => s.chars().take(max_chars).collect(),
     }
 }
 
@@ -61,8 +55,8 @@ mod tests {
 
     #[test]
     fn make_snippet_truncates_at_last_word_boundary_under_cap() {
-        let word = "alpha "; // 6 chars including the trailing space
-        let text = word.repeat(50); // 300 chars
+        let word = "alpha ";
+        let text = word.repeat(50);
         let snippet = make_snippet(&text);
         let count = snippet.chars().count();
         assert!(count <= SNIPPET_CAP, "snippet length {count} exceeds cap");

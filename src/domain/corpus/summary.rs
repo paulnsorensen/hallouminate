@@ -1,11 +1,10 @@
-use super::fences::FenceTracker;
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
 const SUMMARY_CAP: usize = 280;
 
 pub fn extract_summary(text: &str, fallback_filename: &str) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    let (title, paragraph_start) = find_title(&lines, fallback_filename);
-    let paragraph = first_paragraph(&lines, paragraph_start);
+    let (title, paragraph) = walk(text);
+    let title = title.unwrap_or_else(|| fallback_filename.to_string());
     let combined = match paragraph {
         Some(p) => format!("{title} — {p}"),
         None => title,
@@ -13,50 +12,63 @@ pub fn extract_summary(text: &str, fallback_filename: &str) -> String {
     combined.chars().take(SUMMARY_CAP).collect()
 }
 
-fn find_title(lines: &[&str], fallback: &str) -> (String, usize) {
-    let mut fence = FenceTracker::new();
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim_start();
-        if fence.skip_line(trimmed) {
-            continue;
+fn walk(text: &str) -> (Option<String>, Option<String>) {
+    let mut title: Option<String> = None;
+    let mut paragraph_before_title: Option<String> = None;
+    let mut paragraph_after_title: Option<String> = None;
+    let mut iter = Parser::new(text);
+    while let Some(event) = iter.next() {
+        match event {
+            Event::Start(Tag::Heading {
+                level: HeadingLevel::H1,
+                ..
+            }) if title.is_none() => {
+                title = Some(collect_until_end_heading(&mut iter));
+            }
+            Event::Start(Tag::Paragraph) => {
+                let p = collect_until_end_paragraph(&mut iter);
+                if title.is_some() {
+                    paragraph_after_title = Some(p);
+                    break;
+                }
+                if paragraph_before_title.is_none() {
+                    paragraph_before_title = Some(p);
+                }
+            }
+            _ => {}
         }
-        let Some(title) = trimmed
-            .strip_prefix("# ")
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        else {
-            continue;
-        };
-        return (title.to_string(), idx + 1);
     }
-    (fallback.to_string(), 0)
+    let paragraph = if title.is_some() {
+        paragraph_after_title
+    } else {
+        paragraph_before_title
+    };
+    (title, paragraph)
 }
 
-fn first_paragraph(lines: &[&str], start: usize) -> Option<String> {
-    let mut fence = FenceTracker::new();
-    let mut paragraph_lines: Vec<&str> = Vec::new();
-    for line in lines.iter().skip(start) {
-        if fence.skip_line(line) {
-            if paragraph_lines.is_empty() {
-                continue;
-            }
-            break;
+fn collect_until_end_heading(iter: &mut Parser<'_>) -> String {
+    let mut buf = String::new();
+    for event in iter.by_ref() {
+        match event {
+            Event::End(TagEnd::Heading(_)) => break,
+            Event::Text(t) | Event::Code(t) => buf.push_str(&t),
+            _ => {}
         }
-        let trimmed = line.trim();
-        let is_break = trimmed.is_empty() || trimmed.starts_with('#');
-        if is_break && paragraph_lines.is_empty() {
-            continue;
-        }
-        if is_break {
-            break;
-        }
-        paragraph_lines.push(trimmed);
     }
-    if paragraph_lines.is_empty() {
-        None
-    } else {
-        Some(paragraph_lines.join(" "))
+    buf.trim().to_string()
+}
+
+fn collect_until_end_paragraph(iter: &mut Parser<'_>) -> String {
+    let mut buf = String::new();
+    for event in iter.by_ref() {
+        match event {
+            Event::End(TagEnd::Paragraph) => break,
+            Event::Text(t) | Event::Code(t) => buf.push_str(&t),
+            Event::SoftBreak | Event::HardBreak => buf.push(' '),
+            _ => {}
+        }
     }
+    buf.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[cfg(test)]
