@@ -11,6 +11,10 @@ pub fn blake3_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+pub fn blake3_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;

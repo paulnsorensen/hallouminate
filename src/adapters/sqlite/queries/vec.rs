@@ -20,14 +20,6 @@ pub fn insert_vec(conn: &DbConn, chunk_id: i64, embedding: &[f32; EMBEDDING_DIM]
     Ok(())
 }
 
-pub fn delete_vec_for_chunk(conn: &DbConn, chunk_id: i64) -> Result<()> {
-    conn.raw().execute(
-        "DELETE FROM chunks_vec WHERE chunk_id = ?1",
-        params![chunk_id],
-    )?;
-    Ok(())
-}
-
 pub fn knn_chunks(
     conn: &DbConn,
     query: &[f32; EMBEDDING_DIM],
@@ -105,17 +97,5 @@ mod tests {
         let hits = knn_chunks(&db, &unit_basis(0), k(1)).expect("knn");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0, 1);
-    }
-
-    #[test]
-    fn delete_vec_for_chunk_purges_row() {
-        let db = fresh_conn();
-        insert_vec(&db, 7, &unit_basis(0)).expect("insert");
-        delete_vec_for_chunk(&db, 7).expect("delete");
-        let count: i64 = db
-            .raw()
-            .query_row("SELECT count(*) FROM chunks_vec", [], |row| row.get(0))
-            .expect("count");
-        assert_eq!(count, 0);
     }
 }
