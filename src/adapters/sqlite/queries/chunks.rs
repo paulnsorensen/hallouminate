@@ -1,7 +1,7 @@
 use rusqlite::params;
 
 use crate::adapters::sqlite::pool::DbConn;
-use crate::domains::common::Result;
+use crate::domain::common::Result;
 
 #[derive(Debug, Clone)]
 pub struct NewChunk<'a> {

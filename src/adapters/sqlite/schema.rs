@@ -1,5 +1,5 @@
 use crate::adapters::sqlite::pool::DbConn;
-use crate::domains::common::Result;
+use crate::domain::common::Result;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS files (

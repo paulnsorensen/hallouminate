@@ -1,5 +1,9 @@
 use std::path::{Path, PathBuf};
 
+mod paths;
+
+pub use paths::{canonicalize_or_passthrough, expand_tilde};
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileRef(PathBuf);
 
@@ -32,8 +36,19 @@ impl From<PathBuf> for FileRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChunkId(pub i64);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Mtime(pub i64);
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CorpusConfig {
+    pub name: String,
+    pub paths: Vec<String>,
+    pub globs: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Corpus(pub String);
+pub struct Corpus(String);
 
 impl Corpus {
     pub fn new(name: impl Into<String>) -> Self {

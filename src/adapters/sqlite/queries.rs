@@ -1,7 +1,7 @@
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::adapters::sqlite::pool::DbConn;
-use crate::domains::common::Result;
+use crate::domain::common::Result;
 
 pub mod chunks;
 pub mod vec;

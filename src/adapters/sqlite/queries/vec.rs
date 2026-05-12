@@ -3,7 +3,7 @@ use std::num::NonZeroUsize;
 use rusqlite::params;
 
 use crate::adapters::sqlite::pool::DbConn;
-use crate::domains::common::Result;
+use crate::domain::common::Result;
 
 pub const EMBEDDING_DIM: usize = 384;
 

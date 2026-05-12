@@ -2,7 +2,7 @@ mod pool;
 mod queries;
 mod schema;
 
-use crate::domains::common::HallouminateError;
+use crate::domain::common::HallouminateError;
 
 pub use pool::{DbConn, open_db};
 pub use queries::chunks::{NewChunk, delete_chunks_for_file, insert_chunk};
