@@ -53,17 +53,14 @@ impl EmbedBatch for Embedder {
     }
 }
 
-fn finalize_vector(mut v: Vec<f32>) -> Result<[f32; EMBEDDING_DIM]> {
-    if v.len() != EMBEDDING_DIM {
-        return Err(HallouminateError::Embed(format!(
+fn finalize_vector(v: Vec<f32>) -> Result<[f32; EMBEDDING_DIM]> {
+    let mut arr: [f32; EMBEDDING_DIM] = v.try_into().map_err(|v: Vec<f32>| {
+        HallouminateError::Embed(format!(
             "expected {EMBEDDING_DIM}-dim vector, got {}",
             v.len()
-        )));
-    }
-    l2_normalize(&mut v);
-    let arr: [f32; EMBEDDING_DIM] = v
-        .try_into()
-        .map_err(|_| HallouminateError::Embed("vector length mismatch".into()))?;
+        ))
+    })?;
+    l2_normalize(&mut arr);
     Ok(arr)
 }
 

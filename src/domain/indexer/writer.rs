@@ -1,10 +1,8 @@
 use std::fs;
 
-use rusqlite::params;
-
 use crate::adapters::sqlite::{
-    delete_chunks_for_file, delete_vec_for_chunk, insert_chunk, insert_vec, upsert_file, DbConn,
-    FileRow, NewChunk, NewFile,
+    delete_chunks_for_file, insert_chunk, insert_vec, upsert_file, DbConn, FileRow, NewChunk,
+    NewFile,
 };
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::{
@@ -52,7 +50,7 @@ pub(super) fn write_file_chunks(
         },
     )?;
     if req.prior.is_some() {
-        purge_vecs_for_file(conn, file_id)?;
+        // chunks_ad_vec + chunks_ad triggers cascade chunks_vec / chunks_fts on this delete.
         delete_chunks_for_file(conn, file_id)?;
     }
     insert_all_chunks(conn, embedder, file_id, &chunks, stats)
@@ -94,18 +92,6 @@ fn insert_all_chunks(
         insert_vec(conn, chunk_id, vector)?;
         stats.chunks_inserted += 1;
         stats.embeddings_inserted += 1;
-    }
-    Ok(())
-}
-
-pub(super) fn purge_vecs_for_file(conn: &DbConn, file_id: i64) -> Result<()> {
-    let raw = conn.raw();
-    let mut stmt = raw.prepare("SELECT chunk_id FROM chunks WHERE file_id = ?1")?;
-    let ids: Vec<i64> = stmt
-        .query_map(params![file_id], |row| row.get::<_, i64>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for id in ids {
-        delete_vec_for_chunk(conn, id)?;
     }
     Ok(())
 }

@@ -4,7 +4,7 @@ use crate::domain::corpus::blake3_file;
 use crate::domain::embeddings::EmbedBatch;
 
 use super::plan::{IndexPlan, MtimeCandidate, Upsert};
-use super::writer::{file_ref_string, purge_vecs_for_file, write_file_chunks, WriteRequest};
+use super::writer::{file_ref_string, write_file_chunks, WriteRequest};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyStats {
@@ -39,23 +39,6 @@ pub fn apply(
     Ok(stats)
 }
 
-fn run_in_tx<F>(conn: &DbConn, f: F) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-{
-    conn.raw().execute_batch("BEGIN")?;
-    match f() {
-        Ok(()) => {
-            conn.raw().execute_batch("COMMIT")?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = conn.raw().execute_batch("ROLLBACK");
-            Err(e)
-        }
-    }
-}
-
 fn run_upsert(
     conn: &DbConn,
     embedder: &mut dyn EmbedBatch,
@@ -63,20 +46,20 @@ fn run_upsert(
     upsert: Upsert,
     stats: &mut ApplyStats,
 ) -> Result<()> {
-    run_in_tx(conn, || {
-        let prior = get_file_by_ref(conn, &file_ref_string(&upsert.file)?)?;
-        write_file_chunks(
-            conn,
-            embedder,
-            WriteRequest {
-                corpus,
-                file: &upsert.file,
-                mtime: upsert.mtime,
-                prior,
-            },
-            stats,
-        )
-    })?;
+    let tx = conn.raw().unchecked_transaction()?;
+    let prior = get_file_by_ref(conn, &file_ref_string(&upsert.file)?)?;
+    write_file_chunks(
+        conn,
+        embedder,
+        WriteRequest {
+            corpus,
+            file: &upsert.file,
+            mtime: upsert.mtime,
+            prior,
+        },
+        stats,
+    )?;
+    tx.commit()?;
     stats.files_upserted += 1;
     Ok(())
 }
@@ -90,35 +73,33 @@ fn run_touch_or_upsert(
 ) -> Result<()> {
     let new_hash = blake3_file(cand.file.as_path())?;
     if new_hash == cand.row.content_hash {
-        run_in_tx(conn, || {
-            touch_mtime(conn, cand.row.file_id, cand.new_mtime.0)
-        })?;
+        let tx = conn.raw().unchecked_transaction()?;
+        touch_mtime(conn, cand.row.file_id, cand.new_mtime.0)?;
+        tx.commit()?;
         stats.files_touched += 1;
         return Ok(());
     }
-    run_in_tx(conn, || {
-        write_file_chunks(
-            conn,
-            embedder,
-            WriteRequest {
-                corpus,
-                file: &cand.file,
-                mtime: cand.new_mtime,
-                prior: Some(cand.row),
-            },
-            stats,
-        )
-    })?;
+    let tx = conn.raw().unchecked_transaction()?;
+    write_file_chunks(
+        conn,
+        embedder,
+        WriteRequest {
+            corpus,
+            file: &cand.file,
+            mtime: cand.new_mtime,
+            prior: Some(cand.row),
+        },
+        stats,
+    )?;
+    tx.commit()?;
     stats.files_upserted += 1;
     Ok(())
 }
 
 fn run_delete(conn: &DbConn, row: FileRow, stats: &mut ApplyStats) -> Result<()> {
-    run_in_tx(conn, || {
-        purge_vecs_for_file(conn, row.file_id)?;
-        delete_file_cascade(conn, row.file_id)?;
-        Ok(())
-    })?;
+    let tx = conn.raw().unchecked_transaction()?;
+    delete_file_cascade(conn, row.file_id)?;
+    tx.commit()?;
     stats.files_deleted += 1;
     Ok(())
 }
