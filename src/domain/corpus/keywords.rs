@@ -16,35 +16,26 @@ static STOPWORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
 });
 
 pub fn extract_keywords(text: &str) -> Vec<String> {
-    let prose = strip_code_blocks(text);
-    let tokens = tokenize(&prose);
-    rank_top(tokens)
+    rank_top(tokenize_prose(text))
 }
 
-fn strip_code_blocks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_code = false;
+fn tokenize_prose(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut in_code_block = false;
     for event in Parser::new(text) {
         match event {
-            Event::Start(Tag::CodeBlock(_)) => in_code = true,
-            Event::End(TagEnd::CodeBlock) => in_code = false,
-            Event::Text(t) if !in_code => {
-                out.push_str(&t);
-                out.push(' ');
+            Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+            Event::End(TagEnd::CodeBlock) => in_code_block = false,
+            Event::Text(t) if !in_code_block => {
+                tokens.extend(t.unicode_words().map(str::to_lowercase));
             }
             Event::Code(t) => {
-                out.push_str(&t);
-                out.push(' ');
+                tokens.extend(t.unicode_words().map(str::to_lowercase));
             }
-            Event::SoftBreak | Event::HardBreak => out.push(' '),
             _ => {}
         }
     }
-    out
-}
-
-fn tokenize(text: &str) -> Vec<String> {
-    text.unicode_words().map(|w| w.to_lowercase()).collect()
+    tokens
 }
 
 fn rank_top(tokens: Vec<String>) -> Vec<String> {

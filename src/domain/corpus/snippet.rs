@@ -1,34 +1,29 @@
-use unicode_segmentation::UnicodeSegmentation;
-
 const SNIPPET_CAP: usize = 240;
 
 pub fn make_snippet(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_at_word_boundary(&collapsed, SNIPPET_CAP)
-}
-
-fn truncate_at_word_boundary(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut last_boundary: Option<usize> = None;
+    let mut out = String::new();
     let mut chars_so_far = 0usize;
-    for (byte_idx, word) in s.split_word_bound_indices() {
+
+    for word in text.split_whitespace() {
         let word_chars = word.chars().count();
-        if chars_so_far + word_chars > max_chars {
-            break;
+        let space_chars = usize::from(!out.is_empty());
+        let needed = chars_so_far + space_chars + word_chars;
+
+        if needed > SNIPPET_CAP {
+            if out.is_empty() {
+                return word.chars().take(SNIPPET_CAP).collect();
+            }
+            return out;
         }
-        chars_so_far += word_chars;
-        if word.chars().all(char::is_whitespace) {
-            last_boundary = Some(byte_idx);
-        } else {
-            last_boundary = Some(byte_idx + word.len());
+
+        if space_chars > 0 {
+            out.push(' ');
         }
+        out.push_str(word);
+        chars_so_far = needed;
     }
-    match last_boundary {
-        Some(idx) => s[..idx].trim_end().to_string(),
-        None => s.chars().take(max_chars).collect(),
-    }
+
+    out
 }
 
 #[cfg(test)]
