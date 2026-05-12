@@ -99,10 +99,11 @@ pub(crate) fn check_or_set_model(conn: &DbConn, requested: &str) -> Result<()> {
         Some(_) => Ok(()),
         None => {
             conn.raw().execute(
-                "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
                 params![META_KEY_MODEL, requested],
             )?;
-            Ok(())
+            // Re-check: a concurrent process may have won the INSERT race.
+            check_or_set_model(conn, requested)
         }
     }
 }

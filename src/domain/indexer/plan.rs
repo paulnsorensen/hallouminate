@@ -24,6 +24,9 @@ pub struct MtimeCandidate {
 }
 
 pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileRow>) -> IndexPlan {
+    // Dedup by FileRef: overlapping CorpusConfig.paths can yield the same file
+    // twice. Last occurrence wins (preserves the most recent mtime observation).
+    let disk: HashMap<FileRef, Mtime> = disk.into_iter().collect();
     let mut out = IndexPlan::default();
     for (file, mtime) in disk {
         match db.remove(&file) {

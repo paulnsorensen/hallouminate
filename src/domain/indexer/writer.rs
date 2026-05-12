@@ -6,7 +6,7 @@ use crate::adapters::sqlite::{
 };
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::{
-    blake3_file, chunk_markdown, extract_keywords, extract_summary, Chunk,
+    blake3_bytes, chunk_markdown, extract_keywords, extract_summary, Chunk,
 };
 use crate::domain::embeddings::EmbedBatch;
 
@@ -26,8 +26,11 @@ pub(super) fn write_file_chunks(
     stats: &mut ApplyStats,
 ) -> Result<()> {
     let path = req.file.as_path();
-    let body = fs::read_to_string(path)?;
-    let hash = blake3_file(path)?;
+    let bytes = fs::read(path)?;
+    let hash = blake3_bytes(&bytes);
+    let body = String::from_utf8(bytes).map_err(|e| {
+        HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
+    })?;
     let chunks = chunk_markdown(&body);
     let fallback = path
         .file_name()
