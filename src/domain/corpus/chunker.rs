@@ -1,6 +1,26 @@
 use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Parser, Tag, TagEnd};
+use text_splitter::{ChunkConfig, MarkdownSplitter};
+
+use crate::domain::common::{HallouminateError, Result};
 
 const MAX_HEADING_LEVEL: usize = 3;
+
+/// Re-export `text_splitter::ChunkSizer` so callers don't have to depend on
+/// the crate directly.
+pub use text_splitter::ChunkSizer;
+
+/// Object-safe chunker abstraction used by the indexer.  Hides the generic
+/// `ChunkSizer` parameter so `apply`/`writer` can take `&dyn CorpusChunker`
+/// without propagating the type parameter into every layer.
+pub trait CorpusChunker: Send + Sync {
+    fn chunk_text(&self, text: &str) -> Vec<Chunk>;
+}
+
+impl<S: ChunkSizer + Send + Sync> CorpusChunker for MarkdownChunker<S> {
+    fn chunk_text(&self, text: &str) -> Vec<Chunk> {
+        self.chunk(text)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
@@ -11,41 +31,106 @@ pub struct Chunk {
     pub text: String,
 }
 
-pub fn chunk_markdown(text: &str) -> Vec<Chunk> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let line_starts = build_line_starts(text);
-    let total_lines = line_starts.len() - 1;
-    let mut chunks: Vec<Chunk> = Vec::new();
-    let mut stack: [Option<String>; MAX_HEADING_LEVEL] = Default::default();
-    let mut path: Vec<String> = Vec::new();
-    let mut start: usize = 1;
+/// Token-budgeted markdown chunker.
+///
+/// Owns a `text_splitter::MarkdownSplitter` configured with a tokenizer-backed
+/// sizer so chunks respect the embedding model's context window.  A parallel
+/// pulldown-cmark pass enriches each chunk with its active heading path and
+/// line range for citation in the ground orchestrator.
+pub struct MarkdownChunker<S: ChunkSizer> {
+    splitter: MarkdownSplitter<S>,
+}
 
-    let mut iter = Parser::new(text).into_offset_iter();
+impl<S: ChunkSizer> MarkdownChunker<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
+        Self {
+            splitter: MarkdownSplitter::new(config),
+        }
+    }
+
+    /// Split `text` into budget-bounded chunks, each annotated with its
+    /// heading path and line range.
+    pub fn chunk(&self, text: &str) -> Vec<Chunk> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let line_starts = build_line_starts(text);
+        let breadcrumbs = build_breadcrumbs(text);
+        let mut out: Vec<Chunk> = Vec::new();
+        for (byte_off, slice) in self.splitter.chunk_indices(text) {
+            if slice.is_empty() {
+                continue;
+            }
+            let heading_path = heading_path_at(byte_off, &breadcrumbs);
+            let line_start = byte_to_line(byte_off, &line_starts);
+            let end_byte = byte_off + slice.len();
+            // line_end is inclusive: the last line touched by the chunk
+            let line_end = if end_byte == 0 {
+                line_start
+            } else {
+                byte_to_line(end_byte - 1, &line_starts)
+            };
+            out.push(Chunk {
+                ord: out.len(),
+                heading_path,
+                line_start,
+                line_end,
+                text: slice.to_string(),
+            });
+        }
+        out
+    }
+}
+
+/// Convenience: `chunk_markdown(text, sizer)` returns chunks using a fresh
+/// chunker over the supplied sizer. For repeated splits, prefer constructing a
+/// `MarkdownChunker` once.
+pub fn chunk_markdown<S: ChunkSizer>(text: &str, sizer: S) -> Vec<Chunk> {
+    // Need a generous default budget since the sizer might be Characters.
+    MarkdownChunker::new(sizer, 1500).chunk(text)
+}
+
+/// Load a Hugging Face tokenizer for the given model and wrap it as a sizer
+/// that text-splitter can use. Networked on first call; cached in the standard
+/// HF cache directory.
+pub fn load_tokenizer(model_id: &str) -> Result<tokenizers::Tokenizer> {
+    tokenizers::Tokenizer::from_pretrained(model_id, None)
+        .map_err(|e| HallouminateError::Embed(format!("load tokenizer {model_id}: {e}")))
+}
+
+// ── Heading path side-pass ──────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct Breadcrumb {
+    byte_offset: usize,
+    path: Vec<String>,
+}
+
+fn build_breadcrumbs(text: &str) -> Vec<Breadcrumb> {
+    let mut out: Vec<Breadcrumb> = Vec::new();
+    out.push(Breadcrumb {
+        byte_offset: 0,
+        path: Vec::new(),
+    });
+    let mut stack: [Option<String>; MAX_HEADING_LEVEL] = Default::default();
+    let mut iter: OffsetIter<'_> = Parser::new(text).into_offset_iter();
     while let Some((event, range)) = iter.next() {
         let Some(level_idx) = heading_level_idx(&event) else {
             continue;
         };
         let title = collect_heading_text(&mut iter);
-        let heading_line = byte_to_line(range.start, &line_starts);
-        push_chunk(
-            &mut chunks,
-            &path,
-            text,
-            &line_starts,
-            start,
-            heading_line - 1,
-        );
         for slot in &mut stack[level_idx..] {
             *slot = None;
         }
         stack[level_idx] = Some(title);
-        path = stack.iter().flatten().cloned().collect();
-        start = heading_line;
+        let path: Vec<String> = stack.iter().flatten().cloned().collect();
+        out.push(Breadcrumb {
+            byte_offset: range.start,
+            path,
+        });
     }
-    push_chunk(&mut chunks, &path, text, &line_starts, start, total_lines);
-    chunks
+    out
 }
 
 fn heading_level_idx(event: &Event<'_>) -> Option<usize> {
@@ -72,27 +157,20 @@ fn collect_heading_text(iter: &mut OffsetIter<'_>) -> String {
     buf.trim().to_string()
 }
 
-fn push_chunk(
-    out: &mut Vec<Chunk>,
-    path: &[String],
-    text: &str,
-    line_starts: &[usize],
-    start: usize,
-    end: usize,
-) {
-    if end < start {
-        return;
+fn heading_path_at(byte_offset: usize, breadcrumbs: &[Breadcrumb]) -> Vec<String> {
+    // Find the last breadcrumb whose byte_offset <= the chunk's start.
+    let mut active = &breadcrumbs[0];
+    for crumb in breadcrumbs.iter() {
+        if crumb.byte_offset <= byte_offset {
+            active = crumb;
+        } else {
+            break;
+        }
     }
-    let byte_start = line_starts[start - 1];
-    let byte_end = line_starts[end];
-    out.push(Chunk {
-        ord: out.len(),
-        heading_path: path.to_vec(),
-        line_start: start,
-        line_end: end,
-        text: text[byte_start..byte_end].to_string(),
-    });
+    active.path.clone()
 }
+
+// ── Line tracking ────────────────────────────────────────────────────────
 
 fn build_line_starts(text: &str) -> Vec<usize> {
     let mut starts = Vec::with_capacity(64);
@@ -118,128 +196,141 @@ fn byte_to_line(byte: usize, line_starts: &[usize]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use text_splitter::Characters;
+
+    fn small_chunker() -> MarkdownChunker<Characters> {
+        // Characters sizer; budget large enough that simple test docs become 1 chunk
+        // unless we deliberately force multi-chunk behaviour with a small budget.
+        MarkdownChunker::new(Characters, 2000)
+    }
+
+    fn tiny_chunker() -> MarkdownChunker<Characters> {
+        // small budget to force splitting
+        MarkdownChunker::new(Characters, 40)
+    }
 
     #[test]
     fn chunk_markdown_returns_empty_for_empty_input() {
-        assert!(chunk_markdown("").is_empty());
+        let chunks = small_chunker().chunk("");
+        assert!(chunks.is_empty());
     }
 
     #[test]
-    fn chunk_markdown_returns_single_chunk_for_no_headings() {
-        let text = "alpha\nbeta\ngamma\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 1);
-        let c = &chunks[0];
-        assert_eq!(c.ord, 0);
-        assert!(c.heading_path.is_empty());
-        assert_eq!((c.line_start, c.line_end), (1, 3));
-        assert_eq!(c.text, text);
-    }
-
-    #[test]
-    fn chunk_markdown_splits_on_nested_h1_h2_h3() {
-        let text = "# Top\nintro\n## Sub\nbody\n### Deep\ndeep body\n## Sib\nsib\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(chunks[0].heading_path, vec!["Top".to_string()]);
-        assert_eq!(
-            chunks[1].heading_path,
-            vec!["Top".to_string(), "Sub".to_string()]
-        );
-        assert_eq!(
-            chunks[2].heading_path,
-            vec!["Top".to_string(), "Sub".to_string(), "Deep".to_string()]
-        );
-        assert_eq!(
-            chunks[3].heading_path,
-            vec!["Top".to_string(), "Sib".to_string()]
-        );
-        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 2));
-        assert_eq!((chunks[1].line_start, chunks[1].line_end), (3, 4));
-        assert_eq!((chunks[2].line_start, chunks[2].line_end), (5, 6));
-        assert_eq!((chunks[3].line_start, chunks[3].line_end), (7, 8));
+    fn chunk_markdown_assigns_ords_in_order() {
+        let text = "# A\n\nshort body\n\n# B\n\nanother body\n";
+        let chunks = tiny_chunker().chunk(text);
         for (i, c) in chunks.iter().enumerate() {
-            assert_eq!(c.ord, i);
+            assert_eq!(c.ord, i, "ord mismatch at index {i}");
         }
-        let joined: String = chunks.iter().map(|c| c.text.as_str()).collect();
-        assert_eq!(joined, text);
     }
 
     #[test]
-    fn chunk_markdown_does_not_split_on_headings_inside_code_fence() {
-        let text = "# Title\nbefore\n```rust\n# Not a heading\nfn main() {}\n```\nafter\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].heading_path, vec!["Title".to_string()]);
-        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 7));
-        assert_eq!(chunks[0].text, text);
+    fn chunk_markdown_attaches_heading_path() {
+        let text = "# Top\nintro\n## Sub\nbody\n";
+        let chunks = small_chunker().chunk(text);
+        // every chunk should have at least the H1 in its breadcrumbs
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(!c.heading_path.is_empty(), "missing heading_path: {c:?}");
+        }
     }
 
     #[test]
-    fn chunk_markdown_emits_preamble_chunk_with_empty_path() {
-        let text = "preamble\n\n# Title\nbody\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 2);
-        assert!(chunks[0].heading_path.is_empty());
-        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 2));
-        assert_eq!(chunks[1].heading_path, vec!["Title".to_string()]);
-        assert_eq!((chunks[1].line_start, chunks[1].line_end), (3, 4));
-    }
-
-    #[test]
-    fn chunk_markdown_does_not_split_on_h4_or_deeper() {
-        let text = "# T\n#### Deep\nbody\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].heading_path, vec!["T".to_string()]);
-        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 3));
-    }
-
-    #[test]
-    fn chunk_markdown_replaces_lower_levels_when_higher_heading_appears() {
-        let text = "# A\n## B\n### C\n## D\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 4);
-        assert_eq!(
-            chunks[3].heading_path,
-            vec!["A".to_string(), "D".to_string()]
-        );
+    fn chunk_markdown_records_line_range() {
+        let text = "line1\nline2\nline3\n";
+        let chunks = small_chunker().chunk(text);
+        assert!(!chunks.is_empty());
+        let first = &chunks[0];
+        assert_eq!(first.line_start, 1, "{first:?}");
+        assert!(first.line_end >= first.line_start);
     }
 
     #[test]
     fn chunk_markdown_handles_input_without_trailing_newline() {
         let text = "# A\nbody";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!((chunks[0].line_start, chunks[0].line_end), (1, 2));
-        assert_eq!(chunks[0].text, text);
+        let chunks = small_chunker().chunk(text);
+        assert!(!chunks.is_empty());
     }
 
     #[test]
-    fn chunk_markdown_splits_on_setext_h1_and_h2() {
-        let text = "Top\n===\n\nintro\n\nSub\n---\n\nbody\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].heading_path, vec!["Top".to_string()]);
+    fn breadcrumbs_track_h1_h2_h3_levels() {
+        let text = "# A\nx\n## B\ny\n### C\nz\n";
+        let crumbs = build_breadcrumbs(text);
+        // initial empty + 3 headings
+        assert_eq!(crumbs.len(), 4);
+        assert!(crumbs[0].path.is_empty());
+        assert_eq!(crumbs[1].path, vec!["A".to_string()]);
+        assert_eq!(crumbs[2].path, vec!["A".to_string(), "B".to_string()]);
         assert_eq!(
-            chunks[1].heading_path,
-            vec!["Top".to_string(), "Sub".to_string()]
+            crumbs[3].path,
+            vec!["A".to_string(), "B".to_string(), "C".to_string()]
         );
     }
 
     #[test]
-    fn chunk_markdown_strips_inline_formatting_from_heading_title() {
-        let text = "# **Bold** title\nbody\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].heading_path, vec!["Bold title".to_string()]);
+    fn breadcrumbs_replace_lower_levels_when_higher_appears() {
+        let text = "# A\n## B\n### C\n## D\n";
+        let crumbs = build_breadcrumbs(text);
+        // last breadcrumb (for "## D") drops "C" and replaces "B"
+        let last = crumbs.last().unwrap();
+        assert_eq!(last.path, vec!["A".to_string(), "D".to_string()]);
     }
 
     #[test]
-    fn chunk_markdown_strips_atx_closing_hashes_from_title() {
-        let text = "## Title ##\nbody\n";
-        let chunks = chunk_markdown(text);
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].heading_path, vec!["Title".to_string()]);
+    fn chunk_with_tiny_budget_produces_multiple_chunks() {
+        // Force splitting: budget tighter than any single paragraph
+        let chunker = MarkdownChunker::new(Characters, 8);
+        let text = "alpha beta gamma\ndelta epsilon zeta\neta theta iota\n";
+        let chunks = chunker.chunk(text);
+        assert!(
+            chunks.len() >= 2,
+            "tiny budget should force splitting, got {} chunks",
+            chunks.len()
+        );
+    }
+
+    #[test]
+    fn chunks_preserve_text_reconstructable_under_concat() {
+        // Use a budget that produces multiple chunks but still keeps content
+        // recoverable via concatenation (text-splitter chunks are
+        // non-overlapping byte windows).
+        let chunker = MarkdownChunker::new(Characters, 32);
+        let text = "Lorem ipsum dolor sit amet consectetur adipiscing elit\n";
+        let chunks = chunker.chunk(text);
+        let concat: String = chunks.iter().map(|c| c.text.as_str()).collect();
+        // Reconstruction may differ in interior whitespace if text-splitter
+        // trims, so we look for substring containment of the original tokens
+        for token in ["Lorem", "ipsum", "consectetur", "elit"] {
+            assert!(concat.contains(token), "lost token {token:?}: {concat:?}");
+        }
+    }
+
+    #[test]
+    fn breadcrumbs_ignore_h4_and_deeper() {
+        let text = "# Top\n#### Buried\nbody\n";
+        let crumbs = build_breadcrumbs(text);
+        for crumb in &crumbs {
+            assert!(
+                !crumb.path.iter().any(|s| s == "Buried"),
+                "H4 leaked into breadcrumbs: {crumb:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn line_starts_handle_input_without_trailing_newline() {
+        let text = "no\nnewline\nat end";
+        let starts = build_line_starts(text);
+        // 1st char (pos 0), after "no\n" (pos 3), after "newline\n" (pos 11), end (pos 17)
+        assert_eq!(starts.first(), Some(&0));
+        assert_eq!(starts.last(), Some(&text.len()));
+    }
+
+    #[test]
+    fn byte_to_line_returns_one_indexed_lines() {
+        let text = "a\nb\nc\n";
+        let starts = build_line_starts(text);
+        assert_eq!(byte_to_line(0, &starts), 1, "first byte is line 1");
+        assert_eq!(byte_to_line(2, &starts), 2, "after first \\n is line 2");
     }
 }

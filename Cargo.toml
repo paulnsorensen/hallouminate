@@ -16,8 +16,11 @@ clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process"] }
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled"] }
-sqlite-vec = "0.1"
+lancedb = "0.27"
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
+futures = "0.3"
 
 # Embeddings
 fastembed = "5"
@@ -31,6 +34,8 @@ globset = "0.4"
 pulldown-cmark = { version = "0.13", default-features = false }
 stop-words = "0.10"
 unicode-segmentation = "1"
+text-splitter = { version = "0.30", features = ["markdown", "tokenizers"] }
+tokenizers = { version = "0.22", features = ["http"] }
 
 # Serialization + config
 serde = { version = "1", features = ["derive"] }

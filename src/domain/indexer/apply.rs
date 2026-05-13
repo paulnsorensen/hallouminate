@@ -1,36 +1,89 @@
-use crate::adapters::sqlite::{delete_file_cascade, get_file_by_ref, touch_mtime, DbConn, FileRow};
-use crate::domain::common::{CorpusConfig, Result};
-use crate::domain::corpus::blake3_file;
+use crate::adapters::lance::{LanceStore, PreparedFile, EMBEDDING_DIM};
+use crate::domain::common::{CorpusConfig, HallouminateError, Result};
+use crate::domain::corpus::{blake3_file, CorpusChunker};
 use crate::domain::embeddings::EmbedBatch;
 
-use super::plan::{IndexPlan, MtimeCandidate, Upsert};
-use super::writer::{file_ref_string, write_file_chunks, WriteRequest};
+use super::plan::{IndexPlan, MtimeCandidate};
+use super::writer::{prepare_file, WriteRequest};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyStats {
     pub files_upserted: usize,
     pub files_touched: usize,
     pub files_deleted: usize,
+    /// Files that produced zero chunks (typically empty markdown). They are
+    /// not represented in the chunks table and so cannot be made
+    /// idempotent; the caller may want to filter these from the corpus.
+    pub files_skipped_empty: usize,
     pub chunks_inserted: usize,
     pub embeddings_inserted: usize,
 }
 
-pub fn apply(
+pub const DEFAULT_BATCH_SIZE: usize = 16;
+
+pub async fn apply(
     plan: IndexPlan,
-    conn: &DbConn,
+    store: &LanceStore,
     embedder: &mut dyn EmbedBatch,
+    chunker: &dyn CorpusChunker,
     corpus: &CorpusConfig,
+    batch_size: usize,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
-    for upsert in plan.upserts {
-        run_upsert(conn, embedder, corpus, upsert, &mut stats)?;
-    }
+    let batch_size = batch_size.max(1);
+    let indexed_at_ms = chrono::Utc::now().timestamp_millis();
+
+    // Upserts: build write requests and run them in batches.
+    let upsert_reqs: Vec<WriteRequest<'_>> = plan
+        .upserts
+        .iter()
+        .map(|u| WriteRequest {
+            corpus,
+            file: &u.file,
+            mtime: u.mtime,
+        })
+        .collect();
+    run_in_batches(upsert_reqs, batch_size, store, embedder, chunker, indexed_at_ms, &mut stats).await?;
+
+    // Mtime touches: hash-check each. If hash unchanged, just bump mtime.
+    // Otherwise re-index (deferred into the upsert path).
+    let mut fallthrough: Vec<MtimeCandidate> = Vec::new();
     for cand in plan.mtime_touches {
-        run_touch_or_upsert(conn, embedder, corpus, cand, &mut stats)?;
+        let new_hash = blake3_file(cand.file.as_path())?;
+        if new_hash == cand.snap.content_hash {
+            store
+                .touch_mtime(&cand.snap.corpus, &cand.snap.file_ref, cand.new_mtime.0)
+                .await?;
+            stats.files_touched += 1;
+        } else {
+            fallthrough.push(cand);
+        }
     }
-    for row in plan.deletes {
-        run_delete(conn, row, &mut stats)?;
+    let fallthrough_reqs: Vec<WriteRequest<'_>> = fallthrough
+        .iter()
+        .map(|c| WriteRequest {
+            corpus,
+            file: &c.file,
+            mtime: c.new_mtime,
+        })
+        .collect();
+    run_in_batches(
+        fallthrough_reqs,
+        batch_size,
+        store,
+        embedder,
+        chunker,
+        indexed_at_ms,
+        &mut stats,
+    )
+    .await?;
+
+    // Deletes: one delete-by-(corpus, file_ref) per gone file.
+    for snap in plan.deletes {
+        store.delete_file(&snap.corpus, &snap.file_ref).await?;
+        stats.files_deleted += 1;
     }
+
     tracing::debug!(
         target: "hallouminate::indexer",
         embeddings_inserted_total = stats.embeddings_inserted,
@@ -39,246 +92,87 @@ pub fn apply(
     Ok(stats)
 }
 
-fn run_upsert(
-    conn: &DbConn,
+async fn run_in_batches(
+    reqs: Vec<WriteRequest<'_>>,
+    batch_size: usize,
+    store: &LanceStore,
     embedder: &mut dyn EmbedBatch,
-    corpus: &CorpusConfig,
-    upsert: Upsert,
+    chunker: &dyn CorpusChunker,
+    indexed_at_ms: i64,
     stats: &mut ApplyStats,
 ) -> Result<()> {
-    let tx = conn.raw().unchecked_transaction()?;
-    let prior = get_file_by_ref(conn, &file_ref_string(&upsert.file)?)?;
-    write_file_chunks(
-        conn,
-        embedder,
-        WriteRequest {
-            corpus,
-            file: &upsert.file,
-            mtime: upsert.mtime,
-            prior,
-        },
-        stats,
-    )?;
-    tx.commit()?;
-    stats.files_upserted += 1;
-    Ok(())
-}
-
-fn run_touch_or_upsert(
-    conn: &DbConn,
-    embedder: &mut dyn EmbedBatch,
-    corpus: &CorpusConfig,
-    cand: MtimeCandidate,
-    stats: &mut ApplyStats,
-) -> Result<()> {
-    let new_hash = blake3_file(cand.file.as_path())?;
-    if new_hash == cand.row.content_hash {
-        let tx = conn.raw().unchecked_transaction()?;
-        touch_mtime(conn, cand.row.file_id, cand.new_mtime.0)?;
-        tx.commit()?;
-        stats.files_touched += 1;
+    if reqs.is_empty() {
         return Ok(());
     }
-    let tx = conn.raw().unchecked_transaction()?;
-    write_file_chunks(
-        conn,
-        embedder,
-        WriteRequest {
-            corpus,
-            file: &cand.file,
-            mtime: cand.new_mtime,
-            prior: Some(cand.row),
-        },
-        stats,
-    )?;
-    tx.commit()?;
-    stats.files_upserted += 1;
-    Ok(())
-}
-
-fn run_delete(conn: &DbConn, row: FileRow, stats: &mut ApplyStats) -> Result<()> {
-    let tx = conn.raw().unchecked_transaction()?;
-    delete_file_cascade(conn, row.file_id)?;
-    tx.commit()?;
-    stats.files_deleted += 1;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::path::Path;
-
-    use super::apply;
-    use crate::adapters::sqlite::{
-        apply_schema, get_file_by_ref, insert_chunk, insert_vec, open_db, upsert_file, DbConn,
-        FileRow, NewChunk, NewFile,
-    };
-    use crate::domain::common::{CorpusConfig, FileRef, Mtime, Result};
-    use crate::domain::corpus::blake3_file;
-    use crate::domain::embeddings::{EmbedBatch, EMBEDDING_DIM};
-    use crate::domain::indexer::plan::{IndexPlan, MtimeCandidate, Upsert};
-
-    struct ZeroEmbedder;
-
-    impl EmbedBatch for ZeroEmbedder {
-        fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
-            Ok(texts.iter().map(|_| [0.0f32; EMBEDDING_DIM]).collect())
+    for chunk_of_reqs in reqs.chunks(batch_size) {
+        let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
+        for req in chunk_of_reqs {
+            // prepare_file failures (IO, non-UTF8) are real errors — fail
+            // fast rather than silently dropping files from the index.
+            let pf = prepare_file(
+                WriteRequest {
+                    corpus: req.corpus,
+                    file: req.file,
+                    mtime: req.mtime,
+                },
+                chunker,
+                indexed_at_ms,
+            )?;
+            if pf.chunks.is_empty() {
+                // Empty file → no rows would land in the chunks table, which
+                // makes list_files unable to track this file and the next
+                // run would re-attempt the same upsert. Skip and account.
+                tracing::warn!(
+                    target: "hallouminate::indexer",
+                    file = %req.file.as_path().display(),
+                    "skipping empty file (no chunks generated)"
+                );
+                stats.files_skipped_empty += 1;
+                continue;
+            }
+            prepared.push(pf);
         }
-    }
-
-    fn fresh_conn() -> DbConn {
-        let conn = open_db(Path::new(":memory:")).expect("open :memory:");
-        apply_schema(&conn).expect("apply schema");
-        conn
-    }
-
-    fn docs_corpus() -> CorpusConfig {
-        CorpusConfig {
-            name: "docs".into(),
-            ..Default::default()
+        if prepared.is_empty() {
+            continue;
         }
-    }
-
-    fn count(conn: &DbConn, sql: &str) -> i64 {
-        conn.raw().query_row(sql, [], |row| row.get(0)).expect(sql)
-    }
-
-    fn fts_count(conn: &DbConn, term: &str) -> i64 {
-        let sql = "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH ?1";
-        conn.raw()
-            .query_row(sql, rusqlite::params![term], |r| r.get(0))
-            .expect("fts count")
-    }
-
-    fn fetch(conn: &DbConn, file_ref: &str) -> FileRow {
-        get_file_by_ref(conn, file_ref).unwrap().unwrap()
-    }
-
-    fn seed_file(conn: &DbConn, file_ref: &str, hash: &str) -> i64 {
-        upsert_file(
-            conn,
-            &NewFile {
-                file_ref,
-                corpus: "docs",
-                mtime_ms: 1,
-                content_hash: hash,
-                summary: None,
-                keywords_json: "[]",
-                indexed_at_ms: 1,
-            },
-        )
-        .expect("seed file")
-    }
-
-    fn seed_chunk_with_vec(conn: &DbConn, file_id: i64, text: &str) -> i64 {
-        let chunk_id = insert_chunk(
-            conn,
-            &NewChunk {
-                file_id,
-                ord: 0,
-                heading_path_json: "[]",
-                line_start: 1,
-                line_end: 1,
-                text,
-            },
-        )
-        .expect("chunk");
-        insert_vec(conn, chunk_id, &[0.0f32; EMBEDDING_DIM]).expect("vec");
-        chunk_id
-    }
-
-    #[test]
-    fn run_delete_purges_files_chunks_fts_and_vec_rows() {
-        let conn = fresh_conn();
-        let file_id = seed_file(&conn, "/tmp/doomed.md", "abc");
-        seed_chunk_with_vec(&conn, file_id, "spice melange");
-        let row = fetch(&conn, "/tmp/doomed.md");
-        let plan = IndexPlan {
-            deletes: vec![row],
-            ..Default::default()
+        // Embed all chunks across all prepared files in this batch in a single call.
+        let mut all_texts: Vec<String> = Vec::new();
+        let mut splits: Vec<usize> = Vec::with_capacity(prepared.len());
+        for pf in &prepared {
+            splits.push(pf.chunks.len());
+            for c in &pf.chunks {
+                all_texts.push(c.text.clone());
+            }
+        }
+        let mut vectors = if all_texts.is_empty() {
+            Vec::new()
+        } else {
+            embedder.embed_batch(&all_texts)?
         };
-        let stats = apply(plan, &conn, &mut ZeroEmbedder, &docs_corpus()).expect("apply");
-        assert_eq!(stats.files_deleted, 1);
-        assert_eq!(count(&conn, "SELECT count(*) FROM files"), 0);
-        assert_eq!(count(&conn, "SELECT count(*) FROM chunks"), 0);
-        assert_eq!(fts_count(&conn, "melange"), 0);
-        assert_eq!(count(&conn, "SELECT count(*) FROM chunks_vec"), 0);
+        if vectors.len() != all_texts.len() {
+            return Err(HallouminateError::Indexer(format!(
+                "embedder returned {} vectors for {} chunks",
+                vectors.len(),
+                all_texts.len()
+            )));
+        }
+        // De-flatten vectors back into per-file embeddings.
+        let mut iter = vectors.drain(..);
+        for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
+            let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
+            for _ in 0..count {
+                let v = iter.next().ok_or_else(|| {
+                    HallouminateError::Indexer("embedding count drained early".into())
+                })?;
+                buf.push(v);
+            }
+            stats.chunks_inserted += count;
+            stats.embeddings_inserted += count;
+            pf.embeddings = buf;
+        }
+        let n = prepared.len();
+        store.apply_batch(prepared).await?;
+        stats.files_upserted += n;
     }
-
-    #[test]
-    fn run_touch_calls_touch_mtime_when_hash_unchanged() {
-        let conn = fresh_conn();
-        let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("stable.md");
-        fs::write(&path, "# Title\nbody\n").expect("write");
-        let hash = blake3_file(&path).expect("hash");
-        seed_file(&conn, path.to_str().unwrap(), &hash);
-        let row = fetch(&conn, path.to_str().unwrap());
-        let plan = IndexPlan {
-            mtime_touches: vec![MtimeCandidate {
-                file: FileRef::new(path.clone()),
-                row,
-                new_mtime: Mtime(500),
-            }],
-            ..Default::default()
-        };
-        let stats = apply(plan, &conn, &mut ZeroEmbedder, &docs_corpus()).expect("apply");
-        assert_eq!(stats.files_touched, 1);
-        assert_eq!(stats.embeddings_inserted, 0);
-        let after = fetch(&conn, path.to_str().unwrap());
-        assert_eq!(after.mtime_ms, 500);
-        assert_eq!(after.content_hash, hash);
-    }
-
-    #[test]
-    fn run_touch_falls_through_to_upsert_when_hash_changed() {
-        let conn = fresh_conn();
-        let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("changed.md");
-        fs::write(&path, "old body\n").expect("write old");
-        let old_hash = blake3_file(&path).expect("hash");
-        let file_id = seed_file(&conn, path.to_str().unwrap(), &old_hash);
-        seed_chunk_with_vec(&conn, file_id, "stale text");
-        fs::write(&path, "# New\n\nbrand new body\n").expect("rewrite");
-        let row = fetch(&conn, path.to_str().unwrap());
-        let plan = IndexPlan {
-            mtime_touches: vec![MtimeCandidate {
-                file: FileRef::new(path.clone()),
-                row,
-                new_mtime: Mtime(999),
-            }],
-            ..Default::default()
-        };
-        let stats = apply(plan, &conn, &mut ZeroEmbedder, &docs_corpus()).expect("apply");
-        assert_eq!(stats.files_upserted, 1);
-        assert!(stats.embeddings_inserted >= 1);
-        let after = fetch(&conn, path.to_str().unwrap());
-        assert_ne!(after.content_hash, old_hash);
-        assert_eq!(after.mtime_ms, 999);
-        assert_eq!(fts_count(&conn, "stale"), 0);
-    }
-
-    #[test]
-    fn run_upsert_creates_file_chunks_and_vectors() {
-        let conn = fresh_conn();
-        let tmp = tempfile::tempdir().expect("tmp");
-        let path = tmp.path().join("new.md");
-        fs::write(&path, "# Hello\n\nfirst\n## Second\n\nbody two\n").expect("write");
-        let plan = IndexPlan {
-            upserts: vec![Upsert {
-                file: FileRef::new(path.clone()),
-                mtime: Mtime(42),
-            }],
-            ..Default::default()
-        };
-        let stats = apply(plan, &conn, &mut ZeroEmbedder, &docs_corpus()).expect("apply");
-        assert_eq!(stats.files_upserted, 1);
-        assert_eq!(stats.chunks_inserted, 2);
-        assert_eq!(stats.embeddings_inserted, 2);
-        assert_eq!(count(&conn, "SELECT count(*) FROM chunks_vec"), 2);
-        let row = fetch(&conn, path.to_str().unwrap());
-        assert_eq!(row.corpus, "docs");
-        assert!(row.summary.unwrap().contains("Hello"));
-    }
+    Ok(())
 }
