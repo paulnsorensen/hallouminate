@@ -35,7 +35,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 stop-words = "0.10"
 unicode-segmentation = "1"
 text-splitter = { version = "0.30", features = ["markdown", "tokenizers"] }
-tokenizers = { version = "0.20", features = ["http"] }
+tokenizers = { version = "0.22", features = ["http"] }
 
 # Serialization + config
 serde = { version = "1", features = ["derive"] }

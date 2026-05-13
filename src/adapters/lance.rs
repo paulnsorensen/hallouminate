@@ -207,7 +207,6 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
         }
     }
 
-    let row_count = chunk_ids.len();
     let embedding_field = Arc::new(Field::new("item", DataType::Float32, true));
     let embedding_values = Float32Array::from(embeddings_flat);
     let embedding_array = FixedSizeListArray::try_new(
@@ -234,13 +233,88 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
         Arc::new(StringArray::from(texts)),
         Arc::new(embedding_array),
     ];
-    let _ = row_count; // suppress unused if row_count not referenced elsewhere
     RecordBatch::try_new(schema, columns)
         .map_err(|e| HallouminateError::Indexer(format!("build record batch: {e}")))
 }
 
+/// Escape a string for inclusion in a DataFusion SQL literal.
+///
+/// DataFusion follows standard SQL string-literal rules: only single quotes
+/// need escaping (by doubling). Backslashes, newlines, and other control
+/// characters are literal inside `'...'` and need no transformation. NUL
+/// bytes are impossible in file paths on POSIX (kernel guarantee), so
+/// `file_ref` strings never contain them.
 fn escape_sql_str(s: &str) -> String {
     s.replace('\'', "''")
+}
+
+// ── Shared RecordBatch column accessors ─────────────────────────────────
+
+fn string_col<'a>(rb: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
+    rb.column_by_name(name)
+        .ok_or_else(|| HallouminateError::Indexer(format!("missing column {name}")))?
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| HallouminateError::Indexer(format!("{name} not utf8")))
+}
+
+fn int64_col<'a>(rb: &'a RecordBatch, name: &str) -> Result<&'a Int64Array> {
+    rb.column_by_name(name)
+        .ok_or_else(|| HallouminateError::Indexer(format!("missing column {name}")))?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| HallouminateError::Indexer(format!("{name} not int64")))
+}
+
+fn list_utf8_col<'a>(rb: &'a RecordBatch, name: &str) -> Result<&'a ListArray> {
+    rb.column_by_name(name)
+        .ok_or_else(|| HallouminateError::Indexer(format!("missing column {name}")))?
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .ok_or_else(|| HallouminateError::Indexer(format!("{name} not list")))
+}
+
+fn decode_list(list: &ListArray, row: usize) -> Vec<String> {
+    let values = list.value(row);
+    let strs = values.as_any().downcast_ref::<StringArray>();
+    let Some(s) = strs else {
+        return Vec::new();
+    };
+    (0..s.len()).map(|i| s.value(i).to_string()).collect()
+}
+
+fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
+    let chunk_id = string_col(rb, "chunk_id")?;
+    let file_ref = string_col(rb, "file_ref")?;
+    let summary = string_col(rb, "summary")?;
+    let text = string_col(rb, "text")?;
+    let line_start = int64_col(rb, "line_start")?;
+    let line_end = int64_col(rb, "line_end")?;
+    let heading_path = list_utf8_col(rb, "heading_path")?;
+    let keywords = list_utf8_col(rb, "keywords")?;
+    let score = rb
+        .column_by_name("_relevance_score")
+        .or_else(|| rb.column_by_name("_score"))
+        .cloned();
+    for i in 0..rb.num_rows() {
+        let s = score
+            .as_ref()
+            .and_then(|arr| arr.as_any().downcast_ref::<Float32Array>())
+            .map(|f| f.value(i))
+            .unwrap_or(0.0);
+        out.push(SearchHit {
+            chunk_id: chunk_id.value(i).to_string(),
+            file_ref: file_ref.value(i).to_string(),
+            heading_path: decode_list(heading_path, i),
+            line_start: line_start.value(i) as usize,
+            line_end: line_end.value(i) as usize,
+            text: text.value(i).to_string(),
+            summary: summary.value(i).to_string(),
+            keywords: decode_list(keywords, i),
+            score: s,
+        });
+    }
+    Ok(())
 }
 
 fn file_ref_in_filter(refs: &[String]) -> String {
@@ -315,6 +389,48 @@ impl LanceStore {
             .execute(reader)
             .await
             .map_err(map_lance_err)?;
+        self.ensure_search_indexes().await?;
+        Ok(())
+    }
+
+    /// Build the FTS index on `text` (and the ANN index on `embedding`) if
+    /// they don't already exist. LanceDB requires data to be present before
+    /// some indexes can be created, so this runs after `merge_insert` —
+    /// idempotent via `list_indices()`.
+    async fn ensure_search_indexes(&self) -> Result<()> {
+        let existing = self
+            .table
+            .list_indices()
+            .await
+            .map_err(map_lance_err)?;
+        let has_text_index = existing.iter().any(|i| i.columns.iter().any(|c| c == "text"));
+        if !has_text_index {
+            self.table
+                .create_index(&["text"], lancedb::index::Index::FTS(Default::default()))
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+        }
+        // Vector index is optional — small corpora work fine without it via
+        // brute-force scan, and IVF-PQ needs enough rows for meaningful
+        // training. Skip if row count is below a small threshold.
+        let has_vec_index = existing
+            .iter()
+            .any(|i| i.columns.iter().any(|c| c == "embedding"));
+        if !has_vec_index {
+            let rows = self
+                .table
+                .count_rows(None)
+                .await
+                .map_err(map_lance_err)? as u64;
+            if rows >= 256 {
+                let _ = self
+                    .table
+                    .create_index(&["embedding"], lancedb::index::Index::Auto)
+                    .execute()
+                    .await;
+            }
+        }
         Ok(())
     }
 
@@ -357,46 +473,10 @@ impl LanceStore {
         let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
         let mut out: HashMap<FileRef, FileSnapshot> = HashMap::new();
         for rb in batches {
-            let file_ref_col = rb
-                .column_by_name("file_ref")
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "missing file_ref column",
-                ))))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "file_ref not utf8",
-                ))))?;
-            let corpus_col = rb
-                .column_by_name("corpus")
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "missing corpus column",
-                ))))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "corpus not utf8",
-                ))))?;
-            let mtime_col = rb
-                .column_by_name("mtime_ms")
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "missing mtime_ms column",
-                ))))?
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "mtime_ms not int64",
-                ))))?;
-            let hash_col = rb
-                .column_by_name("content_hash")
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "missing content_hash column",
-                ))))?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| HallouminateError::Db(Box::new(std::io::Error::other(
-                    "content_hash not utf8",
-                ))))?;
+            let file_ref_col = string_col(&rb, "file_ref")?;
+            let corpus_col = string_col(&rb, "corpus")?;
+            let mtime_col = int64_col(&rb, "mtime_ms")?;
+            let hash_col = string_col(&rb, "content_hash")?;
             for i in 0..rb.num_rows() {
                 let file_ref = file_ref_col.value(i).to_string();
                 let snap = FileSnapshot {
@@ -411,22 +491,37 @@ impl LanceStore {
         Ok(out)
     }
 
-    pub async fn search(
+    /// Hybrid BM25 + vector search reranked with LanceDB's built-in
+    /// `RRFReranker`. Returns an empty `Vec` for an empty corpus.
+    pub async fn hybrid_search(
         &self,
         query: &str,
         query_vec: &[f32],
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let _ = (query, query_vec, limit);
-        // Hybrid search is the responsibility of `domain::search::hybrid_search`.
-        // This method is left as a placeholder for future direct-search use cases.
-        Err(HallouminateError::Indexer(
-            "LanceStore::search not yet implemented; use domain::search::hybrid_search".into(),
-        ))
-    }
-
-    pub fn table(&self) -> &lancedb::Table {
-        &self.table
+        if self.count_rows().await? == 0 {
+            return Ok(Vec::new());
+        }
+        let reranker = std::sync::Arc::new(lancedb::rerankers::rrf::RRFReranker::default());
+        let stream = self
+            .table
+            .query()
+            .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
+                query.to_string(),
+            ))
+            .nearest_to(query_vec)
+            .map_err(map_lance_err)?
+            .limit(limit)
+            .rerank(reranker)
+            .execute()
+            .await
+            .map_err(map_lance_err)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let mut out: Vec<SearchHit> = Vec::new();
+        for rb in batches {
+            decode_hits(&rb, &mut out)?;
+        }
+        Ok(out)
     }
 }
 
@@ -498,6 +593,30 @@ mod tests {
         let refs = vec!["/tmp/o'brien.md".into()];
         let f = file_ref_in_filter(&refs);
         assert_eq!(f, "file_ref IN ('/tmp/o''brien.md')");
+    }
+
+    #[test]
+    fn escape_sql_str_leaves_backslash_literal() {
+        // DataFusion follows standard SQL: backslash is NOT an escape char
+        // inside '...' literals. The string "a\b" stays "a\b".
+        assert_eq!(escape_sql_str(r"a\b"), r"a\b");
+    }
+
+    #[test]
+    fn escape_sql_str_leaves_newline_and_tab_literal() {
+        assert_eq!(escape_sql_str("line\nfeed\there"), "line\nfeed\there");
+    }
+
+    #[test]
+    fn escape_sql_str_doubles_every_single_quote_not_just_first() {
+        assert_eq!(escape_sql_str("a'b'c'd"), "a''b''c''d");
+    }
+
+    #[test]
+    fn escape_sql_str_handles_already_doubled_quote_safely() {
+        // Defense: input contains a literal '' (two quotes side-by-side).
+        // Each is escaped independently → 4 quotes in output.
+        assert_eq!(escape_sql_str("a''b"), "a''''b");
     }
 
     #[test]
