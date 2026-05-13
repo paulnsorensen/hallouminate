@@ -1,4 +1,4 @@
 #[tokio::main]
-async fn main() {
-    hallouminate::app::run().await;
+async fn main() -> anyhow::Result<()> {
+    hallouminate::app::run().await
 }
