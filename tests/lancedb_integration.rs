@@ -57,7 +57,7 @@ async fn delete_file_removes_all_chunks_for_that_file_only() {
     assert_eq!(store.count_rows().await.unwrap(), 5);
 
     store
-        .delete_file("/tmp/a.md")
+        .delete_file("docs", "/tmp/a.md")
         .await
         .expect("delete /tmp/a.md");
     assert_eq!(
@@ -92,7 +92,7 @@ async fn touch_mtime_updates_only_mtime_column() {
     assert_eq!(before, 2);
 
     store
-        .touch_mtime("/tmp/touch.md", 999)
+        .touch_mtime("docs", "/tmp/touch.md", 999)
         .await
         .expect("touch_mtime");
 
@@ -132,7 +132,7 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
         .embed_batch(&["spice melange".into()])
         .expect("embed query")[0];
 
-    let hits = hybrid_search(&store, "spice", &qv, 5)
+    let hits = hybrid_search(&store, "docs", "spice", &qv, 5)
         .await
         .expect("hybrid_search");
     assert!(
@@ -151,7 +151,7 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
 async fn hybrid_search_on_empty_corpus_returns_empty_vec() {
     let (_dir, store) = fresh_store().await;
     let qv = [0.1_f32; hallouminate::adapters::lance::EMBEDDING_DIM];
-    let hits = hybrid_search(&store, "anything", &qv, 5)
+    let hits = hybrid_search(&store, "docs", "anything", &qv, 5)
         .await
         .expect("empty corpus must yield Ok, not error");
     assert!(hits.is_empty(), "empty corpus must yield zero hits");
@@ -178,7 +178,7 @@ async fn single_file_corpus_top_hit_is_that_file() {
         .embed_batch(&["unique_token_witness_me".into()])
         .expect("embed query")[0];
 
-    let hits = hybrid_search(&store, "unique_token_witness_me", &qv, 5)
+    let hits = hybrid_search(&store, "docs", "unique_token_witness_me", &qv, 5)
         .await
         .expect("hybrid_search");
     assert!(!hits.is_empty(), "expected at least one hit");
@@ -201,11 +201,17 @@ async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
     let snaps = store.list_files("docs").await.unwrap();
     assert!(snaps.contains_key(&FileRef::new(PathBuf::from(weird))));
 
-    store.touch_mtime(weird, 4242).await.expect("touch weird");
+    store
+        .touch_mtime("docs", weird, 4242)
+        .await
+        .expect("touch weird");
     let snaps2 = store.list_files("docs").await.unwrap();
     assert_eq!(snaps2[&FileRef::new(PathBuf::from(weird))].mtime_ms, 4242);
 
-    store.delete_file(weird).await.expect("delete weird");
+    store
+        .delete_file("docs", weird)
+        .await
+        .expect("delete weird");
     assert_eq!(store.count_rows().await.unwrap(), 0);
 }
 
@@ -219,7 +225,8 @@ async fn list_files_returns_only_the_requested_corpus() {
     a.corpus = "alpha".into();
     let mut b = placeholder_prepared_file("/tmp/b.md", 2);
     b.corpus = "beta".into();
-    store.apply_batch(vec![a, b]).await.expect("apply both");
+    store.apply_batch(vec![a]).await.expect("apply alpha");
+    store.apply_batch(vec![b]).await.expect("apply beta");
 
     let alpha = store.list_files("alpha").await.unwrap();
     let beta = store.list_files("beta").await.unwrap();
@@ -228,6 +235,104 @@ async fn list_files_returns_only_the_requested_corpus() {
     assert_eq!(beta.len(), 1, "beta should see only its own file");
     assert!(alpha.contains_key(&FileRef::new(PathBuf::from("/tmp/a.md"))));
     assert!(beta.contains_key(&FileRef::new(PathBuf::from("/tmp/b.md"))));
+}
+
+// ── Multi-corpus apply_batch rejects mixed-corpus batches ───────────────
+
+#[tokio::test]
+async fn apply_batch_rejects_mixed_corpus_batches() {
+    let (_dir, store) = fresh_store().await;
+    let mut a = placeholder_prepared_file("/tmp/a.md", 1);
+    a.corpus = "alpha".into();
+    let mut b = placeholder_prepared_file("/tmp/b.md", 1);
+    b.corpus = "beta".into();
+    let err = store
+        .apply_batch(vec![a, b])
+        .await
+        .expect_err("mixed corpus batch must error");
+    assert!(
+        err.to_string().contains("same corpus"),
+        "error should explain single-corpus invariant: {err}"
+    );
+}
+
+// ── Multi-corpus isolation: shared file_ref keeps independent rows ──────
+
+#[tokio::test]
+async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
+    let (_dir, store) = fresh_store().await;
+    let shared = "/tmp/shared.md";
+
+    let mut a = prepared_file_with_chunks("docs", "alpha", 1, "h1", vec!["alpha-only token"]);
+    a.file_ref = shared.into();
+    let mut b = prepared_file_with_chunks("docs", "beta", 1, "h1", vec!["beta-only token"]);
+    b.file_ref = shared.into();
+
+    store.apply_batch(vec![a]).await.expect("apply alpha");
+    store.apply_batch(vec![b]).await.expect("apply beta");
+
+    // Two corpora × one chunk each = 2 rows total. If the merge key were
+    // chunk_id alone, the second apply would have overwritten the first.
+    assert_eq!(store.count_rows().await.unwrap(), 2);
+
+    // Deleting from `alpha` must not touch `beta`'s row.
+    store
+        .delete_file("alpha", shared)
+        .await
+        .expect("delete alpha row");
+    assert_eq!(store.count_rows().await.unwrap(), 1);
+    let beta = store.list_files("beta").await.unwrap();
+    assert!(beta.contains_key(&FileRef::new(PathBuf::from(shared))));
+}
+
+// ── Multi-corpus isolation: hybrid_search stays inside its corpus ───────
+
+#[tokio::test]
+async fn hybrid_search_returns_only_hits_from_requested_corpus() {
+    let (_dir, store) = fresh_store().await;
+
+    let mut a = prepared_file_with_chunks(
+        "/tmp/alpha.md",
+        "alpha",
+        1,
+        "h1",
+        vec!["unique_alpha_marker on the sand"],
+    );
+    a.corpus = "alpha".into();
+    let mut b = prepared_file_with_chunks(
+        "/tmp/beta.md",
+        "beta",
+        1,
+        "h1",
+        vec!["unique_alpha_marker on the road"],
+    );
+    b.corpus = "beta".into();
+    store.apply_batch(vec![a]).await.expect("apply alpha");
+    store.apply_batch(vec![b]).await.expect("apply beta");
+
+    use hallouminate::domain::embeddings::EmbedBatch;
+    let mut emb = StubEmbedder;
+    let qv = emb
+        .embed_batch(&["unique_alpha_marker".into()])
+        .expect("embed")[0];
+
+    let hits_alpha = hybrid_search(&store, "alpha", "unique_alpha_marker", &qv, 5)
+        .await
+        .expect("alpha search");
+    let hits_beta = hybrid_search(&store, "beta", "unique_alpha_marker", &qv, 5)
+        .await
+        .expect("beta search");
+
+    assert!(
+        hits_alpha.iter().all(|h| h.file_ref == "/tmp/alpha.md"),
+        "alpha search leaked cross-corpus: {:?}",
+        hits_alpha.iter().map(|h| &h.file_ref).collect::<Vec<_>>()
+    );
+    assert!(
+        hits_beta.iter().all(|h| h.file_ref == "/tmp/beta.md"),
+        "beta search leaked cross-corpus: {:?}",
+        hits_beta.iter().map(|h| &h.file_ref).collect::<Vec<_>>()
+    );
 }
 
 // ── Bonus: chunk_id determinism end-to-end through apply_batch ──────────

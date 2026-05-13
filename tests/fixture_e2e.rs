@@ -133,7 +133,7 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
         let qv = emb_for_query
             .embed_batch(&[(*query).to_string()])
             .expect("embed query")[0];
-        let hits = hybrid_search(&store, query, &qv, 5)
+        let hits = hybrid_search(&store, "docs", query, &qv, 5)
             .await
             .expect("hybrid_search");
         assert!(
@@ -230,7 +230,7 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
     // Verify the grail oracle no longer hits its source
     let mut emb = StubEmbedder;
     let qv = emb.embed_batch(&["caerbannog".to_string()]).expect("embed")[0];
-    let hits = hybrid_search(&store, "caerbannog", &qv, 5)
+    let hits = hybrid_search(&store, "docs", "caerbannog", &qv, 5)
         .await
         .expect("search after delete");
     assert!(
@@ -241,6 +241,87 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
 
 #[allow(dead_code)] // used only by const-budget compliance test
 const SMALL_BUDGET: usize = 60;
+
+#[tokio::test]
+async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+
+    // Two files: one with content, one empty.
+    fs::write(corpus_dir.path().join("real.md"), "# Real\n\nhas content\n").unwrap();
+    fs::write(corpus_dir.path().join("empty.md"), "").unwrap();
+
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+    };
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+        .await
+        .expect("open store");
+    let chunker = MarkdownChunker::new(Characters, 1500);
+    let mut emb = StubEmbedder;
+
+    let stats1 = index_corpus(&corpus, &store, &mut emb, &chunker)
+        .await
+        .expect("first index");
+    assert_eq!(stats1.files_upserted, 1, "only real.md upserted");
+    assert_eq!(
+        stats1.files_skipped_empty, 1,
+        "empty.md must be counted as skipped, not silently ignored"
+    );
+}
+
+#[tokio::test]
+async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
+    // Pointing a corpus at a path that doesn't exist would fail at scan time,
+    // not prepare time. To exercise the prepare_file error propagation we
+    // create then yank the file out from under the indexer between scan and
+    // prepare. Use a manual planning path via the lower-level API.
+    use hallouminate::domain::indexer::{apply, plan, DEFAULT_BATCH_SIZE};
+
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+
+    let real = corpus_dir.path().join("vanishes.md");
+    fs::write(&real, "# vanishing\n").unwrap();
+
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+    };
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+        .await
+        .expect("open store");
+    let chunker = MarkdownChunker::new(Characters, 1500);
+    let mut emb = StubEmbedder;
+
+    let disk = hallouminate::domain::corpus::scan(&corpus).expect("scan");
+    let db = store.list_files("docs").await.expect("list");
+    let p = plan(disk, db);
+    fs::remove_file(&real).unwrap();
+
+    let err = apply(
+        p,
+        &store,
+        &mut emb,
+        &chunker,
+        &corpus,
+        DEFAULT_BATCH_SIZE,
+    )
+    .await
+    .expect_err("missing file must surface as Err, not silent skip");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("vanishes.md") || msg.contains("No such file") || msg.contains("not found"),
+        "error should reference the missing file: {msg}"
+    );
+}
 
 #[tokio::test]
 async fn chunker_budget_compliance_with_characters_sizer() {

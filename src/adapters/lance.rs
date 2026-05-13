@@ -325,6 +325,18 @@ fn file_ref_in_filter(refs: &[String]) -> String {
     format!("file_ref IN ({})", quoted.join(", "))
 }
 
+/// Predicate scoped to a single corpus for `merge_insert`'s orphan-drop and
+/// for `delete_file`. Without the `corpus = ...` term, a multi-corpus store
+/// would delete or update rows belonging to other corpora that happen to
+/// share the same `file_ref`.
+fn corpus_and_file_ref_filter(corpus: &str, refs: &[String]) -> String {
+    format!(
+        "corpus = '{}' AND {}",
+        escape_sql_str(corpus),
+        file_ref_in_filter(refs)
+    )
+}
+
 fn map_lance_err<E: std::fmt::Display>(e: E) -> HallouminateError {
     HallouminateError::Db(Box::new(std::io::Error::other(format!("lance: {e}"))))
 }
@@ -370,17 +382,28 @@ impl LanceStore {
             .map(|n| n as u64)
     }
 
+    /// Upsert a batch of prepared files. All files in a single call MUST
+    /// belong to the same corpus — the orphan-drop predicate is scoped to
+    /// that corpus, so mixing corpora here would risk deleting unrelated
+    /// rows. The merge join key is `(corpus, chunk_id)` so two corpora that
+    /// happen to share a `file_ref` keep independent rows.
     pub async fn apply_batch(&self, batch: Vec<PreparedFile>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
+        let corpus = batch[0].corpus.clone();
+        if batch.iter().any(|f| f.corpus != corpus) {
+            return Err(HallouminateError::Indexer(
+                "apply_batch: all PreparedFiles in a batch must share the same corpus".into(),
+            ));
+        }
         let schema = chunks_schema();
         let record_batch = build_record_batch(&batch, schema.clone())?;
         let file_refs: Vec<String> = batch.iter().map(|f| f.file_ref.clone()).collect();
-        let scope = file_ref_in_filter(&file_refs);
+        let scope = corpus_and_file_ref_filter(&corpus, &file_refs);
         let reader = RecordBatchIterator::new(std::iter::once(Ok(record_batch)), schema);
         let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(reader);
-        let mut builder = self.table.merge_insert(&["chunk_id"]);
+        let mut builder = self.table.merge_insert(&["corpus", "chunk_id"]);
         builder
             .when_matched_update_all(None)
             .when_not_matched_insert_all()
@@ -424,18 +447,37 @@ impl LanceStore {
                 .await
                 .map_err(map_lance_err)? as u64;
             if rows >= 256 {
-                let _ = self
+                if let Err(e) = self
                     .table
                     .create_index(&["embedding"], lancedb::index::Index::Auto)
                     .execute()
-                    .await;
+                    .await
+                {
+                    // ANN index is an optimization, not a correctness
+                    // requirement — brute-force scan still works. Log so
+                    // operators can diagnose why ANN never kicked in.
+                    tracing::warn!(
+                        target: "hallouminate::lance",
+                        err = %e,
+                        "failed to create ANN index on `embedding`; queries will brute-force scan"
+                    );
+                }
             }
         }
         Ok(())
     }
 
-    pub async fn touch_mtime(&self, file_ref: &str, new_mtime_ms: i64) -> Result<()> {
-        let predicate = format!("file_ref = '{}'", escape_sql_str(file_ref));
+    pub async fn touch_mtime(
+        &self,
+        corpus: &str,
+        file_ref: &str,
+        new_mtime_ms: i64,
+    ) -> Result<()> {
+        let predicate = format!(
+            "corpus = '{}' AND file_ref = '{}'",
+            escape_sql_str(corpus),
+            escape_sql_str(file_ref)
+        );
         self.table
             .update()
             .only_if(predicate)
@@ -446,8 +488,12 @@ impl LanceStore {
         Ok(())
     }
 
-    pub async fn delete_file(&self, file_ref: &str) -> Result<()> {
-        let predicate = format!("file_ref = '{}'", escape_sql_str(file_ref));
+    pub async fn delete_file(&self, corpus: &str, file_ref: &str) -> Result<()> {
+        let predicate = format!(
+            "corpus = '{}' AND file_ref = '{}'",
+            escape_sql_str(corpus),
+            escape_sql_str(file_ref)
+        );
         self.table
             .delete(&predicate)
             .await
@@ -455,8 +501,13 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Returns one `FileSnapshot` per indexed file in `corpus`. We rely on
+    /// the invariant that every prepared file emits at least one chunk with
+    /// `ord = 0` (enforced in the indexer's writer), which lets us push
+    /// dedup into the store as an `ord = 0` filter instead of materializing
+    /// one row per chunk and folding through a HashMap.
     pub async fn list_files(&self, corpus: &str) -> Result<HashMap<FileRef, FileSnapshot>> {
-        let predicate = format!("corpus = '{}'", escape_sql_str(corpus));
+        let predicate = format!("corpus = '{}' AND ord = 0", escape_sql_str(corpus));
         let stream = self
             .table
             .query()
@@ -492,20 +543,31 @@ impl LanceStore {
     }
 
     /// Hybrid BM25 + vector search reranked with LanceDB's built-in
-    /// `RRFReranker`. Returns an empty `Vec` for an empty corpus.
+    /// `RRFReranker`, scoped to a single `corpus`. Returns an empty `Vec`
+    /// for an empty corpus or when no rows match the corpus filter.
     pub async fn hybrid_search(
         &self,
+        corpus: &str,
         query: &str,
         query_vec: &[f32],
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
+        if query_vec.len() != EMBEDDING_DIM {
+            return Err(HallouminateError::Embed(format!(
+                "query vector dim mismatch: got {}, expected {}",
+                query_vec.len(),
+                EMBEDDING_DIM
+            )));
+        }
         if self.count_rows().await? == 0 {
             return Ok(Vec::new());
         }
         let reranker = std::sync::Arc::new(lancedb::rerankers::rrf::RRFReranker::default());
+        let corpus_filter = format!("corpus = '{}'", escape_sql_str(corpus));
         let stream = self
             .table
             .query()
+            .only_if(corpus_filter)
             .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
                 query.to_string(),
             ))

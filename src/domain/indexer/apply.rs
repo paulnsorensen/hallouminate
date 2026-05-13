@@ -11,6 +11,10 @@ pub struct ApplyStats {
     pub files_upserted: usize,
     pub files_touched: usize,
     pub files_deleted: usize,
+    /// Files that produced zero chunks (typically empty markdown). They are
+    /// not represented in the chunks table and so cannot be made
+    /// idempotent; the caller may want to filter these from the corpus.
+    pub files_skipped_empty: usize,
     pub chunks_inserted: usize,
     pub embeddings_inserted: usize,
 }
@@ -48,7 +52,7 @@ pub async fn apply(
         let new_hash = blake3_file(cand.file.as_path())?;
         if new_hash == cand.snap.content_hash {
             store
-                .touch_mtime(&cand.snap.file_ref, cand.new_mtime.0)
+                .touch_mtime(&cand.snap.corpus, &cand.snap.file_ref, cand.new_mtime.0)
                 .await?;
             stats.files_touched += 1;
         } else {
@@ -74,9 +78,9 @@ pub async fn apply(
     )
     .await?;
 
-    // Deletes: one delete-by-file_ref per gone file.
+    // Deletes: one delete-by-(corpus, file_ref) per gone file.
     for snap in plan.deletes {
-        store.delete_file(&snap.file_ref).await?;
+        store.delete_file(&snap.corpus, &snap.file_ref).await?;
         stats.files_deleted += 1;
     }
 
@@ -103,7 +107,9 @@ async fn run_in_batches(
     for chunk_of_reqs in reqs.chunks(batch_size) {
         let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
         for req in chunk_of_reqs {
-            match prepare_file(
+            // prepare_file failures (IO, non-UTF8) are real errors — fail
+            // fast rather than silently dropping files from the index.
+            let pf = prepare_file(
                 WriteRequest {
                     corpus: req.corpus,
                     file: req.file,
@@ -111,15 +117,20 @@ async fn run_in_batches(
                 },
                 chunker,
                 indexed_at_ms,
-            ) {
-                Ok(pf) => prepared.push(pf),
-                Err(e) => tracing::warn!(
+            )?;
+            if pf.chunks.is_empty() {
+                // Empty file → no rows would land in the chunks table, which
+                // makes list_files unable to track this file and the next
+                // run would re-attempt the same upsert. Skip and account.
+                tracing::warn!(
                     target: "hallouminate::indexer",
                     file = %req.file.as_path().display(),
-                    err = %e,
-                    "skipping file in batch"
-                ),
+                    "skipping empty file (no chunks generated)"
+                );
+                stats.files_skipped_empty += 1;
+                continue;
             }
+            prepared.push(pf);
         }
         if prepared.is_empty() {
             continue;
