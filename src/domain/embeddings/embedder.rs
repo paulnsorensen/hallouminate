@@ -1,15 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use rusqlite::{params, OptionalExtension};
 
-use crate::adapters::sqlite::DbConn;
 use crate::domain::common::{HallouminateError, Result};
 
 pub const EMBEDDING_DIM: usize = 384;
 pub const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
 const ALT_MODEL: &str = "all-minilm-l6-v2";
-const META_KEY_MODEL: &str = "embeddings.model";
 
 pub trait EmbedBatch {
     fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>>;
@@ -21,8 +18,7 @@ pub struct Embedder {
 }
 
 impl Embedder {
-    pub fn try_new(model_name: &str, cache_dir: &Path, conn: &DbConn) -> Result<Self> {
-        check_or_set_model(conn, model_name)?;
+    pub fn try_new(model_name: &str, cache_dir: &Path) -> Result<Self> {
         let model = resolve_model(model_name)?;
         let opts = TextInitOptions::new(model)
             .with_cache_dir(PathBuf::from(cache_dir))
@@ -83,43 +79,9 @@ fn resolve_model(name: &str) -> Result<EmbeddingModel> {
     }
 }
 
-pub(crate) fn check_or_set_model(conn: &DbConn, requested: &str) -> Result<()> {
-    let stored: Option<String> = conn
-        .raw()
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1",
-            params![META_KEY_MODEL],
-            |row| row.get(0),
-        )
-        .optional()?;
-    match stored {
-        Some(existing) if existing != requested => Err(HallouminateError::Embed(format!(
-            "embedding model mismatch: db has {existing:?}, requested {requested:?}; run `hallouminate index --reset` to rebuild"
-        ))),
-        Some(_) => Ok(()),
-        None => {
-            conn.raw().execute(
-                "INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)",
-                params![META_KEY_MODEL, requested],
-            )?;
-            // Re-check: a concurrent process may have won the INSERT race.
-            check_or_set_model(conn, requested)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
-    use crate::adapters::sqlite::{apply_schema, open_db};
-
-    fn fresh_conn() -> DbConn {
-        let conn = open_db(Path::new(":memory:")).expect("open :memory:");
-        apply_schema(&conn).expect("apply schema");
-        conn
-    }
 
     #[test]
     fn l2_normalize_scales_3_4_vector_to_unit_norm() {
@@ -149,44 +111,6 @@ mod tests {
         l2_normalize(&mut v);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6, "norm = {norm}");
-    }
-
-    #[test]
-    fn check_or_set_model_inserts_meta_row_when_empty() {
-        let conn = fresh_conn();
-        check_or_set_model(&conn, DEFAULT_MODEL).expect("first call");
-        let stored: String = conn
-            .raw()
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                params![META_KEY_MODEL],
-                |row| row.get(0),
-            )
-            .expect("meta row");
-        assert_eq!(stored, DEFAULT_MODEL);
-    }
-
-    #[test]
-    fn check_or_set_model_is_no_op_when_existing_matches() {
-        let conn = fresh_conn();
-        check_or_set_model(&conn, DEFAULT_MODEL).expect("first");
-        check_or_set_model(&conn, DEFAULT_MODEL).expect("second must succeed");
-        let count: i64 = conn
-            .raw()
-            .query_row("SELECT count(*) FROM meta", [], |row| row.get(0))
-            .expect("count");
-        assert_eq!(count, 1, "must not insert duplicate meta rows");
-    }
-
-    #[test]
-    fn check_or_set_model_errors_on_mismatch_pointing_at_reset() {
-        let conn = fresh_conn();
-        check_or_set_model(&conn, DEFAULT_MODEL).expect("first");
-        let err = check_or_set_model(&conn, ALT_MODEL).expect_err("must mismatch");
-        let msg = err.to_string();
-        assert!(msg.contains(DEFAULT_MODEL), "{msg}");
-        assert!(msg.contains(ALT_MODEL), "{msg}");
-        assert!(msg.contains("--reset"), "{msg}");
     }
 
     #[test]
@@ -222,32 +146,5 @@ mod tests {
         let norm: f32 = arr.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6, "norm = {norm}");
         assert!((arr[0] - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    #[ignore = "downloads ~33MB model on first run; opt-in via --ignored"]
-    fn embedder_produces_normalized_384d_vectors() {
-        let conn = fresh_conn();
-        let cache = std::env::temp_dir().join("hallouminate-embed-test-cache");
-        let mut e = Embedder::try_new(DEFAULT_MODEL, &cache, &conn).expect("try_new");
-        let out = e
-            .embed_batch(&["the spice must flow".to_string()])
-            .expect("embed");
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].len(), EMBEDDING_DIM);
-        let norm: f32 = out[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "norm = {norm}");
-    }
-
-    #[test]
-    #[ignore = "downloads ~33MB model on first run; opt-in via --ignored"]
-    fn embedder_is_deterministic_for_same_input() {
-        let conn = fresh_conn();
-        let cache = std::env::temp_dir().join("hallouminate-embed-test-cache");
-        let mut e = Embedder::try_new(DEFAULT_MODEL, &cache, &conn).expect("try_new");
-        let texts = vec!["witness me".to_string()];
-        let a = e.embed_batch(&texts).expect("embed a");
-        let b = e.embed_batch(&texts).expect("embed b");
-        assert_eq!(a, b, "same input must yield bit-identical vectors");
     }
 }

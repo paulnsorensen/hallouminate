@@ -7,7 +7,7 @@ struct Cli {
     name: String,
 }
 
-pub fn run() {
+pub async fn run() {
     let cli = Cli::parse();
     println!("Hello, {}!", cli.name);
 }
