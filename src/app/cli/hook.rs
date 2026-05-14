@@ -38,11 +38,34 @@ fn resolve_hooks_dir(repo: Option<&Path>) -> anyhow::Result<PathBuf> {
         Some(p) => p.to_path_buf(),
         None => std::env::current_dir().context("resolve current dir")?,
     };
-    let git_dir = root.join(".git");
-    if !git_dir.exists() {
-        return Err(anyhow!("not a git repository: {}", root.display()));
+    // Defer to git itself so worktrees (where `.git` is a *file* pointing at
+    // `<main>/.git/worktrees/<name>`), submodules, and `core.hooksPath` all
+    // resolve to whatever git would actually invoke at hook time. The naive
+    // `<root>/.git/hooks` assumption breaks in worktrees — git puts hooks at
+    // the common gitdir, not the per-worktree gitdir.
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&root)
+        .args(["rev-parse", "--git-path", "hooks"])
+        .output()
+        .with_context(|| format!("invoke `git -C {} rev-parse`", root.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "not a git repository: {} ({})",
+            root.display(),
+            stderr.trim()
+        ));
     }
-    Ok(git_dir.join("hooks"))
+    let stdout = std::str::from_utf8(&output.stdout)
+        .context("git rev-parse output not UTF-8")?
+        .trim();
+    let resolved = PathBuf::from(stdout);
+    Ok(if resolved.is_absolute() {
+        resolved
+    } else {
+        root.join(resolved)
+    })
 }
 
 fn install_managed_block(hook_path: &Path) -> anyhow::Result<()> {
@@ -141,7 +164,26 @@ mod tests {
     use super::*;
 
     fn init_repo(dir: &Path) {
-        fs::create_dir_all(dir.join(".git/hooks")).expect("init .git/hooks");
+        // Real `git init` so `git rev-parse --git-path hooks` resolves
+        // correctly. The hooks dir git creates includes `.sample` files;
+        // our installer writes `post-commit` and `post-merge` alongside
+        // them, so the existing assertions still hold.
+        git_in(dir, &["init", "--quiet"]);
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("invoke git {args:?}: {e}"));
+        assert!(
+            out.status.success(),
+            "git {args:?} in {} failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     fn count_managed_blocks(text: &str) -> usize {
@@ -243,6 +285,71 @@ mod tests {
         })
         .expect_err("not a git repo");
         assert!(err.to_string().contains("not a git repository"), "{err}");
+    }
+
+    #[test]
+    fn install_in_worktree_writes_to_main_repo_hooks() {
+        // Regression for PR #8 age review: git worktrees use a `.git` file
+        // (containing `gitdir: <main>/.git/worktrees/<name>`) instead of a
+        // `.git` directory. The previous `<root>/.git/hooks` assumption
+        // broke in worktrees; `git rev-parse --git-path hooks` resolves to
+        // the main repo's `.git/hooks/` so install must land there.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let main = dir.path().join("main");
+        let wt = dir.path().join("wt");
+        fs::create_dir_all(&main).expect("mkdir main");
+        init_repo(&main);
+        // `git worktree add` needs a starting commit; give it an empty one
+        // with an inline identity (CI runners don't have user.email set).
+        git_in(
+            &main,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        );
+        git_in(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                wt.to_str().expect("utf8 path"),
+            ],
+        );
+        // Sanity: confirm the worktree really does have a `.git` *file*,
+        // not a directory, so the test exercises the bug it's defending.
+        let wt_git = wt.join(".git");
+        assert!(wt_git.is_file(), "worktree .git must be a file");
+
+        cmd_hook_install(HookArgs {
+            repo: Some(wt.clone()),
+        })
+        .expect("install from worktree");
+
+        for name in HOOK_FILES {
+            let in_main = main.join(".git/hooks").join(name);
+            assert!(
+                in_main.exists(),
+                "hook {name} must be installed at the main repo's .git/hooks; \
+                 missing: {}",
+                in_main.display()
+            );
+            let body = fs::read_to_string(&in_main).expect("read main hook");
+            assert_eq!(
+                count_managed_blocks(&body),
+                1,
+                "{name} must contain one managed block"
+            );
+        }
     }
 
     #[test]

@@ -59,7 +59,12 @@ fn ground_opts(cfg: &Config, args: &GroundArgs) -> GroundOpts {
 
 fn pick_corpus(cfg: &Config, requested: Option<&str>) -> anyhow::Result<String> {
     if let Some(name) = requested {
-        if !cfg.corpora.is_empty() && !cfg.corpora.iter().any(|c| c.name == name) {
+        // Match `select_corpora` on the index path: an explicit --corpus must
+        // exist in the config, even when `cfg.corpora` is empty. The previous
+        // "is_empty implies trust the user" carve-out diverged from the
+        // index-side policy and let `ground --corpus ghost` succeed against
+        // an empty config while `index --corpus ghost` errored.
+        if !cfg.corpora.iter().any(|c| c.name == name) {
             return Err(anyhow!("corpus {name:?} not found in config"));
         }
         return Ok(name.to_string());
@@ -105,10 +110,38 @@ mod tests {
     }
 
     #[test]
-    fn pick_corpus_uses_explicit_flag_when_set() {
+    fn pick_corpus_errors_when_explicit_name_missing_from_empty_config() {
+        // Symmetry with `select_corpora` on the index path: an explicit
+        // `--corpus` must name a configured corpus, even when no corpora are
+        // configured at all. The previous "is_empty implies pass-through"
+        // policy was the asymmetry the cure pass closed.
         let cfg = Config::default();
-        let got = pick_corpus(&cfg, Some("docs")).unwrap();
-        assert_eq!(got, "docs");
+        let err = pick_corpus(&cfg, Some("docs")).unwrap_err();
+        assert!(
+            err.to_string().contains("docs") && err.to_string().contains("not found"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pick_corpus_returns_named_corpus_when_present_in_config() {
+        let cfg = Config {
+            corpora: vec![
+                CorpusConfig {
+                    name: "docs".into(),
+                    paths: vec!["/d".into()],
+                    ..Default::default()
+                },
+                CorpusConfig {
+                    name: "notes".into(),
+                    paths: vec!["/n".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let got = pick_corpus(&cfg, Some("notes")).unwrap();
+        assert_eq!(got, "notes");
     }
 
     #[test]
