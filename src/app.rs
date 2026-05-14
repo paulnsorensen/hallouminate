@@ -1,15 +1,9 @@
-use clap::Parser;
-
+pub mod cli;
 pub mod config;
 
-#[derive(Parser)]
-#[command(version, about, long_about = None)]
-struct Cli {
-    #[arg(short, long, default_value = "world")]
-    name: String,
-}
+use clap::Parser;
 
-pub async fn run() {
-    let cli = Cli::parse();
-    println!("Hello, {}!", cli.name);
+pub async fn run() -> anyhow::Result<()> {
+    let cli = cli::Cli::parse();
+    cli::dispatch(cli).await
 }
