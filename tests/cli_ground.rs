@@ -12,7 +12,7 @@ paths = [{root:?}]
 globs = ["**/*.md"]
 
 [embeddings]
-model     = "bge-small-en-v1.5"
+model     = "BAAI/bge-small-en-v1.5"
 cache_dir = {cache:?}
 
 [storage]

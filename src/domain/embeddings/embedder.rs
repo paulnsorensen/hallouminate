@@ -5,8 +5,8 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use crate::domain::common::{HallouminateError, Result};
 
 pub const EMBEDDING_DIM: usize = 384;
-pub const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
-const ALT_MODEL: &str = "all-minilm-l6-v2";
+pub const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
+const ALT_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
 pub trait EmbedBatch: Send {
     fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>>;
