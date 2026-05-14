@@ -38,8 +38,8 @@ ground_dir = {dir:?}
 
 /// Opening a LanceDB ground directory with one embedding model and then
 /// reopening it with a different model must refuse, name both models in the
-/// error chain, hint at `--reset`, and leave the original `meta.toml` and
-/// row count untouched.
+/// error chain, point at a real remediation (`hallouminate index` against an
+/// emptied ground directory), and leave the original `meta.toml` byte-identical.
 ///
 /// Ported from the SQLite-era preserved test
 /// `.context/preserved/model_mismatch.rs`. The new path keys off the
@@ -87,8 +87,8 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
 
     let chain = format!("{err:#}");
     assert!(
-        chain.contains("--reset"),
-        "error must point at --reset, got: {chain}"
+        chain.contains("delete") && chain.contains("hallouminate index"),
+        "error must point at a real remediation (delete + re-run), got: {chain}"
     );
     assert!(
         chain.contains(MODEL_A) && chain.contains(MODEL_B),
@@ -106,14 +106,12 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
         "refused run must not write any rows"
     );
 
-    // 5. meta.toml still names the original model.
+    // 5. meta.toml is byte-identical to the snapshot taken before the
+    //    refused index call — refusal must not rewrite schema version,
+    //    auto-managed banner, or any other sidecar content.
     let meta_after = fs::read_to_string(&meta_path).expect("read meta.toml after refusal");
-    assert!(
-        meta_after.contains(MODEL_A),
-        "meta.toml must still name original model after refusal: {meta_after}"
-    );
-    assert!(
-        !meta_after.contains(MODEL_B),
-        "meta.toml must not have been rewritten to MODEL_B: {meta_after}"
+    assert_eq!(
+        meta_after, meta_before,
+        "meta.toml must be untouched on refusal\nbefore:\n{meta_before}\nafter:\n{meta_after}"
     );
 }
