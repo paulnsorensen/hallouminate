@@ -10,7 +10,8 @@ const DEFAULT_DEBOUNCE_MS: u64 = 500;
 const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
-const XDG_CONFIG_RELATIVE: &str = "~/.config/hallouminate/config.toml";
+const XDG_CONFIG_FALLBACK_BASE: &str = "~/.config";
+const APP_CONFIG_SUBPATH: [&str; 2] = ["hallouminate", "config.toml"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CodeRepoConfig {
@@ -101,15 +102,34 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
         Some(p) => p.to_path_buf(),
         None => xdg_config_path(),
     };
-    if !resolved.exists() {
-        return Ok(Config::default());
-    }
-    let text = std::fs::read_to_string(&resolved)?;
+    // Only treat a confirmed `NotFound` as "no config file, use defaults".
+    // Other io errors (permission denied, broken symlink, unreadable dir)
+    // must propagate so the user isn't silently dropped to an empty
+    // configuration when the actual problem is filesystem state.
+    let text = match std::fs::read_to_string(&resolved) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default());
+        }
+        Err(e) => return Err(HallouminateError::from(e)),
+    };
     parse(&text, Some(&resolved))
 }
 
 pub fn xdg_config_path() -> PathBuf {
-    PathBuf::from(shellexpand::tilde(XDG_CONFIG_RELATIVE).into_owned())
+    xdg_config_path_from(std::env::var_os("XDG_CONFIG_HOME").as_deref())
+}
+
+/// Pure resolver: honor `$XDG_CONFIG_HOME` when set and non-empty, otherwise
+/// fall back to `~/.config`. Split out from `xdg_config_path` so tests can
+/// exercise both branches without mutating process env (unsafe on edition
+/// 2024) or relying on the developer's local shell environment.
+fn xdg_config_path_from(xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    let base = xdg_config_home
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(shellexpand::tilde(XDG_CONFIG_FALLBACK_BASE).into_owned()));
+    APP_CONFIG_SUBPATH.iter().fold(base, |p, seg| p.join(seg))
 }
 
 fn parse(text: &str, source: Option<&Path>) -> Result<Config> {
@@ -307,13 +327,101 @@ rrf_k                   = 60
     }
 
     #[test]
-    fn xdg_config_path_resolves_under_home() {
-        let path = xdg_config_path();
+    fn xdg_config_path_falls_back_to_dot_config_when_xdg_env_absent() {
+        let path = xdg_config_path_from(None);
         assert!(
             path.ends_with(".config/hallouminate/config.toml"),
             "got {}",
             path.display()
         );
         assert!(path.is_absolute(), "tilde must expand: {}", path.display());
+    }
+
+    #[test]
+    fn xdg_config_path_falls_back_when_xdg_env_is_empty_string() {
+        // POSIX/XDG: an empty XDG_CONFIG_HOME is treated as unset.
+        let path = xdg_config_path_from(Some(std::ffi::OsStr::new("")));
+        assert!(
+            path.ends_with(".config/hallouminate/config.toml"),
+            "empty XDG_CONFIG_HOME must fall back; got {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn xdg_config_path_honors_custom_xdg_config_home() {
+        // Regression for PR #7 Copilot review: the loader must honor a
+        // custom XDG_CONFIG_HOME instead of always resolving to ~/.config.
+        let custom = std::path::PathBuf::from("/var/tmp/custom-xdg");
+        let path = xdg_config_path_from(Some(custom.as_os_str()));
+        assert_eq!(path, custom.join("hallouminate").join("config.toml"));
+    }
+
+    #[test]
+    fn load_missing_path_returns_defaults_without_error() {
+        // A confirmed NotFound on an explicit path must still degrade to
+        // defaults — the NotFound-only filter shouldn't regress this case.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.toml");
+        let cfg = load(Some(&missing)).expect("missing -> defaults");
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_propagates_non_notfound_io_error() {
+        // Regression for PR #7 Copilot review: a non-NotFound io error
+        // (here: unreadable directory → EACCES on read_to_string) must
+        // propagate as HallouminateError::Io, not silently default.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unreadable = dir.path().join("locked");
+        std::fs::create_dir(&unreadable).expect("mkdir");
+        let cfg_path = unreadable.join("config.toml");
+        std::fs::write(&cfg_path, "").expect("write");
+        // 0o000 on parent dir → read of the file inside fails with EACCES.
+        // root can bypass this; skip the assertion when running as root.
+        let is_root = nix_getuid_is_zero();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        let result = load(Some(&cfg_path));
+        // Restore perms before any potential test failure unwind, so the
+        // tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755));
+        if is_root {
+            return; // root reads through 0o000; the negative test is meaningless.
+        }
+        let err = result.expect_err("unreadable parent must surface an io error");
+        match err {
+            HallouminateError::Io(io) => {
+                assert_ne!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "must NOT classify as NotFound: {io}"
+                );
+            }
+            other => panic!("expected HallouminateError::Io, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn nix_getuid_is_zero() -> bool {
+        // Avoid a libc dep just for this; read /proc/self/status on Linux,
+        // shell out to `id -u` everywhere else (macOS, BSDs). The test
+        // tolerates either path failing — worst case we run the assertion
+        // when we shouldn't, which only false-positives in CI containers
+        // running as root, where the assertion is a no-op anyway.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            if let Some(line) = s.lines().find(|l| l.starts_with("Uid:")) {
+                return line.split_whitespace().nth(1) == Some("0");
+            }
+        }
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
     }
 }

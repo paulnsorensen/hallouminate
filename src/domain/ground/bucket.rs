@@ -9,7 +9,8 @@ use super::types::{DocChunk, DocFile};
 /// Bucket `hits` by `file_ref`, sort by max-score descending (file_ref tiebreak),
 /// truncate to `top_files`, then take the top `chunks_per_file` chunks per
 /// bucket by score. Pure CPU — LanceDB hits already carry every field needed
-/// to render a `DocFile`.
+/// to render a `DocFile`, including `mtime_ms` which is formatted as RFC3339
+/// at bucket-emit time.
 pub(super) fn build_docs(
     hits: &[SearchHit],
     top_files: usize,
@@ -43,6 +44,7 @@ struct FileBucket {
     summary: Option<String>,
     keywords: Vec<String>,
     score: f64,
+    mtime_ms: i64,
     chunks: Vec<SearchHit>,
 }
 
@@ -53,6 +55,7 @@ impl FileBucket {
             summary: option_from(&hit.summary),
             keywords: hit.keywords.clone(),
             score: f64::MIN,
+            mtime_ms: hit.mtime_ms,
             chunks: Vec::new(),
         }
     }
@@ -84,17 +87,24 @@ impl FileBucket {
                 snippet: make_snippet(&h.text),
             })
             .collect();
-        // mtime/corpus aren't on SearchHit on `main`; ground orchestrator
-        // doesn't have them either without re-querying. Leave mtime empty
-        // (callers can fill it later if a source surfaces it) and corpus
-        // gets stamped in by the orchestrator from its `corpus: &str` arg.
+        // mtime is sourced from SearchHit.mtime_ms (decoded from the
+        // LanceDB `mtime_ms` column) and formatted RFC3339 in UTC with
+        // second precision so the response shape matches `2026-04-30T10:11:23Z`.
+        // An out-of-range timestamp collapses to an empty string — the
+        // documented contract — rather than panicking on bad row data.
+        // corpus is stamped in by the orchestrator from its `corpus: &str`
+        // arg, since the LanceDB row's corpus is implied by the query
+        // scope (`corpus = '...'`) and isn't returned per-row.
+        let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(self.mtime_ms)
+            .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_default();
         (
             self.file_ref,
             DocFile {
                 summary: self.summary,
                 keywords: self.keywords,
                 score: self.score,
-                mtime: String::new(),
+                mtime,
                 corpus: String::new(),
                 chunks,
             },
@@ -114,6 +124,10 @@ fn option_from(s: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // 2024-01-01T00:00:00Z — fixed reference timestamp so the RFC3339
+    // assertion below stays readable.
+    const FIXTURE_MTIME_MS: i64 = 1_704_067_200_000;
+
     fn hit(file_ref: &str, ord: usize, score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#{ord}"),
@@ -125,6 +139,7 @@ mod tests {
             summary: format!("summary of {file_ref}"),
             keywords: vec!["docs".into(), "test".into()],
             score,
+            mtime_ms: FIXTURE_MTIME_MS,
         }
     }
 
@@ -227,6 +242,35 @@ mod tests {
         assert_eq!(
             a.summary, None,
             "empty SearchHit.summary must collapse to None"
+        );
+    }
+
+    #[test]
+    fn mtime_ms_is_formatted_as_rfc3339_utc_with_z_suffix() {
+        // Regression for PR #7 Copilot review: DocFile.mtime must reflect
+        // the file's stored mtime_ms, not an empty string. Use the fixture
+        // hit's mtime_ms (2024-01-01T00:00:00Z) so the round-trip is exact.
+        let docs = build_docs(&[hit("/a.md", 0, 0.5)], 5, 5).expect("build");
+        let a = docs.get("/a.md").expect("a present");
+        assert_eq!(
+            a.mtime, "2024-01-01T00:00:00Z",
+            "DocFile.mtime must be RFC3339(seconds, Z) from SearchHit.mtime_ms"
+        );
+    }
+
+    #[test]
+    fn out_of_range_mtime_ms_collapses_to_empty_string() {
+        // Defensive: an unrepresentable timestamp must not panic. Pick a
+        // value beyond chrono's i64-ms range so from_timestamp_millis() is
+        // None and the formatter returns Default (empty string).
+        let mut h = hit("/a.md", 0, 0.5);
+        h.mtime_ms = i64::MAX;
+        let docs = build_docs(&[h], 5, 5).expect("build");
+        let a = docs.get("/a.md").expect("a present");
+        assert!(
+            a.mtime.is_empty(),
+            "out-of-range mtime_ms must collapse to empty, got {:?}",
+            a.mtime
         );
     }
 
