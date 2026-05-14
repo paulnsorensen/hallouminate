@@ -55,6 +55,7 @@ pub struct SearchHit {
     pub summary: String,
     pub keywords: Vec<String>,
     pub score: f32,
+    pub mtime_ms: i64,
 }
 
 // ── Deterministic chunk_id ──────────────────────────────────────────────
@@ -290,6 +291,7 @@ fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
     let text = string_col(rb, "text")?;
     let line_start = int64_col(rb, "line_start")?;
     let line_end = int64_col(rb, "line_end")?;
+    let mtime_ms = int64_col(rb, "mtime_ms")?;
     let heading_path = list_utf8_col(rb, "heading_path")?;
     let keywords = list_utf8_col(rb, "keywords")?;
     let score = rb
@@ -312,6 +314,7 @@ fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
             summary: summary.value(i).to_string(),
             keywords: decode_list(keywords, i),
             score: s,
+            mtime_ms: mtime_ms.value(i),
         });
     }
     Ok(())
