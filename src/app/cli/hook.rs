@@ -70,7 +70,8 @@ fn resolve_hooks_dir(repo: Option<&Path>) -> anyhow::Result<PathBuf> {
 
 fn install_managed_block(hook_path: &Path) -> anyhow::Result<()> {
     let existing = read_hook_or_empty(hook_path)?;
-    let stripped = strip_managed_block(&existing);
+    let stripped = strip_managed_block(&existing)
+        .with_context(|| format!("hook {}", hook_path.display()))?;
     let mut next = ensure_shebang(&stripped);
     if !next.ends_with('\n') {
         next.push('\n');
@@ -90,7 +91,8 @@ fn uninstall_managed_block(hook_path: &Path) -> anyhow::Result<()> {
     }
     let existing =
         fs::read_to_string(hook_path).with_context(|| format!("read {}", hook_path.display()))?;
-    let stripped = strip_managed_block(&existing);
+    let stripped = strip_managed_block(&existing)
+        .with_context(|| format!("hook {}", hook_path.display()))?;
     if is_only_shebang_or_empty(&stripped) {
         fs::remove_file(hook_path).with_context(|| format!("remove {}", hook_path.display()))?;
     } else {
@@ -107,7 +109,7 @@ fn read_hook_or_empty(path: &Path) -> anyhow::Result<String> {
     }
 }
 
-fn strip_managed_block(text: &str) -> String {
+fn strip_managed_block(text: &str) -> anyhow::Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut in_block = false;
     for line in text.split_inclusive('\n') {
@@ -124,7 +126,17 @@ fn strip_managed_block(text: &str) -> String {
         }
         out.push_str(line);
     }
-    out
+    if in_block {
+        // BLOCK_START without a matching BLOCK_END means the file was
+        // truncated, hand-edited, or otherwise corrupted. Rewriting would
+        // silently drop every line after the orphan marker (the user's
+        // content), so refuse loudly and let them resolve it.
+        return Err(anyhow!(
+            "malformed hook: `{BLOCK_START}` is not closed by `{BLOCK_END}`; \
+             refusing to rewrite to avoid losing content after the orphan marker"
+        ));
+    }
+    Ok(out)
 }
 
 fn ensure_shebang(text: &str) -> String {
@@ -360,5 +372,42 @@ mod tests {
             repo: Some(dir.path().into()),
         })
         .expect("uninstall noop");
+    }
+
+    #[test]
+    fn strip_managed_block_errors_when_block_is_unterminated() {
+        // Regression for PR #8 Copilot review: an orphan BLOCK_START with no
+        // matching BLOCK_END must NOT silently drop the user's lines that
+        // follow it. The function refuses to rewrite and surfaces the error.
+        let text = format!("#!/bin/sh\n{BLOCK_START}\nold body\necho 'kept content'\n");
+        let err = strip_managed_block(&text).expect_err("unterminated block must error");
+        let msg = err.to_string();
+        assert!(msg.contains(BLOCK_START), "missing BLOCK_START in: {msg}");
+        assert!(msg.contains(BLOCK_END), "missing BLOCK_END in: {msg}");
+    }
+
+    #[test]
+    fn install_refuses_when_existing_hook_has_unterminated_managed_block() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo(dir.path());
+        let hooks = dir.path().join(".git/hooks");
+        fs::create_dir_all(&hooks).expect("mkdir hooks");
+        let post_commit = hooks.join("post-commit");
+        let seeded = format!(
+            "#!/bin/sh\n{BLOCK_START}\nlegacy body\necho 'must-not-be-dropped'\n"
+        );
+        fs::write(&post_commit, &seeded).expect("seed");
+
+        let err = cmd_hook_install(HookArgs {
+            repo: Some(dir.path().into()),
+        })
+        .expect_err("install must refuse to rewrite a malformed hook");
+        let chain = format!("{err:#}");
+        assert!(chain.contains("malformed hook"), "{chain}");
+
+        // The original file must be left untouched so the user can see and
+        // resolve the corruption rather than discover lost content later.
+        let after = fs::read_to_string(&post_commit).expect("read post-commit");
+        assert_eq!(after, seeded, "hook file must be untouched on refusal");
     }
 }
