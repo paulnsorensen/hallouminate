@@ -96,8 +96,10 @@ fn meta_check_or_init(meta_path: &Path, requested_model: &str) -> Result<()> {
         if meta.embedding_model_name != requested_model {
             return Err(HallouminateError::Embed(format!(
                 "embedding model mismatch: store has {:?}, requested {:?}; \
-                 run `hallouminate index --reset` to rebuild",
-                meta.embedding_model_name, requested_model
+                 delete {} and re-run `hallouminate index` to rebuild",
+                meta.embedding_model_name,
+                requested_model,
+                meta_path.parent().unwrap_or(meta_path).display(),
             )));
         }
         return Ok(());
@@ -712,7 +714,8 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("bge-small-en-v1.5"), "{msg}");
         assert!(msg.contains("all-minilm-l6-v2"), "{msg}");
-        assert!(msg.contains("--reset"), "{msg}");
+        assert!(msg.contains("delete"), "{msg}");
+        assert!(msg.contains("hallouminate index"), "{msg}");
     }
 
     #[test]
