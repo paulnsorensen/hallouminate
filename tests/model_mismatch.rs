@@ -4,8 +4,8 @@ use std::path::Path;
 use hallouminate::adapters::lance::LanceStore;
 use hallouminate::app::cli::{cmd_index, IndexArgs};
 
-const MODEL_A: &str = "bge-small-en-v1.5";
-const MODEL_B: &str = "all-minilm-l6-v2";
+const MODEL_A: &str = "BAAI/bge-small-en-v1.5";
+const MODEL_B: &str = "sentence-transformers/all-MiniLM-L6-v2";
 
 fn write_config(
     config_path: &Path,

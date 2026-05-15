@@ -16,7 +16,7 @@ top_files_default       = 10
 chunks_per_file_default = 3
 
 [embeddings]
-model     = "bge-small-en-v1.5"
+model     = "BAAI/bge-small-en-v1.5"
 cache_dir = "~/.cache/hallouminate/fastembed"
 
 [watch]

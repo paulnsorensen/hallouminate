@@ -7,7 +7,7 @@ use crate::domain::common::{CorpusConfig, HallouminateError, Result};
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
 const DEFAULT_DEBOUNCE_MS: u64 = 500;
-const DEFAULT_MODEL: &str = "bge-small-en-v1.5";
+const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 const XDG_CONFIG_FALLBACK_BASE: &str = "~/.config";

@@ -113,7 +113,7 @@ mod tests {
         let cfg: Config =
             toml::from_str(DEFAULT_TEMPLATE).expect("template must be valid TOML");
         assert!(cfg.corpora.is_empty(), "corpora must start commented-out");
-        assert_eq!(cfg.embeddings.model, "bge-small-en-v1.5");
+        assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
         assert_eq!(cfg.search.top_files_default, 10);
     }
 
@@ -139,7 +139,7 @@ mod tests {
         let cfg = config::load(Some(&missing)).expect("missing → defaults");
         let rendered = render_config(&cfg).expect("render defaults");
         assert!(
-            rendered.contains("bge-small-en-v1.5"),
+            rendered.contains("BAAI/bge-small-en-v1.5"),
             "missing model in defaults: {rendered}"
         );
     }

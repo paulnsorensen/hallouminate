@@ -18,7 +18,7 @@ use text_splitter::Characters;
 mod common;
 use common::{placeholder_prepared_file, StubEmbedder};
 
-const MODEL: &str = "bge-small-en-v1.5";
+const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 /// Embedder that always panics. Used to simulate a crash before the
 /// downstream `merge_insert` call.

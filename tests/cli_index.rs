@@ -4,7 +4,7 @@ use std::path::Path;
 use hallouminate::adapters::lance::LanceStore;
 use hallouminate::app::cli::{cmd_index, IndexArgs};
 
-const MODEL: &str = "bge-small-en-v1.5";
+const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 fn write_config(config_path: &Path, corpus_root: &Path, ground_dir: &Path, cache_dir: &Path) {
     let toml = format!(
@@ -15,7 +15,7 @@ paths = [{root:?}]
 globs = ["**/*.md"]
 
 [embeddings]
-model     = "bge-small-en-v1.5"
+model     = "BAAI/bge-small-en-v1.5"
 cache_dir = {cache:?}
 
 [storage]
