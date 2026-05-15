@@ -6,7 +6,7 @@ use crate::adapters::lance::LanceStore;
 use crate::app::config::{self, Config};
 use crate::domain::common::expand_tilde;
 use crate::domain::embeddings::Embedder;
-use crate::domain::ground::{ground, GroundOpts, GroundResponse};
+use crate::domain::ground::{ground, render, Format, GroundOpts, GroundResponse, RenderOpts};
 
 const DEFAULT_LIMIT: usize = 50;
 
@@ -14,7 +14,8 @@ const DEFAULT_LIMIT: usize = 50;
 pub struct GroundArgs {
     pub query: String,
     pub corpus: Option<String>,
-    pub pretty: bool,
+    pub format: Format,
+    pub snippet_chars: Option<usize>,
     pub top_files: Option<usize>,
     pub chunks_per_file: Option<usize>,
     pub limit: Option<usize>,
@@ -22,15 +23,49 @@ pub struct GroundArgs {
 }
 
 pub async fn cmd_ground(args: GroundArgs) -> anyhow::Result<()> {
-    let pretty = args.pretty;
+    let format = args.format;
+    let snippet_chars = args.snippet_chars;
+    let path_prefix_strip = path_prefix_strip(args.config.as_deref(), args.corpus.as_deref())?;
     let response = run_ground(args).await?;
-    let text = if pretty {
-        serde_json::to_string_pretty(&response)?
-    } else {
-        serde_json::to_string(&response)?
+    let opts = RenderOpts {
+        snippet_chars,
+        path_prefix_strip,
     };
-    println!("{text}");
+    println!("{}", render(&response, format, &opts));
     Ok(())
+}
+
+/// When exactly one corpus is in scope and that corpus has exactly one root
+/// path, return that path (with a trailing `/`) so the outline format can
+/// strip it for readability. Multi-path or multi-corpus situations return
+/// `None` — the full absolute path stays so paths remain unambiguous.
+fn path_prefix_strip(
+    config: Option<&std::path::Path>,
+    requested_corpus: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let cfg = config::load(config)?;
+    Ok(resolve_path_prefix_strip(&cfg, requested_corpus))
+}
+
+/// Pure inner: pick the corpus the prefix strip applies to, then build the
+/// trailing-slash prefix. Split out from the loader so the policy can be
+/// unit-tested without a temp config file.
+fn resolve_path_prefix_strip(cfg: &Config, requested_corpus: Option<&str>) -> Option<String> {
+    let candidate = match requested_corpus {
+        Some(name) => cfg.corpora.iter().find(|c| c.name == name),
+        None if cfg.corpora.len() == 1 => cfg.corpora.first(),
+        _ => None,
+    };
+    let corpus = candidate?;
+    if corpus.paths.len() != 1 {
+        return None;
+    }
+    let expanded = expand_tilde(&corpus.paths[0]);
+    let mut prefix = expanded.to_string_lossy().into_owned();
+    if !prefix.ends_with('/') {
+        prefix.push('/');
+    }
+    Some(prefix)
 }
 
 pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
@@ -199,5 +234,132 @@ mod tests {
         };
         let err = pick_corpus(&cfg, None).unwrap_err();
         assert!(err.to_string().contains("multiple"), "{err}");
+    }
+
+    #[test]
+    fn path_prefix_strip_returns_sole_corpus_path_with_trailing_slash() {
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "only".into(),
+                paths: vec!["/abs/cheese".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_path_prefix_strip(&cfg, None),
+            Some("/abs/cheese/".to_string())
+        );
+    }
+
+    #[test]
+    fn path_prefix_strip_preserves_existing_trailing_slash() {
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "only".into(),
+                paths: vec!["/abs/cheese/".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_path_prefix_strip(&cfg, None),
+            Some("/abs/cheese/".to_string()),
+            "single trailing slash, not two"
+        );
+    }
+
+    #[test]
+    fn path_prefix_strip_returns_none_for_multi_path_corpus() {
+        // Ambiguity guard: two roots → no strip, full path stays so the
+        // user can tell which root a result came from.
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "only".into(),
+                paths: vec!["/a".into(), "/b".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_path_prefix_strip(&cfg, None), None);
+    }
+
+    #[test]
+    fn path_prefix_strip_returns_none_for_multi_corpus_without_filter() {
+        let cfg = Config {
+            corpora: vec![
+                CorpusConfig {
+                    name: "a".into(),
+                    paths: vec!["/a".into()],
+                    ..Default::default()
+                },
+                CorpusConfig {
+                    name: "b".into(),
+                    paths: vec!["/b".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(resolve_path_prefix_strip(&cfg, None), None);
+    }
+
+    #[test]
+    fn path_prefix_strip_uses_named_corpus_in_multi_corpus_config() {
+        let cfg = Config {
+            corpora: vec![
+                CorpusConfig {
+                    name: "a".into(),
+                    paths: vec!["/a".into()],
+                    ..Default::default()
+                },
+                CorpusConfig {
+                    name: "b".into(),
+                    paths: vec!["/b".into()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_path_prefix_strip(&cfg, Some("b")),
+            Some("/b/".to_string()),
+        );
+    }
+
+    #[test]
+    fn path_prefix_strip_returns_none_when_named_corpus_missing() {
+        // Defensive: pick_corpus will error later for an unknown name, so
+        // the strip just bows out instead of panicking.
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "a".into(),
+                paths: vec!["/a".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_path_prefix_strip(&cfg, Some("ghost")), None);
+    }
+
+    #[test]
+    fn path_prefix_strip_expands_tilde_in_corpus_path() {
+        // ~/.cheese is the spec example. The strip must expand to the
+        // user's actual home before matching against absolute paths from
+        // the indexer.
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "cheese".into(),
+                paths: vec!["~/.cheese".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let prefix = resolve_path_prefix_strip(&cfg, None).expect("strip resolved");
+        assert!(
+            !prefix.starts_with('~'),
+            "tilde must be expanded: got {prefix:?}"
+        );
+        assert!(prefix.ends_with("/.cheese/"), "trailing slash: {prefix:?}");
     }
 }

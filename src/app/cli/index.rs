@@ -22,6 +22,15 @@ pub struct IndexArgs {
 }
 
 pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
+    let report = run_index(args).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Build the `IndexReport` without printing it. Split out so non-CLI
+/// transports (e.g. the MCP adapter) can hand the structured report straight
+/// to their caller instead of recovering it from stdout.
+pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
     let cfg = config::load(args.config.as_deref())?;
     let corpora = select_corpora(&cfg, &args)?;
     let ground_dir = expand_tilde(&cfg.storage.ground_dir);
@@ -35,9 +44,7 @@ pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
     let tokenizer = load_tokenizer(&cfg.embeddings.model)
         .with_context(|| format!("load tokenizer for {}", cfg.embeddings.model))?;
     let chunker = MarkdownChunker::new(tokenizer, CHUNK_BUDGET_TOKENS);
-    let report = run_indexing(&corpora, &store, &mut embedder, &chunker).await?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    run_indexing(&corpora, &store, &mut embedder, &chunker).await
 }
 
 fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusConfig>> {
