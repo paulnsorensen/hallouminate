@@ -128,7 +128,9 @@ fn xdg_config_path_from(xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
     let base = xdg_config_home
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(shellexpand::tilde(XDG_CONFIG_FALLBACK_BASE).into_owned()));
+        .unwrap_or_else(|| {
+            PathBuf::from(shellexpand::tilde(XDG_CONFIG_FALLBACK_BASE).into_owned())
+        });
     APP_CONFIG_SUBPATH.iter().fold(base, |p, seg| p.join(seg))
 }
 
