@@ -7,7 +7,10 @@ mod ground;
 mod hook;
 mod index;
 
-pub use config::{cmd_config_init, cmd_config_show, ConfigInitArgs, ConfigShowArgs};
+pub use config::{
+    cmd_config_download, cmd_config_init, cmd_config_show, ConfigDownloadArgs, ConfigInitArgs,
+    ConfigShowArgs,
+};
 pub use ground::{cmd_ground, run_ground, GroundArgs};
 pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
 pub use index::{cmd_index, IndexArgs};
@@ -108,6 +111,10 @@ pub enum ConfigAction {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
+    Download {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -123,6 +130,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 cmd_config_init(ConfigInitArgs { force, path })
             }
             ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
+            ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
         },
     }
 }
@@ -288,17 +296,30 @@ mod tests {
 
     #[test]
     fn parses_config_show_with_explicit_config_path() {
+        let cli =
+            Cli::try_parse_from(["hallouminate", "config", "show", "--config", "/tmp/c.toml"])
+                .expect("parse");
+        match cli.command {
+            Command::Config {
+                action: ConfigAction::Show { config },
+            } => assert_eq!(config, Some(PathBuf::from("/tmp/c.toml"))),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_config_download_with_explicit_config_path() {
         let cli = Cli::try_parse_from([
             "hallouminate",
             "config",
-            "show",
+            "download",
             "--config",
             "/tmp/c.toml",
         ])
         .expect("parse");
         match cli.command {
             Command::Config {
-                action: ConfigAction::Show { config },
+                action: ConfigAction::Download { config },
             } => assert_eq!(config, Some(PathBuf::from("/tmp/c.toml"))),
             other => panic!("wrong variant: {other:?}"),
         }

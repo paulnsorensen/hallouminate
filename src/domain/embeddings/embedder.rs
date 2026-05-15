@@ -6,7 +6,11 @@ use crate::domain::common::{HallouminateError, Result};
 
 pub const EMBEDDING_DIM: usize = 384;
 pub const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
-const ALT_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
+pub const ALT_MODEL: &str = "sentence-transformers/all-MiniLM-L6-v2";
+pub const SUPPORTED_MODELS: [&str; 2] = [DEFAULT_MODEL, ALT_MODEL];
+
+const LEGACY_DEFAULT_MODEL: &str = "bge-small-en-v1.5";
+const LEGACY_ALT_MODEL: &str = "all-minilm-l6-v2";
 
 pub trait EmbedBatch: Send {
     fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>>;
@@ -19,15 +23,16 @@ pub struct Embedder {
 
 impl Embedder {
     pub fn try_new(model_name: &str, cache_dir: &Path) -> Result<Self> {
-        let model = resolve_model(model_name)?;
+        let canonical_name = canonical_model_name(model_name)?;
+        let model = resolve_model(canonical_name);
         let opts = TextInitOptions::new(model)
             .with_cache_dir(PathBuf::from(cache_dir))
             .with_show_download_progress(false);
         let inner = TextEmbedding::try_new(opts)
-            .map_err(|e| HallouminateError::Embed(format!("init {model_name}: {e}")))?;
+            .map_err(|e| HallouminateError::Embed(format!("init {canonical_name}: {e}")))?;
         Ok(Self {
             inner,
-            model_name: model_name.to_string(),
+            model_name: canonical_name.to_string(),
         })
     }
 
@@ -69,10 +74,18 @@ pub(crate) fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-fn resolve_model(name: &str) -> Result<EmbeddingModel> {
+fn resolve_model(canonical: &'static str) -> EmbeddingModel {
+    match canonical {
+        DEFAULT_MODEL => EmbeddingModel::BGESmallENV15,
+        ALT_MODEL => EmbeddingModel::AllMiniLML6V2,
+        _ => unreachable!("resolve_model takes a canonical name from canonical_model_name"),
+    }
+}
+
+pub fn canonical_model_name(name: &str) -> Result<&'static str> {
     match name {
-        DEFAULT_MODEL => Ok(EmbeddingModel::BGESmallENV15),
-        ALT_MODEL => Ok(EmbeddingModel::AllMiniLML6V2),
+        DEFAULT_MODEL | LEGACY_DEFAULT_MODEL => Ok(DEFAULT_MODEL),
+        ALT_MODEL | LEGACY_ALT_MODEL => Ok(ALT_MODEL),
         other => Err(HallouminateError::Config(format!(
             "unsupported embedding model {other:?}; choose {DEFAULT_MODEL:?} or {ALT_MODEL:?}"
         ))),
@@ -116,18 +129,46 @@ mod tests {
     #[test]
     fn resolve_model_accepts_default_and_alt() {
         assert!(matches!(
-            resolve_model(DEFAULT_MODEL).unwrap(),
+            resolve_model(DEFAULT_MODEL),
             EmbeddingModel::BGESmallENV15
         ));
         assert!(matches!(
-            resolve_model(ALT_MODEL).unwrap(),
+            resolve_model(ALT_MODEL),
             EmbeddingModel::AllMiniLML6V2
         ));
     }
 
     #[test]
-    fn resolve_model_rejects_unknown_name() {
-        let err = resolve_model("clip-vit-b32").expect_err("must reject");
+    fn canonical_model_name_accepts_legacy_aliases() {
+        assert_eq!(
+            canonical_model_name("bge-small-en-v1.5").unwrap(),
+            DEFAULT_MODEL
+        );
+        assert_eq!(canonical_model_name("all-minilm-l6-v2").unwrap(), ALT_MODEL);
+    }
+
+    #[test]
+    fn supported_model_names_are_hugging_face_repo_ids() {
+        for model in SUPPORTED_MODELS {
+            assert!(
+                model.split_once('/').is_some(),
+                "supported model must be a canonical HF repo id: {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_model_name_rejects_unknown_with_recovery_message() {
+        let err = canonical_model_name("clip-vit-b32").expect_err("unsupported must error");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported embedding model"), "{msg}");
+        assert!(msg.contains(DEFAULT_MODEL), "missing default option: {msg}");
+        assert!(msg.contains(ALT_MODEL), "missing alt option: {msg}");
+    }
+
+    #[test]
+    fn canonical_model_name_rejects_empty_string() {
+        let err = canonical_model_name("").expect_err("empty name must error");
         assert!(err.to_string().contains("unsupported"), "{err}");
     }
 

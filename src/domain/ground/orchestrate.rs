@@ -76,10 +76,12 @@ mod tests {
     #[tokio::test]
     async fn ground_errors_when_embedder_returns_no_vector() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let store =
-            crate::adapters::lance::LanceStore::open_or_create(dir.path(), "bge-small-en-v1.5")
-                .await
-                .expect("open store");
+        let store = crate::adapters::lance::LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+        )
+        .await
+        .expect("open store");
         let mut embedder = EmptyVecEmbedder;
         let err = ground(
             "spice",
