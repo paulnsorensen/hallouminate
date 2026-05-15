@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
+use crate::domain::embeddings::{canonical_model_name, DEFAULT_MODEL};
 
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
 const DEFAULT_DEBOUNCE_MS: u64 = 500;
-const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 const XDG_CONFIG_FALLBACK_BASE: &str = "~/.config";
@@ -128,19 +128,27 @@ fn xdg_config_path_from(xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
     let base = xdg_config_home
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(shellexpand::tilde(XDG_CONFIG_FALLBACK_BASE).into_owned()));
+        .unwrap_or_else(|| {
+            PathBuf::from(shellexpand::tilde(XDG_CONFIG_FALLBACK_BASE).into_owned())
+        });
     APP_CONFIG_SUBPATH.iter().fold(base, |p, seg| p.join(seg))
 }
 
 fn parse(text: &str, source: Option<&Path>) -> Result<Config> {
-    let cfg: Config = toml::from_str(text).map_err(|e| {
+    let mut cfg: Config = toml::from_str(text).map_err(|e| {
         let where_ = source
             .map(|p| format!(" at {}", p.display()))
             .unwrap_or_default();
         HallouminateError::Config(format!("parsing config{where_}: {e}"))
     })?;
+    normalize(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
+}
+
+fn normalize(cfg: &mut Config) -> Result<()> {
+    cfg.embeddings.model = canonical_model_name(&cfg.embeddings.model)?.to_string();
+    Ok(())
 }
 
 fn validate(cfg: &Config) -> Result<()> {
@@ -199,7 +207,7 @@ top_files_default       = 10
 chunks_per_file_default = 3
 
 [embeddings]
-model     = "bge-small-en-v1.5"
+model     = "BAAI/bge-small-en-v1.5"
 cache_dir = "~/.cache/hallouminate/fastembed"
 
 [watch]
@@ -237,7 +245,7 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.search.top_files_default, 10);
         assert_eq!(cfg.search.chunks_per_file_default, 3);
 
-        assert_eq!(cfg.embeddings.model, "bge-small-en-v1.5");
+        assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
         assert_eq!(cfg.embeddings.cache_dir, "~/.cache/hallouminate/fastembed");
 
         assert_eq!(cfg.watch.debounce_ms, 500);
@@ -253,6 +261,26 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.embeddings, EmbeddingsConfig::default());
         assert_eq!(cfg.watch, WatchConfig::default());
         assert_eq!(cfg.storage, StorageConfig::default());
+    }
+
+    #[test]
+    fn parse_legacy_embedding_alias_normalizes_to_canonical_model() {
+        let cfg =
+            parse("[embeddings]\nmodel = \"bge-small-en-v1.5\"\n", None).expect("legacy alias");
+        assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
+    }
+
+    #[test]
+    fn parse_rejects_unknown_embedding_model_before_runtime_downloads() {
+        let err = parse("[embeddings]\nmodel = \"clip-vit-b32\"\n", None)
+            .expect_err("unsupported model must fail during config parse");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("unsupported embedding model"), "got: {msg}");
+                assert!(msg.contains("BAAI/bge-small-en-v1.5"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     #[test]

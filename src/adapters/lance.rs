@@ -14,6 +14,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{FileRef, HallouminateError, Result};
+use crate::domain::embeddings::canonical_model_name;
 use crate::domain::indexer::plan::FileSnapshot;
 
 pub const EMBEDDING_DIM: usize = 384;
@@ -89,18 +90,24 @@ fn default_schema_version() -> u32 {
 }
 
 fn meta_check_or_init(meta_path: &Path, requested_model: &str) -> Result<()> {
+    let requested_model = canonical_model_name(requested_model)?;
     if meta_path.exists() {
         let text = std::fs::read_to_string(meta_path)?;
-        let meta: Meta = toml::from_str(&text)
+        let mut meta: Meta = toml::from_str(&text)
             .map_err(|e| HallouminateError::Config(format!("parse meta.toml: {e}")))?;
-        if meta.embedding_model_name != requested_model {
+        let stored_model = canonical_model_name(&meta.embedding_model_name)?;
+        if stored_model != requested_model {
             return Err(HallouminateError::Embed(format!(
                 "embedding model mismatch: store has {:?}, requested {:?}; \
                  delete {} and re-run `hallouminate index` to rebuild",
-                meta.embedding_model_name,
+                stored_model,
                 requested_model,
                 meta_path.parent().unwrap_or(meta_path).display(),
             )));
+        }
+        if meta.embedding_model_name != stored_model {
+            meta.embedding_model_name = stored_model.to_string();
+            write_meta(meta_path, &meta)?;
         }
         return Ok(());
     }
@@ -108,6 +115,11 @@ fn meta_check_or_init(meta_path: &Path, requested_model: &str) -> Result<()> {
         embedding_model_name: requested_model.to_string(),
         schema_version: 1,
     };
+    write_meta(meta_path, &meta)?;
+    Ok(())
+}
+
+fn write_meta(meta_path: &Path, meta: &Meta) -> Result<()> {
     let body = toml::to_string_pretty(&meta)
         .map_err(|e| HallouminateError::Config(format!("serialize meta: {e}")))?;
     let toml_text = format!("# auto-managed by hallouminate; do not edit\n{body}");
@@ -692,7 +704,8 @@ mod tests {
         let meta_path = dir.path().join("meta.toml");
         meta_check_or_init(&meta_path, "bge-small-en-v1.5").unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
-        assert!(text.contains("bge-small-en-v1.5"));
+        let meta: Meta = toml::from_str(&text).unwrap();
+        assert_eq!(meta.embedding_model_name, "BAAI/bge-small-en-v1.5");
         assert!(text.contains("schema_version"));
         assert!(text.contains("auto-managed"));
     }
@@ -701,21 +714,86 @@ mod tests {
     fn meta_check_or_init_passes_when_existing_matches() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5").unwrap();
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5").expect("second call must succeed");
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").expect("second call must succeed");
     }
 
     #[test]
     fn meta_check_or_init_errors_on_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5").unwrap();
-        let err = meta_check_or_init(&meta_path, "all-minilm-l6-v2").unwrap_err();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
+        let err =
+            meta_check_or_init(&meta_path, "sentence-transformers/all-MiniLM-L6-v2").unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("bge-small-en-v1.5"), "{msg}");
-        assert!(msg.contains("all-minilm-l6-v2"), "{msg}");
+        assert!(msg.contains("BAAI/bge-small-en-v1.5"), "{msg}");
+        assert!(
+            msg.contains("sentence-transformers/all-MiniLM-L6-v2"),
+            "{msg}"
+        );
         assert!(msg.contains("delete"), "{msg}");
         assert!(msg.contains("hallouminate index"), "{msg}");
+    }
+
+    #[test]
+    fn meta_check_or_init_with_legacy_alias_writes_canonical_to_fresh_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        meta_check_or_init(&meta_path, "bge-small-en-v1.5").unwrap();
+        let text = std::fs::read_to_string(&meta_path).unwrap();
+        let meta: Meta = toml::from_str(&text).unwrap();
+        assert_eq!(meta.embedding_model_name, "BAAI/bge-small-en-v1.5");
+    }
+
+    #[test]
+    fn meta_check_or_init_rejects_unsupported_requested_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        let err = meta_check_or_init(&meta_path, "clip-vit-b32")
+            .expect_err("unsupported request must error before any write");
+        assert!(
+            err.to_string().contains("unsupported embedding model"),
+            "{err}"
+        );
+        assert!(!meta_path.exists(), "must not write sidecar on rejected request");
+    }
+
+    #[test]
+    fn meta_check_or_init_rejects_corrupt_stored_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            r#"# auto-managed by hallouminate; do not edit
+embedding_model_name = "hand-edited-garbage"
+schema_version = 1
+"#,
+        )
+        .unwrap();
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5")
+            .expect_err("corrupt sidecar must error");
+        assert!(
+            err.to_string().contains("unsupported embedding model"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn meta_check_or_init_normalizes_existing_legacy_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            r#"# auto-managed by hallouminate; do not edit
+embedding_model_name = "bge-small-en-v1.5"
+schema_version = 1
+"#,
+        )
+        .unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
+        let text = std::fs::read_to_string(&meta_path).unwrap();
+        assert!(text.contains("BAAI/bge-small-en-v1.5"), "{text}");
+        assert!(!text.contains("\"bge-small-en-v1.5\""), "{text}");
     }
 
     #[test]
@@ -866,7 +944,7 @@ mod tests {
     fn meta_check_or_init_creates_parent_directory_if_missing() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("nested/dir/meta.toml");
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5").unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
         assert!(meta_path.exists());
     }
 }

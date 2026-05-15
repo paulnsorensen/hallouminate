@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Context};
 
 use crate::app::config::{self, xdg_config_path, Config};
+use crate::domain::common::expand_tilde;
+use crate::domain::corpus::load_tokenizer;
+use crate::domain::embeddings::Embedder;
 
 const DEFAULT_TEMPLATE: &str = include_str!("config-default.toml");
 
@@ -15,6 +18,11 @@ pub struct ConfigInitArgs {
 
 #[derive(Debug, Default)]
 pub struct ConfigShowArgs {
+    pub config: Option<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+pub struct ConfigDownloadArgs {
     pub config: Option<PathBuf>,
 }
 
@@ -41,6 +49,17 @@ pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
 pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
     let cfg = config::load(args.config.as_deref())?;
     print!("{}", render_config(&cfg)?);
+    Ok(())
+}
+
+pub fn cmd_config_download(args: ConfigDownloadArgs) -> anyhow::Result<()> {
+    let cfg = config::load(args.config.as_deref())?;
+    let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
+    let _embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir)
+        .with_context(|| format!("download embedding model {}", cfg.embeddings.model))?;
+    let _tokenizer = load_tokenizer(&cfg.embeddings.model)
+        .with_context(|| format!("download tokenizer for {}", cfg.embeddings.model))?;
+    println!("downloaded {}", cfg.embeddings.model);
     Ok(())
 }
 
@@ -142,5 +161,23 @@ mod tests {
             rendered.contains("BAAI/bge-small-en-v1.5"),
             "missing model in defaults: {rendered}"
         );
+    }
+
+    #[test]
+    fn download_rejects_unsupported_model_during_config_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[embeddings]
+model = "clip-vit-b32"
+"#,
+        )
+        .expect("write config");
+        let err = cmd_config_download(ConfigDownloadArgs { config: Some(path) })
+            .expect_err("unsupported model must fail before download");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unsupported embedding model"), "{msg}");
     }
 }

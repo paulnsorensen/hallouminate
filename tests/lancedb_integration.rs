@@ -13,7 +13,7 @@ use hallouminate::domain::search::hybrid_search;
 mod common;
 use common::{placeholder_prepared_file, prepared_file_with_chunks, StubEmbedder};
 
-const MODEL: &str = "bge-small-en-v1.5";
+const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 async fn fresh_store() -> (tempfile::TempDir, LanceStore) {
     let dir = tempfile::tempdir().expect("tempdir");

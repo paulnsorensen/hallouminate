@@ -18,7 +18,7 @@ use text_splitter::Characters;
 mod common;
 use common::StubEmbedder;
 
-const MODEL: &str = "bge-small-en-v1.5";
+const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 /// Seed `dir` with ~15 markdown files of varied content. Each file's body
 /// contains a unique distinctive token so oracle queries can be checked.

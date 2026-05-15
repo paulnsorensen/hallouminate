@@ -2,6 +2,7 @@ use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Parser, Tag, TagEnd};
 use text_splitter::{ChunkConfig, MarkdownSplitter};
 
 use crate::domain::common::{HallouminateError, Result};
+use crate::domain::embeddings::canonical_model_name;
 
 const MAX_HEADING_LEVEL: usize = 3;
 
@@ -95,8 +96,9 @@ pub fn chunk_markdown<S: ChunkSizer>(text: &str, sizer: S) -> Vec<Chunk> {
 /// that text-splitter can use. Networked on first call; cached in the standard
 /// HF cache directory.
 pub fn load_tokenizer(model_id: &str) -> Result<tokenizers::Tokenizer> {
-    tokenizers::Tokenizer::from_pretrained(model_id, None)
-        .map_err(|e| HallouminateError::Embed(format!("load tokenizer {model_id}: {e}")))
+    let canonical_model_id = canonical_model_name(model_id)?;
+    tokenizers::Tokenizer::from_pretrained(canonical_model_id, None)
+        .map_err(|e| HallouminateError::Embed(format!("load tokenizer {canonical_model_id}: {e}")))
 }
 
 // ── Heading path side-pass ──────────────────────────────────────────────
@@ -332,5 +334,12 @@ mod tests {
         let starts = build_line_starts(text);
         assert_eq!(byte_to_line(0, &starts), 1, "first byte is line 1");
         assert_eq!(byte_to_line(2, &starts), 2, "after first \\n is line 2");
+    }
+
+    #[test]
+    fn load_tokenizer_rejects_unsupported_model_before_network_call() {
+        let err = load_tokenizer("clip-vit-b32").expect_err("unsupported must error locally");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported embedding model"), "{msg}");
     }
 }
