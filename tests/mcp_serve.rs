@@ -19,8 +19,22 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Mcp {
     child: Child,
-    stdin: ChildStdin,
+    // `Option` so the cooperative `shutdown` path can `take()` and drop
+    // stdin to signal EOF without moving out of a struct that owns a
+    // `Drop` impl — see the impl block below.
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+}
+
+impl Drop for Mcp {
+    /// RAII safety net: if an assertion panics before `shutdown()` is
+    /// reached, the cooperative shutdown path is skipped — without this
+    /// drop guard the child `hallouminate serve` process would leak past
+    /// the test process exit. `start_kill` is the synchronous, non-async
+    /// kill primitive on `tokio::process::Child`, suitable from `Drop`.
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+    }
 }
 
 impl Mcp {
@@ -38,7 +52,7 @@ impl Mcp {
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             stdout,
         }
     }
@@ -46,8 +60,9 @@ impl Mcp {
     async fn send(&mut self, value: Value) {
         let mut buf = serde_json::to_string(&value).unwrap();
         buf.push('\n');
-        self.stdin.write_all(buf.as_bytes()).await.expect("write");
-        self.stdin.flush().await.expect("flush");
+        let stdin = self.stdin.as_mut().expect("stdin not yet closed");
+        stdin.write_all(buf.as_bytes()).await.expect("write");
+        stdin.flush().await.expect("flush");
     }
 
     async fn recv(&mut self) -> Value {
@@ -88,8 +103,10 @@ impl Mcp {
         .await;
     }
 
-    async fn shutdown(mut self) {
-        drop(self.stdin); // closing stdin tells the server to exit
+    async fn shutdown(&mut self) {
+        // Take + drop stdin to send EOF to the server; the `Drop` impl
+        // would do the same on panic by killing the child outright.
+        self.stdin.take();
         let _ = timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await;
         let _ = self.child.kill().await;
     }

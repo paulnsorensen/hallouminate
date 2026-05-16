@@ -48,7 +48,11 @@ fn render_format(response: &GroundResponse, fmt: Format, strip_prefix: Option<&s
     }
 }
 
-fn trim_snippets(response: &GroundResponse, limit: usize) -> GroundResponse {
+/// Trim every chunk's snippet down to `limit` chars. Public so that
+/// callers (e.g. the MCP adapter) can apply the same trim to the
+/// structured payload they hand back, keeping the `snippet_chars`
+/// contract consistent across both views.
+pub fn trim_snippets(response: &GroundResponse, limit: usize) -> GroundResponse {
     let mut out = response.clone();
     for doc in out.docs.values_mut() {
         for chunk in &mut doc.chunks {

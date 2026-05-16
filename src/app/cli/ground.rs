@@ -25,8 +25,13 @@ pub struct GroundArgs {
 pub async fn cmd_ground(args: GroundArgs) -> anyhow::Result<()> {
     let format = args.format;
     let snippet_chars = args.snippet_chars;
-    let path_prefix_strip = path_prefix_strip(args.config.as_deref(), args.corpus.as_deref())?;
-    let response = run_ground(args).await?;
+    // Load config once and reuse it for both prefix-strip resolution and
+    // the search itself. The previous shape loaded config twice (here and
+    // again inside `run_ground`), wasting a TOML parse on every CLI call
+    // and risking inconsistency if the file changed between reads.
+    let cfg = config::load(args.config.as_deref())?;
+    let path_prefix_strip = resolve_path_prefix_strip(&cfg, args.corpus.as_deref());
+    let response = run_ground_with_cfg(&cfg, args).await?;
     let opts = RenderOpts {
         snippet_chars,
         path_prefix_strip,
@@ -39,17 +44,6 @@ pub async fn cmd_ground(args: GroundArgs) -> anyhow::Result<()> {
 /// path, return that path (with a trailing `/`) so the outline format can
 /// strip it for readability. Multi-path or multi-corpus situations return
 /// `None` — the full absolute path stays so paths remain unambiguous.
-fn path_prefix_strip(
-    config: Option<&std::path::Path>,
-    requested_corpus: Option<&str>,
-) -> anyhow::Result<Option<String>> {
-    let cfg = config::load(config)?;
-    Ok(resolve_path_prefix_strip(&cfg, requested_corpus))
-}
-
-/// Pure inner: pick the corpus the prefix strip applies to, then build the
-/// trailing-slash prefix. Split out from the loader so the policy can be
-/// unit-tested without a temp config file.
 fn resolve_path_prefix_strip(cfg: &Config, requested_corpus: Option<&str>) -> Option<String> {
     let candidate = match requested_corpus {
         Some(name) => cfg.corpora.iter().find(|c| c.name == name),
@@ -70,7 +64,17 @@ fn resolve_path_prefix_strip(cfg: &Config, requested_corpus: Option<&str>) -> Op
 
 pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
     let cfg = config::load(args.config.as_deref())?;
-    let opts = ground_opts(&cfg, &args);
+    run_ground_with_cfg(&cfg, args).await
+}
+
+/// Inner core that takes a pre-loaded `Config`. Callers that already need
+/// to read the config for other reasons (CLI: prefix-strip resolution)
+/// reuse the same load instead of paying for a second TOML parse.
+pub async fn run_ground_with_cfg(
+    cfg: &Config,
+    args: GroundArgs,
+) -> anyhow::Result<GroundResponse> {
+    let opts = ground_opts(cfg, &args);
     let ground_dir = expand_tilde(&cfg.storage.ground_dir);
     let store = LanceStore::open_or_create(&ground_dir, &cfg.embeddings.model)
         .await
@@ -78,7 +82,7 @@ pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
     let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
     let mut embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir)
         .with_context(|| format!("init embedder ({})", cfg.embeddings.model))?;
-    let corpus = pick_corpus(&cfg, args.corpus.as_deref())?;
+    let corpus = pick_corpus(cfg, args.corpus.as_deref())?;
     Ok(ground(&args.query, &corpus, &store, &mut embedder, opts).await?)
 }
 

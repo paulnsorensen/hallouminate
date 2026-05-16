@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::cli::{run_ground, run_index, GroundArgs, IndexArgs};
 use crate::app::config;
-use crate::domain::ground::{render, Format, RenderOpts};
+use crate::domain::ground::{render, trim_snippets, Format, RenderOpts};
 
 const SERVER_INSTRUCTIONS: &str = "Hallouminate exposes three tools: `ground` (semantic search), `index` (refresh the LanceDB index), and `list_corpora` (config introspection). Each tool returns a token-cheap text view in `content` and the full structured response in `structuredContent`.";
 
@@ -32,6 +32,30 @@ fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
 
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
+}
+
+fn invalid_params(msg: impl Into<String>) -> ErrorData {
+    ErrorData::invalid_params(msg.into(), None)
+}
+
+/// Decide whether an error from the ground/index call path is the user's
+/// fault (bad corpus name, missing config field) or the server's fault
+/// (disk I/O, embedder init, LanceDB failure). User-input errors must
+/// surface as JSON-RPC `-32602 invalid_params` so MCP clients can show a
+/// useful retry message; everything else stays `internal_error`.
+fn map_app_error(err: anyhow::Error) -> ErrorData {
+    let msg = err.to_string();
+    // `pick_corpus` emits "corpus \"foo\" not found in config" and the
+    // multi-/no-corpora variants below. All are caller-supplied-argument
+    // problems, not server faults.
+    let is_input_error = (msg.contains("corpus") && msg.contains("not found"))
+        || msg.contains("no corpora configured")
+        || msg.contains("corpus required when multiple corpora");
+    if is_input_error {
+        invalid_params(msg)
+    } else {
+        internal_error(msg)
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -114,9 +138,7 @@ impl HallouminateTools {
             limit: params.limit,
             config: None,
         };
-        let response = run_ground(args)
-            .await
-            .map_err(|e| internal_error(e.to_string()))?;
+        let response = run_ground(args).await.map_err(map_app_error)?;
         let outline = render(
             &response,
             Format::Outline,
@@ -125,8 +147,15 @@ impl HallouminateTools {
                 path_prefix_strip: None,
             },
         );
-        let structured = serde_json::to_value(&response)
-            .map_err(|e| internal_error(e.to_string()))?;
+        // Apply the same snippet trim to the structured payload so both
+        // views honour the `snippet_chars` contract. Without this, callers
+        // that ask for short snippets still receive the full ~200-char
+        // chunker output via `structuredContent`.
+        let structured = match params.snippet_chars {
+            Some(limit) => serde_json::to_value(trim_snippets(&response, limit)),
+            None => serde_json::to_value(&response),
+        }
+        .map_err(|e| internal_error(e.to_string()))?;
         Ok(tool_ok(outline, structured))
     }
 
@@ -143,7 +172,7 @@ impl HallouminateTools {
             config: None,
         })
         .await
-        .map_err(|e| internal_error(e.to_string()))?;
+        .map_err(map_app_error)?;
 
         let summary = report
             .corpora
