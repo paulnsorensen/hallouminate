@@ -518,6 +518,54 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Look up the indexer snapshot for a single `(corpus, file_ref)`. Used
+    /// by the MCP `add_markdown` handler so a re-write of an unchanged file
+    /// can short-circuit re-embedding (route the file through the planner's
+    /// `mtime_touches` path instead of `upserts`). Returns `None` when the
+    /// file has never been indexed under this corpus.
+    pub async fn get_file_snapshot(
+        &self,
+        corpus: &str,
+        file_ref: &str,
+    ) -> Result<Option<FileSnapshot>> {
+        let predicate = format!(
+            "corpus = '{}' AND file_ref = '{}' AND ord = 0",
+            escape_sql_str(corpus),
+            escape_sql_str(file_ref)
+        );
+        let stream = self
+            .table
+            .query()
+            .only_if(predicate)
+            .select(lancedb::query::Select::columns(&[
+                "file_ref",
+                "corpus",
+                "mtime_ms",
+                "content_hash",
+            ]))
+            .limit(1)
+            .execute()
+            .await
+            .map_err(map_lance_err)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        for rb in batches {
+            if rb.num_rows() == 0 {
+                continue;
+            }
+            let file_ref_col = string_col(&rb, "file_ref")?;
+            let corpus_col = string_col(&rb, "corpus")?;
+            let mtime_col = int64_col(&rb, "mtime_ms")?;
+            let hash_col = string_col(&rb, "content_hash")?;
+            return Ok(Some(FileSnapshot {
+                file_ref: file_ref_col.value(0).to_string(),
+                corpus: corpus_col.value(0).to_string(),
+                mtime_ms: mtime_col.value(0),
+                content_hash: hash_col.value(0).to_string(),
+            }));
+        }
+        Ok(None)
+    }
+
     /// Returns one `FileSnapshot` per indexed file in `corpus`. We rely on
     /// the invariant that every prepared file emits at least one chunk with
     /// `ord = 0` (enforced in the indexer's writer), which lets us push

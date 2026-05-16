@@ -2,14 +2,15 @@
 //! the MCP JSON-RPC handshake over its stdio, and assert that `tools/list`
 //! and `tools/call list_corpora` produce the expected shapes.
 //!
-//! Skips `tools/call ground` and `tools/call index` because both would
-//! force the embedding model download (~33MB on first run). The CLI-side
-//! ground test already exercises that path under `#[ignore]`.
-
+//! Most tests skip `tools/call ground` and `tools/call index` because
+//! both would force the embedding model download (~33MB on first run).
+//! The `add_markdown` end-to-end test reuses the developer's already-
+//! downloaded model from the default `cache_dir`; on a fresh machine it
+//! will pay the one-time download cost.
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
@@ -138,6 +139,34 @@ globs = ["**/*.md"]
     std::fs::write(cfg_dir.join("config.toml"), toml).expect("write config.toml");
 }
 
+/// Like `write_config_with_corpus` but pins `[storage].ground_dir` to a
+/// per-test tmpdir so the integration test never touches the developer's
+/// `~/.local/share/hallouminate/ground`. Embedding cache is left at the
+/// default `~/.cache/hallouminate/fastembed` so the test reuses any
+/// already-downloaded model.
+fn write_config_with_corpus_and_ground(
+    dir: &std::path::Path,
+    corpus_name: &str,
+    corpus_path: &str,
+    ground_dir: &std::path::Path,
+) {
+    let cfg_dir = dir.join("hallouminate");
+    std::fs::create_dir_all(&cfg_dir).expect("mkdir hallouminate config dir");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "{corpus_name}"
+paths = ["{corpus_path}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{ground}"
+"#,
+        ground = ground_dir.display(),
+    );
+    std::fs::write(cfg_dir.join("config.toml"), toml).expect("write config.toml");
+}
+
 #[tokio::test]
 async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
     let xdg = tempfile::tempdir().expect("tempdir");
@@ -172,7 +201,7 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
     // MCP protocol requires `notifications/initialized` after the response.
     mcp.notify("notifications/initialized", json!({})).await;
 
-    // 2. tools/list — must surface all three tools we registered.
+    // 2. tools/list — must surface all registered tools.
     let list = mcp.rpc(2, "tools/list", json!({})).await;
     assert!(list.get("error").is_none(), "tools/list errored: {list}");
     let tools = list["result"]["tools"]
@@ -182,7 +211,13 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
-    for expected in ["ground", "index", "list_corpora"] {
+    for expected in [
+        "ground",
+        "index",
+        "list_corpora",
+        "list_files",
+        "add_markdown",
+    ] {
         assert!(
             names.contains(&expected),
             "tool `{expected}` missing from {names:?}"
@@ -233,6 +268,67 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
 }
 
 #[tokio::test]
+async fn mcp_list_files_surfaces_corpus_files_without_indexing() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    std::fs::create_dir_all(corpus.path().join("wiki/concepts")).expect("mkdir");
+    std::fs::write(corpus.path().join("wiki/overview.md"), "# Overview\n").expect("write");
+    std::fs::write(
+        corpus.path().join("wiki/concepts/attention.md"),
+        "# Attention\n",
+    )
+    .expect("write");
+    std::fs::write(corpus.path().join("wiki/ignore.txt"), "ignore").expect("write txt");
+    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({"name": "list_files", "arguments": {"corpus": "wiki"}}),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "tools/call errored: {call}");
+    let result = &call["result"];
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("text content present");
+    assert!(text.contains("wiki/overview.md"), "text content: {text:?}");
+    assert!(
+        text.contains("wiki/concepts/attention.md"),
+        "text content: {text:?}"
+    );
+    assert!(!text.contains("ignore.txt"), "text content: {text:?}");
+
+    let structured = result["structuredContent"]
+        .as_array()
+        .expect("structured payload is an array");
+    let paths: Vec<&str> = structured
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["wiki/concepts/attention.md", "wiki/overview.md"]
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
 async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
     // Strengthen the round-trip: a non-empty config must surface each
     // corpus by name in both the text `content` and the structured
@@ -276,16 +372,18 @@ async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
     let structured = result["structuredContent"]
         .as_array()
         .expect("structured payload is an array");
-    assert_eq!(structured.len(), 1, "expected exactly one corpus: {structured:?}");
+    assert_eq!(
+        structured.len(),
+        1,
+        "expected exactly one corpus: {structured:?}"
+    );
     let entry = &structured[0];
     assert_eq!(
         entry["name"].as_str(),
         Some("test-corpus"),
         "structured entry name: {entry:?}"
     );
-    let paths = entry["paths"]
-        .as_array()
-        .expect("paths is an array");
+    let paths = entry["paths"].as_array().expect("paths is an array");
     assert_eq!(paths.len(), 1, "one path configured: {paths:?}");
     assert_eq!(
         paths[0].as_str(),
@@ -330,26 +428,16 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
         )
         .await;
 
-    // Unknown corpus is a caller-supplied-input error — `map_app_error`
-    // routes it to JSON-RPC `-32602 invalid_params` via the `InputError`
-    // marker the producer attaches in `cli::ground::pick_corpus`. Asserting
-    // the exact code catches a regression where the structural marker is
-    // dropped and the error silently falls back to `-32603 internal_error`
-    // (the PR #16 bug). Also assert the message mentions the unknown
-    // corpus name so a future bug that returns -32602 for an unrelated
-    // reason still fails the test.
-    let err = call
-        .get("error")
-        .unwrap_or_else(|| panic!("unknown corpus must surface as JSON-RPC error: {call}"));
+    // The Copilot fix routes user-input failures through `invalid_params`
+    // (-32602). A regression to `internal_error` (-32603) or a panic must
+    // be visible here.
+    let error = call.get("error").unwrap_or_else(|| {
+        panic!("unknown corpus must surface as a top-level JSON-RPC error, got: {call}")
+    });
     assert_eq!(
-        err["code"].as_i64(),
+        error["code"].as_i64(),
         Some(-32602),
-        "unknown corpus must be -32602 invalid_params, got: {err}"
-    );
-    let message = err["message"].as_str().unwrap_or("");
-    assert!(
-        message.contains("ghost"),
-        "error message must mention the unknown corpus name `ghost`, got: {message:?}"
+        "invalid_params code expected, got: {error}"
     );
 
     // Server must still be alive after the error — send a second request
@@ -358,6 +446,184 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
     assert!(
         alive["result"]["tools"].is_array(),
         "server died after error: {alive}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_add_markdown_writes_reindexes_and_rejects_unsafe_inputs() {
+    // End-to-end coverage of the `add_markdown` JSON-RPC handler — write
+    // path, parent dir creation, reindex side effect, overwrite gate, and
+    // path-escape rejection through `-32602`. Reuses the user's
+    // already-downloaded embedding model via the default `cache_dir`
+    // (`~/.cache/hallouminate/fastembed`); pins `ground_dir` to a tmpdir
+    // so the test never pollutes the developer's real ground directory.
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let ground = tempfile::tempdir().expect("ground tempdir");
+    write_config_with_corpus_and_ground(
+        xdg.path(),
+        "wiki",
+        &corpus.path().to_string_lossy(),
+        ground.path(),
+    );
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // 1. add_markdown into a subdir that does not yet exist — exercises
+    //    parent-dir creation and the atomic write path.
+    let content =
+        "# Photosynthesis\nPhotosynthesis converts sunlight into chemical energy in plant cells.\n";
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "add_markdown",
+                "arguments": {
+                    "corpus": "wiki",
+                    "path": "bio/cells/photosynthesis.md",
+                    "content": content,
+                }
+            }),
+        )
+        .await;
+    assert!(
+        call.get("error").is_none(),
+        "add_markdown errored: {call}"
+    );
+    let result = &call["result"];
+    assert_ne!(
+        result["isError"].as_bool(),
+        Some(true),
+        "add_markdown returned tool-level error: {result}"
+    );
+
+    // File on disk has the exact content; parent dir was created.
+    let written = corpus.path().join("bio/cells/photosynthesis.md");
+    assert!(written.exists(), "file not created: {}", written.display());
+    assert_eq!(
+        std::fs::read_to_string(&written).expect("read written file"),
+        content,
+    );
+    assert!(
+        corpus.path().join("bio/cells").is_dir(),
+        "parent directory was not created"
+    );
+
+    // Structured payload reports the indexed file.
+    let structured = &result["structuredContent"];
+    assert_eq!(
+        structured["corpus"].as_str(),
+        Some("wiki"),
+        "structured.corpus: {structured}"
+    );
+    assert_eq!(
+        structured["path"].as_str(),
+        Some("bio/cells/photosynthesis.md"),
+        "structured.path: {structured}"
+    );
+    let corpora = structured["indexed"]["corpora"]
+        .as_array()
+        .expect("indexed.corpora is an array");
+    assert_eq!(corpora.len(), 1, "indexed.corpora: {corpora:?}");
+    assert_eq!(
+        corpora[0]["files_upserted"].as_u64(),
+        Some(1),
+        "the freshly-written file must show as upserted: {:?}",
+        corpora[0]
+    );
+
+    // 2. ground over the same corpus must surface a chunk from the new
+    //    file — proves the reindex side effect actually landed in LanceDB.
+    let call = mcp
+        .rpc(
+            3,
+            "tools/call",
+            json!({
+                "name": "ground",
+                "arguments": {
+                    "query": "photosynthesis converts sunlight",
+                    "corpus": "wiki",
+                    "top_files": 5,
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "ground errored: {call}");
+    let result = &call["result"];
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("ground text content");
+    assert!(
+        text.contains("photosynthesis.md"),
+        "ground outline must reference the freshly-written file: {text:?}"
+    );
+
+    // 3. second add_markdown to the same path WITHOUT overwrite must fail
+    //    with `invalid_params` (-32602).
+    let call = mcp
+        .rpc(
+            4,
+            "tools/call",
+            json!({
+                "name": "add_markdown",
+                "arguments": {
+                    "corpus": "wiki",
+                    "path": "bio/cells/photosynthesis.md",
+                    "content": "# clobber attempt\n",
+                }
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("second add_markdown must error, got: {call}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "overwrite=false rejection must use invalid_params: {error}"
+    );
+    // File content must be untouched after the rejection.
+    assert_eq!(
+        std::fs::read_to_string(&written).expect("read after reject"),
+        content,
+    );
+
+    // 4. parent-escape `../escape.md` must also surface -32602.
+    let call = mcp
+        .rpc(
+            5,
+            "tools/call",
+            json!({
+                "name": "add_markdown",
+                "arguments": {
+                    "corpus": "wiki",
+                    "path": "../escape.md",
+                    "content": "# escape attempt\n",
+                }
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("path-escape must error, got: {call}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "path-escape rejection must use invalid_params: {error}"
     );
 
     mcp.shutdown().await;
