@@ -330,14 +330,26 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
         )
         .await;
 
-    // Either a top-level JSON-RPC error, or a tool-level error embedded in
-    // result.isError = true with content describing the failure. The
-    // contract is "no panic, no crashed server" — both shapes are valid.
-    let has_rpc_error = call.get("error").is_some();
-    let has_tool_error = call["result"]["isError"].as_bool().unwrap_or(false);
+    // Unknown corpus is a caller-supplied-input error — `map_app_error`
+    // routes it to JSON-RPC `-32602 invalid_params` via the `InputError`
+    // marker the producer attaches in `cli::ground::pick_corpus`. Asserting
+    // the exact code catches a regression where the structural marker is
+    // dropped and the error silently falls back to `-32603 internal_error`
+    // (the PR #16 bug). Also assert the message mentions the unknown
+    // corpus name so a future bug that returns -32602 for an unrelated
+    // reason still fails the test.
+    let err = call
+        .get("error")
+        .unwrap_or_else(|| panic!("unknown corpus must surface as JSON-RPC error: {call}"));
+    assert_eq!(
+        err["code"].as_i64(),
+        Some(-32602),
+        "unknown corpus must be -32602 invalid_params, got: {err}"
+    );
+    let message = err["message"].as_str().unwrap_or("");
     assert!(
-        has_rpc_error || has_tool_error,
-        "unknown corpus must surface as RPC error or tool error: {call}"
+        message.contains("ghost"),
+        "error message must mention the unknown corpus name `ghost`, got: {message:?}"
     );
 
     // Server must still be alive after the error — send a second request

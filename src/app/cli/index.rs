@@ -6,6 +6,7 @@ use serde::Serialize;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::config::{self, Config};
+use crate::app::input_error::InputError;
 use crate::domain::common::{expand_tilde, CorpusConfig};
 use crate::domain::corpus::{load_tokenizer, MarkdownChunker};
 use crate::domain::embeddings::Embedder;
@@ -48,6 +49,9 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
 }
 
 fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusConfig>> {
+    // Caller-input errors (unknown corpus, no corpora at all) construct
+    // via `InputError(...)` so the MCP adapter routes them to JSON-RPC
+    // `-32602 invalid_params`. See `app::input_error`.
     if let Some(file) = args.paths_from.as_deref() {
         return Ok(vec![ad_hoc_corpus(file)?]);
     }
@@ -56,11 +60,11 @@ fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusCo
             .corpora
             .iter()
             .find(|c| c.name == name)
-            .ok_or_else(|| anyhow!("corpus {name:?} not found in config"))?;
+            .ok_or_else(|| InputError::new(format!("corpus {name:?} not found in config")))?;
         return Ok(vec![hit.clone()]);
     }
     if cfg.corpora.is_empty() {
-        return Err(anyhow!("no corpora configured; add [[corpus]] to config"));
+        return Err(InputError::new("no corpora configured; add [[corpus]] to config").into());
     }
     Ok(cfg.corpora.clone())
 }

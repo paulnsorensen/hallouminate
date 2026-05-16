@@ -1,9 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::config::{self, Config};
+use crate::app::input_error::InputError;
 use crate::domain::common::expand_tilde;
 use crate::domain::embeddings::Embedder;
 use crate::domain::ground::{ground, render, Format, GroundOpts, GroundResponse, RenderOpts};
@@ -97,6 +98,11 @@ fn ground_opts(cfg: &Config, args: &GroundArgs) -> GroundOpts {
 }
 
 fn pick_corpus(cfg: &Config, requested: Option<&str>) -> anyhow::Result<String> {
+    // All errors here are caller-supplied-argument problems: unknown corpus,
+    // missing --corpus when ambiguous, no corpora at all. Constructing via
+    // `InputError(...)` marks them structurally so the MCP adapter routes
+    // them to JSON-RPC `-32602 invalid_params` instead of the default
+    // `internal_error`. See `app::input_error`.
     if let Some(name) = requested {
         // Match `select_corpora` on the index path: an explicit --corpus must
         // exist in the config, even when `cfg.corpora` is empty. The previous
@@ -104,18 +110,20 @@ fn pick_corpus(cfg: &Config, requested: Option<&str>) -> anyhow::Result<String> 
         // index-side policy and let `ground --corpus ghost` succeed against
         // an empty config while `index --corpus ghost` errored.
         if !cfg.corpora.iter().any(|c| c.name == name) {
-            return Err(anyhow!("corpus {name:?} not found in config"));
+            return Err(InputError::new(format!("corpus {name:?} not found in config")).into());
         }
         return Ok(name.to_string());
     }
     match cfg.corpora.len() {
-        0 => Err(anyhow!(
-            "no corpora configured; pass --corpus or add [[corpus]] to config"
-        )),
+        0 => Err(InputError::new(
+            "no corpora configured; pass --corpus or add [[corpus]] to config",
+        )
+        .into()),
         1 => Ok(cfg.corpora[0].name.clone()),
-        _ => Err(anyhow!(
-            "corpus required when multiple corpora configured; pass --corpus"
-        )),
+        _ => Err(InputError::new(
+            "corpus required when multiple corpora configured; pass --corpus",
+        )
+        .into()),
     }
 }
 
