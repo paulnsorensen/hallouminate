@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod config;
 mod ground;
@@ -13,7 +13,18 @@ pub use config::{
 };
 pub use ground::{cmd_ground, run_ground, GroundArgs};
 pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
-pub use index::{cmd_index, IndexArgs};
+pub use index::{cmd_index, run_index, IndexArgs, IndexReport};
+
+/// CLI surface for output format selection. Mirrors `domain::ground::Format`
+/// but kept in the app layer to keep `ValueEnum` (a clap dep) out of the
+/// domain module.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum FormatArg {
+    #[default]
+    Outline,
+    Json,
+    JsonPretty,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -34,6 +45,10 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Boot the MCP server on stdio. Exposes `ground`, `index`, and
+    /// `list_corpora` tools to MCP-aware clients (Claude Desktop, Claude
+    /// Code, etc.). The process runs until stdin closes.
+    Serve,
 }
 
 #[derive(Debug, Args)]
@@ -61,8 +76,18 @@ pub struct GroundCli {
     pub query: String,
     #[arg(long)]
     pub corpus: Option<String>,
-    #[arg(long)]
-    pub pretty: bool,
+    /// Output format. Default `outline` is the token-efficient ripgrep-style
+    /// view. `json` and `json-pretty` emit the full structured response.
+    /// Conflicts with `--full`.
+    #[arg(long, value_enum, default_value_t = FormatArg::Outline, conflicts_with = "full")]
+    pub format: FormatArg,
+    /// Shorthand for `--format json-pretty`. The human-readable full view.
+    #[arg(long, conflicts_with = "format")]
+    pub full: bool,
+    /// Trim each chunk's snippet to N chars (ending with `…` if truncated).
+    /// Applies to every format — orthogonal to `--format` / `--full`.
+    #[arg(long, value_name = "N")]
+    pub snippet_chars: Option<usize>,
     #[arg(long, value_name = "N")]
     pub top_files: Option<usize>,
     #[arg(long, value_name = "N")]
@@ -75,10 +100,21 @@ pub struct GroundCli {
 
 impl From<GroundCli> for GroundArgs {
     fn from(cli: GroundCli) -> Self {
+        use crate::domain::ground::Format;
+        let format = if cli.full {
+            Format::JsonPretty
+        } else {
+            match cli.format {
+                FormatArg::Outline => Format::Outline,
+                FormatArg::Json => Format::Json,
+                FormatArg::JsonPretty => Format::JsonPretty,
+            }
+        };
         Self {
             query: cli.query,
             corpus: cli.corpus,
-            pretty: cli.pretty,
+            format,
+            snippet_chars: cli.snippet_chars,
             top_files: cli.top_files,
             chunks_per_file: cli.chunks_per_file,
             limit: cli.limit,
@@ -132,6 +168,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
         },
+        Command::Serve => crate::adapters::mcp::serve_stdio().await,
     }
 }
 
@@ -166,15 +203,61 @@ mod tests {
     }
 
     #[test]
-    fn parses_ground_subcommand_with_query() {
+    fn parses_ground_subcommand_with_query_and_outline_default() {
         let cli = Cli::try_parse_from(["hallouminate", "ground", "spice melange"])
             .expect("parse ground");
         match cli.command {
             Command::Ground(args) => {
                 assert_eq!(args.query, "spice melange");
-                assert!(!args.pretty);
+                assert!(!args.full);
+                assert_eq!(args.format, FormatArg::Outline);
                 assert_eq!(args.corpus, None);
+                assert_eq!(args.snippet_chars, None);
             }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_ground_with_format_json_flag() {
+        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--format", "json"])
+            .expect("parse");
+        match cli.command {
+            Command::Ground(args) => {
+                assert_eq!(args.format, FormatArg::Json);
+                assert!(!args.full);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_ground_with_full_flag() {
+        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--full"])
+            .expect("parse");
+        match cli.command {
+            Command::Ground(args) => {
+                assert!(args.full);
+                // GroundArgs conversion maps --full → Format::JsonPretty.
+                let ga: GroundArgs = args.into();
+                assert_eq!(ga.format, crate::domain::ground::Format::JsonPretty);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_ground_with_snippet_chars() {
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "ground",
+            "q",
+            "--snippet-chars",
+            "80",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::Ground(args) => assert_eq!(args.snippet_chars, Some(80)),
             _ => panic!("wrong variant"),
         }
     }
@@ -187,7 +270,8 @@ mod tests {
             "tokio",
             "--corpus",
             "docs",
-            "--pretty",
+            "--format",
+            "json-pretty",
             "--top-files",
             "5",
             "--chunks-per-file",
@@ -200,7 +284,7 @@ mod tests {
             Command::Ground(args) => {
                 assert_eq!(args.query, "tokio");
                 assert_eq!(args.corpus.as_deref(), Some("docs"));
-                assert!(args.pretty);
+                assert_eq!(args.format, FormatArg::JsonPretty);
                 assert_eq!(args.top_files, Some(5));
                 assert_eq!(args.chunks_per_file, Some(2));
                 assert_eq!(args.limit, Some(20));
@@ -214,6 +298,32 @@ mod tests {
         let err =
             Cli::try_parse_from(["hallouminate", "ground"]).expect_err("query required");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn rejects_full_and_format_together() {
+        // The two flags are mutually exclusive — clap should error before
+        // dispatch instead of letting the user wonder which one won.
+        let err = Cli::try_parse_from([
+            "hallouminate",
+            "ground",
+            "q",
+            "--full",
+            "--format",
+            "json",
+        ])
+        .expect_err("conflicting flags must be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn rejects_removed_pretty_flag() {
+        // Pre-1.0 break: --pretty was the old name for what's now --full.
+        // clap must surface a clean unknown-arg error instead of silently
+        // ignoring the flag and emitting compact JSON.
+        let err = Cli::try_parse_from(["hallouminate", "ground", "q", "--pretty"])
+            .expect_err("--pretty must be rejected as unknown");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]

@@ -1,11 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use serde::Serialize;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::config::{self, Config};
+use crate::app::input_error::InputError;
 use crate::domain::common::{expand_tilde, CorpusConfig};
 use crate::domain::corpus::{load_tokenizer, MarkdownChunker};
 use crate::domain::embeddings::Embedder;
@@ -22,6 +23,15 @@ pub struct IndexArgs {
 }
 
 pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
+    let report = run_index(args).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Build the `IndexReport` without printing it. Split out so non-CLI
+/// transports (e.g. the MCP adapter) can hand the structured report straight
+/// to their caller instead of recovering it from stdout.
+pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
     let cfg = config::load(args.config.as_deref())?;
     let corpora = select_corpora(&cfg, &args)?;
     let ground_dir = expand_tilde(&cfg.storage.ground_dir);
@@ -35,12 +45,13 @@ pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
     let tokenizer = load_tokenizer(&cfg.embeddings.model)
         .with_context(|| format!("load tokenizer for {}", cfg.embeddings.model))?;
     let chunker = MarkdownChunker::new(tokenizer, CHUNK_BUDGET_TOKENS);
-    let report = run_indexing(&corpora, &store, &mut embedder, &chunker).await?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(())
+    run_indexing(&corpora, &store, &mut embedder, &chunker).await
 }
 
 fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusConfig>> {
+    // Caller-input errors (unknown corpus, no corpora at all) construct
+    // via `InputError(...)` so the MCP adapter routes them to JSON-RPC
+    // `-32602 invalid_params`. See `app::input_error`.
     if let Some(file) = args.paths_from.as_deref() {
         return Ok(vec![ad_hoc_corpus(file)?]);
     }
@@ -49,11 +60,11 @@ fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusCo
             .corpora
             .iter()
             .find(|c| c.name == name)
-            .ok_or_else(|| anyhow!("corpus {name:?} not found in config"))?;
+            .ok_or_else(|| InputError::new(format!("corpus {name:?} not found in config")))?;
         return Ok(vec![hit.clone()]);
     }
     if cfg.corpora.is_empty() {
-        return Err(anyhow!("no corpora configured; add [[corpus]] to config"));
+        return Err(InputError::new("no corpora configured; add [[corpus]] to config").into());
     }
     Ok(cfg.corpora.clone())
 }
@@ -68,7 +79,11 @@ fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
         .map(|s| s.to_string())
         .collect();
     if paths.is_empty() {
-        return Err(anyhow!("paths-from file {} is empty", file.display()));
+        return Err(InputError::new(format!(
+            "paths-from file {} is empty",
+            file.display()
+        ))
+        .into());
     }
     Ok(CorpusConfig {
         name: AD_HOC_CORPUS_NAME.into(),
@@ -215,5 +230,9 @@ mod tests {
         fs::write(&list, "\n  \n").unwrap();
         let err = ad_hoc_corpus(&list).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
+        assert!(
+            crate::app::input_error::is_input_error(&err),
+            "empty paths-from must mark as InputError so MCP routes it to -32602: {err}"
+        );
     }
 }
