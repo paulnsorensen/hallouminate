@@ -2538,6 +2538,7 @@ dependencies = [
  "futures",
  "globset",
  "lancedb",
+ "libc",
  "once_cell",
  "pulldown-cmark",
  "rmcp",
