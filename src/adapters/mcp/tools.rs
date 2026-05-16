@@ -1,7 +1,6 @@
-//! Tool registrations for the hallouminate MCP server. Each handler reuses
-//! existing domain/app functions — `run_ground`, `cmd_index` (indirectly),
-//! `config::load` — and emits a `CallToolResult` carrying both a
-//! human-readable text block (outline / summary) and a `structured_content`
+//! Tool registrations for the hallouminate MCP server. Handlers keep the
+//! filesystem as the source of truth and emit a `CallToolResult` carrying both
+//! a human-readable text block (outline / summary) and a `structured_content`
 //! field with the full typed response. Token-cheap for the LLM consumer,
 //! structured for the harness consumer.
 
@@ -339,15 +338,12 @@ impl HallouminateTools {
         let root = first_corpus_root(&corpus).map_err(|e| internal_error(e.to_string()))?;
         let relative =
             safe_relative_path(&params.path).map_err(|e| internal_error(e.to_string()))?;
-        let dest = root.join(&relative);
+        let dest = safe_destination(&root, &relative).map_err(|e| internal_error(e.to_string()))?;
         if dest.exists() && !params.overwrite {
             return Err(internal_error(format!(
                 "{} already exists; pass overwrite=true to replace it",
                 relative.display()
             )));
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| internal_error(e.to_string()))?;
         }
         std::fs::write(&dest, params.content).map_err(|e| internal_error(e.to_string()))?;
         let report = self
@@ -475,6 +471,27 @@ fn safe_relative_path(raw: &str) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+fn safe_destination(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(root)?;
+    let canonical_root = std::fs::canonicalize(root)?;
+    let dest = root.join(relative);
+    let parent = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path must have a parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        anyhow::bail!("path resolves outside the corpus root");
+    }
+    if std::fs::symlink_metadata(&dest)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        anyhow::bail!("refusing to overwrite symlink {}", relative.display());
+    }
+    Ok(dest)
+}
+
 fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>> {
     let roots: Vec<PathBuf> = corpus.paths.iter().map(|path| expand_tilde(path)).collect();
     let mut entries: Vec<FileEntry> = scan(corpus)
@@ -546,6 +563,26 @@ mod tests {
     fn safe_relative_path_accepts_nested_agent_owned_structure() {
         let path = safe_relative_path("wiki/concepts/attention.md").expect("valid relative path");
         assert_eq!(path, PathBuf::from("wiki/concepts/attention.md"));
+    }
+
+    #[test]
+    fn safe_destination_creates_inside_corpus_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let relative = safe_relative_path("wiki/concepts/attention.md").expect("relative");
+        let dest = safe_destination(dir.path(), &relative).expect("safe destination");
+        assert!(dest.starts_with(dir.path()));
+        assert!(dest.parent().expect("parent").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_destination_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).expect("symlink");
+        let relative = safe_relative_path("link/out.md").expect("relative");
+        let err = safe_destination(dir.path(), &relative).expect_err("must reject escape");
+        assert!(err.to_string().contains("outside"), "{err}");
     }
 
     #[test]
