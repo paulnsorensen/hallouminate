@@ -13,7 +13,9 @@ pub use config::{
 };
 pub use ground::{cmd_ground, run_ground, GroundArgs};
 pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
-pub use index::{cmd_index, run_index, CorpusReport, IndexArgs, IndexReport};
+pub use index::{
+    cmd_index, run_index, select_corpora, CorpusReport, IndexArgs, IndexReport, AD_HOC_CORPUS_NAME,
+};
 
 /// CLI surface for output format selection. Mirrors `domain::ground::Format`
 /// but kept in the app layer to keep `ValueEnum` (a clap dep) out of the

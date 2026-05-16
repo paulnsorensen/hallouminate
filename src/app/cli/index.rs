@@ -11,7 +11,7 @@ use crate::domain::corpus::{load_tokenizer, MarkdownChunker};
 use crate::domain::embeddings::Embedder;
 use crate::domain::indexer::index_corpus;
 
-const AD_HOC_CORPUS_NAME: &str = "ad-hoc";
+pub const AD_HOC_CORPUS_NAME: &str = "ad-hoc";
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
 #[derive(Debug, Default, Clone)]
@@ -32,7 +32,7 @@ pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
 /// to their caller instead of recovering it from stdout.
 pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
     let cfg = config::load(args.config.as_deref())?;
-    let corpora = select_corpora(&cfg, &args)?;
+    let corpora = select_corpora(&cfg, args.corpus.as_deref(), args.paths_from.as_deref())?;
     let ground_dir = expand_tilde(&cfg.storage.ground_dir);
     ensure_parent(&ground_dir)?;
     let store = LanceStore::open_or_create(&ground_dir, &cfg.embeddings.model)
@@ -47,11 +47,18 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
     run_indexing(&corpora, &store, &mut embedder, &chunker).await
 }
 
-fn select_corpora(cfg: &Config, args: &IndexArgs) -> anyhow::Result<Vec<CorpusConfig>> {
-    if let Some(file) = args.paths_from.as_deref() {
+/// Resolve which corpora to index for a given request. Shared between the
+/// CLI `index` subcommand and the MCP `index` tool so both transports use
+/// the same fallback rules and `ad-hoc` naming.
+pub fn select_corpora(
+    cfg: &Config,
+    requested: Option<&str>,
+    paths_from: Option<&Path>,
+) -> anyhow::Result<Vec<CorpusConfig>> {
+    if let Some(file) = paths_from {
         return Ok(vec![ad_hoc_corpus(file)?]);
     }
-    if let Some(name) = args.corpus.as_deref() {
+    if let Some(name) = requested {
         let hit = cfg
             .corpora
             .iter()
@@ -145,11 +152,7 @@ mod tests {
         let list = dir.path().join("paths.txt");
         fs::write(&list, "/some/path\n  /another/path  \n\n").unwrap();
         let cfg = Config::default();
-        let args = IndexArgs {
-            paths_from: Some(list),
-            ..Default::default()
-        };
-        let out = select_corpora(&cfg, &args).unwrap();
+        let out = select_corpora(&cfg, None, Some(list.as_path())).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, AD_HOC_CORPUS_NAME);
         assert_eq!(out[0].paths, vec!["/some/path", "/another/path"]);
@@ -172,11 +175,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let args = IndexArgs {
-            corpus: Some("notes".into()),
-            ..Default::default()
-        };
-        let out = select_corpora(&cfg, &args).unwrap();
+        let out = select_corpora(&cfg, Some("notes"), None).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "notes");
     }
@@ -184,19 +183,14 @@ mod tests {
     #[test]
     fn select_corpora_errors_when_named_corpus_missing() {
         let cfg = Config::default();
-        let args = IndexArgs {
-            corpus: Some("ghost".into()),
-            ..Default::default()
-        };
-        let err = select_corpora(&cfg, &args).unwrap_err();
+        let err = select_corpora(&cfg, Some("ghost"), None).unwrap_err();
         assert!(err.to_string().contains("ghost"), "{err}");
     }
 
     #[test]
     fn select_corpora_errors_when_no_corpora_and_no_filters() {
         let cfg = Config::default();
-        let args = IndexArgs::default();
-        let err = select_corpora(&cfg, &args).unwrap_err();
+        let err = select_corpora(&cfg, None, None).unwrap_err();
         assert!(err.to_string().contains("no corpora"), "{err}");
     }
 
@@ -210,7 +204,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let out = select_corpora(&cfg, &IndexArgs::default()).unwrap();
+        let out = select_corpora(&cfg, None, None).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "alpha");
     }

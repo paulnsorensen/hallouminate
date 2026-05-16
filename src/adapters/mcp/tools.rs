@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::UNIX_EPOCH;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -16,14 +17,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::adapters::lance::LanceStore;
-use crate::app::cli::{CorpusReport, IndexReport};
+use crate::app::cli::{CorpusReport, IndexReport, select_corpora};
 use crate::app::config;
-use crate::domain::common::{CorpusConfig, expand_tilde};
+use crate::domain::common::{CorpusConfig, Mtime, canonicalize_or_passthrough, expand_tilde};
 use crate::domain::corpus::{MarkdownChunker, load_tokenizer, scan};
 use crate::domain::embeddings::Embedder;
-use crate::domain::ground::{Format, RenderOpts, render};
-use crate::domain::ground::{GroundOpts, ground};
-use crate::domain::indexer::index_corpus;
+use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render};
+use crate::domain::indexer::{DEFAULT_BATCH_SIZE, IndexPlan, Upsert, apply, index_corpus};
 
 const SERVER_INSTRUCTIONS: &str = "Hallouminate exposes tools for semantic grounding, indexing, corpus/file discovery, and plain markdown writes. The filesystem is the source of truth; LanceDB indexes are derived and refreshed automatically after `add_markdown` writes.";
 
@@ -39,6 +39,13 @@ fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
 
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
+}
+
+/// JSON-RPC -32602: surface caller-supplied input failures (bad corpus name,
+/// unsafe path, missing required argument) distinctly from server faults so
+/// MCP clients can route them as user errors instead of retries.
+fn invalid_params(msg: impl Into<String>) -> ErrorData {
+    ErrorData::invalid_params(msg.into(), None)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -121,7 +128,6 @@ struct AddMarkdownResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct StoreKey {
-    corpus: String,
     model: String,
     root: PathBuf,
 }
@@ -141,14 +147,17 @@ impl std::fmt::Debug for McpRuntime {
 }
 
 impl McpRuntime {
+    /// Open (or reuse) the single LanceStore at `ground_root`. The CLI
+    /// (`run_index`, `run_ground`) opens this exact directory, so sharing it
+    /// here keeps both transports pointed at the same on-disk index — writes
+    /// from `add_markdown` are visible to `hallouminate ground` and vice
+    /// versa.
     async fn store_for(
         &self,
         ground_root: &Path,
         model_name: &str,
-        corpus_name: &str,
     ) -> anyhow::Result<Arc<LanceStore>> {
         let key = StoreKey {
-            corpus: corpus_name.to_string(),
             model: model_name.to_string(),
             root: ground_root.to_path_buf(),
         };
@@ -162,9 +171,8 @@ impl McpRuntime {
             return Ok(store);
         }
 
-        let dir = corpus_store_dir(ground_root, corpus_name);
         let store = Arc::new(
-            LanceStore::open_or_create(&dir, model_name)
+            LanceStore::open_or_create(ground_root, model_name)
                 .await
                 .map_err(anyhow::Error::from)?,
         );
@@ -182,11 +190,9 @@ impl McpRuntime {
         let mut embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir)?;
         let tokenizer = load_tokenizer(&cfg.embeddings.model)?;
         let chunker = MarkdownChunker::new(tokenizer, 384);
+        let store = self.store_for(&ground_root, &cfg.embeddings.model).await?;
         let mut report = IndexReport::default();
         for corpus in corpora {
-            let store = self
-                .store_for(&ground_root, &cfg.embeddings.model, &corpus.name)
-                .await?;
             let stats = index_corpus(&corpus, &store, &mut embedder, &chunker).await?;
             report.corpora.push(CorpusReport {
                 name: corpus.name.clone(),
@@ -201,17 +207,71 @@ impl McpRuntime {
         Ok(report)
     }
 
-    async fn index_from_params(&self, params: IndexParams) -> anyhow::Result<IndexReport> {
-        let cfg = config::load(None)?;
-        let corpora = select_corpora(&cfg, params.corpus.as_deref(), params.paths_from.as_deref())?;
-        self.index_selected(&cfg, corpora).await
+    /// Re-index a single freshly-written file under `corpus`. Skips the
+    /// corpus-wide scan/plan: we know the file is the only change, so build
+    /// a one-Upsert plan directly and let `apply` reuse the same write path.
+    /// Keeps `add_markdown` latency O(1) in the file size rather than O(N)
+    /// in the corpus size.
+    async fn index_single_file(
+        &self,
+        cfg: &config::Config,
+        corpus: &CorpusConfig,
+        file: &Path,
+    ) -> anyhow::Result<IndexReport> {
+        let ground_root = expand_tilde(&cfg.storage.ground_dir);
+        let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
+        let mut embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir)?;
+        let tokenizer = load_tokenizer(&cfg.embeddings.model)?;
+        let chunker = MarkdownChunker::new(tokenizer, 384);
+        let store = self.store_for(&ground_root, &cfg.embeddings.model).await?;
+        let mtime_ms = file_mtime_ms(file)?;
+        let file_ref = canonicalize_or_passthrough(file);
+        let single_plan = IndexPlan {
+            upserts: vec![Upsert {
+                file: file_ref,
+                mtime: Mtime(mtime_ms),
+            }],
+            ..IndexPlan::default()
+        };
+        let stats = apply(
+            single_plan,
+            &store,
+            &mut embedder,
+            &chunker,
+            corpus,
+            DEFAULT_BATCH_SIZE,
+        )
+        .await?;
+        Ok(IndexReport {
+            corpora: vec![CorpusReport {
+                name: corpus.name.clone(),
+                files_upserted: stats.files_upserted,
+                files_touched: stats.files_touched,
+                files_deleted: stats.files_deleted,
+                files_skipped_empty: stats.files_skipped_empty,
+                chunks_inserted: stats.chunks_inserted,
+                embeddings_inserted: stats.embeddings_inserted,
+            }],
+        })
     }
 }
 
-/// Long-lived MCP server handle. LanceDB stores are cached by
-/// (storage root, embedding model, corpus) so the daemon owns one open LanceDB
-/// instance per configured corpus while still reopening the same on-disk store
-/// after process restarts.
+fn file_mtime_ms(path: &Path) -> anyhow::Result<i64> {
+    let meta = std::fs::metadata(path)?;
+    let modified = meta.modified()?;
+    let dur = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("pre-epoch mtime on {}", path.display()))?;
+    Ok(dur.as_millis() as i64)
+}
+
+/// Long-lived MCP server handle. The LanceStore at `cfg.storage.ground_dir`
+/// is cached by `(ground_root, embedding model)` so the daemon owns one
+/// open LanceDB instance for the configured ground directory and reopens
+/// the same on-disk store after process restarts. Sharing one store across
+/// corpora matches the CLI (`run_index`, `run_ground`), which also opens
+/// `ground_dir` directly — writes from MCP are immediately visible to the
+/// CLI and vice versa.
 #[derive(Debug, Clone)]
 pub struct HallouminateTools {
     // The `tool_router` field is read by `#[tool_handler]`-generated code
@@ -240,11 +300,11 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let cfg = config::load(None).map_err(|e| internal_error(e.to_string()))?;
         let corpus = pick_corpus(&cfg, params.corpus.as_deref())
-            .map_err(|e| internal_error(e.to_string()))?;
+            .map_err(|e| invalid_params(e.to_string()))?;
         let ground_root = expand_tilde(&cfg.storage.ground_dir);
         let store = self
             .runtime
-            .store_for(&ground_root, &cfg.embeddings.model, &corpus.name)
+            .store_for(&ground_root, &cfg.embeddings.model)
             .await
             .map_err(|e| internal_error(e.to_string()))?;
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
@@ -280,12 +340,12 @@ impl HallouminateTools {
         &self,
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let cfg = config::load(None).map_err(|e| internal_error(e.to_string()))?;
+        let corpora = select_corpora(&cfg, params.corpus.as_deref(), params.paths_from.as_deref())
+            .map_err(|e| invalid_params(e.to_string()))?;
         let report = self
             .runtime
-            .index_from_params(IndexParams {
-                corpus: params.corpus,
-                paths_from: params.paths_from,
-            })
+            .index_selected(&cfg, corpora)
             .await
             .map_err(|e| internal_error(e.to_string()))?;
         let summary = report
@@ -313,7 +373,7 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let cfg = config::load(None).map_err(|e| internal_error(e.to_string()))?;
         let corpus = pick_corpus(&cfg, params.corpus.as_deref())
-            .map_err(|e| internal_error(e.to_string()))?;
+            .map_err(|e| invalid_params(e.to_string()))?;
         let entries = list_corpus_files(&corpus).map_err(|e| internal_error(e.to_string()))?;
         let text = entries
             .iter()
@@ -334,13 +394,13 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let cfg = config::load(None).map_err(|e| internal_error(e.to_string()))?;
         let corpus =
-            pick_corpus(&cfg, Some(&params.corpus)).map_err(|e| internal_error(e.to_string()))?;
-        let root = first_corpus_root(&corpus).map_err(|e| internal_error(e.to_string()))?;
+            pick_corpus(&cfg, Some(&params.corpus)).map_err(|e| invalid_params(e.to_string()))?;
+        let root = first_corpus_root(&corpus).map_err(|e| invalid_params(e.to_string()))?;
         let relative =
-            safe_relative_path(&params.path).map_err(|e| internal_error(e.to_string()))?;
-        let dest = safe_destination(&root, &relative).map_err(|e| internal_error(e.to_string()))?;
+            safe_relative_path(&params.path).map_err(|e| invalid_params(e.to_string()))?;
+        let dest = safe_destination(&root, &relative).map_err(|e| invalid_params(e.to_string()))?;
         if dest.exists() && !params.overwrite {
-            return Err(internal_error(format!(
+            return Err(invalid_params(format!(
                 "{} already exists; pass overwrite=true to replace it",
                 relative.display()
             )));
@@ -348,7 +408,7 @@ impl HallouminateTools {
         std::fs::write(&dest, params.content).map_err(|e| internal_error(e.to_string()))?;
         let report = self
             .runtime
-            .index_selected(&cfg, vec![corpus.clone()])
+            .index_single_file(&cfg, &corpus, &dest)
             .await
             .map_err(|e| internal_error(e.to_string()))?;
         let response = AddMarkdownResponse {
@@ -397,38 +457,6 @@ impl Default for HallouminateTools {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn select_corpora(
-    cfg: &config::Config,
-    requested: Option<&str>,
-    paths_from: Option<&Path>,
-) -> anyhow::Result<Vec<CorpusConfig>> {
-    if let Some(file) = paths_from {
-        let text = std::fs::read_to_string(file)?;
-        let paths: Vec<String> = text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect();
-        if paths.is_empty() {
-            anyhow::bail!("paths-from file {} is empty", file.display());
-        }
-        return Ok(vec![CorpusConfig {
-            name: "ad-hoc".into(),
-            paths,
-            globs: vec![],
-            exclude: vec![],
-        }]);
-    }
-    if let Some(name) = requested {
-        return Ok(vec![pick_corpus(cfg, Some(name))?]);
-    }
-    if cfg.corpora.is_empty() {
-        anyhow::bail!("no corpora configured; add [[corpus]] to config");
-    }
-    Ok(cfg.corpora.clone())
 }
 
 fn pick_corpus(cfg: &config::Config, requested: Option<&str>) -> anyhow::Result<CorpusConfig> {
@@ -513,31 +541,6 @@ fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>> {
     Ok(entries)
 }
 
-fn corpus_store_dir(ground_root: &Path, corpus_name: &str) -> PathBuf {
-    ground_root.join("corpora").join(format!(
-        "{}-{}",
-        slug(corpus_name),
-        corpus_hash(corpus_name)
-    ))
-}
-
-fn slug(input: &str) -> String {
-    let mut out = String::new();
-    for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() { "corpus".into() } else { out }
-}
-
-fn corpus_hash(input: &str) -> String {
-    let hash = blake3::hash(input.as_bytes());
-    hash.to_hex().as_str()[..12].to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,17 +586,6 @@ mod tests {
         let relative = safe_relative_path("link/out.md").expect("relative");
         let err = safe_destination(dir.path(), &relative).expect_err("must reject escape");
         assert!(err.to_string().contains("outside"), "{err}");
-    }
-
-    #[test]
-    fn corpus_store_dir_is_stable_per_corpus_and_separates_names() {
-        let root = Path::new("/tmp/hallouminate-ground");
-        let first = corpus_store_dir(root, "research/wiki");
-        let second = corpus_store_dir(root, "research/wiki");
-        let other = corpus_store_dir(root, "research_wiki");
-        assert_eq!(first, second);
-        assert_ne!(first, other);
-        assert!(first.starts_with(root.join("corpora")));
     }
 
     #[test]
