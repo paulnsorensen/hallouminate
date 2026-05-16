@@ -5,6 +5,8 @@
 //! structured for the harness consumer.
 
 use std::collections::HashMap;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
@@ -399,13 +401,22 @@ impl HallouminateTools {
         let relative =
             safe_relative_path(&params.path).map_err(|e| invalid_params(e.to_string()))?;
         let dest = safe_destination(&root, &relative).map_err(|e| invalid_params(e.to_string()))?;
-        if dest.exists() && !params.overwrite {
-            return Err(invalid_params(format!(
-                "{} already exists; pass overwrite=true to replace it",
-                relative.display()
-            )));
-        }
-        std::fs::write(&dest, params.content).map_err(|e| internal_error(e.to_string()))?;
+        atomic_write_no_follow(&dest, params.content.as_bytes(), params.overwrite).map_err(
+            |WriteError { kind, source }| match kind {
+                // Refusing to clobber on `overwrite=false` and refusing a
+                // symlink final component are both caller-input failures —
+                // surface them as JSON-RPC `invalid_params` (-32602).
+                WriteErrorKind::Exists => invalid_params(format!(
+                    "{} already exists; pass overwrite=true to replace it",
+                    relative.display()
+                )),
+                WriteErrorKind::Symlink => invalid_params(format!(
+                    "refusing to follow symlink at {}",
+                    relative.display()
+                )),
+                WriteErrorKind::Io => internal_error(source.to_string()),
+            },
+        )?;
         let report = self
             .runtime
             .index_single_file(&cfg, &corpus, &dest)
@@ -500,6 +511,9 @@ fn safe_relative_path(raw: &str) -> anyhow::Result<PathBuf> {
 }
 
 fn safe_destination(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    // Walk + canonicalize the parent chain to refuse escapes through any
+    // intermediate symlink. The final-component symlink race is closed
+    // separately by `atomic_write_no_follow` (`O_NOFOLLOW`).
     std::fs::create_dir_all(root)?;
     let canonical_root = std::fs::canonicalize(root)?;
     let dest = root.join(relative);
@@ -511,17 +525,83 @@ fn safe_destination(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
     if !canonical_parent.starts_with(&canonical_root) {
         anyhow::bail!("path resolves outside the corpus root");
     }
-    if std::fs::symlink_metadata(&dest)
-        .map(|meta| meta.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        anyhow::bail!("refusing to overwrite symlink {}", relative.display());
-    }
     Ok(dest)
 }
 
+#[derive(Debug)]
+enum WriteErrorKind {
+    /// File exists and `overwrite=false`.
+    Exists,
+    /// Final-component symlink rejected by `O_NOFOLLOW` (ELOOP).
+    Symlink,
+    /// Any other I/O failure.
+    Io,
+}
+
+#[derive(Debug)]
+struct WriteError {
+    kind: WriteErrorKind,
+    source: std::io::Error,
+}
+
+/// Atomic write that refuses to follow a symlink at the final path
+/// component (`O_NOFOLLOW`). Combined with `safe_destination`'s parent
+/// canonicalization, this closes the TOCTOU window between the
+/// pre-flight symlink check and the write itself: even if an attacker
+/// races a symlink into place after `safe_destination` returns, the
+/// `open(2)` call here fails with `ELOOP` rather than following it out
+/// of the corpus root. When `overwrite=false`, `O_EXCL` makes the
+/// existence check + create atomic too.
+fn atomic_write_no_follow(dest: &Path, content: &[u8], overwrite: bool) -> Result<(), WriteError> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true);
+    if overwrite {
+        opts.truncate(true);
+    } else {
+        opts.create_new(true); // O_CREAT | O_EXCL
+    }
+    // O_NOFOLLOW: refuse to follow a symlink at the final path
+    // component. On macOS/Linux this fails with ELOOP.
+    opts.custom_flags(libc_o_nofollow());
+    let mut file = opts.open(dest).map_err(|e| {
+        let kind = match e.raw_os_error() {
+            // ELOOP on Linux/macOS when O_NOFOLLOW hits a symlink.
+            Some(40) | Some(62) => WriteErrorKind::Symlink,
+            _ if e.kind() == std::io::ErrorKind::AlreadyExists => WriteErrorKind::Exists,
+            _ => WriteErrorKind::Io,
+        };
+        WriteError { kind, source: e }
+    })?;
+    file.write_all(content)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| WriteError {
+            kind: WriteErrorKind::Io,
+            source: e,
+        })
+}
+
+/// `O_NOFOLLOW` constant. `std::os::unix` doesn't re-export it and we
+/// don't pull in `libc`, so hardcode the (stable, POSIX) value. Both
+/// Linux and macOS define it as 0x100.
+const fn libc_o_nofollow() -> i32 {
+    0x0100
+}
+
 fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>> {
-    let roots: Vec<PathBuf> = corpus.paths.iter().map(|path| expand_tilde(path)).collect();
+    // `scan` returns canonicalized absolute paths (see
+    // `canonicalize_or_passthrough` in `walker.rs`), so the strip prefix has
+    // to be canonicalized too. On macOS, tempdirs differ between
+    // `/var/folders/...` (the configured root) and `/private/var/folders/...`
+    // (what canonicalize returns), and a non-canonicalized strip silently
+    // fails — leaving absolute paths in the user-facing response.
+    let roots: Vec<PathBuf> = corpus
+        .paths
+        .iter()
+        .map(|path| {
+            let expanded = expand_tilde(path);
+            std::fs::canonicalize(&expanded).unwrap_or(expanded)
+        })
+        .collect();
     let mut entries: Vec<FileEntry> = scan(corpus)
         .map_err(anyhow::Error::from)?
         .into_iter()
@@ -586,6 +666,49 @@ mod tests {
         let relative = safe_relative_path("link/out.md").expect("relative");
         let err = safe_destination(dir.path(), &relative).expect_err("must reject escape");
         assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_no_follow_rejects_final_component_symlink() {
+        // Even when `safe_destination` returned a path it considered safe,
+        // the write must refuse to follow a symlink swapped in at the
+        // final component (the TOCTOU window).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let outside_file = outside.path().join("target.md");
+        std::fs::write(&outside_file, "original").expect("seed target");
+        let dest = dir.path().join("raced.md");
+        std::os::unix::fs::symlink(&outside_file, &dest).expect("symlink");
+
+        let err = atomic_write_no_follow(&dest, b"clobber", true)
+            .expect_err("O_NOFOLLOW must reject symlink final component");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{:?}", err);
+        // Target outside the corpus root must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(&outside_file).expect("read"),
+            "original"
+        );
+    }
+
+    #[test]
+    fn atomic_write_no_follow_refuses_existing_without_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("out.md");
+        std::fs::write(&dest, "first").expect("seed");
+        let err = atomic_write_no_follow(&dest, b"second", false)
+            .expect_err("existing file without overwrite must fail");
+        assert!(matches!(err.kind, WriteErrorKind::Exists), "{:?}", err);
+        assert_eq!(std::fs::read_to_string(&dest).expect("read"), "first");
+    }
+
+    #[test]
+    fn atomic_write_no_follow_overwrites_when_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("out.md");
+        std::fs::write(&dest, "first").expect("seed");
+        atomic_write_no_follow(&dest, b"second", true).expect("overwrite ok");
+        assert_eq!(std::fs::read_to_string(&dest).expect("read"), "second");
     }
 
     #[test]
