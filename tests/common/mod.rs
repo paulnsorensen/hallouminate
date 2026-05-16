@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use hallouminate::adapters::lance::{PreparedChunk, PreparedFile, EMBEDDING_DIM};
+use hallouminate::adapters::lance::{EMBEDDING_DIM, PreparedChunk, PreparedFile};
 use hallouminate::domain::common::Result;
 use hallouminate::domain::embeddings::EmbedBatch;
 

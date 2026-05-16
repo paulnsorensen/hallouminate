@@ -1,12 +1,12 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
 use crate::adapters::lance::LanceStore;
 use crate::app::config::{self, Config};
 use crate::domain::common::expand_tilde;
 use crate::domain::embeddings::Embedder;
-use crate::domain::ground::{ground, render, Format, GroundOpts, GroundResponse, RenderOpts};
+use crate::domain::ground::{Format, GroundOpts, GroundResponse, RenderOpts, ground, render};
 
 const DEFAULT_LIMIT: usize = 50;
 

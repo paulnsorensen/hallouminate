@@ -1,13 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::config::{self, Config};
-use crate::domain::common::{expand_tilde, CorpusConfig};
-use crate::domain::corpus::{load_tokenizer, MarkdownChunker};
+use crate::domain::common::{CorpusConfig, expand_tilde};
+use crate::domain::corpus::{MarkdownChunker, load_tokenizer};
 use crate::domain::embeddings::Embedder;
 use crate::domain::indexer::index_corpus;
 

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use hallouminate::app::cli::{cmd_index, run_ground, GroundArgs, IndexArgs};
+use hallouminate::app::cli::{GroundArgs, IndexArgs, cmd_index, run_ground};
 
 fn write_config(config_path: &Path, corpus_root: &Path, ground_dir: &Path, cache_dir: &Path) {
     let toml = format!(

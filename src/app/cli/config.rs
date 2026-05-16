@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
-use crate::app::config::{self, xdg_config_path, Config};
+use crate::app::config::{self, Config, xdg_config_path};
 use crate::domain::common::expand_tilde;
 use crate::domain::corpus::load_tokenizer;
 use crate::domain::embeddings::Embedder;
@@ -37,11 +37,9 @@ pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::write(&target, DEFAULT_TEMPLATE)
-        .with_context(|| format!("write {}", target.display()))?;
+    fs::write(&target, DEFAULT_TEMPLATE).with_context(|| format!("write {}", target.display()))?;
     println!("wrote {}", target.display());
     Ok(())
 }
@@ -129,8 +127,7 @@ mod tests {
 
     #[test]
     fn default_template_parses_to_valid_config() {
-        let cfg: Config =
-            toml::from_str(DEFAULT_TEMPLATE).expect("template must be valid TOML");
+        let cfg: Config = toml::from_str(DEFAULT_TEMPLATE).expect("template must be valid TOML");
         assert!(cfg.corpora.is_empty(), "corpora must start commented-out");
         assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
         assert_eq!(cfg.search.top_files_default, 10);

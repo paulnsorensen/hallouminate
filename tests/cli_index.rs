@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use hallouminate::adapters::lance::LanceStore;
-use hallouminate::app::cli::{cmd_index, IndexArgs};
+use hallouminate::app::cli::{IndexArgs, cmd_index};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 

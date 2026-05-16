@@ -1,10 +1,10 @@
 use crate::adapters::lance::LanceStore;
 use crate::domain::common::{CorpusConfig, Result};
-use crate::domain::corpus::{scan, CorpusChunker};
+use crate::domain::corpus::{CorpusChunker, scan};
 use crate::domain::embeddings::EmbedBatch;
 
-pub use super::apply::{apply, ApplyStats, DEFAULT_BATCH_SIZE};
-pub use super::plan::{plan, FileSnapshot, IndexPlan, MtimeCandidate, Upsert};
+pub use super::apply::{ApplyStats, DEFAULT_BATCH_SIZE, apply};
+pub use super::plan::{FileSnapshot, IndexPlan, MtimeCandidate, Upsert, plan};
 
 pub type IndexStats = ApplyStats;
 

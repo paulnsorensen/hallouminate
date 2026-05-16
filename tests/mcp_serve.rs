@@ -9,7 +9,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
@@ -155,7 +155,7 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
     // MCP protocol requires `notifications/initialized` after the response.
     mcp.notify("notifications/initialized", json!({})).await;
 
-    // 2. tools/list — must surface all three tools we registered.
+    // 2. tools/list — must surface all registered tools.
     let list = mcp.rpc(2, "tools/list", json!({})).await;
     assert!(list.get("error").is_none(), "tools/list errored: {list}");
     let tools = list["result"]["tools"]
@@ -165,7 +165,13 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
-    for expected in ["ground", "index", "list_corpora"] {
+    for expected in [
+        "ground",
+        "index",
+        "list_corpora",
+        "list_files",
+        "add_markdown",
+    ] {
         assert!(
             names.contains(&expected),
             "tool `{expected}` missing from {names:?}"
@@ -216,6 +222,67 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
 }
 
 #[tokio::test]
+async fn mcp_list_files_surfaces_corpus_files_without_indexing() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    std::fs::create_dir_all(corpus.path().join("wiki/concepts")).expect("mkdir");
+    std::fs::write(corpus.path().join("wiki/overview.md"), "# Overview\n").expect("write");
+    std::fs::write(
+        corpus.path().join("wiki/concepts/attention.md"),
+        "# Attention\n",
+    )
+    .expect("write");
+    std::fs::write(corpus.path().join("wiki/ignore.txt"), "ignore").expect("write txt");
+    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({"name": "list_files", "arguments": {"corpus": "wiki"}}),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "tools/call errored: {call}");
+    let result = &call["result"];
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("text content present");
+    assert!(text.contains("wiki/overview.md"), "text content: {text:?}");
+    assert!(
+        text.contains("wiki/concepts/attention.md"),
+        "text content: {text:?}"
+    );
+    assert!(!text.contains("ignore.txt"), "text content: {text:?}");
+
+    let structured = result["structuredContent"]
+        .as_array()
+        .expect("structured payload is an array");
+    let paths: Vec<&str> = structured
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["wiki/concepts/attention.md", "wiki/overview.md"]
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
 async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
     // Strengthen the round-trip: a non-empty config must surface each
     // corpus by name in both the text `content` and the structured
@@ -259,16 +326,18 @@ async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
     let structured = result["structuredContent"]
         .as_array()
         .expect("structured payload is an array");
-    assert_eq!(structured.len(), 1, "expected exactly one corpus: {structured:?}");
+    assert_eq!(
+        structured.len(),
+        1,
+        "expected exactly one corpus: {structured:?}"
+    );
     let entry = &structured[0];
     assert_eq!(
         entry["name"].as_str(),
         Some("test-corpus"),
         "structured entry name: {entry:?}"
     );
-    let paths = entry["paths"]
-        .as_array()
-        .expect("paths is an array");
+    let paths = entry["paths"].as_array().expect("paths is an array");
     assert_eq!(paths.len(), 1, "one path configured: {paths:?}");
     assert_eq!(
         paths[0].as_str(),
