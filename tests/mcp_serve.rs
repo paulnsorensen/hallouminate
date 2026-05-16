@@ -452,6 +452,7 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
 }
 
 #[tokio::test]
+#[ignore = "requires the real embedder and may download a model on first run"]
 async fn mcp_add_markdown_writes_reindexes_and_rejects_unsafe_inputs() {
     // End-to-end coverage of the `add_markdown` JSON-RPC handler — write
     // path, parent dir creation, reindex side effect, overwrite gate, and
@@ -500,10 +501,7 @@ async fn mcp_add_markdown_writes_reindexes_and_rejects_unsafe_inputs() {
             }),
         )
         .await;
-    assert!(
-        call.get("error").is_none(),
-        "add_markdown errored: {call}"
-    );
+    assert!(call.get("error").is_none(), "add_markdown errored: {call}");
     let result = &call["result"];
     assert_ne!(
         result["isError"].as_bool(),

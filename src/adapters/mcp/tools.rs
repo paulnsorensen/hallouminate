@@ -5,13 +5,16 @@
 //! structured for the harness consumer.
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::{CString, OsStr, OsString};
 use std::hash::Hash;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData, ServerInfo};
@@ -25,9 +28,9 @@ use crate::app::config;
 use crate::domain::common::{
     CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough, expand_tilde,
 };
-use crate::domain::corpus::{MarkdownChunker, load_tokenizer, scan};
+use crate::domain::corpus::{MarkdownChunker, blake3_file, load_tokenizer, scan};
 use crate::domain::embeddings::Embedder;
-use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render};
+use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
 
 const SERVER_INSTRUCTIONS: &str = "Hallouminate exposes tools for semantic grounding, indexing, corpus/file discovery, and plain markdown writes. The filesystem is the source of truth; LanceDB indexes are derived and refreshed automatically after `add_markdown` writes.";
@@ -346,13 +349,27 @@ async fn index_single_file_with(
     let file_ref_str = file_ref
         .as_path()
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-utf8 path: {}", file_ref.as_path().display()))?;
+        .ok_or_else(|| anyhow::anyhow!("non-utf8 path: {}", file_ref.as_path().display()))?
+        .to_string();
+    let existing = store.get_file_snapshot(&corpus.name, &file_ref_str).await?;
+    let had_snapshot = existing.is_some();
     let mut db: HashMap<FileRef, FileSnapshot> = HashMap::new();
-    if let Some(snap) = store.get_file_snapshot(&corpus.name, file_ref_str).await? {
-        db.insert(file_ref.clone(), snap);
+    if let Some(snap) = existing {
+        let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
+            blake3_file(file)? != snap.content_hash.as_str()
+        } else {
+            false
+        };
+        if !hash_changed_without_mtime {
+            db.insert(file_ref.clone(), snap);
+        }
     }
     let p = plan(vec![(file_ref, Mtime(mtime_ms))], db);
-    let stats = apply(p, store, embedder, chunker, corpus, DEFAULT_BATCH_SIZE).await?;
+    let mut stats = apply(p, store, embedder, chunker, corpus, DEFAULT_BATCH_SIZE).await?;
+    if stats.files_skipped_empty > 0 && had_snapshot {
+        store.delete_file(&corpus.name, &file_ref_str).await?;
+        stats.files_deleted += 1;
+    }
     Ok(stats)
 }
 
@@ -420,11 +437,16 @@ impl HallouminateTools {
         let response = ground(&params.query, &corpus.name, &store, &mut embedder, opts)
             .await
             .map_err(|e| internal_error(e.to_string()))?;
+        let response = if let Some(limit) = params.snippet_chars {
+            trim_snippets(&response, limit)
+        } else {
+            response
+        };
         let outline = render(
             &response,
             Format::Outline,
             &RenderOpts {
-                snippet_chars: params.snippet_chars,
+                snippet_chars: None,
                 path_prefix_strip: None,
             },
         );
@@ -498,33 +520,28 @@ impl HallouminateTools {
         let root = first_corpus_root(&corpus).map_err(|e| invalid_params(e.to_string()))?;
         let relative =
             safe_relative_path(&params.path).map_err(|e| invalid_params(e.to_string()))?;
-        let dest = safe_destination(&root, &relative)
-            .await
-            .map_err(|e| invalid_params(e.to_string()))?;
-        // `atomic_write_no_follow` stays sync because it relies on
-        // `OpenOptionsExt::custom_flags(O_NOFOLLOW)`, which tokio's async
-        // `OpenOptions` does not expose. Push the blocking IO to a worker
-        // thread so the executor stays free for concurrent MCP requests.
-        let write_dest = dest.clone();
+        let dest = root.join(&relative);
+        ensure_corpus_allows_file(&corpus, &dest).map_err(|e| invalid_params(e.to_string()))?;
+
+        let write_root = root.clone();
         let write_relative = relative.clone();
+        let error_relative = relative.clone();
         let content_bytes = params.content.into_bytes();
         let overwrite = params.overwrite;
-        tokio::task::spawn_blocking(move || {
-            atomic_write_no_follow(&write_dest, &content_bytes, overwrite)
+        let dest = tokio::task::spawn_blocking(move || {
+            atomic_write_no_follow(&write_root, &write_relative, &content_bytes, overwrite)
         })
         .await
         .map_err(|e| internal_error(format!("write task panicked: {e}")))?
         .map_err(|WriteError { kind, source }| match kind {
-            // Refusing to clobber on `overwrite=false` and refusing a
-            // symlink final component are both caller-input failures —
-            // surface them as JSON-RPC `invalid_params` (-32602).
             WriteErrorKind::Exists => invalid_params(format!(
                 "{} already exists; pass overwrite=true to replace it",
-                write_relative.display()
+                error_relative.display()
             )),
-            WriteErrorKind::Symlink => invalid_params(format!(
-                "refusing to follow symlink at {}",
-                write_relative.display()
+            WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => invalid_params(format!(
+                "refusing unsafe path {}: {}",
+                error_relative.display(),
+                source
             )),
             WriteErrorKind::Io => internal_error(source.to_string()),
         })?;
@@ -610,44 +627,56 @@ fn safe_relative_path(raw: &str) -> anyhow::Result<PathBuf> {
     if path.as_os_str().is_empty() || path.is_absolute() {
         anyhow::bail!("path must be a non-empty relative path");
     }
-    if path.components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    }) {
-        anyhow::bail!("path must not contain parent-directory components");
+    if raw.as_bytes().last() == Some(&b'/') || raw == "." || raw.ends_with("/.") {
+        anyhow::bail!("path must name a file");
+    }
+    if raw.starts_with("./") || raw.contains("/./") {
+        anyhow::bail!("path must contain only normal file components");
+    }
+    if !matches!(path.components().next_back(), Some(Component::Normal(_))) {
+        anyhow::bail!("path must name a file");
+    }
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("path must contain only normal file components");
     }
     Ok(path.to_path_buf())
 }
 
-async fn safe_destination(root: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
-    // Walk + canonicalize the parent chain to refuse escapes through any
-    // intermediate symlink. The final-component symlink race is closed
-    // separately by `atomic_write_no_follow` (`O_NOFOLLOW`).
-    //
-    // Uses `tokio::fs` to keep the async MCP handler off blocking syscalls
-    // that would otherwise stall the executor under concurrent requests.
-    tokio::fs::create_dir_all(root).await?;
-    let canonical_root = tokio::fs::canonicalize(root).await?;
-    let dest = root.join(relative);
-    let parent = dest
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("path must have a parent directory"))?;
-    tokio::fs::create_dir_all(parent).await?;
-    let canonical_parent = tokio::fs::canonicalize(parent).await?;
-    if !canonical_parent.starts_with(&canonical_root) {
-        anyhow::bail!("path resolves outside the corpus root");
+fn ensure_corpus_allows_file(corpus: &CorpusConfig, path: &Path) -> anyhow::Result<()> {
+    let include = build_globset(&corpus.globs)?;
+    if matches!(include.as_ref(), Some(inc) if !inc.is_match(path)) {
+        anyhow::bail!("path is not included by corpus globs");
     }
-    Ok(dest)
+    let exclude = build_globset(&corpus.exclude)?;
+    if matches!(exclude.as_ref(), Some(ex) if ex.is_match(path)) {
+        anyhow::bail!("path is excluded by corpus rules");
+    }
+    Ok(())
+}
+
+fn build_globset(patterns: &[String]) -> anyhow::Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern)?;
+        builder.add(glob);
+    }
+    Ok(Some(builder.build()?))
 }
 
 #[derive(Debug)]
 enum WriteErrorKind {
     /// File exists and `overwrite=false`.
     Exists,
-    /// Final-component symlink rejected by `O_NOFOLLOW` (ELOOP).
+    /// A path component was a symlink while walking with `O_NOFOLLOW`.
     Symlink,
+    /// The relative path names a non-directory parent or non-file target.
+    InvalidPath,
     /// Any other I/O failure.
     Io,
 }
@@ -658,47 +687,257 @@ struct WriteError {
     source: std::io::Error,
 }
 
-/// Atomic write that refuses to follow a symlink at the final path
-/// component (`O_NOFOLLOW`). Combined with `safe_destination`'s parent
-/// canonicalization, this closes the TOCTOU window between the
-/// pre-flight symlink check and the write itself: even if an attacker
-/// races a symlink into place after `safe_destination` returns, the
-/// `open(2)` call here fails with `ELOOP` rather than following it out
-/// of the corpus root. When `overwrite=false`, `O_EXCL` makes the
-/// existence check + create atomic too.
-fn atomic_write_no_follow(dest: &Path, content: &[u8], overwrite: bool) -> Result<(), WriteError> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true);
-    if overwrite {
-        opts.truncate(true);
-    } else {
-        opts.create_new(true); // O_CREAT | O_EXCL
+impl WriteError {
+    fn new(kind: WriteErrorKind, source: std::io::Error) -> Self {
+        Self { kind, source }
     }
-    // O_NOFOLLOW: refuse to follow a symlink at the final path
-    // component. On macOS/Linux this fails with ELOOP.
-    opts.custom_flags(libc_o_nofollow());
-    let mut file = opts.open(dest).map_err(|e| {
-        let kind = match e.raw_os_error() {
-            // ELOOP on Linux/macOS when O_NOFOLLOW hits a symlink.
-            Some(40) | Some(62) => WriteErrorKind::Symlink,
-            _ if e.kind() == std::io::ErrorKind::AlreadyExists => WriteErrorKind::Exists,
-            _ => WriteErrorKind::Io,
-        };
-        WriteError { kind, source: e }
-    })?;
-    file.write_all(content)
-        .and_then(|_| file.sync_all())
-        .map_err(|e| WriteError {
-            kind: WriteErrorKind::Io,
-            source: e,
-        })
 }
 
-/// `O_NOFOLLOW` constant. `std::os::unix` doesn't re-export it and we
-/// don't pull in `libc`, so hardcode the (stable, POSIX) value. Both
-/// Linux and macOS define it as 0x100.
-const fn libc_o_nofollow() -> i32 {
-    0x0100
+fn atomic_write_no_follow(
+    root: &Path,
+    relative: &Path,
+    content: &[u8],
+    overwrite: bool,
+) -> Result<PathBuf, WriteError> {
+    std::fs::create_dir_all(root).map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    let names = normal_components(relative)?;
+    let file_name = names
+        .last()
+        .ok_or_else(|| invalid_path_error("path must name a file"))?;
+    let parent = open_parent_dir(root, &names[..names.len() - 1])?;
+    if overwrite {
+        atomic_replace(&parent, file_name.as_os_str(), content)?;
+    } else {
+        write_new_file(&parent, file_name.as_os_str(), content)?;
+    }
+    Ok(root.join(relative))
+}
+
+fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {
+    let mut out = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => out.push(name.to_os_string()),
+            _ => {
+                return Err(invalid_path_error(
+                    "path must contain only normal file components",
+                ));
+            }
+        }
+    }
+    if out.is_empty() {
+        return Err(invalid_path_error("path must name a file"));
+    }
+    Ok(out)
+}
+
+fn open_parent_dir(root: &Path, dirs: &[OsString]) -> Result<OwnedFd, WriteError> {
+    let mut current = open_root_dir(root)?;
+    for dir in dirs {
+        current = open_or_create_child_dir(current.as_raw_fd(), dir.as_os_str())?;
+    }
+    Ok(current)
+}
+
+fn open_root_dir(root: &Path) -> Result<OwnedFd, WriteError> {
+    let c_root = cstring(root.as_os_str())?;
+    let fd = unsafe {
+        libc::open(
+            c_root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    fd_to_owned(fd, WriteErrorKind::Io)
+}
+
+fn open_or_create_child_dir(parent_fd: i32, name: &OsStr) -> Result<OwnedFd, WriteError> {
+    match open_child_dir_no_follow(parent_fd, name) {
+        Ok(fd) => Ok(fd),
+        Err(err) if err.source.raw_os_error() == Some(libc::ENOENT) => {
+            let c_name = cstring(name)?;
+            let made = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), 0o755) };
+            if made == -1 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(classify_path_error(source));
+                }
+            }
+            open_child_dir_no_follow(parent_fd, name)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn open_child_dir_no_follow(parent_fd: i32, name: &OsStr) -> Result<OwnedFd, WriteError> {
+    let c_name = cstring(name)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let fd = unsafe { libc::openat(parent_fd, c_name.as_ptr(), flags) };
+    fd_to_owned(fd, WriteErrorKind::Io).map_err(|err| classify_path_error(err.source))
+}
+
+fn write_new_file(parent: &OwnedFd, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
+    let c_name = cstring(name)?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags, 0o644) };
+    if fd == -1 {
+        return Err(classify_create_error(std::io::Error::last_os_error()));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    write_and_sync(&mut file, content)?;
+    drop(file);
+    fsync_dir(parent)
+}
+
+fn atomic_replace(parent: &OwnedFd, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
+    validate_replace_target(parent.as_raw_fd(), name)?;
+    let (temp_name, mut file) = create_temp_file(parent.as_raw_fd(), name)?;
+    if let Err(err) = write_and_sync(&mut file, content) {
+        cleanup_temp(parent.as_raw_fd(), &temp_name);
+        return Err(err);
+    }
+    drop(file);
+
+    let c_name = cstring(name)?;
+    let renamed = unsafe {
+        libc::renameat(
+            parent.as_raw_fd(),
+            temp_name.as_ptr(),
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+        )
+    };
+    if renamed == -1 {
+        let source = std::io::Error::last_os_error();
+        cleanup_temp(parent.as_raw_fd(), &temp_name);
+        return Err(classify_create_error(source));
+    }
+    fsync_dir(parent)
+}
+
+fn validate_replace_target(parent_fd: i32, name: &OsStr) -> Result<(), WriteError> {
+    let c_name = cstring(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            parent_fd,
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == -1 {
+        let source = std::io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::ENOENT) {
+            return Ok(());
+        }
+        return Err(classify_create_error(source));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let file_type = stat.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFLNK {
+        return Err(WriteError::new(
+            WriteErrorKind::Symlink,
+            std::io::Error::from_raw_os_error(libc::ELOOP),
+        ));
+    }
+    if file_type != libc::S_IFREG {
+        return Err(invalid_path_error("target is not a regular file"));
+    }
+    Ok(())
+}
+
+fn create_temp_file(parent_fd: i32, name: &OsStr) -> Result<(CString, std::fs::File), WriteError> {
+    for attempt in 0..100 {
+        let mut temp = OsString::from(".");
+        temp.push(name);
+        temp.push(format!(
+            ".hallouminate-{}-{attempt}.tmp",
+            std::process::id()
+        ));
+        let c_temp = cstring(temp.as_os_str())?;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(parent_fd, c_temp.as_ptr(), flags, 0o644) };
+        if fd != -1 {
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            return Ok((c_temp, file));
+        }
+        let source = std::io::Error::last_os_error();
+        if source.raw_os_error() != Some(libc::EEXIST) {
+            return Err(classify_create_error(source));
+        }
+    }
+    Err(WriteError::new(
+        WriteErrorKind::Io,
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "temporary filename collision",
+        ),
+    ))
+}
+
+fn write_and_sync(file: &mut std::fs::File, content: &[u8]) -> Result<(), WriteError> {
+    file.write_all(content)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
+}
+
+fn fsync_dir(dir: &OwnedFd) -> Result<(), WriteError> {
+    let rc = unsafe { libc::fsync(dir.as_raw_fd()) };
+    if rc == -1 {
+        Err(WriteError::new(
+            WriteErrorKind::Io,
+            std::io::Error::last_os_error(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_temp(parent_fd: i32, name: &CString) {
+    unsafe {
+        libc::unlinkat(parent_fd, name.as_ptr(), 0);
+    }
+}
+
+fn fd_to_owned(fd: i32, default: WriteErrorKind) -> Result<OwnedFd, WriteError> {
+    if fd == -1 {
+        Err(WriteError::new(default, std::io::Error::last_os_error()))
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn cstring(name: &OsStr) -> Result<CString, WriteError> {
+    CString::new(name.as_bytes()).map_err(|_| invalid_path_error("path contains a NUL byte"))
+}
+
+fn classify_path_error(source: std::io::Error) -> WriteError {
+    match source.raw_os_error() {
+        Some(errno) if errno == libc::ELOOP => WriteError::new(WriteErrorKind::Symlink, source),
+        Some(errno) if errno == libc::ENOTDIR => {
+            WriteError::new(WriteErrorKind::InvalidPath, source)
+        }
+        _ => WriteError::new(WriteErrorKind::Io, source),
+    }
+}
+
+fn classify_create_error(source: std::io::Error) -> WriteError {
+    match source.raw_os_error() {
+        Some(errno) if errno == libc::ELOOP => WriteError::new(WriteErrorKind::Symlink, source),
+        Some(errno) if errno == libc::EEXIST => WriteError::new(WriteErrorKind::Exists, source),
+        Some(errno) if errno == libc::ENOTDIR || errno == libc::EISDIR => {
+            WriteError::new(WriteErrorKind::InvalidPath, source)
+        }
+        _ => WriteError::new(WriteErrorKind::Io, source),
+    }
+}
+
+fn invalid_path_error(msg: &'static str) -> WriteError {
+    WriteError::new(
+        WriteErrorKind::InvalidPath,
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, msg),
+    )
 }
 
 fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>> {
@@ -749,11 +988,24 @@ mod tests {
     }
 
     #[test]
-    fn safe_relative_path_rejects_absolute_and_parent_components() {
-        assert!(safe_relative_path("/tmp/out.md").is_err());
-        assert!(safe_relative_path("../out.md").is_err());
-        assert!(safe_relative_path("wiki/../out.md").is_err());
-        assert!(safe_relative_path("").is_err());
+    fn safe_relative_path_rejects_absolute_parent_and_non_file_components() {
+        for (raw, expected) in [
+            ("/tmp/out.md", "path must be a non-empty relative path"),
+            ("", "path must be a non-empty relative path"),
+            (".", "path must name a file"),
+            ("dir/.", "path must name a file"),
+            ("dir/", "path must name a file"),
+        ] {
+            let err = safe_relative_path(raw).expect_err("path must be rejected");
+            assert_eq!(err.to_string(), expected);
+        }
+        for raw in ["../out.md", "wiki/../out.md", "./out.md", "wiki/./out.md"] {
+            let err = safe_relative_path(raw).expect_err("non-normal path must be rejected");
+            assert_eq!(
+                err.to_string(),
+                "path must contain only normal file components"
+            );
+        }
     }
 
     #[test]
@@ -762,47 +1014,74 @@ mod tests {
         assert_eq!(path, PathBuf::from("wiki/concepts/attention.md"));
     }
 
-    #[tokio::test]
-    async fn safe_destination_creates_inside_corpus_root() {
+    #[test]
+    fn corpus_rules_reject_non_matching_and_excluded_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let corpus = corpus_for(dir.path());
+        ensure_corpus_allows_file(&corpus, &dir.path().join("wiki/overview.md"))
+            .expect("matching markdown path must be allowed");
+        let err = ensure_corpus_allows_file(&corpus, &dir.path().join("wiki/ignore.txt"))
+            .expect_err("non-matching extension must be rejected");
+        assert_eq!(err.to_string(), "path is not included by corpus globs");
+        let err = ensure_corpus_allows_file(&corpus, &dir.path().join("wiki/drafts/private.md"))
+            .expect_err("excluded path must be rejected");
+        assert_eq!(err.to_string(), "path is excluded by corpus rules");
+    }
+
+    #[test]
+    fn atomic_write_no_follow_creates_parent_dirs_inside_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let relative = safe_relative_path("wiki/concepts/attention.md").expect("relative");
-        let dest = safe_destination(dir.path(), &relative)
-            .await
-            .expect("safe destination");
+        let dest = atomic_write_no_follow(dir.path(), &relative, b"# Attention\n", false)
+            .expect("safe write");
         assert!(dest.starts_with(dir.path()));
         assert!(dest.parent().expect("parent").exists());
+        assert_eq!(
+            std::fs::read_to_string(dest).expect("read"),
+            "# Attention\n"
+        );
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn safe_destination_rejects_symlink_escape() {
+    #[test]
+    fn atomic_write_no_follow_rejects_intermediate_symlink_without_creating_outside_dirs() {
         let dir = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
         std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).expect("symlink");
-        let relative = safe_relative_path("link/out.md").expect("relative");
-        let err = safe_destination(dir.path(), &relative)
-            .await
-            .expect_err("must reject escape");
-        assert!(err.to_string().contains("outside"), "{err}");
+        let relative = safe_relative_path("link/new/out.md").expect("relative");
+
+        let err = atomic_write_no_follow(dir.path(), &relative, b"# Escape\n", false)
+            .expect_err("must reject intermediate symlink");
+
+        assert!(
+            matches!(
+                err.kind,
+                WriteErrorKind::Symlink | WriteErrorKind::InvalidPath
+            ),
+            "{:?}",
+            err
+        );
+        assert!(
+            !outside.path().join("new").exists(),
+            "must not create directories through a symlink"
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_rejects_final_component_symlink() {
-        // Even when `safe_destination` returned a path it considered safe,
-        // the write must refuse to follow a symlink swapped in at the
-        // final component (the TOCTOU window).
+        // Even when path validation returned a relative path it considered
+        // safe, the write must refuse to follow a symlink swapped in at the
+        // final component.
         let dir = tempfile::tempdir().expect("tempdir");
         let outside = tempfile::tempdir().expect("outside tempdir");
         let outside_file = outside.path().join("target.md");
         std::fs::write(&outside_file, "original").expect("seed target");
-        let dest = dir.path().join("raced.md");
-        std::os::unix::fs::symlink(&outside_file, &dest).expect("symlink");
+        std::os::unix::fs::symlink(&outside_file, dir.path().join("raced.md")).expect("symlink");
 
-        let err = atomic_write_no_follow(&dest, b"clobber", true)
+        let err = atomic_write_no_follow(dir.path(), Path::new("raced.md"), b"clobber", true)
             .expect_err("O_NOFOLLOW must reject symlink final component");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{:?}", err);
-        // Target outside the corpus root must be untouched.
         assert_eq!(
             std::fs::read_to_string(&outside_file).expect("read"),
             "original"
@@ -814,7 +1093,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let dest = dir.path().join("out.md");
         std::fs::write(&dest, "first").expect("seed");
-        let err = atomic_write_no_follow(&dest, b"second", false)
+        let err = atomic_write_no_follow(dir.path(), Path::new("out.md"), b"second", false)
             .expect_err("existing file without overwrite must fail");
         assert!(matches!(err.kind, WriteErrorKind::Exists), "{:?}", err);
         assert_eq!(std::fs::read_to_string(&dest).expect("read"), "first");
@@ -825,7 +1104,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let dest = dir.path().join("out.md");
         std::fs::write(&dest, "first").expect("seed");
-        atomic_write_no_follow(&dest, b"second", true).expect("overwrite ok");
+        atomic_write_no_follow(dir.path(), Path::new("out.md"), b"second", true)
+            .expect("overwrite ok");
         assert_eq!(std::fs::read_to_string(&dest).expect("read"), "second");
     }
 
@@ -957,6 +1237,58 @@ mod tests {
              planner-routed mtime_touch + hash match): first={first_calls} \
              second={second_calls}"
         );
+    }
+
+    #[tokio::test]
+    async fn index_single_file_with_deletes_old_rows_when_new_content_has_no_chunks() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use text_splitter::Characters;
+
+        const MODEL: &str = "BAAI/bge-small-en-v1.5";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LanceStore::open_or_create(dir.path(), MODEL)
+            .await
+            .expect("open store");
+        let chunker = MarkdownChunker::new(Characters, 2000);
+        let corpus = CorpusConfig {
+            name: "wiki".into(),
+            paths: vec![],
+            globs: vec![],
+            exclude: vec![],
+        };
+
+        let work = tempfile::tempdir().expect("work tempdir");
+        let file = work.path().join("note.md");
+        std::fs::write(&file, "# Spice\nThe spice must flow.\n").expect("seed file");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut embedder = CountingEmbedder { calls };
+
+        index_single_file_with(&store, &mut embedder, &chunker, &corpus, &file)
+            .await
+            .expect("first index");
+        let file_ref = canonicalize_or_passthrough(&file);
+        let file_ref = file_ref.as_path().to_str().expect("utf8 file ref");
+        let snap = store
+            .get_file_snapshot(&corpus.name, file_ref)
+            .await
+            .expect("snapshot lookup")
+            .expect("seed index must create rows");
+        assert_eq!(snap.corpus, corpus.name);
+        assert_eq!(snap.file_ref, file_ref);
+
+        std::fs::write(&file, "\n").expect("write empty markdown");
+        let stats = index_single_file_with(&store, &mut embedder, &chunker, &corpus, &file)
+            .await
+            .expect("empty reindex");
+
+        assert_eq!(stats.files_skipped_empty, 1);
+        assert_eq!(stats.files_deleted, 1);
+        let snap = store
+            .get_file_snapshot(&corpus.name, file_ref)
+            .await
+            .expect("snapshot lookup");
+        assert_eq!(snap, None, "empty rewrite must delete stale rows");
     }
 
     #[test]
