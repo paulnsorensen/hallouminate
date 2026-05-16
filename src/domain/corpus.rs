@@ -6,7 +6,7 @@ mod summary;
 mod walker;
 
 pub use chunker::{
-    Chunk, ChunkSizer, CorpusChunker, MarkdownChunker, chunk_markdown, load_tokenizer,
+    chunk_markdown, load_tokenizer, Chunk, ChunkSizer, CorpusChunker, MarkdownChunker,
 };
 pub use hasher::{blake3_bytes, blake3_file};
 pub use keywords::extract_keywords;

@@ -8,12 +8,12 @@ mod hook;
 mod index;
 
 pub use config::{
-    ConfigDownloadArgs, ConfigInitArgs, ConfigShowArgs, cmd_config_download, cmd_config_init,
-    cmd_config_show,
+    cmd_config_download, cmd_config_init, cmd_config_show, ConfigDownloadArgs, ConfigInitArgs,
+    ConfigShowArgs,
 };
-pub use ground::{GroundArgs, cmd_ground, run_ground};
-pub use hook::{HookArgs, cmd_hook_install, cmd_hook_uninstall};
-pub use index::{CorpusReport, IndexArgs, IndexReport, cmd_index, run_index};
+pub use ground::{cmd_ground, run_ground, GroundArgs};
+pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
+pub use index::{cmd_index, run_index, CorpusReport, IndexArgs, IndexReport};
 
 /// CLI surface for output format selection. Mirrors `domain::ground::Format`
 /// but kept in the app layer to keep `ValueEnum` (a clap dep) out of the
@@ -162,7 +162,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             HookAction::Uninstall { repo } => cmd_hook_uninstall(HookArgs { repo }),
         },
         Command::Config { action } => match action {
-            ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
+            ConfigAction::Init { force, path } => {
+                cmd_config_init(ConfigInitArgs { force, path })
+            }
             ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
         },
@@ -202,8 +204,8 @@ mod tests {
 
     #[test]
     fn parses_ground_subcommand_with_query_and_outline_default() {
-        let cli =
-            Cli::try_parse_from(["hallouminate", "ground", "spice melange"]).expect("parse ground");
+        let cli = Cli::try_parse_from(["hallouminate", "ground", "spice melange"])
+            .expect("parse ground");
         match cli.command {
             Command::Ground(args) => {
                 assert_eq!(args.query, "spice melange");
@@ -231,7 +233,8 @@ mod tests {
 
     #[test]
     fn parses_ground_with_full_flag() {
-        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--full"]).expect("parse");
+        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--full"])
+            .expect("parse");
         match cli.command {
             Command::Ground(args) => {
                 assert!(args.full);
@@ -245,8 +248,14 @@ mod tests {
 
     #[test]
     fn parses_ground_with_snippet_chars() {
-        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--snippet-chars", "80"])
-            .expect("parse");
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "ground",
+            "q",
+            "--snippet-chars",
+            "80",
+        ])
+        .expect("parse");
         match cli.command {
             Command::Ground(args) => assert_eq!(args.snippet_chars, Some(80)),
             _ => panic!("wrong variant"),
@@ -286,7 +295,8 @@ mod tests {
 
     #[test]
     fn rejects_ground_without_query() {
-        let err = Cli::try_parse_from(["hallouminate", "ground"]).expect_err("query required");
+        let err =
+            Cli::try_parse_from(["hallouminate", "ground"]).expect_err("query required");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
@@ -294,9 +304,15 @@ mod tests {
     fn rejects_full_and_format_together() {
         // The two flags are mutually exclusive — clap should error before
         // dispatch instead of letting the user wonder which one won.
-        let err =
-            Cli::try_parse_from(["hallouminate", "ground", "q", "--full", "--format", "json"])
-                .expect_err("conflicting flags must be rejected");
+        let err = Cli::try_parse_from([
+            "hallouminate",
+            "ground",
+            "q",
+            "--full",
+            "--format",
+            "json",
+        ])
+        .expect_err("conflicting flags must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
@@ -312,8 +328,8 @@ mod tests {
 
     #[test]
     fn parses_hook_install_and_uninstall() {
-        let install =
-            Cli::try_parse_from(["hallouminate", "hook", "install"]).expect("parse hook install");
+        let install = Cli::try_parse_from(["hallouminate", "hook", "install"])
+            .expect("parse hook install");
         match install.command {
             Command::Hook {
                 action: HookAction::Install { repo },
@@ -332,8 +348,9 @@ mod tests {
 
     #[test]
     fn parses_hook_install_with_repo_path() {
-        let cli = Cli::try_parse_from(["hallouminate", "hook", "install", "--repo", "/tmp/r"])
-            .expect("parse hook install --repo");
+        let cli =
+            Cli::try_parse_from(["hallouminate", "hook", "install", "--repo", "/tmp/r"])
+                .expect("parse hook install --repo");
         match cli.command {
             Command::Hook {
                 action: HookAction::Install { repo },
@@ -344,8 +361,8 @@ mod tests {
 
     #[test]
     fn parses_config_init_and_show() {
-        let init =
-            Cli::try_parse_from(["hallouminate", "config", "init"]).expect("parse config init");
+        let init = Cli::try_parse_from(["hallouminate", "config", "init"])
+            .expect("parse config init");
         match init.command {
             Command::Config {
                 action: ConfigAction::Init { force, path },
@@ -355,8 +372,8 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
-        let show =
-            Cli::try_parse_from(["hallouminate", "config", "show"]).expect("parse config show");
+        let show = Cli::try_parse_from(["hallouminate", "config", "show"])
+            .expect("parse config show");
         match show.command {
             Command::Config {
                 action: ConfigAction::Show { config },

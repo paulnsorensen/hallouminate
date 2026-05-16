@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
-use crate::domain::embeddings::{DEFAULT_MODEL, canonical_model_name};
+use crate::domain::embeddings::{canonical_model_name, DEFAULT_MODEL};
 
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;

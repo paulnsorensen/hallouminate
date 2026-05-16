@@ -6,12 +6,12 @@
 
 use std::path::PathBuf;
 
-use hallouminate::adapters::lance::{LanceStore, chunk_id_for};
+use hallouminate::adapters::lance::{chunk_id_for, LanceStore};
 use hallouminate::domain::common::FileRef;
 use hallouminate::domain::search::hybrid_search;
 
 mod common;
-use common::{StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks};
+use common::{placeholder_prepared_file, prepared_file_with_chunks, StubEmbedder};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 

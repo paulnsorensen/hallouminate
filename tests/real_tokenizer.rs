@@ -2,7 +2,7 @@
 //! tokenizer. `#[ignore]`-gated because it downloads ~few-MB of tokenizer
 //! files from HuggingFace on first run; opt-in via `cargo test -- --ignored`.
 
-use hallouminate::domain::corpus::{MarkdownChunker, load_tokenizer};
+use hallouminate::domain::corpus::{load_tokenizer, MarkdownChunker};
 use tokenizers::Tokenizer;
 
 const BGE_MODEL: &str = "BAAI/bge-small-en-v1.5";

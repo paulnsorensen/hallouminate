@@ -2,7 +2,7 @@ use std::fs;
 
 use crate::adapters::lance::{PreparedChunk, PreparedFile};
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
-use crate::domain::corpus::{CorpusChunker, blake3_bytes, extract_keywords, extract_summary};
+use crate::domain::corpus::{blake3_bytes, extract_keywords, extract_summary, CorpusChunker};
 
 pub(super) struct WriteRequest<'a> {
     pub corpus: &'a CorpusConfig,

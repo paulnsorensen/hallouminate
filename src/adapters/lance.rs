@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::ListArray;
-use arrow_array::builder::{ListBuilder, StringBuilder};
 use arrow_array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
     StringArray,
 };
+use arrow_array::builder::{ListBuilder, StringBuilder};
+use arrow_array::ListArray;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
@@ -374,7 +374,10 @@ impl LanceStore {
         let meta_path = ground_dir.join(META_FILENAME);
         meta_check_or_init(&meta_path, model_name)?;
         let uri = ground_dir.to_str().ok_or_else(|| {
-            HallouminateError::Config(format!("non-utf8 ground dir: {}", ground_dir.display()))
+            HallouminateError::Config(format!(
+                "non-utf8 ground dir: {}",
+                ground_dir.display()
+            ))
         })?;
         let connection = lancedb::connect(uri)
             .execute()
@@ -422,7 +425,10 @@ impl LanceStore {
             .when_matched_update_all(None)
             .when_not_matched_insert_all()
             .when_not_matched_by_source_delete(Some(scope));
-        builder.execute(reader).await.map_err(map_lance_err)?;
+        builder
+            .execute(reader)
+            .await
+            .map_err(map_lance_err)?;
         self.ensure_search_indexes().await?;
         Ok(())
     }
@@ -432,10 +438,12 @@ impl LanceStore {
     /// some indexes can be created, so this runs after `merge_insert` —
     /// idempotent via `list_indices()`.
     async fn ensure_search_indexes(&self) -> Result<()> {
-        let existing = self.table.list_indices().await.map_err(map_lance_err)?;
-        let has_text_index = existing
-            .iter()
-            .any(|i| i.columns.iter().any(|c| c == "text"));
+        let existing = self
+            .table
+            .list_indices()
+            .await
+            .map_err(map_lance_err)?;
+        let has_text_index = existing.iter().any(|i| i.columns.iter().any(|c| c == "text"));
         if !has_text_index {
             self.table
                 .create_index(&["text"], lancedb::index::Index::FTS(Default::default()))
@@ -450,7 +458,11 @@ impl LanceStore {
             .iter()
             .any(|i| i.columns.iter().any(|c| c == "embedding"));
         if !has_vec_index {
-            let rows = self.table.count_rows(None).await.map_err(map_lance_err)? as u64;
+            let rows = self
+                .table
+                .count_rows(None)
+                .await
+                .map_err(map_lance_err)? as u64;
             if rows >= 256 {
                 if let Err(e) = self
                     .table
@@ -472,7 +484,12 @@ impl LanceStore {
         Ok(())
     }
 
-    pub async fn touch_mtime(&self, corpus: &str, file_ref: &str, new_mtime_ms: i64) -> Result<()> {
+    pub async fn touch_mtime(
+        &self,
+        corpus: &str,
+        file_ref: &str,
+        new_mtime_ms: i64,
+    ) -> Result<()> {
         let predicate = format!(
             "corpus = '{}' AND file_ref = '{}'",
             escape_sql_str(corpus),
@@ -494,7 +511,10 @@ impl LanceStore {
             escape_sql_str(corpus),
             escape_sql_str(file_ref)
         );
-        self.table.delete(&predicate).await.map_err(map_lance_err)?;
+        self.table
+            .delete(&predicate)
+            .await
+            .map_err(map_lance_err)?;
         Ok(())
     }
 
@@ -637,10 +657,7 @@ mod tests {
     fn chunk_id_is_32_lowercase_hex_chars() {
         let id = chunk_id_for("/tmp/whatever.md", 7);
         assert_eq!(id.len(), 32);
-        assert!(
-            id.chars()
-                .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_lowercase()))
-        );
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_lowercase())));
     }
 
     #[test]
@@ -738,10 +755,7 @@ mod tests {
             err.to_string().contains("unsupported embedding model"),
             "{err}"
         );
-        assert!(
-            !meta_path.exists(),
-            "must not write sidecar on rejected request"
-        );
+        assert!(!meta_path.exists(), "must not write sidecar on rejected request");
     }
 
     #[test]

@@ -1,10 +1,10 @@
-use crate::adapters::lance::{EMBEDDING_DIM, LanceStore, PreparedFile};
+use crate::adapters::lance::{LanceStore, PreparedFile, EMBEDDING_DIM};
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
-use crate::domain::corpus::{CorpusChunker, blake3_file};
+use crate::domain::corpus::{blake3_file, CorpusChunker};
 use crate::domain::embeddings::EmbedBatch;
 
 use super::plan::{IndexPlan, MtimeCandidate};
-use super::writer::{WriteRequest, prepare_file};
+use super::writer::{prepare_file, WriteRequest};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyStats {
@@ -43,16 +43,7 @@ pub async fn apply(
             mtime: u.mtime,
         })
         .collect();
-    run_in_batches(
-        upsert_reqs,
-        batch_size,
-        store,
-        embedder,
-        chunker,
-        indexed_at_ms,
-        &mut stats,
-    )
-    .await?;
+    run_in_batches(upsert_reqs, batch_size, store, embedder, chunker, indexed_at_ms, &mut stats).await?;
 
     // Mtime touches: hash-check each. If hash unchanged, just bump mtime.
     // Otherwise re-index (deferred into the upsert path).
