@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use serde::Serialize;
 
 use crate::adapters::lance::LanceStore;
@@ -79,7 +79,11 @@ fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
         .map(|s| s.to_string())
         .collect();
     if paths.is_empty() {
-        return Err(anyhow!("paths-from file {} is empty", file.display()));
+        return Err(InputError::new(format!(
+            "paths-from file {} is empty",
+            file.display()
+        ))
+        .into());
     }
     Ok(CorpusConfig {
         name: AD_HOC_CORPUS_NAME.into(),
@@ -226,5 +230,9 @@ mod tests {
         fs::write(&list, "\n  \n").unwrap();
         let err = ad_hoc_corpus(&list).unwrap_err();
         assert!(err.to_string().contains("empty"), "{err}");
+        assert!(
+            crate::app::input_error::is_input_error(&err),
+            "empty paths-from must mark as InputError so MCP routes it to -32602: {err}"
+        );
     }
 }
