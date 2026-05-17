@@ -26,6 +26,23 @@ pub struct ConfigDownloadArgs {
     pub config: Option<PathBuf>,
 }
 
+#[derive(Debug, Default)]
+pub struct ConfigValidateArgs {
+    pub config: Option<PathBuf>,
+}
+
+/// Top-level keys hallouminate recognizes in its TOML config. Used by
+/// `cmd_config_validate` to flag misspellings (`[[corpora]]`, `Storage`)
+/// that parse cleanly but produce a silently empty/wrong config.
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "corpus",
+    "code_repo",
+    "search",
+    "embeddings",
+    "watch",
+    "storage",
+];
+
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     let target = args.path.unwrap_or_else(xdg_config_path);
     if target.exists() && !args.force {
@@ -65,6 +82,77 @@ pub fn cmd_config_download(args: ConfigDownloadArgs) -> anyhow::Result<()> {
 
 fn render_config(cfg: &Config) -> anyhow::Result<String> {
     toml::to_string_pretty(cfg).context("render config as TOML")
+}
+
+pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
+    let resolved = args.config.clone().unwrap_or_else(xdg_config_path);
+    let raw = match fs::read_to_string(&resolved) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow!("read {}: {e}", resolved.display())),
+    };
+    let cfg = config::load(args.config.as_deref())
+        .with_context(|| format!("parse {}", resolved.display()))?;
+
+    println!("config: {}", resolved.display());
+    if raw.is_none() {
+        println!("(file missing — showing defaults)");
+    }
+    println!("embeddings.model:    {}", cfg.embeddings.model);
+    println!("embeddings.cache_dir: {}", cfg.embeddings.cache_dir);
+    println!("storage.ground_dir:  {}", cfg.storage.ground_dir);
+    println!(
+        "search.top_files:    {}  chunks_per_file: {}",
+        cfg.search.top_files_default, cfg.search.chunks_per_file_default
+    );
+    println!("corpora ({}):", cfg.corpora.len());
+    for c in &cfg.corpora {
+        println!(
+            "  - {}  paths={:?}  globs={:?}  exclude={:?}",
+            c.name, c.paths, c.globs, c.exclude
+        );
+    }
+
+    let warnings = collect_warnings(raw.as_deref(), &cfg);
+    if warnings.is_empty() {
+        println!("ok");
+        return Ok(());
+    }
+    println!();
+    for w in &warnings {
+        println!("warning: {w}");
+    }
+    Err(anyhow!("{} warning(s); see above", warnings.len()))
+}
+
+fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(raw) = raw {
+        match toml::from_str::<toml::Value>(raw) {
+            Ok(toml::Value::Table(table)) => {
+                for key in table.keys() {
+                    if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                        let hint = match key.as_str() {
+                            "corpora" => " (did you mean `[[corpus]]`?)",
+                            "code_repos" => " (did you mean `[[code_repo]]`?)",
+                            _ => "",
+                        };
+                        out.push(format!("unknown top-level key `{key}`{hint}"));
+                    }
+                }
+            }
+            Ok(_) => out.push("config is not a TOML table".to_string()),
+            Err(e) => out.push(format!("re-parse for key check failed: {e}")),
+        }
+    }
+    if cfg.corpora.is_empty() {
+        out.push(
+            "no corpora configured — `ground`, `index`, and `add_markdown` will all error \
+             until you add at least one `[[corpus]]` entry"
+                .to_string(),
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -161,6 +249,95 @@ mod tests {
             rendered.contains("BAAI/bge-small-en-v1.5"),
             "missing model in defaults: {rendered}"
         );
+    }
+
+    #[test]
+    fn validate_flags_corpora_typo_and_returns_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // `[[corpora]]` instead of `[[corpus]]` is the classic typo —
+        // parses cleanly but produces a silently empty corpora list.
+        fs::write(
+            &path,
+            r#"
+[[corpora]]
+name = "wiki"
+paths = ["/tmp/wiki"]
+"#,
+        )
+        .expect("write config");
+        let err = cmd_config_validate(ConfigValidateArgs { config: Some(path) })
+            .expect_err("typo must surface a warning");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("warning"), "{msg}");
+    }
+
+    #[test]
+    fn validate_accepts_config_with_one_corpus_and_no_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[corpus]]
+name = "wiki"
+paths = ["/tmp/wiki"]
+"#,
+        )
+        .expect("write config");
+        cmd_config_validate(ConfigValidateArgs { config: Some(path) })
+            .expect("valid config must return Ok");
+    }
+
+    #[test]
+    fn collect_warnings_flags_unknown_top_level_keys_with_hints() {
+        let raw = r#"
+[[corpora]]
+name = "wiki"
+
+[[code_repos]]
+name = "self"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("parse skeleton");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("`corpora`")
+                && w.contains("[[corpus]]")),
+            "missing corpora hint: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("`code_repos`")
+                && w.contains("[[code_repo]]")),
+            "missing code_repos hint: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_empty_corpora_even_for_valid_keys() {
+        // Only known keys — but no corpora configured. Tools that need a
+        // corpus would silently error at call time without this warning.
+        let raw = r#"
+[storage]
+ground_dir = "~/.local/share/hallouminate"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("parse storage-only");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("no corpora configured")),
+            "missing empty-corpora warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_returns_empty_for_valid_config_with_one_corpus() {
+        let raw = r#"
+[[corpus]]
+name = "wiki"
+paths = ["/tmp/wiki"]
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("parse valid");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(warnings.is_empty(), "expected no warnings, got {warnings:?}");
     }
 
     #[test]

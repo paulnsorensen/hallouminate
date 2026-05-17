@@ -33,7 +33,22 @@ use crate::domain::embeddings::Embedder;
 use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
 
-const SERVER_INSTRUCTIONS: &str = "Hallouminate exposes tools for semantic grounding, indexing, corpus/file discovery, and plain markdown writes. The filesystem is the source of truth; LanceDB indexes are derived and refreshed automatically after `add_markdown` writes.";
+const SERVER_INSTRUCTIONS: &str = "\
+Hallouminate stores a markdown corpus on disk and exposes it for semantic search.
+
+Tools:
+- `list_corpora` — names of configured corpora.
+- `list_files` — relative file paths in a corpus.
+- `read_markdown` — verbatim file contents (UTF-8). Use before overwriting.
+- `add_markdown` — write a file (atomic, no-symlink-follow). Auto-reindexes that file.
+- `delete_markdown` — unlink file + prune index rows.
+- `ground` — semantic search; returns ranked chunks with snippet, heading_path, line_range, score.
+- `index` — bulk (re)index a corpus or all corpora.
+
+Filesystem is the source of truth; LanceDB rows are derived and refreshed after `add_markdown` / `delete_markdown`. `index` is the only way to pick up edits made outside hallouminate.
+
+Wiki conventions for LLM authors: one topic per file; H1 (`# Topic`) on the first line; file stem matches the slug. Multi-root corpora write all `add_markdown` / `delete_markdown` to the FIRST configured root only — keep one root if you can.
+";
 
 /// Build a `CallToolResult` with both a human-readable text content block
 /// and a `structured_content` JSON payload. `CallToolResult` is
@@ -54,6 +69,35 @@ fn internal_error(msg: impl Into<String>) -> ErrorData {
 /// MCP clients can route them as user errors instead of retries.
 fn invalid_params(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
+}
+
+/// Translate a `WriteError` from `read_no_follow` / `unlink_no_follow` into
+/// the JSON-RPC error shape MCP clients see. Path-shape failures (missing,
+/// symlink, non-file) become `invalid_params` so clients route them as user
+/// errors; raw I/O failures stay as `internal_error`. `verb` is the operator
+/// (`"read"`, `"delete"`) used to phrase the message.
+fn translate_path_error(relative: &Path, verb: &str, err: WriteError) -> ErrorData {
+    let WriteError { kind, source } = err;
+    match kind {
+        WriteErrorKind::NotFound => {
+            invalid_params(format!("{} does not exist", relative.display()))
+        }
+        WriteErrorKind::Symlink => invalid_params(format!(
+            "refusing to {verb} symlink {}",
+            relative.display()
+        )),
+        WriteErrorKind::InvalidPath => invalid_params(format!(
+            "{} is not a regular file",
+            relative.display()
+        )),
+        WriteErrorKind::Exists => internal_error(format!(
+            "unexpected Exists from {verb} of {}: {source}",
+            relative.display()
+        )),
+        WriteErrorKind::Io => {
+            internal_error(format!("{verb} {}: {source}", relative.display()))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -103,15 +147,37 @@ pub struct ListFilesParams {
 pub struct AddMarkdownParams {
     /// Corpus that owns the markdown file.
     pub corpus: String,
-    /// Relative path under the corpus' first configured root. The caller owns
-    /// the directory structure and markdown shape.
+    /// Relative path under the corpus' FIRST configured root (multi-root
+    /// corpora ignore paths[1..] for writes). The caller owns the directory
+    /// structure and markdown shape — convention: `<slug>.md` or
+    /// `<category>/<slug>.md`, first line `# Title`.
     pub path: String,
-    /// Markdown bytes to write as UTF-8 text. Hallouminate stores this verbatim
-    /// and does not template or validate the markdown format.
+    /// Markdown bytes to write as UTF-8 text. Stored verbatim — hallouminate
+    /// does not template or validate the markdown format.
     pub content: String,
-    /// Replace an existing file. Defaults to false to avoid accidental clobber.
+    /// Replace an existing file. Defaults to false to avoid accidental
+    /// clobber; use `read_markdown` first to inspect, then re-call with
+    /// overwrite=true.
     #[serde(default)]
     pub overwrite: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ReadMarkdownParams {
+    /// Corpus that owns the markdown file.
+    pub corpus: String,
+    /// Relative path under the corpus' first configured root, same shape as
+    /// `add_markdown`. Symlinks are rejected.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DeleteMarkdownParams {
+    /// Corpus that owns the markdown file.
+    pub corpus: String,
+    /// Relative path under the corpus' first configured root, same shape as
+    /// `add_markdown`. Symlinks are rejected. Irreversible.
+    pub path: String,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -132,6 +198,23 @@ struct AddMarkdownResponse {
     path: String,
     absolute_path: String,
     indexed: IndexReport,
+}
+
+#[derive(Debug, Serialize)]
+struct ReadMarkdownResponse {
+    corpus: String,
+    path: String,
+    absolute_path: String,
+    content: String,
+    bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DeleteMarkdownResponse {
+    corpus: String,
+    path: String,
+    absolute_path: String,
+    file_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -332,6 +415,21 @@ impl McpRuntime {
             }],
         })
     }
+
+    /// Remove a single file's rows from the corpus index. Does NOT touch the
+    /// filesystem — caller unlinks first, then asks the store to prune. No
+    /// embedder is constructed, so deletion is fast and offline-safe.
+    async fn delete_indexed_file(
+        &self,
+        cfg: &config::Config,
+        corpus_name: &str,
+        file_ref: &str,
+    ) -> anyhow::Result<()> {
+        let ground_root = expand_tilde(&cfg.storage.ground_dir);
+        let store = self.store_for(&ground_root, &cfg.embeddings.model).await?;
+        store.delete_file(corpus_name, file_ref).await?;
+        Ok(())
+    }
 }
 
 /// Inner half of `McpRuntime::index_single_file`, parameterized on the
@@ -409,7 +507,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Semantic search over the configured markdown corpora. Returns an outline view in `content` and the full GroundResponse in `structuredContent`."
+        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, chunks: [{chunk_id, heading_path, line_range, score, snippet}] }. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set."
     )]
     pub async fn ground(
         &self,
@@ -487,7 +585,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List files currently visible in a configured corpus, honoring its paths/globs/exclude rules. Returns relative paths when a file is under a configured corpus root."
+        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is an array of {path, absolute_path}. Paths are relative when the file lives under a configured corpus root, absolute otherwise."
     )]
     pub async fn list_files(
         &self,
@@ -508,7 +606,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Write a markdown file under a corpus root, creating parent directories as needed, then refresh that corpus' LanceDB index. Hallouminate stores content verbatim and does not impose a markdown schema."
+        description = "Write a markdown file under the corpus' FIRST configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. For updates, call `read_markdown` first, then re-call with `overwrite=true`."
     )]
     pub async fn add_markdown(
         &self,
@@ -543,7 +641,10 @@ impl HallouminateTools {
                 error_relative.display(),
                 source
             )),
-            WriteErrorKind::Io => internal_error(source.to_string()),
+            // `atomic_write_no_follow` creates parents itself, so a NotFound
+            // here means the kernel surfaced ENOENT on the file itself — fall
+            // through to the same shape as a generic I/O failure.
+            WriteErrorKind::NotFound | WriteErrorKind::Io => internal_error(source.to_string()),
         })?;
         let report = self
             .runtime
@@ -566,7 +667,101 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List corpora configured in the hallouminate config file. Returns names in `content` and `{name, paths}` records in `structuredContent`."
+        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search."
+    )]
+    pub async fn read_markdown(
+        &self,
+        Parameters(params): Parameters<ReadMarkdownParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cfg = config::load(None).map_err(|e| internal_error(e.to_string()))?;
+        let corpus =
+            pick_corpus(&cfg, Some(&params.corpus)).map_err(|e| invalid_params(e.to_string()))?;
+        let root = first_corpus_root(&corpus).map_err(|e| invalid_params(e.to_string()))?;
+        let relative =
+            safe_relative_path(&params.path).map_err(|e| invalid_params(e.to_string()))?;
+        let dest = root.join(&relative);
+        ensure_corpus_allows_file(&corpus, &dest).map_err(|e| invalid_params(e.to_string()))?;
+
+        let read_root = root.clone();
+        let read_relative = relative.clone();
+        let bytes = tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_relative))
+            .await
+            .map_err(|e| internal_error(format!("read task panicked: {e}")))?
+            .map_err(|err| translate_path_error(&relative, "read", err))?;
+        let content = String::from_utf8(bytes).map_err(|e| {
+            invalid_params(format!("{} is not valid UTF-8: {e}", relative.display()))
+        })?;
+        let byte_len = content.len() as u64;
+        let response = ReadMarkdownResponse {
+            corpus: corpus.name,
+            path: relative.to_string_lossy().into_owned(),
+            absolute_path: dest.to_string_lossy().into_owned(),
+            bytes: byte_len,
+            content: content.clone(),
+        };
+        let structured =
+            serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
+        Ok(tool_ok(content, structured))
+    }
+
+    #[tool(
+        description = "Unlink a markdown file from the corpus' first configured root and prune its rows from the LanceDB index. Irreversible. Symlinks are rejected. `content` is a one-line summary; `structuredContent` is { corpus, path, absolute_path, file_ref }."
+    )]
+    pub async fn delete_markdown(
+        &self,
+        Parameters(params): Parameters<DeleteMarkdownParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cfg = config::load(None).map_err(|e| internal_error(e.to_string()))?;
+        let corpus =
+            pick_corpus(&cfg, Some(&params.corpus)).map_err(|e| invalid_params(e.to_string()))?;
+        let root = first_corpus_root(&corpus).map_err(|e| invalid_params(e.to_string()))?;
+        let relative =
+            safe_relative_path(&params.path).map_err(|e| invalid_params(e.to_string()))?;
+        let dest = root.join(&relative);
+        ensure_corpus_allows_file(&corpus, &dest).map_err(|e| invalid_params(e.to_string()))?;
+
+        // Capture the canonical file_ref BEFORE unlinking — canonicalize
+        // resolves through any intermediate directory symlinks (the corpus
+        // root may be a symlinked path on macOS, e.g. /var → /private/var)
+        // and matches the form stored in the chunks table by the walker.
+        // `unlink_no_follow` below still rejects intermediate symlinks at
+        // the syscall layer, so canonicalize is only used to produce the
+        // file_ref string the LanceDB walker writes.
+        let file_ref = canonicalize_or_passthrough(&dest);
+        let file_ref_str = file_ref
+            .as_path()
+            .to_str()
+            .ok_or_else(|| {
+                internal_error(format!("non-utf8 path: {}", file_ref.as_path().display()))
+            })?
+            .to_string();
+
+        let unlink_root = root.clone();
+        let unlink_relative = relative.clone();
+        tokio::task::spawn_blocking(move || unlink_no_follow(&unlink_root, &unlink_relative))
+            .await
+            .map_err(|e| internal_error(format!("unlink task panicked: {e}")))?
+            .map_err(|err| translate_path_error(&relative, "delete", err))?;
+
+        self.runtime
+            .delete_indexed_file(&cfg, &corpus.name, &file_ref_str)
+            .await
+            .map_err(|e| internal_error(e.to_string()))?;
+
+        let response = DeleteMarkdownResponse {
+            corpus: corpus.name.clone(),
+            path: relative.to_string_lossy().into_owned(),
+            absolute_path: dest.to_string_lossy().into_owned(),
+            file_ref: file_ref_str,
+        };
+        let text = format!("deleted {} from corpus {}", response.path, response.corpus);
+        let structured =
+            serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
+        Ok(tool_ok(text, structured))
+    }
+
+    #[tool(
+        description = "List corpora configured in the hallouminate config file. `content` is newline-separated corpus names; `structuredContent` is an array of {name, paths} records. Run `hallouminate config validate` for a richer summary."
     )]
     pub async fn list_corpora(
         &self,
@@ -673,6 +868,9 @@ fn build_globset(patterns: &[String]) -> anyhow::Result<Option<GlobSet>> {
 enum WriteErrorKind {
     /// File exists and `overwrite=false`.
     Exists,
+    /// File (or an intermediate directory) does not exist. Only meaningful
+    /// for read/unlink — `atomic_write_no_follow` creates missing parents.
+    NotFound,
     /// A path component was a symlink while walking with `O_NOFOLLOW`.
     Symlink,
     /// The relative path names a non-directory parent or non-file target.
@@ -737,6 +935,98 @@ fn open_parent_dir(root: &Path, dirs: &[OsString]) -> Result<OwnedFd, WriteError
         current = open_or_create_child_dir(current.as_raw_fd(), dir.as_os_str())?;
     }
     Ok(current)
+}
+
+/// Walk `dirs` from `root` without creating anything. Used by read/unlink
+/// paths where missing components are an error, not an implicit mkdir.
+/// Re-classifies ENOENT as `NotFound` so callers can distinguish a missing
+/// intermediate directory from generic I/O failure.
+fn open_parent_dir_no_create(root: &Path, dirs: &[OsString]) -> Result<OwnedFd, WriteError> {
+    let mut current = open_root_dir(root)?;
+    for dir in dirs {
+        let c_name = cstring(dir.as_os_str())?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::openat(current.as_raw_fd(), c_name.as_ptr(), flags) };
+        if fd == -1 {
+            return Err(classify_open_error(std::io::Error::last_os_error()));
+        }
+        current = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    Ok(current)
+}
+
+/// Read `relative` under `root` rejecting any symlink encountered along the
+/// path. Mirrors `atomic_write_no_follow`'s safety contract: every component
+/// is opened with `O_NOFOLLOW`, including the final file.
+fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteError> {
+    use std::io::Read;
+    let names = normal_components(relative)?;
+    let file_name = names
+        .last()
+        .ok_or_else(|| invalid_path_error("path must name a file"))?;
+    let parent = open_parent_dir_no_create(root, &names[..names.len() - 1])?;
+    let c_name = cstring(file_name.as_os_str())?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags) };
+    if fd == -1 {
+        return Err(classify_open_error(std::io::Error::last_os_error()));
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = file
+        .metadata()
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    if !meta.is_file() {
+        return Err(invalid_path_error("target is not a regular file"));
+    }
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    file.read_to_end(&mut buf)
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    Ok(buf)
+}
+
+/// Unlink `relative` under `root` rejecting any symlink. Uses
+/// `fstatat(..., AT_SYMLINK_NOFOLLOW)` on the final component before
+/// `unlinkat` so a symlinked final file cannot be removed and intermediate
+/// symlinked directories are caught during the `open_parent_dir_no_create`
+/// walk.
+fn unlink_no_follow(root: &Path, relative: &Path) -> Result<(), WriteError> {
+    let names = normal_components(relative)?;
+    let file_name = names
+        .last()
+        .ok_or_else(|| invalid_path_error("path must name a file"))?;
+    let parent = open_parent_dir_no_create(root, &names[..names.len() - 1])?;
+    let c_name = cstring(file_name.as_os_str())?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == -1 {
+        return Err(classify_open_error(std::io::Error::last_os_error()));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let file_type = stat.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFLNK {
+        return Err(WriteError::new(
+            WriteErrorKind::Symlink,
+            std::io::Error::from_raw_os_error(libc::ELOOP),
+        ));
+    }
+    if file_type != libc::S_IFREG {
+        return Err(invalid_path_error("target is not a regular file"));
+    }
+    let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), c_name.as_ptr(), 0) };
+    if rc == -1 {
+        return Err(WriteError::new(
+            WriteErrorKind::Io,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 fn open_root_dir(root: &Path) -> Result<OwnedFd, WriteError> {
@@ -914,6 +1204,20 @@ fn cstring(name: &OsStr) -> Result<CString, WriteError> {
 
 fn classify_path_error(source: std::io::Error) -> WriteError {
     match source.raw_os_error() {
+        Some(errno) if errno == libc::ELOOP => WriteError::new(WriteErrorKind::Symlink, source),
+        Some(errno) if errno == libc::ENOTDIR => {
+            WriteError::new(WriteErrorKind::InvalidPath, source)
+        }
+        _ => WriteError::new(WriteErrorKind::Io, source),
+    }
+}
+
+/// Classifier for read/unlink open paths: ENOENT becomes NotFound so the
+/// caller can render "does not exist" without leaking errno, while ELOOP /
+/// ENOTDIR keep their write-path meanings.
+fn classify_open_error(source: std::io::Error) -> WriteError {
+    match source.raw_os_error() {
+        Some(errno) if errno == libc::ENOENT => WriteError::new(WriteErrorKind::NotFound, source),
         Some(errno) if errno == libc::ELOOP => WriteError::new(WriteErrorKind::Symlink, source),
         Some(errno) if errno == libc::ENOTDIR => {
             WriteError::new(WriteErrorKind::InvalidPath, source)

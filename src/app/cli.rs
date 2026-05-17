@@ -8,8 +8,8 @@ mod hook;
 mod index;
 
 pub use config::{
-    cmd_config_download, cmd_config_init, cmd_config_show, ConfigDownloadArgs, ConfigInitArgs,
-    ConfigShowArgs,
+    cmd_config_download, cmd_config_init, cmd_config_show, cmd_config_validate,
+    ConfigDownloadArgs, ConfigInitArgs, ConfigShowArgs, ConfigValidateArgs,
 };
 pub use ground::{cmd_ground, run_ground, GroundArgs};
 pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
@@ -47,8 +47,9 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// Boot the MCP server on stdio. Exposes `ground`, `index`, and
-    /// `list_corpora` tools to MCP-aware clients (Claude Desktop, Claude
+    /// Boot the MCP server on stdio. Exposes `ground`, `index`,
+    /// `list_corpora`, `list_files`, `add_markdown`, `read_markdown`, and
+    /// `delete_markdown` tools to MCP-aware clients (Claude Desktop, Claude
     /// Code, etc.). The process runs until stdin closes.
     Serve,
 }
@@ -153,6 +154,12 @@ pub enum ConfigAction {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
     },
+    /// Parse the config, print a summary, and flag unknown top-level keys
+    /// (e.g. `[[corpora]]` typo for `[[corpus]]`).
+    Validate {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+    },
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -169,6 +176,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
+            ConfigAction::Validate { config } => cmd_config_validate(ConfigValidateArgs { config }),
         },
         Command::Serve => crate::adapters::mcp::serve_stdio().await,
     }
