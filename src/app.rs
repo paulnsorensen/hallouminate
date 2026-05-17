@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod daemon;
 pub mod input_error;
 
 use clap::Parser;

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroundResponse {
     pub query: String,
     pub took_ms: u64,
@@ -12,12 +12,12 @@ pub struct GroundResponse {
     pub warnings: Vec<Warning>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Stats {
     pub hits: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocFile {
     pub summary: Option<String>,
     pub keywords: Vec<String>,
@@ -27,7 +27,7 @@ pub struct DocFile {
     pub chunks: Vec<DocChunk>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocChunk {
     pub chunk_id: String,
     pub heading_path: Vec<String>,
@@ -36,7 +36,7 @@ pub struct DocChunk {
     pub snippet: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Warning {
     pub code: String,
     pub message: String,

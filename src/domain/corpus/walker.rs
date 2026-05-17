@@ -4,8 +4,8 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use walkdir::WalkDir;
 
 use crate::domain::common::{
-    canonicalize_or_passthrough, expand_tilde, CorpusConfig, FileRef, HallouminateError, Mtime,
-    Result,
+    CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
+    expand_tilde,
 };
 
 pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {

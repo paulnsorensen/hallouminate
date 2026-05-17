@@ -280,7 +280,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     // not prepare time. To exercise the prepare_file error propagation we
     // create then yank the file out from under the indexer between scan and
     // prepare. Use a manual planning path via the lower-level API.
-    use hallouminate::domain::indexer::{apply, plan, DEFAULT_BATCH_SIZE};
+    use hallouminate::domain::indexer::{DEFAULT_BATCH_SIZE, apply, plan};
 
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -306,16 +306,9 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     let p = plan(disk, db);
     fs::remove_file(&real).unwrap();
 
-    let err = apply(
-        p,
-        &store,
-        &mut emb,
-        &chunker,
-        &corpus,
-        DEFAULT_BATCH_SIZE,
-    )
-    .await
-    .expect_err("missing file must surface as Err, not silent skip");
+    let err = apply(p, &store, &mut emb, &chunker, &corpus, DEFAULT_BATCH_SIZE)
+        .await
+        .expect_err("missing file must surface as Err, not silent skip");
     let msg = err.to_string();
     assert!(
         msg.contains("vanishes.md") || msg.contains("No such file") || msg.contains("not found"),

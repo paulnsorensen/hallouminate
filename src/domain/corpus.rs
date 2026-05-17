@@ -1,12 +1,13 @@
 mod chunker;
 mod hasher;
 mod keywords;
+pub mod sandbox;
 mod snippet;
 mod summary;
 mod walker;
 
 pub use chunker::{
-    chunk_markdown, load_tokenizer, Chunk, ChunkSizer, CorpusChunker, MarkdownChunker,
+    Chunk, ChunkSizer, CorpusChunker, MarkdownChunker, chunk_markdown, load_tokenizer,
 };
 pub use hasher::{blake3_bytes, blake3_file};
 pub use keywords::extract_keywords;

@@ -65,10 +65,7 @@ mod tests {
     struct EmptyVecEmbedder;
 
     impl EmbedBatch for EmptyVecEmbedder {
-        fn embed_batch(
-            &mut self,
-            _texts: &[String],
-        ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+        fn embed_batch(&mut self, _texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
             Ok(Vec::new())
         }
     }

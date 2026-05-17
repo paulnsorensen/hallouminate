@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
-use crate::domain::embeddings::{canonical_model_name, DEFAULT_MODEL};
+
+use crate::domain::embeddings::{DEFAULT_MODEL, canonical_model_name};
+use crate::domain::repository::{RepositoryConfig, effective_corpora};
 
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
@@ -12,12 +14,6 @@ const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 const XDG_CONFIG_FALLBACK_BASE: &str = "~/.config";
 const APP_CONFIG_SUBPATH: [&str; 2] = ["hallouminate", "config.toml"];
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CodeRepoConfig {
-    pub name: String,
-    pub path: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchConfig {
@@ -85,8 +81,8 @@ impl Default for StorageConfig {
 pub struct Config {
     #[serde(rename = "corpus", default)]
     pub corpora: Vec<CorpusConfig>,
-    #[serde(rename = "code_repo", default)]
-    pub code_repos: Vec<CodeRepoConfig>,
+    #[serde(rename = "repository", default)]
+    pub repositories: Vec<RepositoryConfig>,
     #[serde(default)]
     pub search: SearchConfig,
     #[serde(default)]
@@ -95,6 +91,16 @@ pub struct Config {
     pub watch: WatchConfig,
     #[serde(default)]
     pub storage: StorageConfig,
+}
+
+impl Config {
+    /// All corpora visible to the daemon: explicit `[[corpus]]` entries plus
+    /// `repo:{name}:wiki` / `repo:{name}:corpus` derived from
+    /// `[[repository]]` entries. Fails on duplicate final names so a
+    /// `[[corpus]]` cannot shadow a derived repository corpus.
+    pub fn effective_corpora(&self) -> Result<Vec<CorpusConfig>> {
+        effective_corpora(&self.corpora, &self.repositories)
+    }
 }
 
 pub fn load(path: Option<&Path>) -> Result<Config> {
@@ -165,6 +171,23 @@ fn validate(cfg: &Config) -> Result<()> {
             )));
         }
     }
+    for (idx, r) in cfg.repositories.iter().enumerate() {
+        if r.name.trim().is_empty() {
+            return Err(HallouminateError::Config(format!(
+                "repository #{idx} has empty name"
+            )));
+        }
+        if r.path.trim().is_empty() {
+            return Err(HallouminateError::Config(format!(
+                "repository '{}' has empty path",
+                r.name
+            )));
+        }
+    }
+    // Surface duplicate-name and bad-name failures at config-load time
+    // instead of waiting for the daemon to enumerate corpora at request
+    // time.
+    cfg.effective_corpora()?;
     Ok(())
 }
 
@@ -198,7 +221,7 @@ paths = ["~/.claude/skills", "~/.claude/agents", "~/.claude/CLAUDE.md"]
 globs = ["**/*.md"]
 exclude = ["**/.git/**", "**/node_modules/**"]
 
-[[code_repo]]
+[[repository]]
 name = "tern"
 path = "~/Dev/tern"
 
@@ -238,9 +261,9 @@ ground_dir = "~/.local/share/hallouminate/ground"
             vec!["**/.git/**".to_string(), "**/node_modules/**".into()]
         );
 
-        assert_eq!(cfg.code_repos.len(), 1);
-        assert_eq!(cfg.code_repos[0].name, "tern");
-        assert_eq!(cfg.code_repos[0].path, "~/Dev/tern");
+        assert_eq!(cfg.repositories.len(), 1);
+        assert_eq!(cfg.repositories[0].name, "tern");
+        assert_eq!(cfg.repositories[0].path, "~/Dev/tern");
 
         assert_eq!(cfg.search.top_files_default, 10);
         assert_eq!(cfg.search.chunks_per_file_default, 3);
@@ -256,7 +279,7 @@ ground_dir = "~/.local/share/hallouminate/ground"
     fn parse_empty_string_yields_full_defaults() {
         let cfg = parse("", None).expect("empty toml parses");
         assert!(cfg.corpora.is_empty());
-        assert!(cfg.code_repos.is_empty());
+        assert!(cfg.repositories.is_empty());
         assert_eq!(cfg.search, SearchConfig::default());
         assert_eq!(cfg.embeddings, EmbeddingsConfig::default());
         assert_eq!(cfg.watch, WatchConfig::default());
@@ -305,6 +328,131 @@ ground_dir = "~/.local/share/hallouminate/ground"
         let err = parse("[[corpus]]\nname = \"docs\"\n", None).expect_err("no paths");
         match err {
             HallouminateError::Config(msg) => assert!(msg.contains("no paths"), "got: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_repository_with_empty_name() {
+        let err = parse("[[repository]]\nname = \"\"\npath = \"/r\"\n", None)
+            .expect_err("empty repository name");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("empty name"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_repository_with_empty_path() {
+        let err = parse("[[repository]]\nname = \"tern\"\npath = \"\"\n", None)
+            .expect_err("empty repository path");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("empty path"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_repository_name_containing_colon() {
+        let err = parse("[[repository]]\nname = \"bad:name\"\npath = \"/r\"\n", None)
+            .expect_err("colon in repo name must surface during validate");
+        match err {
+            HallouminateError::Config(msg) => assert!(msg.contains("bad:name"), "got: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_corpora_includes_repository_wiki_after_user_corpora() {
+        let cfg = parse(
+            r#"
+[[corpus]]
+name = "docs"
+paths = ["/docs"]
+
+[[repository]]
+name = "tern"
+path = "/repos/tern"
+"#,
+            None,
+        )
+        .expect("parses");
+        let all = cfg.effective_corpora().expect("derive");
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["docs", "repo:tern:wiki"]);
+    }
+
+    #[test]
+    fn effective_corpora_includes_repository_source_corpus_when_paths_set() {
+        let cfg = parse(
+            r#"
+[[repository]]
+name = "tern"
+path = "/repos/tern"
+corpus_paths = ["docs"]
+"#,
+            None,
+        )
+        .expect("parses");
+        let all = cfg.effective_corpora().expect("derive");
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["repo:tern:wiki", "repo:tern:corpus"]);
+        let source = &all[1];
+        assert_eq!(source.paths, vec!["/repos/tern/docs".to_string()]);
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_user_corpus_shadowing_repository_wiki() {
+        let err = parse(
+            r#"
+[[corpus]]
+name = "repo:tern:wiki"
+paths = ["/x"]
+
+[[repository]]
+name = "tern"
+path = "/r"
+"#,
+            None,
+        )
+        .expect_err("duplicate must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+                assert!(msg.contains("repo:tern:wiki"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_two_repositories_with_same_name_via_derived_corpus_collision() {
+        // Two `[[repository]]` entries with the same name both derive
+        // `repo:{name}:wiki`, so the second entry must surface as a
+        // duplicate-name failure at config-load time — not at the first
+        // daemon request that happens to enumerate corpora.
+        let err = parse(
+            r#"
+[[repository]]
+name = "tern"
+path = "/r1"
+
+[[repository]]
+name = "tern"
+path = "/r2"
+"#,
+            None,
+        )
+        .expect_err("two repos with the same name must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+                assert!(msg.contains("repo:tern:wiki"), "got: {msg}");
+            }
             other => panic!("unexpected error: {other:?}"),
         }
     }

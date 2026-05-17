@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use hallouminate::adapters::lance::LanceStore;
-use hallouminate::app::cli::{cmd_index, IndexArgs};
+use hallouminate::app::config::Config;
+use hallouminate::app::daemon::DaemonState;
 
 const MODEL_A: &str = "BAAI/bge-small-en-v1.5";
 const MODEL_B: &str = "sentence-transformers/all-MiniLM-L6-v2";
@@ -41,10 +42,11 @@ ground_dir = {dir:?}
 /// error chain, point at a real remediation (`hallouminate index` against an
 /// emptied ground directory), and leave the original `meta.toml` byte-identical.
 ///
-/// Ported from the SQLite-era preserved test
-/// `.context/preserved/model_mismatch.rs`. The new path keys off the
-/// LanceStore sidecar `meta.toml` (see `meta_check_or_init` in
-/// `src/adapters/lance.rs`) instead of a `meta` SQL row.
+/// Now exercised at `DaemonState::open` rather than `cmd_index`, because the
+/// daemon is the canonical owner of the ground directory in the rewired
+/// CLI/MCP path. A user who edits config to swap models and starts a fresh
+/// `hallouminate daemon` should see the model-mismatch error at boot, with
+/// the same shape as the pre-rewire CLI surface.
 #[tokio::test]
 async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -76,14 +78,17 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
     let config_path = dir.path().join("config.toml");
     let cache_dir = std::env::temp_dir().join("hallouminate-mismatch-test-cache");
     write_config(&config_path, &corpus_root, &ground_dir, &cache_dir, MODEL_B);
+    let cfg_text = fs::read_to_string(&config_path).expect("read config");
+    let cfg: Config = toml::from_str(&cfg_text).expect("parse config");
 
-    // 3. cmd_index must refuse before any indexing or model download.
-    let err = cmd_index(IndexArgs {
-        config: Some(config_path),
-        ..Default::default()
-    })
-    .await
-    .expect_err("model switch must refuse");
+    // 3. Opening the daemon's shared LanceStore (the canonical owner of the
+    //    ground dir under the spec) with the new model must refuse — same
+    //    contract as the pre-rewire `cmd_index` path, just enforced one
+    //    layer earlier so every CLI/MCP transport benefits from a single
+    //    point of failure rather than each duplicating the check.
+    let err = DaemonState::open(cfg)
+        .await
+        .expect_err("daemon open with mismatched model must refuse");
 
     let chain = format!("{err:#}");
     assert!(

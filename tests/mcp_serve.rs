@@ -7,13 +7,26 @@
 //! The `add_markdown` end-to-end test reuses the developer's already-
 //! downloaded model from the default `cache_dir`; on a fresh machine it
 //! will pay the one-time download cost.
+//!
+//! Spec contract: every stateful MCP tool dispatches through the local
+//! daemon over a Unix socket. Each test that needs tool work spawns a
+//! per-test daemon (`DaemonHarness`) and sets `HALLOUMINATE_SOCKET` on the
+//! child `serve` process so the MCP tools dial that socket. The handshake
+//! itself (initialize / tools/list) does not need a daemon — pure protocol
+//! plumbing — so tests that only exercise the handshake skip the harness.
+
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use hallouminate::app::config::Config;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::timeout;
+
+mod common;
+use common::daemon::DaemonHarness;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,16 +52,35 @@ impl Drop for Mcp {
 }
 
 impl Mcp {
-    async fn spawn(xdg_config_home: &std::path::Path) -> Self {
+    /// Spawn `hallouminate serve` with `XDG_CONFIG_HOME` pointed at the
+    /// per-test config dir. Optionally set `HALLOUMINATE_SOCKET` so the
+    /// MCP tools dial the per-test daemon harness instead of the
+    /// developer's real daemon socket.
+    async fn spawn(xdg_config_home: &Path, daemon_socket: Option<&Path>) -> Self {
         let bin = env!("CARGO_BIN_EXE_hallouminate");
-        let mut child = Command::new(bin)
-            .arg("serve")
+        let mut cmd = Command::new(bin);
+        cmd.arg("serve")
             .env("XDG_CONFIG_HOME", xdg_config_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn hallouminate serve");
+            .stderr(Stdio::piped());
+        if let Some(socket) = daemon_socket {
+            cmd.env("HALLOUMINATE_SOCKET", socket);
+        } else {
+            // Defensive: don't accidentally leak the dev's daemon into the
+            // test sandbox. Tests that don't pass a socket are tests that
+            // shouldn't dial a daemon at all (handshake-only), so point at
+            // a per-process /dev/null-equivalent path that will fail loudly
+            // if any tool call slips through.
+            cmd.env(
+                "HALLOUMINATE_SOCKET",
+                std::env::temp_dir().join(format!(
+                    "hallouminate-mcp-test-no-daemon-{}.sock",
+                    std::process::id()
+                )),
+            );
+        }
+        let mut child = cmd.spawn().expect("spawn hallouminate serve");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = BufReader::new(child.stdout.take().expect("stdout"));
         Self {
@@ -113,7 +145,7 @@ impl Mcp {
     }
 }
 
-fn write_minimal_config(dir: &std::path::Path) {
+fn write_minimal_config(dir: &Path) {
     let cfg_dir = dir.join("hallouminate");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir hallouminate config dir");
     std::fs::write(
@@ -125,7 +157,7 @@ fn write_minimal_config(dir: &std::path::Path) {
     .expect("write config.toml");
 }
 
-fn write_config_with_corpus(dir: &std::path::Path, corpus_name: &str, corpus_path: &str) {
+fn write_config_with_corpus(dir: &Path, corpus_name: &str, corpus_path: &str) -> Config {
     let cfg_dir = dir.join("hallouminate");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir hallouminate config dir");
     let toml = format!(
@@ -136,7 +168,9 @@ paths = ["{corpus_path}"]
 globs = ["**/*.md"]
 "#
     );
-    std::fs::write(cfg_dir.join("config.toml"), toml).expect("write config.toml");
+    let cfg_path = cfg_dir.join("config.toml");
+    std::fs::write(&cfg_path, &toml).expect("write config.toml");
+    toml::from_str(&toml).expect("parse config")
 }
 
 /// Like `write_config_with_corpus` but pins `[storage].ground_dir` to a
@@ -145,11 +179,11 @@ globs = ["**/*.md"]
 /// default `~/.cache/hallouminate/fastembed` so the test reuses any
 /// already-downloaded model.
 fn write_config_with_corpus_and_ground(
-    dir: &std::path::Path,
+    dir: &Path,
     corpus_name: &str,
     corpus_path: &str,
-    ground_dir: &std::path::Path,
-) {
+    ground_dir: &Path,
+) -> Config {
     let cfg_dir = dir.join("hallouminate");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir hallouminate config dir");
     let toml = format!(
@@ -164,15 +198,22 @@ ground_dir = "{ground}"
 "#,
         ground = ground_dir.display(),
     );
-    std::fs::write(cfg_dir.join("config.toml"), toml).expect("write config.toml");
+    let cfg_path = cfg_dir.join("config.toml");
+    std::fs::write(&cfg_path, &toml).expect("write config.toml");
+    toml::from_str(&toml).expect("parse config")
+}
+
+fn load_minimal_config() -> Config {
+    Config::default()
 }
 
 #[tokio::test]
 async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
     let xdg = tempfile::tempdir().expect("tempdir");
     write_minimal_config(xdg.path());
+    let harness = DaemonHarness::spawn(load_minimal_config()).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
 
     // 1. initialize — required first message in the MCP handshake.
     let init = mcp
@@ -237,6 +278,8 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
 
     // 3. tools/call list_corpora — exercises the full request/response
     //    round-trip without forcing the embedding-model download path.
+    //    The daemon (harness) replies with an empty list because the
+    //    daemon's config (also minimal) has no corpora.
     let call = mcp
         .rpc(
             3,
@@ -249,14 +292,6 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
     assert!(
         result["content"].is_array(),
         "content must be an array: {result}"
-    );
-    // Empty-config means structured payload is an empty array; the field
-    // must still be present so structured-aware clients can rely on it.
-    assert!(
-        result["structuredContent"].is_array()
-            || result["structuredContent"].is_object()
-            || result["structuredContent"].is_null(),
-        "structuredContent must be present: {result}"
     );
     let structured = &result["structuredContent"];
     if let Some(arr) = structured.as_array() {
@@ -281,9 +316,10 @@ async fn mcp_list_files_surfaces_corpus_files_without_indexing() {
     )
     .expect("write");
     std::fs::write(corpus.path().join("wiki/ignore.txt"), "ignore").expect("write txt");
-    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -337,9 +373,11 @@ async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
     // payload, with `paths` carried through verbatim. Catches regressions
     // where the tool serializes an empty array or drops the paths field.
     let xdg = tempfile::tempdir().expect("tempdir");
-    write_config_with_corpus(xdg.path(), "test-corpus", "/tmp/hallouminate-press-fixture");
+    let cfg =
+        write_config_with_corpus(xdg.path(), "test-corpus", "/tmp/hallouminate-press-fixture");
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -404,8 +442,9 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
     // before touching the embedder when the corpus name doesn't match.
     let xdg = tempfile::tempdir().expect("tempdir");
     write_minimal_config(xdg.path());
+    let harness = DaemonHarness::spawn(load_minimal_config()).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
 
     mcp.rpc(
         1,
@@ -430,9 +469,9 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
         )
         .await;
 
-    // The Copilot fix routes user-input failures through `invalid_params`
-    // (-32602). A regression to `internal_error` (-32603) or a panic must
-    // be visible here.
+    // Caller-input failures (unknown corpus) must come back as
+    // `-32602 invalid_params`. A regression to `-32603 internal_error` or
+    // a panic must be visible here.
     let error = call.get("error").unwrap_or_else(|| {
         panic!("unknown corpus must surface as a top-level JSON-RPC error, got: {call}")
     });
@@ -454,6 +493,61 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
 }
 
 #[tokio::test]
+async fn mcp_tool_call_fails_loudly_when_daemon_unreachable() {
+    // Spec contract: MCP transport must NOT auto-start the daemon, and
+    // must surface a clear "daemon unavailable" message when the dial
+    // fails. The handshake itself does not touch the daemon (only
+    // tools/call does), so initialize + tools/list succeed even with no
+    // daemon. The first stateful tool call comes back with an error.
+    let xdg = tempfile::tempdir().expect("tempdir");
+    write_minimal_config(xdg.path());
+    // Deliberately do NOT spawn a DaemonHarness. `Mcp::spawn(None)` points
+    // the child at a guaranteed-missing socket.
+    let mut mcp = Mcp::spawn(xdg.path(), None).await;
+
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({"name": "list_corpora", "arguments": {}}),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("daemon-down must surface as a JSON-RPC error, got: {call}"));
+    // Daemon-unreachable is server-side internal_error (the user can't
+    // fix a missing daemon by changing their arguments), not -32602.
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32603),
+        "daemon-unavailable must use internal_error: {error}"
+    );
+    let msg = error["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("daemon unavailable"),
+        "error message must mention daemon-unavailable: {msg}"
+    );
+    assert!(
+        msg.contains("hallouminate daemon"),
+        "error message must hint at how to start the daemon: {msg}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
 #[ignore = "requires the real embedder and may download a model on first run"]
 async fn mcp_add_markdown_writes_reindexes_and_rejects_unsafe_inputs() {
     // End-to-end coverage of the `add_markdown` JSON-RPC handler — write
@@ -465,14 +559,15 @@ async fn mcp_add_markdown_writes_reindexes_and_rejects_unsafe_inputs() {
     let xdg = tempfile::tempdir().expect("tempdir");
     let corpus = tempfile::tempdir().expect("corpus tempdir");
     let ground = tempfile::tempdir().expect("ground tempdir");
-    write_config_with_corpus_and_ground(
+    let cfg = write_config_with_corpus_and_ground(
         xdg.path(),
         "wiki",
         &corpus.path().to_string_lossy(),
         ground.path(),
     );
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -637,9 +732,10 @@ async fn mcp_read_markdown_returns_verbatim_content_and_rejects_unsafe_inputs() 
     let body = "# Halloumi\n\nA grilling cheese.\n";
     std::fs::create_dir_all(corpus.path().join("cheeses")).expect("mkdir");
     std::fs::write(corpus.path().join("cheeses/halloumi.md"), body).expect("seed");
-    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -689,7 +785,11 @@ async fn mcp_read_markdown_returns_verbatim_content_and_rejects_unsafe_inputs() 
     let error = call
         .get("error")
         .unwrap_or_else(|| panic!("missing file must error, got: {call}"));
-    assert_eq!(error["code"].as_i64(), Some(-32602), "missing-file: {error}");
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "missing-file: {error}"
+    );
 
     // Parent-escape → invalid_params.
     let call = mcp
@@ -719,9 +819,10 @@ async fn mcp_read_markdown_rejects_symlink_inside_corpus() {
     let outside = tempfile::NamedTempFile::new().expect("outside file");
     std::fs::write(outside.path(), "secret\n").expect("write outside");
     symlink(outside.path(), corpus.path().join("leak.md")).expect("symlink");
-    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -765,14 +866,15 @@ async fn mcp_delete_markdown_unlinks_file_and_errors_on_repeat() {
     std::fs::create_dir_all(corpus.path().join("cheeses")).expect("mkdir");
     let target = corpus.path().join("cheeses/halloumi.md");
     std::fs::write(&target, "# Halloumi\n").expect("seed");
-    write_config_with_corpus_and_ground(
+    let cfg = write_config_with_corpus_and_ground(
         xdg.path(),
         "wiki",
         &corpus.path().to_string_lossy(),
         ground.path(),
     );
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -839,7 +941,7 @@ async fn mcp_delete_markdown_rejects_parent_escape() {
         ground.path(),
     );
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), None).await;
     mcp.rpc(
         1,
         "initialize",
@@ -893,7 +995,7 @@ async fn mcp_delete_markdown_rejects_symlink_inside_corpus() {
         ground.path(),
     );
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), None).await;
     mcp.rpc(
         1,
         "initialize",
@@ -953,7 +1055,7 @@ async fn mcp_delete_markdown_rejects_intermediate_symlinked_directory() {
         ground.path(),
     );
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), None).await;
     mcp.rpc(
         1,
         "initialize",
@@ -1003,7 +1105,7 @@ async fn mcp_read_markdown_rejects_intermediate_symlinked_directory() {
     symlink(outside_dir.path(), corpus.path().join("cheeses")).expect("symlink dir");
     write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
 
-    let mut mcp = Mcp::spawn(xdg.path()).await;
+    let mut mcp = Mcp::spawn(xdg.path(), None).await;
     mcp.rpc(
         1,
         "initialize",

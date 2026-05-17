@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
 const BLOCK_START: &str = "# hallouminate-managed-block";
 const BLOCK_END: &str = "# /hallouminate-managed-block";
@@ -70,8 +70,8 @@ fn resolve_hooks_dir(repo: Option<&Path>) -> anyhow::Result<PathBuf> {
 
 fn install_managed_block(hook_path: &Path) -> anyhow::Result<()> {
     let existing = read_hook_or_empty(hook_path)?;
-    let stripped = strip_managed_block(&existing)
-        .with_context(|| format!("hook {}", hook_path.display()))?;
+    let stripped =
+        strip_managed_block(&existing).with_context(|| format!("hook {}", hook_path.display()))?;
     let mut next = ensure_shebang(&stripped);
     if !next.ends_with('\n') {
         next.push('\n');
@@ -91,8 +91,8 @@ fn uninstall_managed_block(hook_path: &Path) -> anyhow::Result<()> {
     }
     let existing =
         fs::read_to_string(hook_path).with_context(|| format!("read {}", hook_path.display()))?;
-    let stripped = strip_managed_block(&existing)
-        .with_context(|| format!("hook {}", hook_path.display()))?;
+    let stripped =
+        strip_managed_block(&existing).with_context(|| format!("hook {}", hook_path.display()))?;
     if is_only_shebang_or_empty(&stripped) {
         fs::remove_file(hook_path).with_context(|| format!("remove {}", hook_path.display()))?;
     } else {
@@ -393,9 +393,7 @@ mod tests {
         let hooks = dir.path().join(".git/hooks");
         fs::create_dir_all(&hooks).expect("mkdir hooks");
         let post_commit = hooks.join("post-commit");
-        let seeded = format!(
-            "#!/bin/sh\n{BLOCK_START}\nlegacy body\necho 'must-not-be-dropped'\n"
-        );
+        let seeded = format!("#!/bin/sh\n{BLOCK_START}\nlegacy body\necho 'must-not-be-dropped'\n");
         fs::write(&post_commit, &seeded).expect("seed");
 
         let err = cmd_hook_install(HookArgs {
