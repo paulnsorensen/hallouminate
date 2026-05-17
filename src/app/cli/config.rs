@@ -252,6 +252,95 @@ mod tests {
     }
 
     #[test]
+    fn validate_flags_corpora_typo_and_returns_err() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        // `[[corpora]]` instead of `[[corpus]]` is the classic typo —
+        // parses cleanly but produces a silently empty corpora list.
+        fs::write(
+            &path,
+            r#"
+[[corpora]]
+name = "wiki"
+paths = ["/tmp/wiki"]
+"#,
+        )
+        .expect("write config");
+        let err = cmd_config_validate(ConfigValidateArgs { config: Some(path) })
+            .expect_err("typo must surface a warning");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("warning"), "{msg}");
+    }
+
+    #[test]
+    fn validate_accepts_config_with_one_corpus_and_no_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[[corpus]]
+name = "wiki"
+paths = ["/tmp/wiki"]
+"#,
+        )
+        .expect("write config");
+        cmd_config_validate(ConfigValidateArgs { config: Some(path) })
+            .expect("valid config must return Ok");
+    }
+
+    #[test]
+    fn collect_warnings_flags_unknown_top_level_keys_with_hints() {
+        let raw = r#"
+[[corpora]]
+name = "wiki"
+
+[[code_repos]]
+name = "self"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("parse skeleton");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("`corpora`")
+                && w.contains("[[corpus]]")),
+            "missing corpora hint: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("`code_repos`")
+                && w.contains("[[code_repo]]")),
+            "missing code_repos hint: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_empty_corpora_even_for_valid_keys() {
+        // Only known keys — but no corpora configured. Tools that need a
+        // corpus would silently error at call time without this warning.
+        let raw = r#"
+[storage]
+ground_dir = "~/.local/share/hallouminate"
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("parse storage-only");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("no corpora configured")),
+            "missing empty-corpora warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_returns_empty_for_valid_config_with_one_corpus() {
+        let raw = r#"
+[[corpus]]
+name = "wiki"
+paths = ["/tmp/wiki"]
+"#;
+        let cfg = toml::from_str::<Config>(raw).expect("parse valid");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(warnings.is_empty(), "expected no warnings, got {warnings:?}");
+    }
+
+    #[test]
     fn download_rejects_unsupported_model_during_config_load() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");

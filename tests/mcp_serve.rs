@@ -822,3 +822,214 @@ async fn mcp_delete_markdown_unlinks_file_and_errors_on_repeat() {
 
     mcp.shutdown().await;
 }
+
+#[tokio::test]
+async fn mcp_delete_markdown_rejects_parent_escape() {
+    // Parent-escape paths must be caught by `safe_relative_path` before any
+    // syscall, matching the contract `add_markdown` already enforces.
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let ground = tempfile::tempdir().expect("ground tempdir");
+    let outside = tempfile::NamedTempFile::new().expect("outside file");
+    std::fs::write(outside.path(), "secret\n").expect("write outside");
+    write_config_with_corpus_and_ground(
+        xdg.path(),
+        "wiki",
+        &corpus.path().to_string_lossy(),
+        ground.path(),
+    );
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "delete_markdown",
+                "arguments": {"corpus": "wiki", "path": "../escape.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("parent-escape must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "escape: {error}");
+    assert!(
+        outside.path().exists(),
+        "outside file must not be touched by failed delete"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_delete_markdown_rejects_symlink_inside_corpus() {
+    // A symlink whose target is OUTSIDE the corpus must not be unlinked —
+    // and the target file itself must survive untouched.
+    use std::os::unix::fs::symlink;
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let ground = tempfile::tempdir().expect("ground tempdir");
+    let outside = tempfile::NamedTempFile::new().expect("outside file");
+    std::fs::write(outside.path(), "secret\n").expect("write outside");
+    symlink(outside.path(), corpus.path().join("leak.md")).expect("symlink");
+    write_config_with_corpus_and_ground(
+        xdg.path(),
+        "wiki",
+        &corpus.path().to_string_lossy(),
+        ground.path(),
+    );
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "delete_markdown",
+                "arguments": {"corpus": "wiki", "path": "leak.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("symlink delete must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "symlink: {error}");
+    let msg = error["message"].as_str().unwrap_or("");
+    assert!(msg.contains("symlink"), "message: {msg}");
+    // The symlink itself and its target must both survive.
+    assert!(
+        corpus.path().join("leak.md").exists(),
+        "symlink must not be unlinked"
+    );
+    assert!(outside.path().exists(), "target must not be touched");
+
+    mcp.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_delete_markdown_rejects_intermediate_symlinked_directory() {
+    // A symlinked intermediate directory (e.g. `corpus/cheeses` → /private/etc)
+    // must not let `delete_markdown` reach files outside the corpus.
+    // Pre-hardening, `tokio::fs::remove_file` would follow the dir symlink.
+    use std::os::unix::fs::symlink;
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let ground = tempfile::tempdir().expect("ground tempdir");
+    let outside_dir = tempfile::tempdir().expect("outside dir");
+    let outside_file = outside_dir.path().join("victim.md");
+    std::fs::write(&outside_file, "do not delete\n").expect("seed victim");
+    symlink(outside_dir.path(), corpus.path().join("cheeses")).expect("symlink dir");
+    write_config_with_corpus_and_ground(
+        xdg.path(),
+        "wiki",
+        &corpus.path().to_string_lossy(),
+        ground.path(),
+    );
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "delete_markdown",
+                "arguments": {"corpus": "wiki", "path": "cheeses/victim.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("intermediate symlink must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "intermediate: {error}");
+    assert!(
+        outside_file.exists(),
+        "file behind symlinked dir must not be unlinked"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_read_markdown_rejects_intermediate_symlinked_directory() {
+    // Same shape as the delete test, for read: a symlinked intermediate
+    // directory must not let `read_markdown` exfiltrate files outside the
+    // corpus. Pre-hardening, `tokio::fs::read` would follow the dir symlink.
+    use std::os::unix::fs::symlink;
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let outside_dir = tempfile::tempdir().expect("outside dir");
+    std::fs::write(outside_dir.path().join("secret.md"), "secret contents\n")
+        .expect("seed secret");
+    symlink(outside_dir.path(), corpus.path().join("cheeses")).expect("symlink dir");
+    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"corpus": "wiki", "path": "cheeses/secret.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("intermediate symlink must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "intermediate: {error}");
+
+    mcp.shutdown().await;
+}
