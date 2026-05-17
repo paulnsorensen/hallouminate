@@ -28,8 +28,14 @@ impl Embedder {
         let opts = TextInitOptions::new(model)
             .with_cache_dir(PathBuf::from(cache_dir))
             .with_show_download_progress(false);
-        let inner = TextEmbedding::try_new(opts)
-            .map_err(|e| HallouminateError::Embed(format!("init {canonical_name}: {e}")))?;
+        let inner = TextEmbedding::try_new(opts).map_err(|e| {
+            HallouminateError::Embed(format!(
+                "init {canonical_name}: {e}\n  \
+                 hint: first run needs network to fetch the model into {}; \
+                 run `hallouminate config download` to pre-warm the cache",
+                cache_dir.display()
+            ))
+        })?;
         Ok(Self {
             inner,
             model_name: canonical_name.to_string(),

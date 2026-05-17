@@ -217,6 +217,8 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
         "list_corpora",
         "list_files",
         "add_markdown",
+        "read_markdown",
+        "delete_markdown",
     ] {
         assert!(
             names.contains(&expected),
@@ -623,6 +625,200 @@ async fn mcp_add_markdown_writes_reindexes_and_rejects_unsafe_inputs() {
         Some(-32602),
         "path-escape rejection must use invalid_params: {error}"
     );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_read_markdown_returns_verbatim_content_and_rejects_unsafe_inputs() {
+    // read_markdown does not touch the embedder; this test runs offline.
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let body = "# Halloumi\n\nA grilling cheese.\n";
+    std::fs::create_dir_all(corpus.path().join("cheeses")).expect("mkdir");
+    std::fs::write(corpus.path().join("cheeses/halloumi.md"), body).expect("seed");
+    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // Happy path — full file content round-trips.
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"corpus": "wiki", "path": "cheeses/halloumi.md"}
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "read_markdown errored: {call}");
+    let result = &call["result"];
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("text content present");
+    assert_eq!(text, body, "verbatim content mismatch");
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["corpus"].as_str(), Some("wiki"));
+    assert_eq!(structured["path"].as_str(), Some("cheeses/halloumi.md"));
+    assert_eq!(structured["bytes"].as_u64(), Some(body.len() as u64));
+    assert_eq!(structured["content"].as_str(), Some(body));
+
+    // Missing file → invalid_params (-32602), not internal_error.
+    let call = mcp
+        .rpc(
+            3,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"corpus": "wiki", "path": "cheeses/gone.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("missing file must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "missing-file: {error}");
+
+    // Parent-escape → invalid_params.
+    let call = mcp
+        .rpc(
+            4,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"corpus": "wiki", "path": "../escape.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("path-escape must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "escape: {error}");
+
+    mcp.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn mcp_read_markdown_rejects_symlink_inside_corpus() {
+    use std::os::unix::fs::symlink;
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let outside = tempfile::NamedTempFile::new().expect("outside file");
+    std::fs::write(outside.path(), "secret\n").expect("write outside");
+    symlink(outside.path(), corpus.path().join("leak.md")).expect("symlink");
+    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"corpus": "wiki", "path": "leak.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("symlink read must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "symlink: {error}");
+    let msg = error["message"].as_str().unwrap_or("");
+    assert!(msg.contains("symlink"), "message: {msg}");
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_delete_markdown_unlinks_file_and_errors_on_repeat() {
+    // delete_markdown opens the LanceStore but never builds an embedder, so
+    // it runs offline. The store starts empty — delete-by-ref simply removes
+    // zero rows when no index has been built yet.
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let ground = tempfile::tempdir().expect("ground tempdir");
+    std::fs::create_dir_all(corpus.path().join("cheeses")).expect("mkdir");
+    let target = corpus.path().join("cheeses/halloumi.md");
+    std::fs::write(&target, "# Halloumi\n").expect("seed");
+    write_config_with_corpus_and_ground(
+        xdg.path(),
+        "wiki",
+        &corpus.path().to_string_lossy(),
+        ground.path(),
+    );
+
+    let mut mcp = Mcp::spawn(xdg.path()).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "delete_markdown",
+                "arguments": {"corpus": "wiki", "path": "cheeses/halloumi.md"}
+            }),
+        )
+        .await;
+    assert!(
+        call.get("error").is_none(),
+        "delete_markdown errored: {call}"
+    );
+    let structured = &call["result"]["structuredContent"];
+    assert_eq!(structured["corpus"].as_str(), Some("wiki"));
+    assert_eq!(structured["path"].as_str(), Some("cheeses/halloumi.md"));
+    assert!(!target.exists(), "file should be unlinked");
+
+    // Second delete on the same path → invalid_params (file gone).
+    let call = mcp
+        .rpc(
+            3,
+            "tools/call",
+            json!({
+                "name": "delete_markdown",
+                "arguments": {"corpus": "wiki", "path": "cheeses/halloumi.md"}
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("re-delete must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "re-delete: {error}");
 
     mcp.shutdown().await;
 }

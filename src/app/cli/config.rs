@@ -26,6 +26,23 @@ pub struct ConfigDownloadArgs {
     pub config: Option<PathBuf>,
 }
 
+#[derive(Debug, Default)]
+pub struct ConfigValidateArgs {
+    pub config: Option<PathBuf>,
+}
+
+/// Top-level keys hallouminate recognizes in its TOML config. Used by
+/// `cmd_config_validate` to flag misspellings (`[[corpora]]`, `Storage`)
+/// that parse cleanly but produce a silently empty/wrong config.
+const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "corpus",
+    "code_repo",
+    "search",
+    "embeddings",
+    "watch",
+    "storage",
+];
+
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     let target = args.path.unwrap_or_else(xdg_config_path);
     if target.exists() && !args.force {
@@ -65,6 +82,77 @@ pub fn cmd_config_download(args: ConfigDownloadArgs) -> anyhow::Result<()> {
 
 fn render_config(cfg: &Config) -> anyhow::Result<String> {
     toml::to_string_pretty(cfg).context("render config as TOML")
+}
+
+pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
+    let resolved = args.config.clone().unwrap_or_else(xdg_config_path);
+    let raw = match fs::read_to_string(&resolved) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(anyhow!("read {}: {e}", resolved.display())),
+    };
+    let cfg = config::load(args.config.as_deref())
+        .with_context(|| format!("parse {}", resolved.display()))?;
+
+    println!("config: {}", resolved.display());
+    if raw.is_none() {
+        println!("(file missing — showing defaults)");
+    }
+    println!("embeddings.model:    {}", cfg.embeddings.model);
+    println!("embeddings.cache_dir: {}", cfg.embeddings.cache_dir);
+    println!("storage.ground_dir:  {}", cfg.storage.ground_dir);
+    println!(
+        "search.top_files:    {}  chunks_per_file: {}",
+        cfg.search.top_files_default, cfg.search.chunks_per_file_default
+    );
+    println!("corpora ({}):", cfg.corpora.len());
+    for c in &cfg.corpora {
+        println!(
+            "  - {}  paths={:?}  globs={:?}  exclude={:?}",
+            c.name, c.paths, c.globs, c.exclude
+        );
+    }
+
+    let warnings = collect_warnings(raw.as_deref(), &cfg);
+    if warnings.is_empty() {
+        println!("ok");
+        return Ok(());
+    }
+    println!();
+    for w in &warnings {
+        println!("warning: {w}");
+    }
+    Err(anyhow!("{} warning(s); see above", warnings.len()))
+}
+
+fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(raw) = raw {
+        match toml::from_str::<toml::Value>(raw) {
+            Ok(toml::Value::Table(table)) => {
+                for key in table.keys() {
+                    if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                        let hint = match key.as_str() {
+                            "corpora" => " (did you mean `[[corpus]]`?)",
+                            "code_repos" => " (did you mean `[[code_repo]]`?)",
+                            _ => "",
+                        };
+                        out.push(format!("unknown top-level key `{key}`{hint}"));
+                    }
+                }
+            }
+            Ok(_) => out.push("config is not a TOML table".to_string()),
+            Err(e) => out.push(format!("re-parse for key check failed: {e}")),
+        }
+    }
+    if cfg.corpora.is_empty() {
+        out.push(
+            "no corpora configured — `ground`, `index`, and `add_markdown` will all error \
+             until you add at least one `[[corpus]]` entry"
+                .to_string(),
+        );
+    }
+    out
 }
 
 #[cfg(test)]
