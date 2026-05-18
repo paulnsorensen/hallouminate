@@ -12,7 +12,7 @@
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData, ServerInfo};
+use rmcp::model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -363,6 +363,7 @@ impl ServerHandler for HallouminateTools {
         info.server_info.name = env!("CARGO_PKG_NAME").into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.instructions = Some(SERVER_INSTRUCTIONS.to_string());
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info
     }
 }
