@@ -238,7 +238,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is an array of {path, absolute_path}. Paths are relative when the file lives under a configured corpus root, absolute otherwise."
+        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise."
     )]
     pub async fn list_files(
         &self,
@@ -254,8 +254,7 @@ impl HallouminateTools {
             .map(|e| e.path.clone())
             .collect::<Vec<_>>()
             .join("\n");
-        let structured =
-            serde_json::to_value(&entries).map_err(|e| internal_error(e.to_string()))?;
+        let structured = serde_json::json!({ "files": &entries });
         Ok(tool_ok(text, structured))
     }
 
@@ -321,7 +320,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List corpora configured in the hallouminate config file, including derived `repo:{name}:wiki` / `repo:{name}:corpus` entries from `[[repository]]` declarations. `content` is newline-separated corpus names; `structuredContent` is an array of {name, paths} records. Run `hallouminate config validate` for a richer summary."
+        description = "List corpora configured in the hallouminate config file, including derived `repo:{name}:wiki` / `repo:{name}:corpus` entries from `[[repository]]` declarations. `content` is newline-separated corpus names; `structuredContent` is { corpora: [{name, paths}, …] }. Run `hallouminate config validate` for a richer summary."
     )]
     pub async fn list_corpora(
         &self,
@@ -337,8 +336,7 @@ impl HallouminateTools {
             .map(|e| e.name.clone())
             .collect::<Vec<_>>()
             .join("\n");
-        let structured =
-            serde_json::to_value(&entries).map_err(|e| internal_error(e.to_string()))?;
+        let structured = serde_json::json!({ "corpora": &entries });
         Ok(tool_ok(names, structured))
     }
 }

@@ -310,12 +310,13 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
         "content must be an array: {result}"
     );
     let structured = &result["structuredContent"];
-    if let Some(arr) = structured.as_array() {
-        assert!(
-            arr.is_empty(),
-            "no corpora configured in test fixture — expected empty: {arr:?}"
-        );
-    }
+    let corpora = structured["corpora"]
+        .as_array()
+        .expect("structuredContent.corpora is an array");
+    assert!(
+        corpora.is_empty(),
+        "no corpora configured in test fixture — expected empty: {corpora:?}"
+    );
 
     mcp.shutdown().await;
 }
@@ -367,9 +368,9 @@ async fn mcp_list_files_surfaces_corpus_files_without_indexing() {
     );
     assert!(!text.contains("ignore.txt"), "text content: {text:?}");
 
-    let structured = result["structuredContent"]
+    let structured = result["structuredContent"]["files"]
         .as_array()
-        .expect("structured payload is an array");
+        .expect("structuredContent.files is an array");
     let paths: Vec<&str> = structured
         .iter()
         .filter_map(|entry| entry["path"].as_str())
@@ -424,10 +425,10 @@ async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
         "corpus name missing from text content: {text:?}"
     );
 
-    // Structured payload is an array of {name, paths} objects.
-    let structured = result["structuredContent"]
+    // Structured payload is { corpora: [{name, paths}, …] }.
+    let structured = result["structuredContent"]["corpora"]
         .as_array()
-        .expect("structured payload is an array");
+        .expect("structuredContent.corpora is an array");
     assert_eq!(
         structured.len(),
         1,
