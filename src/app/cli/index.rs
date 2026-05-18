@@ -1,25 +1,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::adapters::lance::LanceStore;
 use crate::app::config::{self, Config};
+use crate::app::daemon::{DaemonRequest, IndexRequest, client_for};
 use crate::app::input_error::InputError;
-use crate::domain::common::{expand_tilde, CorpusConfig};
-use crate::domain::corpus::{load_tokenizer, MarkdownChunker};
-use crate::domain::embeddings::Embedder;
-use crate::domain::indexer::index_corpus;
+use crate::domain::common::CorpusConfig;
 
 pub const AD_HOC_CORPUS_NAME: &str = "ad-hoc";
-const CHUNK_BUDGET_TOKENS: usize = 384;
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexArgs {
     pub corpus: Option<String>,
     pub paths_from: Option<PathBuf>,
     pub config: Option<PathBuf>,
+    /// Optional daemon socket override. Mirrors `HALLOUMINATE_SOCKET` so
+    /// test fixtures can pin the socket per-test without env mutation.
+    pub socket: Option<PathBuf>,
 }
 
 pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
@@ -28,29 +26,45 @@ pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the `IndexReport` without printing it. Split out so non-CLI
-/// transports (e.g. the MCP adapter) can hand the structured report straight
-/// to their caller instead of recovering it from stdout.
+/// Build the `IndexReport` by routing through the daemon. The CLI no longer
+/// opens LanceDB directly — the spec's Approach section names the daemon as
+/// the canonical owner of the ground directory; the CLI is one of its
+/// clients. When the daemon is unreachable, we fail loudly with the same
+/// hint shape the daemon-unavailable test pins.
+///
+/// `--paths-from` is handled here (instead of forwarded) because the daemon
+/// doesn't yet support ad-hoc paths and we want CLI users to keep the same
+/// behaviour. The list is read into an in-memory `[[corpus]]`-shaped entry
+/// and shipped through `--corpus ad-hoc` after the daemon learns to register
+/// transient corpora; until then, surface a clear error early.
 pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
+    // Validate config locally (still loaded here for argument-resolution
+    // pre-checks like `paths_from`), even though the daemon owns the data
+    // operations. The daemon has its own copy of the config.
     let cfg = config::load(args.config.as_deref())?;
-    let corpora = select_corpora(&cfg, args.corpus.as_deref(), args.paths_from.as_deref())?;
-    let ground_dir = expand_tilde(&cfg.storage.ground_dir);
-    ensure_parent(&ground_dir)?;
-    let store = LanceStore::open_or_create(&ground_dir, &cfg.embeddings.model)
-        .await
-        .with_context(|| format!("open ground dir {}", ground_dir.display()))?;
-    let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-    let mut embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir)
-        .with_context(|| format!("init embedder ({})", cfg.embeddings.model))?;
-    let tokenizer = load_tokenizer(&cfg.embeddings.model)
-        .with_context(|| format!("load tokenizer for {}", cfg.embeddings.model))?;
-    let chunker = MarkdownChunker::new(tokenizer, CHUNK_BUDGET_TOKENS);
-    run_indexing(&corpora, &store, &mut embedder, &chunker).await
+    if let Some(paths_from) = args.paths_from.as_deref() {
+        return Err(ad_hoc_corpus_unsupported(paths_from));
+    }
+    // Local sanity check that resolves the same names the daemon would —
+    // surfaces an "unknown corpus" caller error before we open a socket.
+    let _ = select_corpora(&cfg, args.corpus.as_deref(), None)?;
+
+    let client = client_for(args.socket.as_deref()).await?;
+    let req = DaemonRequest::Index(IndexRequest {
+        corpus: args.corpus.clone(),
+        paths_from: None,
+    });
+    let report: IndexReport = client.call(req).await?;
+    Ok(report)
 }
 
 /// Resolve which corpora to index for a given request. Shared between the
 /// CLI `index` subcommand and the MCP `index` tool so both transports use
 /// the same fallback rules and `ad-hoc` naming.
+///
+/// Looks up corpora through `cfg.effective_corpora()` so derived
+/// `repo:{name}:wiki` / `repo:{name}:corpus` corpora are reachable from
+/// `--corpus repo:tern:wiki` and from the no-flag "index everything" path.
 pub fn select_corpora(
     cfg: &Config,
     requested: Option<&str>,
@@ -62,23 +76,26 @@ pub fn select_corpora(
     if let Some(file) = paths_from {
         return Ok(vec![ad_hoc_corpus(file)?]);
     }
+    let effective = cfg.effective_corpora()?;
     if let Some(name) = requested {
-        let hit = cfg
-            .corpora
+        let hit = effective
             .iter()
             .find(|c| c.name == name)
             .ok_or_else(|| InputError::new(format!("corpus {name:?} not found in config")))?;
         return Ok(vec![hit.clone()]);
     }
-    if cfg.corpora.is_empty() {
-        return Err(InputError::new("no corpora configured; add [[corpus]] to config").into());
+    if effective.is_empty() {
+        return Err(InputError::new(
+            "no corpora configured; add [[corpus]] or [[repository]] to config",
+        )
+        .into());
     }
-    Ok(cfg.corpora.clone())
+    Ok(effective)
 }
 
 fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
     let text = fs::read_to_string(file)
-        .with_context(|| format!("read paths-from file {}", file.display()))?;
+        .map_err(|e| InputError::new(format!("read paths-from file {}: {e}", file.display())))?;
     let paths: Vec<String> = text
         .lines()
         .map(str::trim)
@@ -86,11 +103,7 @@ fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
         .map(|s| s.to_string())
         .collect();
     if paths.is_empty() {
-        return Err(InputError::new(format!(
-            "paths-from file {} is empty",
-            file.display()
-        ))
-        .into());
+        return Err(InputError::new(format!("paths-from file {} is empty", file.display())).into());
     }
     Ok(CorpusConfig {
         name: AD_HOC_CORPUS_NAME.into(),
@@ -100,46 +113,24 @@ fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
     })
 }
 
-fn ensure_parent(ground_dir: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = ground_dir.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create ground dir parent {}", parent.display()))?;
-    }
-    Ok(())
+fn ad_hoc_corpus_unsupported(file: &Path) -> anyhow::Error {
+    // Surface the same caller-error shape the daemon dispatcher uses (per
+    // `tests/daemon.rs::daemon_index_with_paths_from_returns_invalid_params`)
+    // so a CLI user sees a clear "not supported yet" instead of an opaque
+    // daemon-side InvalidParams later.
+    InputError::new(format!(
+        "--paths-from is not supported via the daemon yet ({})",
+        file.display()
+    ))
+    .into()
 }
 
-async fn run_indexing(
-    corpora: &[CorpusConfig],
-    store: &LanceStore,
-    embedder: &mut Embedder,
-    chunker: &MarkdownChunker<tokenizers::Tokenizer>,
-) -> anyhow::Result<IndexReport> {
-    let mut report = IndexReport::default();
-    for corpus in corpora {
-        let stats = index_corpus(corpus, store, embedder, chunker)
-            .await
-            .with_context(|| format!("index corpus {:?}", corpus.name))?;
-        report.corpora.push(CorpusReport {
-            name: corpus.name.clone(),
-            files_upserted: stats.files_upserted,
-            files_touched: stats.files_touched,
-            files_deleted: stats.files_deleted,
-            files_skipped_empty: stats.files_skipped_empty,
-            chunks_inserted: stats.chunks_inserted,
-            embeddings_inserted: stats.embeddings_inserted,
-        });
-    }
-    Ok(report)
-}
-
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct IndexReport {
     pub corpora: Vec<CorpusReport>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorpusReport {
     pub name: String,
     pub files_upserted: usize,
@@ -153,6 +144,7 @@ pub struct CorpusReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::repository::RepositoryConfig;
 
     #[test]
     fn select_corpora_uses_paths_from_when_set() {
@@ -227,6 +219,77 @@ mod tests {
         assert!(
             crate::app::input_error::is_input_error(&err),
             "empty paths-from must mark as InputError so MCP routes it to -32602: {err}"
+        );
+    }
+
+    #[test]
+    fn select_corpora_resolves_repository_derived_wiki_by_name() {
+        // Headline spec finding: `--corpus repo:tern:wiki` must reach the
+        // derived wiki corpus instead of erroring with "not found".
+        let cfg = Config {
+            repositories: vec![RepositoryConfig {
+                name: "tern".into(),
+                path: "/repos/tern".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = select_corpora(&cfg, Some("repo:tern:wiki"), None).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "repo:tern:wiki");
+        assert_eq!(
+            out[0].paths,
+            vec!["/repos/tern/.hallouminate/wiki".to_string()]
+        );
+    }
+
+    #[test]
+    fn select_corpora_includes_repository_derived_corpora_when_no_filters_set() {
+        // "index everything" must pick up derived corpora too, so a user
+        // who declares a `[[repository]]` and runs `hallouminate index` ends
+        // up with their wiki indexed.
+        let cfg = Config {
+            repositories: vec![RepositoryConfig {
+                name: "tern".into(),
+                path: "/repos/tern".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let out = select_corpora(&cfg, None, None).unwrap();
+        let names: Vec<&str> = out.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["repo:tern:wiki"]);
+    }
+
+    #[tokio::test]
+    async fn run_index_paths_from_returns_input_error_before_dialing_daemon() {
+        // `--paths-from` is documented as not yet supported via the daemon
+        // (cook flagged it; the daemon dispatcher rejects with InvalidParams).
+        // The CLI surfaces the same shape early, as an InputError, so MCP
+        // routes it to -32602 — and crucially, the failure must happen
+        // BEFORE any socket dial, so the test does not need a daemon.
+        let dir = tempfile::tempdir().unwrap();
+        let list = dir.path().join("paths.txt");
+        fs::write(&list, "/tmp/a\n").unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        // Empty config: no corpora, no repositories. Doesn't matter because
+        // paths_from short-circuits config lookup.
+        fs::write(&cfg_path, "").unwrap();
+        let err = run_index(IndexArgs {
+            paths_from: Some(list),
+            config: Some(cfg_path),
+            ..Default::default()
+        })
+        .await
+        .expect_err("paths_from must surface a clear error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--paths-from") && msg.contains("not supported"),
+            "got: {msg}",
+        );
+        assert!(
+            crate::app::input_error::is_input_error(&err),
+            "must be an InputError so MCP routes it to -32602: {err}",
         );
     }
 }

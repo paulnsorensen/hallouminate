@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
+use anyhow::{Context, anyhow};
 
-use crate::app::config::{self, xdg_config_path, Config};
+use crate::app::config::{self, Config, xdg_config_path};
 use crate::domain::common::expand_tilde;
 use crate::domain::corpus::load_tokenizer;
 use crate::domain::embeddings::Embedder;
@@ -36,7 +36,7 @@ pub struct ConfigValidateArgs {
 /// that parse cleanly but produce a silently empty/wrong config.
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "corpus",
-    "code_repo",
+    "repository",
     "search",
     "embeddings",
     "watch",
@@ -54,11 +54,9 @@ pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     if let Some(parent) = target.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    fs::write(&target, DEFAULT_TEMPLATE)
-        .with_context(|| format!("write {}", target.display()))?;
+    fs::write(&target, DEFAULT_TEMPLATE).with_context(|| format!("write {}", target.display()))?;
     println!("wrote {}", target.display());
     Ok(())
 }
@@ -112,6 +110,24 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
             c.name, c.paths, c.globs, c.exclude
         );
     }
+    println!("repositories ({}):", cfg.repositories.len());
+    for r in &cfg.repositories {
+        println!(
+            "  - {}  path={:?}  corpus_paths={:?}",
+            r.name, r.path, r.corpus_paths
+        );
+    }
+    match cfg.effective_corpora() {
+        Ok(effective) => {
+            println!("effective corpora ({}):", effective.len());
+            for c in &effective {
+                println!("  - {}", c.name);
+            }
+        }
+        Err(e) => {
+            println!("effective corpora: error: {e}");
+        }
+    }
 
     let warnings = collect_warnings(raw.as_deref(), &cfg);
     if warnings.is_empty() {
@@ -134,7 +150,8 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
                     if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
                         let hint = match key.as_str() {
                             "corpora" => " (did you mean `[[corpus]]`?)",
-                            "code_repos" => " (did you mean `[[code_repo]]`?)",
+                            "code_repo" | "code_repos" => " (renamed to `[[repository]]`)",
+                            "repositories" => " (did you mean `[[repository]]`?)",
                             _ => "",
                         };
                         out.push(format!("unknown top-level key `{key}`{hint}"));
@@ -145,10 +162,17 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
             Err(e) => out.push(format!("re-parse for key check failed: {e}")),
         }
     }
-    if cfg.corpora.is_empty() {
+    // Count effective corpora (explicit `[[corpus]]` + repository-derived
+    // `repo:*:wiki` / `repo:*:corpus`) so a repository-only config doesn't
+    // get falsely flagged as empty when the daemon would happily serve it.
+    let effective_empty = cfg
+        .effective_corpora()
+        .map(|c| c.is_empty())
+        .unwrap_or(true);
+    if effective_empty {
         out.push(
             "no corpora configured — `ground`, `index`, and `add_markdown` will all error \
-             until you add at least one `[[corpus]]` entry"
+             until you add at least one `[[corpus]]` or `[[repository]]` entry"
                 .to_string(),
         );
     }
@@ -217,8 +241,7 @@ mod tests {
 
     #[test]
     fn default_template_parses_to_valid_config() {
-        let cfg: Config =
-            toml::from_str(DEFAULT_TEMPLATE).expect("template must be valid TOML");
+        let cfg: Config = toml::from_str(DEFAULT_TEMPLATE).expect("template must be valid TOML");
         assert!(cfg.corpora.is_empty(), "corpora must start commented-out");
         assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
         assert_eq!(cfg.search.top_files_default, 10);
@@ -307,7 +330,7 @@ name = "self"
         );
         assert!(
             warnings.iter().any(|w| w.contains("`code_repos`")
-                && w.contains("[[code_repo]]")),
+                && w.contains("renamed to `[[repository]]`")),
             "missing code_repos hint: {warnings:?}"
         );
     }
@@ -356,5 +379,117 @@ model = "clip-vit-b32"
             .expect_err("unsupported model must fail before download");
         let msg = format!("{err:#}");
         assert!(msg.contains("unsupported embedding model"), "{msg}");
+    }
+
+    // ── collect_warnings ──────────────────────────────────────────────
+    //
+    // Spec gate: `config validate` must surface a `code_repo → repository`
+    // rename hint and flag obvious typos so a user who upgrades doesn't end
+    // up with a silently-empty config because their old key parsed-and-was-
+    // ignored.
+
+    #[test]
+    fn collect_warnings_flags_code_repo_with_rename_hint() {
+        let raw = "[[code_repo]]\nname = \"tern\"\npath = \"/r\"\n";
+        let cfg = Config::default();
+        let warnings = collect_warnings(Some(raw), &cfg);
+        let hint = warnings
+            .iter()
+            .find(|w| w.contains("code_repo"))
+            .unwrap_or_else(|| panic!("missing code_repo hint: {warnings:?}"));
+        assert!(
+            hint.contains("renamed to `[[repository]]`"),
+            "hint must spell out the rename target: {hint}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_code_repos_plural_with_same_rename_hint() {
+        let raw = "[[code_repos]]\nname = \"tern\"\npath = \"/r\"\n";
+        let cfg = Config::default();
+        let warnings = collect_warnings(Some(raw), &cfg);
+        let hint = warnings
+            .iter()
+            .find(|w| w.contains("code_repos"))
+            .unwrap_or_else(|| panic!("missing code_repos hint: {warnings:?}"));
+        assert!(
+            hint.contains("renamed to `[[repository]]`"),
+            "plural alias must point at the same target: {hint}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_corpora_typo_with_corpus_hint() {
+        let raw = "[[corpora]]\nname = \"docs\"\npaths = [\"/x\"]\n";
+        let cfg = Config::default();
+        let warnings = collect_warnings(Some(raw), &cfg);
+        let hint = warnings
+            .iter()
+            .find(|w| w.contains("corpora"))
+            .unwrap_or_else(|| panic!("missing corpora hint: {warnings:?}"));
+        assert!(
+            hint.contains("[[corpus]]"),
+            "corpora hint must point at the singular: {hint}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_repositories_plural_typo_with_repository_hint() {
+        let raw = "[[repositories]]\nname = \"tern\"\npath = \"/r\"\n";
+        let cfg = Config::default();
+        let warnings = collect_warnings(Some(raw), &cfg);
+        let hint = warnings
+            .iter()
+            .find(|w| w.contains("repositories"))
+            .unwrap_or_else(|| panic!("missing repositories hint: {warnings:?}"));
+        assert!(
+            hint.contains("[[repository]]"),
+            "plural typo hint must point at singular: {hint}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_unknown_key_without_specific_hint() {
+        // An unrecognized key that isn't in the typo table still surfaces as
+        // a warning so a user spots it; the hint suffix is empty.
+        let raw = "[zzz_unknown]\nfoo = 1\n";
+        let cfg = Config::default();
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("zzz_unknown")
+                && !w.contains("did you mean")
+                && !w.contains("renamed to")),
+            "unknown key must surface as a plain warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_is_silent_when_every_top_level_key_is_known() {
+        let raw = "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n\n[[repository]]\nname = \"tern\"\npath = \"/r\"\n\n[search]\n[embeddings]\n[watch]\n[storage]\n";
+        let mut cfg = Config::default();
+        cfg.corpora.push(crate::domain::common::CorpusConfig {
+            name: "docs".into(),
+            paths: vec!["/x".into()],
+            globs: Vec::new(),
+            exclude: Vec::new(),
+        });
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings.is_empty(),
+            "known keys + non-empty corpora must produce zero warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_surfaces_empty_corpora_advisory_when_no_corpora_present() {
+        // Empty cfg.corpora produces the "no corpora configured" advisory so
+        // `config validate` exits non-zero rather than silently shipping an
+        // unusable setup.
+        let cfg = Config::default();
+        let warnings = collect_warnings(None, &cfg);
+        assert!(
+            warnings.iter().any(|w| w.contains("no corpora configured")),
+            "empty corpora advisory missing: {warnings:?}"
+        );
     }
 }

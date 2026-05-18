@@ -1,5 +1,5 @@
-# Hallouminate configuration. Edit corpus and code_repo entries to point at
-# the markdown trees and code repos you want indexed.
+# Hallouminate configuration. Edit corpus and repository entries to point at
+# the markdown trees and repositories you want indexed.
 
 # [[corpus]]
 # name = "claude-config"
@@ -7,9 +7,16 @@
 # globs = ["**/*.md"]
 # exclude = ["**/.git/**", "**/node_modules/**"]
 
-# [[code_repo]]
+# [[repository]]
 # name = "tern"
 # path = "~/Dev/tern"
+# # Optional source-document corpus; derived as `repo:tern:corpus`.
+# # corpus_paths = ["docs"]
+# # corpus_globs = ["**/*.md"]
+# # corpus_exclude = ["**/drafts/**"]
+# # The LLM-managed wiki is always derived as `repo:tern:wiki` and lives
+# # at `<path>/.hallouminate/wiki`.
+# # repo:tern:code is reserved for a future code-aware indexing slice.
 
 [search]
 top_files_default       = 10

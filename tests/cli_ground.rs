@@ -1,7 +1,11 @@
 use std::fs;
 use std::path::Path;
 
-use hallouminate::app::cli::{cmd_index, run_ground, GroundArgs, IndexArgs};
+use hallouminate::app::cli::{GroundArgs, IndexArgs, cmd_index, run_ground};
+use hallouminate::app::config::Config;
+
+mod common;
+use common::daemon::DaemonHarness;
 
 fn write_config(config_path: &Path, corpus_root: &Path, ground_dir: &Path, cache_dir: &Path) {
     let toml = format!(
@@ -23,6 +27,11 @@ ground_dir = {dir:?}
         dir = ground_dir.to_string_lossy().to_string(),
     );
     fs::write(config_path, toml).expect("write config");
+}
+
+fn load_config(config_path: &Path) -> Config {
+    let text = fs::read_to_string(config_path).expect("read config");
+    toml::from_str(&text).expect("parse config")
 }
 
 fn seed_fixtures(root: &Path) {
@@ -56,8 +65,18 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
     let cache_dir = std::env::temp_dir().join("hallouminate-cli-test-cache");
     write_config(&config_path, &corpus_root, &ground_dir, &cache_dir);
 
+    // Spec contract: CLI commands are daemon clients. Spawn a daemon over a
+    // per-test socket so both `cmd_index` and `run_ground` dispatch through
+    // it instead of opening LanceDB directly. The harness lives for the
+    // whole test so the index work and the query both hit the same daemon
+    // instance — that's the spec's "one process owns mutations" invariant.
+    let cfg = load_config(&config_path);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let socket = harness.socket().to_path_buf();
+
     cmd_index(IndexArgs {
         config: Some(config_path.clone()),
+        socket: Some(socket.clone()),
         ..Default::default()
     })
     .await
@@ -66,6 +85,7 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
     let response = run_ground(GroundArgs {
         query: "spice melange Arrakis".into(),
         config: Some(config_path),
+        socket: Some(socket),
         ..Default::default()
     })
     .await
@@ -108,5 +128,44 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
     assert!(
         !chunk.chunk_id.is_empty(),
         "chunk_id must be a non-empty blake3-derived string"
+    );
+}
+
+#[tokio::test]
+async fn run_ground_fails_loudly_when_daemon_unreachable() {
+    // Spec contract: ground must surface a clear "daemon unavailable" error
+    // pointing at `hallouminate daemon` when the socket is missing, instead
+    // of silently opening LanceDB directly (which is exactly the
+    // multi-process race the daemon exists to prevent).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let corpus_root = dir.path().join("corpus");
+    fs::create_dir_all(&corpus_root).unwrap();
+    let ground_dir = dir.path().join("ground");
+    let config_path = dir.path().join("config.toml");
+    let cache_dir = dir.path().join("cache");
+    write_config(&config_path, &corpus_root, &ground_dir, &cache_dir);
+    let missing_socket = dir.path().join("absent.sock");
+
+    let err = run_ground(GroundArgs {
+        query: "anything".into(),
+        config: Some(config_path),
+        socket: Some(missing_socket),
+        ..Default::default()
+    })
+    .await
+    .expect_err("missing daemon socket must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("daemon unavailable"),
+        "error must signal `daemon unavailable`: {msg}"
+    );
+    assert!(
+        msg.contains("hallouminate daemon"),
+        "error must hint at how to start the daemon: {msg}"
+    );
+    assert_eq!(
+        msg.matches("daemon unavailable").count(),
+        1,
+        "`daemon unavailable` prefix must appear exactly once (no double-wrap): {msg}"
     );
 }

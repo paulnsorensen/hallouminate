@@ -8,7 +8,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use hallouminate::adapters::lance::{LanceStore, EMBEDDING_DIM};
+use hallouminate::adapters::lance::{EMBEDDING_DIM, LanceStore};
 use hallouminate::domain::common::{CorpusConfig, FileRef, Result};
 use hallouminate::domain::corpus::MarkdownChunker;
 use hallouminate::domain::embeddings::EmbedBatch;
@@ -16,7 +16,7 @@ use hallouminate::domain::indexer::index_corpus;
 use text_splitter::Characters;
 
 mod common;
-use common::{placeholder_prepared_file, StubEmbedder};
+use common::{StubEmbedder, placeholder_prepared_file};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -142,9 +142,7 @@ async fn re_run_after_crash_converges_to_correct_state() {
 
     let snaps = store.list_files("docs").await.expect("list_files");
     assert!(snaps.values().any(|s| s.file_ref.ends_with("b.md")));
-    assert!(!snaps
-        .values()
-        .any(|s| s.file_ref == "/tmp/a.md"));
+    assert!(!snaps.values().any(|s| s.file_ref == "/tmp/a.md"));
 }
 
 #[tokio::test]

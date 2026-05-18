@@ -8,13 +8,13 @@ mod hook;
 mod index;
 
 pub use config::{
-    cmd_config_download, cmd_config_init, cmd_config_show, cmd_config_validate,
-    ConfigDownloadArgs, ConfigInitArgs, ConfigShowArgs, ConfigValidateArgs,
+    ConfigDownloadArgs, ConfigInitArgs, ConfigShowArgs, ConfigValidateArgs, cmd_config_download,
+    cmd_config_init, cmd_config_show, cmd_config_validate,
 };
-pub use ground::{cmd_ground, run_ground, GroundArgs};
-pub use hook::{cmd_hook_install, cmd_hook_uninstall, HookArgs};
+pub use ground::{GroundArgs, cmd_ground, run_ground};
+pub use hook::{HookArgs, cmd_hook_install, cmd_hook_uninstall};
 pub use index::{
-    cmd_index, run_index, select_corpora, CorpusReport, IndexArgs, IndexReport, AD_HOC_CORPUS_NAME,
+    AD_HOC_CORPUS_NAME, CorpusReport, IndexArgs, IndexReport, cmd_index, run_index, select_corpora,
 };
 
 /// CLI surface for output format selection. Mirrors `domain::ground::Format`
@@ -52,16 +52,48 @@ pub enum Command {
     /// `delete_markdown` tools to MCP-aware clients (Claude Desktop, Claude
     /// Code, etc.). The process runs until stdin closes.
     Serve,
+    /// Boot the local daemon: single owner of the LanceDB ground directory,
+    /// repository registry, and per-corpus mutation locks. CLI and MCP
+    /// clients talk to it over a Unix domain socket. Stays in the
+    /// foreground until killed; only one instance per socket can run.
+    Daemon(DaemonCli),
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonCli {
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+}
+
+impl From<DaemonCli> for crate::app::daemon::DaemonArgs {
+    fn from(cli: DaemonCli) -> Self {
+        Self { config: cli.config }
+    }
 }
 
 #[derive(Debug, Args)]
 pub struct IndexCli {
     #[arg(long)]
     pub corpus: Option<String>,
-    #[arg(long, value_name = "FILE")]
+    /// Unsupported in the daemon-backed v1 — always errors with
+    /// "paths_from is not supported via the daemon yet". Kept hidden so old
+    /// scripts surface the message instead of a clap-level "unknown flag".
+    #[arg(long, value_name = "FILE", hide = true)]
     pub paths_from: Option<PathBuf>,
+    /// Local-only pre-check config path — used to validate the corpus
+    /// argument before dialing the daemon. The daemon serves whichever
+    /// config it loaded at startup, so passing `--config other.toml` here
+    /// does NOT change which corpora the daemon sees; it only changes which
+    /// config the CLI consults to surface an early "unknown corpus" error.
+    /// Restart the daemon (`hallouminate daemon --config ...`) to change
+    /// what it serves.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// Override the daemon socket path. Mirrors the `HALLOUMINATE_SOCKET`
+    /// env var the daemon itself reads; lets test fixtures pin per-test
+    /// sockets without env mutation.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 }
 
 impl From<IndexCli> for IndexArgs {
@@ -70,6 +102,7 @@ impl From<IndexCli> for IndexArgs {
             corpus: cli.corpus,
             paths_from: cli.paths_from,
             config: cli.config,
+            socket: cli.socket,
         }
     }
 }
@@ -97,8 +130,15 @@ pub struct GroundCli {
     pub chunks_per_file: Option<usize>,
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
+    /// Local-only pre-check config path — same caveat as `hallouminate
+    /// index --config`: the daemon uses its own startup config, so this
+    /// flag only validates the corpus argument locally before dialing.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+    /// Override the daemon socket path. Mirrors `HALLOUMINATE_SOCKET`; lets
+    /// test fixtures pin per-test sockets without env mutation.
+    #[arg(long, value_name = "PATH")]
+    pub socket: Option<PathBuf>,
 }
 
 impl From<GroundCli> for GroundArgs {
@@ -122,6 +162,7 @@ impl From<GroundCli> for GroundArgs {
             chunks_per_file: cli.chunks_per_file,
             limit: cli.limit,
             config: cli.config,
+            socket: cli.socket,
         }
     }
 }
@@ -171,14 +212,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             HookAction::Uninstall { repo } => cmd_hook_uninstall(HookArgs { repo }),
         },
         Command::Config { action } => match action {
-            ConfigAction::Init { force, path } => {
-                cmd_config_init(ConfigInitArgs { force, path })
-            }
+            ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
             ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
             ConfigAction::Validate { config } => cmd_config_validate(ConfigValidateArgs { config }),
         },
         Command::Serve => crate::adapters::mcp::serve_stdio().await,
+        Command::Daemon(args) => crate::app::daemon::run_daemon(args.into()).await,
     }
 }
 
@@ -214,8 +254,8 @@ mod tests {
 
     #[test]
     fn parses_ground_subcommand_with_query_and_outline_default() {
-        let cli = Cli::try_parse_from(["hallouminate", "ground", "spice melange"])
-            .expect("parse ground");
+        let cli =
+            Cli::try_parse_from(["hallouminate", "ground", "spice melange"]).expect("parse ground");
         match cli.command {
             Command::Ground(args) => {
                 assert_eq!(args.query, "spice melange");
@@ -243,8 +283,7 @@ mod tests {
 
     #[test]
     fn parses_ground_with_full_flag() {
-        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--full"])
-            .expect("parse");
+        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--full"]).expect("parse");
         match cli.command {
             Command::Ground(args) => {
                 assert!(args.full);
@@ -258,14 +297,8 @@ mod tests {
 
     #[test]
     fn parses_ground_with_snippet_chars() {
-        let cli = Cli::try_parse_from([
-            "hallouminate",
-            "ground",
-            "q",
-            "--snippet-chars",
-            "80",
-        ])
-        .expect("parse");
+        let cli = Cli::try_parse_from(["hallouminate", "ground", "q", "--snippet-chars", "80"])
+            .expect("parse");
         match cli.command {
             Command::Ground(args) => assert_eq!(args.snippet_chars, Some(80)),
             _ => panic!("wrong variant"),
@@ -305,8 +338,7 @@ mod tests {
 
     #[test]
     fn rejects_ground_without_query() {
-        let err =
-            Cli::try_parse_from(["hallouminate", "ground"]).expect_err("query required");
+        let err = Cli::try_parse_from(["hallouminate", "ground"]).expect_err("query required");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
@@ -314,15 +346,9 @@ mod tests {
     fn rejects_full_and_format_together() {
         // The two flags are mutually exclusive — clap should error before
         // dispatch instead of letting the user wonder which one won.
-        let err = Cli::try_parse_from([
-            "hallouminate",
-            "ground",
-            "q",
-            "--full",
-            "--format",
-            "json",
-        ])
-        .expect_err("conflicting flags must be rejected");
+        let err =
+            Cli::try_parse_from(["hallouminate", "ground", "q", "--full", "--format", "json"])
+                .expect_err("conflicting flags must be rejected");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
@@ -337,9 +363,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_daemon_subcommand_without_args() {
+        let cli = Cli::try_parse_from(["hallouminate", "daemon"]).expect("parse daemon");
+        match cli.command {
+            Command::Daemon(args) => {
+                assert!(args.config.is_none(), "--config defaults to None");
+                let inner: crate::app::daemon::DaemonArgs = args.into();
+                assert!(inner.config.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_daemon_subcommand_with_config_flag() {
+        let cli = Cli::try_parse_from(["hallouminate", "daemon", "--config", "/tmp/cfg.toml"])
+            .expect("parse daemon --config");
+        match cli.command {
+            Command::Daemon(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/cfg.toml")));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
     fn parses_hook_install_and_uninstall() {
-        let install = Cli::try_parse_from(["hallouminate", "hook", "install"])
-            .expect("parse hook install");
+        let install =
+            Cli::try_parse_from(["hallouminate", "hook", "install"]).expect("parse hook install");
         match install.command {
             Command::Hook {
                 action: HookAction::Install { repo },
@@ -358,9 +409,8 @@ mod tests {
 
     #[test]
     fn parses_hook_install_with_repo_path() {
-        let cli =
-            Cli::try_parse_from(["hallouminate", "hook", "install", "--repo", "/tmp/r"])
-                .expect("parse hook install --repo");
+        let cli = Cli::try_parse_from(["hallouminate", "hook", "install", "--repo", "/tmp/r"])
+            .expect("parse hook install --repo");
         match cli.command {
             Command::Hook {
                 action: HookAction::Install { repo },
@@ -371,8 +421,8 @@ mod tests {
 
     #[test]
     fn parses_config_init_and_show() {
-        let init = Cli::try_parse_from(["hallouminate", "config", "init"])
-            .expect("parse config init");
+        let init =
+            Cli::try_parse_from(["hallouminate", "config", "init"]).expect("parse config init");
         match init.command {
             Command::Config {
                 action: ConfigAction::Init { force, path },
@@ -382,8 +432,8 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
-        let show = Cli::try_parse_from(["hallouminate", "config", "show"])
-            .expect("parse config show");
+        let show =
+            Cli::try_parse_from(["hallouminate", "config", "show"]).expect("parse config show");
         match show.command {
             Command::Config {
                 action: ConfigAction::Show { config },
