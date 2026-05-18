@@ -27,13 +27,15 @@ use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passth
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::corpus::sandbox::{
-    WriteError, WriteErrorKind, atomic_write_no_follow, ensure_corpus_allows_file,
-    first_corpus_root, list_corpus_files, pick_corpus, safe_relative_path,
+    WriteError, WriteErrorKind, atomic_write_no_follow, delete_no_follow, ensure_corpus_allows_file,
+    first_corpus_root, list_corpus_files, pick_corpus, read_no_follow, safe_relative_path,
 };
 use crate::domain::corpus::{MarkdownChunker, blake3_file};
 use crate::domain::embeddings::Embedder;
 use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
+#[cfg(test)]
+use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonResponse,
@@ -113,7 +115,10 @@ async fn handle_ground(state: &DaemonState, req: GroundRequest) -> DaemonRespons
             .unwrap_or(cfg.search.chunks_per_file_default),
         limit: req.limit.unwrap_or(50),
     };
-    let mut embedder = state.embedder().await;
+    let mut embedder = match state.embedder().await {
+        Ok(g) => g,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
     let response = match ground(&req.query, &corpus.name, &store, &mut *embedder, opts).await {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -136,6 +141,12 @@ async fn handle_ground(state: &DaemonState, req: GroundRequest) -> DaemonRespons
 }
 
 async fn handle_index(state: &DaemonState, req: IndexRequest) -> DaemonResponse {
+    // Reject ad-hoc paths_from unconditionally: the daemon protocol does not
+    // accept it yet, and silently ignoring the field when a corpus is also
+    // selected would let MCP clients believe the path list landed.
+    if req.paths_from.is_some() {
+        return DaemonResponse::invalid_params("paths_from is not supported via the daemon yet");
+    }
     let corpora = match effective_corpora(state) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -149,9 +160,15 @@ async fn handle_index(state: &DaemonState, req: IndexRequest) -> DaemonResponse 
                 ));
             }
         }
-    } else if req.paths_from.is_some() {
-        return DaemonResponse::invalid_params("paths_from is not supported via the daemon yet");
     } else {
+        if corpora.is_empty() {
+            // Pre-daemon CLI/MCP treated "no corpora configured" as invalid
+            // input. Match that shape so a misconfigured daemon doesn't
+            // silently report "index ok" with zero work done.
+            return DaemonResponse::invalid_params(
+                "no corpora configured; add [[corpus]] or [[repository]] to config",
+            );
+        }
         corpora.clone()
     };
 
@@ -165,7 +182,10 @@ async fn handle_index(state: &DaemonState, req: IndexRequest) -> DaemonResponse 
             Err(msg) => return DaemonResponse::internal(msg),
         };
         ensure_paths_exist(&corpus);
-        let mut embedder = state.embedder().await;
+        let mut embedder = match state.embedder().await {
+            Ok(g) => g,
+            Err(e) => return DaemonResponse::internal(e.to_string()),
+        };
         let stats = match index_corpus(&corpus, &store, &mut *embedder, &chunker).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -205,6 +225,9 @@ async fn handle_add_markdown(state: &DaemonState, req: AddMarkdownRequest) -> Da
     let dest = root.join(&relative);
     if let Err(e) = ensure_corpus_allows_file(&corpus, &dest) {
         return DaemonResponse::invalid_params(e.into_inner());
+    }
+    if let Err(msg) = ensure_wiki_root_safe(&corpus) {
+        return DaemonResponse::invalid_params(msg);
     }
 
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
@@ -251,16 +274,38 @@ async fn handle_add_markdown(state: &DaemonState, req: AddMarkdownRequest) -> Da
     // Empty content produces zero chunks; the indexer would just count the
     // file as `files_skipped_empty` and burn an embedder call on a no-op.
     // Short-circuit so tests that exercise just the filesystem-mutation lane
-    // don't need the embedding model active.
+    // don't need the embedding model active. When the request is overwriting
+    // a previously-indexed file with empty content, also prune the existing
+    // LanceDB rows so searches stop returning the deleted body — the full
+    // `index_single_file` path does this via `files_skipped_empty > 0 &&
+    // had_snapshot`, but the short-circuit below bypasses that loop.
     let stats = if req.content.trim().is_empty() {
-        crate::domain::indexer::ApplyStats {
+        let mut stats = crate::domain::indexer::ApplyStats {
             files_skipped_empty: 1,
             ..Default::default()
+        };
+        if req.overwrite {
+            let file_ref = canonicalize_or_passthrough(&dest);
+            if let Some(file_ref_str) = file_ref.as_path().to_str() {
+                let store = state.store();
+                match store.get_file_snapshot(&corpus.name, file_ref_str).await {
+                    Ok(Some(_)) => match store.delete_file(&corpus.name, file_ref_str).await {
+                        Ok(()) => stats.files_deleted = 1,
+                        Err(e) => return DaemonResponse::internal(e.to_string()),
+                    },
+                    Ok(None) => {}
+                    Err(e) => return DaemonResponse::internal(e.to_string()),
+                }
+            }
         }
+        stats
     } else {
         let store = state.store();
         let chunker = state.make_chunker();
-        let mut embedder = state.embedder().await;
+        let mut embedder = match state.embedder().await {
+            Ok(g) => g,
+            Err(e) => return DaemonResponse::internal(e.to_string()),
+        };
         match index_single_file(&store, &mut embedder, &chunker, &corpus, &dest).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -308,42 +353,26 @@ async fn handle_read_markdown(state: &DaemonState, req: ReadMarkdownRequest) -> 
     if let Err(e) = ensure_corpus_allows_file(&corpus, &dest) {
         return DaemonResponse::invalid_params(e.into_inner());
     }
+    if let Err(msg) = ensure_wiki_root_safe(&corpus) {
+        return DaemonResponse::invalid_params(msg);
+    }
 
-    // Read still uses a plain `symlink_metadata` + `read` because a read
-    // through a symlinked intermediate dir is not as dangerous as a write
-    // (no data leaks out of the corpus root — worst case the daemon reads
-    // back a file it could have read anyway), and reusing
-    // `atomic_write_no_follow`'s machinery for a read would mean
-    // double-implementing the openat walk. The leaf symlink check below is
-    // still mandatory: returning a symlink's *target* would let a wiki
-    // entry act as a peephole.
-    let meta = match tokio::fs::symlink_metadata(&dest).await {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return DaemonResponse::invalid_params(format!(
-                "{} does not exist",
-                relative.display()
-            ));
+    // Symlink-safe read via the shared sandbox helper: walks every parent
+    // component with `O_NOFOLLOW` and opens the leaf `O_RDONLY | O_NOFOLLOW`
+    // so a symlinked intermediate dir or leaf bounces with the same
+    // `WriteErrorKind::Symlink` shape `add_markdown` uses for writes.
+    let read_root = root.clone();
+    let read_relative = relative.clone();
+    let error_relative = relative.clone();
+    let read = tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_relative)).await;
+    let bytes = match read {
+        Ok(Ok(b)) => b,
+        Ok(Err(WriteError { kind, source })) => {
+            return map_read_error(kind, source, &error_relative);
         }
-        Err(e) => {
-            return DaemonResponse::internal(format!("stat {}: {e}", dest.display()));
+        Err(join_err) => {
+            return DaemonResponse::internal(format!("read task panicked: {join_err}"));
         }
-    };
-    if meta.file_type().is_symlink() {
-        return DaemonResponse::invalid_params(format!(
-            "refusing to read symlink {}",
-            relative.display()
-        ));
-    }
-    if !meta.file_type().is_file() {
-        return DaemonResponse::invalid_params(format!(
-            "{} is not a regular file",
-            relative.display()
-        ));
-    }
-    let bytes = match tokio::fs::read(&dest).await {
-        Ok(b) => b,
-        Err(e) => return DaemonResponse::internal(format!("read {}: {e}", dest.display())),
     };
     let content = match String::from_utf8(bytes) {
         Ok(s) => s,
@@ -383,6 +412,9 @@ async fn handle_delete_markdown(state: &DaemonState, req: DeleteMarkdownRequest)
     let dest = root.join(&relative);
     if let Err(e) = ensure_corpus_allows_file(&corpus, &dest) {
         return DaemonResponse::invalid_params(e.into_inner());
+    }
+    if let Err(msg) = ensure_wiki_root_safe(&corpus) {
+        return DaemonResponse::invalid_params(msg);
     }
 
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
@@ -428,8 +460,25 @@ async fn handle_delete_markdown(state: &DaemonState, req: DeleteMarkdownRequest)
         }
     };
 
-    if let Err(e) = tokio::fs::remove_file(&dest).await {
-        return DaemonResponse::internal(format!("unlink {}: {e}", dest.display()));
+    // Symlink-safe unlink via the shared sandbox helper: walks every parent
+    // component with `O_NOFOLLOW` and refuses if the leaf is a symlink, so a
+    // corpus-controlled symlinked directory cannot redirect the unlink
+    // outside the corpus root.
+    let delete_root = root.clone();
+    let delete_relative = relative.clone();
+    let error_relative = relative.clone();
+    let deleted = tokio::task::spawn_blocking(move || {
+        delete_no_follow(&delete_root, &delete_relative)
+    })
+    .await;
+    match deleted {
+        Ok(Ok(())) => {}
+        Ok(Err(WriteError { kind, source })) => {
+            return map_delete_error(kind, source, &error_relative);
+        }
+        Err(join_err) => {
+            return DaemonResponse::internal(format!("unlink task panicked: {join_err}"));
+        }
     }
     if let Err(e) = state.store().delete_file(&corpus.name, &file_ref_str).await {
         return DaemonResponse::internal(e.to_string());
@@ -485,19 +534,131 @@ async fn index_single_file(
     Ok(stats)
 }
 
-/// Best-effort `mkdir -p` on every configured root so a fresh repository
-/// wiki (which only exists logically until the first write) doesn't blow
-/// up `scan`. Failures are swallowed: `scan` will return a clearer error
-/// shortly if the path is genuinely unreachable.
+/// Best-effort `mkdir -p` on daemon-managed corpus roots so a fresh
+/// repository wiki (which only exists logically until the first write)
+/// doesn't blow up the first `list_files` / `index` call. Restricted to
+/// `repo:*:wiki` corpora so a typo'd `[[corpus]] paths = ...` surfaces as a
+/// clear scan error instead of silently creating an empty directory and
+/// reporting success.
 fn ensure_paths_exist(corpus: &CorpusConfig) {
+    if !is_wiki_corpus(corpus) {
+        return;
+    }
     for raw in &corpus.paths {
         let path = crate::domain::common::expand_tilde(raw);
         let _ = std::fs::create_dir_all(&path);
     }
 }
 
-#[cfg(test)]
-use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
+/// True when `corpus.name` is a derived `repo:{name}:wiki` corpus produced
+/// by `effective_corpora()`. The daemon owns those directories (creates
+/// them on demand, enforces no-symlink safety), so a few helpers behave
+/// differently for them than for user-declared `[[corpus]]` entries.
+fn is_wiki_corpus(corpus: &CorpusConfig) -> bool {
+    corpus.name.starts_with("repo:") && corpus.name.ends_with(":wiki")
+}
+
+/// Refuse to operate on a wiki corpus whose `.hallouminate` parent or
+/// `wiki` leaf is a symlink. The repository's `path` is user-configured (so
+/// trusted), but `.hallouminate` and `wiki` are daemon-managed names that a
+/// malicious repository payload could swap for symlinks before the daemon
+/// runs the no-follow component walk inside the sandbox. Best-effort
+/// pre-flight — TOCTOU-vulnerable between this check and the subsequent
+/// open, but the daemon serializes wiki mutations behind the per-corpus
+/// mutex so a swap during the narrow window would race the daemon's own
+/// consistency model.
+fn ensure_wiki_root_safe(corpus: &CorpusConfig) -> Result<(), String> {
+    if !is_wiki_corpus(corpus) {
+        return Ok(());
+    }
+    let Some(raw) = corpus.paths.first() else {
+        return Ok(());
+    };
+    let root = crate::domain::common::expand_tilde(raw);
+    if let Some(parent) = root.parent()
+        && let Ok(meta) = std::fs::symlink_metadata(parent)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "wiki corpus {} is unsafe: parent {} is a symlink",
+            corpus.name,
+            parent.display(),
+        ));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(&root)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!(
+            "wiki corpus {} is unsafe: wiki root is a symlink",
+            corpus.name,
+        ));
+    }
+    Ok(())
+}
+
+/// Shared error mapping for `read_no_follow` failures — keeps
+/// `handle_read_markdown` flat while preserving the distinct
+/// NotFound / Symlink / IO shapes callers depend on.
+fn map_read_error(kind: WriteErrorKind, source: std::io::Error, relative: &Path) -> DaemonResponse {
+    match kind {
+        WriteErrorKind::Symlink => DaemonResponse::invalid_params(format!(
+            "refusing to read symlink {}: {source}",
+            relative.display()
+        )),
+        WriteErrorKind::InvalidPath => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                DaemonResponse::invalid_params(format!("{} does not exist", relative.display()))
+            } else {
+                DaemonResponse::invalid_params(format!(
+                    "refusing unsafe path {}: {source}",
+                    relative.display()
+                ))
+            }
+        }
+        WriteErrorKind::Io => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                DaemonResponse::invalid_params(format!("{} does not exist", relative.display()))
+            } else {
+                DaemonResponse::internal(format!("read {}: {source}", relative.display()))
+            }
+        }
+        WriteErrorKind::Exists => DaemonResponse::internal(source.to_string()),
+    }
+}
+
+/// Shared error mapping for `delete_no_follow` failures — mirrors
+/// `map_read_error` so the two handlers share one error vocabulary.
+fn map_delete_error(
+    kind: WriteErrorKind,
+    source: std::io::Error,
+    relative: &Path,
+) -> DaemonResponse {
+    match kind {
+        WriteErrorKind::Symlink => DaemonResponse::invalid_params(format!(
+            "refusing to delete symlink {}: {source}",
+            relative.display()
+        )),
+        WriteErrorKind::InvalidPath => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                DaemonResponse::invalid_params(format!("{} does not exist", relative.display()))
+            } else {
+                DaemonResponse::invalid_params(format!(
+                    "refusing unsafe path {}: {source}",
+                    relative.display()
+                ))
+            }
+        }
+        WriteErrorKind::Io => {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                DaemonResponse::invalid_params(format!("{} does not exist", relative.display()))
+            } else {
+                DaemonResponse::internal(format!("unlink {}: {source}", relative.display()))
+            }
+        }
+        WriteErrorKind::Exists => DaemonResponse::internal(source.to_string()),
+    }
+}
+
 #[cfg(test)]
 use serde_json::Value;
 

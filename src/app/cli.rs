@@ -75,8 +75,18 @@ impl From<DaemonCli> for crate::app::daemon::DaemonArgs {
 pub struct IndexCli {
     #[arg(long)]
     pub corpus: Option<String>,
-    #[arg(long, value_name = "FILE")]
+    /// Unsupported in the daemon-backed v1 — always errors with
+    /// "paths_from is not supported via the daemon yet". Kept hidden so old
+    /// scripts surface the message instead of a clap-level "unknown flag".
+    #[arg(long, value_name = "FILE", hide = true)]
     pub paths_from: Option<PathBuf>,
+    /// Local-only pre-check config path — used to validate the corpus
+    /// argument before dialing the daemon. The daemon serves whichever
+    /// config it loaded at startup, so passing `--config other.toml` here
+    /// does NOT change which corpora the daemon sees; it only changes which
+    /// config the CLI consults to surface an early "unknown corpus" error.
+    /// Restart the daemon (`hallouminate daemon --config ...`) to change
+    /// what it serves.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
     /// Override the daemon socket path. Mirrors the `HALLOUMINATE_SOCKET`
@@ -120,6 +130,9 @@ pub struct GroundCli {
     pub chunks_per_file: Option<usize>,
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
+    /// Local-only pre-check config path — same caveat as `hallouminate
+    /// index --config`: the daemon uses its own startup config, so this
+    /// flag only validates the corpus argument locally before dialing.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
     /// Override the daemon socket path. Mirrors `HALLOUMINATE_SOCKET`; lets
@@ -347,6 +360,31 @@ mod tests {
         let err = Cli::try_parse_from(["hallouminate", "ground", "q", "--pretty"])
             .expect_err("--pretty must be rejected as unknown");
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn parses_daemon_subcommand_without_args() {
+        let cli = Cli::try_parse_from(["hallouminate", "daemon"]).expect("parse daemon");
+        match cli.command {
+            Command::Daemon(args) => {
+                assert!(args.config.is_none(), "--config defaults to None");
+                let inner: crate::app::daemon::DaemonArgs = args.into();
+                assert!(inner.config.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn parses_daemon_subcommand_with_config_flag() {
+        let cli = Cli::try_parse_from(["hallouminate", "daemon", "--config", "/tmp/cfg.toml"])
+            .expect("parse daemon --config");
+        match cli.command {
+            Command::Daemon(args) => {
+                assert_eq!(args.config, Some(PathBuf::from("/tmp/cfg.toml")));
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

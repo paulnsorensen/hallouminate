@@ -162,10 +162,17 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
             Err(e) => out.push(format!("re-parse for key check failed: {e}")),
         }
     }
-    if cfg.corpora.is_empty() {
+    // Count effective corpora (explicit `[[corpus]]` + repository-derived
+    // `repo:*:wiki` / `repo:*:corpus`) so a repository-only config doesn't
+    // get falsely flagged as empty when the daemon would happily serve it.
+    let effective_empty = cfg
+        .effective_corpora()
+        .map(|c| c.is_empty())
+        .unwrap_or(true);
+    if effective_empty {
         out.push(
             "no corpora configured — `ground`, `index`, and `add_markdown` will all error \
-             until you add at least one `[[corpus]]` entry"
+             until you add at least one `[[corpus]]` or `[[repository]]` entry"
                 .to_string(),
         );
     }
@@ -323,7 +330,7 @@ name = "self"
         );
         assert!(
             warnings.iter().any(|w| w.contains("`code_repos`")
-                && w.contains("[[code_repo]]")),
+                && w.contains("renamed to `[[repository]]`")),
             "missing code_repos hint: {warnings:?}"
         );
     }

@@ -18,7 +18,7 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonResponse, DaemonState, ErrorKind, ReadMarkdownRequest,
-    connect_at, daemon_client, serve,
+    connect_at, serve,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -67,27 +67,22 @@ async fn daemon_client_returns_clear_error_when_socket_missing() {
 }
 
 #[tokio::test]
-async fn daemon_client_helper_uses_env_override_and_fails_loudly() {
-    // `daemon_client()` reads `HALLOUMINATE_SOCKET` per the spec's
-    // "resolves one user-local path shared by CLI and MCP processes"
-    // contract. Point it at a definitely-missing path and confirm the
-    // failure carries the daemon-unavailable signal.
-    //
-    // NOTE: env mutation is intentionally scoped to this test process
-    // and isolated to a unique tempdir socket so we never leak it.
+async fn daemon_client_helper_returns_clear_error_when_socket_missing() {
+    // `daemon_client()` falls back through `daemon_socket_path()` to read
+    // the configured runtime/cache socket, so we can't drive it from an
+    // env-mutating test without racing the rest of the test binary (the
+    // Rust test harness runs tasks across threads, and parallel tests may
+    // call `daemon_socket_path()` themselves). Instead exercise the same
+    // failure shape through the explicit `connect_at` entry point, which
+    // is the codepath production callers reach via `client_for(Some(...))`
+    // — the env-fallback is then covered structurally by
+    // `socket_path_is_named_daemon_sock` and the empty-XDG filter unit
+    // tests inside `daemon::socket`.
     let tmp = tempfile::tempdir().expect("tempdir");
     let missing = tmp.path().join("absent.sock");
-    // SAFETY: edition 2024 marks env mutation unsafe; the test process is
-    // single-threaded at this await point (no other task holds the env)
-    // and the override is consumed synchronously by `daemon_client()`.
-    unsafe {
-        std::env::set_var("HALLOUMINATE_SOCKET", &missing);
-    }
-    let result = daemon_client().await;
-    unsafe {
-        std::env::remove_var("HALLOUMINATE_SOCKET");
-    }
-    let err = result.expect_err("missing socket must fail");
+    let err = connect_at(&missing)
+        .await
+        .expect_err("missing socket must fail");
     assert!(
         format!("{err:#}").contains("daemon unavailable"),
         "got: {err:#}"
@@ -239,11 +234,18 @@ ground_dir = "{}"
 }
 
 #[tokio::test]
-async fn daemon_lock_does_not_serialize_writes_to_different_corpora() {
-    // Sanity: distinct corpora must NOT serialize through the same mutex.
-    // Each `add_markdown` lands on its own file under its own corpus and
-    // both succeed. (Negative regression for over-broad locking that
-    // would shrink throughput across corpora.)
+async fn per_corpus_mutex_does_not_block_writes_to_different_corpora() {
+    // Per-corpus mutex layer: distinct corpora must NOT share a per-corpus
+    // Mutex<()>, so an `add_markdown` to one corpus doesn't block another
+    // corpus's per-corpus lock acquisition. NOTE: this does NOT claim writes
+    // to different corpora run in parallel — every mutating handler also
+    // takes the single-permit global `write_lane` (see
+    // `DaemonStateInner.write_lane`), which serializes mutations across
+    // corpora at the lane layer. This regression test only covers the
+    // per-corpus mutex map: a refactor that accidentally returned the same
+    // mutex for two different names would still let both writes succeed
+    // (the global lane would serialize them) but would silently shrink
+    // throughput; this test pins the layer-1 contract.
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let corpus_a = tmp.path().join("a");

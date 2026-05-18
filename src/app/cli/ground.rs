@@ -47,9 +47,9 @@ pub async fn cmd_ground(args: GroundArgs) -> anyhow::Result<()> {
 /// Resolves against `effective_corpora()` so a single configured
 /// `[[repository]]` (which derives `repo:{name}:wiki` as its sole corpus)
 /// gets the same single-corpus prefix-strip treatment as a single
-/// `[[corpus]]` entry would. Falls back to `cfg.corpora` on a derive
-/// failure rather than swallowing the error — prefix-strip is cosmetic and
-/// real validation surfaces in `pick_corpus` / `config::load`.
+/// `[[corpus]]` entry would. Returns `None` on a derive failure rather than
+/// falling back to `cfg.corpora`: prefix-strip is cosmetic, and real
+/// validation surfaces in `pick_corpus` / `config::load`.
 fn resolve_path_prefix_strip(cfg: &Config, requested_corpus: Option<&str>) -> Option<String> {
     let effective = cfg.effective_corpora().ok()?;
     let candidate = match requested_corpus {

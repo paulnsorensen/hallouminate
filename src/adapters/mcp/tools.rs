@@ -9,7 +9,6 @@
 //! handle — that fallback is exactly the multi-process race the daemon is
 //! built to remove.
 
-use std::path::PathBuf;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -118,10 +117,6 @@ pub struct IndexParams {
     /// Optional corpus name; omit to index every configured corpus.
     #[serde(default)]
     pub corpus: Option<String>,
-    /// Optional path to a newline-delimited file of paths to ingest as an
-    /// ad-hoc corpus. Mirrors the CLI `--paths-from` flag.
-    #[serde(default)]
-    pub paths_from: Option<PathBuf>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -173,7 +168,7 @@ pub struct DeleteMarkdownParams {
 
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
 /// fresh `UnixStream`, so the server is stateless beyond `tool_router`.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct HallouminateTools {
     // The `tool_router` field is read by `#[tool_handler]`-generated code
     // when dispatching `tools/call`; rustc's dead-code pass doesn't see the
@@ -219,16 +214,6 @@ impl HallouminateTools {
         &self,
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        // The daemon does not yet accept paths_from (cook flagged the
-        // dispatcher returns InvalidParams). Surface the same shape early
-        // so MCP clients see -32602 with the explanatory message instead of
-        // a generic transport failure.
-        if let Some(p) = params.paths_from.as_ref() {
-            return Err(invalid_params(format!(
-                "paths_from is not supported via the daemon yet ({})",
-                p.display()
-            )));
-        }
         let client = daemon_for_tool().await?;
         let req = DaemonRequest::Index(IndexRequest {
             corpus: params.corpus,
@@ -355,6 +340,16 @@ impl HallouminateTools {
         let structured =
             serde_json::to_value(&entries).map_err(|e| internal_error(e.to_string()))?;
         Ok(tool_ok(names, structured))
+    }
+}
+
+impl Default for HallouminateTools {
+    /// `#[derive(Default)]` would construct `ToolRouter::default()` (an empty
+    /// router) and skip the `#[tool_router]`-generated registration. Manual
+    /// impl routes through `new()` so `HallouminateTools::default()` exposes
+    /// the same tool set as `new()`.
+    fn default() -> Self {
+        Self::new()
     }
 }
 

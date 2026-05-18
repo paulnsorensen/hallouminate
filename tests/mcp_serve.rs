@@ -158,15 +158,25 @@ fn write_minimal_config(dir: &Path) {
 }
 
 fn write_config_with_corpus(dir: &Path, corpus_name: &str, corpus_path: &str) -> Config {
+    // Pin `storage.ground_dir` to a per-test path under `dir` so the daemon
+    // doesn't open the developer's real `~/.local/share/hallouminate/ground`
+    // (which would couple every MCP test to the host's existing `meta.toml`
+    // and pollute it with test mutations). Mirrors `write_config_with_corpus_and_ground`'s
+    // contract — just derives the ground dir from `dir` instead of taking it as a separate arg.
     let cfg_dir = dir.join("hallouminate");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir hallouminate config dir");
+    let ground_dir = dir.join("ground");
     let toml = format!(
         r#"
 [[corpus]]
 name = "{corpus_name}"
 paths = ["{corpus_path}"]
 globs = ["**/*.md"]
-"#
+
+[storage]
+ground_dir = "{ground}"
+"#,
+        ground = ground_dir.display(),
     );
     let cfg_path = cfg_dir.join("config.toml");
     std::fs::write(&cfg_path, &toml).expect("write config.toml");
@@ -203,15 +213,21 @@ ground_dir = "{ground}"
     toml::from_str(&toml).expect("parse config")
 }
 
-fn load_minimal_config() -> Config {
-    Config::default()
+fn load_minimal_config(dir: &Path) -> Config {
+    // Daemon opens LanceDB at startup regardless of corpus count, so even a
+    // "minimal" config needs a tempdir ground or we'd hit the developer's
+    // real `~/.local/share/hallouminate/ground` and either create/validate
+    // its `meta.toml` or fail with a real-store model mismatch.
+    let mut cfg = Config::default();
+    cfg.storage.ground_dir = dir.join("ground").to_string_lossy().into_owned();
+    cfg
 }
 
 #[tokio::test]
 async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
     let xdg = tempfile::tempdir().expect("tempdir");
     write_minimal_config(xdg.path());
-    let harness = DaemonHarness::spawn(load_minimal_config()).await;
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
 
     let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
 
@@ -442,7 +458,7 @@ async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
     // before touching the embedder when the corpus name doesn't match.
     let xdg = tempfile::tempdir().expect("tempdir");
     write_minimal_config(xdg.path());
-    let harness = DaemonHarness::spawn(load_minimal_config()).await;
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
 
     let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
 
@@ -934,14 +950,15 @@ async fn mcp_delete_markdown_rejects_parent_escape() {
     let ground = tempfile::tempdir().expect("ground tempdir");
     let outside = tempfile::NamedTempFile::new().expect("outside file");
     std::fs::write(outside.path(), "secret\n").expect("write outside");
-    write_config_with_corpus_and_ground(
+    let cfg = write_config_with_corpus_and_ground(
         xdg.path(),
         "wiki",
         &corpus.path().to_string_lossy(),
         ground.path(),
     );
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path(), None).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -988,14 +1005,15 @@ async fn mcp_delete_markdown_rejects_symlink_inside_corpus() {
     let outside = tempfile::NamedTempFile::new().expect("outside file");
     std::fs::write(outside.path(), "secret\n").expect("write outside");
     symlink(outside.path(), corpus.path().join("leak.md")).expect("symlink");
-    write_config_with_corpus_and_ground(
+    let cfg = write_config_with_corpus_and_ground(
         xdg.path(),
         "wiki",
         &corpus.path().to_string_lossy(),
         ground.path(),
     );
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path(), None).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -1048,14 +1066,15 @@ async fn mcp_delete_markdown_rejects_intermediate_symlinked_directory() {
     let outside_file = outside_dir.path().join("victim.md");
     std::fs::write(&outside_file, "do not delete\n").expect("seed victim");
     symlink(outside_dir.path(), corpus.path().join("cheeses")).expect("symlink dir");
-    write_config_with_corpus_and_ground(
+    let cfg = write_config_with_corpus_and_ground(
         xdg.path(),
         "wiki",
         &corpus.path().to_string_lossy(),
         ground.path(),
     );
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path(), None).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",
@@ -1103,9 +1122,10 @@ async fn mcp_read_markdown_rejects_intermediate_symlinked_directory() {
     std::fs::write(outside_dir.path().join("secret.md"), "secret contents\n")
         .expect("seed secret");
     symlink(outside_dir.path(), corpus.path().join("cheeses")).expect("symlink dir");
-    write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut mcp = Mcp::spawn(xdg.path(), None).await;
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
     mcp.rpc(
         1,
         "initialize",

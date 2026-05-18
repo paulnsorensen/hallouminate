@@ -80,14 +80,39 @@ impl DaemonClient {
         })?;
         let mut text = serde_json::to_string(&req)?;
         text.push('\n');
-        stream.write_all(text.as_bytes()).await?;
-        stream.flush().await?;
+        // Wrap mid-call I/O errors with the same `daemon unavailable` hint
+        // the initial connect uses. Without this, a daemon that dies after
+        // the connect succeeds (write fails, read returns EOF, response
+        // truncates) surfaces as a bare I/O / JSON error and MCP/CLI
+        // callers lose the actionable "start it with `hallouminate daemon`"
+        // recovery suffix.
+        stream
+            .write_all(text.as_bytes())
+            .await
+            .map_err(|e| daemon_client_unavailable(format!("write to {} failed: {e}", self.socket.display())))?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| daemon_client_unavailable(format!("flush {} failed: {e}", self.socket.display())))?;
         let (read_half, _) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        let response: DaemonResponse = serde_json::from_str(line.trim_end())
-            .with_context(|| format!("invalid daemon response: {line:?}"))?;
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display())))?;
+        if n == 0 {
+            return Err(daemon_client_unavailable(format!(
+                "daemon at {} closed the connection before responding",
+                self.socket.display(),
+            )));
+        }
+        let response: DaemonResponse = serde_json::from_str(line.trim_end()).map_err(|e| {
+            daemon_client_unavailable(format!(
+                "invalid daemon response from {}: {e} (response: {line:?})",
+                self.socket.display(),
+            ))
+        })?;
         Ok(response)
     }
 

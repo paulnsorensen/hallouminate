@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::app::config;
+use crate::app::config::{self, Config};
 
 use super::dispatch::dispatch;
 use super::ipc::{DaemonRequest, DaemonResponse};
@@ -30,23 +30,56 @@ pub struct DaemonArgs {
 /// holding the single-instance lock on the configured socket directory.
 pub async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     let cfg = config::load(args.config.as_deref())?;
-    let state = DaemonState::open(cfg).await?;
     let socket_path = daemon_socket_path();
-    serve(&state, &socket_path).await
+    serve_with_config(cfg, &socket_path).await
 }
 
-/// Public for tests: drive the accept loop against a known socket path,
-/// returning when the shutdown channel fires or an unrecoverable IO error
-/// surfaces. Production `run_daemon` calls this with the resolved socket
-/// path; tests can inject `HALLOUMINATE_SOCKET` instead.
-pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
+/// Production wiring that takes the lock first, *then* opens the LanceDB
+/// handle and model. Critical for the single-instance invariant: a second
+/// daemon launched against the same socket must never briefly co-own the
+/// ground directory before failing on the lock — that's exactly the
+/// multi-process LanceDB race the daemon exists to prevent.
+async fn serve_with_config(cfg: Config, socket_path: &Path) -> anyhow::Result<()> {
+    prepare_socket_dir(socket_path).await?;
+    let lock_path = lock_path_for(socket_path);
+    let _lock = acquire_single_instance(&lock_path)?;
+    let state = DaemonState::open(cfg).await?;
+    let _ = tokio::fs::remove_file(socket_path).await;
+    serve_on_listener(&state, socket_path).await
+}
+
+async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = socket_path.parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| anyhow::anyhow!("create socket parent dir {}: {e}", parent.display()))?;
+        // 0o700: owner-only access. Without this, another local user on a
+        // shared machine could traverse the parent dir, connect to the
+        // socket, and issue mutating requests — the daemon has no
+        // peer-credential auth on the wire.
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        if let Err(e) = tokio::fs::set_permissions(parent, perms).await {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                parent = %parent.display(),
+                error = %e,
+                "failed to set socket parent permissions; continuing with default",
+            );
+        }
     }
+    Ok(())
+}
+
+/// Public for tests: drive the accept loop against an already-opened
+/// `DaemonState` and a known socket path. Tests inject shutdown via an
+/// external `tokio::select!` racing this future against an oneshot, which
+/// is why `serve` returns only on an unrecoverable IO error in production
+/// — the loop has no built-in shutdown signal.
+pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
+    prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
     let _lock = acquire_single_instance(&lock_path)?;
     // Stale socket cleanup. If a previous daemon crashed without removing
@@ -54,8 +87,25 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
     // flock above guarantees only one daemon is alive, so removing the
     // socket here is safe.
     let _ = tokio::fs::remove_file(socket_path).await;
+    serve_on_listener(state, socket_path).await
+}
+
+async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
     let listener = UnixListener::bind(socket_path)
         .map_err(|e| anyhow::anyhow!("bind {}: {e}", socket_path.display()))?;
+    // Tighten the socket itself to owner-only access — belt to the parent
+    // dir's 0o700 suspenders. Logged-but-ignored on failure so a tempfs
+    // backend that refuses chmod doesn't crash the daemon.
+    use std::os::unix::fs::PermissionsExt;
+    let perms = std::fs::Permissions::from_mode(0o600);
+    if let Err(e) = tokio::fs::set_permissions(socket_path, perms).await {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            socket = %socket_path.display(),
+            error = %e,
+            "failed to set socket permissions; continuing with default",
+        );
+    }
     tracing::info!(
         target: "hallouminate::daemon",
         socket = %socket_path.display(),

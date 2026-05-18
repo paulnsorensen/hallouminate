@@ -81,7 +81,11 @@ impl Default for StorageConfig {
 pub struct Config {
     #[serde(rename = "corpus", default)]
     pub corpora: Vec<CorpusConfig>,
-    #[serde(rename = "repository", default)]
+    // Accept the legacy `[[code_repo]]` plural too so configs written
+    // before the rename (PR #21) keep loading instead of silently dropping
+    // every repository entry. `config validate` still warns on the legacy
+    // key so users have a clear nudge to migrate.
+    #[serde(rename = "repository", alias = "code_repo", default)]
     pub repositories: Vec<RepositoryConfig>,
     #[serde(default)]
     pub search: SearchConfig,

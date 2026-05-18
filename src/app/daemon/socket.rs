@@ -19,10 +19,18 @@ const FALLBACK_BASE: &str = "~/.cache/hallouminate";
 /// 3. `~/.cache/hallouminate/daemon.sock` — portable fallback for macOS
 ///    and other systems without `$XDG_RUNTIME_DIR`.
 pub fn daemon_socket_path() -> PathBuf {
-    if let Some(explicit) = std::env::var_os("HALLOUMINATE_SOCKET") {
+    if let Some(explicit) = std::env::var_os("HALLOUMINATE_SOCKET")
+        && !explicit.is_empty()
+    {
         return PathBuf::from(explicit);
     }
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+    // An explicitly empty `XDG_RUNTIME_DIR=` (set but blank) would otherwise
+    // yield the relative `hallouminate/daemon.sock` and bind under the
+    // daemon's CWD. Mirror the rest of this codebase's XDG handling and
+    // treat empty as absent.
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+        && !runtime.is_empty()
+    {
         let mut p = PathBuf::from(runtime);
         p.push("hallouminate");
         p.push(SOCKET_NAME);

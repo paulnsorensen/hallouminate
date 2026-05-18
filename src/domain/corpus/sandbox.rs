@@ -22,10 +22,18 @@
 //!
 //! 3. **`list_corpus_files`** — scan-and-format helper both transports
 //!    expose via `list_files` and the daemon's add-markdown ack.
+//!
+//! 4. **`read_no_follow` / `delete_no_follow`** — symlink-safe read + unlink
+//!    counterparts to `atomic_write_no_follow`. The pre-refactor daemon used
+//!    `tokio::fs::read` / `tokio::fs::remove_file` after a leaf-only
+//!    `symlink_metadata` check; that left intermediate-symlink escapes wide
+//!    open. These helpers walk every parent component with `O_NOFOLLOW` so a
+//!    symlinked dir component bounces with `WriteError { kind: Symlink, .. }`
+//!    instead of leaking files outside the corpus root.
 
 use std::ffi::{CString, OsStr, OsString};
-use std::io::Write;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -256,6 +264,97 @@ pub fn atomic_write_no_follow(
         write_new_file(&parent, file_name.as_os_str(), content)?;
     }
     Ok(root.join(relative))
+}
+
+/// Read the contents of `<root>/<relative>` after walking every parent
+/// component with `O_NOFOLLOW`. The leaf is opened `O_RDONLY | O_NOFOLLOW`,
+/// so a symlinked leaf bounces with `WriteErrorKind::Symlink`. Mirrors
+/// `atomic_write_no_follow`'s component-walk so a single change to the
+/// no-follow logic stays in one place.
+pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteError> {
+    let names = normal_components(relative)?;
+    let file_name = names
+        .last()
+        .ok_or_else(|| invalid_path_error("path must name a file"))?;
+    let parent = open_parent_dir(root, &names[..names.len() - 1])?;
+    let c_name = cstring(file_name.as_os_str())?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags) };
+    let owned = fd_to_owned(fd, WriteErrorKind::Io).map_err(|err| {
+        // Match `open_child_dir_no_follow`'s classification: ELOOP on Linux,
+        // ENOTDIR / EACCES on macOS for symlinked leaves opened with
+        // `O_NOFOLLOW`. Promote whichever to `Symlink` if `lstat` confirms
+        // the entry is a symlink, so the caller sees one consistent kind.
+        let kind = classify_path_error(err.source);
+        if matches!(
+            kind.kind,
+            WriteErrorKind::InvalidPath | WriteErrorKind::Io
+        ) && is_symlink_at(parent.as_raw_fd(), file_name.as_os_str())
+        {
+            return WriteError::new(
+                WriteErrorKind::Symlink,
+                std::io::Error::from_raw_os_error(libc::ELOOP),
+            );
+        }
+        kind
+    })?;
+    let mut file = unsafe { std::fs::File::from_raw_fd(owned.into_raw_fd()) };
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    Ok(buf)
+}
+
+/// Unlink `<root>/<relative>` after walking every parent component with
+/// `O_NOFOLLOW`. Refuses to delete when the leaf is a symlink (the pre-fix
+/// daemon path silently followed parent symlinks via `tokio::fs::remove_file`,
+/// letting a corpus-controlled directory symlink redirect the unlink outside
+/// the corpus root).
+pub fn delete_no_follow(root: &Path, relative: &Path) -> Result<(), WriteError> {
+    let names = normal_components(relative)?;
+    let file_name = names
+        .last()
+        .ok_or_else(|| invalid_path_error("path must name a file"))?;
+    let parent = open_parent_dir(root, &names[..names.len() - 1])?;
+    let c_name = cstring(file_name.as_os_str())?;
+
+    // Pre-flight: `fstatat` with `AT_SYMLINK_NOFOLLOW` so the symlink-leaf
+    // case surfaces as `Symlink` (and not-a-regular-file surfaces as
+    // `InvalidPath`) before we call `unlinkat`. `unlinkat` without
+    // `AT_REMOVEDIR` also doesn't follow symlinks by itself, but the daemon's
+    // "deleted X" success message would otherwise be misleading.
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            c_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == -1 {
+        return Err(classify_create_error(std::io::Error::last_os_error()));
+    }
+    let stat = unsafe { stat.assume_init() };
+    let file_type = stat.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFLNK {
+        return Err(WriteError::new(
+            WriteErrorKind::Symlink,
+            std::io::Error::from_raw_os_error(libc::ELOOP),
+        ));
+    }
+    if file_type != libc::S_IFREG {
+        return Err(invalid_path_error("target is not a regular file"));
+    }
+
+    let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), c_name.as_ptr(), 0) };
+    if rc == -1 {
+        return Err(WriteError::new(
+            WriteErrorKind::Io,
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(())
 }
 
 fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {

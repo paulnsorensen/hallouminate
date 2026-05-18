@@ -34,7 +34,11 @@ use crate::domain::embeddings::Embedder;
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
 /// Map of corpus name → per-corpus async mutex. Each corpus gets its own
-/// `Mutex<()>` so unrelated corpora never block each other.
+/// `Mutex<()>` so unrelated corpora never collide *at the per-corpus lock
+/// layer* — but every mutating handler also takes the single-permit global
+/// `write_lane` (see `DaemonStateInner.write_lane`), so cross-corpus writes
+/// still serialize at the lane while reads through different corpora run
+/// freely.
 #[derive(Default)]
 struct CorpusLockMap {
     inner: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -65,7 +69,7 @@ struct DaemonStateInner {
     ground_dir: PathBuf,
     corpus_locks: CorpusLockMap,
     write_lane: Arc<Semaphore>,
-    embedder: Arc<Mutex<Embedder>>,
+    embedder: Arc<Mutex<Option<Embedder>>>,
     tokenizer: tokenizers::Tokenizer,
 }
 
@@ -93,12 +97,25 @@ impl DaemonState {
         let store = LanceStore::open_or_create(&ground_dir, &cfg.embeddings.model)
             .await
             .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
-        // Load the embedder + tokenizer once at boot. A daemon whose whole
-        // job is to amortize LanceDB ownership across CLI/MCP processes
-        // should not pay the model-load cost per request.
+        // Try to load the embedder eagerly so the first request doesn't pay
+        // the load cost mid-call. Tolerate failure (e.g. offline first run
+        // with no cached model) so the daemon can still serve
+        // model-independent ops (`ping`, `list_corpora`, `list_files`,
+        // `read_markdown`, `delete_markdown`); a later embedder() call will
+        // retry the load and surface the error then.
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        let embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir)
-            .map_err(|e| anyhow::anyhow!("init embedder ({}): {e}", cfg.embeddings.model))?;
+        let embedder = match Embedder::try_new(&cfg.embeddings.model, &cache_dir) {
+            Ok(e) => Some(e),
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    model = %cfg.embeddings.model,
+                    error = %e,
+                    "embedder unavailable at startup; will retry on first embedding request",
+                );
+                None
+            }
+        };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
         Ok(DaemonState {
@@ -126,12 +143,25 @@ impl DaemonState {
         &self.inner.ground_dir
     }
 
-    /// Borrow the shared embedder for one call. The fastembed runtime is
-    /// `&mut`-only, so concurrent embed batches serialize behind this mutex.
-    /// That matches the underlying constraint (one model handle per process)
-    /// rather than introducing a new one.
-    pub async fn embedder(&self) -> MutexGuard<'_, Embedder> {
-        self.inner.embedder.lock().await
+    /// Borrow the shared embedder for one call, loading it lazily on first
+    /// use. Daemon boot tries an eager load (see `open`) but tolerates
+    /// failure so model-independent ops (ping, list_corpora, list_files,
+    /// read_markdown, delete_markdown) keep working offline. The first call
+    /// that *needs* embedding pays the load cost (or surfaces a clean error
+    /// when the model is unreachable).
+    ///
+    /// The fastembed runtime is `&mut`-only, so concurrent embed batches
+    /// serialize behind this mutex; that matches the underlying constraint
+    /// (one model handle per process) rather than introducing a new one.
+    pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard<'_>> {
+        let mut guard = self.inner.embedder.lock().await;
+        if guard.is_none() {
+            let cache_dir = expand_tilde(&self.inner.cfg.embeddings.cache_dir);
+            let embedder = Embedder::try_new(&self.inner.cfg.embeddings.model, &cache_dir)
+                .map_err(|e| anyhow::anyhow!("init embedder ({}): {e}", self.inner.cfg.embeddings.model))?;
+            *guard = Some(embedder);
+        }
+        Ok(EmbedderGuard { guard })
     }
 
     /// A freshly-constructed `MarkdownChunker` over the daemon's loaded
@@ -175,6 +205,30 @@ impl DaemonState {
             _permit: permit,
             _corpus: corpus,
         })
+    }
+}
+
+/// Owned guard around the lazily-loaded embedder. Derefs to `Embedder` so
+/// existing call sites (`ground`, `index_corpus`, `apply`) keep their
+/// `&mut Embedder` signatures unchanged — only the *acquisition* shape
+/// (Result instead of infallible) differs.
+pub struct EmbedderGuard<'a> {
+    guard: MutexGuard<'a, Option<Embedder>>,
+}
+
+impl std::ops::Deref for EmbedderGuard<'_> {
+    type Target = Embedder;
+    fn deref(&self) -> &Embedder {
+        // SAFETY-of-correctness: `embedder()` populates `Some(...)` before
+        // handing the guard out, and the guard holds the mutex so no one
+        // else can swap it back to `None`.
+        self.guard.as_ref().expect("embedder loaded")
+    }
+}
+
+impl std::ops::DerefMut for EmbedderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Embedder {
+        self.guard.as_mut().expect("embedder loaded")
     }
 }
 
