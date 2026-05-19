@@ -217,7 +217,10 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
             ConfigAction::Validate { config } => cmd_config_validate(ConfigValidateArgs { config }),
         },
-        Command::Serve => crate::adapters::mcp::serve_stdio().await,
+        Command::Serve => {
+            crate::app::daemon::ensure_daemon_running().await?;
+            crate::adapters::mcp::serve_stdio().await
+        }
         Command::Daemon(args) => crate::app::daemon::run_daemon(args.into()).await,
     }
 }

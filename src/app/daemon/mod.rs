@@ -9,12 +9,16 @@
 //!   `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, or
 //!   `~/.cache/hallouminate/daemon.sock`).
 //! - Single-instance enforced via `flock` on `<socket>.lock`.
-//! - CLI / MCP transports become clients of the daemon for stateful
-//!   operations and fail loudly when the daemon is unreachable instead of
-//!   silently auto-starting (which would recreate the multi-process race).
+//! - Interactive CLI subcommands (`ground`, `index`, …) become clients of
+//!   the daemon and fail loudly when it is unreachable rather than silently
+//!   auto-starting — the user sees a clear hint to run `hallouminate daemon`.
+//! - The non-interactive MCP `serve` transport calls `ensure_daemon_running`
+//!   to spawn a detached daemon when one is not already up. The flock keeps
+//!   concurrent spawns safe: only one daemon wins the lock, the rest exit.
 //!
 //! Lock order across the dispatcher is documented in `state.rs`.
 
+mod bootstrap;
 mod client;
 mod dispatch;
 mod ipc;
@@ -22,6 +26,7 @@ mod server;
 mod socket;
 mod state;
 
+pub use bootstrap::ensure_daemon_running;
 pub use client::{
     DaemonClient, DaemonRpcError, client_for, connect_at, daemon_client, daemon_client_unavailable,
 };
