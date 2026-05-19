@@ -3,6 +3,7 @@ pub mod config;
 pub mod daemon;
 pub mod input_error;
 pub mod logging;
+pub mod xdg;
 
 use clap::Parser;
 

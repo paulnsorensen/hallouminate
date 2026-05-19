@@ -1,7 +1,7 @@
 //! Tracing subscriber wiring.
 //!
 //! Installs a `tracing-appender` daily-rolling file appender at
-//! `$XDG_STATE_HOME/hallouminate/hallouminate.log.YYYY-MM-DD`
+//! `$XDG_STATE_HOME/hallouminate/hallouminate.YYYY-MM-DD.log`
 //! (fallback `~/.local/state/hallouminate/`). Retention is 14 files via
 //! `max_log_files` — cleanup runs at each rotation boundary, which for the
 //! daemon means once per day.
@@ -22,10 +22,6 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
 
-const STATE_FALLBACK_BASE: &str = "~/.local/state";
-const STATE_SUBDIR: &str = "hallouminate";
-const LOG_FILENAME_PREFIX: &str = "hallouminate";
-const LOG_FILENAME_SUFFIX: &str = "log";
 const MAX_LOG_FILES: usize = 14;
 const DEFAULT_FILTER: &str = "hallouminate=info";
 
@@ -38,8 +34,8 @@ pub fn init() -> anyhow::Result<WorkerGuard> {
 
     let appender = Builder::new()
         .rotation(Rotation::DAILY)
-        .filename_prefix(LOG_FILENAME_PREFIX)
-        .filename_suffix(LOG_FILENAME_SUFFIX)
+        .filename_prefix("hallouminate")
+        .filename_suffix("log")
         .max_log_files(MAX_LOG_FILES)
         .build(&dir)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
@@ -58,15 +54,7 @@ pub fn init() -> anyhow::Result<WorkerGuard> {
 }
 
 fn state_dir() -> PathBuf {
-    state_dir_from(std::env::var_os("XDG_STATE_HOME").as_deref())
-}
-
-fn state_dir_from(xdg_state_home: Option<&std::ffi::OsStr>) -> PathBuf {
-    let base = xdg_state_home
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(shellexpand::tilde(STATE_FALLBACK_BASE).into_owned()));
-    base.join(STATE_SUBDIR)
+    crate::app::xdg::xdg_path("XDG_STATE_HOME", "~/.local/state", &["hallouminate"])
 }
 
 #[cfg(test)]
@@ -74,26 +62,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn state_dir_honors_xdg_state_home_when_set() {
-        let dir = state_dir_from(Some(std::ffi::OsStr::new("/var/state")));
-        assert_eq!(dir, PathBuf::from("/var/state/hallouminate"));
-    }
-
-    #[test]
-    fn state_dir_treats_empty_xdg_state_home_as_unset() {
-        let dir = state_dir_from(Some(std::ffi::OsStr::new("")));
+    fn state_dir_ends_under_hallouminate_subdir() {
+        let dir = state_dir();
         assert!(
-            dir.ends_with(".local/state/hallouminate"),
-            "unexpected fallback: {dir:?}"
+            dir.ends_with("hallouminate"),
+            "state dir must terminate in the app subdir: {dir:?}"
         );
-    }
-
-    #[test]
-    fn state_dir_falls_back_to_local_state_under_home() {
-        let dir = state_dir_from(None);
-        assert!(
-            dir.ends_with(".local/state/hallouminate"),
-            "unexpected fallback: {dir:?}"
-        );
+        assert!(dir.is_absolute(), "state dir must be absolute: {dir:?}");
     }
 }

@@ -4,16 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
 
-use crate::domain::embeddings::{DEFAULT_MODEL, canonical_model_name};
-use crate::domain::repository::{RepositoryConfig, effective_corpora};
+use crate::domain::embeddings::{canonical_model_name, DEFAULT_MODEL};
+use crate::domain::repository::{effective_corpora, RepositoryConfig};
 
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
 const DEFAULT_DEBOUNCE_MS: u64 = 500;
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
-const XDG_CONFIG_FALLBACK_BASE: &str = "~/.config";
-const APP_CONFIG_SUBPATH: [&str; 2] = ["hallouminate", "config.toml"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchConfig {
@@ -127,21 +125,23 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
 }
 
 pub fn xdg_config_path() -> PathBuf {
-    xdg_config_path_from(std::env::var_os("XDG_CONFIG_HOME").as_deref())
+    crate::app::xdg::xdg_path(
+        "XDG_CONFIG_HOME",
+        "~/.config",
+        &["hallouminate", "config.toml"],
+    )
 }
 
-/// Pure resolver: honor `$XDG_CONFIG_HOME` when set and non-empty, otherwise
-/// fall back to `~/.config`. Split out from `xdg_config_path` so tests can
-/// exercise both branches without mutating process env (unsafe on edition
+/// Pure resolver kept as a thin wrapper so the existing test suite can
+/// exercise both branches without touching process env (unsafe on edition
 /// 2024) or relying on the developer's local shell environment.
+#[cfg(test)]
 fn xdg_config_path_from(xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
-    let base = xdg_config_home
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(shellexpand::tilde(XDG_CONFIG_FALLBACK_BASE).into_owned())
-        });
-    APP_CONFIG_SUBPATH.iter().fold(base, |p, seg| p.join(seg))
+    crate::app::xdg::xdg_path_from(
+        xdg_config_home,
+        "~/.config",
+        &["hallouminate", "config.toml"],
+    )
 }
 
 fn parse(text: &str, source: Option<&Path>) -> Result<Config> {
