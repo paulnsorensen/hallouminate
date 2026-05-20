@@ -1,6 +1,23 @@
 # hallouminate
 
-A bare-bones Rust CLI tool.
+A markdown corpus indexer for LLMs to build and query their own per-repo
+wikis. Hallouminate stores markdown verbatim on disk, embeds it with
+fastembed, indexes the embeddings in LanceDB, and exposes a small MCP
+surface (`add_markdown` / `read_markdown` / `delete_markdown` / `ground`)
+so an LLM can author and search a per-repo knowledge base without
+leaving its agent loop.
+
+The filesystem is the source of truth; LanceDB rows are derived and
+refreshed automatically when an LLM writes via `add_markdown`, or in
+bulk via `hallouminate index`. Code files (`.rs`, `.toml`, …) can also
+be indexed as text for semantic search, but hallouminate does no
+structural analysis — it's a wiki indexer that happens to tolerate
+code, not a code intelligence tool.
+
+A long-lived local daemon owns the LanceDB ground directory, per-corpus
+mutation locks, and config resolution. The CLI and the stdio MCP server
+both talk to it over a Unix domain socket — one owner, no cross-process
+LanceDB races.
 
 ## Usage
 
