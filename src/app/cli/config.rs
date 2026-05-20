@@ -71,15 +71,15 @@ pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
 
 pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
     let baseline = config::load_xdg(args.config.as_deref())?;
-    let xdg_path = baseline_xdg_path(args.config.as_deref());
+    let baseline_src = baseline_source_path(args.config.as_deref());
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let (effective, layers) =
-        config::resolve_for_cwd(&baseline, &cwd, xdg_path.as_deref()).map_err(|e| {
-            // Repo-config discovery failure: format the same "XDG: ... / repo: not found" header
-            // before the error so `show` and `validate` produce a consistent failure mode.
-            anyhow!(format_no_repo_error(xdg_path.as_deref(), &cwd, &e))
+        config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref())).map_err(|e| {
+            // Repo-config discovery failure: format the same "baseline: ... / repo: not found"
+            // header before the error so `show` and `validate` produce a consistent failure mode.
+            anyhow!(format_no_repo_error(&baseline_src, &cwd, &e))
         })?;
-    print_layered_header(&layers);
+    print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
     println!();
     print!("{}", render_config(&effective)?);
@@ -111,20 +111,17 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     let baseline = config::load_xdg(args.config.as_deref())
         .with_context(|| format!("parse {}", resolved.display()))?;
 
-    let xdg_path = baseline_xdg_path(args.config.as_deref());
+    let baseline_src = baseline_source_path(args.config.as_deref());
     let cwd = resolve_cwd(args.cwd.as_deref())?;
-    let (effective, layers) = match config::resolve_for_cwd(&baseline, &cwd, xdg_path.as_deref()) {
-        Ok(out) => out,
-        Err(e) => {
-            return Err(anyhow!(format_no_repo_error(
-                xdg_path.as_deref(),
-                &cwd,
-                &e,
-            )));
-        }
-    };
+    let (effective, layers) =
+        match config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref())) {
+            Ok(out) => out,
+            Err(e) => {
+                return Err(anyhow!(format_no_repo_error(&baseline_src, &cwd, &e)));
+            }
+        };
 
-    print_layered_header(&layers);
+    print_layered_header(&baseline_src, &layers);
     println!();
     print_effective_summary(&effective)?;
 
@@ -140,13 +137,30 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     Err(anyhow!("{} warning(s); see above", warnings.len()))
 }
 
-/// What to thread into `resolve_for_cwd` as the baseline's source path.
-/// `None` when the baseline came from `--config PATH` (the path isn't an
-/// XDG path so labeling it "XDG" would be misleading); `Some(xdg)` otherwise.
-fn baseline_xdg_path(arg_config: Option<&Path>) -> Option<PathBuf> {
+/// Where the baseline came from. Either the XDG-discovered path or the
+/// explicit `--config PATH` override. Threaded into `resolve_for_cwd` so
+/// scalar-conflict diagnostics name the actual file, and rendered in the
+/// layered header so users see which file is being merged.
+struct BaselineSource {
+    path: PathBuf,
+    origin: BaselineOrigin,
+}
+
+enum BaselineOrigin {
+    Xdg,
+    ConfigFlag,
+}
+
+fn baseline_source_path(arg_config: Option<&Path>) -> BaselineSource {
     match arg_config {
-        Some(_) => None,
-        None => Some(xdg_config_path()),
+        Some(p) => BaselineSource {
+            path: p.to_path_buf(),
+            origin: BaselineOrigin::ConfigFlag,
+        },
+        None => BaselineSource {
+            path: xdg_config_path(),
+            origin: BaselineOrigin::Xdg,
+        },
     }
 }
 
@@ -157,20 +171,28 @@ fn resolve_cwd(arg_cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// "XDG: <path> (loaded | not found) / repo: <path> (loaded)" header, printed
-/// before the effective summary so users see the layer provenance.
-fn print_layered_header(layers: &ResolvedLayers) {
-    match &layers.xdg_path {
-        Some(p) => {
-            let status = if p.is_file() { "loaded" } else { "not found" };
-            println!("XDG: {} ({status})", p.display());
-        }
-        None => {
-            // No XDG layer (baseline came from `--config PATH`); the explicit
-            // path is the de-facto baseline so still surface it under XDG.
-            println!("XDG: (not consulted — baseline from --config)");
-        }
-    }
+/// "baseline: <path> (loaded | not found) [from XDG | --config] / repo:
+/// <path> (loaded)" header, printed before the effective summary so users
+/// see the layer provenance regardless of whether the baseline came from
+/// XDG or `--config PATH`.
+fn print_layered_header(baseline: &BaselineSource, layers: &ResolvedLayers) {
+    let status = if baseline.path.is_file() {
+        "loaded"
+    } else {
+        "not found"
+    };
+    let origin = match baseline.origin {
+        BaselineOrigin::Xdg => "XDG",
+        BaselineOrigin::ConfigFlag => "--config",
+    };
+    println!(
+        "baseline: {} ({status}, from {origin})",
+        baseline.path.display(),
+    );
+    // `layers.xdg_path` is kept for compatibility with `ResolvedLayers`'s
+    // public shape; the header above already named it under the
+    // source-agnostic "baseline" label.
+    let _ = &layers.xdg_path;
     println!("repo: {} (loaded)", layers.repo_path.display());
 }
 
@@ -192,23 +214,27 @@ fn print_effective_summary(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the "XDG: ... / repo: not found ..." block when `resolve_for_cwd`
+/// Build the "baseline: ... / repo: not found ..." block when `resolve_for_cwd`
 /// fails because discovery couldn't locate a `.hallouminate/config.toml`.
 fn format_no_repo_error(
-    xdg_path: Option<&Path>,
+    baseline: &BaselineSource,
     cwd: &Path,
     underlying: &crate::domain::common::HallouminateError,
 ) -> String {
     let mut out = String::new();
-    match xdg_path {
-        Some(p) => {
-            let status = if p.is_file() { "loaded" } else { "not found" };
-            out.push_str(&format!("XDG: {} ({status})\n", p.display()));
-        }
-        None => {
-            out.push_str("XDG: (not consulted — baseline from --config)\n");
-        }
-    }
+    let status = if baseline.path.is_file() {
+        "loaded"
+    } else {
+        "not found"
+    };
+    let origin = match baseline.origin {
+        BaselineOrigin::Xdg => "XDG",
+        BaselineOrigin::ConfigFlag => "--config",
+    };
+    out.push_str(&format!(
+        "baseline: {} ({status}, from {origin})\n",
+        baseline.path.display(),
+    ));
     // Surface the underlying "walked from X (stopped at repo root Y)" wording
     // verbatim — it's the load-bearing diagnostic. Wrap the whole thing as the
     // "repo: not found (...)" line the user expects.

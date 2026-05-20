@@ -154,8 +154,20 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
 /// First-match-wins; never composes multiple repo configs. Stops at the first
 /// `.git` entry (file *or* directory — git worktrees use a file) and returns
 /// an error. Stops at the filesystem root and returns an error.
+///
+/// Relative `cwd` is normalized to an absolute path against the process'
+/// `current_dir()` before walking, so `Path::parent()` walks reliably reach
+/// the real filesystem root (a relative path bottoms out at the empty
+/// component instead, producing a misleading "reached filesystem root"
+/// error).
 pub fn discover_repo_config(cwd: &Path) -> Result<PathBuf> {
-    let mut current: Option<&Path> = Some(cwd);
+    let absolute_cwd: PathBuf = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        let here = std::env::current_dir().map_err(HallouminateError::from)?;
+        here.join(cwd)
+    };
+    let mut current: Option<&Path> = Some(&absolute_cwd);
     while let Some(level) = current {
         let candidate = level.join(".hallouminate").join("config.toml");
         // `is_file` returns false on io errors (permission denied, broken
@@ -185,13 +197,19 @@ pub fn discover_repo_config(cwd: &Path) -> Result<PathBuf> {
 }
 
 /// Parse a repo-layer TOML file, resolving relative paths against the
-/// config file's parent directory.
+/// **repo root** (the parent of `.hallouminate/`, i.e. the directory the
+/// user would `cd` into when working on the repo).
 ///
 /// Same schema as `load_xdg`. Differences:
 ///   - `[[repository]].path`, `[[repository]].corpus_paths[*]`,
 ///     `[[corpus]].paths[*]`, `[storage].ground_dir`, and
-///     `[embeddings].cache_dir` get resolved against `config_path.parent()`
-///     and stored as absolute strings.
+///     `[embeddings].cache_dir` get resolved against the repo root and
+///     stored as absolute strings. Resolving against the repo root (not the
+///     `.hallouminate/` directory) matches user intuition — writing
+///     `paths = ["docs"]` in `.hallouminate/config.toml` means
+///     `<repo>/docs`, and `[[repository]] path = "."` means the repo root
+///     itself (so `wiki_directory` lands at `<repo>/.hallouminate/wiki`,
+///     not `<repo>/.hallouminate/.hallouminate/wiki`).
 ///   - Absolute paths and `~`-prefixed paths pass through untouched —
 ///     tilde expansion happens at consumption time via `expand_tilde`,
 ///     identical to the XDG layer's behavior today.
@@ -201,13 +219,20 @@ pub fn load_repo_layer(config_path: &Path) -> Result<Config> {
     let mut cfg: Config = toml::from_str(&text).map_err(|e| {
         HallouminateError::Config(format!("parsing config at {}: {e}", config_path.display()))
     })?;
-    let base = config_path.parent().ok_or_else(|| {
+    // Resolve against the parent of `.hallouminate/`, i.e. the repo root.
+    // `discover_repo_config` only returns paths ending in
+    // `<repo_root>/.hallouminate/config.toml`, so two `parent()` hops are
+    // always defined for paths produced by discovery. For programmatic
+    // callers that hand us a flatter path we fall back to a single hop
+    // rather than panic.
+    let hallouminate_dir = config_path.parent().ok_or_else(|| {
         HallouminateError::Config(format!(
             "repo config path has no parent directory: {}",
             config_path.display(),
         ))
     })?;
-    resolve_repo_layer_paths(&mut cfg, base);
+    let repo_root = hallouminate_dir.parent().unwrap_or(hallouminate_dir);
+    resolve_repo_layer_paths(&mut cfg, repo_root);
     normalize(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
@@ -361,8 +386,8 @@ where
                 Ok(baseline)
             } else {
                 let baseline_src = baseline_path
-                    .map(|p| format!(" (XDG at {})", p.display()))
-                    .unwrap_or_else(|| " (XDG baseline)".into());
+                    .map(|p| format!(" (baseline at {})", p.display()))
+                    .unwrap_or_else(|| " (baseline)".into());
                 let repo_src = repo_path
                     .map(|p| format!(" (repo at {})", p.display()))
                     .unwrap_or_else(|| " (repo layer)".into());
@@ -375,9 +400,11 @@ where
     }
 }
 
-/// Rewrite every relative non-tilde path in `cfg` as `base.join(path)`,
-/// canonicalized via `Path::components` to drop trailing slashes / `.`
-/// segments. Absolute paths and `~`-prefixed paths are left alone.
+/// Rewrite every relative non-tilde path in `cfg` as `base.join(path)`.
+/// `.` / `..` segments are preserved as written — `Path::join` does not
+/// normalize, and we don't post-process via `Path::components` because
+/// canonicalization would require the path to exist on disk. Absolute
+/// paths and `~`-prefixed paths are left alone.
 fn resolve_repo_layer_paths(cfg: &mut Config, base: &Path) {
     for corpus in cfg.corpora.iter_mut() {
         for p in corpus.paths.iter_mut() {
@@ -1004,7 +1031,7 @@ rrf_k                   = 60
     // ── load_repo_layer ─────────────────────────────────────────────────
 
     #[test]
-    fn load_repo_layer_resolves_relative_paths_against_config_parent() {
+    fn load_repo_layer_resolves_relative_paths_against_repo_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo_root = canon(dir.path());
         let cfg = r#"
@@ -1026,10 +1053,12 @@ cache_dir = "var/fastembed"
         let cfg_path = write_repo_config(&repo_root, cfg);
 
         let parsed = load_repo_layer(&cfg_path).expect("load_repo_layer");
-        let base = canon(cfg_path.parent().unwrap());
+        // Repo-layer relative paths are resolved against the repo root
+        // (the parent of `.hallouminate/`), not against `.hallouminate/`
+        // itself. This matches user intuition: `paths = ["docs"]` written
+        // in `.hallouminate/config.toml` means `<repo>/docs`.
+        let base = &repo_root;
 
-        // Corpus paths resolved against config's parent (i.e. the
-        // `.hallouminate/` directory) per spec.
         assert_eq!(
             parsed.corpora[0].paths,
             vec![
@@ -1037,7 +1066,9 @@ cache_dir = "var/fastembed"
                 base.join("specs/cur").to_string_lossy().into_owned(),
             ]
         );
-        // Repository path "." resolved to the config's parent.
+        // Repository `path = "."` resolves to the repo root itself, so
+        // `wiki_directory` lands at `<repo>/.hallouminate/wiki` (no double
+        // `.hallouminate/`).
         assert_eq!(
             parsed.repositories[0].path,
             base.join(".").to_string_lossy().into_owned(),
@@ -1292,10 +1323,11 @@ paths = ["/g"]
     fn resolve_for_cwd_with_repository_dot_path_derives_corpora_against_repo_root() {
         // AC #8: `[[repository]] name="X" path="."` must derive
         // `repo:X:wiki` and `repo:X:corpus` with paths resolved against the
-        // repo root (i.e. the config parent).
+        // repo root (the parent of `.hallouminate/`, i.e. the directory the
+        // user `cd`s into).
         let dir = tempfile::tempdir().expect("tempdir");
         let repo_root = canon(dir.path());
-        let cfg_path = write_repo_config(
+        write_repo_config(
             &repo_root,
             r#"
 [[repository]]
@@ -1304,7 +1336,6 @@ path = "."
 corpus_paths = ["docs"]
 "#,
         );
-        let base = canon(cfg_path.parent().unwrap());
 
         let baseline = Config::default();
         let (effective, _layers) = resolve_for_cwd(&baseline, &repo_root, None).expect("resolve");
@@ -1313,8 +1344,9 @@ corpus_paths = ["docs"]
         let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["repo:X:wiki", "repo:X:corpus"]);
 
-        // The wiki corpus resolves under the repo root.
-        let wiki_expected = base
+        // The wiki corpus resolves under the repo root — no double
+        // `.hallouminate/.hallouminate/` segment.
+        let wiki_expected = repo_root
             .join(".")
             .join(".hallouminate")
             .join("wiki")
@@ -1322,11 +1354,11 @@ corpus_paths = ["docs"]
             .into_owned();
         assert_eq!(all[0].paths, vec![wiki_expected]);
 
-        // The repo source corpus resolves "docs" against the config parent
-        // at `load_repo_layer` time, then `resolve_under` sees it as already
+        // The repo source corpus resolves "docs" against the repo root at
+        // `load_repo_layer` time, then `resolve_under` sees it as already
         // absolute and passes it through verbatim — so the final path is
-        // `<base>/docs` with no extra `.` segment.
-        let docs_expected = base.join("docs").to_string_lossy().into_owned();
+        // `<repo_root>/docs` with no extra `.` segment.
+        let docs_expected = repo_root.join("docs").to_string_lossy().into_owned();
         assert_eq!(all[1].paths, vec![docs_expected]);
     }
 

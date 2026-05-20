@@ -68,9 +68,9 @@ struct DaemonStateInner {
     ///
     /// Built once from XDG + `--config PATH` at daemon startup and frozen
     /// for the process lifetime. Per-request handling layers repo-discovery
-    /// (`.hallouminate.toml` walk from the request's `cwd`) on top of this
-    /// via `Config::resolve_for_cwd` in the dispatcher — the baseline never
-    /// changes once the daemon is running.
+    /// (`.hallouminate/config.toml` walk from the request's `cwd`) on top of
+    /// this via `Config::resolve_for_cwd` in the dispatcher — the baseline
+    /// never changes once the daemon is running.
     baseline: Config,
     /// Source path of the baseline (the XDG config path or the `--config
     /// PATH` override). Threaded into `resolve_for_cwd` so scalar-conflict
