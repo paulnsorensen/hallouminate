@@ -168,7 +168,8 @@ pub struct DeleteMarkdownParams {
 }
 
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
-/// fresh `UnixStream`, so the server is stateless beyond `tool_router`.
+/// fresh `UnixStream`, so the server is stateless beyond `tool_router`
+/// and the captured client cwd.
 #[derive(Debug, Clone)]
 pub struct HallouminateTools {
     // The `tool_router` field is read by `#[tool_handler]`-generated code
@@ -176,13 +177,17 @@ pub struct HallouminateTools {
     // macro expansion, so silence the warning here.
     #[allow(dead_code)]
     tool_router: ToolRouter<HallouminateTools>,
+    /// CWD captured once at MCP server startup, forwarded on every daemon
+    /// hop so repo discovery resolves against the client's workspace.
+    cwd: PathBuf,
 }
 
 #[tool_router]
 impl HallouminateTools {
-    pub fn new() -> Self {
+    pub fn new(cwd: PathBuf) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            cwd,
         }
     }
 
@@ -195,7 +200,7 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
         let req = DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: self.cwd.clone(),
             payload: DaemonRequestPayload::Ground(GroundRequest {
                 query: params.query,
                 corpus: params.corpus,
@@ -220,7 +225,7 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
         let req = DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: self.cwd.clone(),
             payload: DaemonRequestPayload::Index(IndexRequest {
                 corpus: params.corpus,
                 paths_from: None,
@@ -253,7 +258,7 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
         let req = DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: self.cwd.clone(),
             payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
                 corpus: params.corpus,
             }),
@@ -278,7 +283,7 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
         let req = DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: self.cwd.clone(),
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: params.corpus,
                 path: params.path,
@@ -305,7 +310,7 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
         let req = DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: self.cwd.clone(),
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: params.corpus,
                 path: params.path,
@@ -326,7 +331,7 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
         let req = DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: self.cwd.clone(),
             payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
                 corpus: params.corpus,
                 path: params.path,
@@ -349,7 +354,7 @@ impl HallouminateTools {
         let client = daemon_for_tool().await?;
         let entries: ListCorporaResult = client
             .call(DaemonRequest {
-                cwd: PathBuf::new(),
+                cwd: self.cwd.clone(),
                 payload: DaemonRequestPayload::ListCorpora,
             })
             .await
@@ -369,9 +374,10 @@ impl Default for HallouminateTools {
     /// `#[derive(Default)]` would construct `ToolRouter::default()` (an empty
     /// router) and skip the `#[tool_router]`-generated registration. Manual
     /// impl routes through `new()` so `HallouminateTools::default()` exposes
-    /// the same tool set as `new()`.
+    /// the same tool set as `new()`. The default cwd is empty — production
+    /// callers go through `serve_stdio` which captures the real cwd.
     fn default() -> Self {
-        Self::new()
+        Self::new(PathBuf::new())
     }
 }
 
@@ -415,6 +421,18 @@ mod tests {
         let mapped = map_daemon_err(err);
         assert_eq!(mapped.code.0, -32603);
         assert!(mapped.message.contains("disk on fire"));
+    }
+
+    #[test]
+    fn new_stores_cwd_for_daemon_hops() {
+        // Pin the field plumbing: the cwd handed to `HallouminateTools::new`
+        // at MCP startup must be the same value every tool handler clones
+        // into its `DaemonRequest`. Testing that cwd actually flows over
+        // the socket needs a daemon fixture and lives in the integration
+        // suite — this guards the boring-but-easy-to-break wiring.
+        let cwd = PathBuf::from("/test/cwd");
+        let tools = HallouminateTools::new(cwd.clone());
+        assert_eq!(tools.cwd, cwd);
     }
 
     #[test]
