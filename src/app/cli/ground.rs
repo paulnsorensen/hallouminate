@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::app::config::{self, Config};
-use crate::app::daemon::{DaemonRequest, GroundRequest, GroundResult, client_for};
+use crate::app::daemon::{DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for};
 use crate::app::input_error::InputError;
 use crate::domain::common::{CorpusConfig, expand_tilde};
 use crate::domain::ground::{Format, GroundResponse, RenderOpts, render};
@@ -90,14 +90,17 @@ pub async fn run_ground_with_cfg(cfg: &Config, args: GroundArgs) -> anyhow::Resu
     let _ = pick_corpus(cfg, args.corpus.as_deref())?;
 
     let client = client_for(args.socket.as_deref()).await?;
-    let req = DaemonRequest::Ground(GroundRequest {
-        query: args.query,
-        corpus: args.corpus,
-        top_files: args.top_files,
-        chunks_per_file: args.chunks_per_file,
-        limit: args.limit.or(Some(DEFAULT_LIMIT)),
-        snippet_chars: args.snippet_chars,
-    });
+    let req = DaemonRequest {
+        cwd: PathBuf::new(),
+        payload: DaemonRequestPayload::Ground(GroundRequest {
+            query: args.query,
+            corpus: args.corpus,
+            top_files: args.top_files,
+            chunks_per_file: args.chunks_per_file,
+            limit: args.limit.or(Some(DEFAULT_LIMIT)),
+            snippet_chars: args.snippet_chars,
+        }),
+    };
     let result: GroundResult = client.call(req).await?;
     Ok(result.response)
 }

@@ -10,6 +10,7 @@
 //! built to remove.
 
 
+use std::path::PathBuf;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData, ServerInfo};
@@ -18,10 +19,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::app::daemon::{
-    AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRpcError,
-    DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult,
-    IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult, ReadMarkdownRequest,
-    ReadMarkdownResult, client_for,
+    AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
+    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
+    GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
+    ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -193,14 +194,17 @@ impl HallouminateTools {
         Parameters(params): Parameters<GroundParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
-        let req = DaemonRequest::Ground(GroundRequest {
-            query: params.query,
-            corpus: params.corpus,
-            top_files: params.top_files,
-            chunks_per_file: params.chunks_per_file,
-            limit: params.limit,
-            snippet_chars: params.snippet_chars,
-        });
+        let req = DaemonRequest {
+            cwd: PathBuf::new(),
+            payload: DaemonRequestPayload::Ground(GroundRequest {
+                query: params.query,
+                corpus: params.corpus,
+                top_files: params.top_files,
+                chunks_per_file: params.chunks_per_file,
+                limit: params.limit,
+                snippet_chars: params.snippet_chars,
+            }),
+        };
         let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured =
             serde_json::to_value(&result.response).map_err(|e| internal_error(e.to_string()))?;
@@ -215,10 +219,13 @@ impl HallouminateTools {
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
-        let req = DaemonRequest::Index(IndexRequest {
-            corpus: params.corpus,
-            paths_from: None,
-        });
+        let req = DaemonRequest {
+            cwd: PathBuf::new(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: params.corpus,
+                paths_from: None,
+            }),
+        };
         let report: crate::app::cli::IndexReport =
             client.call(req).await.map_err(map_daemon_err)?;
         let summary = report
@@ -245,9 +252,12 @@ impl HallouminateTools {
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
-        let req = DaemonRequest::ListFiles(ListFilesRequest {
-            corpus: params.corpus,
-        });
+        let req = DaemonRequest {
+            cwd: PathBuf::new(),
+            payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
+                corpus: params.corpus,
+            }),
+        };
         let entries: ListFilesResult = client.call(req).await.map_err(map_daemon_err)?;
         let text = entries
             .iter()
@@ -267,12 +277,15 @@ impl HallouminateTools {
         Parameters(params): Parameters<AddMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
-        let req = DaemonRequest::AddMarkdown(AddMarkdownRequest {
-            corpus: params.corpus,
-            path: params.path,
-            content: params.content,
-            overwrite: params.overwrite,
-        });
+        let req = DaemonRequest {
+            cwd: PathBuf::new(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: params.corpus,
+                path: params.path,
+                content: params.content,
+                overwrite: params.overwrite,
+            }),
+        };
         let response: AddMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let text = format!(
             "wrote {} and refreshed corpus {}",
@@ -291,10 +304,13 @@ impl HallouminateTools {
         Parameters(params): Parameters<ReadMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
-        let req = DaemonRequest::ReadMarkdown(ReadMarkdownRequest {
-            corpus: params.corpus,
-            path: params.path,
-        });
+        let req = DaemonRequest {
+            cwd: PathBuf::new(),
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: params.corpus,
+                path: params.path,
+            }),
+        };
         let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured =
             serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
@@ -309,10 +325,13 @@ impl HallouminateTools {
         Parameters(params): Parameters<DeleteMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
-        let req = DaemonRequest::DeleteMarkdown(DeleteMarkdownRequest {
-            corpus: params.corpus,
-            path: params.path,
-        });
+        let req = DaemonRequest {
+            cwd: PathBuf::new(),
+            payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
+                corpus: params.corpus,
+                path: params.path,
+            }),
+        };
         let response: DeleteMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let text = format!("deleted {} from corpus {}", response.path, response.corpus);
         let structured =
@@ -329,7 +348,10 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
         let entries: ListCorporaResult = client
-            .call(DaemonRequest::ListCorpora)
+            .call(DaemonRequest {
+                cwd: PathBuf::new(),
+                payload: DaemonRequestPayload::ListCorpora,
+            })
             .await
             .map_err(map_daemon_err)?;
         let names = entries

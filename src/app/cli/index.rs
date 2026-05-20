@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::app::config::{self, Config};
-use crate::app::daemon::{DaemonRequest, IndexRequest, client_for};
+use crate::app::daemon::{DaemonRequest, DaemonRequestPayload, IndexRequest, client_for};
 use crate::app::input_error::InputError;
 use crate::domain::common::CorpusConfig;
 
@@ -50,10 +50,13 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
     let _ = select_corpora(&cfg, args.corpus.as_deref(), None)?;
 
     let client = client_for(args.socket.as_deref()).await?;
-    let req = DaemonRequest::Index(IndexRequest {
-        corpus: args.corpus.clone(),
-        paths_from: None,
-    });
+    let req = DaemonRequest {
+        cwd: PathBuf::new(),
+        payload: DaemonRequestPayload::Index(IndexRequest {
+            corpus: args.corpus.clone(),
+            paths_from: None,
+        }),
+    };
     let report: IndexReport = client.call(req).await?;
     Ok(report)
 }

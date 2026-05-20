@@ -28,14 +28,27 @@ use crate::app::cli::IndexReport;
 use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::ground::GroundResponse;
 
-/// Top-level request envelope. One variant per CLI/MCP operation the daemon
-/// owns. Stateless operations (`Ping`, `ListCorpora`, `ListFiles`,
+/// Top-level request envelope. Carries a `cwd: PathBuf` plus a
+/// [`DaemonRequestPayload`] discriminating one of the request variants.
+///
+/// `cwd` is the client's working directory at request time — the daemon
+/// walks it on every request to discover the active repo-layer config
+/// (`.hallouminate/config.toml`) and merge it with the boot baseline. See
+/// `.cheese/specs/repo-config-discovery.md`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonRequest {
+    pub cwd: PathBuf,
+    pub payload: DaemonRequestPayload,
+}
+
+/// The discriminated request body. One variant per CLI/MCP operation the
+/// daemon owns. Stateless operations (`Ping`, `ListCorpora`, `ListFiles`,
 /// `ReadMarkdown`, `Ground`) skip the write lane; mutating operations
 /// (`Index`, `AddMarkdown`, `DeleteMarkdown`) take the corpus lock and the
 /// write-lane permit in that order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
-pub enum DaemonRequest {
+pub enum DaemonRequestPayload {
     /// Liveness check; the server responds with `Pong`.
     Ping,
     /// `ground` semantic search.

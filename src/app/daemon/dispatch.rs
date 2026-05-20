@@ -38,22 +38,22 @@ use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corp
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 
 use super::ipc::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonResponse,
-    DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest,
-    ListFilesRequest, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
+    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
+    IndexRequest, ListFilesRequest, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
 pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
-    match req {
-        DaemonRequest::Ping => DaemonResponse::ok(&"pong"),
-        DaemonRequest::Ground(req) => handle_ground(state, req).await,
-        DaemonRequest::Index(req) => handle_index(state, req).await,
-        DaemonRequest::ListCorpora => handle_list_corpora(state),
-        DaemonRequest::ListFiles(req) => handle_list_files(state, req),
-        DaemonRequest::AddMarkdown(req) => handle_add_markdown(state, req).await,
-        DaemonRequest::ReadMarkdown(req) => handle_read_markdown(state, req).await,
-        DaemonRequest::DeleteMarkdown(req) => handle_delete_markdown(state, req).await,
+    match req.payload {
+        DaemonRequestPayload::Ping => DaemonResponse::ok(&"pong"),
+        DaemonRequestPayload::Ground(req) => handle_ground(state, req).await,
+        DaemonRequestPayload::Index(req) => handle_index(state, req).await,
+        DaemonRequestPayload::ListCorpora => handle_list_corpora(state),
+        DaemonRequestPayload::ListFiles(req) => handle_list_files(state, req),
+        DaemonRequestPayload::AddMarkdown(req) => handle_add_markdown(state, req).await,
+        DaemonRequestPayload::ReadMarkdown(req) => handle_read_markdown(state, req).await,
+        DaemonRequestPayload::DeleteMarkdown(req) => handle_delete_markdown(state, req).await,
     }
 }
 
