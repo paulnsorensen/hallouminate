@@ -464,6 +464,49 @@ mod tests {
             msg.contains("hallouminate requires a .hallouminate/config.toml"),
             "missing user-facing error: {msg}"
         );
+        // Provenance tag: `config: Some(...)` means the baseline came
+        // from `--config`, so the header must surface that origin so
+        // the user knows which file is the baseline.
+        assert!(
+            msg.contains("from --config"),
+            "header must tag baseline origin as --config: {msg}"
+        );
+    }
+
+    #[test]
+    fn format_no_repo_error_surfaces_baseline_path_and_origin_for_xdg() {
+        // The error block must name the actual baseline path and its
+        // origin (`from XDG`) regardless of whether the file exists.
+        // This is the regression-protection for Copilot review #6 — the
+        // pre-fix code rendered "XDG: (not consulted ...)" without a
+        // path when `--config` was supplied; the post-fix code uses a
+        // single source-agnostic format. Test both origins.
+        let baseline = BaselineSource {
+            path: PathBuf::from("/etc/hallouminate/config.toml"),
+            origin: BaselineOrigin::Xdg,
+        };
+        let cwd = PathBuf::from("/work");
+        let err = crate::domain::common::HallouminateError::Config("walked from /work".into());
+        let out = format_no_repo_error(&baseline, &cwd, &err);
+        assert!(out.contains("baseline: /etc/hallouminate/config.toml"), "{out}");
+        assert!(out.contains("from XDG"), "missing XDG origin tag: {out}");
+        assert!(out.contains("not found"), "missing status: {out}");
+    }
+
+    #[test]
+    fn format_no_repo_error_surfaces_baseline_path_and_origin_for_config_flag() {
+        let baseline = BaselineSource {
+            path: PathBuf::from("/tmp/override.toml"),
+            origin: BaselineOrigin::ConfigFlag,
+        };
+        let cwd = PathBuf::from("/work");
+        let err = crate::domain::common::HallouminateError::Config("walked from /work".into());
+        let out = format_no_repo_error(&baseline, &cwd, &err);
+        assert!(out.contains("baseline: /tmp/override.toml"), "{out}");
+        assert!(
+            out.contains("from --config"),
+            "missing --config origin tag: {out}"
+        );
     }
 
     #[test]

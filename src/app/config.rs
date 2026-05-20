@@ -1000,6 +1000,51 @@ rrf_k                   = 60
     }
 
     #[test]
+    fn discover_repo_config_relative_cwd_resolves_against_current_dir() {
+        // The relative-cwd normalization fix: a relative `cwd` must be
+        // joined against `std::env::current_dir()` before walking, so
+        // `Path::parent()` walks reach the real filesystem root rather
+        // than bottoming out at the empty path.
+        //
+        // The error message preserves the user's original `cwd` input
+        // verbatim ("walking up from <cwd>"), so the relative and
+        // absolute inputs differ there. But the *walked* path — the
+        // "stopped at repo root <level>" / "reached filesystem root"
+        // tail — must be identical after normalization, because both
+        // inputs resolve to the same absolute starting point and
+        // ascend the same parent chain.
+        //
+        // Before the fix, the relative input bottomed out at the empty
+        // path and produced either an empty `<level>` in the error or a
+        // misleading "reached filesystem root" branch.
+        let rel = Path::new("nonexistent-relative-input-zzz");
+        let here = std::env::current_dir().expect("current_dir");
+        let abs = here.join(rel);
+        let rel_msg = match discover_repo_config(rel) {
+            Err(HallouminateError::Config(m)) => m,
+            other => panic!("relative input must error: {other:?}"),
+        };
+        let abs_msg = match discover_repo_config(&abs) {
+            Err(HallouminateError::Config(m)) => m,
+            other => panic!("absolute input must error: {other:?}"),
+        };
+
+        // Extract the walk-tail (the parenthesized "(... )" suffix) and
+        // assert relative and absolute inputs ended the walk at the
+        // same point.
+        let tail = |m: &str| {
+            m.rfind('(')
+                .map(|i| m[i..].to_string())
+                .unwrap_or_else(|| m.to_string())
+        };
+        assert_eq!(
+            tail(&rel_msg),
+            tail(&abs_msg),
+            "relative and absolute cwd must reach the same walk endpoint after normalization;\n  rel: {rel_msg}\n  abs: {abs_msg}",
+        );
+    }
+
+    #[test]
     fn discover_repo_config_errors_walking_past_no_git_no_config() {
         // A subtree with no `.git` and no `.hallouminate/config.toml`
         // anywhere up to the filesystem root must error rather than walk
