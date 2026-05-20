@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
+use ignore::WalkBuilder;
 
 use crate::domain::common::{
-    CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
-    expand_tilde,
+    canonicalize_or_passthrough, expand_tilde, CorpusConfig, FileRef, HallouminateError, Mtime,
+    Result,
 };
 
 pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
@@ -57,7 +57,9 @@ fn walk_root(
     }
     for entry in builder.build() {
         let entry = entry.map_err(|e| HallouminateError::Indexer(format!("walk error: {e}")))?;
-        let Some(ft) = entry.file_type() else { continue };
+        let Some(ft) = entry.file_type() else {
+            continue;
+        };
         if !ft.is_file() {
             continue;
         }
@@ -103,9 +105,14 @@ fn root_is_gitignored(root: &Path) -> bool {
     // Outer-to-inner: ancestor patterns apply first; inner `.gitignore` files
     // override them. We collected innermost-first, so reverse.
     for gi in gitignore_files.iter().rev() {
-        if builder.add(gi).is_some() {
-            return false;
-        }
+        // `GitignoreBuilder::add` returns `Some(_)` for non-fatal partial
+        // errors (a single malformed glob line); per the `ignore` crate
+        // docs, every other valid glob in the file is still added. Treating
+        // that as fatal would silently disengage the opt-in escape hatch
+        // whenever an ancestor `.gitignore` (including the user's global
+        // gitignore) has even one bad line, so drop the partial error and
+        // keep going rather than bail.
+        let _ = builder.add(gi);
     }
     let Ok(gitignore) = builder.build() else {
         return false;
@@ -368,21 +375,64 @@ mod tests {
     }
 
     #[test]
-    fn scan_does_not_treat_non_repo_roots_as_opt_in() {
-        // Sanity check: when there's no .git ancestor at all, root_is_gitignored
-        // returns false, so the walk happens with gitignore filtering on. With
-        // no .gitignore files present, that still walks everything — but the
-        // path through the code is the "default" branch, not the opt-in branch.
+    fn root_is_gitignored_distinguishes_opt_in_from_default_paths() {
+        // Verify both branches of the opt-in detector directly. The previous
+        // scan-level test asserted an outcome that was identical between the
+        // two branches it claimed to discriminate, so it couldn't catch a
+        // regression in the dichotomy. This one can.
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
-        fs::write(root.join("a.md"), "a").unwrap();
-        let corpus = CorpusConfig {
-            name: "no-repo".into(),
-            paths: vec![root.to_string_lossy().into_owned()],
-            globs: vec!["**/*.md".into()],
-            exclude: vec![],
-        };
-        let result = scan(&corpus).expect("scan");
-        assert_eq!(file_names(&result), vec!["a.md".to_string()]);
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "secrets/\n").unwrap();
+        let secrets = root.join("secrets");
+        fs::create_dir_all(&secrets).unwrap();
+        let normal = root.join("src");
+        fs::create_dir_all(&normal).unwrap();
+
+        assert!(
+            root_is_gitignored(&secrets),
+            "secrets/ is gitignored — must be detected as explicit opt-in"
+        );
+        assert!(
+            !root_is_gitignored(&normal),
+            "src/ is not gitignored — must not trigger opt-in"
+        );
+        assert!(
+            !root_is_gitignored(root),
+            "repo root itself is not gitignored — must not trigger opt-in"
+        );
+    }
+
+    #[test]
+    fn root_is_gitignored_returns_false_when_no_git_ancestor() {
+        // No `.git` boundary above the tempdir — the helper must bail with
+        // `false` so the walk falls back to honoring gitignore by default
+        // rather than silently disabling it.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(
+            !root_is_gitignored(tmp.path()),
+            "no .git ancestor must yield false"
+        );
+    }
+
+    #[test]
+    fn root_is_gitignored_survives_malformed_ancestor_gitignore() {
+        // Regression guard for the partial-add fix: a single malformed glob
+        // line in an ancestor `.gitignore` used to make `root_is_gitignored`
+        // bail with `false`, silently disengaging the opt-in escape hatch.
+        // The fix drops the partial-add error, so valid globs after the bad
+        // line still apply and a gitignored corpus root is still detected.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        // First line is a malformed character class; second line is valid.
+        fs::write(root.join(".gitignore"), "[invalid\nsecrets/\n").unwrap();
+        let secrets = root.join("secrets");
+        fs::create_dir_all(&secrets).unwrap();
+
+        assert!(
+            root_is_gitignored(&secrets),
+            "valid `secrets/` rule must still apply despite the malformed line above it"
+        );
     }
 }
