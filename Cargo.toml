@@ -28,7 +28,7 @@ fastembed = "5"
 # Hashing + filesystem
 blake3 = "1"
 libc = "0.2"
-walkdir = "2"
+ignore = "0.4"
 globset = "0.4"
 
 # Markdown + text

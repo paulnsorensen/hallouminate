@@ -1,7 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use walkdir::WalkDir;
+use ignore::WalkBuilder;
+use ignore::gitignore::GitignoreBuilder;
 
 use crate::domain::common::{
     CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
@@ -14,50 +16,103 @@ pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
     let mut out = Vec::new();
     for raw in &corpus.paths {
         let root = expand_tilde(raw);
-        walk_root(&root, include.as_ref(), exclude.as_ref(), &mut out)?;
+        // "Auto-skip gitignored, unless explicitly included": if the corpus
+        // root itself is gitignored by some ancestor `.gitignore`, the user
+        // pointed at it on purpose — treat that as explicit opt-in and walk
+        // it without applying gitignore filters. Otherwise honor `.gitignore`,
+        // `.ignore`, `.git/info/exclude`, and the global gitignore as ripgrep
+        // does.
+        let explicit_opt_in = root_is_gitignored(&root);
+        walk_root(
+            &root,
+            include.as_ref(),
+            exclude.as_ref(),
+            explicit_opt_in,
+            &mut out,
+        )?;
     }
     Ok(out)
 }
 
 fn walk_root(
-    root: &std::path::Path,
+    root: &Path,
     include: Option<&GlobSet>,
     exclude: Option<&GlobSet>,
+    explicit_opt_in: bool,
     out: &mut Vec<(FileRef, Mtime)>,
 ) -> Result<()> {
-    let walker = WalkDir::new(root).follow_links(false).into_iter();
-    for entry in walker.filter_entry(|e| {
-        // Prune excluded directories before descending into them.
-        if e.file_type().is_dir() {
-            return !matches!(exclude, Some(ex) if ex.is_match(e.path().join("_")));
-        }
-        true
-    }) {
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .standard_filters(true)
+        // Dotfiles are content too — only skip them when gitignore says so.
+        .hidden(false)
+        .follow_links(false);
+    if explicit_opt_in {
+        builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false)
+            .ignore(false)
+            .parents(false);
+    }
+    for entry in builder.build() {
         let entry = entry.map_err(|e| HallouminateError::Indexer(format!("walk error: {e}")))?;
-        if let Some(hit) = visit_entry(&entry, include, exclude)? {
-            out.push(hit);
+        let Some(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue;
         }
+        let path = entry.path();
+        // Prune ahead of include-match so caller-supplied excludes can mask
+        // even paths the include glob would otherwise pull in.
+        if matches!(exclude, Some(ex) if ex.is_match(path)) {
+            continue;
+        }
+        if matches!(include, Some(inc) if !inc.is_match(path)) {
+            continue;
+        }
+        let mtime = entry_mtime_ms(&entry)?;
+        out.push((canonicalize_or_passthrough(path), Mtime(mtime)));
     }
     Ok(())
 }
 
-fn visit_entry(
-    entry: &walkdir::DirEntry,
-    include: Option<&GlobSet>,
-    exclude: Option<&GlobSet>,
-) -> Result<Option<(FileRef, Mtime)>> {
-    if !entry.file_type().is_file() {
-        return Ok(None);
+/// Walks up from `root` looking for a `.git` boundary, collecting every
+/// `.gitignore` along the way, then asks "would git consider this path
+/// ignored?". Returns false on any structural surprise (no repo found,
+/// gitignore parse error, etc.) so the default behavior is to honor
+/// `.gitignore` rather than silently bypass it.
+fn root_is_gitignored(root: &Path) -> bool {
+    let mut repo_root: Option<PathBuf> = None;
+    let mut gitignore_files: Vec<PathBuf> = Vec::new();
+    let mut cursor: Option<&Path> = root.parent();
+    while let Some(c) = cursor {
+        let gi = c.join(".gitignore");
+        if gi.is_file() {
+            gitignore_files.push(gi);
+        }
+        if c.join(".git").exists() {
+            repo_root = Some(c.to_path_buf());
+            break;
+        }
+        cursor = c.parent();
     }
-    let path = entry.path();
-    if matches!(exclude, Some(ex) if ex.is_match(path)) {
-        return Ok(None);
+    let Some(repo_root) = repo_root else {
+        return false;
+    };
+    let mut builder = GitignoreBuilder::new(&repo_root);
+    // Outer-to-inner: ancestor patterns apply first; inner `.gitignore` files
+    // override them. We collected innermost-first, so reverse.
+    for gi in gitignore_files.iter().rev() {
+        if builder.add(gi).is_some() {
+            return false;
+        }
     }
-    if matches!(include, Some(inc) if !inc.is_match(path)) {
-        return Ok(None);
-    }
-    let mtime = entry_mtime_ms(entry)?;
-    Ok(Some((canonicalize_or_passthrough(path), Mtime(mtime))))
+    let Ok(gitignore) = builder.build() else {
+        return false;
+    };
+    gitignore
+        .matched_path_or_any_parents(root, root.is_dir())
+        .is_ignore()
 }
 
 fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
@@ -76,7 +131,7 @@ fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
     Ok(Some(set))
 }
 
-fn entry_mtime_ms(entry: &walkdir::DirEntry) -> Result<i64> {
+fn entry_mtime_ms(entry: &ignore::DirEntry) -> Result<i64> {
     let meta = entry
         .metadata()
         .map_err(|e| HallouminateError::Indexer(format!("metadata: {e}")))?;
@@ -244,5 +299,90 @@ mod tests {
             !names.contains(&"keepme.md".to_string()),
             "keepme.md inside excluded_dir should not be visited, got {names:?}"
         );
+    }
+
+    #[test]
+    fn scan_skips_gitignored_files_by_default() {
+        // A corpus rooted at a git repo respects `.gitignore` without any
+        // explicit exclude glob — gitignored files are filtered automatically.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "secret.md\nbuild/\n").unwrap();
+        fs::write(root.join("keep.md"), "ok").unwrap();
+        fs::write(root.join("secret.md"), "ignored").unwrap();
+        fs::create_dir_all(root.join("build")).unwrap();
+        fs::write(root.join("build/out.md"), "built").unwrap();
+
+        let corpus = CorpusConfig {
+            name: "gi".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+        };
+        let result = scan(&corpus).expect("scan");
+        let names = file_names(&result);
+        assert!(
+            names.contains(&"keep.md".to_string()),
+            "keep.md should be indexed: {names:?}"
+        );
+        assert!(
+            !names.contains(&"secret.md".to_string()),
+            "secret.md must be filtered by .gitignore: {names:?}"
+        );
+        assert!(
+            !names.contains(&"out.md".to_string()),
+            "build/out.md must be filtered by .gitignore: {names:?}"
+        );
+    }
+
+    #[test]
+    fn scan_indexes_gitignored_root_when_explicitly_chosen() {
+        // The "explicit opt-in" escape hatch: if the corpus root itself is
+        // gitignored, the user pointed at it on purpose — don't second-guess
+        // them by re-applying gitignore inside the chosen subtree.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".gitignore"), "secrets/\n").unwrap();
+        fs::create_dir_all(root.join("secrets")).unwrap();
+        fs::write(root.join("secrets/diary.md"), "private").unwrap();
+        fs::write(root.join("secrets/notes.md"), "more").unwrap();
+
+        let corpus = CorpusConfig {
+            name: "opt-in".into(),
+            paths: vec![root.join("secrets").to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+        };
+        let result = scan(&corpus).expect("scan");
+        let names = file_names(&result);
+        assert!(
+            names.contains(&"diary.md".to_string()),
+            "diary.md must be indexed — gitignored root counts as explicit opt-in: {names:?}"
+        );
+        assert!(
+            names.contains(&"notes.md".to_string()),
+            "notes.md must be indexed — gitignored root counts as explicit opt-in: {names:?}"
+        );
+    }
+
+    #[test]
+    fn scan_does_not_treat_non_repo_roots_as_opt_in() {
+        // Sanity check: when there's no .git ancestor at all, root_is_gitignored
+        // returns false, so the walk happens with gitignore filtering on. With
+        // no .gitignore files present, that still walks everything — but the
+        // path through the code is the "default" branch, not the opt-in branch.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        fs::write(root.join("a.md"), "a").unwrap();
+        let corpus = CorpusConfig {
+            name: "no-repo".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+        };
+        let result = scan(&corpus).expect("scan");
+        assert_eq!(file_names(&result), vec!["a.md".to_string()]);
     }
 }

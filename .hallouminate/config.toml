@@ -1,0 +1,5 @@
+# Repo-layer hallouminate config. Empty by design — the XDG baseline at
+# ~/.config/hallouminate/config.toml owns corpus and repository definitions
+# for this repo. This file exists so the repo-config-discovery pre-check
+# (introduced by feat: repo-level .hallouminate/config.toml auto-discovery)
+# finds something to anchor on.
