@@ -86,7 +86,7 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
     //    contract as the pre-rewire `cmd_index` path, just enforced one
     //    layer earlier so every CLI/MCP transport benefits from a single
     //    point of failure rather than each duplicating the check.
-    let err = DaemonState::open(cfg)
+    let err = DaemonState::open(cfg, None)
         .await
         .expect_err("daemon open with mismatched model must refuse");
 

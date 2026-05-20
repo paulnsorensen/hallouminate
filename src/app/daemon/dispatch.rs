@@ -23,6 +23,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::cli::{CorpusReport, IndexReport};
+use crate::app::config::{Config, resolve_for_cwd};
 use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
@@ -38,34 +39,47 @@ use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corp
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 
 use super::ipc::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonResponse,
-    DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest,
-    ListFilesRequest, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
+    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
+    IndexRequest, ListFilesRequest, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
 pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
-    match req {
-        DaemonRequest::Ping => DaemonResponse::ok(&"pong"),
-        DaemonRequest::Ground(req) => handle_ground(state, req).await,
-        DaemonRequest::Index(req) => handle_index(state, req).await,
-        DaemonRequest::ListCorpora => handle_list_corpora(state),
-        DaemonRequest::ListFiles(req) => handle_list_files(state, req),
-        DaemonRequest::AddMarkdown(req) => handle_add_markdown(state, req).await,
-        DaemonRequest::ReadMarkdown(req) => handle_read_markdown(state, req).await,
-        DaemonRequest::DeleteMarkdown(req) => handle_delete_markdown(state, req).await,
+    // Resolve per-request config layering on every request: discover the
+    // repo-layer `.hallouminate/config.toml` under `req.cwd` and merge with
+    // the boot baseline. Discovery / merge failures surface to the client as
+    // `InvalidParams` so a misconfigured workspace produces a clean error
+    // instead of a silent fall-back to baseline-only.
+    //
+    // `state.baseline_xdg_path()` carries the baseline's source path (the
+    // XDG path, or the `--config PATH` override) so scalar-conflict
+    // messages name the file the user actually has to edit — AC #7.
+    let effective = match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
+        Ok((cfg, _layers)) => cfg,
+        Err(e) => return DaemonResponse::invalid_params(e.to_string()),
+    };
+    match req.payload {
+        DaemonRequestPayload::Ping => DaemonResponse::ok(&"pong"),
+        DaemonRequestPayload::Ground(req) => handle_ground(state, &effective, req).await,
+        DaemonRequestPayload::Index(req) => handle_index(state, &effective, req).await,
+        DaemonRequestPayload::ListCorpora => handle_list_corpora(&effective),
+        DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, req),
+        DaemonRequestPayload::AddMarkdown(req) => handle_add_markdown(state, &effective, req).await,
+        DaemonRequestPayload::ReadMarkdown(req) => handle_read_markdown(&effective, req).await,
+        DaemonRequestPayload::DeleteMarkdown(req) => {
+            handle_delete_markdown(state, &effective, req).await
+        }
     }
 }
 
-fn effective_corpora(state: &DaemonState) -> Result<Vec<CorpusConfig>, DaemonResponse> {
-    state
-        .cfg()
-        .effective_corpora()
+fn effective_corpora(cfg: &Config) -> Result<Vec<CorpusConfig>, DaemonResponse> {
+    cfg.effective_corpora()
         .map_err(|e| DaemonResponse::internal(e.to_string()))
 }
 
-fn handle_list_corpora(state: &DaemonState) -> DaemonResponse {
-    let corpora = match effective_corpora(state) {
+fn handle_list_corpora(cfg: &Config) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -79,8 +93,8 @@ fn handle_list_corpora(state: &DaemonState) -> DaemonResponse {
     DaemonResponse::ok(&entries)
 }
 
-fn handle_list_files(state: &DaemonState, req: ListFilesRequest) -> DaemonResponse {
-    let corpora = match effective_corpora(state) {
+fn handle_list_files(cfg: &Config, req: ListFilesRequest) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -97,9 +111,8 @@ fn handle_list_files(state: &DaemonState, req: ListFilesRequest) -> DaemonRespon
     }
 }
 
-async fn handle_ground(state: &DaemonState, req: GroundRequest) -> DaemonResponse {
-    let cfg = state.cfg().clone();
-    let corpora = match effective_corpora(state) {
+async fn handle_ground(state: &DaemonState, cfg: &Config, req: GroundRequest) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -140,14 +153,14 @@ async fn handle_ground(state: &DaemonState, req: GroundRequest) -> DaemonRespons
     DaemonResponse::ok(&GroundResult { outline, response })
 }
 
-async fn handle_index(state: &DaemonState, req: IndexRequest) -> DaemonResponse {
+async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> DaemonResponse {
     // Reject ad-hoc paths_from unconditionally: the daemon protocol does not
     // accept it yet, and silently ignoring the field when a corpus is also
     // selected would let MCP clients believe the path list landed.
     if req.paths_from.is_some() {
         return DaemonResponse::invalid_params("paths_from is not supported via the daemon yet");
     }
-    let corpora = match effective_corpora(state) {
+    let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -205,8 +218,12 @@ async fn handle_index(state: &DaemonState, req: IndexRequest) -> DaemonResponse 
     DaemonResponse::ok(&report)
 }
 
-async fn handle_add_markdown(state: &DaemonState, req: AddMarkdownRequest) -> DaemonResponse {
-    let corpora = match effective_corpora(state) {
+async fn handle_add_markdown(
+    state: &DaemonState,
+    cfg: &Config,
+    req: AddMarkdownRequest,
+) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -332,8 +349,8 @@ async fn handle_add_markdown(state: &DaemonState, req: AddMarkdownRequest) -> Da
     })
 }
 
-async fn handle_read_markdown(state: &DaemonState, req: ReadMarkdownRequest) -> DaemonResponse {
-    let corpora = match effective_corpora(state) {
+async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -392,8 +409,12 @@ async fn handle_read_markdown(state: &DaemonState, req: ReadMarkdownRequest) -> 
     })
 }
 
-async fn handle_delete_markdown(state: &DaemonState, req: DeleteMarkdownRequest) -> DaemonResponse {
-    let corpora = match effective_corpora(state) {
+async fn handle_delete_markdown(
+    state: &DaemonState,
+    cfg: &Config,
+    req: DeleteMarkdownRequest,
+) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -721,5 +742,185 @@ mod tests {
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["path"], "a.md");
         assert_eq!(json["absolute_path"], "/r/a.md");
+    }
+
+    // ── dispatch + resolve_for_cwd integration ──────────────────────────
+    //
+    // These tests cover AC #2 from .cheese/specs/repo-config-discovery.md:
+    // dispatch consumes `req.cwd` via `resolve_for_cwd` on every request,
+    // and a discovery / merge failure surfaces to the client as
+    // `InvalidParams` (not a silent fall-back to baseline-only).
+
+    use std::path::Path;
+
+    use crate::app::daemon::ErrorKind;
+
+    /// Build a `DaemonState` with a baseline `Config` that points its
+    /// ground_dir at a tempdir-local subdir. Embedder load is tolerated
+    /// failure on first run (see `DaemonState::open`), so a cold cache
+    /// doesn't break tests that don't exercise the embedder.
+    async fn state_with_ground(ground_dir: &Path, baseline_toml: &str) -> DaemonState {
+        let toml = format!(
+            "{baseline_toml}\n[storage]\nground_dir = \"{}\"\n",
+            ground_dir.display(),
+        );
+        let cfg: Config = toml::from_str(&toml).expect("baseline toml parses");
+        DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state")
+    }
+
+    fn write_repo_layer(repo_root: &Path, body: &str) {
+        let cfg_dir = repo_root.join(".hallouminate");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir .hallouminate");
+        std::fs::write(cfg_dir.join("config.toml"), body).expect("write repo config");
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_valid_cwd_returns_ok_for_ping() {
+        // Discovery walks `req.cwd` upward and finds the tempdir's
+        // `.hallouminate/config.toml`; the merge succeeds and `Ping` returns
+        // the canonical `Ok { result: "pong" }` payload.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        write_repo_layer(&cwd, "");
+        let ground = tmp.path().join("ground");
+        let state = state_with_ground(&ground, "").await;
+
+        let req = DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Ping,
+        };
+        let resp = dispatch(&state, req).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert_eq!(result, pong_value(), "ping must echo `pong`");
+            }
+            DaemonResponse::Err { kind, message } => {
+                panic!("ping must succeed; got {kind:?}: {message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_no_repo_config_returns_config_error() {
+        // A `cwd` whose ancestry contains neither `.hallouminate/` nor `.git`
+        // until the filesystem root must surface as
+        // `DaemonResponse::Err { kind: InvalidParams, .. }` carrying the
+        // "filesystem root" discovery-walk error. The dispatcher must NOT
+        // fall back to baseline-only here.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        let ground = tmp.path().join("ground");
+        let state = state_with_ground(&ground, "").await;
+
+        let req = DaemonRequest {
+            cwd: cwd.clone(),
+            payload: DaemonRequestPayload::Ping,
+        };
+        let resp = dispatch(&state, req).await;
+        match resp {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(
+                    kind,
+                    ErrorKind::InvalidParams,
+                    "discovery failure must map to InvalidParams: {message}",
+                );
+                // The discovery walk either reaches the filesystem root
+                // (most environments) or trips a `.git` boundary in unusual
+                // CI sandboxes whose tmp tree sits inside a checkout. Both
+                // outcomes prove dispatch refused to silently fall back.
+                assert!(
+                    message.contains("filesystem root")
+                        || message.contains("stopped at repo root"),
+                    "discovery error must explain the boundary: {message}",
+                );
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("must not fall back to baseline-only; got Ok({result:?})");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_scalar_conflict_returns_config_error() {
+        // Baseline explicitly sets `embeddings.cache_dir = "/a"`; repo layer
+        // explicitly sets `embeddings.cache_dir = "/b"`. `merge_layers`
+        // refuses the conflict, and dispatch must propagate that as
+        // `InvalidParams` with the offending field named.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        write_repo_layer(&cwd, "[embeddings]\ncache_dir = \"/b\"\n");
+        let ground = tmp.path().join("ground");
+        let state = state_with_ground(&ground, "[embeddings]\ncache_dir = \"/a\"\n").await;
+
+        let req = DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Ping,
+        };
+        let resp = dispatch(&state, req).await;
+        match resp {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(
+                    kind,
+                    ErrorKind::InvalidParams,
+                    "merge conflict must map to InvalidParams: {message}",
+                );
+                assert!(
+                    message.contains("embeddings.cache_dir"),
+                    "conflict error must name the field: {message}",
+                );
+                assert!(
+                    message.contains("\"/a\"") && message.contains("\"/b\""),
+                    "conflict error must show both values: {message}",
+                );
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("scalar conflict must error; got Ok({result:?})");
+            }
+        }
+    }
+
+    /// AC #7 regression: when the daemon was booted with a known baseline
+    /// source path (XDG or `--config PATH`), scalar-conflict messages must
+    /// name that path so the user knows which file holds the offending
+    /// baseline value. Before this curd, dispatch passed `xdg_path: None`
+    /// hard-coded and conflict messages said `"(XDG baseline)"` instead.
+    #[tokio::test]
+    async fn dispatch_scalar_conflict_names_baseline_xdg_path_when_known() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        write_repo_layer(&cwd, "[embeddings]\ncache_dir = \"/b\"\n");
+        let ground = tmp.path().join("ground");
+        let baseline_path = tmp.path().join("baseline.toml");
+        // Construct state with an explicit baseline source path. The path
+        // itself doesn't have to be the file the toml came from (the daemon
+        // already has the parsed Config in memory by this point); we just
+        // need a sentinel string to verify it lands in the diagnostic.
+        let baseline_toml = format!(
+            "[embeddings]\ncache_dir = \"/a\"\n[storage]\nground_dir = \"{}\"\n",
+            ground.display(),
+        );
+        let cfg: Config = toml::from_str(&baseline_toml).expect("baseline parses");
+        let state = DaemonState::open(cfg, Some(baseline_path.clone()))
+            .await
+            .expect("open with xdg_path");
+
+        let req = DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Ping,
+        };
+        let resp = dispatch(&state, req).await;
+        let DaemonResponse::Err { message, .. } = resp else {
+            panic!("scalar conflict must error");
+        };
+        assert!(
+            message.contains(&baseline_path.display().to_string()),
+            "conflict message must name the baseline source path: {message}",
+        );
+        assert!(
+            !message.contains("(XDG baseline)"),
+            "must not fall back to the unsourced placeholder: {message}",
+        );
     }
 }

@@ -29,9 +29,17 @@ pub struct DaemonArgs {
 /// rare debug invocations). Returns `Err` if another daemon is already
 /// holding the single-instance lock on the configured socket directory.
 pub async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
-    let cfg = config::load(args.config.as_deref())?;
+    let cfg = config::load_xdg(args.config.as_deref())?;
+    // Capture the baseline source path so the dispatcher can name it in
+    // scalar-conflict diagnostics (AC #7). When the user passed
+    // `--config PATH`, that path *is* the baseline; otherwise the XDG path
+    // is what `load_xdg` consulted.
+    let xdg_path = args
+        .config
+        .clone()
+        .unwrap_or_else(config::xdg_config_path);
     let socket_path = daemon_socket_path();
-    serve_with_config(cfg, &socket_path).await
+    serve_with_config(cfg, Some(xdg_path), &socket_path).await
 }
 
 /// Production wiring that takes the lock first, *then* opens the LanceDB
@@ -39,11 +47,15 @@ pub async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
 /// daemon launched against the same socket must never briefly co-own the
 /// ground directory before failing on the lock — that's exactly the
 /// multi-process LanceDB race the daemon exists to prevent.
-async fn serve_with_config(cfg: Config, socket_path: &Path) -> anyhow::Result<()> {
+async fn serve_with_config(
+    cfg: Config,
+    xdg_path: Option<PathBuf>,
+    socket_path: &Path,
+) -> anyhow::Result<()> {
     prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
     let _lock = acquire_single_instance(&lock_path)?;
-    let state = DaemonState::open(cfg).await?;
+    let state = DaemonState::open(cfg, xdg_path).await?;
     let _ = tokio::fs::remove_file(socket_path).await;
     serve_on_listener(&state, socket_path).await
 }

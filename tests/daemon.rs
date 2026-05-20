@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
-    AddMarkdownRequest, DaemonRequest, DaemonResponse, DaemonState, ErrorKind, ReadMarkdownRequest,
-    connect_at, serve,
+    AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
+    ErrorKind, ReadMarkdownRequest, connect_at, serve,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -128,8 +128,13 @@ ground_dir = "{g}"
     while socket.exists() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Daemon is already dead — call_raw fails at the socket connect before
+    // ever reaching dispatch, so cwd does not need to be a valid path here.
     let err = client
-        .call_raw(DaemonRequest::Ping)
+        .call_raw(DaemonRequest {
+            cwd: PathBuf::new(),
+            payload: DaemonRequestPayload::Ping,
+        })
         .await
         .expect_err("reconnect must fail after daemon shutdown");
     let msg = format!("{err:#}");
@@ -184,13 +189,15 @@ ground_dir = "{}"
     // Empty file (`""`) produces zero chunks; the indexer's empty-skip
     // path avoids the embedding model entirely, keeping this test
     // hermetic.
-    let make_req = || {
-        DaemonRequest::AddMarkdown(AddMarkdownRequest {
+    let cwd = harness.cwd().to_path_buf();
+    let make_req = || DaemonRequest {
+        cwd: cwd.clone(),
+        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: "docs".into(),
             path: "race.md".into(),
             content: "".into(),
             overwrite: false,
-        })
+        }),
     };
 
     let client_a = connect_at(harness.socket()).await.expect("client a");
@@ -277,18 +284,24 @@ ground_dir = "{g}"
     let client_a = connect_at(harness.socket()).await.expect("client a");
     let client_b = connect_at(harness.socket()).await.expect("client b");
 
-    let req_a = DaemonRequest::AddMarkdown(AddMarkdownRequest {
-        corpus: "a".into(),
-        path: "alpha.md".into(),
-        content: "".into(),
-        overwrite: false,
-    });
-    let req_b = DaemonRequest::AddMarkdown(AddMarkdownRequest {
-        corpus: "b".into(),
-        path: "beta.md".into(),
-        content: "".into(),
-        overwrite: false,
-    });
+    let req_a = DaemonRequest {
+        cwd: harness.cwd().to_path_buf(),
+        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+            corpus: "a".into(),
+            path: "alpha.md".into(),
+            content: "".into(),
+            overwrite: false,
+        }),
+    };
+    let req_b = DaemonRequest {
+        cwd: harness.cwd().to_path_buf(),
+        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+            corpus: "b".into(),
+            path: "beta.md".into(),
+            content: "".into(),
+            overwrite: false,
+        }),
+    };
 
     let (res_a, res_b) = tokio::join!(client_a.call_raw(req_a), client_b.call_raw(req_b));
     let res_a = res_a.expect("a transport ok");
@@ -318,7 +331,10 @@ async fn daemon_resolves_repository_derived_corpora_in_list_corpora() {
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
     let value: serde_json::Value = client
-        .call(DaemonRequest::ListCorpora)
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::ListCorpora,
+        })
         .await
         .expect("list_corpora ok");
     let names: Vec<String> = value
@@ -356,12 +372,15 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let body = "# Cheese\n\nHalloumi grills better than most.\n";
-    let req = DaemonRequest::AddMarkdown(AddMarkdownRequest {
-        corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
-        path: "cheese.md".into(),
-        content: body.into(),
-        overwrite: false,
-    });
+    let req = DaemonRequest {
+        cwd: harness.cwd().to_path_buf(),
+        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+            corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+            path: "cheese.md".into(),
+            content: body.into(),
+            overwrite: false,
+        }),
+    };
     let value: serde_json::Value = timeout(Duration::from_secs(60), client.call(req))
         .await
         .expect("timeout")
@@ -397,10 +416,13 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
     // Reading back through the daemon returns the verbatim bytes (the
     // wiki tree is the source of truth).
     let read_value: serde_json::Value = client
-        .call(DaemonRequest::ReadMarkdown(ReadMarkdownRequest {
-            corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
-            path: "cheese.md".into(),
-        }))
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                path: "cheese.md".into(),
+            }),
+        })
         .await
         .expect("read_markdown ok");
     assert_eq!(read_value["content"].as_str(), Some(body));
@@ -433,7 +455,13 @@ ground_dir = "{g}"
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
-    let value: serde_json::Value = client.call(DaemonRequest::Ping).await.expect("ping ok");
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Ping,
+        })
+        .await
+        .expect("ping ok");
     assert_eq!(value, serde_json::Value::String("pong".to_string()));
 }
 
@@ -464,12 +492,13 @@ ground_dir = "{g}"
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
     let response = client
-        .call_raw(DaemonRequest::Index(
-            hallouminate::app::daemon::IndexRequest {
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
-            },
-        ))
+            }),
+        })
         .await
         .expect("transport ok");
     match response {
@@ -580,7 +609,7 @@ ground_dir = "{g}"
     // Second daemon: same socket path, fresh state. `serve()` must bail out
     // before returning, with an error that mentions the lockfile so a user
     // sees what's holding them up.
-    let state2 = DaemonState::open(cfg).await.expect("second open ok");
+    let state2 = DaemonState::open(cfg, None).await.expect("second open ok");
     let socket2 = harness.socket().to_path_buf();
     let result = timeout(Duration::from_secs(5), serve(&state2, &socket2))
         .await
@@ -595,6 +624,12 @@ ground_dir = "{g}"
     let client = connect_at(harness.socket())
         .await
         .expect("first daemon alive");
-    let pong: serde_json::Value = client.call(DaemonRequest::Ping).await.expect("ping");
+    let pong: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Ping,
+        })
+        .await
+        .expect("ping");
     assert_eq!(pong, serde_json::Value::String("pong".to_string()));
 }

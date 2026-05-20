@@ -20,7 +20,7 @@
 //! one. Tokenizers are cheap to clone (`Arc` internally) and need no lock.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -64,7 +64,21 @@ pub struct DaemonState {
 }
 
 struct DaemonStateInner {
-    cfg: Config,
+    /// Boot-time baseline, not the per-request effective config.
+    ///
+    /// Built once from XDG + `--config PATH` at daemon startup and frozen
+    /// for the process lifetime. Per-request handling layers repo-discovery
+    /// (`.hallouminate/config.toml` walk from the request's `cwd`) on top of
+    /// this via `Config::resolve_for_cwd` in the dispatcher — the baseline
+    /// never changes once the daemon is running.
+    baseline: Config,
+    /// Source path of the baseline (the XDG config path or the `--config
+    /// PATH` override). Threaded into `resolve_for_cwd` so scalar-conflict
+    /// diagnostics name the actual file that owns the baseline value, per
+    /// AC #7 of `.cheese/specs/repo-config-discovery.md`. `None` when the
+    /// daemon was booted without a known source (e.g. tests that construct
+    /// a `Config` programmatically).
+    baseline_xdg_path: Option<PathBuf>,
     store: Arc<LanceStore>,
     ground_dir: PathBuf,
     corpus_locks: CorpusLockMap,
@@ -85,7 +99,7 @@ pub struct MutationGuard {
 }
 
 impl DaemonState {
-    pub async fn open(cfg: Config) -> anyhow::Result<Self> {
+    pub async fn open(cfg: Config, xdg_path: Option<PathBuf>) -> anyhow::Result<Self> {
         let ground_dir = expand_tilde(&cfg.storage.ground_dir);
         if let Some(parent) = ground_dir.parent()
             && !parent.as_os_str().is_empty()
@@ -120,7 +134,8 @@ impl DaemonState {
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
         Ok(DaemonState {
             inner: Arc::new(DaemonStateInner {
-                cfg,
+                baseline: cfg,
+                baseline_xdg_path: xdg_path,
                 store: Arc::new(store),
                 ground_dir,
                 corpus_locks: CorpusLockMap::default(),
@@ -131,8 +146,24 @@ impl DaemonState {
         })
     }
 
-    pub fn cfg(&self) -> &Config {
-        &self.inner.cfg
+    /// Source path of the baseline config the daemon booted from — the XDG
+    /// path when no `--config PATH` was given, or the `--config PATH` value
+    /// itself. `None` when the baseline was constructed without a known
+    /// source path (tests that build a `Config` programmatically). Threaded
+    /// into `resolve_for_cwd` by the dispatcher so scalar-conflict messages
+    /// can name the actual file.
+    pub fn baseline_xdg_path(&self) -> Option<&Path> {
+        self.inner.baseline_xdg_path.as_deref()
+    }
+
+    /// Boot-time baseline config (XDG layers + optional `--config PATH`).
+    ///
+    /// Frozen at `DaemonState::open` time. Per-request handling layers
+    /// repo-discovery on top in the dispatcher via
+    /// `Config::resolve_for_cwd`; callers that need the *effective* config
+    /// for a request should use the resolved value, not this baseline.
+    pub fn baseline(&self) -> &Config {
+        &self.inner.baseline
     }
 
     pub fn store(&self) -> Arc<LanceStore> {
@@ -156,9 +187,9 @@ impl DaemonState {
     pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard<'_>> {
         let mut guard = self.inner.embedder.lock().await;
         if guard.is_none() {
-            let cache_dir = expand_tilde(&self.inner.cfg.embeddings.cache_dir);
-            let embedder = Embedder::try_new(&self.inner.cfg.embeddings.model, &cache_dir)
-                .map_err(|e| anyhow::anyhow!("init embedder ({}): {e}", self.inner.cfg.embeddings.model))?;
+            let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
+            let embedder = Embedder::try_new(&self.inner.baseline.embeddings.model, &cache_dir)
+                .map_err(|e| anyhow::anyhow!("init embedder ({}): {e}", self.inner.baseline.embeddings.model))?;
             *guard = Some(embedder);
         }
         Ok(EmbedderGuard { guard })
@@ -236,7 +267,28 @@ impl std::fmt::Debug for DaemonState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaemonState")
             .field("ground_dir", &self.inner.ground_dir)
-            .field("model", &self.inner.cfg.embeddings.model)
+            .field("model", &self.inner.baseline.embeddings.model)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Covers AC #9 (daemon half): the baseline accessor returns the config
+    /// that was passed into `open`, unchanged. The dispatcher layers
+    /// repo-discovery on top per-request via `resolve_for_cwd`; the
+    /// baseline itself is frozen at boot.
+    #[tokio::test]
+    async fn baseline_returns_the_configured_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let expected_model = cfg.embeddings.model.clone();
+
+        let state = DaemonState::open(cfg, None).await.expect("open daemon state");
+
+        assert_eq!(state.baseline().embeddings.model, expected_model);
     }
 }

@@ -80,13 +80,12 @@ pub struct IndexCli {
     /// scripts surface the message instead of a clap-level "unknown flag".
     #[arg(long, value_name = "FILE", hide = true)]
     pub paths_from: Option<PathBuf>,
-    /// Local-only pre-check config path — used to validate the corpus
-    /// argument before dialing the daemon. The daemon serves whichever
-    /// config it loaded at startup, so passing `--config other.toml` here
-    /// does NOT change which corpora the daemon sees; it only changes which
-    /// config the CLI consults to surface an early "unknown corpus" error.
-    /// Restart the daemon (`hallouminate daemon --config ...`) to change
-    /// what it serves.
+    /// Accepted for backward compatibility with pre-layered-config scripts;
+    /// no longer consulted locally. The daemon owns config resolution
+    /// (XDG baseline at startup + repo-layer discovery per request), so to
+    /// change what corpora are visible, restart the daemon
+    /// (`hallouminate daemon --config ...`) or edit `.hallouminate/config.toml`
+    /// in the working directory's repo.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
     /// Override the daemon socket path. Mirrors the `HALLOUMINATE_SOCKET`
@@ -130,9 +129,11 @@ pub struct GroundCli {
     pub chunks_per_file: Option<usize>,
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
-    /// Local-only pre-check config path — same caveat as `hallouminate
-    /// index --config`: the daemon uses its own startup config, so this
-    /// flag only validates the corpus argument locally before dialing.
+    /// Accepted for backward compatibility; same caveat as `hallouminate
+    /// index --config`. The daemon owns config resolution (XDG baseline
+    /// at startup + repo-layer discovery per request), so this flag is
+    /// only consulted locally for the cosmetic outline path-prefix-strip
+    /// and not for the actual search.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
     /// Override the daemon socket path. Mirrors `HALLOUMINATE_SOCKET`; lets
@@ -190,6 +191,9 @@ pub enum ConfigAction {
     Show {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Working directory for repo-config discovery (defaults to current dir).
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
     },
     Download {
         #[arg(long, value_name = "PATH")]
@@ -200,6 +204,9 @@ pub enum ConfigAction {
     Validate {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Working directory for repo-config discovery (defaults to current dir).
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
     },
 }
 
@@ -213,9 +220,13 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
-            ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
+            ConfigAction::Show { config, cwd } => {
+                cmd_config_show(ConfigShowArgs { config, cwd })
+            }
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
-            ConfigAction::Validate { config } => cmd_config_validate(ConfigValidateArgs { config }),
+            ConfigAction::Validate { config, cwd } => {
+                cmd_config_validate(ConfigValidateArgs { config, cwd })
+            }
         },
         Command::Serve => {
             crate::app::daemon::ensure_daemon_running().await?;
@@ -439,7 +450,7 @@ mod tests {
             Cli::try_parse_from(["hallouminate", "config", "show"]).expect("parse config show");
         match show.command {
             Command::Config {
-                action: ConfigAction::Show { config },
+                action: ConfigAction::Show { config, cwd: _ },
             } => assert_eq!(config, None),
             other => panic!("wrong variant: {other:?}"),
         }
@@ -474,7 +485,7 @@ mod tests {
                 .expect("parse");
         match cli.command {
             Command::Config {
-                action: ConfigAction::Show { config },
+                action: ConfigAction::Show { config, cwd: _ },
             } => assert_eq!(config, Some(PathBuf::from("/tmp/c.toml"))),
             other => panic!("wrong variant: {other:?}"),
         }

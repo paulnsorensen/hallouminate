@@ -3,6 +3,10 @@ use std::path::Path;
 
 use hallouminate::app::cli::{GroundArgs, IndexArgs, cmd_index, run_ground};
 use hallouminate::app::config::Config;
+use hallouminate::app::daemon::{
+    CorpusEntry, DaemonRequest, DaemonRequestPayload, DaemonResponse, ListCorporaResult,
+    connect_at,
+};
 
 mod common;
 use common::daemon::DaemonHarness;
@@ -168,4 +172,125 @@ async fn run_ground_fails_loudly_when_daemon_unreachable() {
         1,
         "`daemon unavailable` prefix must appear exactly once (no double-wrap): {msg}"
     );
+}
+
+/// AC #6 from `.cheese/specs/repo-config-discovery.md`: editing a repo's
+/// `.hallouminate/config.toml` does NOT require a daemon restart — the next
+/// request must reflect the edit. Drives the daemon directly via
+/// `DaemonClient` rather than `cmd_ground`, so the test never has to mutate
+/// the process-wide CWD (which would race other parallel test threads).
+#[tokio::test]
+async fn repo_config_edit_takes_effect_without_daemon_restart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo_root = dir.path().to_path_buf();
+
+    // Repo-layer config declares its own corpus rooted under <repo>/notes.
+    let notes_dir = repo_root.join("notes");
+    fs::create_dir_all(&notes_dir).expect("mkdir notes");
+    let repo_cfg_dir = repo_root.join(".hallouminate");
+    fs::create_dir_all(&repo_cfg_dir).expect("mkdir .hallouminate");
+    let repo_cfg_path = repo_cfg_dir.join("config.toml");
+    fs::write(
+        &repo_cfg_path,
+        format!(
+            r#"
+[[corpus]]
+name = "notes"
+paths = [{notes:?}]
+globs = ["**/*.md"]
+"#,
+            notes = notes_dir.to_string_lossy().to_string(),
+        ),
+    )
+    .expect("write repo config");
+
+    // Baseline (XDG-equivalent) config the daemon boots with: a separate
+    // corpus, a tempdir ground/cache, no overlap with the repo's corpus.
+    let baseline_corpus_root = dir.path().join("baseline-corpus");
+    fs::create_dir_all(&baseline_corpus_root).expect("mkdir baseline corpus");
+    let ground_dir = dir.path().join("ground");
+    let cache_dir = dir.path().join("cache");
+    let baseline_cfg_path = dir.path().join("baseline.toml");
+    write_config(
+        &baseline_cfg_path,
+        &baseline_corpus_root,
+        &ground_dir,
+        &cache_dir,
+    );
+    // Rename baseline's sole corpus so it never collides with the repo
+    // layer's `"notes"`. `write_config` hardcodes the name `"fixtures"` so
+    // we already have the disjoint-name shape; assert it for future-proofing.
+    let baseline_cfg = load_config(&baseline_cfg_path);
+    assert!(
+        baseline_cfg.corpora.iter().all(|c| c.name != "notes"),
+        "baseline must not pre-declare the corpus the repo layer introduces"
+    );
+
+    let harness = DaemonHarness::spawn(baseline_cfg).await;
+    let client = connect_at(harness.socket())
+        .await
+        .expect("connect to daemon");
+
+    // First request: repo config declares `notes`, daemon must surface it.
+    let corpora = list_corpora_at(&client, &repo_root).await;
+    assert!(
+        corpora.iter().any(|c| c.name == "notes"),
+        "repo-declared corpus must be visible without daemon restart: {corpora:?}"
+    );
+
+    // Edit the repo config in place — add a second corpus under <repo>/wiki.
+    let wiki_dir = repo_root.join("wiki");
+    fs::create_dir_all(&wiki_dir).expect("mkdir wiki");
+    fs::write(
+        &repo_cfg_path,
+        format!(
+            r#"
+[[corpus]]
+name = "notes"
+paths = [{notes:?}]
+globs = ["**/*.md"]
+
+[[corpus]]
+name = "wiki"
+paths = [{wiki:?}]
+globs = ["**/*.md"]
+"#,
+            notes = notes_dir.to_string_lossy().to_string(),
+            wiki = wiki_dir.to_string_lossy().to_string(),
+        ),
+    )
+    .expect("rewrite repo config");
+
+    // Second request, same daemon — the edit must be reflected without a
+    // restart.
+    let corpora = list_corpora_at(&client, &repo_root).await;
+    let names: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+    assert!(
+        names.contains(&"notes") && names.contains(&"wiki"),
+        "edit to repo config must be visible on the next request: {names:?}"
+    );
+}
+
+/// Helper: issue a `ListCorpora` request against the daemon with an explicit
+/// `cwd` so the dispatcher can run repo-config discovery against the chosen
+/// directory. Pulls the typed payload out of `DaemonResponse::Ok`.
+async fn list_corpora_at(
+    client: &hallouminate::app::daemon::DaemonClient,
+    cwd: &Path,
+) -> ListCorporaResult {
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: cwd.to_path_buf(),
+            payload: DaemonRequestPayload::ListCorpora,
+        })
+        .await
+        .expect("list_corpora transport ok");
+    match resp {
+        DaemonResponse::Ok { result } => {
+            serde_json::from_value::<Vec<CorpusEntry>>(result).expect("list_corpora payload shape")
+        }
+        DaemonResponse::Err { kind, message } => {
+            panic!("list_corpora returned {kind:?}: {message}");
+        }
+    }
 }

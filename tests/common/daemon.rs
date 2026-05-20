@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 
 pub struct DaemonHarness {
     socket: PathBuf,
+    cwd: PathBuf,
     _tmp: tempfile::TempDir,
     handle: Option<JoinHandle<anyhow::Result<()>>>,
     shutdown: Option<oneshot::Sender<()>>,
@@ -29,7 +30,18 @@ impl DaemonHarness {
     pub async fn spawn(cfg: Config) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("daemon.sock");
-        let state = DaemonState::open(cfg).await.expect("open state");
+
+        // Per repo-config-discovery: every daemon request walks its `cwd`
+        // looking for `.hallouminate/config.toml`. Seed an empty repo-layer
+        // file in the harness tempdir so tests can pass `harness.cwd()` as
+        // the request envelope's `cwd`. An empty TOML file parses to
+        // `Config::default()`, which merges trivially into the baseline.
+        let cwd = tmp.path().to_path_buf();
+        let hallou_dir = cwd.join(".hallouminate");
+        std::fs::create_dir_all(&hallou_dir).expect("mkdir .hallouminate");
+        std::fs::write(hallou_dir.join("config.toml"), "").expect("write empty repo config");
+
+        let state = DaemonState::open(cfg, None).await.expect("open state");
         let (tx, rx) = oneshot::channel();
         let socket_clone = socket.clone();
         let handle = tokio::spawn(async move {
@@ -49,6 +61,7 @@ impl DaemonHarness {
         }
         DaemonHarness {
             socket,
+            cwd,
             _tmp: tmp,
             handle: Some(handle),
             shutdown: Some(tx),
@@ -57,6 +70,13 @@ impl DaemonHarness {
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Path of the harness tempdir, which contains an empty
+    /// `.hallouminate/config.toml`. Use as the `cwd` field of any
+    /// `DaemonRequest` sent through a client connected to this harness.
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
     }
 }
 
