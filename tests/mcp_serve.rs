@@ -57,9 +57,22 @@ impl Mcp {
     /// MCP tools dial the per-test daemon harness instead of the
     /// developer's real daemon socket.
     async fn spawn(xdg_config_home: &Path, daemon_socket: Option<&Path>) -> Self {
+        // Per repo-config-discovery: the MCP server captures `current_dir()`
+        // at startup and forwards it on every daemon hop. Set the child's
+        // cwd to the per-test `xdg_config_home` tempdir and drop a
+        // `.hallouminate/config.toml` in it so the daemon's discovery walk
+        // resolves cleanly. Empty TOML → `Config::default()` → trivial
+        // merge against whichever baseline the per-test daemon was booted
+        // with.
+        let hallou_dir = xdg_config_home.join(".hallouminate");
+        std::fs::create_dir_all(&hallou_dir).expect("mkdir .hallouminate");
+        std::fs::write(hallou_dir.join("config.toml"), "")
+            .expect("write empty repo-layer config");
+
         let bin = env!("CARGO_BIN_EXE_hallouminate");
         let mut cmd = Command::new(bin);
         cmd.arg("serve")
+            .current_dir(xdg_config_home)
             .env("XDG_CONFIG_HOME", xdg_config_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

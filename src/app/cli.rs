@@ -190,6 +190,9 @@ pub enum ConfigAction {
     Show {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Working directory for repo-config discovery (defaults to current dir).
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
     },
     Download {
         #[arg(long, value_name = "PATH")]
@@ -200,6 +203,9 @@ pub enum ConfigAction {
     Validate {
         #[arg(long, value_name = "PATH")]
         config: Option<PathBuf>,
+        /// Working directory for repo-config discovery (defaults to current dir).
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
     },
 }
 
@@ -213,15 +219,12 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
-            // Wiring W1 will plumb `--cwd` from clap; until then `cwd: None`
-            // makes the new `ConfigShowArgs`/`ConfigValidateArgs` field
-            // resolve to `std::env::current_dir()` at command time.
-            ConfigAction::Show { config } => {
-                cmd_config_show(ConfigShowArgs { config, cwd: None })
+            ConfigAction::Show { config, cwd } => {
+                cmd_config_show(ConfigShowArgs { config, cwd })
             }
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
-            ConfigAction::Validate { config } => {
-                cmd_config_validate(ConfigValidateArgs { config, cwd: None })
+            ConfigAction::Validate { config, cwd } => {
+                cmd_config_validate(ConfigValidateArgs { config, cwd })
             }
         },
         Command::Serve => crate::adapters::mcp::serve_stdio().await,
@@ -443,7 +446,7 @@ mod tests {
             Cli::try_parse_from(["hallouminate", "config", "show"]).expect("parse config show");
         match show.command {
             Command::Config {
-                action: ConfigAction::Show { config },
+                action: ConfigAction::Show { config, cwd: _ },
             } => assert_eq!(config, None),
             other => panic!("wrong variant: {other:?}"),
         }
@@ -478,7 +481,7 @@ mod tests {
                 .expect("parse");
         match cli.command {
             Command::Config {
-                action: ConfigAction::Show { config },
+                action: ConfigAction::Show { config, cwd: _ },
             } => assert_eq!(config, Some(PathBuf::from("/tmp/c.toml"))),
             other => panic!("wrong variant: {other:?}"),
         }

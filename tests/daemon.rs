@@ -128,6 +128,8 @@ ground_dir = "{g}"
     while socket.exists() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    // Daemon is already dead — call_raw fails at the socket connect before
+    // ever reaching dispatch, so cwd does not need to be a valid path here.
     let err = client
         .call_raw(DaemonRequest {
             cwd: PathBuf::new(),
@@ -187,8 +189,9 @@ ground_dir = "{}"
     // Empty file (`""`) produces zero chunks; the indexer's empty-skip
     // path avoids the embedding model entirely, keeping this test
     // hermetic.
+    let cwd = harness.cwd().to_path_buf();
     let make_req = || DaemonRequest {
-        cwd: PathBuf::new(),
+        cwd: cwd.clone(),
         payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: "docs".into(),
             path: "race.md".into(),
@@ -282,7 +285,7 @@ ground_dir = "{g}"
     let client_b = connect_at(harness.socket()).await.expect("client b");
 
     let req_a = DaemonRequest {
-        cwd: PathBuf::new(),
+        cwd: harness.cwd().to_path_buf(),
         payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: "a".into(),
             path: "alpha.md".into(),
@@ -291,7 +294,7 @@ ground_dir = "{g}"
         }),
     };
     let req_b = DaemonRequest {
-        cwd: PathBuf::new(),
+        cwd: harness.cwd().to_path_buf(),
         payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: "b".into(),
             path: "beta.md".into(),
@@ -329,7 +332,7 @@ async fn daemon_resolves_repository_derived_corpora_in_list_corpora() {
     let client = connect_at(harness.socket()).await.expect("connect");
     let value: serde_json::Value = client
         .call(DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::ListCorpora,
         })
         .await
@@ -370,7 +373,7 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
 
     let body = "# Cheese\n\nHalloumi grills better than most.\n";
     let req = DaemonRequest {
-        cwd: PathBuf::new(),
+        cwd: harness.cwd().to_path_buf(),
         payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
             path: "cheese.md".into(),
@@ -414,7 +417,7 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
     // wiki tree is the source of truth).
     let read_value: serde_json::Value = client
         .call(DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
                 path: "cheese.md".into(),
@@ -454,7 +457,7 @@ ground_dir = "{g}"
     let client = connect_at(harness.socket()).await.expect("connect");
     let value: serde_json::Value = client
         .call(DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::Ping,
         })
         .await
@@ -490,7 +493,7 @@ ground_dir = "{g}"
     let client = connect_at(harness.socket()).await.expect("connect");
     let response = client
         .call_raw(DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
@@ -623,7 +626,7 @@ ground_dir = "{g}"
         .expect("first daemon alive");
     let pong: serde_json::Value = client
         .call(DaemonRequest {
-            cwd: PathBuf::new(),
+            cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::Ping,
         })
         .await
