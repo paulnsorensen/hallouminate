@@ -609,7 +609,7 @@ ground_dir = "{g}"
     // Second daemon: same socket path, fresh state. `serve()` must bail out
     // before returning, with an error that mentions the lockfile so a user
     // sees what's holding them up.
-    let state2 = DaemonState::open(cfg).await.expect("second open ok");
+    let state2 = DaemonState::open(cfg, None).await.expect("second open ok");
     let socket2 = harness.socket().to_path_buf();
     let result = timeout(Duration::from_secs(5), serve(&state2, &socket2))
         .await

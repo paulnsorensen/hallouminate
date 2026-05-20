@@ -41,7 +41,7 @@ impl DaemonHarness {
         std::fs::create_dir_all(&hallou_dir).expect("mkdir .hallouminate");
         std::fs::write(hallou_dir.join("config.toml"), "").expect("write empty repo config");
 
-        let state = DaemonState::open(cfg).await.expect("open state");
+        let state = DaemonState::open(cfg, None).await.expect("open state");
         let (tx, rx) = oneshot::channel();
         let socket_clone = socket.clone();
         let handle = tokio::spawn(async move {

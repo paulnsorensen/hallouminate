@@ -52,9 +52,10 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
     // `InvalidParams` so a misconfigured workspace produces a clean error
     // instead of a silent fall-back to baseline-only.
     //
-    // `xdg_path` is `None` for now — the daemon doesn't yet thread its
-    // baseline source path through to dispatch. A later curd will plumb it.
-    let effective = match resolve_for_cwd(state.baseline(), &req.cwd, None) {
+    // `state.baseline_xdg_path()` carries the baseline's source path (the
+    // XDG path, or the `--config PATH` override) so scalar-conflict
+    // messages name the file the user actually has to edit — AC #7.
+    let effective = match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
         Ok((cfg, _layers)) => cfg,
         Err(e) => return DaemonResponse::invalid_params(e.to_string()),
     };
@@ -764,7 +765,9 @@ mod tests {
             ground_dir.display(),
         );
         let cfg: Config = toml::from_str(&toml).expect("baseline toml parses");
-        DaemonState::open(cfg).await.expect("open daemon state")
+        DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state")
     }
 
     fn write_repo_layer(repo_root: &Path, body: &str) {
@@ -876,5 +879,48 @@ mod tests {
                 panic!("scalar conflict must error; got Ok({result:?})");
             }
         }
+    }
+
+    /// AC #7 regression: when the daemon was booted with a known baseline
+    /// source path (XDG or `--config PATH`), scalar-conflict messages must
+    /// name that path so the user knows which file holds the offending
+    /// baseline value. Before this curd, dispatch passed `xdg_path: None`
+    /// hard-coded and conflict messages said `"(XDG baseline)"` instead.
+    #[tokio::test]
+    async fn dispatch_scalar_conflict_names_baseline_xdg_path_when_known() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().to_path_buf();
+        write_repo_layer(&cwd, "[embeddings]\ncache_dir = \"/b\"\n");
+        let ground = tmp.path().join("ground");
+        let baseline_path = tmp.path().join("baseline.toml");
+        // Construct state with an explicit baseline source path. The path
+        // itself doesn't have to be the file the toml came from (the daemon
+        // already has the parsed Config in memory by this point); we just
+        // need a sentinel string to verify it lands in the diagnostic.
+        let baseline_toml = format!(
+            "[embeddings]\ncache_dir = \"/a\"\n[storage]\nground_dir = \"{}\"\n",
+            ground.display(),
+        );
+        let cfg: Config = toml::from_str(&baseline_toml).expect("baseline parses");
+        let state = DaemonState::open(cfg, Some(baseline_path.clone()))
+            .await
+            .expect("open with xdg_path");
+
+        let req = DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Ping,
+        };
+        let resp = dispatch(&state, req).await;
+        let DaemonResponse::Err { message, .. } = resp else {
+            panic!("scalar conflict must error");
+        };
+        assert!(
+            message.contains(&baseline_path.display().to_string()),
+            "conflict message must name the baseline source path: {message}",
+        );
+        assert!(
+            !message.contains("(XDG baseline)"),
+            "must not fall back to the unsourced placeholder: {message}",
+        );
     }
 }
