@@ -179,13 +179,7 @@ async fn run_ground_fails_loudly_when_daemon_unreachable() {
 /// request must reflect the edit. Drives the daemon directly via
 /// `DaemonClient` rather than `cmd_ground`, so the test never has to mutate
 /// the process-wide CWD (which would race other parallel test threads).
-///
-/// `#[ignore]` until curd 2 lands the dispatch-side `resolve_for_cwd` wiring
-/// — at the seed state, `handle_list_corpora` reads `state.cfg()` directly
-/// and ignores `req.cwd`, so the repo-declared corpus is invisible. The
-/// orchestrator un-ignores this after curd 2 merges.
 #[tokio::test]
-#[ignore = "depends on curd 2 dispatch wiring"]
 async fn repo_config_edit_takes_effect_without_daemon_restart() {
     let dir = tempfile::tempdir().expect("tempdir");
     let repo_root = dir.path().to_path_buf();
