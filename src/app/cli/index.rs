@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::app::config::{self, Config};
@@ -50,8 +51,14 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
     let _ = select_corpora(&cfg, args.corpus.as_deref(), None)?;
 
     let client = client_for(args.socket.as_deref()).await?;
+    // Capture CWD at the CLI entry so the daemon can run repo-config
+    // discovery against the user's working directory rather than its own
+    // (`.cheese/specs/repo-config-discovery.md`, AC #3). `PathBuf::new()`
+    // was a seed placeholder; replacing it here is what makes the per-
+    // request layered-config path effective end-to-end on the index lane.
+    let cwd = std::env::current_dir().context("capture current_dir for daemon request")?;
     let req = DaemonRequest {
-        cwd: PathBuf::new(),
+        cwd,
         payload: DaemonRequestPayload::Index(IndexRequest {
             corpus: args.corpus.clone(),
             paths_from: None,

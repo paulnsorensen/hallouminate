@@ -2,8 +2,11 @@ use std::fs;
 use std::path::Path;
 
 use hallouminate::adapters::lance::LanceStore;
-use hallouminate::app::cli::{IndexArgs, cmd_index, run_index};
+use hallouminate::app::cli::{IndexArgs, IndexReport, cmd_index, run_index};
 use hallouminate::app::config::Config;
+use hallouminate::app::daemon::{
+    DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest, connect_at,
+};
 
 mod common;
 use common::daemon::DaemonHarness;
@@ -129,5 +132,94 @@ async fn run_index_fails_loudly_when_daemon_unreachable() {
         msg.matches("daemon unavailable").count(),
         1,
         "`daemon unavailable` prefix must appear exactly once (no double-wrap): {msg}"
+    );
+}
+
+/// AC #3 from `.cheese/specs/repo-config-discovery.md`: the `index`
+/// subcommand must capture `std::env::current_dir()` and forward it as
+/// `DaemonRequest.cwd` so the daemon's per-request layered-config resolution
+/// reaches the repo-declared `.hallouminate/config.toml` under the user's
+/// working directory.
+///
+/// Drives the daemon directly via `DaemonClient::call_raw` with an explicit
+/// `cwd` envelope rather than `cmd_index`, so the test never mutates the
+/// process-wide CWD (which would race other parallel test threads — curd 4
+/// established the pattern for `tests/cli_ground.rs`).
+///
+/// `#[ignore]` because `handle_index` unconditionally acquires the embedder
+/// before scanning (no empty-skip short-circuit at the dispatch level), so
+/// the embedding model must be cached locally — same constraint as the other
+/// non-Ping daemon-end-to-end tests in this suite.
+#[tokio::test]
+#[ignore = "downloads ~33MB embedding model on first run; opt-in via --ignored"]
+async fn index_request_with_cwd_envelope_surfaces_repo_derived_corpus() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo_root = dir.path().to_path_buf();
+
+    // Repo-layer config declares a repository rooted at `.`, which derives
+    // `repo:rcd-test:wiki` against `<repo>/.hallouminate/wiki`. The daemon's
+    // `ensure_paths_exist` creates that directory on first call.
+    let repo_cfg_dir = repo_root.join(".hallouminate");
+    fs::create_dir_all(&repo_cfg_dir).expect("mkdir .hallouminate");
+    let repo_cfg_path = repo_cfg_dir.join("config.toml");
+    fs::write(
+        &repo_cfg_path,
+        r#"
+[[repository]]
+name = "rcd-test"
+path = "."
+"#,
+    )
+    .expect("write repo config");
+
+    // Baseline (XDG-equivalent) config the daemon boots with: a separate
+    // corpus root, a tempdir ground / cache, and no overlap with the repo's
+    // derived corpus.
+    let baseline_corpus_root = dir.path().join("baseline-corpus");
+    fs::create_dir_all(&baseline_corpus_root).expect("mkdir baseline corpus");
+    let ground_dir = dir.path().join("ground");
+    let cache_dir = std::env::temp_dir().join("hallouminate-cli-test-cache");
+    let baseline_cfg_path = dir.path().join("baseline.toml");
+    write_config(
+        &baseline_cfg_path,
+        &baseline_corpus_root,
+        &ground_dir,
+        &cache_dir,
+    );
+    let baseline_cfg = load_config(&baseline_cfg_path);
+
+    let harness = DaemonHarness::spawn(baseline_cfg).await;
+    let client = connect_at(harness.socket())
+        .await
+        .expect("connect to daemon");
+
+    // Send Index with an explicit `cwd: <repo_root>` so dispatch picks up
+    // the repo-layer config and the indexer sees the derived
+    // `repo:rcd-test:wiki` corpus.
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: repo_root.clone(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("repo:rcd-test:wiki".into()),
+                paths_from: None,
+            }),
+        })
+        .await
+        .expect("index transport ok");
+
+    let report: IndexReport = match resp {
+        DaemonResponse::Ok { result } => {
+            serde_json::from_value(result).expect("index payload shape")
+        }
+        DaemonResponse::Err { kind, message } => {
+            panic!("index returned {kind:?}: {message}");
+        }
+    };
+
+    let names: Vec<&str> = report.corpora.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["repo:rcd-test:wiki"],
+        "daemon must reflect the repo-derived corpus when CLI forwards cwd: {names:?}"
     );
 }
