@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use anyhow::Context;
+
 use crate::app::config::{self, Config};
 use crate::app::daemon::{DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for};
 use crate::app::input_error::InputError;
@@ -90,8 +92,14 @@ pub async fn run_ground_with_cfg(cfg: &Config, args: GroundArgs) -> anyhow::Resu
     let _ = pick_corpus(cfg, args.corpus.as_deref())?;
 
     let client = client_for(args.socket.as_deref()).await?;
+    // Capture CWD at the CLI entry so the daemon can run repo-config
+    // discovery against the user's working directory rather than its own
+    // (`.cheese/specs/repo-config-discovery.md`, AC #3). `PathBuf::new()`
+    // was a seed placeholder; replacing it here is what makes the per-
+    // request layered-config path effective end-to-end.
+    let cwd = std::env::current_dir().context("capture current_dir for daemon request")?;
     let req = DaemonRequest {
-        cwd: PathBuf::new(),
+        cwd,
         payload: DaemonRequestPayload::Ground(GroundRequest {
             query: args.query,
             corpus: args.corpus,
