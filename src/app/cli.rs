@@ -213,9 +213,16 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
-            ConfigAction::Show { config } => cmd_config_show(ConfigShowArgs { config }),
+            // Wiring W1 will plumb `--cwd` from clap; until then `cwd: None`
+            // makes the new `ConfigShowArgs`/`ConfigValidateArgs` field
+            // resolve to `std::env::current_dir()` at command time.
+            ConfigAction::Show { config } => {
+                cmd_config_show(ConfigShowArgs { config, cwd: None })
+            }
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
-            ConfigAction::Validate { config } => cmd_config_validate(ConfigValidateArgs { config }),
+            ConfigAction::Validate { config } => {
+                cmd_config_validate(ConfigValidateArgs { config, cwd: None })
+            }
         },
         Command::Serve => crate::adapters::mcp::serve_stdio().await,
         Command::Daemon(args) => crate::app::daemon::run_daemon(args.into()).await,
