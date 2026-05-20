@@ -135,6 +135,13 @@ impl DaemonState {
         &self.inner.cfg
     }
 
+    /// Alias for [`cfg`] introduced as a seed stub for the
+    /// repo-config-discovery spec. Curd 3 will rename the underlying
+    /// field and remove `cfg()`. See `.cheese/specs/repo-config-discovery.md`.
+    pub fn baseline(&self) -> &Config {
+        self.cfg()
+    }
+
     pub fn store(&self) -> Arc<LanceStore> {
         self.inner.store.clone()
     }

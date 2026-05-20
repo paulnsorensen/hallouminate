@@ -107,6 +107,58 @@ impl Config {
     }
 }
 
+// ── Seed stubs (filled in by curd 1 of repo-config-discovery) ──────────
+//
+// These signatures are present so curds 2, 3, and 6 can compile against
+// the new layered-config API without curd 1 having merged. Curd 1 will
+// replace the stub bodies with real implementations, add unit tests, and
+// rename `load` to `load_xdg`. See `.cheese/specs/repo-config-discovery.md`.
+
+/// Per-request diagnostic struct used by `config validate` / `config show`.
+pub struct ResolvedLayers {
+    pub xdg_path: Option<PathBuf>,
+    pub repo_path: PathBuf,
+}
+
+/// Load the XDG baseline (or `--config PATH`). Alias for `load` until curd
+/// 1 promotes this to the canonical name.
+pub fn load_xdg(path: Option<&Path>) -> Result<Config> {
+    load(path)
+}
+
+/// Walk from `cwd` up looking for `.hallouminate/config.toml`. Stub.
+pub fn discover_repo_config(_cwd: &Path) -> Result<PathBuf> {
+    Err(HallouminateError::Config(
+        "discover_repo_config: not implemented (curd 1)".into(),
+    ))
+}
+
+/// Parse a repo-layer TOML file, resolving relative paths against the
+/// config file's parent directory. Stub.
+pub fn load_repo_layer(_config_path: &Path) -> Result<Config> {
+    Err(HallouminateError::Config(
+        "load_repo_layer: not implemented (curd 1)".into(),
+    ))
+}
+
+/// Merge a baseline config with a repo-layer config. Stub.
+pub fn merge_layers(_baseline: &Config, _repo: &Config) -> Result<Config> {
+    Err(HallouminateError::Config(
+        "merge_layers: not implemented (curd 1)".into(),
+    ))
+}
+
+/// Per-request top-level: discover repo config → load layer → merge with
+/// baseline. Stub.
+pub fn resolve_for_cwd(
+    _baseline: &Config,
+    _cwd: &Path,
+) -> Result<(Config, ResolvedLayers)> {
+    Err(HallouminateError::Config(
+        "resolve_for_cwd: not implemented (curd 1)".into(),
+    ))
+}
+
 pub fn load(path: Option<&Path>) -> Result<Config> {
     let resolved = match path {
         Some(p) => p.to_path_buf(),
