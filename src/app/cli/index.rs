@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-use crate::app::config::{self, Config};
+use crate::app::config::Config;
 use crate::app::daemon::{DaemonRequest, DaemonRequestPayload, IndexRequest, client_for};
 use crate::app::input_error::InputError;
 use crate::domain::common::CorpusConfig;
@@ -39,16 +39,15 @@ pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
 /// and shipped through `--corpus ad-hoc` after the daemon learns to register
 /// transient corpora; until then, surface a clear error early.
 pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
-    // Validate config locally (still loaded here for argument-resolution
-    // pre-checks like `paths_from`), even though the daemon owns the data
-    // operations. The daemon has its own copy of the config.
-    let cfg = config::load(args.config.as_deref())?;
+    // `--paths-from` short-circuits to a clear "not supported via the daemon
+    // yet" error so callers don't see an opaque daemon-side InvalidParams
+    // later. Everything else (config layering, corpus name resolution) is
+    // the daemon's job — the layered model means the CLI doesn't see repo
+    // corpora locally, so any local pre-check would have to re-implement
+    // discovery.
     if let Some(paths_from) = args.paths_from.as_deref() {
         return Err(ad_hoc_corpus_unsupported(paths_from));
     }
-    // Local sanity check that resolves the same names the daemon would —
-    // surfaces an "unknown corpus" caller error before we open a socket.
-    let _ = select_corpora(&cfg, args.corpus.as_deref(), None)?;
 
     let client = client_for(args.socket.as_deref()).await?;
     // Capture CWD at the CLI entry so the daemon can run repo-config
