@@ -29,7 +29,7 @@ pub struct DaemonArgs {
 /// rare debug invocations). Returns `Err` if another daemon is already
 /// holding the single-instance lock on the configured socket directory.
 pub async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
-    let cfg = config::load(args.config.as_deref())?;
+    let cfg = config::load_xdg(args.config.as_deref())?;
     let socket_path = daemon_socket_path();
     serve_with_config(cfg, &socket_path).await
 }
