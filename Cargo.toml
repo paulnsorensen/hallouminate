@@ -20,6 +20,7 @@ lancedb = "0.27"
 arrow = "57"
 arrow-array = "57"
 arrow-schema = "57"
+async-trait = "0.1"
 futures = "0.3"
 
 # Embeddings
