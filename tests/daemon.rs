@@ -406,10 +406,12 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
         .as_array()
         .expect("indexed.corpora array");
     assert_eq!(corpora.len(), 1, "one corpus report: {corpora:?}");
+    // The primary write (cheese.md) plus the auto-generated root index.md
+    // both flow through index_single_file, so files_upserted is 2.
     assert_eq!(
         corpora[0]["files_upserted"].as_u64(),
-        Some(1),
-        "the freshly-written file must be upserted: {:?}",
+        Some(2),
+        "primary write + auto-built root index.md must both be upserted: {:?}",
         corpora[0],
     );
 

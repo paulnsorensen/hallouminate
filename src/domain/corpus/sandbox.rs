@@ -213,6 +213,110 @@ pub fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>
     Ok(entries)
 }
 
+/// One node in the directory tree returned by `build_corpus_tree`. The root
+/// node has `path == ""` and represents the corpus' first configured root.
+/// `files` carries direct-child files visible in the corpus; `subdirs`
+/// carries immediate child directories that themselves contain markdown.
+/// Empty directories (no markdown anywhere beneath) are pruned so the tree
+/// mirrors what `list_corpus_files` would surface.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TreeNode {
+    pub path: String,
+    pub absolute_path: String,
+    pub files: Vec<FileEntry>,
+    pub subdirs: Vec<TreeNode>,
+}
+
+/// Build a directory tree for `corpus` keyed on its first configured root.
+///
+/// Multi-root corpora collapse to the first root for the tree — wiki writes
+/// already target it exclusively, and a cross-root tree has no canonical
+/// path representation. Honors include/exclude globs by reusing the same
+/// `scan` pass that `list_corpus_files` uses, then groups results by
+/// directory so a navigator (LLM or human) can browse without re-parsing
+/// the flat list.
+pub fn build_corpus_tree(corpus: &CorpusConfig) -> anyhow::Result<TreeNode> {
+    let raw_root = corpus
+        .paths
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("corpus {:?} has no paths", corpus.name))?;
+    let expanded = expand_tilde(raw_root);
+    let root_abs = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+    let files = list_corpus_files(corpus)?;
+    let mut node = TreeNode {
+        path: String::new(),
+        absolute_path: root_abs.to_string_lossy().into_owned(),
+        files: Vec::new(),
+        subdirs: Vec::new(),
+    };
+    for entry in files {
+        // Skip entries that didn't strip cleanly to a relative path (i.e.,
+        // belong to a non-first root). `list_corpus_files` returns the
+        // absolute path verbatim in that case, which would fan out to a
+        // bogus subdir branch under the tree's first-root frame.
+        if entry.absolute_path == entry.path {
+            continue;
+        }
+        let rel_path = PathBuf::from(&entry.path);
+        insert_into_tree(&mut node, &rel_path, entry, &root_abs);
+    }
+    sort_tree(&mut node);
+    Ok(node)
+}
+
+fn insert_into_tree(node: &mut TreeNode, rel: &Path, entry: FileEntry, root_abs: &Path) {
+    let components: Vec<&OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if components.is_empty() {
+        return;
+    }
+    if components.len() == 1 {
+        node.files.push(entry);
+        return;
+    }
+    let head = components[0];
+    let head_str = head.to_string_lossy().into_owned();
+    let child = match node.subdirs.iter().position(|n| {
+        Path::new(&n.path)
+            .components()
+            .next_back()
+            .map(|c| matches!(c, Component::Normal(s) if s == head))
+            .unwrap_or(false)
+    }) {
+        Some(idx) => &mut node.subdirs[idx],
+        None => {
+            let child_rel = if node.path.is_empty() {
+                head_str.clone()
+            } else {
+                format!("{}/{}", node.path, head_str)
+            };
+            let child_abs = root_abs.join(&child_rel);
+            node.subdirs.push(TreeNode {
+                path: child_rel,
+                absolute_path: child_abs.to_string_lossy().into_owned(),
+                files: Vec::new(),
+                subdirs: Vec::new(),
+            });
+            node.subdirs.last_mut().expect("just pushed")
+        }
+    };
+    let tail: PathBuf = components[1..].iter().collect();
+    insert_into_tree(child, &tail, entry, root_abs);
+}
+
+fn sort_tree(node: &mut TreeNode) {
+    node.files.sort_by(|a, b| a.path.cmp(&b.path));
+    node.subdirs.sort_by(|a, b| a.path.cmp(&b.path));
+    for child in &mut node.subdirs {
+        sort_tree(child);
+    }
+}
+
 // ── atomic_write_no_follow ──────────────────────────────────────────────
 //
 // `openat`-based atomic writer that walks every path component with
@@ -900,5 +1004,51 @@ mod tests {
         let entries = list_corpus_files(&corpus).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec!["a.md", "b.md", "sub/c.md"]);
+    }
+
+    // ── build_corpus_tree ──────────────────────────────────────────────
+
+    #[test]
+    fn build_corpus_tree_groups_files_by_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("adapters")).unwrap();
+        std::fs::create_dir_all(root.join("adapters/nested")).unwrap();
+        std::fs::write(root.join("top.md"), "# Top").unwrap();
+        std::fs::write(root.join("adapters/index.md"), "# Adapters").unwrap();
+        std::fs::write(root.join("adapters/lance.md"), "# Lance").unwrap();
+        std::fs::write(root.join("adapters/nested/deep.md"), "# Deep").unwrap();
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+        };
+        let tree = build_corpus_tree(&corpus).unwrap();
+        assert_eq!(tree.path, "");
+        assert_eq!(tree.files.len(), 1, "one top-level file");
+        assert_eq!(tree.files[0].path, "top.md");
+        assert_eq!(tree.subdirs.len(), 1, "one subdir at root");
+        let adapters = &tree.subdirs[0];
+        assert_eq!(adapters.path, "adapters");
+        assert_eq!(adapters.files.len(), 2);
+        assert_eq!(adapters.subdirs.len(), 1);
+        assert_eq!(adapters.subdirs[0].path, "adapters/nested");
+        assert_eq!(adapters.subdirs[0].files[0].path, "adapters/nested/deep.md");
+    }
+
+    #[test]
+    fn build_corpus_tree_returns_root_only_for_empty_corpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = CorpusConfig {
+            name: "empty".into(),
+            paths: vec![tmp.path().to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+        };
+        let tree = build_corpus_tree(&corpus).unwrap();
+        assert_eq!(tree.path, "");
+        assert!(tree.files.is_empty());
+        assert!(tree.subdirs.is_empty());
     }
 }

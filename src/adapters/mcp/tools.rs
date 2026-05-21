@@ -10,7 +10,7 @@
 //! built to remove.
 
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo};
@@ -22,24 +22,133 @@ use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
     DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
     GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
-    ReadMarkdownRequest, ReadMarkdownResult, client_for,
+    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 const SERVER_INSTRUCTIONS: &str = "\
-Hallouminate stores a markdown corpus on disk and exposes it for semantic search.
+Hallouminate stores per-repository markdown wikis on disk and exposes them \
+for semantic search. Each `[[repository]]` entry derives a `repo:{name}:wiki` \
+corpus rooted at `<repo>/.hallouminate/wiki/`. The wiki is the canonical \
+place for cross-session knowledge: architecture, conventions, gotchas, \
+\"why this design not that one\" notes.
+
+Two audiences use this server:
+- CONSUMERS (grounding agents) read the wiki via `ground` / `read_markdown` \
+  / `list_files` / `list_tree`.
+- AUTHORS (curator agents) write entries via `add_markdown` / overwrite via \
+  `read_markdown` + `add_markdown { overwrite: true }`.
+
+Default corpus: tool calls that omit `corpus` default to the wiki for the \
+repository containing the daemon's current working directory. Pass `corpus` \
+explicitly to target another wiki, the repo's source corpus \
+(`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry. \
+`list_corpora` enumerates everything available.
 
 Tools:
-- `list_corpora` — names of configured corpora.
-- `list_files` — relative file paths in a corpus.
-- `read_markdown` — verbatim file contents (UTF-8). Use before overwriting.
-- `add_markdown` — write a file (atomic, no-symlink-follow). Auto-reindexes that file.
-- `delete_markdown` — unlink file + prune index rows.
-- `ground` — semantic search; returns ranked chunks with snippet, heading_path, line_range, score.
+- `list_corpora` — every configured corpus name.
+- `list_files` — flat list of relative paths in a corpus.
+- `list_tree` — same files grouped into a directory tree with subdirs; use \
+  this to navigate progressively-disclosed wikis instead of reading every \
+  index.md in sequence.
+- `read_markdown` — verbatim file contents (UTF-8). Call before overwriting.
+- `add_markdown` — write a file (atomic, no-symlink-follow). Reindexes that \
+  file AND walks ancestor `index.md`s to refresh the link tree.
+- `delete_markdown` — unlink file + prune index rows + refresh ancestor \
+  indexes.
+- `ground` — semantic search; returns ranked chunks with snippet, \
+  heading_path, line_range, score.
 - `index` — bulk (re)index a corpus or all corpora.
 
-Filesystem is the source of truth; LanceDB rows are derived and refreshed after `add_markdown` / `delete_markdown`. `index` is the only way to pick up edits made outside hallouminate.
+Filesystem is the source of truth; LanceDB rows are derived and refreshed \
+after `add_markdown` / `delete_markdown`. `index` is the only way to pick \
+up edits made outside hallouminate.
 
-Wiki conventions for LLM authors: one topic per file; H1 (`# Topic`) on the first line; file stem matches the slug. Multi-root corpora write all `add_markdown` / `delete_markdown` to the FIRST configured root only — keep one root if you can.
+# Authoring conventions (REQUIRED for `add_markdown`)
+
+ONE TOPIC PER FILE. A wiki entry is a slice of knowledge with a clear \
+scope. The chunker splits on headings — two unrelated topics in one file \
+make `ground` rank both sections together, which is rarely what you want.
+
+FIRST NON-BLANK LINE IS H1. Every file's first non-blank line must be \
+`# Topic Name`. The chunker uses the H1 as the breadcrumb root; without \
+it, search results lose navigability. The H1 is also what the auto-index \
+quotes as each entry's gloss.
+
+FILE STEM MATCHES THE SLUG. \"Corpus walker\" → `corpus-walker.md`. \
+Lowercase, kebab case. No spaces, no capitals, no extensions other than \
+`.md`.
+
+LEAD WITH THE CONCLUSION. Don't bury what the file is about under \
+preamble. Cite files and line ranges by path: \
+`src/domain/corpus/walker.rs:42`. Prefer concrete examples to abstract \
+description. ~50-150 lines per entry is the right band.
+
+# Tree layout & linking
+
+Subdirectories work — write `architecture/dataflow.md` and the daemon \
+creates `architecture/` for you. Use them to give a wiki shape:
+
+- Top-level files for foundational topics (`architecture.md`, \
+  `mcp-surface.md`).
+- Subdirectories for related entries (`adapters/lance.md`, \
+  `adapters/mcp.md`, `adapters/index.md`).
+
+Each directory carries an `index.md`. The daemon scaffolds and maintains \
+the LINK LIST inside it between markers, but you OWN the prose outside.
+
+After `add_markdown` / `delete_markdown`, the daemon walks from the corpus \
+root down to the changed file's parent and refreshes the link list inside \
+`<!-- HALLOUMINATE:INDEX-START -->` / `<!-- HALLOUMINATE:INDEX-END -->` \
+in each ancestor `index.md`. A missing `index.md` is scaffolded; prose \
+outside the markers is preserved verbatim. To opt OUT, remove the markers \
+— the daemon will then leave the file alone.
+
+Link convention: `[stem](./stem.md)` for files, \
+`[subdir/](./subdir/index.md)` for directories. Use relative paths so the \
+links survive moves of the whole wiki.
+
+# Authoring loop
+
+```
+1. list_tree                          (see what's already there)
+2. ground \"<topic-adjacent search>\"   (find related entries to cross-link)
+3. read_markdown index.md             (confirm naming + style)
+4. draft (H1 first line, kebab slug, link adjacent entries)
+5. add_markdown { corpus, path, content, overwrite: false }
+6. (the daemon updates ancestor index.md link lists for you)
+```
+
+# Examples
+
+Add a top-level entry:
+```
+add_markdown {
+  corpus: \"repo:myrepo:wiki\",
+  path: \"corpus-walker.md\",
+  content: \"# Corpus walker\\n\\nGitignore-aware...\\n\",
+  overwrite: false,
+}
+```
+
+Add a nested entry — daemon creates `adapters/index.md` if missing:
+```
+add_markdown {
+  corpus: \"repo:myrepo:wiki\",
+  path: \"adapters/lance.md\",
+  content: \"# LanceDB adapter\\n\\n...\\n\",
+  overwrite: false,
+}
+```
+
+Update with rollback safety:
+```
+read_markdown { corpus: \"repo:myrepo:wiki\", path: \"corpus-walker.md\" }
+// edit content
+add_markdown { ..., overwrite: true }
+```
+
+Multi-root corpora write all `add_markdown` / `delete_markdown` to the \
+FIRST configured root only — keep one root if you can.
 ";
 
 /// Build a `CallToolResult` with both a human-readable text content block
@@ -50,6 +159,38 @@ fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
     let mut result = CallToolResult::success(vec![Content::text(text)]);
     result.structured_content = Some(structured);
     result
+}
+
+/// Render a `TreeNode` as an indented ASCII outline — subdirs first, then
+/// files, with one entry per line and two-space indents per depth level.
+/// Mirrors the structured tree for clients that only want the text block.
+fn render_tree_outline(
+    node: &crate::domain::corpus::sandbox::TreeNode,
+    depth: usize,
+    out: &mut String,
+) {
+    let indent = "  ".repeat(depth);
+    let label = if node.path.is_empty() {
+        ".".to_string()
+    } else {
+        Path::new(&node.path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&node.path)
+            .to_string()
+    };
+    out.push_str(&format!("{indent}{label}/\n"));
+    for sub in &node.subdirs {
+        render_tree_outline(sub, depth + 1, out);
+    }
+    let file_indent = "  ".repeat(depth + 1);
+    for f in &node.files {
+        let name = Path::new(&f.path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&f.path);
+        out.push_str(&format!("{file_indent}{name}\n"));
+    }
 }
 
 fn internal_error(msg: impl Into<String>) -> ErrorData {
@@ -125,7 +266,18 @@ pub struct ListCorporaParams {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesParams {
-    /// Corpus name; required when more than one corpus is configured.
+    /// Corpus name; defaults to the wiki for the repo containing the
+    /// daemon's cwd. Required only when no default applies and multiple
+    /// corpora are configured.
+    #[serde(default)]
+    pub corpus: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ListTreeParams {
+    /// Corpus name; defaults to the wiki for the repo containing the
+    /// daemon's cwd. Required only when no default applies and multiple
+    /// corpora are configured.
     #[serde(default)]
     pub corpus: Option<String>,
 }
@@ -250,7 +402,29 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise."
+        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing the daemon's cwd when `corpus` is omitted."
+    )]
+    pub async fn list_tree(
+        &self,
+        Parameters(params): Parameters<ListTreeParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = daemon_for_tool().await?;
+        let req = DaemonRequest {
+            cwd: self.cwd.clone(),
+            payload: DaemonRequestPayload::ListTree(ListTreeRequest {
+                corpus: params.corpus,
+            }),
+        };
+        let result: ListTreeResult = client.call(req).await.map_err(map_daemon_err)?;
+        let mut outline = String::new();
+        render_tree_outline(&result.root, 0, &mut outline);
+        let structured =
+            serde_json::to_value(&result).map_err(|e| internal_error(e.to_string()))?;
+        Ok(tool_ok(outline, structured))
+    }
+
+    #[tool(
+        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise. Defaults to the wiki for the repo containing the daemon's cwd when `corpus` is omitted."
     )]
     pub async fn list_files(
         &self,

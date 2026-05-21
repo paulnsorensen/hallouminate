@@ -1,5 +1,6 @@
 mod chunker;
 mod hasher;
+pub mod index_md;
 mod keywords;
 pub mod sandbox;
 mod snippet;
