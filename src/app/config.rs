@@ -19,6 +19,12 @@ pub struct SearchConfig {
     pub top_files_default: usize,
     #[serde(default = "default_chunks_per_file")]
     pub chunks_per_file_default: usize,
+    /// Crossencoder model identifier (e.g. `"jina-reranker-v1-turbo-en"`).
+    /// `None` (the default) disables the rerank step entirely; the
+    /// FTS+vector+rg fusion result is returned as-is. Names map to
+    /// `domain::search::crossencoder::canonical_crossencoder_model`.
+    #[serde(default)]
+    pub crossencoder: Option<String>,
 }
 
 impl Default for SearchConfig {
@@ -26,6 +32,7 @@ impl Default for SearchConfig {
         Self {
             top_files_default: DEFAULT_TOP_FILES,
             chunks_per_file_default: DEFAULT_CHUNKS_PER_FILE,
+            crossencoder: None,
         }
     }
 }
@@ -282,6 +289,14 @@ fn merge_layers_with_sources(
             baseline.search.chunks_per_file_default,
             repo.search.chunks_per_file_default,
             defaults.search.chunks_per_file_default,
+            baseline_path,
+            repo_path,
+        )?,
+        crossencoder: merge_scalar(
+            "search.crossencoder",
+            baseline.search.crossencoder.clone(),
+            repo.search.crossencoder.clone(),
+            defaults.search.crossencoder.clone(),
             baseline_path,
             repo_path,
         )?,
@@ -823,8 +838,9 @@ rrf_k                   = 60
             SearchConfig {
                 top_files_default: 7,
                 chunks_per_file_default: 2,
+                crossencoder: None,
             },
-            "SearchConfig must hold only the two surviving fields"
+            "SearchConfig must hold only the surviving fields"
         );
     }
 

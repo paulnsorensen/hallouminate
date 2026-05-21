@@ -7,6 +7,7 @@
 //! of our chunk_id scheme — boosting per file_ref keeps the math
 //! coherent without forcing an rg→chunk resolution pass.
 
+pub mod crossencoder;
 pub mod ripgrep;
 
 use std::collections::HashMap;
@@ -14,6 +15,10 @@ use std::collections::HashMap;
 use crate::adapters::lance::{LanceStore, SearchHit};
 use crate::domain::common::Result;
 
+pub use crossencoder::{
+    Crossencoder, DEFAULT_CROSSENCODER_MODEL, FastembedCrossencoder, Noop as NoopCrossencoder,
+    SUPPORTED_CROSSENCODER_MODELS, canonical_crossencoder_model,
+};
 pub use ripgrep::RipgrepHit;
 
 /// File-level RRF weight for ripgrep matches. Lower than FTS_WEIGHT

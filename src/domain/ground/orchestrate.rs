@@ -4,7 +4,7 @@ use std::time::Instant;
 use crate::adapters::lance::LanceStore;
 use crate::domain::common::{HallouminateError, Result};
 use crate::domain::embeddings::EmbedBatch;
-use crate::domain::search::hybrid_with_ripgrep;
+use crate::domain::search::{Crossencoder, hybrid_with_ripgrep};
 
 use super::bucket::build_docs;
 use super::types::{GroundResponse, Stats};
@@ -32,6 +32,7 @@ pub async fn ground(
     corpus_paths: &[String],
     store: &LanceStore,
     embedder: &mut dyn EmbedBatch,
+    crossencoder: Option<&mut dyn Crossencoder>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
@@ -39,8 +40,15 @@ pub async fn ground(
     let query_vec = embeddings.into_iter().next().ok_or_else(|| {
         HallouminateError::Embed("embed_batch returned no vector for query".into())
     })?;
-    let hits =
+    let mut hits =
         hybrid_with_ripgrep(store, corpus, corpus_paths, query, &query_vec, opts.limit).await?;
+    if let Some(rerank) = crossencoder {
+        // The crossencoder is the most expensive step; skip it on empty
+        // hit lists so a no-match query doesn't pay the model latency.
+        if !hits.is_empty() {
+            rerank.rerank(query, &mut hits)?;
+        }
+    }
     let stats = Stats { hits: hits.len() };
     let mut docs = build_docs(&hits, opts.top_files, opts.chunks_per_file)?;
     for doc in docs.values_mut() {
@@ -88,6 +96,7 @@ mod tests {
             &[],
             &store,
             &mut embedder,
+            None,
             GroundOpts::default(),
         )
         .await

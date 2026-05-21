@@ -30,6 +30,7 @@ use crate::app::config::Config;
 use crate::domain::common::expand_tilde;
 use crate::domain::corpus::{MarkdownChunker, load_tokenizer};
 use crate::domain::embeddings::Embedder;
+use crate::domain::search::FastembedCrossencoder;
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
@@ -84,6 +85,11 @@ struct DaemonStateInner {
     corpus_locks: CorpusLockMap,
     write_lane: Arc<Semaphore>,
     embedder: Arc<Mutex<Option<Embedder>>>,
+    /// Lazy-loaded crossencoder reranker. `None` here means either no
+    /// `[search].crossencoder` was configured (most users), or the
+    /// model failed to load at boot. The `embedder()`-style guard pulls
+    /// the lock and lazily inits on first request.
+    crossencoder: Arc<Mutex<Option<FastembedCrossencoder>>>,
     tokenizer: tokenizers::Tokenizer,
 }
 
@@ -132,6 +138,27 @@ impl DaemonState {
         };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
+        // Eager-load the crossencoder iff configured; tolerate failure
+        // so a misconfigured model name (or offline first run) doesn't
+        // brick the daemon. Unconfigured stays `None` and `ground`
+        // skips the rerank step entirely.
+        let crossencoder = match cfg.search.crossencoder.as_deref() {
+            Some(model) => {
+                match FastembedCrossencoder::try_new(model, &cache_dir) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "hallouminate::daemon",
+                            model = %model,
+                            error = %e,
+                            "crossencoder unavailable at startup; ground will skip rerank until reload",
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         Ok(DaemonState {
             inner: Arc::new(DaemonStateInner {
                 baseline: cfg,
@@ -141,6 +168,7 @@ impl DaemonState {
                 corpus_locks: CorpusLockMap::default(),
                 write_lane: Arc::new(Semaphore::new(1)),
                 embedder: Arc::new(Mutex::new(embedder)),
+                crossencoder: Arc::new(Mutex::new(crossencoder)),
                 tokenizer,
             }),
         })
@@ -193,6 +221,31 @@ impl DaemonState {
             *guard = Some(embedder);
         }
         Ok(EmbedderGuard { guard })
+    }
+
+    /// Borrow the shared crossencoder for one call, if configured.
+    /// Returns `Ok(None)` when `[search].crossencoder` is unset OR when
+    /// the model failed to load at boot — `ground` falls back to the
+    /// unranked fusion result in that case. Lazy-init mirrors `embedder()`
+    /// so a daemon booted before the model file existed picks it up on
+    /// the next request without restart.
+    pub async fn crossencoder(&self) -> anyhow::Result<Option<CrossencoderGuard<'_>>> {
+        let Some(model_name) = self.inner.baseline.search.crossencoder.clone() else {
+            return Ok(None);
+        };
+        let mut guard = self.inner.crossencoder.lock().await;
+        if guard.is_none() {
+            let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
+            match FastembedCrossencoder::try_new(&model_name, &cache_dir) {
+                Ok(c) => *guard = Some(c),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "init crossencoder ({model_name}): {e}"
+                    ));
+                }
+            }
+        }
+        Ok(Some(CrossencoderGuard { guard }))
     }
 
     /// A freshly-constructed `MarkdownChunker` over the daemon's loaded
@@ -260,6 +313,27 @@ impl std::ops::Deref for EmbedderGuard<'_> {
 impl std::ops::DerefMut for EmbedderGuard<'_> {
     fn deref_mut(&mut self) -> &mut Embedder {
         self.guard.as_mut().expect("embedder loaded")
+    }
+}
+
+/// Owned guard around the lazily-loaded crossencoder, mirroring
+/// `EmbedderGuard`. Derefs to `FastembedCrossencoder` so callers can
+/// pass `&mut *guard` directly into anything that wants
+/// `&mut dyn Crossencoder`.
+pub struct CrossencoderGuard<'a> {
+    guard: MutexGuard<'a, Option<FastembedCrossencoder>>,
+}
+
+impl std::ops::Deref for CrossencoderGuard<'_> {
+    type Target = FastembedCrossencoder;
+    fn deref(&self) -> &FastembedCrossencoder {
+        self.guard.as_ref().expect("crossencoder loaded")
+    }
+}
+
+impl std::ops::DerefMut for CrossencoderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut FastembedCrossencoder {
+        self.guard.as_mut().expect("crossencoder loaded")
     }
 }
 
