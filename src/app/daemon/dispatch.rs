@@ -132,7 +132,16 @@ async fn handle_ground(state: &DaemonState, cfg: &Config, req: GroundRequest) ->
         Ok(g) => g,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    let response = match ground(&req.query, &corpus.name, &store, &mut *embedder, opts).await {
+    let response = match ground(
+        &req.query,
+        &corpus.name,
+        &corpus.paths,
+        &store,
+        &mut *embedder,
+        opts,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
