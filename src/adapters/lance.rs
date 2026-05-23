@@ -1061,8 +1061,11 @@ mod weighted_rrf {
             accumulate(&mut scores, &fts_ids, self.fts_weight, self.k);
 
             let combined = self.merge_results(vector_results, fts_results)?;
-            let combined_row_ids: UInt64Array =
-                downcast_array(combined.column_by_name(ROW_ID).expect("merge_results preserves _rowid"));
+            let combined_row_ids: UInt64Array = downcast_array(
+                combined
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| missing_row_id("merged results", &combined))?,
+            );
 
             let relevance_scores = Float32Array::from_iter_values(
                 combined_row_ids
@@ -1078,15 +1081,14 @@ mod weighted_rrf {
                     ..Default::default()
                 }),
                 None,
-            )
-            .expect("sort_to_indices on Float32Array");
+            )?;
 
             let mut columns: Vec<Arc<dyn arrow_array::Array>> = combined.columns().to_vec();
             columns.push(Arc::new(relevance_scores));
             let columns: Vec<Arc<dyn arrow_array::Array>> = columns
                 .iter()
-                .map(|c| take(c, &sort_indices, None).expect("take on aligned arrays"))
-                .collect();
+                .map(|c| take(c, &sort_indices, None))
+                .collect::<arrow::error::Result<_>>()?;
 
             let mut fields = combined.schema().fields().to_vec();
             fields.push(Arc::new(Field::new(
@@ -1111,8 +1113,8 @@ mod weighted_rrf {
     }
 
     fn missing_row_id(which: &str, batch: &RecordBatch) -> lancedb::Error {
-        let cols: Vec<&str> = batch
-            .schema()
+        let schema = batch.schema();
+        let cols: Vec<&str> = schema
             .fields()
             .iter()
             .map(|f| f.name().as_str())

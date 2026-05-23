@@ -79,10 +79,11 @@ pub async fn hybrid_with_ripgrep(
     Ok(hits)
 }
 
-/// In-place: add `RIPGREP_WEIGHT / (K + first_rank)` to every hit
-/// whose `file_ref` appears in `rg_hits`, then re-sort descending. The
-/// rg first-occurrence rank is captured before any truncation so two
-/// rg-matched files don't end up with the same boost.
+/// In-place: add `RIPGREP_WEIGHT / (K + first_rank)` to every hit whose
+/// `file_ref` appears in `rg_hits`, then re-sort descending. `first_rank`
+/// is each file's first-occurrence position within `rg_hits` (already
+/// capped at `limit` by `ripgrep::run`), so two rg-matched files get
+/// distinct boosts.
 fn apply_rg_boost(hits: &mut Vec<SearchHit>, rg_hits: &[RipgrepHit]) {
     if rg_hits.is_empty() || hits.is_empty() {
         return;

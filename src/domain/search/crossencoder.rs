@@ -115,15 +115,32 @@ impl Crossencoder for FastembedCrossencoder {
         // each carrying the original `index` into the docs slice. Apply
         // that permutation in place via a destructive take/swap dance.
         let order: Vec<usize> = scored.iter().map(|r| r.index).collect();
-        // Sanity check: rerank must return one row per input. If the
-        // model misbehaves and returns fewer (or duplicate indices),
-        // bail rather than silently truncating hits.
+        // `order` must be a true permutation of `0..hits.len()`.
+        // `apply_permutation` indexes `hits[i]` directly, so an
+        // out-of-range index would panic and a duplicate would drop one
+        // hit while cloning another — both violating the trait's
+        // "preserve contents" contract. The length check alone permits
+        // both, so validate length, range, and uniqueness explicitly.
         if order.len() != hits.len() {
             return Err(HallouminateError::Embed(format!(
                 "crossencoder returned {} scores for {} docs",
                 order.len(),
                 hits.len()
             )));
+        }
+        let mut seen = vec![false; hits.len()];
+        for &idx in &order {
+            let slot = seen.get_mut(idx).ok_or_else(|| {
+                HallouminateError::Embed(format!(
+                    "crossencoder returned out-of-range index {idx} for {} docs",
+                    hits.len()
+                ))
+            })?;
+            if std::mem::replace(slot, true) {
+                return Err(HallouminateError::Embed(format!(
+                    "crossencoder returned duplicate index {idx}"
+                )));
+            }
         }
         // Overwrite per-hit score with the crossencoder score so
         // downstream `build_docs` aggregation uses the new ranking.

@@ -136,7 +136,7 @@ async fn handle_ground(state: &DaemonState, cfg: &Config, req: GroundRequest) ->
     // load (e.g. model file vanished), log and ground without it
     // rather than refusing the request. Unconfigured paths return
     // Ok(None) and the rerank step is skipped entirely.
-    let mut crossencoder = match state.crossencoder().await {
+    let mut crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(

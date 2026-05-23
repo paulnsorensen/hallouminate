@@ -1,15 +1,16 @@
 //! Ripgrep-backed exact-match retrieval.
 //!
 //! Covers the gap LanceDB's BM25 tokenizer misses: identifiers with
-//! embedded punctuation, case-sensitive matches, raw substrings inside
-//! code fences. Returns hits in the order `rg` emits them so the caller
-//! can treat first-occurrence position as the rank for RRF fusion.
+//! embedded punctuation and raw substrings inside code fences. Matching
+//! is case-insensitive (`--ignore-case`), matching BM25's folded
+//! tokens. Returns hits in the order `rg` emits them so the caller can
+//! treat first-occurrence position as the rank for RRF fusion.
 
 use std::path::Path;
 use std::process::Stdio;
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::domain::common::{HallouminateError, Result, canonicalize_or_passthrough};
@@ -79,9 +80,26 @@ pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<Ripg
         }
     }
 
-    // Drain rg even if we stopped early so the child can exit cleanly
-    // (kill_on_drop catches the worst case but a clean wait is cheaper).
-    let _ = child.wait().await;
+    // Wait for the child so it exits cleanly (kill_on_drop catches the
+    // worst case, but a clean wait is cheaper) AND so we can inspect its
+    // exit status instead of masking real failures.
+    let status = child.wait().await.map_err(HallouminateError::Io)?;
+    // rg exit codes: 0 = matches found, 1 = no matches, 2 = real error
+    // (bad pattern, IO failure, …). A non-zero exit with hits already
+    // collected is tolerated — e.g. exit 1/2 because one path vanished
+    // while another matched. A non-zero exit with NO hits is a genuine
+    // failure: surface it (with stderr) rather than returning an empty
+    // success that hides the error.
+    if !status.success() && hits.is_empty() {
+        let mut stderr_buf = String::new();
+        if let Some(mut err) = child.stderr.take() {
+            let _ = err.read_to_string(&mut stderr_buf).await;
+        }
+        return Err(HallouminateError::Embed(format!(
+            "rg failed ({status}) with no matches: {}",
+            stderr_buf.trim()
+        )));
+    }
     Ok(hits)
 }
 
