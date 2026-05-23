@@ -587,9 +587,10 @@ impl LanceStore {
         Ok(out)
     }
 
-    /// Hybrid BM25 + vector search reranked with LanceDB's built-in
-    /// `RRFReranker`, scoped to a single `corpus`. Returns an empty `Vec`
-    /// for an empty corpus or when no rows match the corpus filter.
+    /// Hybrid BM25 + vector search reranked with a `WeightedRRFReranker`
+    /// biased toward FTS (see `weighted_rrf::FTS_WEIGHT` /
+    /// `VECTOR_WEIGHT`), scoped to a single `corpus`. Returns an empty
+    /// `Vec` for an empty corpus or when no rows match the corpus filter.
     pub async fn hybrid_search(
         &self,
         corpus: &str,
@@ -607,7 +608,7 @@ impl LanceStore {
         if self.count_rows().await? == 0 {
             return Ok(Vec::new());
         }
-        let reranker = std::sync::Arc::new(lancedb::rerankers::rrf::RRFReranker::default());
+        let reranker = std::sync::Arc::new(weighted_rrf::WeightedRRFReranker::default());
         let corpus_filter = format!("corpus = '{}'", escape_sql_str(corpus));
         let stream = self
             .table
@@ -980,5 +981,221 @@ schema_version = 1
         let meta_path = dir.path().join("nested/dir/meta.toml");
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
         assert!(meta_path.exists());
+    }
+}
+
+/// Weighted Reciprocal Rank Fusion reranker for hybrid (BM25 + vector)
+/// search. Identical to LanceDB's stock `RRFReranker` except each ranked
+/// list contributes a per-source multiplier on top of the standard
+/// `1 / (k + rank)` term, letting us bias fusion toward FTS when the
+/// embedding model is generic and the corpus is keyword-heavy.
+mod weighted_rrf {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use arrow::array::downcast_array;
+    use arrow::compute::{sort_to_indices, take};
+    use arrow_array::{Float32Array, RecordBatch, UInt64Array};
+    use arrow_schema::{DataType, Field, Schema, SortOptions};
+    use async_trait::async_trait;
+    use lancedb::rerankers::Reranker;
+
+    /// Matches `lance::dataset::ROW_ID` — hardcoded so we don't pull
+    /// `lance-core` into our dep graph just for one `&str` constant.
+    const ROW_ID: &str = "_rowid";
+    /// Column name LanceDB's hybrid pipeline requires the reranker to
+    /// emit. Mirrors `lancedb::rerankers::RELEVANCE_SCORE`, which is
+    /// private; if LanceDB ever renames it, `check_reranker_result`
+    /// raises a `Schema` error and tests fail loudly.
+    const RELEVANCE_SCORE: &str = "_relevance_score";
+
+    /// FTS rank gets twice the weight of vector rank in the fused score.
+    /// Picked because BM25 over our short markdown chunks beats the
+    /// generic `bge-small-en-v1.5` embeddings on distinctive-token
+    /// queries (the e2e oracles in `tests/fixture_e2e.rs` rely entirely
+    /// on the FTS path under the stub embedder).
+    pub const FTS_WEIGHT: f32 = 2.0;
+    pub const VECTOR_WEIGHT: f32 = 1.0;
+    /// RRF dampening constant; 60 matches Cormack et al. and LanceDB's
+    /// stock default.
+    pub const K: f32 = 60.0;
+
+    #[derive(Debug)]
+    pub struct WeightedRRFReranker {
+        k: f32,
+        fts_weight: f32,
+        vector_weight: f32,
+    }
+
+    impl Default for WeightedRRFReranker {
+        fn default() -> Self {
+            Self {
+                k: K,
+                fts_weight: FTS_WEIGHT,
+                vector_weight: VECTOR_WEIGHT,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Reranker for WeightedRRFReranker {
+        async fn rerank_hybrid(
+            &self,
+            _query: &str,
+            vector_results: RecordBatch,
+            fts_results: RecordBatch,
+        ) -> lancedb::Result<RecordBatch> {
+            let vector_ids: UInt64Array = downcast_array(
+                vector_results
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| missing_row_id("vector_results", &vector_results))?,
+            );
+            let fts_ids: UInt64Array = downcast_array(
+                fts_results
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| missing_row_id("fts_results", &fts_results))?,
+            );
+
+            let mut scores: BTreeMap<u64, f32> = BTreeMap::new();
+            accumulate(&mut scores, &vector_ids, self.vector_weight, self.k);
+            accumulate(&mut scores, &fts_ids, self.fts_weight, self.k);
+
+            let combined = self.merge_results(vector_results, fts_results)?;
+            let combined_row_ids: UInt64Array = downcast_array(
+                combined
+                    .column_by_name(ROW_ID)
+                    .ok_or_else(|| missing_row_id("merged results", &combined))?,
+            );
+
+            let relevance_scores = Float32Array::from_iter_values(
+                combined_row_ids
+                    .values()
+                    .iter()
+                    .map(|row_id| *scores.get(row_id).unwrap_or(&0.0)),
+            );
+
+            let sort_indices = sort_to_indices(
+                &relevance_scores,
+                Some(SortOptions {
+                    descending: true,
+                    ..Default::default()
+                }),
+                None,
+            )?;
+
+            let mut columns: Vec<Arc<dyn arrow_array::Array>> = combined.columns().to_vec();
+            columns.push(Arc::new(relevance_scores));
+            let columns: Vec<Arc<dyn arrow_array::Array>> = columns
+                .iter()
+                .map(|c| take(c, &sort_indices, None))
+                .collect::<arrow::error::Result<_>>()?;
+
+            let mut fields = combined.schema().fields().to_vec();
+            fields.push(Arc::new(Field::new(
+                RELEVANCE_SCORE,
+                DataType::Float32,
+                false,
+            )));
+            let schema = Schema::new(fields);
+
+            Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
+        }
+    }
+
+    fn accumulate(scores: &mut BTreeMap<u64, f32>, ids: &UInt64Array, weight: f32, k: f32) {
+        for (rank, row_id) in ids.values().iter().enumerate() {
+            let contribution = weight / (rank as f32 + k);
+            scores
+                .entry(*row_id)
+                .and_modify(|s| *s += contribution)
+                .or_insert(contribution);
+        }
+    }
+
+    fn missing_row_id(which: &str, batch: &RecordBatch) -> lancedb::Error {
+        let schema = batch.schema();
+        let cols: Vec<&str> = schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        lancedb::Error::InvalidInput {
+            message: format!(
+                "expected column {ROW_ID} not found in {which}; found {cols:?}"
+            ),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use arrow_array::StringArray;
+
+        fn batch(ids: &[u64], names: &[&str]) -> RecordBatch {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new(ROW_ID, DataType::UInt64, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(names.to_vec())),
+                    Arc::new(UInt64Array::from(ids.to_vec())),
+                ],
+            )
+            .unwrap()
+        }
+
+        /// FTS-only hit at rank 0 must beat a vector-only hit at rank 0
+        /// once the weight bias is applied. With equal weights the two
+        /// would tie; with FTS_WEIGHT > VECTOR_WEIGHT the FTS row wins.
+        #[tokio::test]
+        async fn fts_only_hit_outranks_vector_only_hit_at_same_rank() {
+            let vec_results = batch(&[1], &["vec_only"]);
+            let fts_results = batch(&[2], &["fts_only"]);
+            let reranker = WeightedRRFReranker::default();
+            let out = reranker
+                .rerank_hybrid("q", vec_results, fts_results)
+                .await
+                .unwrap();
+            let names: StringArray = downcast_array(out.column(0));
+            let names: Vec<&str> = names.iter().map(|n| n.unwrap()).collect();
+            assert_eq!(names[0], "fts_only", "FTS-weighted RRF must rank fts_only first");
+            assert_eq!(names[1], "vec_only");
+        }
+
+        /// Row in both lists must beat either list's solo top hit (the
+        /// weight bias must not invert RRF's core property of rewarding
+        /// agreement).
+        #[tokio::test]
+        async fn row_in_both_lists_beats_solo_hits() {
+            let vec_results = batch(&[1, 2], &["solo_vec", "shared"]);
+            let fts_results = batch(&[3, 2], &["solo_fts", "shared"]);
+            let reranker = WeightedRRFReranker::default();
+            let out = reranker
+                .rerank_hybrid("q", vec_results, fts_results)
+                .await
+                .unwrap();
+            let names: StringArray = downcast_array(out.column(0));
+            let names: Vec<&str> = names.iter().map(|n| n.unwrap()).collect();
+            assert_eq!(names[0], "shared");
+        }
+
+        /// Output must carry the `_relevance_score` column LanceDB's
+        /// hybrid pipeline validates via `check_reranker_result`.
+        #[tokio::test]
+        async fn output_includes_relevance_score_column() {
+            let vec_results = batch(&[1], &["a"]);
+            let fts_results = batch(&[1], &["a"]);
+            let reranker = WeightedRRFReranker::default();
+            let out = reranker
+                .rerank_hybrid("q", vec_results, fts_results)
+                .await
+                .unwrap();
+            assert!(
+                out.schema().column_with_name(RELEVANCE_SCORE).is_some(),
+                "schema must expose {RELEVANCE_SCORE}"
+            );
+        }
     }
 }

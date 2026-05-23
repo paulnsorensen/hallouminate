@@ -132,10 +132,39 @@ async fn handle_ground(state: &DaemonState, cfg: &Config, req: GroundRequest) ->
         Ok(g) => g,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    let response = match ground(&req.query, &corpus.name, &store, &mut *embedder, opts).await {
+    // crossencoder is best-effort: if it's configured but failed to
+    // load (e.g. model file vanished), log and ground without it
+    // rather than refusing the request. Unconfigured paths return
+    // Ok(None) and the rerank step is skipped entirely.
+    let mut crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()).await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "crossencoder unavailable for this request; falling back to fusion-only ranking",
+            );
+            None
+        }
+    };
+    let crossencoder_dyn: Option<&mut dyn crate::domain::search::Crossencoder> = crossencoder
+        .as_mut()
+        .map(|g| &mut **g as &mut dyn crate::domain::search::Crossencoder);
+    let response = match ground(
+        &req.query,
+        &corpus.name,
+        &corpus.paths,
+        &store,
+        &mut *embedder,
+        crossencoder_dyn,
+        opts,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
+    drop(crossencoder);
     drop(embedder);
     let response = if let Some(limit) = req.snippet_chars {
         trim_snippets(&response, limit)

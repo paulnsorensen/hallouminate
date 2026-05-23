@@ -21,6 +21,11 @@
 [search]
 top_files_default       = 10
 chunks_per_file_default = 3
+# Optional crossencoder rerank model — runs after FTS+vector+rg fusion
+# to re-score the top candidates. Leave commented to skip the step.
+# Supported: jina-reranker-v1-turbo-en, jina-reranker-v2-base-multiligual,
+# bge-reranker-base, bge-reranker-v2-m3.
+# crossencoder = "jina-reranker-v1-turbo-en"
 
 [embeddings]
 model     = "BAAI/bge-small-en-v1.5"

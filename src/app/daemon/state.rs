@@ -30,6 +30,7 @@ use crate::app::config::Config;
 use crate::domain::common::expand_tilde;
 use crate::domain::corpus::{MarkdownChunker, load_tokenizer};
 use crate::domain::embeddings::Embedder;
+use crate::domain::search::{FastembedCrossencoder, canonical_crossencoder_model};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
@@ -84,6 +85,13 @@ struct DaemonStateInner {
     corpus_locks: CorpusLockMap,
     write_lane: Arc<Semaphore>,
     embedder: Arc<Mutex<Option<Embedder>>>,
+    /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
+    /// A per-model cache (rather than a single slot) so that repos
+    /// selecting different `[search].crossencoder` models via repo-layer
+    /// config each get their own loaded model instead of clobbering a
+    /// shared one. Empty until the first `ground` request that resolves a
+    /// configured model; the baseline model (if any) is pre-warmed at boot.
+    crossencoders: Arc<Mutex<HashMap<String, FastembedCrossencoder>>>,
     tokenizer: tokenizers::Tokenizer,
 }
 
@@ -132,6 +140,33 @@ impl DaemonState {
         };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
+        // Pre-warm the baseline crossencoder iff configured; tolerate
+        // failure so a misconfigured model name (or offline first run)
+        // doesn't brick the daemon. The cache stays empty for that model
+        // and a later `crossencoder()` call retries the load. Per-request
+        // repo-layer models are loaded lazily on first use, keyed by name.
+        let mut crossencoders: HashMap<String, FastembedCrossencoder> = HashMap::new();
+        if let Some(model) = cfg.search.crossencoder.as_deref() {
+            match canonical_crossencoder_model(model)
+                .map_err(anyhow::Error::from)
+                .and_then(|canonical| {
+                    FastembedCrossencoder::try_new(canonical, &cache_dir)
+                        .map(|c| (canonical, c))
+                        .map_err(anyhow::Error::from)
+                }) {
+                Ok((canonical, c)) => {
+                    crossencoders.insert(canonical.to_string(), c);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        model = %model,
+                        error = %e,
+                        "crossencoder unavailable at startup; ground will skip rerank until reload",
+                    );
+                }
+            }
+        }
         Ok(DaemonState {
             inner: Arc::new(DaemonStateInner {
                 baseline: cfg,
@@ -141,6 +176,7 @@ impl DaemonState {
                 corpus_locks: CorpusLockMap::default(),
                 write_lane: Arc::new(Semaphore::new(1)),
                 embedder: Arc::new(Mutex::new(embedder)),
+                crossencoders: Arc::new(Mutex::new(crossencoders)),
                 tokenizer,
             }),
         })
@@ -193,6 +229,37 @@ impl DaemonState {
             *guard = Some(embedder);
         }
         Ok(EmbedderGuard { guard })
+    }
+
+    /// Borrow the crossencoder for the model named by the per-request
+    /// resolved config, loading it lazily on first use and caching it by
+    /// canonical model name. Pass `None` (no model configured for this
+    /// request) to skip reranking — returns `Ok(None)`. Returns `Err`
+    /// when a configured model name is unknown or fails to load; the
+    /// caller logs and falls back to fusion-only ranking. Resolving from
+    /// the per-request `cfg.search.crossencoder` (not the baseline) is
+    /// what lets repo-layer `[search].crossencoder` overrides take effect.
+    pub async fn crossencoder(
+        &self,
+        model_name: Option<&str>,
+    ) -> anyhow::Result<Option<CrossencoderGuard<'_>>> {
+        let Some(model_name) = model_name else {
+            return Ok(None);
+        };
+        // Canonicalize so config aliases (e.g. the corrected English
+        // spelling of a typo'd upstream id) share one cache entry.
+        let canonical = canonical_crossencoder_model(model_name)?;
+        let mut guard = self.inner.crossencoders.lock().await;
+        if !guard.contains_key(canonical) {
+            let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
+            let model = FastembedCrossencoder::try_new(canonical, &cache_dir)
+                .map_err(|e| anyhow::anyhow!("init crossencoder ({canonical}): {e}"))?;
+            guard.insert(canonical.to_string(), model);
+        }
+        Ok(Some(CrossencoderGuard {
+            guard,
+            key: canonical.to_string(),
+        }))
     }
 
     /// A freshly-constructed `MarkdownChunker` over the daemon's loaded
@@ -260,6 +327,32 @@ impl std::ops::Deref for EmbedderGuard<'_> {
 impl std::ops::DerefMut for EmbedderGuard<'_> {
     fn deref_mut(&mut self) -> &mut Embedder {
         self.guard.as_mut().expect("embedder loaded")
+    }
+}
+
+/// Owned guard around the lazily-loaded crossencoder, mirroring
+/// `EmbedderGuard`. Derefs to `FastembedCrossencoder` so callers can
+/// pass `&mut *guard` directly into anything that wants
+/// `&mut dyn Crossencoder`.
+pub struct CrossencoderGuard<'a> {
+    guard: MutexGuard<'a, HashMap<String, FastembedCrossencoder>>,
+    /// Canonical model name; the key into `guard` that `crossencoder()`
+    /// inserted before handing the guard out.
+    key: String,
+}
+
+impl std::ops::Deref for CrossencoderGuard<'_> {
+    type Target = FastembedCrossencoder;
+    fn deref(&self) -> &FastembedCrossencoder {
+        // `crossencoder()` inserts `key` before constructing the guard,
+        // and the guard holds the lock, so the entry can't vanish.
+        self.guard.get(&self.key).expect("crossencoder loaded")
+    }
+}
+
+impl std::ops::DerefMut for CrossencoderGuard<'_> {
+    fn deref_mut(&mut self) -> &mut FastembedCrossencoder {
+        self.guard.get_mut(&self.key).expect("crossencoder loaded")
     }
 }
 
