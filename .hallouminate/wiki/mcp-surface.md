@@ -13,9 +13,9 @@ containing the daemon's cwd — `repo:<NAME>:wiki` for the deepest
 sit under any configured repo, the daemon falls back to the existing
 single-corpus / ambiguity error and the caller must name a corpus
 explicitly. This applies to the read-side tools (`ground`, `list_files`,
-`list_tree`); the mutating tools (`add_markdown`, `delete_markdown`,
-`read_markdown`) still require an explicit `corpus` to avoid accidental
-writes to the wrong wiki.
+`list_tree`); the mutating tools (`add_markdown`, `delete_markdown`) and
+`read_markdown` still require an explicit `corpus` to avoid accidental
+writes to the wrong wiki or ambiguous reads.
 
 ## Tools
 

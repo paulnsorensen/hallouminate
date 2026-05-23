@@ -250,14 +250,16 @@ pub fn build_corpus_tree(corpus: &CorpusConfig) -> anyhow::Result<TreeNode> {
         subdirs: Vec::new(),
     };
     for entry in files {
-        // Skip entries that didn't strip cleanly to a relative path (i.e.,
-        // belong to a non-first root). `list_corpus_files` returns the
-        // absolute path verbatim in that case, which would fan out to a
-        // bogus subdir branch under the tree's first-root frame.
-        if entry.absolute_path == entry.path {
+        // Skip entries that don't actually live under the first root.
+        // `list_corpus_files` strips `path` against whichever root matched,
+        // so a file under `paths[1..]` still carries a relative `path` and
+        // the old `absolute_path == path` test let it slip through. Strip
+        // against `root_abs` explicitly so a non-first-root entry yields
+        // `Err` and gets dropped.
+        let Ok(rel_path) = Path::new(&entry.absolute_path).strip_prefix(&root_abs) else {
             continue;
-        }
-        let rel_path = PathBuf::from(&entry.path);
+        };
+        let rel_path = rel_path.to_path_buf();
         insert_into_tree(&mut node, &rel_path, entry, &root_abs);
     }
     sort_tree(&mut node);
@@ -1050,5 +1052,42 @@ mod tests {
         assert_eq!(tree.path, "");
         assert!(tree.files.is_empty());
         assert!(tree.subdirs.is_empty());
+    }
+
+    #[test]
+    fn build_corpus_tree_drops_files_outside_first_root_for_multi_root_corpus() {
+        // Regression for the multi-root filter bug: `list_corpus_files` strips
+        // `path` against whichever root matched, so a file under `paths[1..]`
+        // used to slip past the `absolute_path == path` filter and land in
+        // the tree under a bogus subdir of `paths[0]`. With the strip-against-
+        // `root_abs` filter, only files under the first root survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("a.md"), "# A").unwrap();
+        std::fs::write(second.join("b.md"), "# B").unwrap();
+        let corpus = CorpusConfig {
+            name: "multi".into(),
+            paths: vec![
+                first.to_string_lossy().into_owned(),
+                second.to_string_lossy().into_owned(),
+            ],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+        };
+        let tree = build_corpus_tree(&corpus).unwrap();
+        assert_eq!(tree.path, "");
+        assert!(
+            tree.subdirs.is_empty(),
+            "non-first-root file must not fan out"
+        );
+        assert_eq!(
+            tree.files.len(),
+            1,
+            "only the first-root file lands in the tree"
+        );
+        assert_eq!(tree.files[0].path, "a.md");
     }
 }
