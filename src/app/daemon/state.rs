@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::config::Config;
@@ -97,6 +98,10 @@ struct DaemonStateInner {
     /// configured model; the baseline model (if any) is pre-warmed at boot.
     crossencoders: Arc<Mutex<HashMap<String, FastembedCrossencoder>>>,
     tokenizer: tokenizers::Tokenizer,
+    /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
+    /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
+    /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
+    shutdown: CancellationToken,
 }
 
 /// Both guards a mutating handler takes in the documented `corpus → write_lane`
@@ -197,8 +202,16 @@ impl DaemonState {
                 embedder: Arc::new(Mutex::new(embedder)),
                 crossencoders: Arc::new(Mutex::new(crossencoders)),
                 tokenizer,
+                shutdown: CancellationToken::new(),
             }),
         })
+    }
+
+    /// The daemon-wide shutdown token. The accept loop selects on
+    /// [`CancellationToken::cancelled`]; the IPC `Shutdown` dispatcher and the
+    /// signal handlers call [`CancellationToken::cancel`].
+    pub fn shutdown_token(&self) -> &CancellationToken {
+        &self.inner.shutdown
     }
 
     /// Source path of the baseline config the daemon booted from — the XDG
@@ -256,7 +269,10 @@ impl DaemonState {
                 &cache_dir,
             )
             .map_err(|e| {
-                anyhow::anyhow!("init embedder ({}): {e}", self.inner.baseline.embeddings.model)
+                anyhow::anyhow!(
+                    "init embedder ({}): {e}",
+                    self.inner.baseline.embeddings.model
+                )
             })?;
             *guard = Some(embedder);
         }
@@ -412,7 +428,9 @@ mod tests {
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let expected_model = cfg.embeddings.model.clone();
 
-        let state = DaemonState::open(cfg, None).await.expect("open daemon state");
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
 
         assert_eq!(state.baseline().embeddings.model, expected_model);
     }

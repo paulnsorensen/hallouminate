@@ -4,8 +4,7 @@ use std::path::Path;
 use hallouminate::app::cli::{GroundArgs, IndexArgs, cmd_index, run_ground};
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
-    CorpusEntry, DaemonRequest, DaemonRequestPayload, DaemonResponse, ListCorporaResult,
-    connect_at,
+    CorpusEntry, DaemonRequest, DaemonRequestPayload, DaemonResponse, ListCorporaResult, connect_at,
 };
 
 mod common;

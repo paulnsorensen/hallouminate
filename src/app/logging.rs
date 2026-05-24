@@ -20,7 +20,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{Builder, Rotation};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 const MAX_LOG_FILES: usize = 14;
 const DEFAULT_FILTER: &str = "hallouminate=info";

@@ -16,8 +16,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     // spawned them (Claude Code, an editor, a shell). Capture it once at
     // startup and forward that same value on every daemon hop so repo
     // discovery resolves against the client's workspace, not the daemon's.
-    let cwd = std::env::current_dir()
-        .context("capturing MCP server cwd at startup")?;
+    let cwd = std::env::current_dir().context("capturing MCP server cwd at startup")?;
     let server = HallouminateTools::new(cwd);
     let running = server.serve(stdio()).await?;
     running.waiting().await?;

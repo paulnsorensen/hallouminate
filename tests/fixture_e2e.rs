@@ -32,8 +32,9 @@ impl EmbedBatch for RoleRecordingEmbedder {
         &mut self,
         texts: &[String],
         role: EmbedRole,
-    ) -> hallouminate::domain::common::Result<Vec<[f32; hallouminate::adapters::lance::EMBEDDING_DIM]>>
-    {
+    ) -> hallouminate::domain::common::Result<
+        Vec<[f32; hallouminate::adapters::lance::EMBEDDING_DIM]>,
+    > {
         self.roles.push(role);
         Ok(texts
             .iter()
@@ -111,6 +112,7 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
 
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
@@ -185,6 +187,7 @@ async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
 
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
@@ -223,6 +226,7 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
 
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
@@ -251,7 +255,9 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
 
     // Verify the grail oracle no longer hits its source
     let mut emb = StubEmbedder;
-    let qv = emb.embed_batch(&["caerbannog".to_string()], EmbedRole::Query).expect("embed")[0];
+    let qv = emb
+        .embed_batch(&["caerbannog".to_string()], EmbedRole::Query)
+        .expect("embed")[0];
     let hits = hybrid_search(&store, "docs", "caerbannog", &qv, 5)
         .await
         .expect("search after delete");
@@ -278,6 +284,7 @@ async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
 
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
@@ -315,6 +322,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
 
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
@@ -328,9 +336,16 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     let p = plan(disk, db);
     fs::remove_file(&real).unwrap();
 
-    let err = apply(p, &store, Some(&mut emb), &chunker, &corpus, DEFAULT_BATCH_SIZE)
-        .await
-        .expect_err("missing file must surface as Err, not silent skip");
+    let err = apply(
+        p,
+        &store,
+        Some(&mut emb),
+        &chunker,
+        &corpus,
+        DEFAULT_BATCH_SIZE,
+    )
+    .await
+    .expect_err("missing file must surface as Err, not silent skip");
     let msg = err.to_string();
     assert!(
         msg.contains("vanishes.md") || msg.contains("No such file") || msg.contains("not found"),
@@ -355,6 +370,7 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
 
     // enabled = false → the store's `embedding` column is all nulls.
@@ -367,7 +383,10 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
     let stats = index_corpus(&corpus, &store, None, &chunker)
         .await
         .expect("OFF-mode index_corpus");
-    assert_eq!(stats.files_upserted, 12, "all fixture files indexed in OFF mode");
+    assert_eq!(
+        stats.files_upserted, 12,
+        "all fixture files indexed in OFF mode"
+    );
     assert!(
         stats.chunks_inserted >= 12,
         "chunks still inserted in OFF mode, got {}",
@@ -423,6 +442,7 @@ async fn index_corpus_embeds_passages_with_passage_role() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await

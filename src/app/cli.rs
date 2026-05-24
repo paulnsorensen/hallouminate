@@ -52,17 +52,38 @@ pub enum Command {
     /// `delete_markdown` tools to MCP-aware clients (Claude Desktop, Claude
     /// Code, etc.). The process runs until stdin closes.
     Serve,
-    /// Boot the local daemon: single owner of the LanceDB ground directory,
+    /// Manage the local daemon: single owner of the LanceDB ground directory,
     /// repository registry, and per-corpus mutation locks. CLI and MCP
-    /// clients talk to it over a Unix domain socket. Stays in the
-    /// foreground until killed; only one instance per socket can run.
+    /// clients talk to it over a Unix domain socket. Bare `daemon` runs it in
+    /// the foreground until killed; `stop`/`restart`/`status` are lifecycle
+    /// controls. Only one instance per socket can run.
     Daemon(DaemonCli),
 }
 
 #[derive(Debug, Args)]
 pub struct DaemonCli {
+    #[command(subcommand)]
+    pub action: Option<DaemonAction>,
+    /// Config path override for the foreground run. Only consulted by the
+    /// bare `daemon` / `daemon run` form; the lifecycle subcommands talk to
+    /// an already-running daemon over the control socket.
     #[arg(long, value_name = "PATH")]
     pub config: Option<PathBuf>,
+}
+
+/// Daemon lifecycle action. Bare `daemon` (no subcommand) is `Run`, so
+/// `ensure_daemon_running`'s `exe daemon` spawn and existing scripts keep
+/// working unchanged.
+#[derive(Debug, Subcommand, Clone, PartialEq, Eq)]
+pub enum DaemonAction {
+    /// Run the daemon in the foreground (the default).
+    Run,
+    /// Ask a running daemon to shut down gracefully.
+    Stop,
+    /// Stop a running daemon (if any) and start a fresh one.
+    Restart,
+    /// Report whether a daemon is reachable.
+    Status,
 }
 
 impl From<DaemonCli> for crate::app::daemon::DaemonArgs {
@@ -220,9 +241,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
-            ConfigAction::Show { config, cwd } => {
-                cmd_config_show(ConfigShowArgs { config, cwd })
-            }
+            ConfigAction::Show { config, cwd } => cmd_config_show(ConfigShowArgs { config, cwd }),
             ConfigAction::Download { config } => cmd_config_download(ConfigDownloadArgs { config }),
             ConfigAction::Validate { config, cwd } => {
                 cmd_config_validate(ConfigValidateArgs { config, cwd })
@@ -232,7 +251,29 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             crate::app::daemon::ensure_daemon_running().await?;
             crate::adapters::mcp::serve_stdio().await
         }
-        Command::Daemon(args) => crate::app::daemon::run_daemon(args.into()).await,
+        Command::Daemon(args) => {
+            let action = args.action.clone().unwrap_or(DaemonAction::Run);
+            match action {
+                DaemonAction::Run => crate::app::daemon::run_daemon(args.into()).await,
+                DaemonAction::Stop => {
+                    crate::app::daemon::stop().await?;
+                    println!("daemon stopped");
+                    Ok(())
+                }
+                DaemonAction::Restart => {
+                    crate::app::daemon::restart().await?;
+                    println!("daemon restarted");
+                    Ok(())
+                }
+                DaemonAction::Status => {
+                    match crate::app::daemon::status().await? {
+                        crate::app::daemon::DaemonStatus::Running => println!("running"),
+                        crate::app::daemon::DaemonStatus::NotRunning => println!("not running"),
+                    }
+                    Ok(())
+                }
+            }
+        }
     }
 }
 

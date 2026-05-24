@@ -111,7 +111,7 @@ pub async fn fts_with_ripgrep(
 /// is each file's first-occurrence position within `rg_hits` (already
 /// capped at `limit` by `ripgrep::run`), so two rg-matched files get
 /// distinct boosts.
-fn apply_rg_boost(hits: &mut Vec<SearchHit>, rg_hits: &[RipgrepHit]) {
+fn apply_rg_boost(hits: &mut [SearchHit], rg_hits: &[RipgrepHit]) {
     if rg_hits.is_empty() || hits.is_empty() {
         return;
     }

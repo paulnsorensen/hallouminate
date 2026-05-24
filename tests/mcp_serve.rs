@@ -66,8 +66,7 @@ impl Mcp {
         // with.
         let hallou_dir = xdg_config_home.join(".hallouminate");
         std::fs::create_dir_all(&hallou_dir).expect("mkdir .hallouminate");
-        std::fs::write(hallou_dir.join("config.toml"), "")
-            .expect("write empty repo-layer config");
+        std::fs::write(hallou_dir.join("config.toml"), "").expect("write empty repo-layer config");
 
         let bin = env!("CARGO_BIN_EXE_hallouminate");
         let mut cmd = Command::new(bin);
@@ -1114,7 +1113,11 @@ async fn mcp_delete_markdown_rejects_intermediate_symlinked_directory() {
     let error = call
         .get("error")
         .unwrap_or_else(|| panic!("intermediate symlink must error, got: {call}"));
-    assert_eq!(error["code"].as_i64(), Some(-32602), "intermediate: {error}");
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "intermediate: {error}"
+    );
     assert!(
         outside_file.exists(),
         "file behind symlinked dir must not be unlinked"
@@ -1133,8 +1136,7 @@ async fn mcp_read_markdown_rejects_intermediate_symlinked_directory() {
     let xdg = tempfile::tempdir().expect("tempdir");
     let corpus = tempfile::tempdir().expect("corpus tempdir");
     let outside_dir = tempfile::tempdir().expect("outside dir");
-    std::fs::write(outside_dir.path().join("secret.md"), "secret contents\n")
-        .expect("seed secret");
+    std::fs::write(outside_dir.path().join("secret.md"), "secret contents\n").expect("seed secret");
     symlink(outside_dir.path(), corpus.path().join("cheeses")).expect("symlink dir");
     let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
     let harness = DaemonHarness::spawn(cfg).await;
@@ -1165,7 +1167,11 @@ async fn mcp_read_markdown_rejects_intermediate_symlinked_directory() {
     let error = call
         .get("error")
         .unwrap_or_else(|| panic!("intermediate symlink must error, got: {call}"));
-    assert_eq!(error["code"].as_i64(), Some(-32602), "intermediate: {error}");
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "intermediate: {error}"
+    );
 
     mcp.shutdown().await;
 }

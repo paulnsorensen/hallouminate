@@ -28,21 +28,22 @@ use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passth
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::corpus::sandbox::{
-    WriteError, WriteErrorKind, atomic_write_no_follow, delete_no_follow, ensure_corpus_allows_file,
-    first_corpus_root, list_corpus_files, pick_corpus, read_no_follow, safe_relative_path,
+    WriteError, WriteErrorKind, atomic_write_no_follow, delete_no_follow,
+    ensure_corpus_allows_file, first_corpus_root, list_corpus_files, pick_corpus, read_no_follow,
+    safe_relative_path,
 };
 use crate::domain::corpus::{MarkdownChunker, blake3_file};
 use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
-use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 #[cfg(test)]
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
+use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
-    IndexRequest, ListFilesRequest, ListTreeRequest, ListTreeResult, ReadMarkdownRequest,
-    ReadMarkdownResult,
+    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GlobalizeMarkdownRequest,
+    GlobalizeMarkdownResult, GroundRequest, GroundResult, IndexRequest, ListFilesRequest,
+    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -56,6 +57,13 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
     // `state.baseline_xdg_path()` carries the baseline's source path (the
     // XDG path, or the `--config PATH` override) so scalar-conflict
     // messages name the file the user actually has to edit — AC #7.
+    // Shutdown and Ping are config-independent control ops: handle them
+    // before `resolve_for_cwd` so a stop request (or a liveness probe) works
+    // even when the client's cwd has no discoverable repo config.
+    if let DaemonRequestPayload::Shutdown = req.payload {
+        state.shutdown_token().cancel();
+        return DaemonResponse::ok(&"stopping");
+    }
     let req_cwd = req.cwd.clone();
     let effective = match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
         Ok((cfg, _layers)) => cfg,
@@ -72,6 +80,13 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::ReadMarkdown(req) => handle_read_markdown(&effective, req).await,
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
+        }
+        DaemonRequestPayload::GlobalizeMarkdown(req) => {
+            handle_globalize_markdown(state, &effective, req).await
+        }
+        DaemonRequestPayload::Shutdown => {
+            // Handled before `resolve_for_cwd` above; unreachable here.
+            DaemonResponse::ok(&"stopping")
         }
     }
 }
@@ -124,15 +139,11 @@ fn handle_list_files(cfg: &Config, cwd: &Path, req: ListFilesRequest) -> DaemonR
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus_or_default(
-        &corpora,
-        &cfg.repositories,
-        cwd,
-        req.corpus.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
+    let corpus =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
     // Ensure wiki dir exists so an unindexed repository wiki doesn't error
     // out the first list call.
     ensure_paths_exist(&corpus);
@@ -147,15 +158,11 @@ fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonRes
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus_or_default(
-        &corpora,
-        &cfg.repositories,
-        cwd,
-        req.corpus.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
+    let corpus =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
     ensure_paths_exist(&corpus);
     let root = match crate::domain::corpus::sandbox::build_corpus_tree(&corpus) {
         Ok(node) => node,
@@ -177,15 +184,11 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus_or_default(
-        &corpora,
-        &cfg.repositories,
-        cwd,
-        req.corpus.as_deref(),
-    ) {
-        Ok(c) => c,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
+    let corpus =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
     let store = state.store();
     let opts = GroundOpts {
         top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
@@ -513,7 +516,8 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
     let read_root = root.clone();
     let read_relative = relative.clone();
     let error_relative = relative.clone();
-    let read = tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_relative)).await;
+    let read =
+        tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_relative)).await;
     let bytes = match read {
         Ok(Ok(b)) => b,
         Ok(Err(WriteError { kind, source })) => {
@@ -620,10 +624,8 @@ async fn handle_delete_markdown(
     let delete_root = root.clone();
     let delete_relative = relative.clone();
     let error_relative = relative.clone();
-    let deleted = tokio::task::spawn_blocking(move || {
-        delete_no_follow(&delete_root, &delete_relative)
-    })
-    .await;
+    let deleted =
+        tokio::task::spawn_blocking(move || delete_no_follow(&delete_root, &delete_relative)).await;
     match deleted {
         Ok(Ok(())) => {}
         Ok(Err(WriteError { kind, source })) => {
@@ -656,7 +658,182 @@ async fn handle_delete_markdown(
     })
 }
 
-async fn index_single_file(
+/// Copy a single markdown entry from `source_corpus` into the corpus marked
+/// `global = true`, reindexing the global corpus row synchronously. Mirrors
+/// `add_markdown`'s contract: read via the no-follow reader, write via the
+/// no-follow atomic writer, collision gated by `overwrite`. Source stays.
+async fn handle_globalize_markdown(
+    state: &DaemonState,
+    cfg: &Config,
+    req: GlobalizeMarkdownRequest,
+) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // Resolve the single global corpus. None / more-than-one is a config
+    // error the caller can't fix per-request, so surface it as InvalidParams.
+    let globals: Vec<&CorpusConfig> = corpora.iter().filter(|c| c.global).collect();
+    let global = match globals.as_slice() {
+        [] => {
+            return DaemonResponse::invalid_params(
+                "no global corpus configured; mark one [[corpus]] with global = true",
+            );
+        }
+        [only] => (*only).clone(),
+        _ => {
+            return DaemonResponse::internal(
+                "more than one corpus marked global = true; config validation should have rejected this",
+            );
+        }
+    };
+
+    let source = match pick_corpus(&corpora, Some(&req.source_corpus)) {
+        Ok(c) => c,
+        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    };
+
+    // Reject the no-op self-copy (spec open question, leaning reject).
+    if source.name == global.name {
+        return DaemonResponse::invalid_params(format!(
+            "source corpus {:?} is already the global corpus; nothing to globalize",
+            source.name,
+        ));
+    }
+
+    // Read the source entry (symlink-safe).
+    let source_root = match first_corpus_root(&source) {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    };
+    let source_rel = match safe_relative_path(&req.path) {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    };
+    let source_abs = source_root.join(&source_rel);
+    if let Err(e) = ensure_corpus_allows_file(&source, &source_abs) {
+        return DaemonResponse::invalid_params(e.into_inner());
+    }
+
+    let read_root = source_root.clone();
+    let read_rel = source_rel.clone();
+    let read_err_rel = source_rel.clone();
+    let read = tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_rel)).await;
+    let bytes = match read {
+        Ok(Ok(b)) => b,
+        Ok(Err(WriteError { kind, source })) => {
+            return map_read_error(kind, source, &read_err_rel);
+        }
+        Err(join_err) => {
+            return DaemonResponse::internal(format!("read task panicked: {join_err}"));
+        }
+    };
+
+    // Destination path defaults to the source path.
+    let dest_raw = req.dest_path.as_deref().unwrap_or(req.path.as_str());
+    let dest_root = match first_corpus_root(&global) {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    };
+    let dest_rel = match safe_relative_path(dest_raw) {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    };
+    let dest_check = dest_root.join(&dest_rel);
+    if let Err(e) = ensure_corpus_allows_file(&global, &dest_check) {
+        return DaemonResponse::invalid_params(e.into_inner());
+    }
+
+    let guard = match state.acquire_mutation_guard(&global.name).await {
+        Ok(g) => g,
+        Err(msg) => return DaemonResponse::internal(msg),
+    };
+
+    let write_root = dest_root.clone();
+    let write_rel = dest_rel.clone();
+    let write_err_rel = dest_rel.clone();
+    let overwrite = req.overwrite;
+    let written = tokio::task::spawn_blocking(move || {
+        atomic_write_no_follow(&write_root, &write_rel, &bytes, overwrite)
+    })
+    .await;
+    let dest_abs = match written {
+        Ok(Ok(p)) => p,
+        Ok(Err(WriteError { kind, source })) => {
+            let resp = match kind {
+                WriteErrorKind::Exists => DaemonResponse::invalid_params(format!(
+                    "{} already exists in the global corpus; pass overwrite=true to replace it",
+                    write_err_rel.display()
+                )),
+                WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => {
+                    DaemonResponse::invalid_params(format!(
+                        "refusing unsafe path {}: {source}",
+                        write_err_rel.display()
+                    ))
+                }
+                WriteErrorKind::Io => DaemonResponse::internal(source.to_string()),
+            };
+            drop(guard);
+            return resp;
+        }
+        Err(join_err) => {
+            drop(guard);
+            return DaemonResponse::internal(format!("write task panicked: {join_err}"));
+        }
+    };
+
+    // Reindex the global corpus row for the just-written file. Empty content
+    // produces zero chunks; the indexer counts it as files_skipped_empty.
+    let stats = {
+        let store = state.store();
+        let chunker = state.make_chunker();
+        let mut embedder = if state.embeddings_enabled() {
+            match state.embedder().await {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    drop(guard);
+                    return DaemonResponse::internal(e.to_string());
+                }
+            }
+        } else {
+            None
+        };
+        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
+            .as_mut()
+            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
+        match index_single_file(&store, embedder_dyn, &chunker, &global, &dest_abs).await {
+            Ok(s) => s,
+            Err(e) => {
+                drop(guard);
+                return DaemonResponse::internal(e.to_string());
+            }
+        }
+    };
+    drop(guard);
+
+    let report = IndexReport {
+        corpora: vec![CorpusReport {
+            name: global.name.clone(),
+            files_upserted: stats.files_upserted,
+            files_touched: stats.files_touched,
+            files_deleted: stats.files_deleted,
+            files_skipped_empty: stats.files_skipped_empty,
+            chunks_inserted: stats.chunks_inserted,
+            embeddings_inserted: stats.embeddings_inserted,
+        }],
+    };
+    DaemonResponse::ok(&GlobalizeMarkdownResult {
+        source_corpus: source.name,
+        source_path: source_rel.to_string_lossy().into_owned(),
+        global_corpus: global.name,
+        dest_path: dest_rel.to_string_lossy().into_owned(),
+        absolute_path: dest_abs.to_string_lossy().into_owned(),
+        indexed: report,
+    })
+}
+
+pub(super) async fn index_single_file(
     store: &LanceStore,
     embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
     chunker: &MarkdownChunker<tokenizers::Tokenizer>,
@@ -785,7 +962,12 @@ async fn rebuild_wiki_indexes(
         // the auto-index inherits its symlink safety.
         let rel = match index_path.strip_prefix(root) {
             Ok(p) => p.to_path_buf(),
-            Err(_) => return Err(format!("index path {} not under root", index_path.display())),
+            Err(_) => {
+                return Err(format!(
+                    "index path {} not under root",
+                    index_path.display()
+                ));
+            }
         };
         let write_root = root.to_path_buf();
         let write_rel = rel.clone();
@@ -1090,8 +1272,7 @@ mod tests {
                 // CI sandboxes whose tmp tree sits inside a checkout. Both
                 // outcomes prove dispatch refused to silently fall back.
                 assert!(
-                    message.contains("filesystem root")
-                        || message.contains("stopped at repo root"),
+                    message.contains("filesystem root") || message.contains("stopped at repo root"),
                     "discovery error must explain the boundary: {message}",
                 );
             }

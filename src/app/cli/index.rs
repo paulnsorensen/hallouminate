@@ -119,6 +119,7 @@ fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
         paths,
         globs: vec![],
         exclude: vec![],
+        global: false,
     })
 }
 

@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use crate::app::config::{self, Config};
-use crate::app::daemon::{DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for};
+use crate::app::daemon::{
+    DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for,
+};
 use crate::domain::common::expand_tilde;
 use crate::domain::ground::{Format, GroundResponse, RenderOpts, render};
 
