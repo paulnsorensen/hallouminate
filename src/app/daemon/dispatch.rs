@@ -806,14 +806,22 @@ async fn rebuild_wiki_indexes(
             }
         };
 
-        // Refresh LanceDB rows for the just-rewritten index.md. Embedder
-        // is needed; if it can't load (cold cache, network failure) the
-        // mutation fails — same shape as the primary add_markdown path.
-        let mut embedder = state
-            .embedder()
-            .await
-            .map_err(|e| format!("embedder: {e}"))?;
-        let stats = index_single_file(&store, &mut embedder, &chunker, corpus, &dest)
+        // Refresh LanceDB rows for the just-rewritten index.md. Embeddings
+        // are opt-in: when enabled, the embedder must load (a cold-cache or
+        // network failure fails the mutation, same shape as the primary
+        // add_markdown path); when disabled, reindex lexical-only.
+        let mut embedder = if state.embeddings_enabled() {
+            match state.embedder().await {
+                Ok(g) => Some(g),
+                Err(e) => return Err(format!("embedder: {e}")),
+            }
+        } else {
+            None
+        };
+        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
+            .as_mut()
+            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
+        let stats = index_single_file(&store, embedder_dyn, &chunker, corpus, &dest)
             .await
             .map_err(|e| format!("reindex {}: {e}", dest.display()))?;
         drop(embedder);
