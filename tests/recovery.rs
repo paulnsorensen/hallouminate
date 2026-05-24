@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use hallouminate::adapters::lance::{EMBEDDING_DIM, LanceStore};
 use hallouminate::domain::common::{CorpusConfig, FileRef, Result};
 use hallouminate::domain::corpus::MarkdownChunker;
-use hallouminate::domain::embeddings::EmbedBatch;
+use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
 use hallouminate::domain::indexer::index_corpus;
 use text_splitter::Characters;
 
@@ -25,7 +25,11 @@ const MODEL: &str = "BAAI/bge-small-en-v1.5";
 struct PanickingEmbedder;
 
 impl EmbedBatch for PanickingEmbedder {
-    fn embed_batch(&mut self, _texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+    fn embed_batch(
+        &mut self,
+        _texts: &[String],
+        _role: EmbedRole,
+    ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
         panic!("simulated mid-apply crash");
     }
 }
@@ -37,7 +41,7 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
 
     // Phase 1: successfully apply file A
     {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
             .await
             .expect("open initial");
         let pf_a = placeholder_prepared_file("/tmp/a.md", 3);
@@ -58,12 +62,12 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     let store_path = store_dir.path().to_path_buf();
     let corpus_clone = corpus.clone();
     let crashed = tokio::task::spawn(async move {
-        let store = LanceStore::open_or_create(&store_path, MODEL)
+        let store = LanceStore::open_or_create(&store_path, MODEL, false, true)
             .await
             .expect("reopen for crash");
         let chunker = MarkdownChunker::new(Characters, 1500);
         let mut emb = PanickingEmbedder;
-        let _ = index_corpus(&corpus_clone, &store, &mut emb, &chunker).await;
+        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &chunker).await;
     })
     .await;
     assert!(
@@ -72,7 +76,7 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     );
 
     // Phase 3: reopen the store; file A still present, no orphan partial writes
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("reopen after crash");
     let snaps = store.list_files("docs").await.expect("list_files");
@@ -94,7 +98,7 @@ async fn re_run_after_crash_converges_to_correct_state() {
 
     // Pre-crash: index file A
     {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
             .await
             .expect("open");
         let pf_a = placeholder_prepared_file("/tmp/a.md", 2);
@@ -112,23 +116,23 @@ async fn re_run_after_crash_converges_to_correct_state() {
     let store_path = store_dir.path().to_path_buf();
     let corpus_clone = corpus.clone();
     let crashed = tokio::task::spawn(async move {
-        let store = LanceStore::open_or_create(&store_path, MODEL)
+        let store = LanceStore::open_or_create(&store_path, MODEL, false, true)
             .await
             .expect("reopen");
         let chunker = MarkdownChunker::new(Characters, 1500);
         let mut emb = PanickingEmbedder;
-        let _ = index_corpus(&corpus_clone, &store, &mut emb, &chunker).await;
+        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &chunker).await;
     })
     .await;
     assert!(crashed.is_err());
 
     // Recovery: re-run with a healthy embedder; convergence to final state
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("recover");
     let chunker = MarkdownChunker::new(Characters, 1500);
     let mut emb = StubEmbedder;
-    let stats = index_corpus(&corpus, &store, &mut emb, &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut emb), &chunker)
         .await
         .expect("recovered index_corpus");
 
@@ -152,7 +156,7 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
 
     let cycles: &[&str] = &["/tmp/x.md", "/tmp/y.md", "/tmp/z.md"];
     for (i, file_ref) in cycles.iter().enumerate() {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
             .await
             .expect("reopen cycle");
         let n_chunks = i + 1;
@@ -161,7 +165,7 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
         // explicit drop via scope end
     }
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("final reopen");
     let total = store.count_rows().await.unwrap();

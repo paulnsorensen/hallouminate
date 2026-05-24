@@ -6,7 +6,7 @@ use hallouminate::app::config::Config;
 use hallouminate::app::daemon::DaemonState;
 
 const MODEL_A: &str = "BAAI/bge-small-en-v1.5";
-const MODEL_B: &str = "sentence-transformers/all-MiniLM-L6-v2";
+const MODEL_B: &str = "intfloat/multilingual-e5-small";
 
 fn write_config(
     config_path: &Path,
@@ -63,7 +63,7 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
     // 1. Establish meta.toml under model A. We do not need to index any rows
     //    — open_or_create alone writes the sidecar.
     {
-        let _store = LanceStore::open_or_create(&ground_dir, MODEL_A)
+        let _store = LanceStore::open_or_create(&ground_dir, MODEL_A, false, true)
             .await
             .expect("open store with model A");
     }
@@ -102,7 +102,7 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
 
     // 4. No rows written: reopen under MODEL_A (allowed by the meta check)
     //    and confirm count_rows == 0.
-    let reopened = LanceStore::open_or_create(&ground_dir, MODEL_A)
+    let reopened = LanceStore::open_or_create(&ground_dir, MODEL_A, false, true)
         .await
         .expect("reopen store with original model");
     assert_eq!(

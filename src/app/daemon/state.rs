@@ -82,6 +82,10 @@ struct DaemonStateInner {
     baseline_xdg_path: Option<PathBuf>,
     store: Arc<LanceStore>,
     ground_dir: PathBuf,
+    /// Whether dense embeddings are enabled for this daemon (mirrors
+    /// `baseline.embeddings.enabled`). When false, the embedder is `None`
+    /// permanently and every retrieval/index path runs lexical-only.
+    embeddings_enabled: bool,
     corpus_locks: CorpusLockMap,
     write_lane: Arc<Semaphore>,
     embedder: Arc<Mutex<Option<Embedder>>>,
@@ -116,27 +120,41 @@ impl DaemonState {
                 .await
                 .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
         }
-        let store = LanceStore::open_or_create(&ground_dir, &cfg.embeddings.model)
-            .await
-            .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
-        // Try to load the embedder eagerly so the first request doesn't pay
-        // the load cost mid-call. Tolerate failure (e.g. offline first run
-        // with no cached model) so the daemon can still serve
+        let store = LanceStore::open_or_create(
+            &ground_dir,
+            &cfg.embeddings.model,
+            cfg.embeddings.quantized,
+            cfg.embeddings.enabled,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
+        // Embeddings are opt-in. When disabled, the embedder stays `None` for
+        // the daemon's lifetime (no model download, no load) and every
+        // retrieval/index path runs lexical-only. The tokenizer is still
+        // loaded below — chunking needs it regardless of the embedding mode.
+        //
+        // When enabled, try to load the embedder eagerly so the first request
+        // doesn't pay the load cost mid-call. Tolerate failure (e.g. offline
+        // first run with no cached model) so the daemon can still serve
         // model-independent ops (`ping`, `list_corpora`, `list_files`,
         // `read_markdown`, `delete_markdown`); a later embedder() call will
         // retry the load and surface the error then.
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        let embedder = match Embedder::try_new(&cfg.embeddings.model, &cache_dir) {
-            Ok(e) => Some(e),
-            Err(e) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    model = %cfg.embeddings.model,
-                    error = %e,
-                    "embedder unavailable at startup; will retry on first embedding request",
-                );
-                None
+        let embedder = if cfg.embeddings.enabled {
+            match Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        model = %cfg.embeddings.model,
+                        error = %e,
+                        "embedder unavailable at startup; will retry on first embedding request",
+                    );
+                    None
+                }
             }
+        } else {
+            None
         };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
@@ -169,6 +187,7 @@ impl DaemonState {
         }
         Ok(DaemonState {
             inner: Arc::new(DaemonStateInner {
+                embeddings_enabled: cfg.embeddings.enabled,
                 baseline: cfg,
                 baseline_xdg_path: xdg_path,
                 store: Arc::new(store),
@@ -210,6 +229,13 @@ impl DaemonState {
         &self.inner.ground_dir
     }
 
+    /// Whether dense embeddings are enabled. Dispatchers branch on this to
+    /// pass `Some(embedder)` (hybrid) or `None` (lexical-only) into `ground`
+    /// and `index_corpus`. False means the embedder is permanently `None`.
+    pub fn embeddings_enabled(&self) -> bool {
+        self.inner.embeddings_enabled
+    }
+
     /// Borrow the shared embedder for one call, loading it lazily on first
     /// use. Daemon boot tries an eager load (see `open`) but tolerates
     /// failure so model-independent ops (ping, list_corpora, list_files,
@@ -224,8 +250,14 @@ impl DaemonState {
         let mut guard = self.inner.embedder.lock().await;
         if guard.is_none() {
             let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
-            let embedder = Embedder::try_new(&self.inner.baseline.embeddings.model, &cache_dir)
-                .map_err(|e| anyhow::anyhow!("init embedder ({}): {e}", self.inner.baseline.embeddings.model))?;
+            let embedder = Embedder::try_new(
+                &self.inner.baseline.embeddings.model,
+                self.inner.baseline.embeddings.quantized,
+                &cache_dir,
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("init embedder ({}): {e}", self.inner.baseline.embeddings.model)
+            })?;
             *guard = Some(embedder);
         }
         Ok(EmbedderGuard { guard })

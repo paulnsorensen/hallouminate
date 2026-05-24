@@ -42,7 +42,10 @@ pub struct PreparedFile {
     pub keywords: Vec<String>,
     pub indexed_at_ms: i64,
     pub chunks: Vec<PreparedChunk>,
-    pub embeddings: Vec<[f32; EMBEDDING_DIM]>,
+    /// `Some(v)` (embeddings ON): one vector per chunk, length-checked
+    /// against `chunks`. `None` (embeddings OFF): the indexer ran without an
+    /// embedder, so every chunk row is written with a null embedding.
+    pub embeddings: Option<Vec<[f32; EMBEDDING_DIM]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +81,23 @@ pub fn chunk_id_for(file_ref: &str, ord: usize) -> String {
 
 // ── Meta sidecar (TOML) ─────────────────────────────────────────────────
 
+/// Identity that ties a ground directory to the embedding configuration it
+/// was built with. A change in any field invalidates the stored vectors (or
+/// their absence), so `meta_check_or_init` treats all three as a unit and
+/// refuses a mismatch with the same "delete + reindex" remedy.
+///
+/// `quantized` and `embeddings_enabled` default to the pre-feature shape
+/// (full precision, embeddings ON) so a sidecar written before this feature
+/// reads back as the mode it was actually built in. Upgrading to the new
+/// default (`enabled = false`) then trips the mismatch guard — correct, since
+/// switching the mode does change the store's contents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Meta {
     embedding_model_name: String,
+    #[serde(default = "default_quantized")]
+    quantized: bool,
+    #[serde(default = "default_embeddings_enabled")]
+    embeddings_enabled: bool,
     #[serde(default = "default_schema_version")]
     schema_version: u32,
 }
@@ -89,19 +106,41 @@ fn default_schema_version() -> u32 {
     1
 }
 
-fn meta_check_or_init(meta_path: &Path, requested_model: &str) -> Result<()> {
+fn default_quantized() -> bool {
+    false
+}
+
+fn default_embeddings_enabled() -> bool {
+    true
+}
+
+fn meta_check_or_init(
+    meta_path: &Path,
+    requested_model: &str,
+    quantized: bool,
+    enabled: bool,
+) -> Result<()> {
     let requested_model = canonical_model_name(requested_model)?;
     if meta_path.exists() {
         let text = std::fs::read_to_string(meta_path)?;
         let mut meta: Meta = toml::from_str(&text)
             .map_err(|e| HallouminateError::Config(format!("parse meta.toml: {e}")))?;
         let stored_model = canonical_model_name(&meta.embedding_model_name)?;
-        if stored_model != requested_model {
+        if stored_model != requested_model
+            || meta.quantized != quantized
+            || meta.embeddings_enabled != enabled
+        {
             return Err(HallouminateError::Embed(format!(
-                "embedding model mismatch: store has {:?}, requested {:?}; \
+                "embedding store mismatch: store has \
+                 (model {:?}, quantized {}, embeddings_enabled {}), requested \
+                 (model {:?}, quantized {}, embeddings_enabled {}); \
                  delete {} and re-run `hallouminate index` to rebuild",
                 stored_model,
+                meta.quantized,
+                meta.embeddings_enabled,
                 requested_model,
+                quantized,
+                enabled,
                 meta_path.parent().unwrap_or(meta_path).display(),
             )));
         }
@@ -113,6 +152,8 @@ fn meta_check_or_init(meta_path: &Path, requested_model: &str) -> Result<()> {
     }
     let meta = Meta {
         embedding_model_name: requested_model.to_string(),
+        quantized,
+        embeddings_enabled: enabled,
         schema_version: 1,
     };
     write_meta(meta_path, &meta)?;
@@ -161,7 +202,9 @@ pub fn chunks_schema() -> SchemaRef {
                 Arc::new(Field::new("item", DataType::Float32, true)),
                 EMBEDDING_DIM as i32,
             ),
-            false,
+            // Nullable: embeddings-OFF mode writes a null vector per chunk.
+            // ON mode writes a real 384-dim vector. One schema, no sentinel.
+            true,
         ),
     ]))
 }
@@ -194,17 +237,26 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
     let mut line_ends: Vec<i64> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
     let mut embeddings_flat: Vec<f32> = Vec::new();
+    // One validity bit per chunk row: true = real vector, false = null
+    // (embeddings-OFF mode). Stays all-true on the ON path so the null
+    // buffer is dropped entirely and the column is byte-identical to before.
+    let mut embedding_valid: Vec<bool> = Vec::new();
 
     for file in batch {
-        if file.chunks.len() != file.embeddings.len() {
-            return Err(HallouminateError::Indexer(format!(
-                "prepared file {:?}: {} chunks but {} embeddings",
-                file.file_ref,
-                file.chunks.len(),
-                file.embeddings.len()
-            )));
+        match &file.embeddings {
+            Some(embeddings) => {
+                if file.chunks.len() != embeddings.len() {
+                    return Err(HallouminateError::Indexer(format!(
+                        "prepared file {:?}: {} chunks but {} embeddings",
+                        file.file_ref,
+                        file.chunks.len(),
+                        embeddings.len()
+                    )));
+                }
+            }
+            None => {}
         }
-        for (chunk, embedding) in file.chunks.iter().zip(file.embeddings.iter()) {
+        for (idx, chunk) in file.chunks.iter().enumerate() {
             chunk_ids.push(chunk_id_for(&file.file_ref, chunk.ord));
             file_refs.push(file.file_ref.clone());
             corpora.push(file.corpus.clone());
@@ -218,17 +270,34 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
             line_starts.push(chunk.line_start as i64);
             line_ends.push(chunk.line_end as i64);
             texts.push(chunk.text.clone());
-            embeddings_flat.extend_from_slice(embedding);
+            match &file.embeddings {
+                Some(embeddings) => {
+                    embeddings_flat.extend_from_slice(&embeddings[idx]);
+                    embedding_valid.push(true);
+                }
+                None => {
+                    // A null FixedSizeList entry still occupies `EMBEDDING_DIM`
+                    // slots in the values buffer; they are masked by the null
+                    // bit, so the placeholder zeros are never read.
+                    embeddings_flat.extend_from_slice(&[0.0_f32; EMBEDDING_DIM]);
+                    embedding_valid.push(false);
+                }
+            }
         }
     }
 
     let embedding_field = Arc::new(Field::new("item", DataType::Float32, true));
     let embedding_values = Float32Array::from(embeddings_flat);
+    let nulls = if embedding_valid.iter().all(|&v| v) {
+        None
+    } else {
+        Some(arrow::buffer::NullBuffer::from(embedding_valid))
+    };
     let embedding_array = FixedSizeListArray::try_new(
         embedding_field,
         EMBEDDING_DIM as i32,
         Arc::new(embedding_values),
-        None,
+        nulls,
     )
     .map_err(|e| HallouminateError::Indexer(format!("build embedding column: {e}")))?;
 
@@ -366,13 +435,22 @@ pub struct LanceStore {
     connection: lancedb::Connection,
     #[allow(dead_code)]
     meta_path: PathBuf,
+    /// Mirrors the store's `embeddings_enabled` identity. When false, the
+    /// `embedding` column is all nulls, so `ensure_search_indexes` skips the
+    /// ANN index entirely (there is nothing to vector-search).
+    embeddings_enabled: bool,
 }
 
 impl LanceStore {
-    pub async fn open_or_create(ground_dir: &Path, model_name: &str) -> Result<Self> {
+    pub async fn open_or_create(
+        ground_dir: &Path,
+        model_name: &str,
+        quantized: bool,
+        embeddings_enabled: bool,
+    ) -> Result<Self> {
         std::fs::create_dir_all(ground_dir)?;
         let meta_path = ground_dir.join(META_FILENAME);
-        meta_check_or_init(&meta_path, model_name)?;
+        meta_check_or_init(&meta_path, model_name, quantized, embeddings_enabled)?;
         let uri = ground_dir.to_str().ok_or_else(|| {
             HallouminateError::Config(format!("non-utf8 ground dir: {}", ground_dir.display()))
         })?;
@@ -385,6 +463,7 @@ impl LanceStore {
             table,
             connection,
             meta_path,
+            embeddings_enabled,
         })
     }
 
@@ -442,6 +521,13 @@ impl LanceStore {
                 .execute()
                 .await
                 .map_err(map_lance_err)?;
+        }
+        // Embeddings-OFF: the `embedding` column is all nulls, so there is
+        // nothing to ANN-index. Skip entirely (spec: OFF mode builds no
+        // vector index). The FTS index above is still built — it is the only
+        // dense-independent signal the OFF path ranks on.
+        if !self.embeddings_enabled {
+            return Ok(());
         }
         // Vector index is optional — small corpora work fine without it via
         // brute-force scan, and IVF-PQ needs enough rows for meaningful
@@ -631,6 +717,40 @@ impl LanceStore {
         }
         Ok(out)
     }
+
+    /// BM25-only search, scoped to a single `corpus`. The embeddings-OFF
+    /// sibling of `hybrid_search`: same FTS path, but no `.nearest_to()`
+    /// vector leg, no reranker (there is only one signal to rank), and no
+    /// query-vector dim guard. Returns an empty `Vec` for an empty corpus or
+    /// when no rows match the corpus filter.
+    pub async fn fts_search(
+        &self,
+        corpus: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        if self.count_rows().await? == 0 {
+            return Ok(Vec::new());
+        }
+        let corpus_filter = format!("corpus = '{}'", escape_sql_str(corpus));
+        let stream = self
+            .table
+            .query()
+            .only_if(corpus_filter)
+            .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
+                query.to_string(),
+            ))
+            .limit(limit)
+            .execute()
+            .await
+            .map_err(map_lance_err)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let mut out: Vec<SearchHit> = Vec::new();
+        for rb in batches {
+            decode_hits(&rb, &mut out)?;
+        }
+        Ok(out)
+    }
 }
 
 async fn open_or_create_table(connection: &lancedb::Connection) -> Result<lancedb::Table> {
@@ -734,11 +854,15 @@ mod tests {
     fn meta_check_or_init_writes_meta_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5").unwrap();
+        meta_check_or_init(&meta_path, "bge-small-en-v1.5", false, true).unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
         let meta: Meta = toml::from_str(&text).unwrap();
         assert_eq!(meta.embedding_model_name, "BAAI/bge-small-en-v1.5");
+        assert!(!meta.quantized);
+        assert!(meta.embeddings_enabled);
         assert!(text.contains("schema_version"));
+        assert!(text.contains("quantized"));
+        assert!(text.contains("embeddings_enabled"));
         assert!(text.contains("auto-managed"));
     }
 
@@ -746,42 +870,84 @@ mod tests {
     fn meta_check_or_init_passes_when_existing_matches() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").expect("second call must succeed");
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
+            .expect("second call must succeed");
     }
 
     #[test]
-    fn meta_check_or_init_errors_on_mismatch() {
+    fn meta_check_or_init_errors_on_model_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
-        let err =
-            meta_check_or_init(&meta_path, "sentence-transformers/all-MiniLM-L6-v2").unwrap_err();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
+        let err = meta_check_or_init(&meta_path, "intfloat/multilingual-e5-small", false, true)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("BAAI/bge-small-en-v1.5"), "{msg}");
-        assert!(
-            msg.contains("sentence-transformers/all-MiniLM-L6-v2"),
-            "{msg}"
-        );
+        assert!(msg.contains("intfloat/multilingual-e5-small"), "{msg}");
         assert!(msg.contains("delete"), "{msg}");
         assert!(msg.contains("hallouminate index"), "{msg}");
+    }
+
+    #[test]
+    fn meta_check_or_init_errors_on_quantized_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", true, true)
+            .expect_err("flipping quantized must invalidate the store");
+        let msg = err.to_string();
+        assert!(msg.contains("quantized"), "{msg}");
+        assert!(msg.contains("delete"), "{msg}");
+    }
+
+    #[test]
+    fn meta_check_or_init_errors_on_enabled_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect_err("flipping embeddings_enabled must invalidate the store");
+        let msg = err.to_string();
+        assert!(msg.contains("embeddings_enabled"), "{msg}");
+        assert!(msg.contains("delete"), "{msg}");
     }
 
     #[test]
     fn meta_check_or_init_with_legacy_alias_writes_canonical_to_fresh_sidecar() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5").unwrap();
+        meta_check_or_init(&meta_path, "bge-small-en-v1.5", false, true).unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
         let meta: Meta = toml::from_str(&text).unwrap();
         assert_eq!(meta.embedding_model_name, "BAAI/bge-small-en-v1.5");
     }
 
     #[test]
+    fn meta_check_or_init_reads_pre_feature_sidecar_as_enabled_full_precision() {
+        // A sidecar written before this feature has neither `quantized` nor
+        // `embeddings_enabled`; it must read back as the mode it was built in
+        // (ON, full precision) so a re-open under the same model + ON config
+        // does NOT trip the mismatch guard.
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            r#"# auto-managed by hallouminate; do not edit
+embedding_model_name = "BAAI/bge-small-en-v1.5"
+schema_version = 1
+"#,
+        )
+        .unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
+            .expect("pre-feature sidecar must match ON + full-precision config");
+    }
+
+    #[test]
     fn meta_check_or_init_rejects_unsupported_requested_model() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        let err = meta_check_or_init(&meta_path, "clip-vit-b32")
+        let err = meta_check_or_init(&meta_path, "clip-vit-b32", false, true)
             .expect_err("unsupported request must error before any write");
         assert!(
             err.to_string().contains("unsupported embedding model"),
@@ -805,7 +971,7 @@ schema_version = 1
 "#,
         )
         .unwrap();
-        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5")
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
             .expect_err("corrupt sidecar must error");
         assert!(
             err.to_string().contains("unsupported embedding model"),
@@ -825,7 +991,7 @@ schema_version = 1
 "#,
         )
         .unwrap();
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
         assert!(text.contains("BAAI/bge-small-en-v1.5"), "{text}");
         assert!(!text.contains("\"bge-small-en-v1.5\""), "{text}");
@@ -873,6 +1039,7 @@ schema_version = 1
     }
 
     fn synthetic_prepared(file_ref: &str, chunks: usize) -> PreparedFile {
+        let mut embeddings = Vec::new();
         let mut pf = PreparedFile {
             file_ref: file_ref.to_string(),
             corpus: "docs".into(),
@@ -882,7 +1049,7 @@ schema_version = 1
             keywords: vec!["k1".into(), "k2".into()],
             indexed_at_ms: 11,
             chunks: Vec::new(),
-            embeddings: Vec::new(),
+            embeddings: None,
         };
         for i in 0..chunks {
             pf.chunks.push(PreparedChunk {
@@ -892,8 +1059,17 @@ schema_version = 1
                 line_end: 2,
                 text: format!("chunk-{i}"),
             });
-            pf.embeddings.push([0.0_f32; EMBEDDING_DIM]);
+            embeddings.push([0.0_f32; EMBEDDING_DIM]);
         }
+        pf.embeddings = Some(embeddings);
+        pf
+    }
+
+    /// Embeddings-OFF variant: same chunks, but `embeddings: None` so every
+    /// row is written with a null vector.
+    fn synthetic_prepared_no_embeddings(file_ref: &str, chunks: usize) -> PreparedFile {
+        let mut pf = synthetic_prepared(file_ref, chunks);
+        pf.embeddings = None;
         pf
     }
 
@@ -935,12 +1111,44 @@ schema_version = 1
     #[test]
     fn build_record_batch_rejects_chunk_embedding_length_mismatch() {
         let mut pf = synthetic_prepared("/tmp/bad.md", 2);
-        pf.embeddings.pop(); // 2 chunks, 1 embedding
+        if let Some(v) = pf.embeddings.as_mut() {
+            v.pop(); // 2 chunks, 1 embedding
+        }
         let schema = chunks_schema();
         let err = build_record_batch(&[pf], schema).unwrap_err();
         assert!(
             err.to_string().contains("chunks but 1 embeddings"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_record_batch_off_mode_writes_null_embeddings_for_every_chunk() {
+        let batch = vec![synthetic_prepared_no_embeddings("/tmp/off.md", 3)];
+        let schema = chunks_schema();
+        let rb = build_record_batch(&batch, schema).expect("build OFF batch");
+        assert_eq!(rb.num_rows(), 3);
+        let embedding = rb.column_by_name("embedding").expect("embedding column");
+        assert_eq!(
+            embedding.null_count(),
+            3,
+            "every chunk row must carry a null embedding in OFF mode"
+        );
+        for i in 0..rb.num_rows() {
+            assert!(embedding.is_null(i), "row {i} embedding must be null");
+        }
+    }
+
+    #[test]
+    fn build_record_batch_on_mode_has_no_null_embeddings() {
+        let batch = vec![synthetic_prepared("/tmp/on.md", 3)];
+        let schema = chunks_schema();
+        let rb = build_record_batch(&batch, schema).expect("build ON batch");
+        let embedding = rb.column_by_name("embedding").expect("embedding column");
+        assert_eq!(
+            embedding.null_count(),
+            0,
+            "ON mode must write a real vector for every chunk"
         );
     }
 
@@ -979,7 +1187,7 @@ schema_version = 1
     fn meta_check_or_init_creates_parent_directory_if_missing() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("nested/dir/meta.toml");
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5").unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
         assert!(meta_path.exists());
     }
 }

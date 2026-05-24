@@ -10,7 +10,7 @@ use std::path::Path;
 use hallouminate::adapters::lance::LanceStore;
 use hallouminate::domain::common::CorpusConfig;
 use hallouminate::domain::corpus::MarkdownChunker;
-use hallouminate::domain::embeddings::EmbedBatch;
+use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
 use hallouminate::domain::indexer::index_corpus;
 use hallouminate::domain::search::hybrid_search;
 use text_splitter::Characters;
@@ -19,6 +19,28 @@ mod common;
 use common::StubEmbedder;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
+
+/// Embedder that records every role it was asked to embed, so a test can
+/// assert the indexer embeds passages with `EmbedRole::Passage`.
+#[derive(Default)]
+struct RoleRecordingEmbedder {
+    roles: Vec<EmbedRole>,
+}
+
+impl EmbedBatch for RoleRecordingEmbedder {
+    fn embed_batch(
+        &mut self,
+        texts: &[String],
+        role: EmbedRole,
+    ) -> hallouminate::domain::common::Result<Vec<[f32; hallouminate::adapters::lance::EMBEDDING_DIM]>>
+    {
+        self.roles.push(role);
+        Ok(texts
+            .iter()
+            .map(|_| [0.1_f32; hallouminate::adapters::lance::EMBEDDING_DIM])
+            .collect())
+    }
+}
 
 /// Seed `dir` with ~15 markdown files of varied content. Each file's body
 /// contains a unique distinctive token so oracle queries can be checked.
@@ -91,14 +113,14 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
         exclude: vec![],
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
 
     let chunker = MarkdownChunker::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, &mut embedder, &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
         .await
         .expect("index_corpus");
 
@@ -131,7 +153,7 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
     let mut emb_for_query = StubEmbedder;
     for (query, expected_file) in oracles {
         let qv = emb_for_query
-            .embed_batch(&[(*query).to_string()])
+            .embed_batch(&[(*query).to_string()], EmbedRole::Query)
             .expect("embed query")[0];
         let hits = hybrid_search(&store, "docs", query, &qv, 5)
             .await
@@ -165,18 +187,18 @@ async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
         exclude: vec![],
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
     let chunker = MarkdownChunker::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    let stats1 = index_corpus(&corpus, &store, &mut embedder, &chunker)
+    let stats1 = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
         .await
         .expect("first index");
     let rows1 = store.count_rows().await.unwrap();
 
-    let stats2 = index_corpus(&corpus, &store, &mut embedder, &chunker)
+    let stats2 = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
         .await
         .expect("second index");
     let rows2 = store.count_rows().await.unwrap();
@@ -203,20 +225,20 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
         exclude: vec![],
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
     let chunker = MarkdownChunker::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    index_corpus(&corpus, &store, &mut embedder, &chunker)
+    index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
         .await
         .expect("first index");
     let initial = store.count_rows().await.unwrap();
 
     fs::remove_file(corpus_dir.path().join("grail.md")).expect("remove grail.md");
 
-    let stats = index_corpus(&corpus, &store, &mut embedder, &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
         .await
         .expect("second index after delete");
 
@@ -229,7 +251,7 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
 
     // Verify the grail oracle no longer hits its source
     let mut emb = StubEmbedder;
-    let qv = emb.embed_batch(&["caerbannog".to_string()]).expect("embed")[0];
+    let qv = emb.embed_batch(&["caerbannog".to_string()], EmbedRole::Query).expect("embed")[0];
     let hits = hybrid_search(&store, "docs", "caerbannog", &qv, 5)
         .await
         .expect("search after delete");
@@ -258,13 +280,13 @@ async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
         exclude: vec![],
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
     let chunker = MarkdownChunker::new(Characters, 1500);
     let mut emb = StubEmbedder;
 
-    let stats1 = index_corpus(&corpus, &store, &mut emb, &chunker)
+    let stats1 = index_corpus(&corpus, &store, Some(&mut emb), &chunker)
         .await
         .expect("first index");
     assert_eq!(stats1.files_upserted, 1, "only real.md upserted");
@@ -295,7 +317,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
         exclude: vec![],
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
     let chunker = MarkdownChunker::new(Characters, 1500);
@@ -306,13 +328,120 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     let p = plan(disk, db);
     fs::remove_file(&real).unwrap();
 
-    let err = apply(p, &store, &mut emb, &chunker, &corpus, DEFAULT_BATCH_SIZE)
+    let err = apply(p, &store, Some(&mut emb), &chunker, &corpus, DEFAULT_BATCH_SIZE)
         .await
         .expect_err("missing file must surface as Err, not silent skip");
     let msg = err.to_string();
     assert!(
         msg.contains("vanishes.md") || msg.contains("No such file") || msg.contains("not found"),
         "error should reference the missing file: {msg}"
+    );
+}
+
+/// Spec testing #1 + #2: embeddings-OFF index + ground round-trip. With no
+/// embedder, indexing writes null embeddings (zero `embeddings_inserted`) and
+/// ground takes the lexical-only (FTS + ripgrep) path, still returning the
+/// right file for a distinctive token.
+#[tokio::test]
+async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
+    use hallouminate::domain::ground::{GroundOpts, ground};
+
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+    seed_fixture_corpus(corpus_dir.path());
+
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+    };
+
+    // enabled = false → the store's `embedding` column is all nulls.
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, false)
+        .await
+        .expect("open OFF-mode store");
+    let chunker = MarkdownChunker::new(Characters, 1500);
+
+    // No embedder: OFF-mode indexing.
+    let stats = index_corpus(&corpus, &store, None, &chunker)
+        .await
+        .expect("OFF-mode index_corpus");
+    assert_eq!(stats.files_upserted, 12, "all fixture files indexed in OFF mode");
+    assert!(
+        stats.chunks_inserted >= 12,
+        "chunks still inserted in OFF mode, got {}",
+        stats.chunks_inserted
+    );
+    assert_eq!(
+        stats.embeddings_inserted, 0,
+        "OFF mode must write zero embeddings (null vectors only)"
+    );
+
+    // Lexical-only ground: no embedder, distinctive token resolves to grail.md.
+    let resp = ground(
+        "caerbannog",
+        &corpus.name,
+        &corpus.paths,
+        &store,
+        None,
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("OFF-mode ground");
+    assert!(resp.stats.hits > 0, "FTS must return at least one hit");
+    // `docs` is keyed by file_ref. The top-scoring doc for a distinctive
+    // token must be grail.md.
+    let top_ref = resp
+        .docs
+        .iter()
+        .max_by(|a, b| {
+            a.1.score
+                .partial_cmp(&b.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(file_ref, _)| file_ref.clone())
+        .expect("at least one doc");
+    assert!(
+        top_ref.ends_with("grail.md"),
+        "distinctive token 'caerbannog' must surface grail.md, got {top_ref}"
+    );
+}
+
+/// Spec testing #7 (indexing side): `index_corpus` must embed chunks with
+/// `EmbedRole::Passage`, never `Query`. Pairs with the unit test in
+/// `ground/orchestrate.rs` that locks the query side to `EmbedRole::Query`.
+#[tokio::test]
+async fn index_corpus_embeds_passages_with_passage_role() {
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+    seed_fixture_corpus(corpus_dir.path());
+
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+    };
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let chunker = MarkdownChunker::new(Characters, 1500);
+    let mut recorder = RoleRecordingEmbedder::default();
+
+    index_corpus(&corpus, &store, Some(&mut recorder), &chunker)
+        .await
+        .expect("index_corpus");
+
+    assert!(
+        !recorder.roles.is_empty(),
+        "indexing must embed at least one passage batch"
+    );
+    assert!(
+        recorder.roles.iter().all(|r| *r == EmbedRole::Passage),
+        "indexing must embed every batch with the Passage role, got {:?}",
+        recorder.roles
     );
 }
 

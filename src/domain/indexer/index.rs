@@ -9,10 +9,13 @@ pub use super::plan::{FileSnapshot, IndexPlan, MtimeCandidate, Upsert, plan};
 pub type IndexStats = ApplyStats;
 
 /// Crust facade: scan → snapshot → plan → apply.
+///
+/// `embedder` is `None` in embeddings-OFF mode — indexing then writes null
+/// embeddings and builds no vector index.
 pub async fn index_corpus(
     corpus: &CorpusConfig,
     store: &LanceStore,
-    embedder: &mut dyn EmbedBatch,
+    embedder: Option<&mut dyn EmbedBatch>,
     chunker: &dyn CorpusChunker,
 ) -> Result<IndexStats> {
     let disk = scan(corpus)?;
