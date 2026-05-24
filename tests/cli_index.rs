@@ -84,7 +84,7 @@ async fn cmd_index_indexes_fixture_corpus_end_to_end() {
     // assert chunks landed. (Reading the store directly is safe here
     // because the daemon doesn't hold an exclusive lock — it just owns
     // mutations. Listing rows is a read.)
-    let store = LanceStore::open_or_create(&ground_dir, MODEL)
+    let store = LanceStore::open_or_create(&ground_dir, MODEL, false, true)
         .await
         .expect("reopen ground dir");
     let rows = store.count_rows().await.expect("count rows");

@@ -79,6 +79,33 @@ pub async fn hybrid_with_ripgrep(
     Ok(hits)
 }
 
+/// Lexical-only sibling of `hybrid_with_ripgrep` for the embeddings-OFF
+/// path: BM25 (`fts_search`) PLUS the same per-file ripgrep boost, with no
+/// vector leg. Identical fusion math — the only difference is the base
+/// signal is FTS-only instead of FTS+vector. `corpus_paths` is the resolved
+/// root list; pass an empty slice (or empty `query`) to skip the rg pass.
+pub async fn fts_with_ripgrep(
+    store: &LanceStore,
+    corpus: &str,
+    corpus_paths: &[String],
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    let fts_fut = store.fts_search(corpus, query, limit);
+    let rg_fut = ripgrep::run(corpus_paths, query, limit);
+    let (fts_res, rg_res) = tokio::join!(fts_fut, rg_fut);
+    let mut hits = fts_res?;
+    let rg_hits = match rg_res {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(target: "hallouminate::search", err = %e, "ripgrep pass failed; returning fts-only results");
+            Vec::new()
+        }
+    };
+    apply_rg_boost(&mut hits, &rg_hits);
+    Ok(hits)
+}
+
 /// In-place: add `RIPGREP_WEIGHT / (K + first_rank)` to every hit whose
 /// `file_ref` appears in `rg_hits`, then re-sort descending. `first_rank`
 /// is each file's first-occurrence position within `rg_hits` (already

@@ -1,7 +1,7 @@
 use crate::adapters::lance::{EMBEDDING_DIM, LanceStore, PreparedFile};
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
 use crate::domain::corpus::{CorpusChunker, blake3_file};
-use crate::domain::embeddings::EmbedBatch;
+use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 
 use super::plan::{IndexPlan, MtimeCandidate};
 use super::writer::{WriteRequest, prepare_file};
@@ -24,7 +24,7 @@ pub const DEFAULT_BATCH_SIZE: usize = 16;
 pub async fn apply(
     plan: IndexPlan,
     store: &LanceStore,
-    embedder: &mut dyn EmbedBatch,
+    mut embedder: Option<&mut dyn EmbedBatch>,
     chunker: &dyn CorpusChunker,
     corpus: &CorpusConfig,
     batch_size: usize,
@@ -47,7 +47,7 @@ pub async fn apply(
         upsert_reqs,
         batch_size,
         store,
-        embedder,
+        embedder.as_deref_mut(),
         chunker,
         indexed_at_ms,
         &mut stats,
@@ -80,7 +80,7 @@ pub async fn apply(
         fallthrough_reqs,
         batch_size,
         store,
-        embedder,
+        embedder.as_deref_mut(),
         chunker,
         indexed_at_ms,
         &mut stats,
@@ -105,7 +105,11 @@ async fn run_in_batches(
     reqs: Vec<WriteRequest<'_>>,
     batch_size: usize,
     store: &LanceStore,
-    embedder: &mut dyn EmbedBatch,
+    // `+ '_` decouples the trait-object lifetime from the reference lifetime
+    // so `apply` can hand out two successive short reborrows via
+    // `as_deref_mut()` without the first borrow being pinned for the whole
+    // function body.
+    mut embedder: Option<&mut (dyn EmbedBatch + '_)>,
     chunker: &dyn CorpusChunker,
     indexed_at_ms: i64,
     stats: &mut ApplyStats,
@@ -153,31 +157,42 @@ async fn run_in_batches(
                 all_texts.push(c.text.clone());
             }
         }
-        let mut vectors = if all_texts.is_empty() {
-            Vec::new()
-        } else {
-            embedder.embed_batch(&all_texts)?
-        };
-        if vectors.len() != all_texts.len() {
-            return Err(HallouminateError::Indexer(format!(
-                "embedder returned {} vectors for {} chunks",
-                vectors.len(),
-                all_texts.len()
-            )));
-        }
-        // De-flatten vectors back into per-file embeddings.
-        let mut iter = vectors.drain(..);
-        for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
-            let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
-            for _ in 0..count {
-                let v = iter.next().ok_or_else(|| {
-                    HallouminateError::Indexer("embedding count drained early".into())
-                })?;
-                buf.push(v);
+        match embedder.as_deref_mut() {
+            // ON mode: embed the passages and de-flatten back per file.
+            Some(embedder) => {
+                let mut vectors = if all_texts.is_empty() {
+                    Vec::new()
+                } else {
+                    embedder.embed_batch(&all_texts, EmbedRole::Passage)?
+                };
+                if vectors.len() != all_texts.len() {
+                    return Err(HallouminateError::Indexer(format!(
+                        "embedder returned {} vectors for {} chunks",
+                        vectors.len(),
+                        all_texts.len()
+                    )));
+                }
+                let mut iter = vectors.drain(..);
+                for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
+                    let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        let v = iter.next().ok_or_else(|| {
+                            HallouminateError::Indexer("embedding count drained early".into())
+                        })?;
+                        buf.push(v);
+                    }
+                    stats.chunks_inserted += count;
+                    stats.embeddings_inserted += count;
+                    pf.embeddings = Some(buf);
+                }
             }
-            stats.chunks_inserted += count;
-            stats.embeddings_inserted += count;
-            pf.embeddings = buf;
+            // OFF mode: write null embeddings, count chunks but no embeddings.
+            None => {
+                for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
+                    stats.chunks_inserted += count;
+                    pf.embeddings = None;
+                }
+            }
         }
         let n = prepared.len();
         store.apply_batch(prepared).await?;

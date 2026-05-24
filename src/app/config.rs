@@ -39,8 +39,18 @@ impl Default for SearchConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
+    /// Opt-in switch for dense embeddings. Off by default: hallouminate then
+    /// runs a lexical-only retrieval path (FTS + ripgrep + rerank) and loads
+    /// no embedding model — only the tokenizer needed for chunking.
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default = "default_model")]
     pub model: String,
+    /// Select the fastembed `*Q` quantized variant of `model` when one
+    /// exists. Errors at load time for models with no quantized ONNX
+    /// (multilingual-e5-small).
+    #[serde(default)]
+    pub quantized: bool,
     #[serde(default = "default_embed_cache")]
     pub cache_dir: String,
 }
@@ -48,7 +58,9 @@ pub struct EmbeddingsConfig {
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
+            enabled: false,
             model: DEFAULT_MODEL.into(),
+            quantized: false,
             cache_dir: DEFAULT_EMBED_CACHE.into(),
         }
     }
@@ -302,11 +314,27 @@ fn merge_layers_with_sources(
         )?,
     };
     let embeddings = EmbeddingsConfig {
+        enabled: merge_scalar(
+            "embeddings.enabled",
+            baseline.embeddings.enabled,
+            repo.embeddings.enabled,
+            defaults.embeddings.enabled,
+            baseline_path,
+            repo_path,
+        )?,
         model: merge_scalar(
             "embeddings.model",
             baseline.embeddings.model.clone(),
             repo.embeddings.model.clone(),
             defaults.embeddings.model.clone(),
+            baseline_path,
+            repo_path,
+        )?,
+        quantized: merge_scalar(
+            "embeddings.quantized",
+            baseline.embeddings.quantized,
+            repo.embeddings.quantized,
+            defaults.embeddings.quantized,
             baseline_path,
             repo_path,
         )?,
@@ -558,7 +586,9 @@ top_files_default       = 10
 chunks_per_file_default = 3
 
 [embeddings]
+enabled   = true
 model     = "BAAI/bge-small-en-v1.5"
+quantized = false
 cache_dir = "~/.cache/hallouminate/fastembed"
 
 [watch]
@@ -596,7 +626,9 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.search.top_files_default, 10);
         assert_eq!(cfg.search.chunks_per_file_default, 3);
 
+        assert!(cfg.embeddings.enabled);
         assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
+        assert!(!cfg.embeddings.quantized);
         assert_eq!(cfg.embeddings.cache_dir, "~/.cache/hallouminate/fastembed");
 
         assert_eq!(cfg.watch.debounce_ms, 500);
@@ -612,6 +644,26 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.embeddings, EmbeddingsConfig::default());
         assert_eq!(cfg.watch, WatchConfig::default());
         assert_eq!(cfg.storage, StorageConfig::default());
+    }
+
+    #[test]
+    fn embeddings_default_is_opt_out_off_and_full_precision() {
+        // The headline contract: dense embeddings are off unless explicitly
+        // enabled, and quantization is off by default.
+        let cfg = EmbeddingsConfig::default();
+        assert!(!cfg.enabled, "embeddings must default to disabled (opt-in)");
+        assert!(!cfg.quantized, "quantization must default to off");
+        assert_eq!(cfg.model, "BAAI/bge-small-en-v1.5");
+    }
+
+    #[test]
+    fn parse_embeddings_section_omitting_enabled_defaults_to_disabled() {
+        let cfg = parse("[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n", None)
+            .expect("partial embeddings section parses");
+        assert!(
+            !cfg.embeddings.enabled,
+            "absent `enabled` must default to false, not true"
+        );
     }
 
     #[test]

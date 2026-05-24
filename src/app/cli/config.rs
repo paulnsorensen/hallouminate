@@ -89,11 +89,21 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
 pub fn cmd_config_download(args: ConfigDownloadArgs) -> anyhow::Result<()> {
     let cfg = config::load(args.config.as_deref())?;
     let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-    let _embedder = Embedder::try_new(&cfg.embeddings.model, &cache_dir)
-        .with_context(|| format!("download embedding model {}", cfg.embeddings.model))?;
+    // The tokenizer is always needed (chunking uses it regardless of mode).
     let _tokenizer = load_tokenizer(&cfg.embeddings.model)
         .with_context(|| format!("download tokenizer for {}", cfg.embeddings.model))?;
-    println!("downloaded {}", cfg.embeddings.model);
+    if cfg.embeddings.enabled {
+        let _embedder = Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir)
+            .with_context(|| format!("download embedding model {}", cfg.embeddings.model))?;
+        println!("downloaded model + tokenizer for {}", cfg.embeddings.model);
+    } else {
+        // Embeddings are off: fetch only the tokenizer, skip the ONNX model.
+        println!(
+            "embeddings disabled; downloaded tokenizer only for {} \
+             (set embeddings.enabled = true to fetch the model)",
+            cfg.embeddings.model
+        );
+    }
     Ok(())
 }
 

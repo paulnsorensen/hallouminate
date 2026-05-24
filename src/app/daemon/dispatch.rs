@@ -32,7 +32,6 @@ use crate::domain::corpus::sandbox::{
     first_corpus_root, list_corpus_files, pick_corpus, read_no_follow, safe_relative_path,
 };
 use crate::domain::corpus::{MarkdownChunker, blake3_file};
-use crate::domain::embeddings::Embedder;
 use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
 #[cfg(test)]
@@ -128,9 +127,15 @@ async fn handle_ground(state: &DaemonState, cfg: &Config, req: GroundRequest) ->
             .unwrap_or(cfg.search.chunks_per_file_default),
         limit: req.limit.unwrap_or(50),
     };
-    let mut embedder = match state.embedder().await {
-        Ok(g) => g,
-        Err(e) => return DaemonResponse::internal(e.to_string()),
+    // Embeddings-OFF: skip the embedder entirely and let `ground` run the
+    // lexical-only path. ON: borrow the shared embedder (lazy-loaded).
+    let mut embedder = if state.embeddings_enabled() {
+        match state.embedder().await {
+            Ok(g) => Some(g),
+            Err(e) => return DaemonResponse::internal(e.to_string()),
+        }
+    } else {
+        None
     };
     // crossencoder is best-effort: if it's configured but failed to
     // load (e.g. model file vanished), log and ground without it
@@ -150,12 +155,15 @@ async fn handle_ground(state: &DaemonState, cfg: &Config, req: GroundRequest) ->
     let crossencoder_dyn: Option<&mut dyn crate::domain::search::Crossencoder> = crossencoder
         .as_mut()
         .map(|g| &mut **g as &mut dyn crate::domain::search::Crossencoder);
+    let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
+        .as_mut()
+        .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
     let response = match ground(
         &req.query,
         &corpus.name,
         &corpus.paths,
         &store,
-        &mut *embedder,
+        embedder_dyn,
         crossencoder_dyn,
         opts,
     )
@@ -224,11 +232,18 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             Err(msg) => return DaemonResponse::internal(msg),
         };
         ensure_paths_exist(&corpus);
-        let mut embedder = match state.embedder().await {
-            Ok(g) => g,
-            Err(e) => return DaemonResponse::internal(e.to_string()),
+        let mut embedder = if state.embeddings_enabled() {
+            match state.embedder().await {
+                Ok(g) => Some(g),
+                Err(e) => return DaemonResponse::internal(e.to_string()),
+            }
+        } else {
+            None
         };
-        let stats = match index_corpus(&corpus, &store, &mut *embedder, &chunker).await {
+        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
+            .as_mut()
+            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
+        let stats = match index_corpus(&corpus, &store, embedder_dyn, &chunker).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
         };
@@ -348,11 +363,18 @@ async fn handle_add_markdown(
     } else {
         let store = state.store();
         let chunker = state.make_chunker();
-        let mut embedder = match state.embedder().await {
-            Ok(g) => g,
-            Err(e) => return DaemonResponse::internal(e.to_string()),
+        let mut embedder = if state.embeddings_enabled() {
+            match state.embedder().await {
+                Ok(g) => Some(g),
+                Err(e) => return DaemonResponse::internal(e.to_string()),
+            }
+        } else {
+            None
         };
-        match index_single_file(&store, &mut embedder, &chunker, &corpus, &dest).await {
+        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
+            .as_mut()
+            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
+        match index_single_file(&store, embedder_dyn, &chunker, &corpus, &dest).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
         }
@@ -545,7 +567,7 @@ async fn handle_delete_markdown(
 
 async fn index_single_file(
     store: &LanceStore,
-    embedder: &mut Embedder,
+    embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
     chunker: &MarkdownChunker<tokenizers::Tokenizer>,
     corpus: &CorpusConfig,
     file: &Path,

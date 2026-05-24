@@ -10,12 +10,16 @@ pub mod daemon;
 
 use hallouminate::adapters::lance::{EMBEDDING_DIM, PreparedChunk, PreparedFile};
 use hallouminate::domain::common::Result;
-use hallouminate::domain::embeddings::EmbedBatch;
+use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
 
 pub struct StubEmbedder;
 
 impl EmbedBatch for StubEmbedder {
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+    fn embed_batch(
+        &mut self,
+        texts: &[String],
+        _role: EmbedRole,
+    ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
         Ok(texts
             .iter()
             .map(|t| {
@@ -41,7 +45,11 @@ impl EmbedBatch for StubEmbedder {
 pub struct ZeroEmbedder;
 
 impl EmbedBatch for ZeroEmbedder {
-    fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+    fn embed_batch(
+        &mut self,
+        texts: &[String],
+        _role: EmbedRole,
+    ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
         Ok(texts.iter().map(|_| [0.0_f32; EMBEDDING_DIM]).collect())
     }
 }
@@ -68,7 +76,9 @@ pub fn prepared_file_with_chunks(
         })
         .collect();
     let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let embeddings = emb.embed_batch(&texts).expect("stub embed");
+    let embeddings = emb
+        .embed_batch(&texts, EmbedRole::Passage)
+        .expect("stub embed");
     PreparedFile {
         file_ref: file_ref.to_string(),
         corpus: corpus.to_string(),
@@ -78,7 +88,7 @@ pub fn prepared_file_with_chunks(
         keywords: vec!["docs".into(), "test".into()],
         indexed_at_ms: 1_700_000_000_000,
         chunks,
-        embeddings,
+        embeddings: Some(embeddings),
     }
 }
 

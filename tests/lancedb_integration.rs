@@ -17,7 +17,7 @@ const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 async fn fresh_store() -> (tempfile::TempDir, LanceStore) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = LanceStore::open_or_create(dir.path(), MODEL)
+    let store = LanceStore::open_or_create(dir.path(), MODEL, false, true)
         .await
         .expect("open LanceStore");
     (dir, store)
@@ -71,6 +71,53 @@ async fn delete_file_removes_all_chunks_for_that_file_only() {
     let b_key = FileRef::new(PathBuf::from("/tmp/b.md"));
     assert!(!snaps.contains_key(&a_key), "a.md must be gone");
     assert!(snaps.contains_key(&b_key), "b.md must remain");
+}
+
+// ── fts_search: BM25-only sibling, corpus-scoped ─────────────────────────
+
+#[tokio::test]
+async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
+    let (_dir, store) = fresh_store().await;
+
+    // Same distinctive token in two corpora; apply_batch requires one corpus
+    // per call, so seed them separately.
+    let a = prepared_file_with_chunks(
+        "/tmp/a.md",
+        "alpha",
+        100,
+        "ha",
+        vec!["zebrafish distinctive marker token"],
+    );
+    let b = prepared_file_with_chunks(
+        "/tmp/b.md",
+        "beta",
+        100,
+        "hb",
+        vec!["zebrafish distinctive marker token"],
+    );
+    store.apply_batch(vec![a]).await.expect("apply alpha");
+    store.apply_batch(vec![b]).await.expect("apply beta");
+
+    let hits = store
+        .fts_search("alpha", "zebrafish", 10)
+        .await
+        .expect("fts_search");
+    assert!(!hits.is_empty(), "must find the token in corpus alpha");
+    assert!(
+        hits.iter().all(|h| h.file_ref == "/tmp/a.md"),
+        "fts_search must not leak rows from corpus beta: {:?}",
+        hits.iter().map(|h| &h.file_ref).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn fts_search_on_empty_store_returns_no_hits() {
+    let (_dir, store) = fresh_store().await;
+    let hits = store
+        .fts_search("docs", "anything", 10)
+        .await
+        .expect("fts_search on empty store");
+    assert!(hits.is_empty(), "empty store must yield zero FTS hits");
 }
 
 // ── Spec §8.1 #4: Mtime-touch leaves chunks/embeddings alone ─────────────
@@ -127,9 +174,9 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
 
     // Use the stub embedder to compute a query vector deterministically.
     let mut emb = StubEmbedder;
-    use hallouminate::domain::embeddings::EmbedBatch;
+    use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
     let qv = emb
-        .embed_batch(&["spice melange".into()])
+        .embed_batch(&["spice melange".into()], EmbedRole::Query)
         .expect("embed query")[0];
 
     let hits = hybrid_search(&store, "docs", "spice", &qv, 5)
@@ -173,9 +220,9 @@ async fn single_file_corpus_top_hit_is_that_file() {
     store.apply_batch(vec![pf]).await.expect("apply");
 
     let mut emb = StubEmbedder;
-    use hallouminate::domain::embeddings::EmbedBatch;
+    use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
     let qv = emb
-        .embed_batch(&["unique_token_witness_me".into()])
+        .embed_batch(&["unique_token_witness_me".into()], EmbedRole::Query)
         .expect("embed query")[0];
 
     let hits = hybrid_search(&store, "docs", "unique_token_witness_me", &qv, 5)
@@ -310,10 +357,10 @@ async fn hybrid_search_returns_only_hits_from_requested_corpus() {
     store.apply_batch(vec![a]).await.expect("apply alpha");
     store.apply_batch(vec![b]).await.expect("apply beta");
 
-    use hallouminate::domain::embeddings::EmbedBatch;
+    use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
     let mut emb = StubEmbedder;
     let qv = emb
-        .embed_batch(&["unique_alpha_marker".into()])
+        .embed_batch(&["unique_alpha_marker".into()], EmbedRole::Query)
         .expect("embed")[0];
 
     let hits_alpha = hybrid_search(&store, "alpha", "unique_alpha_marker", &qv, 5)

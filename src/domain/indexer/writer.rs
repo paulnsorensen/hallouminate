@@ -2,7 +2,7 @@ use std::fs;
 
 use crate::adapters::lance::{PreparedChunk, PreparedFile};
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
-use crate::domain::corpus::{CorpusChunker, blake3_bytes, extract_keywords, extract_summary};
+use crate::domain::corpus::{blake3_bytes, extract_keywords, extract_summary, CorpusChunker};
 
 pub(super) struct WriteRequest<'a> {
     pub corpus: &'a CorpusConfig,
@@ -11,8 +11,9 @@ pub(super) struct WriteRequest<'a> {
 }
 
 /// Read a file from disk, chunk it, extract metadata. Returns a
-/// `PreparedFile` with empty `embeddings` — the caller fills those in via the
-/// embedder before passing the batch to `LanceStore::apply_batch`.
+/// `PreparedFile` with `embeddings: None` — the caller (`apply`) fills in
+/// `Some(vectors)` in ON mode, or leaves `None` to write null embeddings in
+/// OFF mode, before passing the batch to `LanceStore::apply_batch`.
 pub(super) fn prepare_file(
     req: WriteRequest<'_>,
     chunker: &dyn CorpusChunker,
@@ -51,7 +52,7 @@ pub(super) fn prepare_file(
         keywords,
         indexed_at_ms,
         chunks,
-        embeddings: Vec::new(),
+        embeddings: None,
     })
 }
 
@@ -113,8 +114,8 @@ mod tests {
             "summary should reflect content: {:?}",
             pf.summary
         );
-        // embeddings start empty; apply.rs fills them in.
-        assert!(pf.embeddings.is_empty());
+        // embeddings start as None; apply.rs fills in Some(..) in ON mode.
+        assert!(pf.embeddings.is_none());
         // content_hash is a 64-char blake3 hex
         assert_eq!(pf.content_hash.len(), 64);
     }
