@@ -35,13 +35,15 @@ use crate::domain::corpus::{MarkdownChunker, blake3_file};
 use crate::domain::embeddings::Embedder;
 use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
+use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 #[cfg(test)]
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
     DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
-    IndexRequest, ListFilesRequest, ReadMarkdownRequest, ReadMarkdownResult,
+    IndexRequest, ListFilesRequest, ListTreeRequest, ListTreeResult, ReadMarkdownRequest,
+    ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -55,16 +57,18 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
     // `state.baseline_xdg_path()` carries the baseline's source path (the
     // XDG path, or the `--config PATH` override) so scalar-conflict
     // messages name the file the user actually has to edit — AC #7.
+    let req_cwd = req.cwd.clone();
     let effective = match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
         Ok((cfg, _layers)) => cfg,
         Err(e) => return DaemonResponse::invalid_params(e.to_string()),
     };
     match req.payload {
         DaemonRequestPayload::Ping => DaemonResponse::ok(&"pong"),
-        DaemonRequestPayload::Ground(req) => handle_ground(state, &effective, req).await,
+        DaemonRequestPayload::Ground(req) => handle_ground(state, &effective, &req_cwd, req).await,
         DaemonRequestPayload::Index(req) => handle_index(state, &effective, req).await,
         DaemonRequestPayload::ListCorpora => handle_list_corpora(&effective),
-        DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, req),
+        DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, &req_cwd, req),
+        DaemonRequestPayload::ListTree(req) => handle_list_tree(&effective, &req_cwd, req),
         DaemonRequestPayload::AddMarkdown(req) => handle_add_markdown(state, &effective, req).await,
         DaemonRequestPayload::ReadMarkdown(req) => handle_read_markdown(&effective, req).await,
         DaemonRequestPayload::DeleteMarkdown(req) => {
@@ -76,6 +80,29 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
 fn effective_corpora(cfg: &Config) -> Result<Vec<CorpusConfig>, DaemonResponse> {
     cfg.effective_corpora()
         .map_err(|e| DaemonResponse::internal(e.to_string()))
+}
+
+/// Read-side corpus selection with wiki-defaulting.
+///
+/// When `requested` is `None`, try to default to `repo:{name}:wiki` for the
+/// repository whose `path` contains `cwd` — that's the wiki the LLM is
+/// actually working in. If no repository matches (or the derived corpus
+/// isn't present), fall through to `pick_corpus`'s existing single-corpus /
+/// ambiguity behavior. Mutating handlers do NOT use this — they require
+/// an explicit corpus to avoid accidental writes to the wrong wiki.
+fn pick_corpus_or_default(
+    corpora: &[CorpusConfig],
+    repositories: &[RepositoryConfig],
+    cwd: &Path,
+    requested: Option<&str>,
+) -> Result<CorpusConfig, crate::domain::corpus::sandbox::SandboxError> {
+    if requested.is_none()
+        && let Some(name) = default_wiki_for_cwd(repositories, cwd)
+        && let Some(found) = corpora.iter().find(|c| c.name == name).cloned()
+    {
+        return Ok(found);
+    }
+    pick_corpus(corpora, requested)
 }
 
 fn handle_list_corpora(cfg: &Config) -> DaemonResponse {
@@ -93,12 +120,17 @@ fn handle_list_corpora(cfg: &Config) -> DaemonResponse {
     DaemonResponse::ok(&entries)
 }
 
-fn handle_list_files(cfg: &Config, req: ListFilesRequest) -> DaemonResponse {
+fn handle_list_files(cfg: &Config, cwd: &Path, req: ListFilesRequest) -> DaemonResponse {
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus(&corpora, req.corpus.as_deref()) {
+    let corpus = match pick_corpus_or_default(
+        &corpora,
+        &cfg.repositories,
+        cwd,
+        req.corpus.as_deref(),
+    ) {
         Ok(c) => c,
         Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
     };
@@ -111,12 +143,47 @@ fn handle_list_files(cfg: &Config, req: ListFilesRequest) -> DaemonResponse {
     }
 }
 
-async fn handle_ground(state: &DaemonState, cfg: &Config, req: GroundRequest) -> DaemonResponse {
+fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonResponse {
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus(&corpora, req.corpus.as_deref()) {
+    let corpus = match pick_corpus_or_default(
+        &corpora,
+        &cfg.repositories,
+        cwd,
+        req.corpus.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    };
+    ensure_paths_exist(&corpus);
+    let root = match crate::domain::corpus::sandbox::build_corpus_tree(&corpus) {
+        Ok(node) => node,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    DaemonResponse::ok(&ListTreeResult {
+        corpus: corpus.name,
+        root,
+    })
+}
+
+async fn handle_ground(
+    state: &DaemonState,
+    cfg: &Config,
+    cwd: &Path,
+    req: GroundRequest,
+) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let corpus = match pick_corpus_or_default(
+        &corpora,
+        &cfg.repositories,
+        cwd,
+        req.corpus.as_deref(),
+    ) {
         Ok(c) => c,
         Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
     };
@@ -325,7 +392,7 @@ async fn handle_add_markdown(
     // LanceDB rows so searches stop returning the deleted body — the full
     // `index_single_file` path does this via `files_skipped_empty > 0 &&
     // had_snapshot`, but the short-circuit below bypasses that loop.
-    let stats = if req.content.trim().is_empty() {
+    let mut stats = if req.content.trim().is_empty() {
         let mut stats = crate::domain::indexer::ApplyStats {
             files_skipped_empty: 1,
             ..Default::default()
@@ -357,6 +424,20 @@ async fn handle_add_markdown(
             Err(e) => return DaemonResponse::internal(e.to_string()),
         }
     };
+
+    // Auto-rebuild wiki indexes from the corpus root down to the parent of
+    // the just-written file. Failures here surface as `Internal` and the
+    // mutation guard is dropped — partial index regen would leave the wiki
+    // in a less-coherent state than aborting outright.
+    if is_wiki_corpus(&corpus) {
+        match rebuild_wiki_indexes(state, &corpus, &root, &relative).await {
+            Ok(extra) => fold_apply_stats(&mut stats, &extra),
+            Err(msg) => {
+                drop(guard);
+                return DaemonResponse::internal(msg);
+            }
+        }
+    }
     drop(guard);
 
     let report = IndexReport {
@@ -533,6 +614,16 @@ async fn handle_delete_markdown(
     if let Err(e) = state.store().delete_file(&corpus.name, &file_ref_str).await {
         return DaemonResponse::internal(e.to_string());
     }
+
+    // Auto-rebuild wiki indexes after the unlink so the parent index no
+    // longer links to the deleted file. Same internal-error semantics as
+    // the add_markdown path — partial regen would desync the wiki tree.
+    if is_wiki_corpus(&corpus)
+        && let Err(msg) = rebuild_wiki_indexes(state, &corpus, &root, &relative).await
+    {
+        drop(guard);
+        return DaemonResponse::internal(msg);
+    }
     drop(guard);
 
     DaemonResponse::ok(&DeleteMarkdownResult {
@@ -598,6 +689,115 @@ fn ensure_paths_exist(corpus: &CorpusConfig) {
         let path = crate::domain::common::expand_tilde(raw);
         let _ = std::fs::create_dir_all(&path);
     }
+}
+
+/// Sum `extra` into `into` so the daemon's IndexReport reflects both the
+/// initial single-file write and the cascade of index.md rewrites that
+/// followed it. Without this, the auto-built indexes would be silently
+/// re-embedded but the report would still claim `files_upserted = 1`.
+fn fold_apply_stats(
+    into: &mut crate::domain::indexer::ApplyStats,
+    extra: &crate::domain::indexer::ApplyStats,
+) {
+    into.files_upserted += extra.files_upserted;
+    into.files_touched += extra.files_touched;
+    into.files_deleted += extra.files_deleted;
+    into.files_skipped_empty += extra.files_skipped_empty;
+    into.chunks_inserted += extra.chunks_inserted;
+    into.embeddings_inserted += extra.embeddings_inserted;
+}
+
+/// Walk from `root` down to the parent of `file_relative`, rewriting each
+/// directory's `index.md` between INDEX-START / INDEX-END markers. Returns
+/// the aggregate of `index_single_file` stats for every regenerated index
+/// file so the caller can roll them into the response. The dir that owns
+/// `file_relative` is skipped when the file itself IS that dir's `index.md`
+/// — the LLM's verbatim write is the final word for the leaf file, and
+/// regenerating would clobber it.
+async fn rebuild_wiki_indexes(
+    state: &DaemonState,
+    corpus: &CorpusConfig,
+    root: &Path,
+    file_relative: &Path,
+) -> Result<crate::domain::indexer::ApplyStats, String> {
+    use crate::domain::corpus::index_md::{
+        INDEX_FILENAME, ancestor_dirs, compose_index_md, is_index_md,
+    };
+
+    let written_is_index = is_index_md(file_relative);
+    let mut totals = crate::domain::indexer::ApplyStats::default();
+    let dirs = ancestor_dirs(root, file_relative);
+    let store = state.store();
+    let chunker = state.make_chunker();
+
+    for dir in &dirs {
+        let index_path = dir.join(INDEX_FILENAME);
+        // Skip the dir that owns the file we just wrote if that file IS
+        // its index.md — the author's verbatim write wins. `Path::parent`
+        // returns `Some(Path::new(""))` for a top-level filename, so this
+        // covers root-level `index.md` writes too via `root.join("") == root`.
+        if written_is_index
+            && let Some(parent) = file_relative.parent()
+            && dir == &root.join(parent)
+        {
+            continue;
+        }
+
+        let existing = match std::fs::read_to_string(&index_path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("read {}: {e}", index_path.display())),
+        };
+
+        let is_root = dir == root;
+        let (new_content, outcome) = compose_index_md(dir, is_root, existing.as_deref())
+            .map_err(|e| format!("compose index {}: {e}", dir.display()))?;
+        match outcome {
+            crate::domain::corpus::index_md::RewriteOutcome::NoMarkers
+            | crate::domain::corpus::index_md::RewriteOutcome::Unchanged => continue,
+            crate::domain::corpus::index_md::RewriteOutcome::Created
+            | crate::domain::corpus::index_md::RewriteOutcome::Updated => {}
+        }
+
+        // Use the same atomic-write-no-follow path that AddMarkdown uses so
+        // the auto-index inherits its symlink safety.
+        let rel = match index_path.strip_prefix(root) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => return Err(format!("index path {} not under root", index_path.display())),
+        };
+        let write_root = root.to_path_buf();
+        let write_rel = rel.clone();
+        let bytes = new_content.into_bytes();
+        let written = tokio::task::spawn_blocking(move || {
+            atomic_write_no_follow(&write_root, &write_rel, &bytes, true)
+        })
+        .await
+        .map_err(|e| format!("index write task panicked: {e}"))?;
+        let dest = match written {
+            Ok(p) => p,
+            Err(WriteError { kind, source }) => {
+                return Err(format!(
+                    "writing index {} failed ({:?}): {source}",
+                    index_path.display(),
+                    kind,
+                ));
+            }
+        };
+
+        // Refresh LanceDB rows for the just-rewritten index.md. Embedder
+        // is needed; if it can't load (cold cache, network failure) the
+        // mutation fails — same shape as the primary add_markdown path.
+        let mut embedder = state
+            .embedder()
+            .await
+            .map_err(|e| format!("embedder: {e}"))?;
+        let stats = index_single_file(&store, &mut embedder, &chunker, corpus, &dest)
+            .await
+            .map_err(|e| format!("reindex {}: {e}", dest.display()))?;
+        drop(embedder);
+        fold_apply_stats(&mut totals, &stats);
+    }
+    Ok(totals)
 }
 
 /// True when `corpus.name` is a derived `repo:{name}:wiki` corpus produced

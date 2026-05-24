@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::common::{CorpusConfig, HallouminateError, Result};
+use crate::domain::common::{CorpusConfig, HallouminateError, Result, expand_tilde};
 
 /// Declaration of a single repository tenant.
 ///
@@ -147,6 +147,40 @@ pub fn effective_corpora(
 /// Wiki directory for a repository: `<repo.path>/.hallouminate/wiki`.
 pub fn wiki_directory(repo: &RepositoryConfig) -> PathBuf {
     PathBuf::from(&repo.path).join(WIKI_RELATIVE_PATH)
+}
+
+/// Pick the default wiki corpus name for `cwd`.
+///
+/// Returns `repo:{name}:wiki` for the repository whose `path` is the
+/// deepest ancestor of `cwd`. Returns `None` when `cwd` does not sit under
+/// any configured repository; callers should fall through to the existing
+/// single-corpus / ambiguity behavior.
+///
+/// Tilde and relative segments in `repo.path` are expanded and
+/// canonicalized best-effort before the prefix match, so a config that
+/// writes `~/Dev/foo` resolves the same as one that writes the absolute
+/// equivalent. Repos whose corpus name fails the canonical-name validation
+/// (e.g. empty or `:`-bearing) are skipped silently — the per-repo
+/// validation surfaces elsewhere.
+pub fn default_wiki_for_cwd(repositories: &[RepositoryConfig], cwd: &Path) -> Option<String> {
+    let cwd_abs = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let mut best: Option<(usize, String)> = None;
+    for repo in repositories {
+        let expanded = expand_tilde(&repo.path);
+        let repo_abs = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+        if !cwd_abs.starts_with(&repo_abs) {
+            continue;
+        }
+        let depth = repo_abs.components().count();
+        let beats_best = best.as_ref().is_none_or(|(d, _)| depth > *d);
+        if !beats_best {
+            continue;
+        }
+        if let Ok(name) = repo_corpus_name(&repo.name, RepoCorpusKind::Wiki) {
+            best = Some((depth, name));
+        }
+    }
+    best.map(|(_, name)| name)
 }
 
 fn resolve_under(base: &Path, raw: &str) -> String {
@@ -289,5 +323,51 @@ mod tests {
             wiki_directory(&r),
             PathBuf::from("/repos/tern/.hallouminate/wiki"),
         );
+    }
+
+    // ── default_wiki_for_cwd ──────────────────────────────────────────────
+
+    #[test]
+    fn default_wiki_for_cwd_returns_none_with_no_repositories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(default_wiki_for_cwd(&[], tmp.path()).is_none());
+    }
+
+    #[test]
+    fn default_wiki_for_cwd_returns_none_when_cwd_outside_every_repo() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let repo_root = outer.path().join("inside");
+        std::fs::create_dir(&repo_root).expect("mkdir");
+        let elsewhere = outer.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("mkdir");
+        let r = repo("tern", repo_root.to_str().unwrap());
+        assert!(default_wiki_for_cwd(&[r], &elsewhere).is_none());
+    }
+
+    #[test]
+    fn default_wiki_for_cwd_picks_repo_containing_cwd() {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let repo_root = outer.path().join("tern");
+        let nested = repo_root.join("src");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        let r = repo("tern", repo_root.to_str().unwrap());
+        let got = default_wiki_for_cwd(&[r], &nested).expect("matched");
+        assert_eq!(got, "repo:tern:wiki");
+    }
+
+    #[test]
+    fn default_wiki_for_cwd_prefers_deepest_repo_when_nested() {
+        // When two repos are configured and one's path is inside the other,
+        // cwd that lies inside both should resolve to the deeper repo's wiki
+        // — that's the wiki the LLM is actually working in.
+        let outer = tempfile::tempdir().expect("tempdir");
+        let parent_repo = outer.path().join("parent");
+        let inner_repo = parent_repo.join("vendor").join("inner");
+        let cwd = inner_repo.join("src");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let parent = repo("parent", parent_repo.to_str().unwrap());
+        let inner = repo("inner", inner_repo.to_str().unwrap());
+        let got = default_wiki_for_cwd(&[parent, inner], &cwd).expect("matched");
+        assert_eq!(got, "repo:inner:wiki");
     }
 }

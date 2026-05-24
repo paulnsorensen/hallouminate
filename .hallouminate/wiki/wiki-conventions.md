@@ -18,7 +18,9 @@ sections together and that's almost never what you want.
 The first non-blank line of every wiki entry must be `# Topic Name`.
 The chunker uses the H1 as the breadcrumb root for every chunk in the
 file. Skip the H1 and breadcrumbs degrade to just sub-headings, which
-makes `ground` results less navigable.
+makes `ground` results less navigable. The auto-index also reads each
+file's first H1 to use as the trailing gloss on its link entry, so a
+missing H1 leaves the file's row in the parent index ungloss'd.
 
 ## File stem matches the slug
 
@@ -46,6 +48,64 @@ edits.
 name = "hallouminate"` entry in the XDG baseline. Writes go to the
 first (and only) configured root.
 
+## Tree layout & progressive disclosure
+
+Use subdirectories to group related entries. `add_markdown` accepts
+nested paths (`adapters/lance.md`) and creates parent directories
+on demand. Recommended shape:
+
+- Top-level files for foundational topics (`architecture.md`,
+  `mcp-surface.md`, `wiki-conventions.md`).
+- Subdirectories per concern (`adapters/lance.md`,
+  `adapters/mcp.md`, …).
+
+Every directory carries an `index.md`. The first H1 names the
+subtopic; the body holds curated prose plus a link list to siblings
+and children. Consumers either navigate via `list_tree` (which exposes
+the structure machine-readably) or browse `index.md` files top-down.
+
+### Auto-maintained link list
+
+The daemon scaffolds and maintains the LINK LIST inside each
+`index.md` between markers:
+
+```markdown
+# Topic — index
+
+Curated prose lives outside the markers and is preserved verbatim.
+
+<!-- HALLOUMINATE:INDEX-START -->
+- [some-page](./some-page.md) — H1 of some-page.md
+- [subdir/](./subdir/index.md) — H1 of subdir/index.md
+<!-- HALLOUMINATE:INDEX-END -->
+
+More prose down here also survives.
+```
+
+After every `add_markdown` / `delete_markdown` against a
+`repo:*:wiki` corpus, the daemon walks from the corpus root down to
+the new file's parent. For each ancestor dir:
+
+- If `index.md` is missing, scaffold one with the H1 + empty marker
+  block, then populate it.
+- If `index.md` exists and has both markers, rewrite the link list
+  between them. Everything outside the markers is preserved.
+- If `index.md` exists but has no markers, leave it alone — the author
+  opted out.
+
+To opt out per file, remove the marker pair from your `index.md`. To
+opt out per directory entirely, just don't create an `index.md` and
+remove the markers from any parent dir's index that might point at it
+(or leave them — the parent's link list will still show the subdir if
+it contains markdown).
+
+### Link convention
+
+- `[stem](./stem.md)` for files in the same directory.
+- `[subdir/](./subdir/index.md)` for child directories.
+- Relative paths only — the wiki should survive moves of the whole
+  directory.
+
 ## What belongs here vs `.cheese/`
 
 | Where | Indexed as | Lifecycle | Use for |
@@ -61,18 +121,20 @@ task, leave it in `.cheese/`.
 ## The authoring loop
 
 ```text
-1. list_files repo:hallouminate:wiki         (avoid duplication)
-2. ground "<topic adjacent search>"           (find related entries)
+1. list_tree                                 (see the existing shape)
+2. ground "<topic adjacent search>"          (find related entries)
 3. read_markdown index.md                    (confirm naming + style)
-4. draft the new page (H1 first line, kebab-case slug)
+4. draft the new page (H1 first line, kebab-case slug, link siblings)
 5. add_markdown { corpus: "repo:hallouminate:wiki",
-                  path: "<slug>.md",
+                  path: "<slug>.md" or "<dir>/<slug>.md",
                   content: "<markdown>",
                   overwrite: false }
-6. read_markdown index.md
-7. add_markdown index.md with overwrite: true
-   (append the new entry to the topic list, alphabetical)
+6. (the daemon rewrites ancestor index.md link lists for you)
 ```
+
+For curated prose in `index.md` itself, manage it the same way:
+`read_markdown` → edit → `add_markdown` with `overwrite: true`. The
+auto-index only touches the marker block.
 
 ## Style
 

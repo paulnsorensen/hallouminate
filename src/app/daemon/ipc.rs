@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::app::cli::IndexReport;
-use crate::domain::corpus::sandbox::FileEntry;
+use crate::domain::corpus::sandbox::{FileEntry, TreeNode};
 use crate::domain::ground::GroundResponse;
 
 /// Top-level request envelope. Carries a `cwd: PathBuf` plus a
@@ -59,6 +59,8 @@ pub enum DaemonRequestPayload {
     ListCorpora,
     /// List files visible in a corpus.
     ListFiles(ListFilesRequest),
+    /// List files visible in a corpus, grouped into a directory tree.
+    ListTree(ListTreeRequest),
     /// Write a markdown file to a corpus root and refresh its index rows.
     AddMarkdown(AddMarkdownRequest),
     /// Read verbatim markdown content from a corpus root.
@@ -85,6 +87,11 @@ pub struct IndexRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListFilesRequest {
+    pub corpus: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTreeRequest {
     pub corpus: Option<String>,
 }
 
@@ -202,6 +209,12 @@ pub struct DeleteMarkdownResult {
 
 /// `ListFiles` payload alias — daemon emits an array of [`FileEntry`].
 pub type ListFilesResult = Vec<FileEntry>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTreeResult {
+    pub corpus: String,
+    pub root: TreeNode,
+}
 
 /// `ListCorpora` payload alias — daemon emits an array of [`CorpusEntry`].
 pub type ListCorporaResult = Vec<CorpusEntry>;

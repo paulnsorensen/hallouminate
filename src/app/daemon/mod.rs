@@ -34,7 +34,7 @@ pub use ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
     DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
     GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
-    ReadMarkdownRequest, ReadMarkdownResult,
+    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult,
 };
 pub use server::{DaemonArgs, run_daemon, serve};
 pub use socket::daemon_socket_path;
