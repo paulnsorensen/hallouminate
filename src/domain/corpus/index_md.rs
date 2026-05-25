@@ -68,7 +68,25 @@ pub struct ChildEntry {
 /// link entry, so the list is browsable without opening every child.
 pub fn read_h1(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
-    for line in text.lines() {
+    let mut lines = text.lines().peekable();
+
+    // Skip a leading YAML frontmatter block, but only when the `---` fence
+    // opens on line 1 (per the spec). A mid-document `---` is a thematic
+    // break, not frontmatter, so it must not be mistaken for one.
+    if lines.peek() == Some(&"---") {
+        lines.next();
+        // Consume through the closing fence. Unterminated frontmatter means
+        // there's no body H1 to find — bail rather than scan into the content.
+        loop {
+            match lines.next() {
+                Some("---") => break,
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+
+    for line in lines {
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
             continue;
@@ -348,6 +366,40 @@ mod tests {
     #[test]
     fn read_h1_returns_none_for_missing_file() {
         assert_eq!(read_h1(Path::new("/does/not/exist")), None);
+    }
+
+    #[test]
+    fn read_h1_skips_frontmatter_before_h1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.md");
+        std::fs::write(&path, "---\nup:\n  - \"[[bar]]\"\n---\n\n# Foo Title\n").unwrap();
+        assert_eq!(read_h1(&path), Some("Foo Title".to_string()));
+    }
+
+    #[test]
+    fn read_h1_returns_none_when_first_content_after_frontmatter_is_not_h1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.md");
+        std::fs::write(&path, "---\nup: bar\n---\n\nintro text\n# late\n").unwrap();
+        assert_eq!(read_h1(&path), None);
+    }
+
+    #[test]
+    fn read_h1_returns_none_for_unterminated_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.md");
+        // No closing fence — must not over-scan into the body and grab the H1.
+        std::fs::write(&path, "---\nup: bar\n# Not a real title\n").unwrap();
+        assert_eq!(read_h1(&path), None);
+    }
+
+    #[test]
+    fn read_h1_treats_mid_body_dashes_as_thematic_break_not_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.md");
+        // `---` not on line 1 is a thematic break; H1 detection is unchanged.
+        std::fs::write(&path, "# Real Title\n\n---\n\nbody\n").unwrap();
+        assert_eq!(read_h1(&path), Some("Real Title".to_string()));
     }
 
     #[test]
