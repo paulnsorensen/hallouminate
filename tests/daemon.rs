@@ -1248,15 +1248,17 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     // `list_files` (a filesystem scan that sees the on-disk file regardless of
     // indexing).
     //
-    // Embeddings default to opt-in/disabled, so non-empty content indexes
-    // lexical-only (FTS) — hermetic, no model download. A distinctive token in
-    // the body lets `ground` find precisely this file and nothing else.
+    // Pin embeddings off so non-empty content indexes lexical-only (FTS) —
+    // no embedding-model (ONNX) load. The chunking tokenizer still loads
+    // (and is networked on a cold cache), so this is hermetic only with the
+    // tokenizer cached. A distinctive token in the body lets `ground` find
+    // precisely this file and nothing else.
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[watch]\ndebounce_ms = 100\n\n[storage]\nground_dir = \"{g}\"\n",
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\n\n[storage]\nground_dir = \"{g}\"\n",
         c = corpus_root.display(),
         g = ground.display(),
     );

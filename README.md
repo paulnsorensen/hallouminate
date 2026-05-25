@@ -55,6 +55,32 @@ The config lives at `$XDG_CONFIG_HOME/hallouminate/config.toml`
 (`~/.config/hallouminate/config.toml` by default). Bootstrap with
 `hallouminate config init`, check with `hallouminate config validate`.
 
+## FAQ
+
+### How do I turn embeddings off?
+
+Dense embeddings are **on by default**, using the
+`snowflake/snowflake-arctic-embed-s` model. On first index hallouminate
+downloads that model and fuses its vector signal with lexical search.
+
+To run lexically only — full-text search + ripgrep + rerank, no embedding
+model downloaded (just the tokenizer used for chunking) — set `enabled = false`
+in `~/.config/hallouminate/config.toml`:
+
+```toml
+[embeddings]
+enabled = false
+```
+
+Changing the embedding mode (or model) for a ground directory that was already
+indexed under a different mode trips the store's mismatch guard on the next
+run. Delete the ground directory and re-run `hallouminate index` to rebuild:
+
+```sh
+rm -rf ~/.local/share/hallouminate/ground
+hallouminate index
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
