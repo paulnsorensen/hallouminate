@@ -87,10 +87,11 @@ pub fn chunk_id_for(file_ref: &str, ord: usize) -> String {
 /// refuses a mismatch with the same "delete + reindex" remedy.
 ///
 /// `quantized` and `embeddings_enabled` default to the pre-feature shape
-/// (full precision, embeddings ON) so a sidecar written before this feature
-/// reads back as the mode it was actually built in. Upgrading to the new
-/// default (`enabled = false`) then trips the mismatch guard — correct, since
-/// switching the mode does change the store's contents.
+/// (full precision, embeddings ON) so a sidecar written before these fields
+/// existed reads back as the mode it was actually built in. Changing the
+/// active embedding mode — e.g. setting `enabled = false` — then trips the
+/// mismatch guard on the next open, correct, since switching the mode does
+/// change the store's contents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Meta {
     embedding_model_name: String,

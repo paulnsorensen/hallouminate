@@ -27,17 +27,18 @@ chunks_per_file_default = 3
 # bge-reranker-base, bge-reranker-v2-m3.
 # crossencoder = "jina-reranker-v1-turbo-en"
 
-# Dense embeddings are opt-in. With `enabled = false` (the default),
-# hallouminate retrieves lexically (full-text search + ripgrep + rerank) and
-# downloads no embedding model — only the tokenizer used for chunking. Set
-# `enabled = true` to add the dense (vector) signal for prose-heavy corpora.
+# Dense embeddings are on by default: hallouminate downloads the embedding
+# model on first use and fuses the dense (vector) signal with lexical search
+# (full-text search + ripgrep + rerank). Set `enabled = false` to retrieve
+# lexically only — no embedding model is downloaded, just the tokenizer used
+# for chunking.
 [embeddings]
-enabled   = false
+enabled   = true
 # Supported 384-dim models:
-#   BAAI/bge-small-en-v1.5            (default, English, retrieval-tuned)
-#   intfloat/multilingual-e5-small   (multilingual; no quantized variant)
-#   snowflake/snowflake-arctic-embed-s (retrieval-tuned English)
-model     = "BAAI/bge-small-en-v1.5"
+#   snowflake/snowflake-arctic-embed-s (default, retrieval-tuned English)
+#   BAAI/bge-small-en-v1.5             (English, retrieval-tuned)
+#   intfloat/multilingual-e5-small     (multilingual; no quantized variant)
+model     = "snowflake/snowflake-arctic-embed-s"
 # Use the quantized (*Q) fastembed variant when one exists. No effect for
 # multilingual-e5-small (it ships no quantized ONNX — would error if enabled).
 quantized = false

@@ -382,7 +382,8 @@ mod tests {
     fn default_template_parses_to_valid_config() {
         let cfg: Config = toml::from_str(DEFAULT_TEMPLATE).expect("template must be valid TOML");
         assert!(cfg.corpora.is_empty(), "corpora must start commented-out");
-        assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
+        assert!(cfg.embeddings.enabled, "embeddings on by default in template");
+        assert_eq!(cfg.embeddings.model, "snowflake/snowflake-arctic-embed-s");
         assert_eq!(cfg.search.top_files_default, 10);
     }
 

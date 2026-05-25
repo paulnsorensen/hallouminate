@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
 
-use crate::domain::embeddings::{DEFAULT_MODEL, canonical_model_name};
+use crate::domain::embeddings::{ARCTIC_S_MODEL, canonical_model_name};
 use crate::domain::repository::{RepositoryConfig, effective_corpora};
 
 const DEFAULT_TOP_FILES: usize = 10;
@@ -39,10 +39,12 @@ impl Default for SearchConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
-    /// Opt-in switch for dense embeddings. Off by default: hallouminate then
-    /// runs a lexical-only retrieval path (FTS + ripgrep + rerank) and loads
-    /// no embedding model — only the tokenizer needed for chunking.
-    #[serde(default)]
+    /// Switch for dense embeddings. On by default: hallouminate downloads the
+    /// embedding model on first use and fuses the dense (vector) signal into
+    /// retrieval. Set `false` to run a lexical-only path (FTS + ripgrep +
+    /// rerank) that loads no embedding model — only the tokenizer needed for
+    /// chunking.
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
     #[serde(default = "default_model")]
     pub model: String,
@@ -58,8 +60,8 @@ pub struct EmbeddingsConfig {
 impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            model: DEFAULT_MODEL.into(),
+            enabled: true,
+            model: ARCTIC_S_MODEL.into(),
             quantized: false,
             cache_dir: DEFAULT_EMBED_CACHE.into(),
         }
@@ -583,8 +585,11 @@ fn default_chunks_per_file() -> usize {
 fn default_debounce_ms() -> u64 {
     DEFAULT_DEBOUNCE_MS
 }
+fn default_enabled() -> bool {
+    true
+}
 fn default_model() -> String {
-    DEFAULT_MODEL.into()
+    ARCTIC_S_MODEL.into()
 }
 fn default_embed_cache() -> String {
     DEFAULT_EMBED_CACHE.into()
@@ -743,22 +748,22 @@ ground_dir = "~/.local/share/hallouminate/ground"
     }
 
     #[test]
-    fn embeddings_default_is_opt_out_off_and_full_precision() {
-        // The headline contract: dense embeddings are off unless explicitly
-        // enabled, and quantization is off by default.
+    fn embeddings_default_is_on_snowflake_and_full_precision() {
+        // The headline contract: dense embeddings are on by default, using the
+        // snowflake arctic model, and quantization is off by default.
         let cfg = EmbeddingsConfig::default();
-        assert!(!cfg.enabled, "embeddings must default to disabled (opt-in)");
+        assert!(cfg.enabled, "embeddings must default to enabled");
         assert!(!cfg.quantized, "quantization must default to off");
-        assert_eq!(cfg.model, "BAAI/bge-small-en-v1.5");
+        assert_eq!(cfg.model, "snowflake/snowflake-arctic-embed-s");
     }
 
     #[test]
-    fn parse_embeddings_section_omitting_enabled_defaults_to_disabled() {
+    fn parse_embeddings_section_omitting_enabled_defaults_to_enabled() {
         let cfg = parse("[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n", None)
             .expect("partial embeddings section parses");
         assert!(
-            !cfg.embeddings.enabled,
-            "absent `enabled` must default to false, not true"
+            cfg.embeddings.enabled,
+            "absent `enabled` must default to true, not false"
         );
     }
 
