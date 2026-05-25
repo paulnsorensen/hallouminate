@@ -1,5 +1,14 @@
-# Repo-layer hallouminate config. Empty by design — the XDG baseline at
-# ~/.config/hallouminate/config.toml owns corpus and repository definitions
-# for this repo. This file exists so the repo-config-discovery pre-check
-# (introduced by feat: repo-level .hallouminate/config.toml auto-discovery)
-# finds something to anchor on.
+# Repo-layer hallouminate config.
+#
+# Declares this repo as a hallouminate tenant so the wiki under
+# .hallouminate/wiki/ is searchable as the `repo:hallouminate:wiki` corpus.
+# `path = "."` resolves against the repo root (the parent of .hallouminate/),
+# so this works from any checkout or worktree without per-machine config —
+# the daemon reads the repo layer fresh on every request (no restart needed).
+#
+# Do NOT also declare `[[repository]] name = "hallouminate"` in the XDG
+# baseline: both layers would derive `repo:hallouminate:wiki` and collide on
+# the duplicate-name check.
+[[repository]]
+name = "hallouminate"
+path = "."
