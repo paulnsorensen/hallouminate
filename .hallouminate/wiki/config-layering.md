@@ -38,6 +38,34 @@ Since commit `bf14888` (auto-discovery), the repo layer is **required**
 .hallouminate/config.toml in the working directory's repo`. An empty
 file is enough to satisfy the check.
 
+### Relative paths resolve against the repo root
+
+`load_repo_layer` (`src/app/config.rs::load_repo_layer` →
+`resolve_repo_path`) rewrites relative paths in the repo layer against
+the **repo root** — the parent of `.hallouminate/`, not `.hallouminate/`
+itself. Absolute and `~`-prefixed paths pass through untouched. So a
+repo-layer `[[repository]] path = "."` resolves to the repo root, and
+`wiki_directory` lands it at `<repo>/.hallouminate/wiki`.
+
+This repo self-declares with exactly that — `.hallouminate/config.toml`
+holds:
+
+```toml
+[[repository]]
+name = "hallouminate"
+path = "."
+```
+
+so its own wiki is searchable as `repo:hallouminate:wiki` from any
+checkout or worktree with no per-machine baseline entry. This is the
+exception to "repo corpora are typically empty" above. Don't also
+declare `hallouminate` in the XDG baseline: both layers would derive
+`repo:hallouminate:wiki` and collide on the duplicate-name check.
+
+A wiki corpus is **not** auto-discovered just because a
+`.hallouminate/wiki/` directory exists under `cwd` — the corpus only
+exists once a `[[repository]]` (baseline or repo layer) declares it.
+
 ## Merge semantics
 
 Implemented in `src/app/config.rs::merge_layers`. Rules:
