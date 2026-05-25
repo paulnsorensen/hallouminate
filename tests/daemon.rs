@@ -1249,8 +1249,10 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     // indexing).
     //
     // Pin embeddings off so non-empty content indexes lexical-only (FTS) —
-    // hermetic, no model load. A distinctive token in the body lets `ground`
-    // find precisely this file and nothing else.
+    // no embedding-model (ONNX) load. The chunking tokenizer still loads
+    // (and is networked on a cold cache), so this is hermetic only with the
+    // tokenizer cached. A distinctive token in the body lets `ground` find
+    // precisely this file and nothing else.
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let corpus_root = tmp.path().join("corpus");
