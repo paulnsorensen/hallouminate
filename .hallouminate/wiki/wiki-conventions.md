@@ -118,6 +118,18 @@ the note even with no context about the task that produced it, write
 it to the wiki. If it only makes sense in the context of a specific
 task, leave it in `.cheese/`.
 
+## When to update — the post-land cadence
+
+`AGENTS.md` at the repo root instructs every coding agent to refresh
+this wiki **after a change lands on `main`**, but only when the change
+altered durable knowledge — architecture, conventions, protocols, the
+MCP tool surface, or a "why this design not that one" decision. Routine
+bug fixes and transient per-task output stay out (see the table above).
+
+Do the update through the MCP (`read_markdown` → `add_markdown` with
+`overwrite: true`), not raw file edits, so the LanceDB index and the
+ancestor `index.md` link lists stay in sync.
+
 ## The authoring loop
 
 ```text
