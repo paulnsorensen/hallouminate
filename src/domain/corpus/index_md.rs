@@ -394,6 +394,17 @@ mod tests {
     }
 
     #[test]
+    fn read_h1_skips_frontmatter_with_crlf_line_endings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.md");
+        // `str::lines()` strips the trailing `\r`, so the `== "---"` fence
+        // checks match under CRLF. Lock that so a future move off `lines()`
+        // can't silently regress Windows-authored frontmatter pages.
+        std::fs::write(&path, "---\r\nup: bar\r\n---\r\n\r\n# Foo Title\r\n").unwrap();
+        assert_eq!(read_h1(&path), Some("Foo Title".to_string()));
+    }
+
+    #[test]
     fn read_h1_treats_mid_body_dashes_as_thematic_break_not_frontmatter() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.md");
