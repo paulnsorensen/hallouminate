@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::gitignore::GitignoreBuilder;
 use ignore::WalkBuilder;
+use ignore::gitignore::GitignoreBuilder;
 
 use crate::domain::common::{
-    canonicalize_or_passthrough, expand_tilde, CorpusConfig, FileRef, HallouminateError, Mtime,
-    Result,
+    CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
+    expand_tilde,
 };
 
 pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
@@ -162,6 +162,7 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec!["**/.git/**".into(), "**/node_modules/**".into()],
+            global: false,
         }
     }
 
@@ -214,6 +215,7 @@ mod tests {
             paths: vec![file.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let result = scan(&corpus).expect("scan");
         assert_eq!(result.len(), 1);
@@ -231,6 +233,7 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             globs: vec![],
             exclude: vec![],
+            global: false,
         };
         let result = scan(&corpus).expect("scan");
         assert_eq!(result.len(), 2);
@@ -246,6 +249,7 @@ mod tests {
             paths: vec![path.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let result = scan(&corpus).expect("scan");
         let (_, Mtime(ms)) = &result[0];
@@ -263,6 +267,7 @@ mod tests {
             paths: vec![tmp.path().to_string_lossy().into_owned()],
             globs: vec!["[invalid".into()],
             exclude: vec![],
+            global: false,
         };
         let err = scan(&corpus).expect_err("invalid glob must fail");
         let msg = err.to_string();
@@ -294,6 +299,7 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec!["**/excluded_dir/**".into()],
+            global: false,
         };
         let result = scan(&corpus).expect("scan");
         let names = file_names(&result);
@@ -326,6 +332,7 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let result = scan(&corpus).expect("scan");
         let names = file_names(&result);
@@ -361,6 +368,7 @@ mod tests {
             paths: vec![root.join("secrets").to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let result = scan(&corpus).expect("scan");
         let names = file_names(&result);

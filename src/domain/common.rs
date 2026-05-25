@@ -50,6 +50,11 @@ pub struct CorpusConfig {
     pub globs: Vec<String>,
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// Marks this corpus as the single globalize target. `globalize_markdown`
+    /// copies entries into whichever corpus has `global = true`. Config
+    /// validation rejects more than one such corpus.
+    #[serde(default)]
+    pub global: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

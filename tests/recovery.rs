@@ -57,6 +57,7 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
 
     let store_path = store_dir.path().to_path_buf();
@@ -112,6 +113,7 @@ async fn re_run_after_crash_converges_to_correct_state() {
         paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
         globs: vec!["**/*.md".into()],
         exclude: vec![],
+        global: false,
     };
     let store_path = store_dir.path().to_path_buf();
     let corpus_clone = corpus.clone();

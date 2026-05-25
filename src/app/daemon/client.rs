@@ -86,21 +86,18 @@ impl DaemonClient {
         // truncates) surfaces as a bare I/O / JSON error and MCP/CLI
         // callers lose the actionable "start it with `hallouminate daemon`"
         // recovery suffix.
-        stream
-            .write_all(text.as_bytes())
-            .await
-            .map_err(|e| daemon_client_unavailable(format!("write to {} failed: {e}", self.socket.display())))?;
-        stream
-            .flush()
-            .await
-            .map_err(|e| daemon_client_unavailable(format!("flush {} failed: {e}", self.socket.display())))?;
+        stream.write_all(text.as_bytes()).await.map_err(|e| {
+            daemon_client_unavailable(format!("write to {} failed: {e}", self.socket.display()))
+        })?;
+        stream.flush().await.map_err(|e| {
+            daemon_client_unavailable(format!("flush {} failed: {e}", self.socket.display()))
+        })?;
         let (read_half, _) = stream.into_split();
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display())))?;
+        let n = reader.read_line(&mut line).await.map_err(|e| {
+            daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
+        })?;
         if n == 0 {
             return Err(daemon_client_unavailable(format!(
                 "daemon at {} closed the connection before responding",

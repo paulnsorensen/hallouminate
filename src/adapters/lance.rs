@@ -243,18 +243,15 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
     let mut embedding_valid: Vec<bool> = Vec::new();
 
     for file in batch {
-        match &file.embeddings {
-            Some(embeddings) => {
-                if file.chunks.len() != embeddings.len() {
-                    return Err(HallouminateError::Indexer(format!(
-                        "prepared file {:?}: {} chunks but {} embeddings",
-                        file.file_ref,
-                        file.chunks.len(),
-                        embeddings.len()
-                    )));
-                }
-            }
-            None => {}
+        if let Some(embeddings) = &file.embeddings
+            && file.chunks.len() != embeddings.len()
+        {
+            return Err(HallouminateError::Indexer(format!(
+                "prepared file {:?}: {} chunks but {} embeddings",
+                file.file_ref,
+                file.chunks.len(),
+                embeddings.len()
+            )));
         }
         for (idx, chunk) in file.chunks.iter().enumerate() {
             chunk_ids.push(chunk_id_for(&file.file_ref, chunk.ord));
@@ -537,22 +534,21 @@ impl LanceStore {
             .any(|i| i.columns.iter().any(|c| c == "embedding"));
         if !has_vec_index {
             let rows = self.table.count_rows(None).await.map_err(map_lance_err)? as u64;
-            if rows >= 256 {
-                if let Err(e) = self
+            if rows >= 256
+                && let Err(e) = self
                     .table
                     .create_index(&["embedding"], lancedb::index::Index::Auto)
                     .execute()
                     .await
-                {
-                    // ANN index is an optimization, not a correctness
-                    // requirement — brute-force scan still works. Log so
-                    // operators can diagnose why ANN never kicked in.
-                    tracing::warn!(
-                        target: "hallouminate::lance",
-                        err = %e,
-                        "failed to create ANN index on `embedding`; queries will brute-force scan"
-                    );
-                }
+            {
+                // ANN index is an optimization, not a correctness
+                // requirement — brute-force scan still works. Log so
+                // operators can diagnose why ANN never kicked in.
+                tracing::warn!(
+                    target: "hallouminate::lance",
+                    err = %e,
+                    "failed to create ANN index on `embedding`; queries will brute-force scan"
+                );
             }
         }
         Ok(())
@@ -1322,15 +1318,9 @@ mod weighted_rrf {
 
     fn missing_row_id(which: &str, batch: &RecordBatch) -> lancedb::Error {
         let schema = batch.schema();
-        let cols: Vec<&str> = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().as_str())
-            .collect();
+        let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
         lancedb::Error::InvalidInput {
-            message: format!(
-                "expected column {ROW_ID} not found in {which}; found {cols:?}"
-            ),
+            message: format!("expected column {ROW_ID} not found in {which}; found {cols:?}"),
         }
     }
 
@@ -1368,7 +1358,10 @@ mod weighted_rrf {
                 .unwrap();
             let names: StringArray = downcast_array(out.column(0));
             let names: Vec<&str> = names.iter().map(|n| n.unwrap()).collect();
-            assert_eq!(names[0], "fts_only", "FTS-weighted RRF must rank fts_only first");
+            assert_eq!(
+                names[0], "fts_only",
+                "FTS-weighted RRF must rank fts_only first"
+            );
             assert_eq!(names[1], "vec_only");
         }
 

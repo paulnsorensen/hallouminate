@@ -22,9 +22,11 @@ mod bootstrap;
 mod client;
 mod dispatch;
 mod ipc;
+mod lifecycle;
 mod server;
 mod socket;
 mod state;
+mod watch;
 
 pub use bootstrap::ensure_daemon_running;
 pub use client::{
@@ -32,10 +34,12 @@ pub use client::{
 };
 pub use ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
-    GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
-    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult,
+    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
+    GlobalizeMarkdownRequest, GlobalizeMarkdownResult, GroundRequest, GroundResult, IndexRequest,
+    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
+    ReadMarkdownRequest, ReadMarkdownResult,
 };
-pub use server::{DaemonArgs, run_daemon, serve};
+pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
+pub use server::{DaemonArgs, run_daemon, serve, spawn_signal_handlers};
 pub use socket::daemon_socket_path;
 pub use state::DaemonState;

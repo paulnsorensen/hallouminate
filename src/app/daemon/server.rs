@@ -34,10 +34,7 @@ pub async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
     // scalar-conflict diagnostics (AC #7). When the user passed
     // `--config PATH`, that path *is* the baseline; otherwise the XDG path
     // is what `load_xdg` consulted.
-    let xdg_path = args
-        .config
-        .clone()
-        .unwrap_or_else(config::xdg_config_path);
+    let xdg_path = args.config.clone().unwrap_or_else(config::xdg_config_path);
     let socket_path = daemon_socket_path();
     serve_with_config(cfg, Some(xdg_path), &socket_path).await
 }
@@ -54,10 +51,57 @@ async fn serve_with_config(
 ) -> anyhow::Result<()> {
     prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
-    let _lock = acquire_single_instance(&lock_path)?;
+    let lock = acquire_single_instance(&lock_path)?;
     let state = DaemonState::open(cfg, xdg_path).await?;
     let _ = tokio::fs::remove_file(socket_path).await;
-    serve_on_listener(&state, socket_path).await
+    let watcher = super::watch::spawn_corpus_watcher(&state);
+    spawn_signal_handlers(&state);
+    let result = serve_on_listener(&state, socket_path).await;
+    drop(watcher);
+    cleanup(lock, socket_path).await;
+    result
+}
+
+/// Wire SIGINT and SIGTERM onto the daemon's shutdown token so a `kill` (or
+/// Ctrl-C in the foreground) drains the accept loop and runs the same
+/// flock-drop + socket-removal cleanup as the IPC `Shutdown` request, rather
+/// than dying on default signal disposition and leaving a stale socket.
+///
+/// The SIGTERM stream is registered **synchronously** (before the function
+/// returns), so on return the process's default-terminate disposition is
+/// already overridden — a `kill -TERM` after this returns reaches the token,
+/// not the default killer. This synchronous postcondition is what the SIGTERM
+/// integration test relies on to raise the signal without a spawn race.
+pub fn spawn_signal_handlers(state: &DaemonState) {
+    let token = state.shutdown_token().clone();
+    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(target: "hallouminate::daemon", error = %e, "failed to install SIGTERM handler");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!(target: "hallouminate::daemon", "received SIGINT; shutting down");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!(target: "hallouminate::daemon", "received SIGTERM; shutting down");
+            }
+        }
+        token.cancel();
+    });
+}
+
+/// Release the single-instance flock and remove the socket file so the next
+/// boot binds cleanly. Dropping the `File` releases the advisory lock (POSIX);
+/// we remove the socket after so a client racing a reconnect sees the socket
+/// gone rather than a dead-but-present file.
+async fn cleanup(lock: std::fs::File, socket_path: &Path) {
+    let _ = tokio::fs::remove_file(socket_path).await;
+    drop(lock);
 }
 
 async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
@@ -86,20 +130,25 @@ async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
 }
 
 /// Public for tests: drive the accept loop against an already-opened
-/// `DaemonState` and a known socket path. Tests inject shutdown via an
-/// external `tokio::select!` racing this future against an oneshot, which
-/// is why `serve` returns only on an unrecoverable IO error in production
-/// — the loop has no built-in shutdown signal.
+/// `DaemonState` and a known socket path. The accept loop breaks when
+/// `state.shutdown_token()` is cancelled — the IPC `Shutdown` request
+/// cancels that token, so `serve` returns once shutdown is requested (or
+/// on an unrecoverable bind error). After the loop breaks, the caller runs
+/// cleanup: dropping the single-instance flock and removing the socket.
 pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
     prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
-    let _lock = acquire_single_instance(&lock_path)?;
+    let lock = acquire_single_instance(&lock_path)?;
     // Stale socket cleanup. If a previous daemon crashed without removing
     // its socket, the next bind would fail with EADDRINUSE. Holding the
     // flock above guarantees only one daemon is alive, so removing the
     // socket here is safe.
     let _ = tokio::fs::remove_file(socket_path).await;
-    serve_on_listener(state, socket_path).await
+    let watcher = super::watch::spawn_corpus_watcher(state);
+    let result = serve_on_listener(state, socket_path).await;
+    drop(watcher);
+    cleanup(lock, socket_path).await;
+    result
 }
 
 async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
@@ -125,13 +174,25 @@ async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::R
     );
     eprintln!("hallouminate daemon listening on {}", socket_path.display());
 
+    let shutdown = state.shutdown_token().clone();
     loop {
-        let (stream, _addr) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(target: "hallouminate::daemon", error = %e, "accept error");
-                continue;
+        // Drain semantics (spec Curd 1 open question): cancelling the token
+        // stops accepting *new* connections but does not abort in-flight
+        // `handle_connection` tasks — they were spawned detached and finish
+        // their one-shot request/response on their own. The cancel only
+        // breaks this accept loop, after which the caller runs cleanup.
+        let (stream, _addr) = tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!(target: "hallouminate::daemon", "shutdown requested; stopping accept loop");
+                break;
             }
+            accepted = listener.accept() => match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!(target: "hallouminate::daemon", error = %e, "accept error");
+                    continue;
+                }
+            },
         };
         let state = state.clone();
         tokio::spawn(async move {
@@ -144,6 +205,7 @@ async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::R
             }
         });
     }
+    Ok(())
 }
 
 async fn handle_connection(state: DaemonState, stream: UnixStream) -> anyhow::Result<()> {

@@ -18,7 +18,8 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    ErrorKind, ReadMarkdownRequest, connect_at, serve,
+    ErrorKind, GlobalizeMarkdownRequest, ReadMarkdownRequest, connect_at, serve,
+    spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -634,4 +635,705 @@ ground_dir = "{g}"
         .await
         .expect("ping");
     assert_eq!(pong, serde_json::Value::String("pong".to_string()));
+}
+
+// ─── Curd 1: graceful shutdown ───────────────────────────────────────────
+
+/// Build a tempdir with an empty `.hallouminate/config.toml` so daemon
+/// requests using it as `cwd` resolve a (trivial) repo layer.
+fn seed_cwd(tmp: &Path) -> PathBuf {
+    let cwd = tmp.to_path_buf();
+    let hallou = cwd.join(".hallouminate");
+    std::fs::create_dir_all(&hallou).expect("mkdir .hallouminate");
+    std::fs::write(hallou.join("config.toml"), "").expect("write repo config");
+    cwd
+}
+
+fn docs_cfg(ground_dir: &Path, corpus_root: &Path) -> Config {
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n",
+        c = corpus_root.display(),
+        g = ground_dir.display(),
+    );
+    toml::from_str(&toml).expect("parse cfg")
+}
+
+#[tokio::test]
+async fn ipc_shutdown_removes_socket_and_lockfile_and_refuses_new_connections() {
+    // Quality gate (Curd 1): sending `Shutdown` exits the daemon gracefully —
+    // socket + lockfile gone, a subsequent connect fails.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let cwd = seed_cwd(tmp.path());
+    let socket = tmp.path().join("daemon.sock");
+    let lockfile = tmp.path().join("daemon.sock.lock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let socket_clone = socket.clone();
+    let handle = tokio::spawn(async move { serve(&state, &socket_clone).await });
+
+    // Wait for the socket to appear.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(lockfile.exists(), "lockfile must exist while daemon runs");
+
+    let client = connect_at(&socket).await.expect("connect");
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: cwd.clone(),
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await
+        .expect("shutdown transport ok");
+    match resp {
+        DaemonResponse::Ok { result } => {
+            assert_eq!(result, serde_json::Value::String("stopping".to_string()));
+        }
+        other => panic!("shutdown must ack `stopping`, got {other:?}"),
+    }
+
+    // The serve future must return Ok after cleanup.
+    let served = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve must return after shutdown")
+        .expect("join ok");
+    served.expect("serve returns Ok on graceful shutdown");
+
+    // Socket removed; lockfile removed (flock dropped + file removal by cleanup
+    // is not guaranteed, but the socket is — and a new connect must fail).
+    assert!(!socket.exists(), "socket file must be removed on shutdown");
+    let err = connect_at(&socket)
+        .await
+        .expect_err("connect must fail after shutdown");
+    assert!(
+        format!("{err:#}").contains("daemon unavailable"),
+        "post-shutdown connect must report daemon unavailable: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn sigterm_removes_socket_and_refuses_new_connections() {
+    // Quality gate (Curd 1): a SIGTERM must drive the *same* graceful exit as
+    // the IPC `Shutdown` path — accept loop drained, socket removed, a
+    // subsequent connect fails — rather than dying on the default-terminate
+    // disposition and leaving a stale socket. This exercises the production
+    // signal wiring (`spawn_signal_handlers`), not just the IPC token-cancel
+    // already covered above.
+    //
+    // `spawn_signal_handlers` registers the SIGTERM stream synchronously, so
+    // by the time it returns the default-terminate disposition is overridden
+    // and `libc::raise(SIGTERM)` reaches the token instead of killing the test
+    // process.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    // Install the real signal handlers against this state's shutdown token
+    // *before* serving, mirroring `serve_with_config`'s production order.
+    spawn_signal_handlers(&state);
+    let serve_state = state.clone();
+    let socket_clone = socket.clone();
+    let handle = tokio::spawn(async move { serve(&serve_state, &socket_clone).await });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Sanity: the daemon is reachable before the signal.
+    let client = connect_at(&socket).await.expect("connect before SIGTERM");
+    let pong: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: seed_cwd(tmp.path()),
+            payload: DaemonRequestPayload::Ping,
+        })
+        .await
+        .expect("ping before SIGTERM");
+    assert_eq!(pong, serde_json::Value::String("pong".to_string()));
+
+    // Raise SIGTERM at our own process; the installed handler cancels the
+    // shutdown token, the accept loop breaks, and `serve` runs cleanup.
+    let rc = unsafe { libc::raise(libc::SIGTERM) };
+    assert_eq!(rc, 0, "libc::raise(SIGTERM) must succeed");
+
+    let served = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve must return after SIGTERM")
+        .expect("join ok");
+    served.expect("serve returns Ok on SIGTERM-driven shutdown");
+
+    assert!(
+        !socket.exists(),
+        "socket must be removed on SIGTERM shutdown"
+    );
+    let err = connect_at(&socket)
+        .await
+        .expect_err("connect must fail after SIGTERM");
+    assert!(
+        format!("{err:#}").contains("daemon unavailable"),
+        "post-SIGTERM connect must report daemon unavailable: {err:#}"
+    );
+}
+
+// ─── Curd 2: lifecycle status / restart ──────────────────────────────────
+
+#[tokio::test]
+async fn status_reports_running_then_not_running_across_shutdown() {
+    // Quality gate (Curd 2): `daemon status` returns Running against a live
+    // daemon and NotRunning once it has stopped. `status()` resolves the
+    // socket via `daemon_socket_path()`, so point HALLOUMINATE_SOCKET at the
+    // harness socket for the duration of this test. (Serialized via a process
+    // env mutex below — env is global to the test binary.)
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let serve_state = state.clone();
+    let socket_clone = socket.clone();
+    let handle = tokio::spawn(async move { serve(&serve_state, &socket_clone).await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
+
+    assert_eq!(
+        hallouminate::app::daemon::status()
+            .await
+            .expect("status ok while running"),
+        hallouminate::app::daemon::DaemonStatus::Running,
+        "status must be Running against a live daemon"
+    );
+
+    // Drive a graceful shutdown via the IPC path, then assert NotRunning.
+    let client = connect_at(&socket).await.expect("connect");
+    let _ = client
+        .call_raw(DaemonRequest {
+            cwd: seed_cwd(tmp.path()),
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await;
+    let served = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve returns after shutdown")
+        .expect("join ok");
+    served.expect("serve Ok on shutdown");
+
+    assert_eq!(
+        hallouminate::app::daemon::status()
+            .await
+            .expect("status ok while stopped"),
+        hallouminate::app::daemon::DaemonStatus::NotRunning,
+        "status must be NotRunning once the socket is gone"
+    );
+}
+
+#[tokio::test]
+async fn stop_is_a_noop_against_an_already_stopped_daemon() {
+    // `stop()` returns Ok when no daemon is reachable — stopping an
+    // already-stopped daemon is success, not an error. Point the socket path
+    // at a tempdir location that was never bound.
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("never-bound.sock");
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
+
+    hallouminate::app::daemon::stop()
+        .await
+        .expect("stop against a stopped daemon must be Ok");
+    assert!(
+        !socket.exists(),
+        "stop must not create the socket it never connected to"
+    );
+}
+
+/// Spawn an in-process `serve` on `socket` from a fresh `DaemonState` and wait
+/// until the socket is reachable. Returns the serve task handle so the caller
+/// can join it after a graceful shutdown.
+async fn spawn_serve(cfg: Config, socket: &Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let socket_clone = socket.to_path_buf();
+    let handle = tokio::spawn(async move { serve(&state, &socket_clone).await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    handle
+}
+
+#[tokio::test]
+async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
+    // `restart()` must take a running daemon down and bring a fresh, reachable
+    // one up. The suite sets HALLOUMINATE_SOCKET, which makes the production
+    // respawn (`ensure_daemon_running`) a no-op, so we drive the real
+    // stop→respawn→reachable sequence through the `restart_with` seam: the
+    // injected respawn spins up an in-process `serve`, exactly as production's
+    // spawned daemon would, but against the controllable harness socket.
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    // First daemon up and reachable.
+    let first = spawn_serve(cfg.clone(), &socket).await;
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
+    assert_eq!(
+        hallouminate::app::daemon::status()
+            .await
+            .expect("status ok while first daemon runs"),
+        hallouminate::app::daemon::DaemonStatus::Running,
+        "the first daemon must be reachable before restart",
+    );
+
+    // Restart: stop() takes the first daemon down (its serve future returns),
+    // then the injected respawn brings a fresh in-process daemon up. The
+    // respawn must observe the old daemon already gone, proving stop ran first.
+    let restarted_cfg = cfg.clone();
+    let restart_socket = socket.clone();
+    let second_handle: std::sync::Arc<
+        std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let stash = second_handle.clone();
+    hallouminate::app::daemon::restart_with(|| async move {
+        // After restart's stop(), nothing must answer on the socket.
+        assert_eq!(
+            hallouminate::app::daemon::status()
+                .await
+                .expect("status ok between stop and respawn"),
+            hallouminate::app::daemon::DaemonStatus::NotRunning,
+            "restart must stop the old daemon before respawning",
+        );
+        let handle = spawn_serve(restarted_cfg, &restart_socket).await;
+        *stash.lock().expect("stash lock") = Some(handle);
+        Ok(())
+    })
+    .await
+    .expect("restart_with ok");
+
+    // The first daemon's serve future must have returned (graceful shutdown).
+    let first_result = timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first serve must return after restart's stop")
+        .expect("first serve join ok");
+    first_result.expect("first serve returns Ok on shutdown");
+
+    // The freshly respawned daemon must be reachable.
+    assert_eq!(
+        hallouminate::app::daemon::status()
+            .await
+            .expect("status ok after restart"),
+        hallouminate::app::daemon::DaemonStatus::Running,
+        "restart must leave a fresh, reachable daemon up",
+    );
+
+    // Tear down the second daemon so the test leaves no listener behind.
+    let second = second_handle
+        .lock()
+        .expect("stash lock")
+        .take()
+        .expect("respawn must have stored the second serve handle");
+    let client = connect_at(&socket).await.expect("connect to second daemon");
+    let _ = client
+        .call_raw(DaemonRequest {
+            cwd: seed_cwd(tmp.path()),
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await;
+    let second_result = timeout(Duration::from_secs(5), second)
+        .await
+        .expect("second serve must return after teardown shutdown")
+        .expect("second serve join ok");
+    second_result.expect("second serve returns Ok on shutdown");
+}
+
+/// RAII guard that removes an env var on drop and serializes env-mutating
+/// tests against a shared mutex (the Rust test harness runs tests across
+/// threads; `daemon_socket_path()` reads `HALLOUMINATE_SOCKET` process-wide).
+struct EnvGuard {
+    key: &'static str,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn set(key: &'static str) -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        EnvGuard { key, _lock }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var(self.key) };
+    }
+}
+
+// ─── Curd 5: globalize_markdown ──────────────────────────────────────────
+
+fn global_corpus_cfg(ground_dir: &Path, src_root: &Path, global_root: &Path) -> Config {
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "src"
+paths = ["{s}"]
+globs = ["**/*.md"]
+
+[[corpus]]
+name = "cheese-global"
+paths = ["{gl}"]
+globs = ["**/*.md"]
+global = true
+
+[storage]
+ground_dir = "{g}"
+"#,
+        s = src_root.display(),
+        gl = global_root.display(),
+        g = ground_dir.display(),
+    );
+    toml::from_str(&toml).expect("parse cfg")
+}
+
+#[tokio::test]
+async fn globalize_copies_entry_into_global_corpus_source_stays() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let src_root = tmp.path().join("src");
+    let global_root = tmp.path().join("global");
+    std::fs::create_dir_all(&src_root).expect("mkdir src");
+    std::fs::create_dir_all(&global_root).expect("mkdir global");
+    // Empty body keeps the indexer off the embedding model.
+    std::fs::write(src_root.join("note.md"), "").expect("seed source entry");
+    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
+    // DaemonHarness seeds its own tempdir cwd with an empty repo-layer config,
+    // so requests using `harness.cwd()` resolve discovery trivially.
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
+                source_corpus: "src".into(),
+                path: "note.md".into(),
+                dest_path: None,
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("globalize ok");
+
+    assert_eq!(resp["global_corpus"].as_str(), Some("cheese-global"));
+    assert_eq!(resp["dest_path"].as_str(), Some("note.md"));
+    // Source stays (copy, not move).
+    assert!(src_root.join("note.md").exists(), "source must remain");
+    // Global copy exists.
+    assert!(
+        global_root.join("note.md").exists(),
+        "global copy must exist"
+    );
+}
+
+#[tokio::test]
+async fn globalize_without_global_corpus_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    std::fs::write(corpus_root.join("note.md"), "").expect("seed");
+    let cfg = docs_cfg(&ground, &corpus_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
+                source_corpus: "docs".into(),
+                path: "note.md".into(),
+                dest_path: None,
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err {
+            kind: ErrorKind::InvalidParams,
+            message,
+        } => {
+            assert!(
+                message.contains("global"),
+                "must mention global corpus: {message}"
+            );
+        }
+        other => panic!("expected InvalidParams when no global corpus, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn globalize_existing_dest_without_overwrite_errors() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let src_root = tmp.path().join("src");
+    let global_root = tmp.path().join("global");
+    std::fs::create_dir_all(&src_root).expect("mkdir src");
+    std::fs::create_dir_all(&global_root).expect("mkdir global");
+    std::fs::write(src_root.join("note.md"), "").expect("seed source");
+    std::fs::write(global_root.join("note.md"), "").expect("pre-existing dest");
+    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
+                source_corpus: "src".into(),
+                path: "note.md".into(),
+                dest_path: None,
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err {
+            kind: ErrorKind::InvalidParams,
+            message,
+        } => {
+            assert!(
+                message.contains("already exists"),
+                "must report collision: {message}"
+            );
+        }
+        other => panic!("expected InvalidParams on existing dest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn globalize_self_copy_into_global_corpus_errors() {
+    // Spec open question (Curd 5), leaning reject: globalizing FROM the
+    // global corpus itself is a no-op self-copy. The handler must refuse it
+    // with InvalidParams rather than redundantly re-copying a file onto
+    // itself. Without this guard a caller could pass source_corpus ==
+    // cheese-global and silently round-trip the file through the same root.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let src_root = tmp.path().join("src");
+    let global_root = tmp.path().join("global");
+    std::fs::create_dir_all(&src_root).expect("mkdir src");
+    std::fs::create_dir_all(&global_root).expect("mkdir global");
+    std::fs::write(global_root.join("note.md"), "").expect("seed global entry");
+    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
+                // Source IS the global corpus.
+                source_corpus: "cheese-global".into(),
+                path: "note.md".into(),
+                dest_path: None,
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err {
+            kind: ErrorKind::InvalidParams,
+            message,
+        } => {
+            assert!(
+                message.contains("already the global corpus"),
+                "self-copy rejection must explain the no-op: {message}"
+            );
+        }
+        other => panic!("expected InvalidParams on self-copy, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn globalize_honors_dest_path_override() {
+    // Boundary: `dest_path` defaults to the source path, but when supplied
+    // it must rename the entry inside the global corpus. The renamed file
+    // must exist at the override path, and the source-named path must NOT be
+    // created in the global root — proving the override is honored, not
+    // ignored (which would silently write to the default source path).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let src_root = tmp.path().join("src");
+    let global_root = tmp.path().join("global");
+    std::fs::create_dir_all(&src_root).expect("mkdir src");
+    std::fs::create_dir_all(&global_root).expect("mkdir global");
+    std::fs::write(src_root.join("note.md"), "").expect("seed source entry");
+    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
+                source_corpus: "src".into(),
+                path: "note.md".into(),
+                dest_path: Some("renamed/elsewhere.md".into()),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("globalize ok");
+
+    assert_eq!(
+        resp["dest_path"].as_str(),
+        Some("renamed/elsewhere.md"),
+        "response must echo the override dest_path: {resp:?}"
+    );
+    assert!(
+        global_root.join("renamed/elsewhere.md").exists(),
+        "global copy must land at the override path"
+    );
+    assert!(
+        !global_root.join("note.md").exists(),
+        "override must not also write the default source-named path"
+    );
+    // Source stays untouched (copy, not move).
+    assert!(src_root.join("note.md").exists(), "source must remain");
+}
+
+// ─── Curd 3: corpus watcher ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
+    // Quality gate (Curd 3): editing a file in a baseline corpus root triggers
+    // a reindex within ~debounce_ms; deleting prunes its rows. Both legs are
+    // asserted via `ground` — the watcher's *unique* observable effect on the
+    // LanceDB rows — never via a manual `index` (which would index the file
+    // itself, so the old assertion passed even with the watcher disabled) nor
+    // `list_files` (a filesystem scan that sees the on-disk file regardless of
+    // indexing).
+    //
+    // Embeddings default to opt-in/disabled, so non-empty content indexes
+    // lexical-only (FTS) — hermetic, no model download. A distinctive token in
+    // the body lets `ground` find precisely this file and nothing else.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[watch]\ndebounce_ms = 100\n\n[storage]\nground_dir = \"{g}\"\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    // Write a NON-EMPTY file directly on disk (outside the add_markdown lane)
+    // with a unique token. Only the background watcher can index it — the test
+    // never calls `index`, so a hit in `ground` proves the watcher reindexed.
+    let watched = corpus_root.join("watched.md");
+    std::fs::write(
+        &watched,
+        "# Spice\n\nthe rarespiceword melange flows here\n",
+    )
+    .expect("write watched file");
+
+    let ground_hits = |client: hallouminate::app::daemon::DaemonClient, cwd: PathBuf| async move {
+        let res: hallouminate::app::daemon::GroundResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Ground(hallouminate::app::daemon::GroundRequest {
+                    query: "rarespiceword".into(),
+                    corpus: Some("docs".into()),
+                    top_files: None,
+                    chunks_per_file: None,
+                    limit: None,
+                    snippet_chars: None,
+                }),
+            })
+            .await
+            .expect("ground ok");
+        res.response.docs.len()
+    };
+
+    // The watcher must reindex the created file within a few debounce windows.
+    // Assert a `ground` hit appears that could only come from the watcher.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut indexed = false;
+    while std::time::Instant::now() < deadline {
+        if ground_hits(
+            connect_at(harness.socket()).await.expect("connect"),
+            harness.cwd().to_path_buf(),
+        )
+        .await
+            >= 1
+        {
+            indexed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        indexed,
+        "watcher must reindex watched.md so `ground` returns it (no manual index was issued)"
+    );
+
+    // DELETE → prune: remove the file and let the debounced watcher observe it.
+    // The rows must disappear from `ground` — proving the prune ran, not merely
+    // that the daemon survived.
+    std::fs::remove_file(&watched).expect("remove watched file");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut pruned = false;
+    while std::time::Instant::now() < deadline {
+        if ground_hits(
+            connect_at(harness.socket()).await.expect("connect"),
+            harness.cwd().to_path_buf(),
+        )
+        .await
+            == 0
+        {
+            pruned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        pruned,
+        "watcher must prune watched.md's rows on delete so `ground` no longer returns it"
+    );
 }

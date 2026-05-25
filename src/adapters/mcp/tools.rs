@@ -9,20 +9,20 @@
 //! handle — that fallback is exactly the multi-process race the daemon is
 //! built to remove.
 
-
-use std::path::{Path, PathBuf};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
-    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
-    GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
-    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult, client_for,
+    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
+    GlobalizeMarkdownRequest, GlobalizeMarkdownResult, GroundRequest, GroundResult, IndexRequest,
+    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
+    ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -319,6 +319,20 @@ pub struct DeleteMarkdownParams {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GlobalizeMarkdownParams {
+    /// Corpus the entry currently lives in.
+    pub source_corpus: String,
+    /// Relative path of the entry within `source_corpus`.
+    pub path: String,
+    /// Destination path within the global corpus. Defaults to `path`.
+    #[serde(default)]
+    pub dest_path: Option<String>,
+    /// Replace an existing destination entry. Defaults to false.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
 /// fresh `UnixStream`, so the server is stateless beyond `tool_router`
 /// and the captured client cwd.
@@ -512,6 +526,36 @@ impl HallouminateTools {
         };
         let response: DeleteMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let text = format!("deleted {} from corpus {}", response.path, response.corpus);
+        let structured =
+            serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
+        Ok(tool_ok(text, structured))
+    }
+
+    #[tool(
+        description = "Copy a single markdown entry from `source_corpus` into the corpus marked `global = true` in config, making it searchable everywhere. The source stays in place (copy, not move). `dest_path` defaults to the source path; `overwrite=false` (default) errors if the destination already exists. The global corpus row is reindexed synchronously. Errors if no global corpus is configured or if `source_corpus` is itself the global corpus. `structuredContent` is { source_corpus, source_path, global_corpus, dest_path, absolute_path, indexed }."
+    )]
+    pub async fn globalize_markdown(
+        &self,
+        Parameters(params): Parameters<GlobalizeMarkdownParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let client = daemon_for_tool().await?;
+        let req = DaemonRequest {
+            cwd: self.cwd.clone(),
+            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
+                source_corpus: params.source_corpus,
+                path: params.path,
+                dest_path: params.dest_path,
+                overwrite: params.overwrite,
+            }),
+        };
+        let response: GlobalizeMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
+        let text = format!(
+            "globalized {} from {} into {} as {}",
+            response.source_path,
+            response.source_corpus,
+            response.global_corpus,
+            response.dest_path,
+        );
         let structured =
             serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
         Ok(tool_ok(text, structured))

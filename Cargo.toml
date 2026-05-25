@@ -13,7 +13,12 @@ authors = ["Paul Sorensen <paulnsorensen@gmail.com>"]
 clap = { version = "4", features = ["derive"] }
 
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "net", "sync", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "net", "sync", "io-util", "signal"] }
+tokio-util = "0.7"
+
+# Filesystem watching (corpus auto-reindex)
+notify = "8"
+notify-debouncer-full = "0.7"
 
 # Storage
 lancedb = "0.27"

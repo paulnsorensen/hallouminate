@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
 
-use crate::domain::embeddings::{canonical_model_name, DEFAULT_MODEL};
-use crate::domain::repository::{effective_corpora, RepositoryConfig};
+use crate::domain::embeddings::{DEFAULT_MODEL, canonical_model_name};
+use crate::domain::repository::{RepositoryConfig, effective_corpora};
 
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
@@ -178,11 +178,11 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
 /// component instead, producing a misleading "reached filesystem root"
 /// error).
 pub fn discover_repo_config(cwd: &Path) -> Result<PathBuf> {
-    let absolute_cwd: PathBuf = if cwd.is_absolute() {
+    let absolute_cwd = if cwd.is_absolute() {
         cwd.to_path_buf()
     } else {
         let here = std::env::current_dir().map_err(HallouminateError::from)?;
-        here.join(cwd)
+        absolutize_cwd(cwd, &here)
     };
     let mut current: Option<&Path> = Some(&absolute_cwd);
     while let Some(level) = current {
@@ -211,6 +211,17 @@ pub fn discover_repo_config(cwd: &Path) -> Result<PathBuf> {
          (reached filesystem root without hitting a .git boundary)",
         cwd.display(),
     )))
+}
+
+/// Normalize a relative `cwd` to an absolute path by joining it against `base`
+/// (the process `current_dir()` in production). Pulled out of
+/// `discover_repo_config` so the join can be asserted hermetically against a
+/// controlled base, without depending on the process' real working directory
+/// (which, when the test runs inside a repo that ships its own
+/// `.hallouminate/config.toml`, would make the discovery walk find that config
+/// instead of exercising the normalization).
+fn absolutize_cwd(cwd: &Path, base: &Path) -> PathBuf {
+    base.join(cwd)
 }
 
 /// Parse a repo-layer TOML file, resolving relative paths against the
@@ -540,6 +551,22 @@ fn validate(cfg: &Config) -> Result<()> {
             )));
         }
     }
+    // At most one corpus may carry `global = true`. `globalize_markdown`
+    // resolves its destination by finding the single global corpus; two
+    // would make the target ambiguous, so reject the config outright rather
+    // than picking one nondeterministically at request time.
+    let globals: Vec<&str> = cfg
+        .corpora
+        .iter()
+        .filter(|c| c.global)
+        .map(|c| c.name.as_str())
+        .collect();
+    if globals.len() > 1 {
+        return Err(HallouminateError::Config(format!(
+            "more than one corpus marked global = true: {}; exactly one is allowed",
+            globals.join(", "),
+        )));
+    }
     // Surface duplicate-name and bad-name failures at config-load time
     // instead of waiting for the daemon to enumerate corpora at request
     // time.
@@ -569,6 +596,75 @@ fn default_ground_dir() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_rejects_two_global_corpora() {
+        // Curd 4: globalize resolves its destination by finding the single
+        // corpus with `global = true`; two would be ambiguous, so config
+        // validation must reject the file outright.
+        let err = parse(
+            r#"
+[[corpus]]
+name = "a"
+paths = ["/a"]
+global = true
+
+[[corpus]]
+name = "b"
+paths = ["/b"]
+global = true
+"#,
+            None,
+        )
+        .expect_err("two global corpora must fail validation");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("global"), "got: {msg}");
+                assert!(
+                    msg.contains('a') && msg.contains('b'),
+                    "must name both: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_single_global_corpus() {
+        let cfg = parse(
+            r#"
+[[corpus]]
+name = "global"
+paths = ["/g"]
+global = true
+
+[[corpus]]
+name = "local"
+paths = ["/l"]
+"#,
+            None,
+        )
+        .expect("one global corpus is valid");
+        let global = cfg
+            .corpora
+            .iter()
+            .find(|c| c.global)
+            .expect("global corpus present");
+        assert_eq!(global.name, "global");
+        assert!(
+            !cfg.corpora
+                .iter()
+                .find(|c| c.name == "local")
+                .unwrap()
+                .global
+        );
+    }
+
+    #[test]
+    fn parse_defaults_corpus_global_to_false() {
+        let cfg = parse("[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n", None).expect("parse");
+        assert!(!cfg.corpora[0].global, "global must default to false");
+    }
 
     const SPEC_EXAMPLE: &str = r#"
 [[corpus]]
@@ -981,10 +1077,10 @@ rrf_k                   = 60
         // tolerates either path failing — worst case we run the assertion
         // when we shouldn't, which only false-positives in CI containers
         // running as root, where the assertion is a no-op anyway.
-        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
-            if let Some(line) = s.lines().find(|l| l.starts_with("Uid:")) {
-                return line.split_whitespace().nth(1) == Some("0");
-            }
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+            && let Some(line) = s.lines().find(|l| l.starts_with("Uid:"))
+        {
+            return line.split_whitespace().nth(1) == Some("0");
         }
         std::process::Command::new("id")
             .arg("-u")
@@ -1069,47 +1165,61 @@ rrf_k                   = 60
 
     #[test]
     fn discover_repo_config_relative_cwd_resolves_against_current_dir() {
-        // The relative-cwd normalization fix: a relative `cwd` must be
-        // joined against `std::env::current_dir()` before walking, so
-        // `Path::parent()` walks reach the real filesystem root rather
-        // than bottoming out at the empty path.
+        // The relative-cwd normalization fix: a relative `cwd` must be joined
+        // against the base directory (`std::env::current_dir()` in production)
+        // before walking, so `Path::parent()` walks reach the real filesystem
+        // root rather than bottoming out at the empty path.
         //
-        // The error message preserves the user's original `cwd` input
-        // verbatim ("walking up from <cwd>"), so the relative and
-        // absolute inputs differ there. But the *walked* path — the
-        // "stopped at repo root <level>" / "reached filesystem root"
-        // tail — must be identical after normalization, because both
-        // inputs resolve to the same absolute starting point and
-        // ascend the same parent chain.
-        //
-        // Before the fix, the relative input bottomed out at the empty
-        // path and produced either an empty `<level>` in the error or a
-        // misleading "reached filesystem root" branch.
-        let rel = Path::new("nonexistent-relative-input-zzz");
-        let here = std::env::current_dir().expect("current_dir");
-        let abs = here.join(rel);
-        let rel_msg = match discover_repo_config(rel) {
-            Err(HallouminateError::Config(m)) => m,
-            other => panic!("relative input must error: {other:?}"),
-        };
-        let abs_msg = match discover_repo_config(&abs) {
-            Err(HallouminateError::Config(m)) => m,
-            other => panic!("absolute input must error: {other:?}"),
-        };
+        // This is asserted hermetically against a controlled, config-free base
+        // dir rather than the process' real working directory. This repo ships
+        // its own committed `.hallouminate/config.toml`, so normalizing a
+        // relative input against the *real* cwd would make the walk find that
+        // config and return Ok before the normalization behavior could be
+        // observed. Driving the normalization through `absolutize_cwd` with a
+        // tempdir base isolates the relative→absolute join from repo-root
+        // config discovery while still asserting exactly the join the
+        // production path performs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = canon(dir.path());
 
-        // Extract the walk-tail (the parenthesized "(... )" suffix) and
-        // assert relative and absolute inputs ended the walk at the
-        // same point.
-        let tail = |m: &str| {
-            m.rfind('(')
-                .map(|i| m[i..].to_string())
-                .unwrap_or_else(|| m.to_string())
-        };
+        let rel = Path::new("nested/leaf");
+        // The relative input, normalized against the base, must equal the
+        // absolute path you'd get by joining the base yourself. This is the
+        // contract `discover_repo_config` relies on so a relative cwd ascends
+        // the same parent chain as its absolute equivalent.
+        let normalized = absolutize_cwd(rel, &base);
         assert_eq!(
-            tail(&rel_msg),
-            tail(&abs_msg),
-            "relative and absolute cwd must reach the same walk endpoint after normalization;\n  rel: {rel_msg}\n  abs: {abs_msg}",
+            normalized,
+            base.join(rel),
+            "a relative cwd must resolve by joining against the base dir",
         );
+        assert!(
+            normalized.is_absolute(),
+            "normalization against an absolute base must yield an absolute path \
+             so the walk reaches the real filesystem root, not the empty component",
+        );
+
+        // End-to-end against the absolute, normalized path: walking it must
+        // ascend a real parent chain and bottom out at the filesystem-root
+        // exhaust branch (the base tempdir has no `.git` and no
+        // `.hallouminate/config.toml` ancestor). This is the regression the fix
+        // guards: before normalization, a relative cwd's `Path::parent()` walk
+        // bottomed out at the empty component, producing a misleading error
+        // rather than ascending to the real root.
+        match discover_repo_config(&normalized) {
+            Err(HallouminateError::Config(m)) => {
+                assert!(
+                    m.contains("reached filesystem root") || m.contains("stopped at repo root"),
+                    "the normalized path must walk a real parent chain to a \
+                     boundary, not bottom out at an empty component; got: {m}",
+                );
+                assert!(
+                    m.contains(&normalized.display().to_string()),
+                    "the error must name the normalized cwd it walked from; got: {m}",
+                );
+            }
+            other => panic!("normalized relative input must error: {other:?}"),
+        }
     }
 
     #[test]

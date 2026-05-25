@@ -74,11 +74,13 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
     let baseline_src = baseline_source_path(args.config.as_deref());
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let (effective, layers) =
-        config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref())).map_err(|e| {
-            // Repo-config discovery failure: format the same "baseline: ... / repo: not found"
-            // header before the error so `show` and `validate` produce a consistent failure mode.
-            anyhow!(format_no_repo_error(&baseline_src, &cwd, &e))
-        })?;
+        config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref())).map_err(
+            |e| {
+                // Repo-config discovery failure: format the same "baseline: ... / repo: not found"
+                // header before the error so `show` and `validate` produce a consistent failure mode.
+                anyhow!(format_no_repo_error(&baseline_src, &cwd, &e))
+            },
+        )?;
     print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
     println!();
@@ -93,8 +95,9 @@ pub fn cmd_config_download(args: ConfigDownloadArgs) -> anyhow::Result<()> {
     let _tokenizer = load_tokenizer(&cfg.embeddings.model)
         .with_context(|| format!("download tokenizer for {}", cfg.embeddings.model))?;
     if cfg.embeddings.enabled {
-        let _embedder = Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir)
-            .with_context(|| format!("download embedding model {}", cfg.embeddings.model))?;
+        let _embedder =
+            Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir)
+                .with_context(|| format!("download embedding model {}", cfg.embeddings.model))?;
         println!("downloaded model + tokenizer for {}", cfg.embeddings.model);
     } else {
         // Embeddings are off: fetch only the tokenizer, skip the ONNX model.
@@ -396,10 +399,7 @@ mod tests {
         })
         .expect("seed XDG");
         let cwd = canon(dir.path());
-        write_repo_config(
-            &cwd,
-            "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n",
-        );
+        write_repo_config(&cwd, "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n");
         cmd_config_show(ConfigShowArgs {
             config: Some(xdg_path),
             cwd: Some(cwd),
@@ -419,10 +419,7 @@ mod tests {
         )
         .expect("write XDG with typo");
         let cwd = canon(dir.path());
-        write_repo_config(
-            &cwd,
-            "[[corpus]]\nname = \"present\"\npaths = [\"/x\"]\n",
-        );
+        write_repo_config(&cwd, "[[corpus]]\nname = \"present\"\npaths = [\"/x\"]\n");
         let err = cmd_config_validate(ConfigValidateArgs {
             config: Some(xdg_path),
             cwd: Some(cwd),
@@ -498,7 +495,10 @@ mod tests {
         let cwd = PathBuf::from("/work");
         let err = crate::domain::common::HallouminateError::Config("walked from /work".into());
         let out = format_no_repo_error(&baseline, &cwd, &err);
-        assert!(out.contains("baseline: /etc/hallouminate/config.toml"), "{out}");
+        assert!(
+            out.contains("baseline: /etc/hallouminate/config.toml"),
+            "{out}"
+        );
         assert!(out.contains("from XDG"), "missing XDG origin tag: {out}");
         assert!(out.contains("not found"), "missing status: {out}");
     }
@@ -525,10 +525,7 @@ mod tests {
         let cwd = canon(dir.path());
         let xdg_path = cwd.join("xdg.toml");
         fs::write(&xdg_path, "").expect("write empty XDG");
-        write_repo_config(
-            &cwd,
-            "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n",
-        );
+        write_repo_config(&cwd, "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n");
         // Just exercise the path — the printlns go to stdout. We assert on
         // the Ok result + that the implementation accesses both layers.
         cmd_config_validate(ConfigValidateArgs {
@@ -550,15 +547,11 @@ mod tests {
             "[[corpus]]\nname = \"global\"\npaths = [\"/global\"]\n",
         )
         .expect("write XDG with global corpus");
-        write_repo_config(
-            &cwd,
-            "[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n",
-        );
+        write_repo_config(&cwd, "[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n");
 
         // Re-load the same way `show` does and assert the merged corpora.
         let baseline = config::load_xdg(Some(&xdg_path)).expect("load baseline");
-        let (effective, _) =
-            config::resolve_for_cwd(&baseline, &cwd, None).expect("resolve");
+        let (effective, _) = config::resolve_for_cwd(&baseline, &cwd, None).expect("resolve");
         let names: Vec<&str> = effective.corpora.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["global", "local"]);
 
@@ -582,13 +575,15 @@ name = "self"
         let cfg = toml::from_str::<Config>(raw).expect("parse skeleton");
         let warnings = collect_warnings(Some(raw), &cfg);
         assert!(
-            warnings.iter().any(|w| w.contains("`corpora`")
-                && w.contains("[[corpus]]")),
+            warnings
+                .iter()
+                .any(|w| w.contains("`corpora`") && w.contains("[[corpus]]")),
             "missing corpora hint: {warnings:?}"
         );
         assert!(
-            warnings.iter().any(|w| w.contains("`code_repos`")
-                && w.contains("renamed to `[[repository]]`")),
+            warnings
+                .iter()
+                .any(|w| w.contains("`code_repos`") && w.contains("renamed to `[[repository]]`")),
             "missing code_repos hint: {warnings:?}"
         );
     }
@@ -618,7 +613,10 @@ paths = ["/tmp/wiki"]
 "#;
         let cfg = toml::from_str::<Config>(raw).expect("parse valid");
         let warnings = collect_warnings(Some(raw), &cfg);
-        assert!(warnings.is_empty(), "expected no warnings, got {warnings:?}");
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
     }
 
     #[test]
@@ -730,6 +728,7 @@ model = "clip-vit-b32"
             paths: vec!["/x".into()],
             globs: Vec::new(),
             exclude: Vec::new(),
+            global: false,
         });
         let warnings = collect_warnings(Some(raw), &cfg);
         assert!(

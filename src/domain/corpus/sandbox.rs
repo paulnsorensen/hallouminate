@@ -392,10 +392,8 @@ pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteErro
         // `O_NOFOLLOW`. Promote whichever to `Symlink` if `lstat` confirms
         // the entry is a symlink, so the caller sees one consistent kind.
         let kind = classify_path_error(err.source);
-        if matches!(
-            kind.kind,
-            WriteErrorKind::InvalidPath | WriteErrorKind::Io
-        ) && is_symlink_at(parent.as_raw_fd(), file_name.as_os_str())
+        if matches!(kind.kind, WriteErrorKind::InvalidPath | WriteErrorKind::Io)
+            && is_symlink_at(parent.as_raw_fd(), file_name.as_os_str())
         {
             return WriteError::new(
                 WriteErrorKind::Symlink,
@@ -743,6 +741,7 @@ mod tests {
             paths: paths.into_iter().map(String::from).collect(),
             globs: Vec::new(),
             exclude: Vec::new(),
+            global: false,
         }
     }
 
@@ -1002,6 +1001,7 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let entries = list_corpus_files(&corpus).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
@@ -1025,6 +1025,7 @@ mod tests {
             paths: vec![root.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let tree = build_corpus_tree(&corpus).unwrap();
         assert_eq!(tree.path, "");
@@ -1047,6 +1048,7 @@ mod tests {
             paths: vec![tmp.path().to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let tree = build_corpus_tree(&corpus).unwrap();
         assert_eq!(tree.path, "");
@@ -1076,6 +1078,7 @@ mod tests {
             ],
             globs: vec!["**/*.md".into()],
             exclude: vec![],
+            global: false,
         };
         let tree = build_corpus_tree(&corpus).unwrap();
         assert_eq!(tree.path, "");

@@ -92,6 +92,7 @@ pub fn repository_wiki_corpus(repo: &RepositoryConfig) -> Result<CorpusConfig> {
         paths: vec![wiki_dir.to_string_lossy().into_owned()],
         globs: vec!["**/*.md".to_string()],
         exclude: Vec::new(),
+        global: false,
     })
 }
 
@@ -115,6 +116,7 @@ pub fn repository_source_corpus(repo: &RepositoryConfig) -> Result<Option<Corpus
         paths,
         globs: repo.corpus_globs.clone(),
         exclude: repo.corpus_exclude.clone(),
+        global: false,
     }))
 }
 
@@ -282,6 +284,7 @@ mod tests {
             paths: vec!["/docs".into()],
             globs: vec!["**/*.md".into()],
             exclude: Vec::new(),
+            global: false,
         };
         let mut r = repo("tern", "/r");
         r.corpus_paths = vec!["src/docs".into()];

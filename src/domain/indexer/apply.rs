@@ -80,7 +80,7 @@ pub async fn apply(
         fallthrough_reqs,
         batch_size,
         store,
-        embedder.as_deref_mut(),
+        embedder,
         chunker,
         indexed_at_ms,
         &mut stats,

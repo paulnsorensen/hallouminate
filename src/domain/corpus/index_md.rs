@@ -192,9 +192,7 @@ fn dir_contains_markdown(dir: &Path) -> bool {
 /// H1 and the empty marker block — the caller fills the block on the next
 /// pass.
 pub fn render_scaffold(title: &str) -> String {
-    format!(
-        "# {title}\n\n{INDEX_START_MARKER}\n{INDEX_END_MARKER}\n",
-    )
+    format!("# {title}\n\n{INDEX_START_MARKER}\n{INDEX_END_MARKER}\n",)
 }
 
 /// Render the marker-bounded block body for `dir`.
@@ -362,10 +360,7 @@ mod tests {
         let lines: Vec<&str> = children.iter().map(|c| c.line.as_str()).collect();
         assert_eq!(
             lines,
-            vec![
-                "- [alpha](./alpha.md) — Alpha topic",
-                "- [beta](./beta.md)",
-            ],
+            vec!["- [alpha](./alpha.md) — Alpha topic", "- [beta](./beta.md)",],
         );
     }
 
@@ -462,9 +457,8 @@ mod tests {
     fn compose_index_md_unchanged_when_block_matches_existing() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.md"), "# Alpha\n").unwrap();
-        let current = format!(
-            "# wiki\n\n{INDEX_START_MARKER}\n- [a](./a.md) — Alpha\n{INDEX_END_MARKER}\n",
-        );
+        let current =
+            format!("# wiki\n\n{INDEX_START_MARKER}\n- [a](./a.md) — Alpha\n{INDEX_END_MARKER}\n",);
         let (content, outcome) = compose_index_md(tmp.path(), true, Some(&current)).unwrap();
         assert_eq!(outcome, RewriteOutcome::Unchanged);
         assert_eq!(content, current);
@@ -472,7 +466,8 @@ mod tests {
 
     #[test]
     fn inject_block_replaces_existing_content_between_markers() {
-        let input = format!("prefix {INDEX_START_MARKER}\nold\nmore old\n{INDEX_END_MARKER} suffix");
+        let input =
+            format!("prefix {INDEX_START_MARKER}\nold\nmore old\n{INDEX_END_MARKER} suffix");
         let out = inject_block(&input, "new\n").unwrap();
         assert_eq!(
             out,
