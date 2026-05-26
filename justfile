@@ -1,16 +1,31 @@
-# hallouminate dev commands.
-#
-#   just build::ci    checks only, no writes (mirrors .github/workflows/ci.yml)
-#   just build::llm   auto-fix formatting + lints, then verify
-#
-# (`just build ci` / `just build llm` also work.)
+# hallouminate dev commands — run `just` to list recipes.
 #
 # rustup honors rust-toolchain.toml (the crate's MSRV). protoc must be
 # installed locally for the lancedb build script:
 #   macOS:  brew install protobuf
 #   Debian: sudo apt-get install -y protobuf-compiler
 
-mod build
-
 default:
     @just --list
+
+# CI gate — checks only, no writes (mirrors .github/workflows/ci.yml).
+ci: _fmt-check _clippy _build _test
+
+# For agents/LLMs — auto-fix formatting + machine-applicable lints, then verify.
+llm: _fix _clippy _build _test
+
+_fmt-check:
+    cargo fmt --all --check
+
+_fix:
+    cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged
+    cargo fmt --all
+
+_clippy:
+    cargo clippy --locked --all-targets --all-features -- -D warnings
+
+_build:
+    cargo build --locked --all-targets
+
+_test:
+    cargo test --locked
