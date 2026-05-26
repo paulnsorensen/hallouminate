@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::ListArray;
-use arrow_array::builder::{ListBuilder, StringBuilder};
-use arrow_array::{
+use arrow::array::ListArray;
+use arrow::array::builder::{ListBuilder, StringBuilder};
+use arrow::array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
     StringArray,
 };
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
@@ -493,7 +493,7 @@ impl LanceStore {
         let file_refs: Vec<String> = batch.iter().map(|f| f.file_ref.clone()).collect();
         let scope = corpus_and_file_ref_filter(&corpus, &file_refs);
         let reader = RecordBatchIterator::new(std::iter::once(Ok(record_batch)), schema);
-        let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(reader);
+        let reader: Box<dyn arrow::array::RecordBatchReader + Send> = Box::new(reader);
         let mut builder = self.table.merge_insert(&["corpus", "chunk_id"]);
         builder
             .when_matched_update_all(None)
@@ -764,9 +764,9 @@ async fn open_or_create_table(connection: &lancedb::Connection) -> Result<lanced
             .map_err(map_lance_err);
     }
     let schema = chunks_schema();
-    let empty: Vec<std::result::Result<RecordBatch, arrow_schema::ArrowError>> = Vec::new();
+    let empty: Vec<std::result::Result<RecordBatch, arrow::error::ArrowError>> = Vec::new();
     let reader = RecordBatchIterator::new(empty.into_iter(), schema);
-    let reader: Box<dyn arrow_array::RecordBatchReader + Send> = Box::new(reader);
+    let reader: Box<dyn arrow::array::RecordBatchReader + Send> = Box::new(reader);
     connection
         .create_table(TABLE_NAME, reader)
         .execute()
@@ -1024,10 +1024,10 @@ schema_version = 1
         let schema = chunks_schema();
         let embedding = schema.field_with_name("embedding").unwrap();
         match embedding.data_type() {
-            arrow_schema::DataType::FixedSizeList(child, dim) => {
+            arrow::datatypes::DataType::FixedSizeList(child, dim) => {
                 assert_eq!(*dim, EMBEDDING_DIM as i32, "expected 384, got {dim}");
                 match child.data_type() {
-                    arrow_schema::DataType::Float32 => {}
+                    arrow::datatypes::DataType::Float32 => {}
                     other => panic!("expected Float32 child, got {other:?}"),
                 }
             }
@@ -1199,9 +1199,9 @@ mod weighted_rrf {
     use std::sync::Arc;
 
     use arrow::array::downcast_array;
-    use arrow::compute::{sort_to_indices, take};
-    use arrow_array::{Float32Array, RecordBatch, UInt64Array};
-    use arrow_schema::{DataType, Field, Schema, SortOptions};
+    use arrow::compute::{SortOptions, sort_to_indices, take};
+    use arrow::array::{Float32Array, RecordBatch, UInt64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use lancedb::rerankers::Reranker;
 
@@ -1288,9 +1288,9 @@ mod weighted_rrf {
                 None,
             )?;
 
-            let mut columns: Vec<Arc<dyn arrow_array::Array>> = combined.columns().to_vec();
+            let mut columns: Vec<Arc<dyn arrow::array::Array>> = combined.columns().to_vec();
             columns.push(Arc::new(relevance_scores));
-            let columns: Vec<Arc<dyn arrow_array::Array>> = columns
+            let columns: Vec<Arc<dyn arrow::array::Array>> = columns
                 .iter()
                 .map(|c| take(c, &sort_indices, None))
                 .collect::<arrow::error::Result<_>>()?;
@@ -1328,7 +1328,7 @@ mod weighted_rrf {
     #[cfg(test)]
     mod tests {
         use super::*;
-        use arrow_array::StringArray;
+        use arrow::array::StringArray;
 
         fn batch(ids: &[u64], names: &[&str]) -> RecordBatch {
             let schema = Arc::new(Schema::new(vec![

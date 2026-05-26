@@ -2,7 +2,7 @@
 name = "hallouminate"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 description = "A markdown corpus indexer for LLMs to build and query their own per-repo wikis."
 license = "MIT"
 readme = "README.md"
@@ -21,10 +21,10 @@ notify = "8"
 notify-debouncer-full = "0.7"
 
 # Storage
-lancedb = "0.27"
-arrow = "57"
-arrow-array = "57"
-arrow-schema = "57"
+lancedb = "0.29"
+# Only the `arrow` umbrella: its `arrow::array` / `arrow::datatypes` re-exports
+# replace direct arrow-array/arrow-schema deps, so they can never drift apart.
+arrow = "58"
 async-trait = "0.1"
 futures = "0.3"
 
@@ -42,12 +42,14 @@ pulldown-cmark = { version = "0.13", default-features = false }
 stop-words = "0.10"
 unicode-segmentation = "1"
 text-splitter = { version = "0.30", features = ["markdown", "tokenizers"] }
+# Pinned to ^0.22 to match text-splitter's tokenizers requirement; bumping to
+# 0.23 splits the crate graph and breaks the `ChunkSizer for Tokenizer` impl.
 tokenizers = { version = "0.22", features = ["http"] }
 
 # Serialization + config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1.1"
 
 # Error handling
 thiserror = "2"

@@ -1,51 +1,56 @@
-# CI gate — fmt, clippy, and tests on every PR and push to main.
-name: ci
+name: CI
 
 on:
-  pull_request:
-    branches: [main]
   push:
     branches: [main]
-
-permissions:
-  contents: read
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  pull_request:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
 
 jobs:
   fmt:
+    name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        # installs the channel pinned in rust-toolchain.toml (the crate's MSRV)
+        run: rustup show && rustup component add rustfmt
       - run: cargo fmt --all --check
 
   clippy:
+    name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        # lance-encoding (via lancedb) runs a build script that needs protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install Rust toolchain
+        run: rustup show && rustup component add clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features --locked
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-  test:
+  build-test:
+    name: build & test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        # cross-platform protoc (apt-get is Linux-only); lancedb needs it
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-features --locked
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Test
+        run: cargo test --locked
