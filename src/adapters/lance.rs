@@ -1199,8 +1199,8 @@ mod weighted_rrf {
     use std::sync::Arc;
 
     use arrow::array::downcast_array;
-    use arrow::compute::{SortOptions, sort_to_indices, take};
     use arrow::array::{Float32Array, RecordBatch, UInt64Array};
+    use arrow::compute::{SortOptions, sort_to_indices, take};
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use lancedb::rerankers::Reranker;
