@@ -8,34 +8,24 @@
 default:
     @just --list
 
-# Full CI gate, locally — mirrors .github/workflows/ci.yml.
-ci: fmt-check clippy build test
+# CI gate — checks only, no writes (mirrors .github/workflows/ci.yml).
+ci: _fmt-check _clippy _build _test
 
-# Auto-fix everything: clippy machine-applicable fixes, then format.
-fix:
+# For agents/LLMs — auto-fix formatting + machine-applicable lints, then verify.
+llm: _fix _clippy _build _test
+
+_fmt-check:
+    cargo fmt --all --check
+
+_fix:
     cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged
     cargo fmt --all
 
-# Format all code in place.
-fmt:
-    cargo fmt --all
-
-# Check formatting without writing (CI mode).
-fmt-check:
-    cargo fmt --all --check
-
-# Lint with clippy, warnings-as-errors (matches CI).
-clippy:
+_clippy:
     cargo clippy --locked --all-targets --all-features -- -D warnings
 
-# Fast type-check, no binaries.
-check:
-    cargo check --locked --all-targets
-
-# Build all targets.
-build:
+_build:
     cargo build --locked --all-targets
 
-# Run the test suite.
-test:
+_test:
     cargo test --locked
