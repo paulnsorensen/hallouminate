@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        # lance-encoding (via lancedb) runs a build script that needs protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install Rust toolchain
+        # installs the channel pinned in rust-toolchain.toml (the crate's MSRV)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --all-targets
+      - name: Test
+        run: cargo test --locked
