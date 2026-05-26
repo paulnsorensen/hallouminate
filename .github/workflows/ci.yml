@@ -34,14 +34,21 @@ jobs:
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   build-test:
-    name: build & test
-    # ubuntu-only: the crate is unix-only (libc path handling won't compile on
-    # Windows) and the macOS watcher FTS test is flaky — tracked separately.
-    runs-on: ubuntu-latest
+    name: build & test (${{ matrix.os }})
+    # Unix only: the crate is unix-only (libc path handling won't compile on
+    # Windows — tracked in #48).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
       - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # cross-platform protoc (apt-get is Linux-only); lancedb needs it
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
