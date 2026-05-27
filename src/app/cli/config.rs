@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 
 use crate::app::config::{self, Config, ResolvedLayers, xdg_config_path};
-use crate::domain::common::expand_tilde;
+use crate::domain::common::{canonicalize_or_passthrough, expand_tilde};
 use crate::domain::corpus::load_tokenizer;
 use crate::domain::embeddings::Embedder;
 
@@ -333,13 +333,13 @@ fn unregistered_wiki_advisory(repo_config_path: &Path, cfg: &Config) -> Option<S
     // Canonicalize so a corpus path written with `.` segments or a tilde
     // (e.g. `repo:self:wiki` from `path = "."`) compares equal to the
     // on-disk directory we just confirmed exists.
-    let target = canonicalize_best_effort(&wiki_dir);
+    let target = canonicalize_or_passthrough(&wiki_dir).into_path_buf();
     let corpora = cfg.effective_corpora().ok()?;
     let registered = corpora
         .iter()
         .filter(|c| is_repo_wiki_corpus(&c.name))
         .flat_map(|c| c.paths.iter())
-        .any(|p| canonicalize_best_effort(&expand_tilde(p)) == target);
+        .any(|p| canonicalize_or_passthrough(&expand_tilde(p)).into_path_buf() == target);
     if registered {
         return None;
     }
@@ -353,12 +353,6 @@ fn unregistered_wiki_advisory(repo_config_path: &Path, cfg: &Config) -> Option<S
 /// True for the canonical `repo:{name}:wiki` derived-corpus naming.
 fn is_repo_wiki_corpus(name: &str) -> bool {
     name.starts_with("repo:") && name.ends_with(":wiki")
-}
-
-/// Resolve symlinks and `.`/`..` segments, falling back to the input on
-/// failure (e.g. the path does not exist yet).
-fn canonicalize_best_effort(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
