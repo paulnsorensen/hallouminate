@@ -40,8 +40,11 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     // anything emitted before the subscriber installs (panics, early
     // config errors) and is the fallback diagnostic when the daemon
     // refuses to come up.
-    let log_path =
-        crate::app::xdg::xdg_path("XDG_STATE_HOME", "~/.local/state", &["hallouminate", "daemon-bootstrap.log"]);
+    let log_path = crate::app::xdg::xdg_path(
+        "XDG_STATE_HOME",
+        "~/.local/state",
+        &["hallouminate", "daemon-bootstrap.log"],
+    );
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -92,7 +95,9 @@ mod tests {
     #[test]
     fn empty_socket_env_does_not_bypass_spawn() {
         // POSIX/XDG convention: empty env value treated as unset.
-        assert!(!has_explicit_socket_override(Some(std::ffi::OsStr::new(""))));
+        assert!(!has_explicit_socket_override(Some(std::ffi::OsStr::new(
+            ""
+        ))));
     }
 
     #[test]

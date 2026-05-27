@@ -555,6 +555,20 @@ impl LanceStore {
         Ok(())
     }
 
+    /// True once the FTS (inverted) index on `text` exists. A full-text query
+    /// against a table that has rows but no inverted index hard-errors in
+    /// LanceDB, and `apply_batch` commits the rows (`merge_insert`) before it
+    /// commits the index (`ensure_search_indexes`) — so a concurrent query can
+    /// observe that in-between version. Callers guard on this and treat "index
+    /// not built yet" as "no results" (a transient state during indexing)
+    /// rather than surfacing the error.
+    async fn has_text_index(&self) -> Result<bool> {
+        let existing = self.table.list_indices().await.map_err(map_lance_err)?;
+        Ok(existing
+            .iter()
+            .any(|i| i.columns.iter().any(|c| c == "text")))
+    }
+
     pub async fn touch_mtime(&self, corpus: &str, file_ref: &str, new_mtime_ms: i64) -> Result<()> {
         let predicate = format!(
             "corpus = '{}' AND file_ref = '{}'",
@@ -691,6 +705,9 @@ impl LanceStore {
         if self.count_rows().await? == 0 {
             return Ok(Vec::new());
         }
+        if !self.has_text_index().await? {
+            return Ok(Vec::new());
+        }
         let reranker = std::sync::Arc::new(weighted_rrf::WeightedRRFReranker::default());
         let corpus_filter = format!("corpus = '{}'", escape_sql_str(corpus));
         let stream = self
@@ -727,6 +744,9 @@ impl LanceStore {
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
         if self.count_rows().await? == 0 {
+            return Ok(Vec::new());
+        }
+        if !self.has_text_index().await? {
             return Ok(Vec::new());
         }
         let corpus_filter = format!("corpus = '{}'", escape_sql_str(corpus));
@@ -1199,8 +1219,8 @@ mod weighted_rrf {
     use std::sync::Arc;
 
     use arrow::array::downcast_array;
-    use arrow::compute::{SortOptions, sort_to_indices, take};
     use arrow::array::{Float32Array, RecordBatch, UInt64Array};
+    use arrow::compute::{SortOptions, sort_to_indices, take};
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use lancedb::rerankers::Reranker;

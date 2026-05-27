@@ -1,0 +1,37 @@
+# Publishes the crate to crates.io on a version tag (e.g. v0.1.0).
+# Runs alongside release.yml (dist), which builds the GitHub Release binaries.
+#
+# Auth uses crates.io Trusted Publishing (OIDC) — no stored token. One-time setup:
+#   crates.io → hallouminate → Settings → Trusted Publishing → add GitHub publisher
+#   repository: paulnsorensen/hallouminate, workflow: publish-crates.yml
+# See: https://crates.io/docs/trusted-publishing
+name: publish-crates
+
+on:
+  push:
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: read
+  id-token: write # required for crates.io OIDC trusted publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          manifest="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$manifest" ]; then
+            echo "::error::Tag version '$tag' does not match Cargo.toml version '$manifest'"
+            exit 1
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

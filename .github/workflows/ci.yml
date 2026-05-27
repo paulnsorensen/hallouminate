@@ -9,8 +9,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-test:
-    name: build & test
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        # installs the channel pinned in rust-toolchain.toml (the crate's MSRV)
+        run: rustup show && rustup component add rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -18,10 +28,46 @@ jobs:
         # lance-encoding (via lancedb) runs a build script that needs protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install Rust toolchain
-        # installs the channel pinned in rust-toolchain.toml (the crate's MSRV)
+        run: rustup show && rustup component add clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+  build-test-matrix:
+    name: build & test (${{ matrix.os }})
+    # Unix only: the crate is unix-only (libc path handling won't compile on
+    # Windows — tracked in #48).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        # cross-platform protoc (apt-get is Linux-only); lancedb needs it
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --locked --all-targets
       - name: Test
         run: cargo test --locked
+
+  # Aggregation gate: the branch ruleset requires a single status check named
+  # "build & test", but the matrix expands to "build & test (ubuntu-latest)" etc.
+  # This job collapses the matrix into one required context and fails unless
+  # every matrix leg succeeded — so the required check stays stable when the
+  # matrix gains or loses an OS.
+  build-test:
+    name: build & test
+    needs: build-test-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all matrix legs to pass
+        if: needs.build-test-matrix.result != 'success'
+        run: exit 1
