@@ -33,7 +33,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-  build-test:
+  build-test-matrix:
     name: build & test (${{ matrix.os }})
     # Unix only: the crate is unix-only (libc path handling won't compile on
     # Windows — tracked in #48).
@@ -56,3 +56,18 @@ jobs:
         run: cargo build --locked --all-targets
       - name: Test
         run: cargo test --locked
+
+  # Aggregation gate: the branch ruleset requires a single status check named
+  # "build & test", but the matrix expands to "build & test (ubuntu-latest)" etc.
+  # This job collapses the matrix into one required context and fails unless
+  # every matrix leg succeeded — so the required check stays stable when the
+  # matrix gains or loses an OS.
+  build-test:
+    name: build & test
+    needs: build-test-matrix
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all matrix legs to pass
+        if: needs.build-test-matrix.result != 'success'
+        run: exit 1
