@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 
 use crate::app::config::{self, Config, ResolvedLayers, xdg_config_path};
-use crate::domain::common::expand_tilde;
+use crate::domain::common::{canonicalize_or_passthrough, expand_tilde};
 use crate::domain::corpus::load_tokenizer;
 use crate::domain::embeddings::Embedder;
 
@@ -83,6 +83,10 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
         )?;
     print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
+    if let Some(advisory) = unregistered_wiki_advisory(&layers.repo_path, &effective) {
+        println!();
+        println!("warning: {advisory}");
+    }
     println!();
     print!("{}", render_config(&effective)?);
     Ok(())
@@ -138,14 +142,24 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     println!();
     print_effective_summary(&effective)?;
 
+    // Non-fatal advisory: an on-disk wiki that no corpus serves. Printed
+    // alongside the fatal warnings but excluded from the exit-code count —
+    // it's a hint, not an error (issue #32).
+    let advisory = unregistered_wiki_advisory(&layers.repo_path, &effective);
     let warnings = collect_warnings(raw.as_deref(), &effective);
+
+    if advisory.is_some() || !warnings.is_empty() {
+        println!();
+    }
+    if let Some(advisory) = &advisory {
+        println!("warning: {advisory}");
+    }
+    for w in &warnings {
+        println!("warning: {w}");
+    }
     if warnings.is_empty() {
         println!("ok");
         return Ok(());
-    }
-    println!();
-    for w in &warnings {
-        println!("warning: {w}");
     }
     Err(anyhow!("{} warning(s); see above", warnings.len()))
 }
@@ -300,6 +314,45 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
         );
     }
     out
+}
+
+/// Non-fatal advisory for issue #32: a `.hallouminate/wiki/` directory sits
+/// next to the resolved repo config, but no `repo:*:wiki` corpus in the
+/// effective config points at it. That's a silent "configured but inert"
+/// state — the wiki is full of content yet unsearchable because nothing
+/// derived a corpus for it. Returns the warning text, or `None` when there's
+/// no wiki directory or it's already served by a `repo:*:wiki` corpus.
+///
+/// `repo_config_path` is the discovered `.hallouminate/config.toml`; its
+/// parent is the `.hallouminate/` directory the wiki lives under.
+fn unregistered_wiki_advisory(repo_config_path: &Path, cfg: &Config) -> Option<String> {
+    let wiki_dir = repo_config_path.parent()?.join("wiki");
+    if !wiki_dir.is_dir() {
+        return None;
+    }
+    // Canonicalize so a corpus path written with `.` segments or a tilde
+    // (e.g. `repo:self:wiki` from `path = "."`) compares equal to the
+    // on-disk directory we just confirmed exists.
+    let target = canonicalize_or_passthrough(&wiki_dir).into_path_buf();
+    let corpora = cfg.effective_corpora().ok()?;
+    let registered = corpora
+        .iter()
+        .filter(|c| is_repo_wiki_corpus(&c.name))
+        .flat_map(|c| c.paths.iter())
+        .any(|p| canonicalize_or_passthrough(&expand_tilde(p)).into_path_buf() == target);
+    if registered {
+        return None;
+    }
+    Some(format!(
+        "{} exists but no repository declares it — \
+         add a [[repository]] entry to make it searchable",
+        wiki_dir.display()
+    ))
+}
+
+/// True for the canonical `repo:{name}:wiki` derived-corpus naming.
+fn is_repo_wiki_corpus(name: &str) -> bool {
+    name.starts_with("repo:") && name.ends_with(":wiki")
 }
 
 #[cfg(test)]
@@ -752,5 +805,97 @@ model = "clip-vit-b32"
             warnings.iter().any(|w| w.contains("no corpora configured")),
             "empty corpora advisory missing: {warnings:?}"
         );
+    }
+
+    // ── unregistered_wiki_advisory (issue #32) ────────────────────────────
+
+    use crate::domain::repository::RepositoryConfig;
+
+    /// Create `<root>/.hallouminate/wiki/` and return the (notional) config
+    /// path `<root>/.hallouminate/config.toml` the advisory keys off.
+    fn seed_wiki_dir(root: &Path) -> PathBuf {
+        let hallou = root.join(".hallouminate");
+        std::fs::create_dir_all(hallou.join("wiki")).expect("mkdir wiki");
+        hallou.join("config.toml")
+    }
+
+    #[test]
+    fn wiki_advisory_warns_when_wiki_dir_present_but_unregistered() {
+        // AC #1: a populated `.hallouminate/wiki/` with no `repo:*:wiki`
+        // corpus pointing at it is the silent inert state we must flag.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        let repo_config = seed_wiki_dir(&root);
+        // No `[[repository]]` → no derived wiki corpus.
+        let cfg = Config::default();
+        let advisory =
+            unregistered_wiki_advisory(&repo_config, &cfg).expect("unregistered wiki must warn");
+        assert!(
+            advisory.contains("[[repository]]"),
+            "advisory must point at the fix: {advisory}"
+        );
+        assert!(
+            advisory.contains("wiki"),
+            "advisory must name the wiki dir: {advisory}"
+        );
+    }
+
+    #[test]
+    fn wiki_advisory_silent_when_wiki_registered_by_repository() {
+        // AC #2: a `[[repository]]` whose derived `repo:*:wiki` corpus
+        // resolves to this directory means the wiki is searchable — no warning.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        let repo_config = seed_wiki_dir(&root);
+        let cfg = Config {
+            repositories: vec![RepositoryConfig {
+                name: "self".into(),
+                path: root.to_string_lossy().into_owned(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            unregistered_wiki_advisory(&repo_config, &cfg).is_none(),
+            "a registered wiki must not warn"
+        );
+    }
+
+    #[test]
+    fn wiki_advisory_silent_when_no_wiki_dir() {
+        // AC #3: a repository-less scalar-override config with no
+        // `.hallouminate/wiki/` directory stays silent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        std::fs::create_dir_all(root.join(".hallouminate")).expect("mkdir .hallouminate");
+        let repo_config = root.join(".hallouminate").join("config.toml");
+        let cfg = Config::default();
+        assert!(
+            unregistered_wiki_advisory(&repo_config, &cfg).is_none(),
+            "absent wiki dir must not warn"
+        );
+    }
+
+    #[test]
+    fn validate_warns_but_exits_ok_for_unregistered_wiki() {
+        // AC #4: the wiki advisory is a hint, not an error — `validate` must
+        // still return Ok even though it printed the warning.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = canon(dir.path());
+        let xdg_path = cwd.join("xdg.toml");
+        // A baseline corpus keeps the fatal "no corpora configured" warning
+        // from firing, so the only warning in play is the non-fatal wiki one.
+        fs::write(
+            &xdg_path,
+            "[[corpus]]\nname = \"docs\"\npaths = [\"/tmp/docs\"]\n",
+        )
+        .expect("write XDG");
+        write_repo_config(&cwd, "");
+        std::fs::create_dir_all(cwd.join(".hallouminate").join("wiki")).expect("mkdir wiki");
+        cmd_config_validate(ConfigValidateArgs {
+            config: Some(xdg_path),
+            cwd: Some(cwd),
+        })
+        .expect("unregistered wiki advisory must be non-fatal");
     }
 }
