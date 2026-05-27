@@ -1,5 +1,10 @@
 # hallouminate
 
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/paulnsorensen/hallouminate/badge)](https://scorecard.dev/viewer/?uri=github.com/paulnsorensen/hallouminate)
+<!-- Register at https://www.bestpractices.dev/en/projects/new, then replace <id> and uncomment:
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<id>/badge)](https://www.bestpractices.dev/projects/<id>)
+-->
+
 A markdown corpus indexer for LLMs to build and query their own per-repo
 wikis. Hallouminate stores markdown verbatim on disk, embeds it with
 fastembed, indexes the embeddings in LanceDB, and exposes a small MCP
