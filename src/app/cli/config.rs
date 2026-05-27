@@ -828,8 +828,8 @@ model = "clip-vit-b32"
         let repo_config = seed_wiki_dir(&root);
         // No `[[repository]]` → no derived wiki corpus.
         let cfg = Config::default();
-        let advisory = unregistered_wiki_advisory(&repo_config, &cfg)
-            .expect("unregistered wiki must warn");
+        let advisory =
+            unregistered_wiki_advisory(&repo_config, &cfg).expect("unregistered wiki must warn");
         assert!(
             advisory.contains("[[repository]]"),
             "advisory must point at the fix: {advisory}"
