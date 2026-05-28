@@ -38,12 +38,12 @@ use std::path::{Component, Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use rustix::fs::{
-    fsync, mkdirat, openat, renameat, statat, unlinkat, AtFlags, FileType, Mode, OFlags,
+    AtFlags, FileType, Mode, OFlags, fsync, mkdirat, openat, renameat, statat, unlinkat,
 };
 use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::common::{expand_tilde, CorpusConfig};
+use crate::domain::common::{CorpusConfig, expand_tilde};
 use crate::domain::corpus::scan;
 
 /// Caller-supplied input failure when validating a corpus / path pair.
@@ -126,6 +126,15 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
     let path = Path::new(raw);
     if path.as_os_str().is_empty() || path.is_absolute() {
         return Err(SandboxError::new("path must be a non-empty relative path"));
+    }
+    // NUL bytes in path components can't be passed to syscalls — reject at
+    // the boundary so the caller gets the historical "path contains a NUL
+    // byte" message and `SandboxError` shape rather than letting the failure
+    // surface as `Errno::INVAL` deeper in the sandbox writer. (Defense in
+    // depth: `classify_*_errno` also maps `Errno::INVAL` to `InvalidPath`,
+    // but the boundary check gives a clearer error.)
+    if raw.contains('\0') {
+        return Err(SandboxError::new("path contains a NUL byte"));
     }
     if raw.ends_with('/') || raw == "." || raw.ends_with("/.") {
         return Err(SandboxError::new("path must name a file"));
@@ -601,7 +610,13 @@ fn classify_path_errno(errno: Errno) -> WriteError {
     let io_err: std::io::Error = errno.into();
     if errno == Errno::LOOP {
         WriteError::new(WriteErrorKind::Symlink, io_err)
-    } else if errno == Errno::NOTDIR {
+    } else if errno == Errno::NOTDIR || errno == Errno::INVAL {
+        // rustix surfaces a NUL byte in an `&OsStr` path argument as `INVAL`
+        // when it fails to build the underlying `&CStr`. Pre-migration code
+        // caught NUL upstream via `cstring(name)` and returned `InvalidPath`
+        // with a clear "path contains a NUL byte" message; preserve the
+        // public `WriteErrorKind` contract for any caller that bypasses
+        // `safe_relative_path`'s boundary NUL check.
         WriteError::new(WriteErrorKind::InvalidPath, io_err)
     } else {
         WriteError::new(WriteErrorKind::Io, io_err)
@@ -614,7 +629,8 @@ fn classify_create_errno(errno: Errno) -> WriteError {
         WriteError::new(WriteErrorKind::Symlink, io_err)
     } else if errno == Errno::EXIST {
         WriteError::new(WriteErrorKind::Exists, io_err)
-    } else if errno == Errno::NOTDIR || errno == Errno::ISDIR {
+    } else if errno == Errno::NOTDIR || errno == Errno::ISDIR || errno == Errno::INVAL {
+        // `INVAL` covers the NUL-in-path case; see `classify_path_errno`.
         WriteError::new(WriteErrorKind::InvalidPath, io_err)
     } else {
         WriteError::new(WriteErrorKind::Io, io_err)
@@ -704,6 +720,12 @@ mod tests {
     fn safe_relative_path_rejects_trailing_dot_segment() {
         let err = safe_relative_path("docs/.").expect_err("trailing `/.` must fail");
         assert!(err.as_str().contains("must name a file"), "got: {err}");
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_nul_byte() {
+        let err = safe_relative_path("file\0.md").expect_err("NUL byte must fail");
+        assert!(err.as_str().contains("NUL byte"), "got: {err}");
     }
 
     #[test]
@@ -876,6 +898,30 @@ mod tests {
         let err = atomic_write_no_follow(root, Path::new("x.md"), b"second", false)
             .expect_err("second write must EEXIST");
         assert!(matches!(err.kind, WriteErrorKind::Exists), "{err:?}");
+    }
+
+    #[test]
+    fn atomic_write_no_follow_classifies_nul_byte_filename_as_invalid_path() {
+        // Defense-in-depth: even if a caller bypasses `safe_relative_path`
+        // and reaches the writer with a NUL-bearing component, the rustix
+        // `Errno::INVAL` must classify as `InvalidPath` — not `Io` — so the
+        // public `WriteErrorKind` contract matches the pre-migration
+        // `cstring()`-based rejection.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A filename literally containing a NUL byte. Bypasses
+        // `safe_relative_path`'s string-level check by constructing
+        // straight from raw bytes.
+        let nul_name = OsString::from_vec(b"bad\0name.md".to_vec());
+        let rel = PathBuf::from(nul_name);
+        let err = atomic_write_no_follow(root, &rel, b"x", false)
+            .expect_err("NUL in component must fail");
+        assert!(
+            matches!(err.kind, WriteErrorKind::InvalidPath),
+            "expected InvalidPath, got {err:?}"
+        );
     }
 
     #[test]
