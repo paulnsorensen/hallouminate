@@ -1006,6 +1006,198 @@ mod tests {
         );
     }
 
+    // ── cap-std migration hardening ──────────────────────────────────
+    //
+    // These tests lock behaviour that changed shape in the cap-std
+    // migration (PR #N): the symlink-refusal contract moved from kernel
+    // `O_NOFOLLOW` to `Dir::symlink_metadata` pre-checks, and the
+    // capability now also refuses outside-the-root escapes via its own
+    // `EscapeAttempt`. Each test pins one cap-std-era property that would
+    // regress if the pre-check were dropped or the capability shape
+    // changed.
+
+    #[test]
+    fn read_no_follow_returns_contents_when_path_is_plain_file() {
+        // Happy-path lock for `read_no_follow` — the cap-std migration
+        // rewrote the leaf-open path; if the new `Dir::open` + `into_std`
+        // chain ever returns the wrong handle (e.g. a re-opened symlink
+        // target), the round-trip read will surface the regression.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/leaf.md"), b"# hardened\n").unwrap();
+        let got = read_no_follow(root, Path::new("a/b/leaf.md")).expect("read");
+        assert_eq!(got, b"# hardened\n");
+    }
+
+    #[test]
+    fn read_no_follow_rejects_symlinked_leaf_with_symlink_kind() {
+        // Mirrors `atomic_write_no_follow_rejects_final_component_symlink`
+        // but on the read path. The cap-std migration relies on a
+        // `Dir::symlink_metadata` pre-check (cap-std's own `Dir::open`
+        // would silently follow an in-capability symlink); regress the
+        // pre-check and a symlinked leaf would surface as `Io` (or worse,
+        // succeed) instead of `Symlink`.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let target = root.join("real.md");
+        std::fs::write(&target, b"target\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link.md")).unwrap();
+        let err =
+            read_no_follow(&root, Path::new("link.md")).expect_err("symlinked leaf must bounce");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
+    }
+
+    #[test]
+    fn read_no_follow_rejects_symlinked_intermediate_dir() {
+        // The pre-fix daemon path missed this exact case (leaf-only
+        // `symlink_metadata` check). The cap-std migration must keep the
+        // every-component pre-check — if `open_or_create_child_dir` skips
+        // the `symlink_metadata` call, an attacker who can plant a
+        // symlinked dir component inside the corpus can redirect reads.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), b"shh\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        let err = read_no_follow(&root, Path::new("escape/secret.md"))
+            .expect_err("intermediate symlink must bounce");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
+    }
+
+    #[test]
+    fn read_no_follow_classifies_missing_file_as_invalid_path() {
+        // Locks the classification path: a missing leaf goes through
+        // `classify_path_io_error`. ENOENT → `Io` (not `InvalidPath`,
+        // which is reserved for shape violations) — pins the contract so
+        // a downstream caller can still distinguish "you gave me a bad
+        // path" from "the file isn't there".
+        let tmp = tempfile::tempdir().unwrap();
+        let err = read_no_follow(tmp.path(), Path::new("missing.md"))
+            .expect_err("missing file must fail");
+        assert!(matches!(err.kind, WriteErrorKind::Io), "{err:?}");
+        assert_eq!(
+            err.source.kind(),
+            std::io::ErrorKind::NotFound,
+            "source kind: {err:?}"
+        );
+    }
+
+    #[test]
+    fn delete_no_follow_removes_existing_regular_file() {
+        // Happy-path lock for the delete path. cap-std's
+        // `Dir::remove_file` is the migration's replacement for
+        // `rustix::fs::unlinkat`; this test would catch a regression
+        // where the call is wired to the wrong cap-std method (e.g.
+        // `remove_dir`, which would fail on a regular file).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let target = root.join("sub/doomed.md");
+        std::fs::write(&target, b"bye\n").unwrap();
+        delete_no_follow(root, Path::new("sub/doomed.md")).expect("delete");
+        assert!(!target.exists(), "file must be gone");
+    }
+
+    #[test]
+    fn delete_no_follow_rejects_symlinked_leaf_without_unlinking_target() {
+        // Lock the security contract: a symlinked leaf must surface as
+        // `Symlink` and the target must survive. Regress the pre-check
+        // and cap-std's `Dir::remove_file` would unlink the SYMLINK
+        // itself (POSIX unlink semantics) — which technically leaves the
+        // target intact, but loses the explicit `Symlink` discrimination
+        // every daemon and MCP caller maps to a user-visible "refused
+        // symlink" error.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let target = tmp.path().join("target.md");
+        std::fs::write(&target, b"keep me\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link.md")).unwrap();
+        let err =
+            delete_no_follow(&root, Path::new("link.md")).expect_err("symlinked leaf must bounce");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
+        assert!(target.exists(), "target must survive");
+        assert!(root.join("link.md").exists(), "symlink must survive too");
+    }
+
+    #[test]
+    fn delete_no_follow_rejects_symlinked_intermediate_dir() {
+        // Same shape as the read test — covers the unlink path. The
+        // existing MCP integration test
+        // `mcp_delete_markdown_rejects_intermediate_symlinked_directory`
+        // covers this at the transport level; this unit lock makes the
+        // contract regression visible without booting the daemon.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("victim.md"), b"keep\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        let err = delete_no_follow(&root, Path::new("escape/victim.md"))
+            .expect_err("intermediate symlink must bounce");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
+        assert!(
+            outside.join("victim.md").exists(),
+            "victim file must survive the refused unlink"
+        );
+    }
+
+    #[test]
+    fn delete_no_follow_rejects_directory_target_as_invalid_path() {
+        // The leaf-is-a-directory case maps to `InvalidPath` ("target is
+        // not a regular file"), not `Io`. The cap-std migration's
+        // pre-check inspects `meta.is_file()`; this test pins that
+        // discrimination so a daemon caller asking for `delete_markdown
+        // some-subdir` gets the right user-facing error.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir(root.join("notafile")).unwrap();
+        let err = delete_no_follow(root, Path::new("notafile")).expect_err("dir target must fail");
+        assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
+    }
+
+    #[test]
+    fn atomic_write_no_follow_rejects_regular_file_as_intermediate_dir_component() {
+        // If a normal file sits where the writer expects a directory,
+        // the failure must be `InvalidPath` — not `Io`. The cap-std
+        // migration routes this through `open_or_create_child_dir`'s
+        // post-`symlink_metadata` `meta.is_dir()` check; without that
+        // check, cap-std would surface `NotADirectory` (errno mapped to
+        // `Io` via the stable `ErrorKind`), losing the historical
+        // discrimination.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("a"), b"i am a file\n").unwrap();
+        let err = atomic_write_no_follow(root, Path::new("a/b.md"), b"x", false)
+            .expect_err("file-as-dir-component must fail");
+        assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
+    }
+
+    #[test]
+    fn atomic_write_no_follow_durable_write_round_trips_through_fsync_path() {
+        // Locks the `fsync_dir` workaround for cap-std's `O_PATH` `Dir`
+        // handles on Linux: if the re-open of `.` regresses (e.g. the
+        // `Dir::open(".")` call gets replaced with a `try_clone` that
+        // returns the same O_PATH fd), `sync_all` would surface `EBADF`
+        // and propagate as `WriteError { kind: Io, .. }`. A successful
+        // round-trip means the workaround stayed effective.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        atomic_write_no_follow(root, Path::new("durable/leaf.md"), b"sync me\n", false)
+            .expect("first write must survive the fsync_dir call");
+        atomic_write_no_follow(root, Path::new("durable/leaf.md"), b"and again\n", true)
+            .expect("overwrite must survive the second fsync_dir call");
+        assert_eq!(
+            std::fs::read(root.join("durable/leaf.md")).unwrap(),
+            b"and again\n"
+        );
+    }
+
     // ── list_corpus_files ──────────────────────────────────────────────
 
     #[test]
