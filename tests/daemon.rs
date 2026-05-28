@@ -769,8 +769,8 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
 
     // Raise SIGTERM at our own process; the installed handler cancels the
     // shutdown token, the accept loop breaks, and `serve` runs cleanup.
-    let rc = unsafe { libc::raise(libc::SIGTERM) };
-    assert_eq!(rc, 0, "libc::raise(SIGTERM) must succeed");
+    rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::TERM)
+        .expect("kill_process(self, SIGTERM) must succeed");
 
     let served = timeout(Duration::from_secs(5), handle)
         .await

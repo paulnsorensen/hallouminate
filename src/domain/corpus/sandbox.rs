@@ -31,13 +31,16 @@
 //!    symlinked dir component bounces with `WriteError { kind: Symlink, .. }`
 //!    instead of leaking files outside the corpus root.
 
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, fsync, mkdirat, openat, renameat, statat, unlinkat,
+};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, expand_tilde};
@@ -123,6 +126,15 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
     let path = Path::new(raw);
     if path.as_os_str().is_empty() || path.is_absolute() {
         return Err(SandboxError::new("path must be a non-empty relative path"));
+    }
+    // NUL bytes in path components can't be passed to syscalls — reject at
+    // the boundary so the caller gets the historical "path contains a NUL
+    // byte" message and `SandboxError` shape rather than letting the failure
+    // surface as `Errno::INVAL` deeper in the sandbox writer. (Defense in
+    // depth: `classify_*_errno` also maps `Errno::INVAL` to `InvalidPath`,
+    // but the boundary check gives a clearer error.)
+    if raw.contains('\0') {
+        return Err(SandboxError::new("path contains a NUL byte"));
     }
     if raw.ends_with('/') || raw == "." || raw.ends_with("/.") {
         return Err(SandboxError::new("path must name a file"));
@@ -383,26 +395,21 @@ pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteErro
         .last()
         .ok_or_else(|| invalid_path_error("path must name a file"))?;
     let parent = open_parent_dir(root, &names[..names.len() - 1])?;
-    let c_name = cstring(file_name.as_os_str())?;
-    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags) };
-    let owned = fd_to_owned(fd, WriteErrorKind::Io).map_err(|err| {
-        // Match `open_child_dir_no_follow`'s classification: ELOOP on Linux,
-        // ENOTDIR / EACCES on macOS for symlinked leaves opened with
-        // `O_NOFOLLOW`. Promote whichever to `Symlink` if `lstat` confirms
-        // the entry is a symlink, so the caller sees one consistent kind.
-        let kind = classify_path_error(err.source);
-        if matches!(kind.kind, WriteErrorKind::InvalidPath | WriteErrorKind::Io)
-            && is_symlink_at(parent.as_raw_fd(), file_name.as_os_str())
+    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let owned = openat(&parent, file_name.as_os_str(), flags, Mode::empty()).map_err(|errno| {
+        // ELOOP on Linux, ENOTDIR / EACCES on macOS for symlinked leaves
+        // opened with `O_NOFOLLOW`. Promote whichever to `Symlink` if `lstat`
+        // confirms the entry is a symlink, so the caller sees one consistent
+        // kind across platforms.
+        let err = classify_path_errno(errno);
+        if matches!(err.kind, WriteErrorKind::InvalidPath | WriteErrorKind::Io)
+            && is_symlink_at(parent.as_fd(), file_name.as_os_str())
         {
-            return WriteError::new(
-                WriteErrorKind::Symlink,
-                std::io::Error::from_raw_os_error(libc::ELOOP),
-            );
+            return WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into());
         }
-        kind
+        err
     })?;
-    let mut file = unsafe { std::fs::File::from_raw_fd(owned.into_raw_fd()) };
+    let mut file = std::fs::File::from(owned);
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
@@ -420,45 +427,24 @@ pub fn delete_no_follow(root: &Path, relative: &Path) -> Result<(), WriteError> 
         .last()
         .ok_or_else(|| invalid_path_error("path must name a file"))?;
     let parent = open_parent_dir(root, &names[..names.len() - 1])?;
-    let c_name = cstring(file_name.as_os_str())?;
 
-    // Pre-flight: `fstatat` with `AT_SYMLINK_NOFOLLOW` so the symlink-leaf
+    // Pre-flight: `statat` with `AT_SYMLINK_NOFOLLOW` so the symlink-leaf
     // case surfaces as `Symlink` (and not-a-regular-file surfaces as
     // `InvalidPath`) before we call `unlinkat`. `unlinkat` without
     // `AT_REMOVEDIR` also doesn't follow symlinks by itself, but the daemon's
     // "deleted X" success message would otherwise be misleading.
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            c_name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc == -1 {
-        return Err(classify_create_error(std::io::Error::last_os_error()));
-    }
-    let stat = unsafe { stat.assume_init() };
-    let file_type = stat.st_mode & libc::S_IFMT;
-    if file_type == libc::S_IFLNK {
-        return Err(WriteError::new(
-            WriteErrorKind::Symlink,
-            std::io::Error::from_raw_os_error(libc::ELOOP),
-        ));
-    }
-    if file_type != libc::S_IFREG {
-        return Err(invalid_path_error("target is not a regular file"));
+    let stat = statat(&parent, file_name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(classify_create_errno)?;
+    match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Symlink => {
+            return Err(WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into()));
+        }
+        FileType::RegularFile => {}
+        _ => return Err(invalid_path_error("target is not a regular file")),
     }
 
-    let rc = unsafe { libc::unlinkat(parent.as_raw_fd(), c_name.as_ptr(), 0) };
-    if rc == -1 {
-        return Err(WriteError::new(
-            WriteErrorKind::Io,
-            std::io::Error::last_os_error(),
-        ));
-    }
-    Ok(())
+    unlinkat(&parent, file_name.as_os_str(), AtFlags::empty())
+        .map_err(|errno| WriteError::new(WriteErrorKind::Io, errno.into()))
 }
 
 fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {
@@ -482,154 +468,101 @@ fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {
 fn open_parent_dir(root: &Path, dirs: &[OsString]) -> Result<OwnedFd, WriteError> {
     let mut current = open_root_dir(root)?;
     for dir in dirs {
-        current = open_or_create_child_dir(current.as_raw_fd(), dir.as_os_str())?;
+        current = open_or_create_child_dir(current.as_fd(), dir.as_os_str())?;
     }
     Ok(current)
 }
 
 fn open_root_dir(root: &Path) -> Result<OwnedFd, WriteError> {
-    let c_root = cstring(root.as_os_str())?;
-    let fd = unsafe {
-        libc::open(
-            c_root.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
-    };
-    fd_to_owned(fd, WriteErrorKind::Io)
+    rustix::fs::open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|errno| WriteError::new(WriteErrorKind::Io, errno.into()))
 }
 
-fn open_or_create_child_dir(parent_fd: i32, name: &OsStr) -> Result<OwnedFd, WriteError> {
-    match open_child_dir_no_follow(parent_fd, name) {
+fn open_or_create_child_dir(parent: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, WriteError> {
+    match open_child_dir_no_follow(parent, name) {
         Ok(fd) => Ok(fd),
-        Err(err) if err.source.raw_os_error() == Some(libc::ENOENT) => {
-            let c_name = cstring(name)?;
-            let made = unsafe { libc::mkdirat(parent_fd, c_name.as_ptr(), 0o755) };
-            if made == -1 {
-                let source = std::io::Error::last_os_error();
-                if source.raw_os_error() != Some(libc::EEXIST) {
-                    return Err(classify_path_error(source));
-                }
+        Err(err) if err.source.raw_os_error() == Some(Errno::NOENT.raw_os_error()) => {
+            match mkdirat(parent, name, Mode::from_bits_truncate(0o755)) {
+                Ok(()) => {}
+                Err(errno) if errno == Errno::EXIST => {}
+                Err(errno) => return Err(classify_path_errno(errno)),
             }
-            open_child_dir_no_follow(parent_fd, name)
+            open_child_dir_no_follow(parent, name)
         }
         Err(err) => Err(err),
     }
 }
 
-fn open_child_dir_no_follow(parent_fd: i32, name: &OsStr) -> Result<OwnedFd, WriteError> {
-    let c_name = cstring(name)?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-    let fd = unsafe { libc::openat(parent_fd, c_name.as_ptr(), flags) };
-    fd_to_owned(fd, WriteErrorKind::Io).map_err(|err| {
+fn open_child_dir_no_follow(parent: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, WriteError> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    openat(parent, name, flags, Mode::empty()).map_err(|errno| {
         // Linux: opening a symlinked component with `O_NOFOLLOW | O_DIRECTORY`
         // returns `ELOOP`. macOS: same syscall returns `ENOTDIR` because the
         // dir-open refusal happens before the symlink check. To classify the
         // refusal consistently across platforms (the security guarantee is
         // identical — the writer bounces either way), `lstat` the entry and
         // promote `ENOTDIR` to `Symlink` when the entry is actually a symlink.
-        let kind = classify_path_error(err.source);
-        if matches!(kind.kind, WriteErrorKind::InvalidPath) && is_symlink_at(parent_fd, name) {
-            return WriteError::new(
-                WriteErrorKind::Symlink,
-                std::io::Error::from_raw_os_error(libc::ELOOP),
-            );
+        let err = classify_path_errno(errno);
+        if matches!(err.kind, WriteErrorKind::InvalidPath) && is_symlink_at(parent, name) {
+            return WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into());
         }
-        kind
+        err
     })
 }
 
-fn is_symlink_at(parent_fd: i32, name: &OsStr) -> bool {
-    let Ok(c_name) = cstring(name) else {
-        return false;
-    };
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe {
-        libc::fstatat(
-            parent_fd,
-            c_name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc == -1 {
-        return false;
+fn is_symlink_at(parent: BorrowedFd<'_>, name: &OsStr) -> bool {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => FileType::from_raw_mode(stat.st_mode) == FileType::Symlink,
+        Err(_) => false,
     }
-    let stat = unsafe { stat.assume_init() };
-    (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
 }
 
 fn write_new_file(parent: &OwnedFd, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
-    let c_name = cstring(name)?;
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), c_name.as_ptr(), flags, 0o644) };
-    if fd == -1 {
-        return Err(classify_create_error(std::io::Error::last_os_error()));
-    }
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    let owned = openat(parent, name, flags, Mode::from_bits_truncate(0o644))
+        .map_err(classify_create_errno)?;
+    let mut file = std::fs::File::from(owned);
     write_and_sync(&mut file, content)?;
     drop(file);
     fsync_dir(parent)
 }
 
 fn atomic_replace(parent: &OwnedFd, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
-    validate_replace_target(parent.as_raw_fd(), name)?;
-    let (temp_name, mut file) = create_temp_file(parent.as_raw_fd(), name)?;
+    validate_replace_target(parent.as_fd(), name)?;
+    let (temp_name, mut file) = create_temp_file(parent.as_fd(), name)?;
     if let Err(err) = write_and_sync(&mut file, content) {
-        cleanup_temp(parent.as_raw_fd(), &temp_name);
+        cleanup_temp(parent.as_fd(), &temp_name);
         return Err(err);
     }
     drop(file);
 
-    let c_name = cstring(name)?;
-    let renamed = unsafe {
-        libc::renameat(
-            parent.as_raw_fd(),
-            temp_name.as_ptr(),
-            parent.as_raw_fd(),
-            c_name.as_ptr(),
-        )
-    };
-    if renamed == -1 {
-        let source = std::io::Error::last_os_error();
-        cleanup_temp(parent.as_raw_fd(), &temp_name);
-        return Err(classify_create_error(source));
+    if let Err(errno) = renameat(parent, temp_name.as_os_str(), parent, name) {
+        cleanup_temp(parent.as_fd(), &temp_name);
+        return Err(classify_create_errno(errno));
     }
     fsync_dir(parent)
 }
 
-fn validate_replace_target(parent_fd: i32, name: &OsStr) -> Result<(), WriteError> {
-    let c_name = cstring(name)?;
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let rc = unsafe {
-        libc::fstatat(
-            parent_fd,
-            c_name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc == -1 {
-        let source = std::io::Error::last_os_error();
-        if source.raw_os_error() == Some(libc::ENOENT) {
-            return Ok(());
-        }
-        return Err(classify_create_error(source));
+fn validate_replace_target(parent: BorrowedFd<'_>, name: &OsStr) -> Result<(), WriteError> {
+    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Symlink => Err(WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into())),
+            FileType::RegularFile => Ok(()),
+            _ => Err(invalid_path_error("target is not a regular file")),
+        },
+        Err(errno) if errno == Errno::NOENT => Ok(()),
+        Err(errno) => Err(classify_create_errno(errno)),
     }
-    let stat = unsafe { stat.assume_init() };
-    let file_type = stat.st_mode & libc::S_IFMT;
-    if file_type == libc::S_IFLNK {
-        return Err(WriteError::new(
-            WriteErrorKind::Symlink,
-            std::io::Error::from_raw_os_error(libc::ELOOP),
-        ));
-    }
-    if file_type != libc::S_IFREG {
-        return Err(invalid_path_error("target is not a regular file"));
-    }
-    Ok(())
 }
 
-fn create_temp_file(parent_fd: i32, name: &OsStr) -> Result<(CString, std::fs::File), WriteError> {
+fn create_temp_file(
+    parent: BorrowedFd<'_>,
+    name: &OsStr,
+) -> Result<(OsString, std::fs::File), WriteError> {
     for attempt in 0..100 {
         let mut temp = OsString::from(".");
         temp.push(name);
@@ -637,17 +570,17 @@ fn create_temp_file(parent_fd: i32, name: &OsStr) -> Result<(CString, std::fs::F
             ".hallouminate-{}-{attempt}.tmp",
             std::process::id()
         ));
-        let c_temp = cstring(temp.as_os_str())?;
         let flags =
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        let fd = unsafe { libc::openat(parent_fd, c_temp.as_ptr(), flags, 0o644) };
-        if fd != -1 {
-            let file = unsafe { std::fs::File::from_raw_fd(fd) };
-            return Ok((c_temp, file));
-        }
-        let source = std::io::Error::last_os_error();
-        if source.raw_os_error() != Some(libc::EEXIST) {
-            return Err(classify_create_error(source));
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+        match openat(
+            parent,
+            temp.as_os_str(),
+            flags,
+            Mode::from_bits_truncate(0o644),
+        ) {
+            Ok(fd) => return Ok((temp, std::fs::File::from(fd))),
+            Err(errno) if errno == Errno::EXIST => continue,
+            Err(errno) => return Err(classify_create_errno(errno)),
         }
     }
     Err(WriteError::new(
@@ -666,53 +599,41 @@ fn write_and_sync(file: &mut std::fs::File, content: &[u8]) -> Result<(), WriteE
 }
 
 fn fsync_dir(dir: &OwnedFd) -> Result<(), WriteError> {
-    let rc = unsafe { libc::fsync(dir.as_raw_fd()) };
-    if rc == -1 {
-        Err(WriteError::new(
-            WriteErrorKind::Io,
-            std::io::Error::last_os_error(),
-        ))
+    fsync(dir).map_err(|errno| WriteError::new(WriteErrorKind::Io, errno.into()))
+}
+
+fn cleanup_temp(parent: BorrowedFd<'_>, name: &OsStr) {
+    let _ = unlinkat(parent, name, AtFlags::empty());
+}
+
+fn classify_path_errno(errno: Errno) -> WriteError {
+    let io_err: std::io::Error = errno.into();
+    if errno == Errno::LOOP {
+        WriteError::new(WriteErrorKind::Symlink, io_err)
+    } else if errno == Errno::NOTDIR || errno == Errno::INVAL {
+        // rustix surfaces a NUL byte in an `&OsStr` path argument as `INVAL`
+        // when it fails to build the underlying `&CStr`. Pre-migration code
+        // caught NUL upstream via `cstring(name)` and returned `InvalidPath`
+        // with a clear "path contains a NUL byte" message; preserve the
+        // public `WriteErrorKind` contract for any caller that bypasses
+        // `safe_relative_path`'s boundary NUL check.
+        WriteError::new(WriteErrorKind::InvalidPath, io_err)
     } else {
-        Ok(())
+        WriteError::new(WriteErrorKind::Io, io_err)
     }
 }
 
-fn cleanup_temp(parent_fd: i32, name: &CString) {
-    unsafe {
-        libc::unlinkat(parent_fd, name.as_ptr(), 0);
-    }
-}
-
-fn fd_to_owned(fd: i32, default: WriteErrorKind) -> Result<OwnedFd, WriteError> {
-    if fd == -1 {
-        Err(WriteError::new(default, std::io::Error::last_os_error()))
+fn classify_create_errno(errno: Errno) -> WriteError {
+    let io_err: std::io::Error = errno.into();
+    if errno == Errno::LOOP {
+        WriteError::new(WriteErrorKind::Symlink, io_err)
+    } else if errno == Errno::EXIST {
+        WriteError::new(WriteErrorKind::Exists, io_err)
+    } else if errno == Errno::NOTDIR || errno == Errno::ISDIR || errno == Errno::INVAL {
+        // `INVAL` covers the NUL-in-path case; see `classify_path_errno`.
+        WriteError::new(WriteErrorKind::InvalidPath, io_err)
     } else {
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-}
-
-fn cstring(name: &OsStr) -> Result<CString, WriteError> {
-    CString::new(name.as_bytes()).map_err(|_| invalid_path_error("path contains a NUL byte"))
-}
-
-fn classify_path_error(source: std::io::Error) -> WriteError {
-    match source.raw_os_error() {
-        Some(errno) if errno == libc::ELOOP => WriteError::new(WriteErrorKind::Symlink, source),
-        Some(errno) if errno == libc::ENOTDIR => {
-            WriteError::new(WriteErrorKind::InvalidPath, source)
-        }
-        _ => WriteError::new(WriteErrorKind::Io, source),
-    }
-}
-
-fn classify_create_error(source: std::io::Error) -> WriteError {
-    match source.raw_os_error() {
-        Some(errno) if errno == libc::ELOOP => WriteError::new(WriteErrorKind::Symlink, source),
-        Some(errno) if errno == libc::EEXIST => WriteError::new(WriteErrorKind::Exists, source),
-        Some(errno) if errno == libc::ENOTDIR || errno == libc::EISDIR => {
-            WriteError::new(WriteErrorKind::InvalidPath, source)
-        }
-        _ => WriteError::new(WriteErrorKind::Io, source),
+        WriteError::new(WriteErrorKind::Io, io_err)
     }
 }
 
@@ -799,6 +720,12 @@ mod tests {
     fn safe_relative_path_rejects_trailing_dot_segment() {
         let err = safe_relative_path("docs/.").expect_err("trailing `/.` must fail");
         assert!(err.as_str().contains("must name a file"), "got: {err}");
+    }
+
+    #[test]
+    fn safe_relative_path_rejects_nul_byte() {
+        let err = safe_relative_path("file\0.md").expect_err("NUL byte must fail");
+        assert!(err.as_str().contains("NUL byte"), "got: {err}");
     }
 
     #[test]
@@ -971,6 +898,30 @@ mod tests {
         let err = atomic_write_no_follow(root, Path::new("x.md"), b"second", false)
             .expect_err("second write must EEXIST");
         assert!(matches!(err.kind, WriteErrorKind::Exists), "{err:?}");
+    }
+
+    #[test]
+    fn atomic_write_no_follow_classifies_nul_byte_filename_as_invalid_path() {
+        // Defense-in-depth: even if a caller bypasses `safe_relative_path`
+        // and reaches the writer with a NUL-bearing component, the rustix
+        // `Errno::INVAL` must classify as `InvalidPath` — not `Io` — so the
+        // public `WriteErrorKind` contract matches the pre-migration
+        // `cstring()`-based rejection.
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // A filename literally containing a NUL byte. Bypasses
+        // `safe_relative_path`'s string-level check by constructing
+        // straight from raw bytes.
+        let nul_name = OsString::from_vec(b"bad\0name.md".to_vec());
+        let rel = PathBuf::from(nul_name);
+        let err = atomic_write_no_follow(root, &rel, b"x", false)
+            .expect_err("NUL in component must fail");
+        assert!(
+            matches!(err.kind, WriteErrorKind::InvalidPath),
+            "expected InvalidPath, got {err:?}"
+        );
     }
 
     #[test]
