@@ -12,13 +12,13 @@
 //!    map straight to their preferred error type (anyhow for MCP, `String`
 //!    for daemon JSON envelopes).
 //!
-//! 2. **`atomic_write_no_follow`** — the symlink-safe `openat`-based writer
-//!    the MCP path already used. The daemon's previous
-//!    `tokio::fs::create_dir_all` + `tokio::fs::write` path only checked the
-//!    leaf for symlinks and missed symlinked intermediate directory
-//!    components; this shared implementation walks every path component with
-//!    `O_NOFOLLOW | O_DIRECTORY` so a symlinked dir-component bounces with
-//!    `WriteError { kind: Symlink, .. }`.
+//! 2. **`atomic_write_no_follow`** — the symlink-safe writer the MCP path
+//!    already used. The daemon's previous `tokio::fs::create_dir_all` +
+//!    `tokio::fs::write` path only checked the leaf for symlinks and missed
+//!    symlinked intermediate directory components; this shared implementation
+//!    walks every path component through a `cap-std` `Dir` capability and
+//!    pre-checks each with `symlink_metadata`, so a symlinked dir-component
+//!    bounces with `WriteError { kind: Symlink, .. }`.
 //!
 //! 3. **`list_corpus_files`** — scan-and-format helper both transports
 //!    expose via `list_files` and the daemon's add-markdown ack.
@@ -27,20 +27,18 @@
 //!    counterparts to `atomic_write_no_follow`. The pre-refactor daemon used
 //!    `tokio::fs::read` / `tokio::fs::remove_file` after a leaf-only
 //!    `symlink_metadata` check; that left intermediate-symlink escapes wide
-//!    open. These helpers walk every parent component with `O_NOFOLLOW` so a
-//!    symlinked dir component bounces with `WriteError { kind: Symlink, .. }`
-//!    instead of leaking files outside the corpus root.
+//!    open. These helpers walk every parent component through the same
+//!    cap-std `Dir` capability and pre-check each component for symlinks,
+//!    so a symlinked dir component bounces with `WriteError { kind: Symlink,
+//!    .. }` instead of leaking files outside the corpus root.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, fsync, mkdirat, openat, renameat, statat, unlinkat,
-};
-use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, expand_tilde};
@@ -130,9 +128,9 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
     // NUL bytes in path components can't be passed to syscalls — reject at
     // the boundary so the caller gets the historical "path contains a NUL
     // byte" message and `SandboxError` shape rather than letting the failure
-    // surface as `Errno::INVAL` deeper in the sandbox writer. (Defense in
-    // depth: `classify_*_errno` also maps `Errno::INVAL` to `InvalidPath`,
-    // but the boundary check gives a clearer error.)
+    // surface as `EINVAL` deeper in the sandbox writer. (Defense in depth:
+    // `classify_*_io_error` also maps `EINVAL` to `InvalidPath`, but the
+    // boundary check gives a clearer error.)
     if raw.contains('\0') {
         return Err(SandboxError::new("path contains a NUL byte"));
     }
@@ -333,18 +331,28 @@ fn sort_tree(node: &mut TreeNode) {
 
 // ── atomic_write_no_follow ──────────────────────────────────────────────
 //
-// `openat`-based atomic writer that walks every path component with
-// `O_NOFOLLOW | O_DIRECTORY` and refuses to traverse a symlinked component.
-// Previously a fork of this lived only in the MCP transport while the
-// daemon used `tokio::fs::write` + a leaf `symlink_metadata` check — which
-// missed symlinked intermediate directories. Sharing the implementation
-// closes that asymmetry and gives both transports the same write contract.
+// Atomic writer that walks every path component through a `cap-std` `Dir`
+// capability and refuses to traverse a symlinked component. Previously a
+// fork of this lived only in the MCP transport while the daemon used
+// `tokio::fs::write` + a leaf `symlink_metadata` check — which missed
+// symlinked intermediate directories. Sharing the implementation closes that
+// asymmetry and gives both transports the same write contract.
+//
+// `cap-std`'s default open APIs follow symlinks during path resolution as
+// long as the target stays within the capability (an outside-pointing
+// symlink errors with `EscapeAttempt`). To preserve the historical
+// "refuse ALL symlinks in the path" contract — and the
+// `WriteErrorKind::Symlink` discrimination both transports already rely on —
+// every parent component and the leaf are pre-checked with
+// `Dir::symlink_metadata` before the corresponding `open_dir` / `open` /
+// `remove_file` / `rename` call. The capability still guarantees the
+// post-write resolved path stays under the root.
 
 #[derive(Debug)]
 pub enum WriteErrorKind {
     /// File exists and `overwrite=false`.
     Exists,
-    /// A path component was a symlink while walking with `O_NOFOLLOW`.
+    /// A path component was a symlink.
     Symlink,
     /// The relative path names a non-directory parent or non-file target.
     InvalidPath,
@@ -385,8 +393,9 @@ pub fn atomic_write_no_follow(
 }
 
 /// Read the contents of `<root>/<relative>` after walking every parent
-/// component with `O_NOFOLLOW`. The leaf is opened `O_RDONLY | O_NOFOLLOW`,
-/// so a symlinked leaf bounces with `WriteErrorKind::Symlink`. Mirrors
+/// component through a `cap-std` `Dir` capability and pre-checking each for
+/// symlinks. The leaf is opened only after a `symlink_metadata` check, so a
+/// symlinked leaf bounces with `WriteErrorKind::Symlink`. Mirrors
 /// `atomic_write_no_follow`'s component-walk so a single change to the
 /// no-follow logic stays in one place.
 pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteError> {
@@ -395,32 +404,22 @@ pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteErro
         .last()
         .ok_or_else(|| invalid_path_error("path must name a file"))?;
     let parent = open_parent_dir(root, &names[..names.len() - 1])?;
-    let flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let owned = openat(&parent, file_name.as_os_str(), flags, Mode::empty()).map_err(|errno| {
-        // ELOOP on Linux, ENOTDIR / EACCES on macOS for symlinked leaves
-        // opened with `O_NOFOLLOW`. Promote whichever to `Symlink` if `lstat`
-        // confirms the entry is a symlink, so the caller sees one consistent
-        // kind across platforms.
-        let err = classify_path_errno(errno);
-        if matches!(err.kind, WriteErrorKind::InvalidPath | WriteErrorKind::Io)
-            && is_symlink_at(parent.as_fd(), file_name.as_os_str())
-        {
-            return WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into());
-        }
-        err
-    })?;
-    let mut file = std::fs::File::from(owned);
+    reject_symlink_leaf(&parent, file_name.as_os_str())?;
+    let cap_file = parent
+        .open(file_name.as_os_str())
+        .map_err(classify_path_io_error)?;
+    let mut file = cap_file.into_std();
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
     Ok(buf)
 }
 
-/// Unlink `<root>/<relative>` after walking every parent component with
-/// `O_NOFOLLOW`. Refuses to delete when the leaf is a symlink (the pre-fix
-/// daemon path silently followed parent symlinks via `tokio::fs::remove_file`,
-/// letting a corpus-controlled directory symlink redirect the unlink outside
-/// the corpus root).
+/// Unlink `<root>/<relative>` after walking every parent component through a
+/// `cap-std` `Dir` capability. Refuses to delete when the leaf is a symlink
+/// (the pre-fix daemon path silently followed parent symlinks via
+/// `tokio::fs::remove_file`, letting a corpus-controlled directory symlink
+/// redirect the unlink outside the corpus root).
 pub fn delete_no_follow(root: &Path, relative: &Path) -> Result<(), WriteError> {
     let names = normal_components(relative)?;
     let file_name = names
@@ -428,23 +427,25 @@ pub fn delete_no_follow(root: &Path, relative: &Path) -> Result<(), WriteError> 
         .ok_or_else(|| invalid_path_error("path must name a file"))?;
     let parent = open_parent_dir(root, &names[..names.len() - 1])?;
 
-    // Pre-flight: `statat` with `AT_SYMLINK_NOFOLLOW` so the symlink-leaf
-    // case surfaces as `Symlink` (and not-a-regular-file surfaces as
-    // `InvalidPath`) before we call `unlinkat`. `unlinkat` without
-    // `AT_REMOVEDIR` also doesn't follow symlinks by itself, but the daemon's
-    // "deleted X" success message would otherwise be misleading.
-    let stat = statat(&parent, file_name.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)
-        .map_err(classify_create_errno)?;
-    match FileType::from_raw_mode(stat.st_mode) {
-        FileType::Symlink => {
-            return Err(WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into()));
-        }
-        FileType::RegularFile => {}
-        _ => return Err(invalid_path_error("target is not a regular file")),
+    // Pre-flight: `symlink_metadata` so the symlink-leaf case surfaces as
+    // `Symlink` (and not-a-regular-file surfaces as `InvalidPath`) before we
+    // call `remove_file`. cap-std's `Dir::remove_file` doesn't follow a
+    // symlink either, but the daemon's "deleted X" success message would
+    // otherwise be misleading if the leaf were a symlink.
+    let meta = parent
+        .symlink_metadata(file_name.as_os_str())
+        .map_err(classify_create_io_error)?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()));
+    }
+    if !ft.is_file() {
+        return Err(invalid_path_error("target is not a regular file"));
     }
 
-    unlinkat(&parent, file_name.as_os_str(), AtFlags::empty())
-        .map_err(|errno| WriteError::new(WriteErrorKind::Io, errno.into()))
+    parent
+        .remove_file(file_name.as_os_str())
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
 }
 
 fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {
@@ -465,104 +466,122 @@ fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {
     Ok(out)
 }
 
-fn open_parent_dir(root: &Path, dirs: &[OsString]) -> Result<OwnedFd, WriteError> {
+fn open_parent_dir(root: &Path, dirs: &[OsString]) -> Result<Dir, WriteError> {
     let mut current = open_root_dir(root)?;
     for dir in dirs {
-        current = open_or_create_child_dir(current.as_fd(), dir.as_os_str())?;
+        current = open_or_create_child_dir(&current, dir.as_os_str())?;
     }
     Ok(current)
 }
 
-fn open_root_dir(root: &Path) -> Result<OwnedFd, WriteError> {
-    rustix::fs::open(
-        root,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|errno| WriteError::new(WriteErrorKind::Io, errno.into()))
+fn open_root_dir(root: &Path) -> Result<Dir, WriteError> {
+    // `open_ambient_dir` is the documented bootstrap for getting a `Dir`
+    // capability from an absolute path. All subsequent component opens go
+    // through that capability and stay confined to `root`.
+    Dir::open_ambient_dir(root, ambient_authority())
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
 }
 
-fn open_or_create_child_dir(parent: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, WriteError> {
-    match open_child_dir_no_follow(parent, name) {
-        Ok(fd) => Ok(fd),
-        Err(err) if err.source.raw_os_error() == Some(Errno::NOENT.raw_os_error()) => {
-            match mkdirat(parent, name, Mode::from_bits_truncate(0o755)) {
-                Ok(()) => {}
-                Err(errno) if errno == Errno::EXIST => {}
-                Err(errno) => return Err(classify_path_errno(errno)),
+fn open_or_create_child_dir(parent: &Dir, name: &OsStr) -> Result<Dir, WriteError> {
+    // Try metadata first so we can refuse symlinked intermediate components
+    // with the historical `WriteErrorKind::Symlink` discrimination. cap-std's
+    // own `open_dir` would silently follow a symlink that resolves inside the
+    // capability, which is a contract relaxation we don't want for the
+    // corpus sandbox.
+    match parent.symlink_metadata(name) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()));
             }
-            open_child_dir_no_follow(parent, name)
+            if !meta.is_dir() {
+                return Err(invalid_path_error("path component is not a directory"));
+            }
         }
-        Err(err) => Err(err),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Create the missing directory and fall through to the open.
+            // `cap-std`'s `Dir::create_dir` is umask-modified `0o777` on
+            // unix; on a default umask that resolves to `0o755`, matching
+            // the previous `mkdirat(..., 0o755)` behaviour.
+            match parent.create_dir(name) {
+                Ok(()) => {}
+                Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Race: another process created the directory between
+                    // our `symlink_metadata` and `create_dir`. Fall through
+                    // to the open and let it resolve the entry.
+                }
+                Err(create_err) => return Err(classify_path_io_error(create_err)),
+            }
+        }
+        Err(e) => return Err(classify_path_io_error(e)),
+    }
+
+    parent.open_dir(name).map_err(classify_path_io_error)
+}
+
+fn reject_symlink_leaf(parent: &Dir, name: &OsStr) -> Result<(), WriteError> {
+    match parent.symlink_metadata(name) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()))
+            } else {
+                Ok(())
+            }
+        }
+        Err(e) => Err(classify_path_io_error(e)),
     }
 }
 
-fn open_child_dir_no_follow(parent: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, WriteError> {
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    openat(parent, name, flags, Mode::empty()).map_err(|errno| {
-        // Linux: opening a symlinked component with `O_NOFOLLOW | O_DIRECTORY`
-        // returns `ELOOP`. macOS: same syscall returns `ENOTDIR` because the
-        // dir-open refusal happens before the symlink check. To classify the
-        // refusal consistently across platforms (the security guarantee is
-        // identical — the writer bounces either way), `lstat` the entry and
-        // promote `ENOTDIR` to `Symlink` when the entry is actually a symlink.
-        let err = classify_path_errno(errno);
-        if matches!(err.kind, WriteErrorKind::InvalidPath) && is_symlink_at(parent, name) {
-            return WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into());
-        }
-        err
-    })
-}
-
-fn is_symlink_at(parent: BorrowedFd<'_>, name: &OsStr) -> bool {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => FileType::from_raw_mode(stat.st_mode) == FileType::Symlink,
-        Err(_) => false,
-    }
-}
-
-fn write_new_file(parent: &OwnedFd, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
-    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    let owned = openat(parent, name, flags, Mode::from_bits_truncate(0o644))
-        .map_err(classify_create_errno)?;
-    let mut file = std::fs::File::from(owned);
+fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
+    // `create_new(true)` maps to `O_CREAT | O_EXCL`. The pre-existing-leaf
+    // case (including a pre-existing symlink) surfaces as `AlreadyExists`,
+    // which classifies to `WriteErrorKind::Exists`. There's no race window
+    // for a swap-in symlink to be followed because `O_EXCL` refuses any
+    // existing entry.
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    let cap_file = parent
+        .open_with(name, &opts)
+        .map_err(classify_create_io_error)?;
+    let mut file = cap_file.into_std();
     write_and_sync(&mut file, content)?;
     drop(file);
     fsync_dir(parent)
 }
 
-fn atomic_replace(parent: &OwnedFd, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
-    validate_replace_target(parent.as_fd(), name)?;
-    let (temp_name, mut file) = create_temp_file(parent.as_fd(), name)?;
+fn atomic_replace(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
+    validate_replace_target(parent, name)?;
+    let (temp_name, mut file) = create_temp_file(parent, name)?;
     if let Err(err) = write_and_sync(&mut file, content) {
-        cleanup_temp(parent.as_fd(), &temp_name);
+        cleanup_temp(parent, &temp_name);
         return Err(err);
     }
     drop(file);
 
-    if let Err(errno) = renameat(parent, temp_name.as_os_str(), parent, name) {
-        cleanup_temp(parent.as_fd(), &temp_name);
-        return Err(classify_create_errno(errno));
+    if let Err(e) = parent.rename(temp_name.as_os_str(), parent, name) {
+        cleanup_temp(parent, &temp_name);
+        return Err(classify_create_io_error(e));
     }
     fsync_dir(parent)
 }
 
-fn validate_replace_target(parent: BorrowedFd<'_>, name: &OsStr) -> Result<(), WriteError> {
-    match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Symlink => Err(WriteError::new(WriteErrorKind::Symlink, Errno::LOOP.into())),
-            FileType::RegularFile => Ok(()),
-            _ => Err(invalid_path_error("target is not a regular file")),
-        },
-        Err(errno) if errno == Errno::NOENT => Ok(()),
-        Err(errno) => Err(classify_create_errno(errno)),
+fn validate_replace_target(parent: &Dir, name: &OsStr) -> Result<(), WriteError> {
+    match parent.symlink_metadata(name) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()))
+            } else if ft.is_file() {
+                Ok(())
+            } else {
+                Err(invalid_path_error("target is not a regular file"))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(classify_create_io_error(e)),
     }
 }
 
-fn create_temp_file(
-    parent: BorrowedFd<'_>,
-    name: &OsStr,
-) -> Result<(OsString, std::fs::File), WriteError> {
+fn create_temp_file(parent: &Dir, name: &OsStr) -> Result<(OsString, std::fs::File), WriteError> {
     for attempt in 0..100 {
         let mut temp = OsString::from(".");
         temp.push(name);
@@ -570,17 +589,12 @@ fn create_temp_file(
             ".hallouminate-{}-{attempt}.tmp",
             std::process::id()
         ));
-        let flags =
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-        match openat(
-            parent,
-            temp.as_os_str(),
-            flags,
-            Mode::from_bits_truncate(0o644),
-        ) {
-            Ok(fd) => return Ok((temp, std::fs::File::from(fd))),
-            Err(errno) if errno == Errno::EXIST => continue,
-            Err(errno) => return Err(classify_create_errno(errno)),
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        match parent.open_with(temp.as_os_str(), &opts) {
+            Ok(cap_file) => return Ok((temp, cap_file.into_std())),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(classify_create_io_error(e)),
         }
     }
     Err(WriteError::new(
@@ -598,43 +612,99 @@ fn write_and_sync(file: &mut std::fs::File, content: &[u8]) -> Result<(), WriteE
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
 }
 
-fn fsync_dir(dir: &OwnedFd) -> Result<(), WriteError> {
-    fsync(dir).map_err(|errno| WriteError::new(WriteErrorKind::Io, errno.into()))
+fn fsync_dir(dir: &Dir) -> Result<(), WriteError> {
+    // `cap_std::fs::Dir` has no `sync_all` method, and its underlying
+    // `std::fs::File` is opened with `O_PATH` on Linux (cap-std's dir-open
+    // optimisation for `*at`-only handles). `O_PATH` fds cannot be fsync'd
+    // — `sync_all` on one returns `EBADF`. Re-open `.` through the
+    // capability with `read(true)` to get a regular RDONLY fd; cap-std's
+    // path-resolver special-cases the trailing `.` and re-opens with the
+    // user-supplied options, so the resulting handle supports `sync_all`.
+    // (Confirmed against cap-primitives' `internal_open::follow_with_dot`
+    // branch.) Stays cross-platform — Windows accepts `sync_all` on the
+    // dir handle either way.
+    let dot = dir
+        .open(".")
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    dot.into_std()
+        .sync_all()
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
 }
 
-fn cleanup_temp(parent: BorrowedFd<'_>, name: &OsStr) {
-    let _ = unlinkat(parent, name, AtFlags::empty());
+fn cleanup_temp(parent: &Dir, name: &OsStr) {
+    let _ = parent.remove_file(name);
 }
 
-fn classify_path_errno(errno: Errno) -> WriteError {
-    let io_err: std::io::Error = errno.into();
-    if errno == Errno::LOOP {
-        WriteError::new(WriteErrorKind::Symlink, io_err)
-    } else if errno == Errno::NOTDIR || errno == Errno::INVAL {
-        // rustix surfaces a NUL byte in an `&OsStr` path argument as `INVAL`
-        // when it fails to build the underlying `&CStr`. Pre-migration code
-        // caught NUL upstream via `cstring(name)` and returned `InvalidPath`
-        // with a clear "path contains a NUL byte" message; preserve the
-        // public `WriteErrorKind` contract for any caller that bypasses
-        // `safe_relative_path`'s boundary NUL check.
-        WriteError::new(WriteErrorKind::InvalidPath, io_err)
-    } else {
-        WriteError::new(WriteErrorKind::Io, io_err)
+// Numeric errno constants used in path-error classification. `std::io::ErrorKind`
+// gates `NotADirectory`, `IsADirectory`, `FilesystemLoop`, and
+// `InvalidFilename` behind the unstable `io_error_more` feature on Rust 1.91,
+// so we match on `raw_os_error()` for the discrimination the public
+// `WriteErrorKind` contract requires. The constants are the standard POSIX
+// errnos; on Windows cap-std maps native errors into the same numeric space
+// via rustix's translation layer.
+//
+// Linux/macOS: ELOOP=Linux 40 / macOS 62, ENOTDIR=20, EISDIR=21, EINVAL=22.
+// We compare against the platform-resolved constant via `rustix::io::Errno`'s
+// associated constants — those are stable, cross-platform names that resolve
+// to the right raw errno per target, and rustix is already a workspace dep
+// (kept for `process` + `fs::flock` elsewhere).
+const ELOOP: i32 = rustix::io::Errno::LOOP.raw_os_error();
+const ENOTDIR: i32 = rustix::io::Errno::NOTDIR.raw_os_error();
+const EISDIR: i32 = rustix::io::Errno::ISDIR.raw_os_error();
+const EINVAL: i32 = rustix::io::Errno::INVAL.raw_os_error();
+
+/// Classify an error from a non-create path operation (open_dir, open,
+/// symlink_metadata on an intermediate component). Preserves the historical
+/// `WriteErrorKind::Symlink` / `InvalidPath` / `Io` discrimination callers
+/// depend on.
+fn classify_path_io_error(err: std::io::Error) -> WriteError {
+    if let Some(raw) = err.raw_os_error() {
+        if raw == ELOOP {
+            return WriteError::new(WriteErrorKind::Symlink, err);
+        }
+        if raw == ENOTDIR || raw == EINVAL {
+            // `EINVAL` covers the NUL-in-path case: cap-std (via rustix)
+            // surfaces a NUL byte in an `&OsStr` path argument as `EINVAL`
+            // when building the underlying `&CStr`. Pre-migration code
+            // caught NUL upstream via `cstring(name)` and returned
+            // `InvalidPath` with a clear "path contains a NUL byte" message;
+            // preserve the public `WriteErrorKind` contract for any caller
+            // that bypasses `safe_relative_path`'s boundary NUL check.
+            return WriteError::new(WriteErrorKind::InvalidPath, err);
+        }
     }
+    if err.kind() == std::io::ErrorKind::InvalidInput {
+        return WriteError::new(WriteErrorKind::InvalidPath, err);
+    }
+    WriteError::new(WriteErrorKind::Io, err)
 }
 
-fn classify_create_errno(errno: Errno) -> WriteError {
-    let io_err: std::io::Error = errno.into();
-    if errno == Errno::LOOP {
-        WriteError::new(WriteErrorKind::Symlink, io_err)
-    } else if errno == Errno::EXIST {
-        WriteError::new(WriteErrorKind::Exists, io_err)
-    } else if errno == Errno::NOTDIR || errno == Errno::ISDIR || errno == Errno::INVAL {
-        // `INVAL` covers the NUL-in-path case; see `classify_path_errno`.
-        WriteError::new(WriteErrorKind::InvalidPath, io_err)
-    } else {
-        WriteError::new(WriteErrorKind::Io, io_err)
+/// Classify an error from a create or rename operation. Adds the `EEXIST →
+/// Exists` mapping on top of `classify_path_io_error`'s rules, plus a
+/// `EISDIR → InvalidPath` mapping the old `Errno::ISDIR` branch had.
+fn classify_create_io_error(err: std::io::Error) -> WriteError {
+    if let Some(raw) = err.raw_os_error() {
+        if raw == ELOOP {
+            return WriteError::new(WriteErrorKind::Symlink, err);
+        }
+        if raw == ENOTDIR || raw == EISDIR || raw == EINVAL {
+            return WriteError::new(WriteErrorKind::InvalidPath, err);
+        }
     }
+    if err.kind() == std::io::ErrorKind::AlreadyExists {
+        return WriteError::new(WriteErrorKind::Exists, err);
+    }
+    if err.kind() == std::io::ErrorKind::InvalidInput {
+        return WriteError::new(WriteErrorKind::InvalidPath, err);
+    }
+    WriteError::new(WriteErrorKind::Io, err)
+}
+
+fn symlink_io_error() -> std::io::Error {
+    // Construct a synthetic ELOOP-bearing error so callers that inspect
+    // `WriteError.source.raw_os_error()` see the same value the rustix-era
+    // code returned via `Errno::LOOP.into()`.
+    std::io::Error::from_raw_os_error(ELOOP)
 }
 
 fn invalid_path_error(msg: &'static str) -> WriteError {

@@ -33,6 +33,14 @@ fastembed = "5"
 
 # Hashing + filesystem
 blake3 = "1"
+# `cap-std` is the cross-platform `Dir`-relative API the corpus sandbox uses
+# (built on rustix on unix, windows-sys on Windows). Confines all writes to
+# the corpus root capability and is the symlink-safe replacement for the
+# rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
+cap-std = "4"
+# rustix is still pulled in transitively by cap-std; the direct dep is kept
+# for `process::kill_process` (daemon shutdown tests) and `fs::flock`
+# (single-instance daemon lock in `server.rs`).
 rustix = { version = "1", features = ["fs", "process"] }
 ignore = "0.4"
 globset = "0.4"
