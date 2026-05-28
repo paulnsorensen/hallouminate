@@ -63,6 +63,7 @@ tracing-appender = "0.2"
 # Path resolution
 directories = "5"
 shellexpand = "3"
+url = "2"
 
 # Time + lazy init
 chrono = { version = "0.4", features = ["serde"] }

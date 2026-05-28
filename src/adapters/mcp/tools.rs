@@ -12,11 +12,13 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use crate::app::config::discover_repo_config;
 use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
     DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
@@ -39,8 +41,9 @@ Two audiences use this server:
   `read_markdown` + `add_markdown { overwrite: true }`.
 
 Default corpus: tool calls that omit `corpus` default to the wiki for the \
-repository containing the daemon's current working directory. Pass `corpus` \
-explicitly to target another wiki, the repo's source corpus \
+repository containing the client's MCP workspace root when the client exposes \
+roots, falling back to the MCP server process cwd. Pass `corpus` explicitly \
+to target another wiki, the repo's source corpus \
 (`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry. \
 `list_corpora` enumerates everything available.
 
@@ -217,6 +220,40 @@ async fn daemon_for_tool() -> Result<DaemonClient, ErrorData> {
         .map_err(|e| internal_error(format!("{e:#}")))
 }
 
+const ROOTS_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn cwd_for_tool(fallback: &Path, peer: &Peer<RoleServer>) -> PathBuf {
+    let Some(info) = peer.peer_info() else {
+        return fallback.to_path_buf();
+    };
+    if info.capabilities.roots.is_none() {
+        return fallback.to_path_buf();
+    }
+    let Ok(Ok(result)) = tokio::time::timeout(ROOTS_LIST_TIMEOUT, peer.list_roots()).await else {
+        return fallback.to_path_buf();
+    };
+    result
+        .roots
+        .iter()
+        .filter_map(|root| root_uri_to_path(&root.uri))
+        .find(|path| has_repo_config_ancestor(path))
+        .unwrap_or_else(|| fallback.to_path_buf())
+}
+
+fn has_repo_config_ancestor(path: &Path) -> bool {
+    discover_repo_config(path).is_ok()
+}
+
+fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
+    if let Ok(url) = url::Url::parse(uri)
+        && url.scheme() == "file"
+    {
+        return url.to_file_path().ok();
+    }
+    let path = PathBuf::from(uri);
+    path.is_absolute().then_some(path)
+}
+
 /// Translate a daemon RPC error into the MCP transport's `ErrorData` shape.
 /// Daemon `InvalidParams` becomes `-32602`, `Internal` becomes `-32603`, and
 /// transport / decode failures (already `anyhow::Error` by the time we get
@@ -267,7 +304,7 @@ pub struct ListCorporaParams {}
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesParams {
     /// Corpus name; defaults to the wiki for the repo containing the
-    /// daemon's cwd. Required only when no default applies and multiple
+    /// MCP workspace root. Required only when no default applies and multiple
     /// corpora are configured.
     #[serde(default)]
     pub corpus: Option<String>,
@@ -276,7 +313,7 @@ pub struct ListFilesParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListTreeParams {
     /// Corpus name; defaults to the wiki for the repo containing the
-    /// daemon's cwd. Required only when no default applies and multiple
+    /// MCP workspace root. Required only when no default applies and multiple
     /// corpora are configured.
     #[serde(default)]
     pub corpus: Option<String>,
@@ -335,7 +372,7 @@ pub struct GlobalizeMarkdownParams {
 
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
 /// fresh `UnixStream`, so the server is stateless beyond `tool_router`
-/// and the captured client cwd.
+/// and the fallback cwd captured at startup.
 #[derive(Debug, Clone)]
 pub struct HallouminateTools {
     // The `tool_router` field is read by `#[tool_handler]`-generated code
@@ -343,8 +380,9 @@ pub struct HallouminateTools {
     // macro expansion, so silence the warning here.
     #[allow(dead_code)]
     tool_router: ToolRouter<HallouminateTools>,
-    /// CWD captured once at MCP server startup, forwarded on every daemon
-    /// hop so repo discovery resolves against the client's workspace.
+    /// Fallback CWD captured once at MCP server startup. Tool calls prefer
+    /// MCP client roots when available so user-global IDE configs still
+    /// resolve against the open workspace.
     cwd: PathBuf,
 }
 
@@ -363,10 +401,12 @@ impl HallouminateTools {
     pub async fn ground(
         &self,
         Parameters(params): Parameters<GroundParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::Ground(GroundRequest {
                 query: params.query,
                 corpus: params.corpus,
@@ -388,10 +428,12 @@ impl HallouminateTools {
     pub async fn index(
         &self,
         Parameters(params): Parameters<IndexParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::Index(IndexRequest {
                 corpus: params.corpus,
                 paths_from: None,
@@ -416,15 +458,17 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing the daemon's cwd when `corpus` is omitted."
+        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted."
     )]
     pub async fn list_tree(
         &self,
         Parameters(params): Parameters<ListTreeParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::ListTree(ListTreeRequest {
                 corpus: params.corpus,
             }),
@@ -438,15 +482,17 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise. Defaults to the wiki for the repo containing the daemon's cwd when `corpus` is omitted."
+        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted."
     )]
     pub async fn list_files(
         &self,
         Parameters(params): Parameters<ListFilesParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
                 corpus: params.corpus,
             }),
@@ -467,10 +513,12 @@ impl HallouminateTools {
     pub async fn add_markdown(
         &self,
         Parameters(params): Parameters<AddMarkdownParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: params.corpus,
                 path: params.path,
@@ -494,10 +542,12 @@ impl HallouminateTools {
     pub async fn read_markdown(
         &self,
         Parameters(params): Parameters<ReadMarkdownParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: params.corpus,
                 path: params.path,
@@ -515,10 +565,12 @@ impl HallouminateTools {
     pub async fn delete_markdown(
         &self,
         Parameters(params): Parameters<DeleteMarkdownParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
                 corpus: params.corpus,
                 path: params.path,
@@ -537,10 +589,12 @@ impl HallouminateTools {
     pub async fn globalize_markdown(
         &self,
         Parameters(params): Parameters<GlobalizeMarkdownParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let req = DaemonRequest {
-            cwd: self.cwd.clone(),
+            cwd,
             payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
                 source_corpus: params.source_corpus,
                 path: params.path,
@@ -567,11 +621,13 @@ impl HallouminateTools {
     pub async fn list_corpora(
         &self,
         _params: Parameters<ListCorporaParams>,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, &peer).await;
         let entries: ListCorporaResult = client
             .call(DaemonRequest {
-                cwd: self.cwd.clone(),
+                cwd,
                 payload: DaemonRequestPayload::ListCorpora,
             })
             .await

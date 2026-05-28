@@ -57,21 +57,30 @@ impl Mcp {
     /// MCP tools dial the per-test daemon harness instead of the
     /// developer's real daemon socket.
     async fn spawn(xdg_config_home: &Path, daemon_socket: Option<&Path>) -> Self {
-        // Per repo-config-discovery: the MCP server captures `current_dir()`
-        // at startup and forwards it on every daemon hop. Set the child's
-        // cwd to the per-test `xdg_config_home` tempdir and drop a
-        // `.hallouminate/config.toml` in it so the daemon's discovery walk
-        // resolves cleanly. Empty TOML → `Config::default()` → trivial
-        // merge against whichever baseline the per-test daemon was booted
-        // with.
-        let hallou_dir = xdg_config_home.join(".hallouminate");
-        std::fs::create_dir_all(&hallou_dir).expect("mkdir .hallouminate");
-        std::fs::write(hallou_dir.join("config.toml"), "").expect("write empty repo-layer config");
+        Self::spawn_with_cwd(xdg_config_home, xdg_config_home, daemon_socket, true).await
+    }
+
+    async fn spawn_with_cwd(
+        xdg_config_home: &Path,
+        cwd: &Path,
+        daemon_socket: Option<&Path>,
+        seed_repo_config_in_cwd: bool,
+    ) -> Self {
+        // Most MCP tests exercise the fallback cwd path: set the child's cwd
+        // to a tempdir with an empty repo layer so daemon discovery resolves
+        // cleanly. Empty TOML → `Config::default()` → trivial merge against
+        // whichever baseline the per-test daemon was booted with.
+        if seed_repo_config_in_cwd {
+            let hallou_dir = cwd.join(".hallouminate");
+            std::fs::create_dir_all(&hallou_dir).expect("mkdir .hallouminate");
+            std::fs::write(hallou_dir.join("config.toml"), "")
+                .expect("write empty repo-layer config");
+        }
 
         let bin = env!("CARGO_BIN_EXE_hallouminate");
         let mut cmd = Command::new(bin);
         cmd.arg("serve")
-            .current_dir(xdg_config_home)
+            .current_dir(cwd)
             .env("XDG_CONFIG_HOME", xdg_config_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -99,6 +108,46 @@ impl Mcp {
             child,
             stdin: Some(stdin),
             stdout,
+        }
+    }
+
+    async fn rpc_with_roots(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: Value,
+        roots: &[&Path],
+    ) -> Value {
+        self.send(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .await;
+        loop {
+            let msg = self.recv().await;
+            if msg.get("id").and_then(Value::as_u64) == Some(id) {
+                return msg;
+            }
+            if msg.get("method").and_then(Value::as_str) == Some("roots/list") {
+                let request_id = msg["id"].clone();
+                let roots = roots
+                    .iter()
+                    .map(|path| {
+                        json!({
+                            "uri": format!("file://{}", path.display()),
+                            "name": path.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                self.send(json!({
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": { "roots": roots },
+                }))
+                .await;
+            }
         }
     }
 
@@ -155,6 +204,22 @@ impl Mcp {
         let _ = timeout(SHUTDOWN_TIMEOUT, self.child.wait()).await;
         let _ = self.child.kill().await;
     }
+}
+
+fn write_repo_config(dir: &Path, name: &str) {
+    std::fs::create_dir_all(dir.join(".git")).expect("mkdir .git");
+    std::fs::create_dir_all(dir.join(".hallouminate")).expect("mkdir .hallouminate");
+    std::fs::write(
+        dir.join(".hallouminate/config.toml"),
+        format!(
+            r#"
+[[repository]]
+name = "{name}"
+path = "."
+"#
+        ),
+    )
+    .expect("write repo config");
 }
 
 fn write_minimal_config(dir: &Path) {
@@ -459,6 +524,92 @@ async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
         Some("/tmp/hallouminate-press-fixture"),
         "path carried verbatim: {paths:?}"
     );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tool_uses_client_root_when_process_cwd_is_not_a_repo() {
+    let xdg = tempfile::tempdir().expect("xdg tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let workspace = repo.path().join("packages/api");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    write_minimal_config(xdg.path());
+    write_repo_config(repo.path(), "workspace");
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
+
+    let mut mcp = Mcp::spawn_with_cwd(xdg.path(), home.path(), Some(harness.socket()), false).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"roots": {"listChanged": true}},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc_with_roots(
+            2,
+            "tools/call",
+            json!({"name": "list_corpora", "arguments": {}}),
+            &[&workspace],
+        )
+        .await;
+    assert!(call.get("error").is_none(), "tools/call errored: {call}");
+    let corpora = call["result"]["structuredContent"]["corpora"]
+        .as_array()
+        .expect("structuredContent.corpora is an array");
+    let names: Vec<&str> = corpora
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["repo:workspace:wiki"]);
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tool_falls_back_to_process_cwd_without_client_roots() {
+    let xdg = tempfile::tempdir().expect("xdg tempdir");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    write_minimal_config(xdg.path());
+    write_repo_config(repo.path(), "fallback");
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
+
+    let mut mcp = Mcp::spawn_with_cwd(xdg.path(), repo.path(), Some(harness.socket()), false).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({"name": "list_corpora", "arguments": {}}),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "tools/call errored: {call}");
+    let corpora = call["result"]["structuredContent"]["corpora"]
+        .as_array()
+        .expect("structuredContent.corpora is an array");
+    let names: Vec<&str> = corpora
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["repo:fallback:wiki"]);
 
     mcp.shutdown().await;
 }
