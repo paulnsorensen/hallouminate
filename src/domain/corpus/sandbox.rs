@@ -488,6 +488,21 @@ fn open_or_create_child_dir(parent: &Dir, name: &OsStr) -> Result<Dir, WriteErro
     // own `open_dir` would silently follow a symlink that resolves inside the
     // capability, which is a contract relaxation we don't want for the
     // corpus sandbox.
+    //
+    // **Known TOCTOU window**: the pre-migration code used a single
+    // `openat(..., O_NOFOLLOW | O_DIRECTORY)` syscall that the kernel
+    // evaluated atomically. The migration splits that into
+    // `symlink_metadata` + `open_dir`, opening a window in which an
+    // attacker who can plant entries inside the corpus root can race a
+    // symlink in between the two calls. The blast radius is bounded by
+    // cap-std's capability: even a raced symlink can only redirect within
+    // the corpus root (an outside-pointing symlink fails with
+    // `EscapeAttempt`), so the security guarantee that nothing writes
+    // outside the corpus still holds. What's relaxed is the strict
+    // "refuse ALL symlinks, even in-corpus ones" contract the existing
+    // tests assert. Anticipated in the cap-std migration spec's Risk
+    // Register; closing the window would require either upstream cap-std
+    // exposing `nofollow` on `OpenOptions` or a manual `openat` fallback.
     match parent.symlink_metadata(name) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -623,6 +638,11 @@ fn fsync_dir(dir: &Dir) -> Result<(), WriteError> {
     // (Confirmed against cap-primitives' `internal_open::follow_with_dot`
     // branch.) Stays cross-platform — Windows accepts `sync_all` on the
     // dir handle either way.
+    //
+    // Cost vs pre-migration: two extra syscalls per write (`open(".")` +
+    // drop) on top of the `sync_all`. `atomic_write_no_follow` is the
+    // markdown-write hot path; the overhead has been measured as invisible
+    // here. Revisit only if a future profile flags it.
     let dot = dir
         .open(".")
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
@@ -635,19 +655,35 @@ fn cleanup_temp(parent: &Dir, name: &OsStr) {
     let _ = parent.remove_file(name);
 }
 
-// Numeric errno constants used in path-error classification. `std::io::ErrorKind`
-// gates `NotADirectory`, `IsADirectory`, `FilesystemLoop`, and
-// `InvalidFilename` behind the unstable `io_error_more` feature on Rust 1.91,
-// so we match on `raw_os_error()` for the discrimination the public
-// `WriteErrorKind` contract requires. The constants are the standard POSIX
-// errnos; on Windows cap-std maps native errors into the same numeric space
-// via rustix's translation layer.
+// Numeric errno constants used in path-error classification.
+//
+// AC2 of the cap-std migration spec ("`rustix::io::Errno` is also removed")
+// is intentionally partial here, as an explicit reviewed trade-off rather
+// than inherited rustix coupling. The reason: `std::io::ErrorKind` gates
+// `NotADirectory`, `IsADirectory`, `FilesystemLoop`, and `InvalidFilename`
+// behind the unstable `io_error_more` feature on Rust 1.91 (the project's
+// MSRV), so the public `WriteErrorKind` discrimination callers depend on
+// has to come from `raw_os_error()` matches. The three alternatives all
+// have worse trade-offs:
+//
+//   1. Hand-rolled platform-cfg-gated constants — banned by the spec
+//      ("No new `#[cfg(unix)]` / `#[cfg(windows)]` gates inside
+//      `sandbox.rs`").
+//   2. Add `libc` as a direct dep just for the constants — heavyweight
+//      for a four-constant ask.
+//   3. Wait for `io_error_more` to stabilise — open-ended, MSRV-bound.
+//
+// The spec's Risk Register entry on `classify_path_error` already
+// anticipated this gap. `rustix::io::Errno`'s associated constants are
+// stable, cross-platform names that resolve to the right raw errno per
+// target, and rustix is already a workspace dep (kept for
+// `process::kill_process` in tests and `fs::flock` in
+// `src/app/daemon/server.rs`).
 //
 // Linux/macOS: ELOOP=Linux 40 / macOS 62, ENOTDIR=20, EISDIR=21, EINVAL=22.
-// We compare against the platform-resolved constant via `rustix::io::Errno`'s
-// associated constants — those are stable, cross-platform names that resolve
-// to the right raw errno per target, and rustix is already a workspace dep
-// (kept for `process` + `fs::flock` elsewhere).
+// Windows: cap-std maps native errors into the rustix errno namespace via
+// its translation layer; runtime verification is deferred to a later curd
+// per the spec's Verification Plan.
 const ELOOP: i32 = rustix::io::Errno::LOOP.raw_os_error();
 const ENOTDIR: i32 = rustix::io::Errno::NOTDIR.raw_os_error();
 const EISDIR: i32 = rustix::io::Errno::ISDIR.raw_os_error();
@@ -973,10 +1009,11 @@ mod tests {
     #[test]
     fn atomic_write_no_follow_classifies_nul_byte_filename_as_invalid_path() {
         // Defense-in-depth: even if a caller bypasses `safe_relative_path`
-        // and reaches the writer with a NUL-bearing component, the rustix
-        // `Errno::INVAL` must classify as `InvalidPath` — not `Io` — so the
-        // public `WriteErrorKind` contract matches the pre-migration
-        // `cstring()`-based rejection.
+        // and reaches the writer with a NUL-bearing component, the platform
+        // `EINVAL` (sourced via `rustix::io::Errno::INVAL` — see the errno
+        // constants block above for why) must classify as `InvalidPath` —
+        // not `Io` — so the public `WriteErrorKind` contract matches the
+        // pre-migration `cstring()`-based rejection.
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
         let tmp = tempfile::tempdir().unwrap();
@@ -1009,7 +1046,7 @@ mod tests {
     // ── cap-std migration hardening ──────────────────────────────────
     //
     // These tests lock behaviour that changed shape in the cap-std
-    // migration (PR #N): the symlink-refusal contract moved from kernel
+    // migration: the symlink-refusal contract moved from kernel
     // `O_NOFOLLOW` to `Dir::symlink_metadata` pre-checks, and the
     // capability now also refuses outside-the-root escapes via its own
     // `EscapeAttempt`. Each test pins one cap-std-era property that would
