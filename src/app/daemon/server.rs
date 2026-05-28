@@ -7,7 +7,6 @@
 //! `dispatch::dispatch`; the accept loop is only responsible for surfacing
 //! framing/IO errors.
 
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -241,6 +240,8 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
+    use rustix::fs::{FlockOperation, flock};
+
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -249,14 +250,11 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
         .mode(0o600)
         .open(lock_path)
         .map_err(|e| anyhow::anyhow!("open lockfile {}: {e}", lock_path.display()))?;
-    let fd = file.as_raw_fd();
-    let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(errno) = flock(&file, FlockOperation::NonBlockingLockExclusive) {
         return Err(anyhow::anyhow!(
             "another hallouminate daemon already holds {} ({})",
             lock_path.display(),
-            err
+            std::io::Error::from(errno)
         ));
     }
     Ok(file)
