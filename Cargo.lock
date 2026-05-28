@@ -2620,6 +2620,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "unicode-segmentation",
+ "url",
 ]
 
 [[package]]
