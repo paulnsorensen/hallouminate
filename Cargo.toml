@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 
 # Path resolution
-directories = "5"
+directories = "6"
 shellexpand = "3"
 url = "2"
 
