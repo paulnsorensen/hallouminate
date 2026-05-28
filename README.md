@@ -30,6 +30,19 @@ LanceDB races.
 cargo run -- --name Cheese
 ```
 
+## Install
+
+```sh
+# Prebuilt binary, no Rust toolchain required:
+npx hallouminate --help
+
+# Or from crates.io:
+cargo install hallouminate
+```
+
+The npm package is a thin shim — its postinstall step downloads the
+matching prebuilt binary for your platform from the GitHub release.
+
 ## Build
 
 ```sh
