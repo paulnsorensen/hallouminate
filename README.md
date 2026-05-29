@@ -47,6 +47,8 @@ The binary lands in `target/release/hallouminate`.
 - `list_corpora`, `list_files` — discovery.
 - `add_markdown` — write a markdown file under the corpus' first root,
   atomic and no-symlink-follow, with auto-reindex of just that file.
+  Returns advisory lint `warnings` (empty-destination links, empty mermaid
+  blocks, heading-level jumps) without blocking or rewriting the content.
 - `read_markdown` — verbatim UTF-8 file contents. Use before overwriting.
 - `delete_markdown` — unlink the file and prune its rows from the index.
 
