@@ -1275,6 +1275,103 @@ mod tests {
         assert_eq!(json["absolute_path"], "/r/a.md");
     }
 
+    // ── validate_wiki_path: the shared add/read/delete preamble ──────────
+    //
+    // Curd B folded the five-step validation that `handle_add_markdown`,
+    // `handle_read_markdown`, and `handle_delete_markdown` each repeated
+    // verbatim onto `validate_wiki_path`. Its doc promises the handlers'
+    // error shapes survive "byte-for-byte" and that every step still fires.
+    // The underlying helpers are unit-tested in `sandbox`, but nothing pinned
+    // the wiring: that the helper maps each failing step onto `InvalidParams`
+    // (not `Internal`) and that no middle step (e.g. the glob check) was
+    // dropped in the extraction. These tests lock that seam.
+
+    fn wiki_corpus_at(root: &Path) -> CorpusConfig {
+        CorpusConfig {
+            name: "repo:tern:wiki".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        }
+    }
+
+    fn assert_invalid_params(resp: DaemonResponse, needle: &str) {
+        match resp {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(
+                    kind,
+                    ErrorKind::InvalidParams,
+                    "a validation failure must surface as InvalidParams, not a \
+                     server fault: {message}",
+                );
+                assert!(
+                    message.contains(needle),
+                    "error must explain the failing step (want {needle:?}): {message}",
+                );
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("expected an InvalidParams error, got Ok({result:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn validate_wiki_path_returns_corpus_root_and_relative_on_valid_input() {
+        // Happy path: a known corpus + a glob-allowed relative file resolves to
+        // the tuple the handlers then write/read/delete against. The relative
+        // path is returned verbatim (not joined onto root) so the caller keeps
+        // building `root.join(relative)` exactly as before the extract.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let corpus = wiki_corpus_at(&root);
+        let (got_corpus, got_root, got_relative) =
+            validate_wiki_path(std::slice::from_ref(&corpus), "repo:tern:wiki", "notes/a.md")
+                .expect("valid corpus + path must resolve");
+        assert_eq!(got_corpus.name, "repo:tern:wiki");
+        assert_eq!(got_root, root);
+        assert_eq!(got_relative, std::path::PathBuf::from("notes/a.md"));
+    }
+
+    #[test]
+    fn validate_wiki_path_maps_unknown_corpus_to_invalid_params() {
+        // First step (`pick_corpus`): an unknown corpus name is caller error,
+        // so it must be InvalidParams — never Internal, which clients retry.
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = wiki_corpus_at(tmp.path());
+        let resp = validate_wiki_path(std::slice::from_ref(&corpus), "repo:nope:wiki", "a.md")
+            .expect_err("unknown corpus must fail validation");
+        assert_invalid_params(resp, "not found");
+    }
+
+    #[test]
+    fn validate_wiki_path_rejects_path_traversal_as_invalid_params() {
+        // Third step (`safe_relative_path`): a `..` escape must be refused at
+        // the boundary, mapped to InvalidParams. Proves the path-sandbox step
+        // is still wired into the shared preamble.
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = wiki_corpus_at(tmp.path());
+        let resp =
+            validate_wiki_path(std::slice::from_ref(&corpus), "repo:tern:wiki", "../../etc/passwd")
+                .expect_err("path traversal must fail validation");
+        assert_invalid_params(resp, "normal file components");
+    }
+
+    #[test]
+    fn validate_wiki_path_enforces_corpus_globs_as_invalid_params() {
+        // Fourth step (`ensure_corpus_allows_file`): a glob-allowed path passes
+        // the earlier steps but is excluded by the corpus's `**/*.md` include
+        // set. This is the middle step most easily dropped in a refactor — a
+        // `.txt` path that sails through `safe_relative_path` would silently be
+        // accepted if the glob check were lost. Pin that it still fires.
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = wiki_corpus_at(tmp.path());
+        let resp =
+            validate_wiki_path(std::slice::from_ref(&corpus), "repo:tern:wiki", "notes/a.txt")
+                .expect_err("a non-markdown path must be rejected by corpus globs");
+        assert_invalid_params(resp, "not included by corpus globs");
+    }
+
     // ── dispatch + resolve_for_cwd integration ──────────────────────────
     //
     // These tests cover AC #2 from .cheese/specs/repo-config-discovery.md:
