@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::common::{expand_tilde, CorpusConfig, HallouminateError, Result};
+use crate::domain::common::{CorpusConfig, HallouminateError, Result, expand_tilde};
 
 /// Declaration of a single repository tenant.
 ///

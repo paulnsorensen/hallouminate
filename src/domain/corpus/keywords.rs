@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-use stop_words::{get, LANGUAGE};
+use stop_words::{LANGUAGE, get};
 use unicode_segmentation::UnicodeSegmentation;
 
 const TOP_K: usize = 8;
@@ -93,7 +93,9 @@ vector vector vector vector vector
         assert_eq!(kws.len(), 8);
         assert_eq!(
             kws,
-            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",]
+            vec![
+                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+            ]
         );
     }
 

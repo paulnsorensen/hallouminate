@@ -107,9 +107,9 @@ fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
         .map_err(|e| InputError::new(format!("read paths-from file {}: {e}", file.display())))?;
     let mut paths: Vec<String> = Vec::new();
     for line in text.lines() {
-        let trimmed = line.trim();
-        if !trimmed.is_empty() {
-            paths.push(trimmed.to_string());
+        let line = line.trim();
+        if !line.is_empty() {
+            paths.push(line.to_string());
         }
     }
     if paths.is_empty() {

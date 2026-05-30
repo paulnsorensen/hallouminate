@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::gitignore::GitignoreBuilder;
 use ignore::WalkBuilder;
+use ignore::gitignore::GitignoreBuilder;
 
 use crate::domain::common::{
-    canonicalize_or_passthrough, expand_tilde, CorpusConfig, FileRef, HallouminateError, Mtime,
-    Result,
+    CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
+    expand_tilde,
 };
 
 pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
