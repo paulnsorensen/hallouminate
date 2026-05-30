@@ -1222,8 +1222,8 @@ mod tests {
     #[test]
     fn mtime_ms_from_duration_passes_through_normal_value() {
         let dur = std::time::Duration::from_millis(1_700_000_000_000);
-        let got = mtime_ms_from_duration(dur, Path::new("/tmp/a.md"))
-            .expect("a sane mtime must convert");
+        let got =
+            mtime_ms_from_duration(dur, Path::new("/tmp/a.md")).expect("a sane mtime must convert");
         assert_eq!(got, 1_700_000_000_000_i64);
     }
 
@@ -1325,9 +1325,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let corpus = wiki_corpus_at(&root);
-        let (got_corpus, got_root, got_relative) =
-            validate_wiki_path(std::slice::from_ref(&corpus), "repo:tern:wiki", "notes/a.md")
-                .expect("valid corpus + path must resolve");
+        let (got_corpus, got_root, got_relative) = validate_wiki_path(
+            std::slice::from_ref(&corpus),
+            "repo:tern:wiki",
+            "notes/a.md",
+        )
+        .expect("valid corpus + path must resolve");
         assert_eq!(got_corpus.name, "repo:tern:wiki");
         assert_eq!(got_root, root);
         assert_eq!(got_relative, std::path::PathBuf::from("notes/a.md"));
@@ -1351,9 +1354,12 @@ mod tests {
         // is still wired into the shared preamble.
         let tmp = tempfile::tempdir().unwrap();
         let corpus = wiki_corpus_at(tmp.path());
-        let resp =
-            validate_wiki_path(std::slice::from_ref(&corpus), "repo:tern:wiki", "../../etc/passwd")
-                .expect_err("path traversal must fail validation");
+        let resp = validate_wiki_path(
+            std::slice::from_ref(&corpus),
+            "repo:tern:wiki",
+            "../../etc/passwd",
+        )
+        .expect_err("path traversal must fail validation");
         assert_invalid_params(resp, "normal file components");
     }
 
@@ -1366,9 +1372,12 @@ mod tests {
         // accepted if the glob check were lost. Pin that it still fires.
         let tmp = tempfile::tempdir().unwrap();
         let corpus = wiki_corpus_at(tmp.path());
-        let resp =
-            validate_wiki_path(std::slice::from_ref(&corpus), "repo:tern:wiki", "notes/a.txt")
-                .expect_err("a non-markdown path must be rejected by corpus globs");
+        let resp = validate_wiki_path(
+            std::slice::from_ref(&corpus),
+            "repo:tern:wiki",
+            "notes/a.txt",
+        )
+        .expect_err("a non-markdown path must be rejected by corpus globs");
         assert_invalid_params(resp, "not included by corpus globs");
     }
 
