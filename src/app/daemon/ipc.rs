@@ -252,6 +252,24 @@ pub struct GlobalizeMarkdownResult {
     pub indexed: IndexReport,
 }
 
+/// `Ping` reply payload (Curd C — cross-version daemon skew). Carries the
+/// daemon binary's `CARGO_PKG_VERSION` so the MCP `serve` bootstrap can detect
+/// version skew — a new client adopting a daemon spawned from an older release
+/// — and self-heal by restarting the stale daemon. `flock` enforces one
+/// daemon, not one version, so without this a fresh MCP server would silently
+/// drive a mismatched daemon.
+///
+/// # Wire compatibility
+///
+/// A daemon from a release *before* this field existed answers `Ping` with the
+/// bare string `"pong"`, which carries no `version`. Clients must treat a
+/// missing or unparseable version as a mismatch (→ restart), never as a hard
+/// error — see `bootstrap::ensure_daemon_running`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PongResult {
+    pub version: String,
+}
+
 /// `ListFiles` payload alias — daemon emits an array of [`FileEntry`].
 pub type ListFilesResult = Vec<FileEntry>;
 
