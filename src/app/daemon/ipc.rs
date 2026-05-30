@@ -215,6 +215,11 @@ pub struct AddMarkdownResult {
     pub path: String,
     pub absolute_path: String,
     pub indexed: IndexReport,
+    /// Non-blocking lint advisories for the written content (broken links,
+    /// empty mermaid blocks, heading-level jumps). Omitted when empty so the
+    /// common clean-write case carries no extra payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `ReadMarkdown` payload.
