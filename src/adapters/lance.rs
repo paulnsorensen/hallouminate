@@ -542,7 +542,7 @@ impl LanceStore {
                 target: "hallouminate::lance",
                 corpus = %corpus,
                 files = batch.len(),
-                err = %e,
+                error = %e,
                 "LanceDB merge_insert failed; batch not written"
             );
             return Err(map_lance_err(e));
@@ -551,7 +551,7 @@ impl LanceStore {
             tracing::error!(
                 target: "hallouminate::lance",
                 corpus = %corpus,
-                err = %e,
+                error = %e,
                 "LanceDB search-index build failed after merge_insert"
             );
             return Err(e);
@@ -620,7 +620,7 @@ impl LanceStore {
                     // the latch open so a later batch retries the build.
                     tracing::warn!(
                         target: "hallouminate::lance",
-                        err = %e,
+                        error = %e,
                         "failed to create ANN index on `embedding`; queries will brute-force scan"
                     );
                 }
