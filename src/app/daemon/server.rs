@@ -52,7 +52,7 @@ async fn serve_with_config(
     let lock_path = lock_path_for(socket_path);
     let lock = acquire_single_instance(&lock_path)?;
     let state = DaemonState::open(cfg, xdg_path).await?;
-    let _ = tokio::fs::remove_file(socket_path).await;
+    remove_stale_socket(socket_path).await;
     let watcher = super::watch::spawn_corpus_watcher(&state);
     spawn_signal_handlers(&state);
     let result = serve_on_listener(&state, socket_path).await;
@@ -128,6 +128,26 @@ async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Remove a leftover socket before binding, tolerating a missing file.
+///
+/// A `NotFound` error is the common, benign case (no prior daemon) and is
+/// silently ignored. Any other error — typically `PermissionDenied` — is
+/// logged at `warn`: it leaves the stale socket in place, so the subsequent
+/// `bind` fails with a confusing `EADDRINUSE`, and the log is the only breadcrumb
+/// pointing at the real (permissions) cause.
+async fn remove_stale_socket(socket_path: &Path) {
+    if let Err(e) = tokio::fs::remove_file(socket_path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            socket = %socket_path.display(),
+            error = %e,
+            "failed to remove stale socket before bind; bind may fail with address-in-use",
+        );
+    }
+}
+
 /// Public for tests: drive the accept loop against an already-opened
 /// `DaemonState` and a known socket path. The accept loop breaks when
 /// `state.shutdown_token()` is cancelled — the IPC `Shutdown` request
@@ -142,7 +162,7 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
     // its socket, the next bind would fail with EADDRINUSE. Holding the
     // flock above guarantees only one daemon is alive, so removing the
     // socket here is safe.
-    let _ = tokio::fs::remove_file(socket_path).await;
+    remove_stale_socket(socket_path).await;
     let watcher = super::watch::spawn_corpus_watcher(state);
     let result = serve_on_listener(state, socket_path).await;
     drop(watcher);
@@ -151,8 +171,15 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
 }
 
 async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
-    let listener = UnixListener::bind(socket_path)
-        .map_err(|e| anyhow::anyhow!("bind {}: {e}", socket_path.display()))?;
+    let listener = UnixListener::bind(socket_path).map_err(|e| {
+        tracing::error!(
+            target: "hallouminate::daemon",
+            socket = %socket_path.display(),
+            error = %e,
+            "failed to bind daemon socket",
+        );
+        anyhow::anyhow!("bind {}: {e}", socket_path.display())
+    })?;
     // Tighten the socket itself to owner-only access — belt to the parent
     // dir's 0o700 suspenders. Logged-but-ignored on failure so a tempfs
     // backend that refuses chmod doesn't crash the daemon.
@@ -171,7 +198,6 @@ async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::R
         socket = %socket_path.display(),
         "daemon listening"
     );
-    eprintln!("hallouminate daemon listening on {}", socket_path.display());
 
     let shutdown = state.shutdown_token().clone();
     loop {
@@ -272,5 +298,36 @@ mod tests {
             lock_path_for(&sock),
             PathBuf::from("/tmp/hallouminate/daemon.sock.lock"),
         );
+    }
+
+    // A missing socket is the normal first-boot case: pre-bind cleanup must
+    // treat `NotFound` as success, never an error, so the boot path proceeds
+    // straight to `bind`.
+    #[tokio::test]
+    async fn remove_stale_socket_tolerates_missing_file() {
+        let dir = std::env::temp_dir().join(format!("hallouminate-test-{}", std::process::id()));
+        let missing = dir.join("never-existed.sock");
+        assert!(!missing.exists());
+        // Returns without panicking; the `NotFound` branch is the silent path.
+        remove_stale_socket(&missing).await;
+        assert!(!missing.exists());
+    }
+
+    // When a prior daemon left a socket behind, pre-bind cleanup must actually
+    // unlink it — otherwise the later `bind` fails with EADDRINUSE.
+    #[tokio::test]
+    async fn remove_stale_socket_unlinks_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "hallouminate-test-{}-{}",
+            std::process::id(),
+            "stale"
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let stale = dir.join("daemon.sock");
+        std::fs::write(&stale, b"").expect("create stale socket stand-in");
+        assert!(stale.exists());
+        remove_stale_socket(&stale).await;
+        assert!(!stale.exists(), "stale socket must be removed before bind");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

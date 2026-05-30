@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::array::ListArray;
 use arrow::array::builder::{ListBuilder, StringBuilder};
@@ -17,12 +18,17 @@ use crate::domain::common::{FileRef, HallouminateError, Result};
 use crate::domain::embeddings::canonical_model_name;
 use crate::domain::indexer::plan::FileSnapshot;
 
+/// Dimensionality of every stored embedding vector.
+///
+/// Matches the output width of the `BAAI/bge-small-en-v1.5` model the indexer
+/// embeds with. The `embedding` column is a `FixedSizeList` of exactly this
+/// many `f32`s, and `hybrid_search` rejects query vectors of any other length.
 pub const EMBEDDING_DIM: usize = 384;
 const TABLE_NAME: &str = "chunks";
 const META_FILENAME: &str = "meta.toml";
 
-// ── Public types ────────────────────────────────────────────────────────
-
+/// One chunk of a prepared file, ready to be written as a row in the `chunks`
+/// table.
 #[derive(Debug, Clone)]
 pub struct PreparedChunk {
     pub ord: usize,
@@ -32,6 +38,10 @@ pub struct PreparedChunk {
     pub text: String,
 }
 
+/// A single source file plus all of its chunks, ready for `apply_batch`.
+///
+/// File-level metadata (`summary`, `keywords`, `mtime_ms`, …) is denormalized
+/// onto every chunk row when the batch is built.
 #[derive(Debug, Clone)]
 pub struct PreparedFile {
     pub file_ref: String,
@@ -48,6 +58,10 @@ pub struct PreparedFile {
     pub embeddings: Option<Vec<[f32; EMBEDDING_DIM]>>,
 }
 
+/// One ranked result row returned by `hybrid_search` or `fts_search`.
+///
+/// Carries the chunk's text and location plus its parent file's `summary`,
+/// `keywords`, and `mtime_ms`, with `score` set by the active reranker.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub chunk_id: String,
@@ -61,8 +75,6 @@ pub struct SearchHit {
     pub score: f32,
     pub mtime_ms: i64,
 }
-
-// ── Deterministic chunk_id ──────────────────────────────────────────────
 
 /// Stable, deterministic chunk identifier derived from (file_ref, ord).
 ///
@@ -78,8 +90,6 @@ pub fn chunk_id_for(file_ref: &str, ord: usize) -> String {
     let hex = h.to_hex();
     hex.as_str()[..32].to_string()
 }
-
-// ── Meta sidecar (TOML) ─────────────────────────────────────────────────
 
 /// Identity that ties a ground directory to the embedding configuration it
 /// was built with. A change in any field invalidates the stored vectors (or
@@ -172,8 +182,6 @@ fn write_meta(meta_path: &Path, meta: &Meta) -> Result<()> {
     Ok(())
 }
 
-// ── Schema ──────────────────────────────────────────────────────────────
-
 fn list_utf8_field(name: &str) -> Field {
     Field::new(
         name,
@@ -209,8 +217,6 @@ pub fn chunks_schema() -> SchemaRef {
         ),
     ]))
 }
-
-// ── Record batch building ───────────────────────────────────────────────
 
 fn build_list_utf8(values: &[Vec<String>]) -> ListArray {
     let mut builder = ListBuilder::new(StringBuilder::new());
@@ -330,8 +336,6 @@ fn escape_sql_str(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-// ── Shared RecordBatch column accessors ─────────────────────────────────
-
 fn string_col<'a>(rb: &'a RecordBatch, name: &str) -> Result<&'a StringArray> {
     rb.column_by_name(name)
         .ok_or_else(|| HallouminateError::Indexer(format!("missing column {name}")))?
@@ -425,8 +429,13 @@ fn map_lance_err<E: std::fmt::Display>(e: E) -> HallouminateError {
     HallouminateError::Db(Box::new(std::io::Error::other(format!("lance: {e}"))))
 }
 
-// ── LanceStore ──────────────────────────────────────────────────────────
-
+/// Handle to a single LanceDB `chunks` table and its `meta.toml` sidecar.
+///
+/// One instance binds to one table for its whole lifetime: the table is
+/// opened (or created) once in [`open_or_create`], and the search-index
+/// state is cached against that table via `indexes_ensured`.
+///
+/// [`open_or_create`]: LanceStore::open_or_create
 pub struct LanceStore {
     table: lancedb::Table,
     #[allow(dead_code)]
@@ -437,9 +446,23 @@ pub struct LanceStore {
     /// `embedding` column is all nulls, so `ensure_search_indexes` skips the
     /// ANN index entirely (there is nothing to vector-search).
     embeddings_enabled: bool,
+    /// Latches true once `ensure_search_indexes` has confirmed the search
+    /// indexes exist, letting later `apply_batch` calls skip the
+    /// `list_indices()` round-trip. The table is created once per instance,
+    /// so a fresh `LanceStore` always starts unlatched.
+    indexes_ensured: AtomicBool,
 }
 
 impl LanceStore {
+    /// Opens the `chunks` table under `ground_dir`, creating it (and the
+    /// `meta.toml` sidecar) when absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the requested embedding configuration mismatches
+    /// the stored sidecar (model, quantization, or embeddings-enabled flag),
+    /// when `ground_dir` is not valid UTF-8, or when the LanceDB connection or
+    /// table open/create fails.
     pub async fn open_or_create(
         ground_dir: &Path,
         model_name: &str,
@@ -462,9 +485,15 @@ impl LanceStore {
             connection,
             meta_path,
             embeddings_enabled,
+            indexes_ensured: AtomicBool::new(false),
         })
     }
 
+    /// Returns the total number of chunk rows in the table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB count query fails.
     pub async fn count_rows(&self) -> Result<u64> {
         self.table
             .count_rows(None)
@@ -478,6 +507,12 @@ impl LanceStore {
     /// that corpus, so mixing corpora here would risk deleting unrelated
     /// rows. The merge join key is `(corpus, chunk_id)` so two corpora that
     /// happen to share a `file_ref` keep independent rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch mixes corpora, when building the Arrow
+    /// record batch fails (e.g. a chunk/embedding length mismatch), or when
+    /// the LanceDB `merge_insert` or index build fails.
     pub async fn apply_batch(&self, batch: Vec<PreparedFile>) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -490,7 +525,10 @@ impl LanceStore {
         }
         let schema = chunks_schema();
         let record_batch = build_record_batch(&batch, schema.clone())?;
-        let file_refs: Vec<String> = batch.iter().map(|f| f.file_ref.clone()).collect();
+        let mut file_refs: Vec<String> = Vec::with_capacity(batch.len());
+        for file in &batch {
+            file_refs.push(file.file_ref.clone());
+        }
         let scope = corpus_and_file_ref_filter(&corpus, &file_refs);
         let reader = RecordBatchIterator::new(std::iter::once(Ok(record_batch)), schema);
         let reader: Box<dyn arrow::array::RecordBatchReader + Send> = Box::new(reader);
@@ -499,8 +537,25 @@ impl LanceStore {
             .when_matched_update_all(None)
             .when_not_matched_insert_all()
             .when_not_matched_by_source_delete(Some(scope));
-        builder.execute(reader).await.map_err(map_lance_err)?;
-        self.ensure_search_indexes().await?;
+        if let Err(e) = builder.execute(reader).await {
+            tracing::error!(
+                target: "hallouminate::lance",
+                corpus = %corpus,
+                files = batch.len(),
+                error = %e,
+                "LanceDB merge_insert failed; batch not written"
+            );
+            return Err(map_lance_err(e));
+        }
+        if let Err(e) = self.ensure_search_indexes().await {
+            tracing::error!(
+                target: "hallouminate::lance",
+                corpus = %corpus,
+                error = %e,
+                "LanceDB search-index build failed after merge_insert"
+            );
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -508,7 +563,16 @@ impl LanceStore {
     /// they don't already exist. LanceDB requires data to be present before
     /// some indexes can be created, so this runs after `merge_insert` —
     /// idempotent via `list_indices()`.
+    ///
+    /// `indexes_ensured` latches true only once every index this store will
+    /// ever build is in place, after which the `list_indices()` round-trip is
+    /// skipped on subsequent calls. In embeddings-ON mode the ANN index is
+    /// only built once the corpus reaches the row threshold, so the latch
+    /// stays open across early batches until that index materializes.
     async fn ensure_search_indexes(&self) -> Result<()> {
+        if self.indexes_ensured.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let existing = self.table.list_indices().await.map_err(map_lance_err)?;
         let has_text_index = existing
             .iter()
@@ -523,8 +587,10 @@ impl LanceStore {
         // Embeddings-OFF: the `embedding` column is all nulls, so there is
         // nothing to ANN-index. Skip entirely (spec: OFF mode builds no
         // vector index). The FTS index above is still built — it is the only
-        // dense-independent signal the OFF path ranks on.
+        // dense-independent signal the OFF path ranks on. Nothing else will
+        // ever build, so latch.
         if !self.embeddings_enabled {
+            self.indexes_ensured.store(true, Ordering::Release);
             return Ok(());
         }
         // Vector index is optional — small corpora work fine without it via
@@ -533,23 +599,31 @@ impl LanceStore {
         let has_vec_index = existing
             .iter()
             .any(|i| i.columns.iter().any(|c| c == "embedding"));
-        if !has_vec_index {
-            let rows = self.table.count_rows(None).await.map_err(map_lance_err)? as u64;
-            if rows >= 256
-                && let Err(e) = self
-                    .table
-                    .create_index(&["embedding"], lancedb::index::Index::Auto)
-                    .execute()
-                    .await
+        if has_vec_index {
+            // Both FTS and ANN are present; no further index work remains.
+            self.indexes_ensured.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let rows = self.table.count_rows(None).await.map_err(map_lance_err)? as u64;
+        if rows >= 256 {
+            match self
+                .table
+                .create_index(&["embedding"], lancedb::index::Index::Auto)
+                .execute()
+                .await
             {
-                // ANN index is an optimization, not a correctness
-                // requirement — brute-force scan still works. Log so
-                // operators can diagnose why ANN never kicked in.
-                tracing::warn!(
-                    target: "hallouminate::lance",
-                    err = %e,
-                    "failed to create ANN index on `embedding`; queries will brute-force scan"
-                );
+                Ok(()) => self.indexes_ensured.store(true, Ordering::Release),
+                Err(e) => {
+                    // ANN index is an optimization, not a correctness
+                    // requirement — brute-force scan still works. Log so
+                    // operators can diagnose why ANN never kicked in. Leave
+                    // the latch open so a later batch retries the build.
+                    tracing::warn!(
+                        target: "hallouminate::lance",
+                        error = %e,
+                        "failed to create ANN index on `embedding`; queries will brute-force scan"
+                    );
+                }
             }
         }
         Ok(())
@@ -569,6 +643,11 @@ impl LanceStore {
             .any(|i| i.columns.iter().any(|c| c == "text")))
     }
 
+    /// Updates the stored `mtime_ms` for every row of `(corpus, file_ref)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB update fails.
     pub async fn touch_mtime(&self, corpus: &str, file_ref: &str, new_mtime_ms: i64) -> Result<()> {
         let predicate = format!(
             "corpus = '{}' AND file_ref = '{}'",
@@ -600,6 +679,11 @@ impl LanceStore {
     /// can short-circuit re-embedding (route the file through the planner's
     /// `mtime_touches` path instead of `upserts`). Returns `None` when the
     /// file has never been indexed under this corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB query fails or a returned column has an
+    /// unexpected type.
     pub async fn get_file_snapshot(
         &self,
         corpus: &str,
@@ -648,6 +732,11 @@ impl LanceStore {
     /// `ord = 0` (enforced in the indexer's writer), which lets us push
     /// dedup into the store as an `ord = 0` filter instead of materializing
     /// one row per chunk and folding through a HashMap.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB query fails or a returned column has an
+    /// unexpected type.
     pub async fn list_files(&self, corpus: &str) -> Result<HashMap<FileRef, FileSnapshot>> {
         let predicate = format!("corpus = '{}' AND ord = 0", escape_sql_str(corpus));
         let stream = self
@@ -688,6 +777,11 @@ impl LanceStore {
     /// biased toward FTS (see `weighted_rrf::FTS_WEIGHT` /
     /// `VECTOR_WEIGHT`), scoped to a single `corpus`. Returns an empty
     /// `Vec` for an empty corpus or when no rows match the corpus filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `query_vec` is not [`EMBEDDING_DIM`] long, or if the
+    /// LanceDB search, rerank, or row decode fails.
     pub async fn hybrid_search(
         &self,
         corpus: &str,
@@ -737,6 +831,10 @@ impl LanceStore {
     /// vector leg, no reranker (there is only one signal to rank), and no
     /// query-vector dim guard. Returns an empty `Vec` for an empty corpus or
     /// when no rows match the corpus filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB full-text search or row decode fails.
     pub async fn fts_search(
         &self,
         corpus: &str,
@@ -1207,6 +1305,101 @@ schema_version = 1
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
         assert!(meta_path.exists());
     }
+
+    /// Re-indexing across more than one batch must produce the same row state
+    /// whether or not the `indexes_ensured` latch short-circuits the
+    /// `list_indices()` round-trip. The latch is an optimization: it must not
+    /// change what ends up in the table. In embeddings-ON mode below the ANN
+    /// row threshold the latch deliberately stays open (a later batch could
+    /// cross the threshold and still need the vector index built), yet both
+    /// files' rows must be present, durable, and searchable.
+    #[tokio::test]
+    async fn re_indexing_across_batches_keeps_rows_durable_with_indexes_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
+            .await
+            .expect("open store");
+
+        assert!(
+            !store.indexes_ensured.load(Ordering::Acquire),
+            "a fresh store must start with the index latch open"
+        );
+
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 3)])
+            .await
+            .expect("first batch");
+        assert_eq!(store.count_rows().await.unwrap(), 3);
+        assert!(
+            !store.indexes_ensured.load(Ordering::Acquire),
+            "ON mode below the ANN row threshold must NOT latch — a later, \
+             larger batch still needs the chance to build the vector index"
+        );
+
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/b.md", 2)])
+            .await
+            .expect("second batch");
+        assert_eq!(
+            store.count_rows().await.unwrap(),
+            5,
+            "second batch must still write its rows"
+        );
+        assert!(
+            !store.indexes_ensured.load(Ordering::Acquire),
+            "latch must stay open while the corpus is still below the ANN threshold"
+        );
+
+        let hits = store
+            .fts_search("docs", "chunk-0", 10)
+            .await
+            .expect("fts search after re-index");
+        assert!(
+            !hits.is_empty(),
+            "FTS must still return results after a multi-batch re-index"
+        );
+    }
+
+    /// In embeddings-OFF mode the only index that will ever exist is FTS, so
+    /// the very first successful batch latches `indexes_ensured`. The next
+    /// batch then takes the cached path (no `list_indices()` round-trip) and
+    /// must still write its rows — proving the latch short-circuits the check
+    /// without altering what lands in the table.
+    #[tokio::test]
+    async fn off_mode_latches_after_first_batch_then_skips_list_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false)
+            .await
+            .expect("open OFF-mode store");
+
+        store
+            .apply_batch(vec![synthetic_prepared_no_embeddings("/tmp/a.md", 3)])
+            .await
+            .expect("first OFF batch");
+        assert!(
+            store.indexes_ensured.load(Ordering::Acquire),
+            "OFF mode must latch after the first batch builds FTS — nothing else can build"
+        );
+
+        store
+            .apply_batch(vec![synthetic_prepared_no_embeddings("/tmp/b.md", 2)])
+            .await
+            .expect("second OFF batch on the cached path");
+        assert_eq!(
+            store.count_rows().await.unwrap(),
+            5,
+            "cached-path batch must still write its rows"
+        );
+
+        let hits = store
+            .fts_search("docs", "chunk-1", 10)
+            .await
+            .expect("fts search after cached re-index");
+        assert!(
+            !hits.is_empty(),
+            "FTS must still return results after the cached-path batch"
+        );
+    }
 }
 
 /// Weighted Reciprocal Rank Fusion reranker for hybrid (BM25 + vector)
@@ -1240,6 +1433,8 @@ mod weighted_rrf {
     /// queries (the e2e oracles in `tests/fixture_e2e.rs` rely entirely
     /// on the FTS path under the stub embedder).
     pub const FTS_WEIGHT: f32 = 2.0;
+    /// Baseline weight for the vector (ANN) ranked list; FTS is biased above
+    /// it via [`FTS_WEIGHT`].
     pub const VECTOR_WEIGHT: f32 = 1.0;
     /// RRF dampening constant; 60 matches Cormack et al. and LanceDB's
     /// stock default.

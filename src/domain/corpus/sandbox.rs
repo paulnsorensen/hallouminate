@@ -189,6 +189,15 @@ pub fn build_globset(patterns: &[String]) -> anyhow::Result<Option<GlobSet>> {
 /// daemon and MCP response payloads, so the field shape is part of both
 /// transports' public contract. Deserialize lets daemon clients (CLI,
 /// MCP) decode the daemon's `ListFiles` response back into typed entries.
+///
+/// # Wire contract (v1 — stable)
+///
+/// The field names `path` and `absolute_path` and their `String` types are
+/// part of the v1 daemon/MCP wire contract — they land verbatim in
+/// `structuredContent` and the daemon's `ListFiles` JSON. Renaming or
+/// retyping a field is a breaking change for every deployed client; do not
+/// touch them without a wire-version bump. (`dispatch.rs` asserts the field
+/// names so an accidental rename fails the build.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileEntry {
     pub path: String,
@@ -203,7 +212,7 @@ pub fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>
         .iter()
         .map(|p| {
             let expanded = expand_tilde(p);
-            std::fs::canonicalize(&expanded).unwrap_or(expanded)
+            canonicalize_or_log(expanded)
         })
         .collect();
     let mut entries: Vec<FileEntry> = scan(corpus)
@@ -223,6 +232,26 @@ pub fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+/// Canonicalize `expanded`, falling back to the non-canonical path when the
+/// root does not yet exist on disk (a freshly-configured wiki corpus whose
+/// directory hasn't been created). Logs at `debug` on fallback because a
+/// non-canonical `absolute_path` can diverge from the canonical `file_ref`
+/// LanceDB stores, so the divergence is traceable rather than silent.
+fn canonicalize_or_log(expanded: PathBuf) -> PathBuf {
+    match std::fs::canonicalize(&expanded) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            tracing::debug!(
+                target: "hallouminate::corpus",
+                path = %expanded.display(),
+                error = %e,
+                "canonicalize failed; using non-canonical path (corpus root may not exist yet)"
+            );
+            expanded
+        }
+    }
 }
 
 /// One node in the directory tree returned by `build_corpus_tree`. The root
@@ -253,7 +282,7 @@ pub fn build_corpus_tree(corpus: &CorpusConfig) -> anyhow::Result<TreeNode> {
         .first()
         .ok_or_else(|| anyhow::anyhow!("corpus {:?} has no paths", corpus.name))?;
     let expanded = expand_tilde(raw_root);
-    let root_abs = std::fs::canonicalize(&expanded).unwrap_or(expanded);
+    let root_abs = canonicalize_or_log(expanded);
     let files = list_corpus_files(corpus)?;
     let mut node = TreeNode {
         path: String::new(),
@@ -340,6 +369,13 @@ fn sort_tree(node: &mut TreeNode) {
 // missed symlinked intermediate directories. Sharing the implementation
 // closes that asymmetry and gives both transports the same write contract.
 
+/// Why a sandbox write, read, or delete failed.
+///
+/// Callers branch on the kind to map the failure onto their transport's
+/// error vocabulary (the daemon's JSON-RPC codes, the MCP transport's
+/// `ErrorData`). `Symlink` and `InvalidPath` are normalized across platforms
+/// by the `classify_*_errno` helpers so a caller sees one stable kind
+/// regardless of whether Linux or macOS raised the underlying errno.
 #[derive(Debug)]
 pub enum WriteErrorKind {
     /// File exists and `overwrite=false`.
@@ -352,6 +388,9 @@ pub enum WriteErrorKind {
     Io,
 }
 
+/// A failed sandbox filesystem operation: its classified [`WriteErrorKind`]
+/// plus the originating [`std::io::Error`] for diagnostics. Returned by
+/// [`atomic_write_no_follow`], [`read_no_follow`], and [`delete_no_follow`].
 #[derive(Debug)]
 pub struct WriteError {
     pub kind: WriteErrorKind,
@@ -364,6 +403,20 @@ impl WriteError {
     }
 }
 
+/// Atomically write `content` to `<root>/<relative>`, creating intermediate
+/// directories under `root` and walking every component with `O_NOFOLLOW` so
+/// no symlinked path component can redirect the write outside `root`. Returns
+/// the absolute path written.
+///
+/// # Errors
+///
+/// Returns [`WriteError`] with:
+/// - [`WriteErrorKind::Exists`] when the target exists and `overwrite` is false.
+/// - [`WriteErrorKind::Symlink`] when any path component (intermediate dir or
+///   the leaf) is a symlink.
+/// - [`WriteErrorKind::InvalidPath`] when `relative` is not a non-empty path of
+///   normal file components, names a non-file target, or carries a NUL byte.
+/// - [`WriteErrorKind::Io`] for any other underlying I/O failure.
 pub fn atomic_write_no_follow(
     root: &Path,
     relative: &Path,
@@ -389,6 +442,15 @@ pub fn atomic_write_no_follow(
 /// so a symlinked leaf bounces with `WriteErrorKind::Symlink`. Mirrors
 /// `atomic_write_no_follow`'s component-walk so a single change to the
 /// no-follow logic stays in one place.
+///
+/// # Errors
+///
+/// Returns [`WriteError`] with:
+/// - [`WriteErrorKind::Symlink`] when any path component or the leaf is a symlink.
+/// - [`WriteErrorKind::InvalidPath`] when `relative` is not a non-empty path of
+///   normal file components, a parent component is not a directory, or the path
+///   carries a NUL byte.
+/// - [`WriteErrorKind::Io`] when the file is absent or any other read fails.
 pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteError> {
     let names = normal_components(relative)?;
     let file_name = names
@@ -421,6 +483,14 @@ pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteErro
 /// daemon path silently followed parent symlinks via `tokio::fs::remove_file`,
 /// letting a corpus-controlled directory symlink redirect the unlink outside
 /// the corpus root).
+///
+/// # Errors
+///
+/// Returns [`WriteError`] with:
+/// - [`WriteErrorKind::Symlink`] when any path component or the leaf is a symlink.
+/// - [`WriteErrorKind::InvalidPath`] when `relative` is not a non-empty path of
+///   normal file components, or the leaf is not a regular file.
+/// - [`WriteErrorKind::Io`] when the file is absent or the unlink fails.
 pub fn delete_no_follow(root: &Path, relative: &Path) -> Result<(), WriteError> {
     let names = normal_components(relative)?;
     let file_name = names
@@ -957,6 +1027,66 @@ mod tests {
         let entries = list_corpus_files(&corpus).unwrap();
         let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec!["a.md", "b.md", "sub/c.md"]);
+    }
+
+    #[test]
+    fn canonicalize_or_log_falls_back_to_input_for_missing_path() {
+        // A freshly-configured wiki corpus root may not yet exist on disk when
+        // `list_corpus_files` / `build_corpus_tree` build their root list.
+        // `canonicalize` errors for a non-existent path; the helper must fall
+        // back to the (non-canonical) input rather than panic on `unwrap`.
+        // WHY: the pre-fix `.unwrap_or(expanded)` swallowed the error silently
+        // — this pins that the fallback is graceful AND returns the exact
+        // input path so `absolute_path` is still well-formed (just resolvable
+        // to the LanceDB `file_ref` only once the dir exists and is re-listed).
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("not-created-yet");
+        assert!(!missing.exists(), "precondition: path must not exist");
+        let got = canonicalize_or_log(missing.clone());
+        assert_eq!(
+            got, missing,
+            "fallback must return the input path unchanged"
+        );
+    }
+
+    #[test]
+    fn canonicalize_or_log_returns_canonical_path_for_existing_dir() {
+        // The success arm: an existing root must be canonicalized, NOT passed
+        // through. WHY: `FileEntry.absolute_path` has to match the canonical
+        // `file_ref` LanceDB stores; a regression that always returned the raw
+        // input (collapsing the helper to just the fallback) would silently
+        // de-canonicalize every path. On macOS `tempdir()` lives under the
+        // `/var -> /private/var` symlink, so the canonical form genuinely
+        // differs from the input and this assertion has teeth.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let expected = std::fs::canonicalize(&root).expect("existing dir canonicalizes");
+        let got = canonicalize_or_log(root);
+        assert_eq!(
+            got, expected,
+            "existing dir must resolve to its canonical path"
+        );
+    }
+
+    #[test]
+    fn list_corpus_files_returns_empty_for_freshly_created_empty_corpus() {
+        // The real fresh-wiki path: `ensure_paths_exist` has created the root
+        // dir but no markdown has been written yet. `canonicalize` succeeds
+        // here, but the corpus must list cleanly (no panic, empty result)
+        // rather than error — the regression guard for "first `list_files`
+        // against a brand-new wiki".
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fresh-wiki");
+        std::fs::create_dir_all(&root).unwrap();
+        let corpus = CorpusConfig {
+            name: "fresh".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        };
+        let entries = list_corpus_files(&corpus).expect("empty fresh corpus must list cleanly");
+        assert!(entries.is_empty(), "no markdown written yet");
     }
 
     // ── build_corpus_tree ──────────────────────────────────────────────
