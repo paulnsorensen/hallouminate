@@ -583,15 +583,29 @@ fn open_or_create_child_dir(parent: &Dir, name: &OsStr) -> Result<Dir, WriteErro
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Create the missing directory and fall through to the open.
-            // `cap-std`'s `Dir::create_dir` is umask-modified `0o777` on
-            // unix; on a default umask that resolves to `0o755`, matching
-            // the previous `mkdirat(..., 0o755)` behaviour.
-            match parent.create_dir(name) {
+            // Restore the pre-cap-std `mkdirat(0o755)` mode explicitly.
+            // cap-std's bare `create_dir` requests `0o777`-before-umask, so
+            // under a permissive umask (000/002) intermediate dirs end up
+            // group/other-writable — looser than the old `mkdirat(0o755)`,
+            // which capped at `0o755 & ~umask` (never group/other write) at
+            // any umask. `DirBuilderExt::mode` is unix-only; on non-unix
+            // (Windows) unix mode bits don't apply, so the bare `create_dir`
+            // is the correct fallback.
+            #[cfg(unix)]
+            let created = {
+                use cap_std::fs::{DirBuilder, DirBuilderExt};
+                let mut builder = DirBuilder::new();
+                builder.mode(0o755);
+                parent.create_dir_with(name, &builder)
+            };
+            #[cfg(not(unix))]
+            let created = parent.create_dir(name);
+
+            match created {
                 Ok(()) => {}
                 Err(create_err) if create_err.kind() == std::io::ErrorKind::AlreadyExists => {
                     // Race: another process created the directory between
-                    // our `symlink_metadata` and `create_dir`. Fall through
+                    // our `symlink_metadata` and the create. Fall through
                     // to the open and let it resolve the entry.
                 }
                 Err(create_err) => return Err(classify_path_io_error(create_err)),
@@ -1285,6 +1299,94 @@ mod tests {
         assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
     }
 
+    /// Run `body` with the process umask forced to 0, holding a process-wide
+    /// lock for the whole window so the global umask cannot race a sibling
+    /// test, and restoring the inherited umask before releasing the lock.
+    /// Needed because `cargo test` runs a binary's tests on multiple threads
+    /// and `umask(2)` is per-process, not per-thread; the `Restore` guard also
+    /// repairs the umask if `body` panics.
+    #[cfg(unix)]
+    fn with_permissive_umask<R>(body: impl FnOnce() -> R) -> R {
+        use rustix::fs::Mode;
+        use rustix::process::umask;
+        use std::sync::Mutex;
+
+        static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+        struct Restore(Mode);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                umask(self.0);
+            }
+        }
+
+        // Mutual exclusion is all we need; a poisoned lock (a prior test
+        // panicked mid-window) is still safe to take.
+        let _serialize = UMASK_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        // Dropped before `_serialize` (LIFO), so the umask is restored while
+        // the lock is still held.
+        let _restore = Restore(umask(Mode::empty()));
+        body()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_no_follow_caps_intermediate_dir_mode_at_0o755_under_permissive_umask() {
+        // The cap-std migration swapped `mkdirat(.., 0o755)` for a bare
+        // `Dir::create_dir`, which requests `0o777`-before-umask. Under a
+        // permissive umask the created intermediate dir is group/other
+        // writable — a silent loosening the old `mkdirat(0o755)` never
+        // allowed. We force umask 0 so the buggy path yields 0o777 and only
+        // the explicit `DirBuilderExt::mode(0o755)` caps it; under the
+        // default 0o022 umask both paths coincide at 0o755 and the bug is
+        // invisible (Risk Register R1).
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        with_permissive_umask(|| {
+            atomic_write_no_follow(root, Path::new("perm/leaf.md"), b"x", false)
+                .expect("write through a fresh intermediate dir");
+        });
+
+        let mode = std::fs::metadata(root.join("perm"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o755,
+            "intermediate dir must be capped at 0o755, got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_no_follow_caps_every_nested_intermediate_dir_at_0o755() {
+        // Boundary for the component walk (Risk Register R2): each level of
+        // a deep path is created one-at-a-time through
+        // `open_or_create_child_dir`, so the `0o755` cap must hold for EVERY
+        // intermediate dir, not just the leaf's parent. A regression that
+        // only moded the last component would still leak `0o777` on the
+        // outer dirs under a permissive umask.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        with_permissive_umask(|| {
+            atomic_write_no_follow(root, Path::new("a/b/c/leaf.md"), b"x", false)
+                .expect("write through three fresh intermediate dirs");
+        });
+
+        for rel in ["a", "a/b", "a/b/c"] {
+            let mode = std::fs::metadata(root.join(rel))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o755, "{rel} must be capped at 0o755, got {mode:o}");
+        }
+    }
     #[test]
     fn atomic_write_no_follow_durable_write_round_trips_through_fsync_path() {
         // Locks the `fsync_dir` workaround for cap-std's `O_PATH` `Dir`
