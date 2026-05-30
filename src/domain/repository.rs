@@ -106,11 +106,10 @@ pub fn repository_source_corpus(repo: &RepositoryConfig) -> Result<Option<Corpus
     }
     let name = repo_corpus_name(&repo.name, RepoCorpusKind::Corpus)?;
     let repo_root = PathBuf::from(&repo.path);
-    let paths: Vec<String> = repo
-        .corpus_paths
-        .iter()
-        .map(|raw| resolve_under(&repo_root, raw))
-        .collect();
+    let mut paths: Vec<String> = Vec::with_capacity(repo.corpus_paths.len());
+    for raw in &repo.corpus_paths {
+        paths.push(resolve_under(&repo_root, raw));
+    }
     Ok(Some(CorpusConfig {
         name,
         paths,

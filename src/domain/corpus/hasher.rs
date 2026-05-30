@@ -4,6 +4,16 @@ use std::path::Path;
 
 use crate::domain::common::Result;
 
+/// Stream `path` through BLAKE3 and return the lowercase hex digest.
+///
+/// Streams rather than reads the whole file into memory, so large documents
+/// hash with bounded memory.
+///
+/// # Errors
+///
+/// Returns [`HallouminateError::Io`] if the file cannot be opened or read.
+///
+/// [`HallouminateError::Io`]: crate::domain::common::HallouminateError::Io
 pub fn blake3_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -11,6 +21,7 @@ pub fn blake3_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+/// Hash an in-memory byte slice and return the lowercase hex digest.
 pub fn blake3_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }

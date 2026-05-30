@@ -66,10 +66,14 @@ fn walk_root(
         let path = entry.path();
         // Prune ahead of include-match so caller-supplied excludes can mask
         // even paths the include glob would otherwise pull in.
-        if matches!(exclude, Some(ex) if ex.is_match(path)) {
+        if let Some(ex) = exclude
+            && ex.is_match(path)
+        {
             continue;
         }
-        if matches!(include, Some(inc) if !inc.is_match(path)) {
+        if let Some(inc) = include
+            && !inc.is_match(path)
+        {
             continue;
         }
         let mtime = entry_mtime_ms(&entry)?;

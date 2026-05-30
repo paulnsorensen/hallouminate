@@ -9,10 +9,11 @@ const TOP_K: usize = 8;
 const MIN_LEN: usize = 2;
 
 static STOPWORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
-    get(LANGUAGE::English)
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    let mut set = HashSet::new();
+    for word in get(LANGUAGE::English) {
+        set.insert(word.to_string());
+    }
+    set
 });
 
 pub fn extract_keywords(text: &str) -> Vec<String> {
@@ -32,6 +33,12 @@ fn tokenize_prose(text: &str) -> Vec<String> {
             Event::Code(t) => {
                 tokens.extend(t.unicode_words().map(str::to_lowercase));
             }
+            // Tokens come from text (`Event::Text`, which includes heading and
+            // list-item text) and inline code spans (`Event::Code`); fenced
+            // code blocks are skipped via `in_code_block`. The remaining events
+            // are pure structure (paragraph/list/emphasis starts and ends,
+            // breaks, HTML, and any future pulldown-cmark variants) and carry
+            // no text we rank, so ignoring them is safe.
             _ => {}
         }
     }

@@ -14,6 +14,10 @@ pub use text_splitter::ChunkSizer;
 /// `ChunkSizer` parameter so `apply`/`writer` can take `&dyn CorpusChunker`
 /// without propagating the type parameter into every layer.
 pub trait CorpusChunker: Send + Sync {
+    /// Split `text` into budget-bounded [`Chunk`]s in document order.
+    ///
+    /// Infallible: malformed markdown still chunks (the splitter degrades to
+    /// byte windows), and empty input yields an empty `Vec`.
     fn chunk_text(&self, text: &str) -> Vec<Chunk>;
 }
 
@@ -23,12 +27,19 @@ impl<S: ChunkSizer + Send + Sync> CorpusChunker for MarkdownChunker<S> {
     }
 }
 
+/// One budget-bounded slice of a document, annotated for citation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
+    /// Zero-based position of this chunk within the document's chunk sequence.
     pub ord: usize,
+    /// Active heading breadcrumbs (H1→H3) above the chunk's start, outermost
+    /// first. Empty when the chunk precedes any heading.
     pub heading_path: Vec<String>,
+    /// First source line the chunk touches, 1-indexed.
     pub line_start: usize,
+    /// Last source line the chunk touches, 1-indexed and inclusive.
     pub line_end: usize,
+    /// The chunk's verbatim text slice.
     pub text: String,
 }
 
