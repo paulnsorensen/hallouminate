@@ -4,10 +4,16 @@ use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use crate::domain::common::{HallouminateError, Result};
 
+/// Output dimensionality shared by every supported model. All three embed to
+/// 384-dim vectors, so the rest of the pipeline can use a fixed-size array.
 pub const EMBEDDING_DIM: usize = 384;
+/// Default embedding model: a small, English, symmetric retrieval model.
 pub const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
+/// Multilingual, asymmetric retrieval model (distinct query/passage prefixes).
 pub const E5_SMALL_MODEL: &str = "intfloat/multilingual-e5-small";
+/// Snowflake Arctic small model; symmetric retrieval like [`DEFAULT_MODEL`].
 pub const ARCTIC_S_MODEL: &str = "snowflake/snowflake-arctic-embed-s";
+/// Every model name accepted by [`canonical_model_name`], for menus and tests.
 pub const SUPPORTED_MODELS: [&str; 3] = [DEFAULT_MODEL, E5_SMALL_MODEL, ARCTIC_S_MODEL];
 
 const LEGACY_DEFAULT_MODEL: &str = "bge-small-en-v1.5";
@@ -24,12 +30,40 @@ pub enum EmbedRole {
     Passage,
 }
 
+/// Embeds a batch of texts into unit-normalized vectors. Implemented by
+/// [`Embedder`] and by test doubles; the `role` selects the query- vs
+/// passage-side instruction prefix for asymmetric models.
 pub trait EmbedBatch: Send {
+    /// Embed `texts` under `role`, returning one vector per input in order.
+    ///
+    /// # Errors
+    /// Returns [`HallouminateError::Embed`] if the backend fails to embed or
+    /// returns a vector whose dimensionality is not [`EMBEDDING_DIM`].
     fn embed_batch(
         &mut self,
         texts: &[String],
         role: EmbedRole,
     ) -> Result<Vec<[f32; EMBEDDING_DIM]>>;
+}
+
+/// Whether to load the quantized (`*Q`) ONNX variant of a model. Internal to
+/// model resolution; the wire/config boundary stays a `bool`, mapped here once
+/// in [`Embedder::try_new`] so [`resolve_model`] matches on an exhaustive enum
+/// rather than a bare flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Quantization {
+    Full,
+    Quantized,
+}
+
+impl From<bool> for Quantization {
+    fn from(quantized: bool) -> Self {
+        if quantized {
+            Self::Quantized
+        } else {
+            Self::Full
+        }
+    }
 }
 
 pub struct Embedder {
@@ -40,7 +74,7 @@ pub struct Embedder {
 impl Embedder {
     pub fn try_new(model_name: &str, quantized: bool, cache_dir: &Path) -> Result<Self> {
         let canonical_name = canonical_model_name(model_name)?;
-        let model = resolve_model(canonical_name, quantized)?;
+        let model = resolve_model(canonical_name, quantized.into())?;
         let opts = TextInitOptions::new(model)
             .with_cache_dir(PathBuf::from(cache_dir))
             .with_show_download_progress(false);
@@ -109,25 +143,26 @@ pub(crate) fn l2_normalize(v: &mut [f32]) {
     }
 }
 
-/// Map a canonical model name + quantization flag to a fastembed enum
-/// variant. Errors when a quantized variant is requested for a model that
-/// has none (multilingual-e5-small ships only a full-precision ONNX). The
-/// canonical name is guaranteed valid by `canonical_model_name`, so the
+/// Map a canonical model name + [`Quantization`] to a fastembed enum
+/// variant. Errors when [`Quantization::Quantized`] is requested for a model
+/// that has none (multilingual-e5-small ships only a full-precision ONNX). The
+/// canonical name is guaranteed valid by [`canonical_model_name`], so the
 /// only fallible axis here is the missing-Q-variant case.
-fn resolve_model(canonical: &str, quantized: bool) -> Result<EmbeddingModel> {
-    let model = match (canonical, quantized) {
-        (DEFAULT_MODEL, false) => EmbeddingModel::BGESmallENV15,
-        (DEFAULT_MODEL, true) => EmbeddingModel::BGESmallENV15Q,
-        (E5_SMALL_MODEL, false) => EmbeddingModel::MultilingualE5Small,
-        (E5_SMALL_MODEL, true) => {
+fn resolve_model(canonical: &str, quantization: Quantization) -> Result<EmbeddingModel> {
+    use Quantization::{Full, Quantized};
+    let model = match (canonical, quantization) {
+        (DEFAULT_MODEL, Full) => EmbeddingModel::BGESmallENV15,
+        (DEFAULT_MODEL, Quantized) => EmbeddingModel::BGESmallENV15Q,
+        (E5_SMALL_MODEL, Full) => EmbeddingModel::MultilingualE5Small,
+        (E5_SMALL_MODEL, Quantized) => {
             return Err(HallouminateError::Config(format!(
                 "{E5_SMALL_MODEL:?} has no quantized variant; \
                  set embeddings.quantized = false or choose {DEFAULT_MODEL:?} \
                  or {ARCTIC_S_MODEL:?}"
             )));
         }
-        (ARCTIC_S_MODEL, false) => EmbeddingModel::SnowflakeArcticEmbedS,
-        (ARCTIC_S_MODEL, true) => EmbeddingModel::SnowflakeArcticEmbedSQ,
+        (ARCTIC_S_MODEL, Full) => EmbeddingModel::SnowflakeArcticEmbedS,
+        (ARCTIC_S_MODEL, Quantized) => EmbeddingModel::SnowflakeArcticEmbedSQ,
         _ => unreachable!("resolve_model takes a canonical name from canonical_model_name"),
     };
     Ok(model)
@@ -150,6 +185,13 @@ pub fn instruction_prefix(canonical: &str, role: EmbedRole) -> &'static str {
     }
 }
 
+/// Resolve a user-supplied model name to its canonical form, accepting the
+/// legacy `bge-small-en-v1.5` alias for [`DEFAULT_MODEL`].
+///
+/// # Errors
+/// Returns [`HallouminateError::Config`] when `name` is not one of the
+/// supported models (or the legacy alias), with a message listing the valid
+/// choices.
 pub fn canonical_model_name(name: &str) -> Result<&'static str> {
     match name {
         DEFAULT_MODEL | LEGACY_DEFAULT_MODEL => Ok(DEFAULT_MODEL),
@@ -201,15 +243,15 @@ mod tests {
     #[test]
     fn resolve_model_maps_each_supported_model_full_precision() {
         assert!(matches!(
-            resolve_model(DEFAULT_MODEL, false).unwrap(),
+            resolve_model(DEFAULT_MODEL, Quantization::Full).unwrap(),
             EmbeddingModel::BGESmallENV15
         ));
         assert!(matches!(
-            resolve_model(E5_SMALL_MODEL, false).unwrap(),
+            resolve_model(E5_SMALL_MODEL, Quantization::Full).unwrap(),
             EmbeddingModel::MultilingualE5Small
         ));
         assert!(matches!(
-            resolve_model(ARCTIC_S_MODEL, false).unwrap(),
+            resolve_model(ARCTIC_S_MODEL, Quantization::Full).unwrap(),
             EmbeddingModel::SnowflakeArcticEmbedS
         ));
     }
@@ -217,18 +259,24 @@ mod tests {
     #[test]
     fn resolve_model_picks_quantized_variant_when_one_exists() {
         assert!(matches!(
-            resolve_model(DEFAULT_MODEL, true).unwrap(),
+            resolve_model(DEFAULT_MODEL, Quantization::Quantized).unwrap(),
             EmbeddingModel::BGESmallENV15Q
         ));
         assert!(matches!(
-            resolve_model(ARCTIC_S_MODEL, true).unwrap(),
+            resolve_model(ARCTIC_S_MODEL, Quantization::Quantized).unwrap(),
             EmbeddingModel::SnowflakeArcticEmbedSQ
         ));
     }
 
     #[test]
+    fn quantization_from_bool_maps_true_to_quantized_false_to_full() {
+        assert_eq!(Quantization::from(true), Quantization::Quantized);
+        assert_eq!(Quantization::from(false), Quantization::Full);
+    }
+
+    #[test]
     fn resolve_model_errors_for_quantized_e5_small_which_has_no_q_variant() {
-        let err = resolve_model(E5_SMALL_MODEL, true)
+        let err = resolve_model(E5_SMALL_MODEL, Quantization::Quantized)
             .expect_err("e5-small has no quantized ONNX; must error");
         let msg = err.to_string();
         assert!(msg.contains("no quantized variant"), "{msg}");

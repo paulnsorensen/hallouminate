@@ -6,19 +6,28 @@ use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 use super::plan::{IndexPlan, MtimeCandidate};
 use super::writer::{WriteRequest, prepare_file};
 
+/// Tallies of the work an [`apply`] run performed, returned to the caller for
+/// reporting and assertions.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ApplyStats {
+    /// Files written through the upsert/fallthrough path (content (re)indexed).
     pub files_upserted: usize,
+    /// Files whose content was unchanged; only the stored mtime was bumped.
     pub files_touched: usize,
+    /// Files removed from the index because they vanished from disk.
     pub files_deleted: usize,
     /// Files that produced zero chunks (typically empty markdown). They are
     /// not represented in the chunks table and so cannot be made
     /// idempotent; the caller may want to filter these from the corpus.
     pub files_skipped_empty: usize,
+    /// Total chunks written across all upserted files (both embedding modes).
     pub chunks_inserted: usize,
+    /// Total embedding vectors written; zero when the embedder is `None`.
     pub embeddings_inserted: usize,
 }
 
+/// Default number of files prepared and embedded per batch when the caller
+/// does not specify one. Bounds peak memory and embedder call width.
 pub const DEFAULT_BATCH_SIZE: usize = 16;
 
 pub async fn apply(
@@ -31,18 +40,19 @@ pub async fn apply(
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
     let batch_size = batch_size.max(1);
+    // Captured once so every file written by this run shares a single
+    // `indexed_at_ms`, regardless of how many batches it spans.
     let indexed_at_ms = chrono::Utc::now().timestamp_millis();
 
     // Upserts: build write requests and run them in batches.
-    let upsert_reqs: Vec<WriteRequest<'_>> = plan
-        .upserts
-        .iter()
-        .map(|u| WriteRequest {
+    let mut upsert_reqs: Vec<WriteRequest<'_>> = Vec::with_capacity(plan.upserts.len());
+    for u in &plan.upserts {
+        upsert_reqs.push(WriteRequest {
             corpus,
             file: &u.file,
             mtime: u.mtime,
-        })
-        .collect();
+        });
+    }
     run_in_batches(
         upsert_reqs,
         batch_size,
@@ -68,14 +78,14 @@ pub async fn apply(
             fallthrough.push(cand);
         }
     }
-    let fallthrough_reqs: Vec<WriteRequest<'_>> = fallthrough
-        .iter()
-        .map(|c| WriteRequest {
+    let mut fallthrough_reqs: Vec<WriteRequest<'_>> = Vec::with_capacity(fallthrough.len());
+    for c in &fallthrough {
+        fallthrough_reqs.push(WriteRequest {
             corpus,
             file: &c.file,
             mtime: c.new_mtime,
-        })
-        .collect();
+        });
+    }
     run_in_batches(
         fallthrough_reqs,
         batch_size,
