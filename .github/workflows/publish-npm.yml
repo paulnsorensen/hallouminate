@@ -24,7 +24,7 @@ jobs:
           # Strip optional leading "v" — cargo-dist accepts both forms.
           TAG_VER="${TAG#v}"
           CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          NPM_VER=$(node -p "require('./npm/package.json').version")
+          NPM_VER=$(jq -r .version npm/package.json)
           echo "Tag: $TAG_VER  Cargo: $CARGO_VER  npm: $NPM_VER"
           if [ "$CARGO_VER" != "$TAG_VER" ]; then
             echo "::error::Cargo.toml version ($CARGO_VER) does not match tag ($TAG_VER)"
