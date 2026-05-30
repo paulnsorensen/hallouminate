@@ -20,7 +20,7 @@ pub struct GroundResponse {
     /// `BTreeMap`'s path sort.
     pub docs: BTreeMap<String, DocFile>,
     /// Matched code-repo results keyed by absolute path. Empty unless a
-    /// `[[code_repo]]` is configured; values are opaque to this layer.
+    /// `[[repository]]` is configured; values are opaque to this layer.
     pub code: BTreeMap<String, serde_json::Value>,
     /// Non-fatal advisories (e.g. no code repos configured) attached to the run.
     pub warnings: Vec<Warning>,
