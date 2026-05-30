@@ -1322,7 +1322,9 @@ mod tests {
 
         // Mutual exclusion is all we need; a poisoned lock (a prior test
         // panicked mid-window) is still safe to take.
-        let _serialize = UMASK_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _serialize = UMASK_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // Dropped before `_serialize` (LIFO), so the umask is restored while
         // the lock is still held.
         let _restore = Restore(umask(Mode::empty()));
