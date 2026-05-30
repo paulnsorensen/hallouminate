@@ -13,10 +13,13 @@ const DEFAULT_DEBOUNCE_MS: u64 = 500;
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 
+/// Search and ranking defaults applied when a query does not override them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchConfig {
+    /// Number of files returned per query by default (default `10`).
     #[serde(default = "default_top_files")]
     pub top_files_default: usize,
+    /// Number of chunks shown per file by default (default `3`).
     #[serde(default = "default_chunks_per_file")]
     pub chunks_per_file_default: usize,
     /// Crossencoder model identifier (e.g. `"jina-reranker-v1-turbo-en"`).
@@ -37,6 +40,8 @@ impl Default for SearchConfig {
     }
 }
 
+/// Dense-embedding settings: which model to load, whether to load one at all,
+/// and where to cache it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
     /// Switch for dense embeddings. On by default: hallouminate downloads the
@@ -46,6 +51,9 @@ pub struct EmbeddingsConfig {
     /// chunking.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// Embedding model identifier (default Snowflake Arctic-S). Legacy aliases
+    /// are normalized to a canonical name at load time; unknown names are
+    /// rejected before any download.
     #[serde(default = "default_model")]
     pub model: String,
     /// Select the fastembed `*Q` quantized variant of `model` when one
@@ -53,6 +61,8 @@ pub struct EmbeddingsConfig {
     /// (multilingual-e5-small).
     #[serde(default)]
     pub quantized: bool,
+    /// Directory where fastembed caches downloaded model files
+    /// (default `~/.cache/hallouminate/fastembed`).
     #[serde(default = "default_embed_cache")]
     pub cache_dir: String,
 }
@@ -68,8 +78,11 @@ impl Default for EmbeddingsConfig {
     }
 }
 
+/// File-watcher settings for incremental re-indexing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchConfig {
+    /// Milliseconds to wait after the last filesystem event before re-indexing,
+    /// coalescing bursts of changes (default `500`).
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
 }
@@ -82,8 +95,11 @@ impl Default for WatchConfig {
     }
 }
 
+/// On-disk storage locations for hallouminate's persistent state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
+    /// Directory holding the ground (markdown wiki) store
+    /// (default `~/.local/share/hallouminate/ground`).
     #[serde(default = "default_ground_dir")]
     pub ground_dir: String,
 }
@@ -96,22 +112,33 @@ impl Default for StorageConfig {
     }
 }
 
+/// The fully-resolved hallouminate configuration.
+///
+/// Assembled by merging the XDG baseline layer with the discovered per-repo
+/// layer; every nested section falls back to its `Default` when omitted, so an
+/// empty config decodes to a fully-defaulted `Config`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Config {
+    /// User-defined corpora, declared as `[[corpus]]` entries.
     #[serde(rename = "corpus", default)]
     pub corpora: Vec<CorpusConfig>,
+    /// Indexed code repositories, declared as `[[repository]]` entries.
     // Accept the legacy `[[code_repo]]` plural too so configs written
     // before the rename (PR #21) keep loading instead of silently dropping
     // every repository entry. `config validate` still warns on the legacy
     // key so users have a clear nudge to migrate.
     #[serde(rename = "repository", alias = "code_repo", default)]
     pub repositories: Vec<RepositoryConfig>,
+    /// Search and ranking defaults.
     #[serde(default)]
     pub search: SearchConfig,
+    /// Dense-embedding settings.
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    /// File-watcher settings.
     #[serde(default)]
     pub watch: WatchConfig,
+    /// On-disk storage locations.
     #[serde(default)]
     pub storage: StorageConfig,
 }
