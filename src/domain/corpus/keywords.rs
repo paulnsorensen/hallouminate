@@ -33,10 +33,12 @@ fn tokenize_prose(text: &str) -> Vec<String> {
             Event::Code(t) => {
                 tokens.extend(t.unicode_words().map(str::to_lowercase));
             }
-            // Keywords come only from prose text and inline code spans. All
-            // other markdown events (headings, lists, breaks, emphasis, and
-            // any future pulldown-cmark variants) carry no tokens we rank, so
-            // ignoring them is safe.
+            // Tokens come from text (`Event::Text`, which includes heading and
+            // list-item text) and inline code spans (`Event::Code`); fenced
+            // code blocks are skipped via `in_code_block`. The remaining events
+            // are pure structure (paragraph/list/emphasis starts and ends,
+            // breaks, HTML, and any future pulldown-cmark variants) and carry
+            // no text we rank, so ignoring them is safe.
             _ => {}
         }
     }
