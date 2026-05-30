@@ -3,7 +3,6 @@
 "use strict";
 
 const https = require("https");
-const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
@@ -46,14 +45,21 @@ fs.mkdirSync(binDir, { recursive: true });
 console.log(`hallouminate: downloading ${target} binary...`);
 
 function follow(url, cb) {
-  const mod = url.startsWith("https") ? https : http;
-  mod
+  // postinstall download: refuse anything but HTTPS, including redirect
+  // targets, so a hijacked Location header can't downgrade or jump host.
+  if (!url.startsWith("https:")) {
+    console.error(`hallouminate: refusing non-HTTPS download URL: ${url}`);
+    console.error("Install manually: cargo install hallouminate");
+    process.exit(1);
+  }
+  https
     .get(url, { headers: { "User-Agent": "hallouminate-npm" } }, (res) => {
       if (
         res.statusCode >= 300 &&
         res.statusCode < 400 &&
         res.headers.location
       ) {
+        res.resume(); // drain the redirect body so the socket is freed
         follow(res.headers.location, cb);
       } else if (res.statusCode !== 200) {
         console.error(`hallouminate: download failed (HTTP ${res.statusCode})`);
@@ -80,6 +86,11 @@ follow(url, (res) => {
     ["-xJ", "--strip-components=1", "-C", binDir],
     { stdio: ["pipe", "inherit", "inherit"] },
   );
+  tar.on("error", (err) => {
+    console.error(`hallouminate: failed to run tar: ${err.message}`);
+    console.error("Install manually: cargo install hallouminate");
+    process.exit(1);
+  });
   res.pipe(tar.stdin);
   tar.on("close", (code) => {
     if (code !== 0) {
