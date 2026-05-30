@@ -123,7 +123,6 @@ pub struct Config {
     #[serde(rename = "corpus", default)]
     pub corpora: Vec<CorpusConfig>,
     /// Indexed code repositories, declared as `[[repository]]` entries.
-    //
     // Accept the legacy `[[code_repo]]` plural too so configs written
     // before the rename (PR #21) keep loading instead of silently dropping
     // every repository entry. `config validate` still warns on the legacy
