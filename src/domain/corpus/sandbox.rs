@@ -41,7 +41,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::common::{expand_tilde, CorpusConfig};
+use crate::domain::common::{CorpusConfig, expand_tilde};
 use crate::domain::corpus::scan;
 
 /// Caller-supplied input failure when validating a corpus / path pair.
