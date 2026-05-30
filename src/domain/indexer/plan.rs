@@ -17,7 +17,7 @@ pub struct FileSnapshot {
 }
 
 /// The diff between what is on disk and what is already indexed, split into the
-/// three actions [`apply`](super::apply::apply) performs: write new/changed
+/// three actions [`apply`](crate::domain::indexer::apply) performs: write new/changed
 /// files, fast-path mtime bumps, and delete vanished files.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndexPlan {
