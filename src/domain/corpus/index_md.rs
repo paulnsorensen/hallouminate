@@ -19,8 +19,13 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+/// Filename of the auto-maintained directory index.
 pub const INDEX_FILENAME: &str = "index.md";
+/// Opening fence of the auto-generated link block; prose before it is the
+/// author's and left untouched.
 pub const INDEX_START_MARKER: &str = "<!-- HALLOUMINATE:INDEX-START -->";
+/// Closing fence of the auto-generated link block; prose after it is the
+/// author's and left untouched.
 pub const INDEX_END_MARKER: &str = "<!-- HALLOUMINATE:INDEX-END -->";
 
 /// Directories from the corpus root down to the parent of `file_relative`,
@@ -184,18 +189,13 @@ fn dir_contains_markdown(dir: &Path) -> bool {
             continue;
         }
         if ft.is_file() {
-            if entry
-                .file_name()
-                .to_str()
-                .map(|n| n.ends_with(".md"))
-                .unwrap_or(false)
-            {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|n| n.ends_with(".md")) {
                 return true;
             }
         } else if ft.is_dir() {
             let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') {
+            if name.to_string_lossy().starts_with('.') {
                 continue;
             }
             if dir_contains_markdown(&entry.path()) {

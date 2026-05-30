@@ -2,17 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-use stop_words::{LANGUAGE, get};
+use stop_words::{get, LANGUAGE};
 use unicode_segmentation::UnicodeSegmentation;
 
 const TOP_K: usize = 8;
 const MIN_LEN: usize = 2;
 
 static STOPWORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
-    get(LANGUAGE::English)
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    let mut set = HashSet::new();
+    for word in get(LANGUAGE::English) {
+        set.insert(word.to_string());
+    }
+    set
 });
 
 pub fn extract_keywords(text: &str) -> Vec<String> {
@@ -32,6 +33,10 @@ fn tokenize_prose(text: &str) -> Vec<String> {
             Event::Code(t) => {
                 tokens.extend(t.unicode_words().map(str::to_lowercase));
             }
+            // Keywords come only from prose text and inline code spans. All
+            // other markdown events (headings, lists, breaks, emphasis, and
+            // any future pulldown-cmark variants) carry no tokens we rank, so
+            // ignoring them is safe.
             _ => {}
         }
     }
@@ -88,9 +93,7 @@ vector vector vector vector vector
         assert_eq!(kws.len(), 8);
         assert_eq!(
             kws,
-            vec![
-                "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
-            ]
+            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",]
         );
     }
 

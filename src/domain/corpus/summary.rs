@@ -2,6 +2,13 @@ use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
 const SUMMARY_CAP: usize = 280;
 
+/// Derive a one-line summary for a markdown document.
+///
+/// Uses the first H1 as the title (falling back to `fallback_filename` when
+/// the document has none) and joins it with the first prose paragraph as
+/// `"{title} — {paragraph}"`. The result is truncated to the first 280
+/// characters (counted by `char`, not byte, so multibyte text is never split
+/// mid-codepoint).
 pub fn extract_summary(text: &str, fallback_filename: &str) -> String {
     let (title, paragraph) = walk(text);
     let title = title.unwrap_or_else(|| fallback_filename.to_string());
@@ -35,6 +42,10 @@ fn walk(text: &str) -> (Option<String>, Option<String>) {
                     paragraph_before_title = Some(p);
                 }
             }
+            // Only the first H1 and the first prose paragraph feed the
+            // summary; every other markdown event (lists, code, emphasis,
+            // breaks, future pulldown-cmark variants) is irrelevant here and
+            // safe to skip.
             _ => {}
         }
     }

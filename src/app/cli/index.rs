@@ -105,12 +105,13 @@ pub fn select_corpora(
 fn ad_hoc_corpus(file: &Path) -> anyhow::Result<CorpusConfig> {
     let text = fs::read_to_string(file)
         .map_err(|e| InputError::new(format!("read paths-from file {}: {e}", file.display())))?;
-    let paths: Vec<String> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(|s| s.to_string())
-        .collect();
+    let mut paths: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            paths.push(trimmed.to_string());
+        }
+    }
     if paths.is_empty() {
         return Err(InputError::new(format!("paths-from file {} is empty", file.display())).into());
     }

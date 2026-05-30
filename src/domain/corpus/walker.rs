@@ -2,12 +2,12 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
+use ignore::WalkBuilder;
 
 use crate::domain::common::{
-    CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
-    expand_tilde,
+    canonicalize_or_passthrough, expand_tilde, CorpusConfig, FileRef, HallouminateError, Mtime,
+    Result,
 };
 
 pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
@@ -66,10 +66,14 @@ fn walk_root(
         let path = entry.path();
         // Prune ahead of include-match so caller-supplied excludes can mask
         // even paths the include glob would otherwise pull in.
-        if matches!(exclude, Some(ex) if ex.is_match(path)) {
+        if let Some(ex) = exclude
+            && ex.is_match(path)
+        {
             continue;
         }
-        if matches!(include, Some(inc) if !inc.is_match(path)) {
+        if let Some(inc) = include
+            && !inc.is_match(path)
+        {
             continue;
         }
         let mtime = entry_mtime_ms(&entry)?;
