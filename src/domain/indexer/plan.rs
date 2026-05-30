@@ -6,29 +6,52 @@ use crate::domain::common::{FileRef, Mtime};
 /// denormalized columns of the chunks table by `LanceStore::list_files`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FileSnapshot {
+    /// Stored path key of the file, as written to the chunks table.
     pub file_ref: String,
+    /// Corpus the file belongs to.
     pub corpus: String,
+    /// Last-modified time recorded at the previous index, in epoch millis.
     pub mtime_ms: i64,
+    /// blake3 hex digest of the file's content at the previous index.
     pub content_hash: String,
 }
 
+/// The diff between what is on disk and what is already indexed, split into the
+/// three actions [`apply`](crate::domain::indexer::apply) performs: write new/changed
+/// files, fast-path mtime bumps, and delete vanished files.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct IndexPlan {
+    /// Files absent from the index — written in full (chunked + embedded).
     pub upserts: Vec<Upsert>,
+    /// Files whose mtime moved while their snapshot stayed. The mtime change
+    /// is only a hint that content *may* have changed: `apply` re-hashes each
+    /// candidate and, when the hash matches the snapshot, takes the fast path
+    /// of bumping the stored mtime without re-chunking or re-embedding.
+    /// Candidates whose hash differs fall through to the upsert path.
     pub mtime_touches: Vec<MtimeCandidate>,
+    /// Snapshots of files gone from disk — deleted from the index.
     pub deletes: Vec<FileSnapshot>,
 }
 
+/// A file to (re)index in full because no prior snapshot exists for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upsert {
+    /// Path of the file on disk.
     pub file: FileRef,
+    /// Current mtime to record for the file.
     pub mtime: Mtime,
 }
 
+/// A file whose mtime moved since the last index. Carries the prior `snap` so
+/// `apply` can compare content hashes and decide between the fast mtime-only
+/// path and a full re-index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MtimeCandidate {
+    /// Path of the file on disk.
     pub file: FileRef,
+    /// Snapshot from the previous index, including the old content hash.
     pub snap: FileSnapshot,
+    /// Current on-disk mtime to record if the fast path is taken.
     pub new_mtime: Mtime,
 }
 

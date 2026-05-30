@@ -33,16 +33,16 @@ pub(super) fn prepare_file(
     let summary = extract_summary(&body, &fallback);
     let keywords = extract_keywords(&body);
     let file_ref_str = file_ref_string(req.file)?;
-    let chunks: Vec<PreparedChunk> = chunks_raw
-        .into_iter()
-        .map(|c| PreparedChunk {
+    let mut chunks: Vec<PreparedChunk> = Vec::with_capacity(chunks_raw.len());
+    for c in chunks_raw {
+        chunks.push(PreparedChunk {
             ord: c.ord,
             heading_path: c.heading_path,
             line_start: c.line_start,
             line_end: c.line_end,
             text: c.text,
-        })
-        .collect();
+        });
+    }
     Ok(PreparedFile {
         file_ref: file_ref_str,
         corpus: req.corpus.name.clone(),
@@ -59,7 +59,7 @@ pub(super) fn prepare_file(
 pub(super) fn file_ref_string(file: &FileRef) -> Result<String> {
     file.as_path()
         .to_str()
-        .map(|s| s.to_string())
+        .map(|s| s.to_owned())
         .ok_or_else(|| {
             HallouminateError::Indexer(format!(
                 "non-utf8 path cannot be stored: {}",
