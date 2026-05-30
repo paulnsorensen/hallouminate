@@ -431,6 +431,91 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
     assert_eq!(read_value["content"].as_str(), Some(body));
 }
 
+#[tokio::test]
+async fn daemon_add_markdown_returns_lint_warnings_without_blocking_the_write() {
+    // add_markdown stores content verbatim AND returns advisory lint warnings
+    // in the same response. Embeddings are disabled so the index path stays
+    // lexical-only (no model download) — the write still succeeds and the
+    // warnings ride back alongside the index report, never rewriting or
+    // rejecting the content.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Two flaggable issues: an empty-destination link and an empty mermaid block.
+    let body = "# Notes\n\nSee [the spec]() for details.\n\n```mermaid\n```\n";
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "notes.md".into(),
+                content: body.into(),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("add_markdown ok");
+
+    // Stored verbatim despite the warnings — the linter never edits content.
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("notes.md")).unwrap(),
+        body,
+        "content must be stored verbatim, never rewritten by the linter"
+    );
+
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present when content has lint issues");
+    assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+    let joined = warnings
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("empty destination"), "got: {joined}");
+    assert!(joined.contains("mermaid"), "got: {joined}");
+
+    // A clean write omits the warnings field entirely (skip_serializing_if).
+    let clean: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "clean.md".into(),
+                content: "# Clean\n\nNothing to flag here.\n".into(),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("add_markdown clean ok");
+    assert!(
+        clean["warnings"].as_array().is_none_or(|w| w.is_empty()),
+        "clean content must carry no warnings: {:?}",
+        clean["warnings"]
+    );
+}
+
 // ─── Hardening: liveness, contract surface, single-instance ────────────
 
 #[tokio::test]

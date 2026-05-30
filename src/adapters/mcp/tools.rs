@@ -508,7 +508,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Write a markdown file under the corpus' FIRST configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. For updates, call `read_markdown` first, then re-call with `overwrite=true`."
+        description = "Write a markdown file under the corpus' FIRST configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`."
     )]
     pub async fn add_markdown(
         &self,
@@ -527,10 +527,16 @@ impl HallouminateTools {
             }),
         };
         let response: AddMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let text = format!(
+        let mut text = format!(
             "wrote {} and refreshed corpus {}",
             response.path, response.corpus
         );
+        if !response.warnings.is_empty() {
+            text.push_str("\n\nlint warnings (advisory, file was written as-is):");
+            for warning in &response.warnings {
+                text.push_str(&format!("\n- {warning}"));
+            }
+        }
         let structured =
             serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
         Ok(tool_ok(text, structured))

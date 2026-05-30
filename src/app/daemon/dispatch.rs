@@ -96,6 +96,36 @@ fn effective_corpora(cfg: &Config) -> Result<Vec<CorpusConfig>, DaemonResponse> 
         .map_err(|e| DaemonResponse::internal(e.to_string()))
 }
 
+/// Resolve and validate an explicit corpus + relative path for the mutating /
+/// reading wiki handlers (`add` / `read` / `delete`). Runs the shared
+/// preamble every one of them repeated verbatim: pick the named corpus,
+/// resolve its first root, sandbox the caller-supplied path, confirm the
+/// corpus's filters allow it, and pre-flight the wiki root for symlink swaps.
+/// Returns `(corpus, root, relative)` on success, or the exact
+/// `DaemonResponse` the handler would have returned at the failing step — so
+/// folding handlers onto this preserves their error shapes byte-for-byte.
+///
+/// `globalize_markdown` deliberately does NOT use this helper: it resolves two
+/// corpora (source + global) and its source side skips `ensure_wiki_root_safe`,
+/// so routing it through here would add a check it does not have today.
+fn validate_wiki_path(
+    corpora: &[CorpusConfig],
+    corpus_name: &str,
+    path: &str,
+) -> Result<(CorpusConfig, std::path::PathBuf, std::path::PathBuf), DaemonResponse> {
+    let corpus = pick_corpus(corpora, Some(corpus_name))
+        .map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    let root =
+        first_corpus_root(&corpus).map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    let relative =
+        safe_relative_path(path).map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    let dest = root.join(&relative);
+    ensure_corpus_allows_file(&corpus, &dest)
+        .map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    ensure_wiki_root_safe(&corpus).map_err(DaemonResponse::invalid_params)?;
+    Ok((corpus, root, relative))
+}
+
 /// Read-side corpus selection with wiki-defaulting.
 ///
 /// When `requested` is `None`, try to default to `repo:{name}:wiki` for the
@@ -341,25 +371,15 @@ async fn handle_add_markdown(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus(&corpora, Some(&req.corpus)) {
-        Ok(c) => c,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    let (corpus, root, relative) = match validate_wiki_path(&corpora, &req.corpus, &req.path) {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
-    let root = match first_corpus_root(&corpus) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let relative = match safe_relative_path(&req.path) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let dest = root.join(&relative);
-    if let Err(e) = ensure_corpus_allows_file(&corpus, &dest) {
-        return DaemonResponse::invalid_params(e.into_inner());
-    }
-    if let Err(msg) = ensure_wiki_root_safe(&corpus) {
-        return DaemonResponse::invalid_params(msg);
-    }
+
+    // Advisory-only lint of the verbatim content. Never blocks or rewrites the
+    // write — the messages ride back in the response so the author can fix in
+    // a follow-up instead of discovering breakage on a later read.
+    let warnings = crate::domain::corpus::lint_markdown(&req.content);
 
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
@@ -373,8 +393,11 @@ async fn handle_add_markdown(
     let write_root = root.clone();
     let write_relative = relative.clone();
     let error_relative = relative.clone();
-    let content_bytes = req.content.clone().into_bytes();
+    // Read scalars and the empty-content flag before consuming `req.content`,
+    // so the move into `into_bytes()` avoids cloning a potentially large body.
     let overwrite = req.overwrite;
+    let content_is_empty = req.content.trim().is_empty();
+    let content_bytes = req.content.into_bytes();
     let written = tokio::task::spawn_blocking(move || {
         atomic_write_no_follow(&write_root, &write_relative, &content_bytes, overwrite)
     })
@@ -398,6 +421,13 @@ async fn handle_add_markdown(
             return resp;
         }
         Err(join_err) => {
+            // Non-retriable: a panicked blocking task means the write lane is
+            // in an unknown state, so log at error (not warn) for alerting.
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %join_err,
+                "add_markdown write task panicked",
+            );
             return DaemonResponse::internal(format!("write task panicked: {join_err}"));
         }
     };
@@ -410,12 +440,12 @@ async fn handle_add_markdown(
     // LanceDB rows so searches stop returning the deleted body — the full
     // `index_single_file` path does this via `files_skipped_empty > 0 &&
     // had_snapshot`, but the short-circuit below bypasses that loop.
-    let mut stats = if req.content.trim().is_empty() {
+    let mut stats = if content_is_empty {
         let mut stats = crate::domain::indexer::ApplyStats {
             files_skipped_empty: 1,
             ..Default::default()
         };
-        if req.overwrite {
+        if overwrite {
             let file_ref = canonicalize_or_passthrough(&dest);
             if let Some(file_ref_str) = file_ref.as_path().to_str() {
                 let store = state.store();
@@ -481,6 +511,7 @@ async fn handle_add_markdown(
         path: relative.to_string_lossy().into_owned(),
         absolute_path: dest.to_string_lossy().into_owned(),
         indexed: report,
+        warnings,
     })
 }
 
@@ -489,25 +520,11 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus(&corpora, Some(&req.corpus)) {
-        Ok(c) => c,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let root = match first_corpus_root(&corpus) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let relative = match safe_relative_path(&req.path) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    let (corpus, root, relative) = match validate_wiki_path(&corpora, &req.corpus, &req.path) {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
     let dest = root.join(&relative);
-    if let Err(e) = ensure_corpus_allows_file(&corpus, &dest) {
-        return DaemonResponse::invalid_params(e.into_inner());
-    }
-    if let Err(msg) = ensure_wiki_root_safe(&corpus) {
-        return DaemonResponse::invalid_params(msg);
-    }
 
     // Symlink-safe read via the shared sandbox helper: walks every parent
     // component with `O_NOFOLLOW` and opens the leaf `O_RDONLY | O_NOFOLLOW`
@@ -524,6 +541,11 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
             return map_read_error(kind, source, &error_relative);
         }
         Err(join_err) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %join_err,
+                "read_markdown read task panicked",
+            );
             return DaemonResponse::internal(format!("read task panicked: {join_err}"));
         }
     };
@@ -554,31 +576,23 @@ async fn handle_delete_markdown(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus = match pick_corpus(&corpora, Some(&req.corpus)) {
-        Ok(c) => c,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let root = match first_corpus_root(&corpus) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let relative = match safe_relative_path(&req.path) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+    let (corpus, root, relative) = match validate_wiki_path(&corpora, &req.corpus, &req.path) {
+        Ok(t) => t,
+        Err(resp) => return resp,
     };
     let dest = root.join(&relative);
-    if let Err(e) = ensure_corpus_allows_file(&corpus, &dest) {
-        return DaemonResponse::invalid_params(e.into_inner());
-    }
-    if let Err(msg) = ensure_wiki_root_safe(&corpus) {
-        return DaemonResponse::invalid_params(msg);
-    }
 
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
         Err(msg) => return DaemonResponse::internal(msg),
     };
 
+    // Best-effort UX pre-check only: the `symlink_metadata` lookup produces
+    // the precise "does not exist" / "refusing to delete symlink" / "not a
+    // regular file" messages callers rely on. It is NOT the security boundary
+    // — `delete_no_follow` below re-checks each path component and the leaf
+    // with the kernel `statat(SYMLINK_NOFOLLOW)`, which is the authoritative
+    // gate (and closes the TOCTOU window this stat-then-unlink cannot).
     let meta = match tokio::fs::symlink_metadata(&dest).await {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -632,6 +646,11 @@ async fn handle_delete_markdown(
             return map_delete_error(kind, source, &error_relative);
         }
         Err(join_err) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %join_err,
+                "delete_markdown unlink task panicked",
+            );
             return DaemonResponse::internal(format!("unlink task panicked: {join_err}"));
         }
     }
@@ -726,6 +745,11 @@ async fn handle_globalize_markdown(
             return map_read_error(kind, source, &read_err_rel);
         }
         Err(join_err) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %join_err,
+                "globalize_markdown read task panicked",
+            );
             return DaemonResponse::internal(format!("read task panicked: {join_err}"));
         }
     };
@@ -778,6 +802,11 @@ async fn handle_globalize_markdown(
             return resp;
         }
         Err(join_err) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %join_err,
+                "globalize_markdown write task panicked",
+            );
             drop(guard);
             return DaemonResponse::internal(format!("write task panicked: {join_err}"));
         }
@@ -833,6 +862,16 @@ async fn handle_globalize_markdown(
     })
 }
 
+/// Convert a since-epoch duration to a millisecond `i64` mtime, failing
+/// cleanly when the value overflows `i64` instead of silently truncating the
+/// `u128` (which `as i64` would do). Mtimes near `i64::MAX` ms are absurd in
+/// practice, but a corrupt or attacker-controlled timestamp must error rather
+/// than wrap into a bogus past/future mtime the indexer would trust.
+fn mtime_ms_from_duration(dur: std::time::Duration, file: &Path) -> anyhow::Result<i64> {
+    i64::try_from(dur.as_millis())
+        .map_err(|_| anyhow::anyhow!("mtime overflows i64 on {}", file.display()))
+}
+
 pub(super) async fn index_single_file(
     store: &LanceStore,
     embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
@@ -842,10 +881,10 @@ pub(super) async fn index_single_file(
 ) -> anyhow::Result<crate::domain::indexer::ApplyStats> {
     let meta = tokio::fs::metadata(file).await?;
     let modified = meta.modified()?;
-    let mtime_ms = modified
+    let dur = modified
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| anyhow::anyhow!("pre-epoch mtime on {}", file.display()))?
-        .as_millis() as i64;
+        .map_err(|_| anyhow::anyhow!("pre-epoch mtime on {}", file.display()))?;
+    let mtime_ms = mtime_ms_from_duration(dur, file)?;
     let file_ref = canonicalize_or_passthrough(file);
     let file_ref_str = file_ref
         .as_path()
@@ -976,7 +1015,14 @@ async fn rebuild_wiki_indexes(
             atomic_write_no_follow(&write_root, &write_rel, &bytes, true)
         })
         .await
-        .map_err(|e| format!("index write task panicked: {e}"))?;
+        .map_err(|e| {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "rebuild_wiki_indexes write task panicked",
+            );
+            format!("index write task panicked: {e}")
+        })?;
         let dest = match written {
             Ok(p) => p,
             Err(WriteError { kind, source }) => {
@@ -1020,15 +1066,21 @@ fn is_wiki_corpus(corpus: &CorpusConfig) -> bool {
     corpus.name.starts_with("repo:") && corpus.name.ends_with(":wiki")
 }
 
-/// Refuse to operate on a wiki corpus whose `.hallouminate` parent or
-/// `wiki` leaf is a symlink. The repository's `path` is user-configured (so
-/// trusted), but `.hallouminate` and `wiki` are daemon-managed names that a
-/// malicious repository payload could swap for symlinks before the daemon
-/// runs the no-follow component walk inside the sandbox. Best-effort
-/// pre-flight — TOCTOU-vulnerable between this check and the subsequent
-/// open, but the daemon serializes wiki mutations behind the per-corpus
-/// mutex so a swap during the narrow window would race the daemon's own
-/// consistency model.
+/// UX-quality early-exit, NOT the security boundary. Refuses up front on a
+/// wiki corpus whose `.hallouminate` parent or `wiki` leaf is already a
+/// symlink, producing a clear error instead of a cryptic mid-write failure.
+/// The repository's `path` is user-configured (so trusted), but
+/// `.hallouminate` and `wiki` are daemon-managed names that a malicious
+/// repository payload could swap for symlinks.
+///
+/// The actual security gate is the `O_NOFOLLOW` component walk inside
+/// `atomic_write_no_follow` / `read_no_follow` / `delete_no_follow`: the
+/// kernel refuses to traverse a symlinked component there, which holds even
+/// for the TOCTOU window this check cannot close (a swap between this stat
+/// and the subsequent open). This pre-flight only improves the error message;
+/// removing it would not weaken safety. The daemon also serializes wiki
+/// mutations behind the per-corpus mutex, so a swap in the narrow window races
+/// the daemon's own consistency model.
 fn ensure_wiki_root_safe(corpus: &CorpusConfig) -> Result<(), String> {
     if !is_wiki_corpus(corpus) {
         return Ok(());
@@ -1170,6 +1222,50 @@ mod tests {
         assert_eq!(pong_value(), Value::String("pong".to_string()));
     }
 
+    /// A normal mtime (well under `i64::MAX` ms) converts to the exact
+    /// millisecond count — the happy path the indexer relies on for change
+    /// detection.
+    #[test]
+    fn mtime_ms_from_duration_passes_through_normal_value() {
+        let dur = std::time::Duration::from_millis(1_700_000_000_000);
+        let got =
+            mtime_ms_from_duration(dur, Path::new("/tmp/a.md")).expect("a sane mtime must convert");
+        assert_eq!(got, 1_700_000_000_000_i64);
+    }
+
+    /// Boundary: exactly `i64::MAX` milliseconds is the largest representable
+    /// mtime and must convert, not error. Pins the conversion to `<`-overflow
+    /// semantics so a future off-by-one (rejecting the max valid value) is
+    /// caught.
+    #[test]
+    fn mtime_ms_from_duration_accepts_i64_max_milliseconds() {
+        let max_ms = u64::try_from(i64::MAX).unwrap();
+        let dur = std::time::Duration::from_millis(max_ms);
+        let got = mtime_ms_from_duration(dur, Path::new("/tmp/max.md"))
+            .expect("i64::MAX ms is representable and must convert");
+        assert_eq!(got, i64::MAX);
+    }
+
+    /// WHY this matters: the old `.as_millis() as i64` silently truncated the
+    /// `u128`, so a duration whose millisecond count exceeds `i64::MAX` would
+    /// wrap into a bogus (possibly negative) mtime the indexer would then
+    /// trust for change detection — masking edits or forcing needless
+    /// re-embeds. `i64::try_from` must reject it loudly instead. Tests the
+    /// first value past the boundary (`i64::MAX + 1` ms), so an off-by-one in
+    /// the bound would be caught alongside the gross-overflow case.
+    #[test]
+    fn mtime_ms_from_duration_errors_one_past_i64_max() {
+        let overflow_ms = u64::try_from(i64::MAX).unwrap() + 1;
+        let dur = std::time::Duration::from_millis(overflow_ms);
+        let err = mtime_ms_from_duration(dur, Path::new("/tmp/huge.md"))
+            .expect_err("an mtime past i64::MAX ms must error, not truncate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overflows i64") && msg.contains("huge.md"),
+            "overflow error must name the cause and file: {msg}",
+        );
+    }
+
     /// FileEntry is re-exported from the shared sandbox module to keep the
     /// daemon's response struct serializing the same shape as before the
     /// extract — list_files clients depend on the `{ path, absolute_path }`
@@ -1183,6 +1279,112 @@ mod tests {
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["path"], "a.md");
         assert_eq!(json["absolute_path"], "/r/a.md");
+    }
+
+    // ── validate_wiki_path: the shared add/read/delete preamble ──────────
+    //
+    // Curd B folded the five-step validation that `handle_add_markdown`,
+    // `handle_read_markdown`, and `handle_delete_markdown` each repeated
+    // verbatim onto `validate_wiki_path`. Its doc promises the handlers'
+    // error shapes survive "byte-for-byte" and that every step still fires.
+    // The underlying helpers are unit-tested in `sandbox`, but nothing pinned
+    // the wiring: that the helper maps each failing step onto `InvalidParams`
+    // (not `Internal`) and that no middle step (e.g. the glob check) was
+    // dropped in the extraction. These tests lock that seam.
+
+    fn wiki_corpus_at(root: &Path) -> CorpusConfig {
+        CorpusConfig {
+            name: "repo:tern:wiki".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        }
+    }
+
+    fn assert_invalid_params(resp: DaemonResponse, needle: &str) {
+        match resp {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(
+                    kind,
+                    ErrorKind::InvalidParams,
+                    "a validation failure must surface as InvalidParams, not a \
+                     server fault: {message}",
+                );
+                assert!(
+                    message.contains(needle),
+                    "error must explain the failing step (want {needle:?}): {message}",
+                );
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("expected an InvalidParams error, got Ok({result:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn validate_wiki_path_returns_corpus_root_and_relative_on_valid_input() {
+        // Happy path: a known corpus + a glob-allowed relative file resolves to
+        // the tuple the handlers then write/read/delete against. The relative
+        // path is returned verbatim (not joined onto root) so the caller keeps
+        // building `root.join(relative)` exactly as before the extract.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let corpus = wiki_corpus_at(&root);
+        let (got_corpus, got_root, got_relative) = validate_wiki_path(
+            std::slice::from_ref(&corpus),
+            "repo:tern:wiki",
+            "notes/a.md",
+        )
+        .expect("valid corpus + path must resolve");
+        assert_eq!(got_corpus.name, "repo:tern:wiki");
+        assert_eq!(got_root, root);
+        assert_eq!(got_relative, std::path::PathBuf::from("notes/a.md"));
+    }
+
+    #[test]
+    fn validate_wiki_path_maps_unknown_corpus_to_invalid_params() {
+        // First step (`pick_corpus`): an unknown corpus name is caller error,
+        // so it must be InvalidParams — never Internal, which clients retry.
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = wiki_corpus_at(tmp.path());
+        let resp = validate_wiki_path(std::slice::from_ref(&corpus), "repo:nope:wiki", "a.md")
+            .expect_err("unknown corpus must fail validation");
+        assert_invalid_params(resp, "not found");
+    }
+
+    #[test]
+    fn validate_wiki_path_rejects_path_traversal_as_invalid_params() {
+        // Third step (`safe_relative_path`): a `..` escape must be refused at
+        // the boundary, mapped to InvalidParams. Proves the path-sandbox step
+        // is still wired into the shared preamble.
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = wiki_corpus_at(tmp.path());
+        let resp = validate_wiki_path(
+            std::slice::from_ref(&corpus),
+            "repo:tern:wiki",
+            "../../etc/passwd",
+        )
+        .expect_err("path traversal must fail validation");
+        assert_invalid_params(resp, "normal file components");
+    }
+
+    #[test]
+    fn validate_wiki_path_enforces_corpus_globs_as_invalid_params() {
+        // Fourth step (`ensure_corpus_allows_file`): a glob-allowed path passes
+        // the earlier steps but is excluded by the corpus's `**/*.md` include
+        // set. This is the middle step most easily dropped in a refactor — a
+        // `.txt` path that sails through `safe_relative_path` would silently be
+        // accepted if the glob check were lost. Pin that it still fires.
+        let tmp = tempfile::tempdir().unwrap();
+        let corpus = wiki_corpus_at(tmp.path());
+        let resp = validate_wiki_path(
+            std::slice::from_ref(&corpus),
+            "repo:tern:wiki",
+            "notes/a.txt",
+        )
+        .expect_err("a non-markdown path must be rejected by corpus globs");
+        assert_invalid_params(resp, "not included by corpus globs");
     }
 
     // ── dispatch + resolve_for_cwd integration ──────────────────────────
