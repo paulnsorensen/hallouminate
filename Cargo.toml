@@ -44,7 +44,7 @@ unicode-segmentation = "1"
 text-splitter = { version = "0.30", features = ["markdown", "tokenizers"] }
 # Pinned to ^0.22 to match text-splitter's tokenizers requirement; bumping to
 # 0.23 splits the crate graph and breaks the `ChunkSizer for Tokenizer` impl.
-tokenizers = { version = "0.22", features = ["http"] }
+tokenizers = { version = "0.23", features = ["http"] }
 
 # Serialization + config
 serde = { version = "1", features = ["derive"] }
