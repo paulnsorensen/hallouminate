@@ -6,6 +6,11 @@ mod paths;
 
 pub use paths::{canonicalize_or_passthrough, expand_tilde};
 
+/// A reference to a file on disk, identified by its path.
+///
+/// Wraps a [`PathBuf`] to give file paths a distinct domain type so they are
+/// not confused with arbitrary strings or paths as they flow through indexing,
+/// storage, and search.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FileRef(PathBuf);
 
@@ -34,10 +39,10 @@ impl From<PathBuf> for FileRef {
         Self(path)
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ChunkId(pub i64);
-
+/// A file's modification time, in milliseconds since the Unix epoch.
+///
+/// Used to detect whether an on-disk file has changed since it was last
+/// indexed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Mtime(pub i64);
 
@@ -70,22 +75,36 @@ impl Corpus {
     }
 }
 
+/// The crate-wide error type, covering every fallible operation in
+/// hallouminate.
 #[derive(Debug, thiserror::Error)]
 pub enum HallouminateError {
+    /// A filesystem operation failed. Produced automatically (via `#[from]`)
+    /// whenever an [`std::io::Error`] propagates — reading config, walking
+    /// corpus paths, or accessing the ground store.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
+    /// The vector store (LanceDB) failed — opening, reading, or applying a
+    /// write batch to the on-disk index.
     #[error("db: {0}")]
     Db(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 
+    /// Embedding generation failed — loading the embedding model or encoding
+    /// chunk text into vectors.
     #[error("embed: {0}")]
     Embed(String),
 
+    /// Configuration was invalid — a malformed config file, a rejected corpus
+    /// or repository entry, or a name that violates the `repo:` namespace
+    /// rules.
     #[error("config: {0}")]
     Config(String),
 
+    /// Indexing failed while chunking files or applying batches to the store.
     #[error("indexer: {0}")]
     Indexer(String),
 }
 
+/// Crate-wide result alias, fixing the error type to [`HallouminateError`].
 pub type Result<T> = std::result::Result<T, HallouminateError>;
