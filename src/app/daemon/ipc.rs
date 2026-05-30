@@ -149,9 +149,17 @@ pub enum DaemonResponse {
 }
 
 impl DaemonResponse {
+    /// Wrap a serializable payload in an `Ok` response.
+    ///
+    /// On serialization failure the result is an [`Internal`](ErrorKind::Internal)
+    /// error rather than a silent `Ok { result: Null }`: a `null` payload
+    /// reads as an empty success across the CLI/MCP transport, so swallowing
+    /// the error would mask the fault. The `Err` variant is a valid `Self`,
+    /// so the signature is unchanged.
     pub fn ok<T: Serialize>(value: &T) -> Self {
-        DaemonResponse::Ok {
-            result: serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
+        match serde_json::to_value(value) {
+            Ok(result) => DaemonResponse::Ok { result },
+            Err(e) => DaemonResponse::internal(format!("serialize response: {e}")),
         }
     }
 
@@ -250,3 +258,77 @@ pub struct ListTreeResult {
 
 /// `ListCorpora` payload alias — daemon emits an array of [`CorpusEntry`].
 pub type ListCorporaResult = Vec<CorpusEntry>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A payload whose `Serialize` impl always fails, standing in for any
+    /// domain type that errors mid-serialization (e.g. a map with non-string
+    /// keys nested deep in a response).
+    struct FailsToSerialize;
+
+    impl Serialize for FailsToSerialize {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("boom"))
+        }
+    }
+
+    #[test]
+    fn ok_maps_serialize_failure_to_internal_error_not_null_success() {
+        // WHY: a serialization failure that degrades to `Ok { result: Null }`
+        // reads as an empty success on the CLI/MCP transport, hiding the
+        // fault from the caller. It must surface as an Internal error.
+        let resp = DaemonResponse::ok(&FailsToSerialize);
+        match resp {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::Internal);
+                assert!(
+                    message.starts_with("serialize response:"),
+                    "message should name the serialize failure, got: {message:?}"
+                );
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("serialize failure must not produce Ok, got result: {result:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn ok_wraps_serializable_payload_verbatim() {
+        // WHY: the failure path must not regress the happy path — a value
+        // that serializes cleanly still lands in `Ok { result }`.
+        let resp = DaemonResponse::ok(&"pong");
+        match resp {
+            DaemonResponse::Ok { result } => {
+                assert_eq!(result, serde_json::Value::String("pong".to_string()));
+            }
+            DaemonResponse::Err { kind, message } => {
+                panic!("clean payload must serialize, got {kind:?}: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn serialize_failure_response_is_err_envelope_on_the_wire() {
+        // WHY: the defect is transport-level — a client deserializing the
+        // response must see an error, not the old `{"status":"ok",
+        // "result":null}` it would misread as empty success. Pin the wire
+        // shape a remote client actually decodes, so a regression to the
+        // null-success envelope is caught here.
+        let wire = serde_json::to_value(DaemonResponse::ok(&FailsToSerialize))
+            .expect("the Err envelope itself serializes cleanly");
+        assert_eq!(wire["status"], "err");
+        assert_eq!(wire["kind"], "internal");
+        assert!(
+            wire.get("result").is_none(),
+            "an error envelope must not carry a `result` field, got: {wire}"
+        );
+        assert!(
+            wire["message"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("serialize response:")),
+            "error message must name the serialize failure, got: {wire}"
+        );
+    }
+}
