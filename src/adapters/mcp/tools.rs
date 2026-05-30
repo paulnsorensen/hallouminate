@@ -14,7 +14,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -198,6 +198,14 @@ fn render_tree_outline(
 
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
+}
+
+/// Serialize a daemon response into the `structuredContent` JSON payload,
+/// mapping a serializer failure to a `-32603 internal_error`. A failure here
+/// means a daemon result type produced non-JSON-representable data, which is a
+/// server fault, not caller input.
+fn to_structured<T: Serialize>(v: &T) -> Result<serde_json::Value, ErrorData> {
+    serde_json::to_value(v).map_err(|e| internal_error(e.to_string()))
 }
 
 /// JSON-RPC -32602: surface caller-supplied input failures (bad corpus name,
@@ -395,6 +403,18 @@ impl HallouminateTools {
         }
     }
 
+    /// Shared per-call preamble: dial the daemon and resolve the effective cwd
+    /// (preferring MCP client roots over the startup fallback). Every tool
+    /// method opens with this before building its `DaemonRequest`.
+    async fn tool_setup(
+        &self,
+        peer: &Peer<RoleServer>,
+    ) -> Result<(DaemonClient, PathBuf), ErrorData> {
+        let client = daemon_for_tool().await?;
+        let cwd = cwd_for_tool(&self.cwd, peer).await;
+        Ok((client, cwd))
+    }
+
     #[tool(
         description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, chunks: [{chunk_id, heading_path, line_range, score, snippet}] }. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set."
     )]
@@ -403,8 +423,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<GroundParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::Ground(GroundRequest {
@@ -417,8 +436,7 @@ impl HallouminateTools {
             }),
         };
         let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
-        let structured =
-            serde_json::to_value(&result.response).map_err(|e| internal_error(e.to_string()))?;
+        let structured = to_structured(&result.response)?;
         Ok(tool_ok(result.outline, structured))
     }
 
@@ -430,8 +448,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<IndexParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::Index(IndexRequest {
@@ -452,8 +469,7 @@ impl HallouminateTools {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let structured =
-            serde_json::to_value(&report).map_err(|e| internal_error(e.to_string()))?;
+        let structured = to_structured(&report)?;
         Ok(tool_ok(summary, structured))
     }
 
@@ -465,8 +481,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<ListTreeParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ListTree(ListTreeRequest {
@@ -476,8 +491,7 @@ impl HallouminateTools {
         let result: ListTreeResult = client.call(req).await.map_err(map_daemon_err)?;
         let mut outline = String::new();
         render_tree_outline(&result.root, 0, &mut outline);
-        let structured =
-            serde_json::to_value(&result).map_err(|e| internal_error(e.to_string()))?;
+        let structured = to_structured(&result)?;
         Ok(tool_ok(outline, structured))
     }
 
@@ -489,8 +503,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<ListFilesParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
@@ -498,11 +511,13 @@ impl HallouminateTools {
             }),
         };
         let entries: ListFilesResult = client.call(req).await.map_err(map_daemon_err)?;
-        let text = entries
-            .iter()
-            .map(|e| e.path.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let mut text = String::new();
+        for e in entries.iter() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(e.path.as_str());
+        }
         let structured = serde_json::json!({ "files": &entries });
         Ok(tool_ok(text, structured))
     }
@@ -515,8 +530,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<AddMarkdownParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
@@ -537,8 +551,7 @@ impl HallouminateTools {
                 text.push_str(&format!("\n- {warning}"));
             }
         }
-        let structured =
-            serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
+        let structured = to_structured(&response)?;
         Ok(tool_ok(text, structured))
     }
 
@@ -550,8 +563,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<ReadMarkdownParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
@@ -560,8 +572,7 @@ impl HallouminateTools {
             }),
         };
         let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let structured =
-            serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
+        let structured = to_structured(&response)?;
         Ok(tool_ok(response.content, structured))
     }
 
@@ -573,8 +584,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<DeleteMarkdownParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
@@ -584,8 +594,7 @@ impl HallouminateTools {
         };
         let response: DeleteMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let text = format!("deleted {} from corpus {}", response.path, response.corpus);
-        let structured =
-            serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
+        let structured = to_structured(&response)?;
         Ok(tool_ok(text, structured))
     }
 
@@ -597,8 +606,7 @@ impl HallouminateTools {
         Parameters(params): Parameters<GlobalizeMarkdownParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
@@ -616,8 +624,7 @@ impl HallouminateTools {
             response.global_corpus,
             response.dest_path,
         );
-        let structured =
-            serde_json::to_value(&response).map_err(|e| internal_error(e.to_string()))?;
+        let structured = to_structured(&response)?;
         Ok(tool_ok(text, structured))
     }
 
@@ -629,8 +636,7 @@ impl HallouminateTools {
         _params: Parameters<ListCorporaParams>,
         peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, &peer).await;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let entries: ListCorporaResult = client
             .call(DaemonRequest {
                 cwd,
@@ -640,7 +646,7 @@ impl HallouminateTools {
             .map_err(map_daemon_err)?;
         let names = entries
             .iter()
-            .map(|e| e.name.clone())
+            .map(|e| e.name.as_str())
             .collect::<Vec<_>>()
             .join("\n");
         let structured = serde_json::json!({ "corpora": &entries });
@@ -712,6 +718,22 @@ mod tests {
         let cwd = PathBuf::from("/test/cwd");
         let tools = HallouminateTools::new(cwd.clone());
         assert_eq!(tools.cwd, cwd);
+    }
+
+    #[test]
+    fn to_structured_maps_serialize_failure_to_internal_error() {
+        // A type whose `Serialize` impl always errors must surface as a
+        // -32603 internal_error, not panic or silently drop the structured
+        // payload: a non-JSON-representable daemon result is a server fault.
+        struct Unserializable;
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("nope"))
+            }
+        }
+        let err = to_structured(&Unserializable).expect_err("serialize must fail");
+        assert_eq!(err.code.0, -32603);
+        assert!(err.message.contains("nope"));
     }
 
     #[test]
