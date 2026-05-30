@@ -21,3 +21,21 @@ index and the ancestor `index.md` link lists stay in sync:
 
 Follow `.hallouminate/wiki/wiki-conventions.md` for slug, H1, and
 one-topic-per-file rules.
+
+## Local Rust skills
+
+Three skills live under `.agents/skills/`. Apply them when working in Rust:
+
+- **`rust-style`** — coding style. Apply automatically whenever you write
+  or modify any Rust code: `for` loops over iterator chains, `let ... else`
+  for early returns, variable shadowing over renaming, newtypes over bare
+  strings, enums over `bool` params, explicit/exhaustive matching (no `_`
+  wildcards, no `matches!`), explicit destructuring, and minimal comments.
+- **`rustdoc`** — doc-comment conventions (RFC 1574). Apply when writing
+  `///` doc comments on public items: summary sentences, the standard
+  section headings (`# Examples`, `# Panics`, `# Errors`, `# Safety`),
+  type references, and examples.
+- **`rust-analyzer-ssr`** — structural search and replace. Use when making
+  the same AST-level change across many call sites (API migrations, UFCS
+  ↔ method calls, struct-literal ↔ constructor), where a semantic,
+  type-aware transform beats text find-and-replace.
