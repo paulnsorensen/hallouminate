@@ -969,7 +969,7 @@ mod tests {
     fn meta_check_or_init_writes_meta_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5", false, true).unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
         let meta: Meta = toml::from_str(&text).unwrap();
         assert_eq!(meta.embedding_model_name, "BAAI/bge-small-en-v1.5");
@@ -1029,16 +1029,6 @@ mod tests {
     }
 
     #[test]
-    fn meta_check_or_init_with_legacy_alias_writes_canonical_to_fresh_sidecar() {
-        let dir = tempfile::tempdir().unwrap();
-        let meta_path = dir.path().join("meta.toml");
-        meta_check_or_init(&meta_path, "bge-small-en-v1.5", false, true).unwrap();
-        let text = std::fs::read_to_string(&meta_path).unwrap();
-        let meta: Meta = toml::from_str(&text).unwrap();
-        assert_eq!(meta.embedding_model_name, "BAAI/bge-small-en-v1.5");
-    }
-
-    #[test]
     fn meta_check_or_init_reads_pre_feature_sidecar_as_enabled_full_precision() {
         // A sidecar written before this feature has neither `quantized` nor
         // `embeddings_enabled`; it must read back as the mode it was built in
@@ -1092,24 +1082,6 @@ schema_version = 1
             err.to_string().contains("unsupported embedding model"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn meta_check_or_init_normalizes_existing_legacy_alias() {
-        let dir = tempfile::tempdir().unwrap();
-        let meta_path = dir.path().join("meta.toml");
-        std::fs::write(
-            &meta_path,
-            r#"# auto-managed by hallouminate; do not edit
-embedding_model_name = "bge-small-en-v1.5"
-schema_version = 1
-"#,
-        )
-        .unwrap();
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
-        let text = std::fs::read_to_string(&meta_path).unwrap();
-        assert!(text.contains("BAAI/bge-small-en-v1.5"), "{text}");
-        assert!(!text.contains("\"bge-small-en-v1.5\""), "{text}");
     }
 
     #[test]

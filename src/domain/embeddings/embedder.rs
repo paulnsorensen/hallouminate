@@ -7,16 +7,19 @@ use crate::domain::common::{HallouminateError, Result};
 /// Output dimensionality shared by every supported model. All three embed to
 /// 384-dim vectors, so the rest of the pipeline can use a fixed-size array.
 pub const EMBEDDING_DIM: usize = 384;
-/// Default embedding model: a small, English, symmetric retrieval model.
-pub const DEFAULT_MODEL: &str = "BAAI/bge-small-en-v1.5";
+/// BAAI bge small model: a small, English, symmetric retrieval model.
+pub const BGE_SMALL_MODEL: &str = "BAAI/bge-small-en-v1.5";
 /// Multilingual, asymmetric retrieval model (distinct query/passage prefixes).
 pub const E5_SMALL_MODEL: &str = "intfloat/multilingual-e5-small";
-/// Snowflake Arctic small model; symmetric retrieval like [`DEFAULT_MODEL`].
+/// Snowflake Arctic small model; symmetric retrieval like [`BGE_SMALL_MODEL`].
 pub const ARCTIC_S_MODEL: &str = "snowflake/snowflake-arctic-embed-s";
+/// The default embedding model — the one [`crate::app::config`] selects when a
+/// config omits `embeddings.model`. Named separately from the model it points
+/// at so the default can move without renaming a model const (and so the
+/// const name no longer lies about which model is actually the default).
+pub const DEFAULT_EMBED_MODEL: &str = ARCTIC_S_MODEL;
 /// Every model name accepted by [`canonical_model_name`], for menus and tests.
-pub const SUPPORTED_MODELS: [&str; 3] = [DEFAULT_MODEL, E5_SMALL_MODEL, ARCTIC_S_MODEL];
-
-const LEGACY_DEFAULT_MODEL: &str = "bge-small-en-v1.5";
+pub const SUPPORTED_MODELS: [&str; 3] = [BGE_SMALL_MODEL, E5_SMALL_MODEL, ARCTIC_S_MODEL];
 
 /// Whether a query or a passage is being embedded. Asymmetric retrieval
 /// models (the e5 family) take different instruction prefixes for the two
@@ -151,13 +154,13 @@ pub(crate) fn l2_normalize(v: &mut [f32]) {
 fn resolve_model(canonical: &str, quantization: Quantization) -> Result<EmbeddingModel> {
     use Quantization::{Full, Quantized};
     let model = match (canonical, quantization) {
-        (DEFAULT_MODEL, Full) => EmbeddingModel::BGESmallENV15,
-        (DEFAULT_MODEL, Quantized) => EmbeddingModel::BGESmallENV15Q,
+        (BGE_SMALL_MODEL, Full) => EmbeddingModel::BGESmallENV15,
+        (BGE_SMALL_MODEL, Quantized) => EmbeddingModel::BGESmallENV15Q,
         (E5_SMALL_MODEL, Full) => EmbeddingModel::MultilingualE5Small,
         (E5_SMALL_MODEL, Quantized) => {
             return Err(HallouminateError::Config(format!(
                 "{E5_SMALL_MODEL:?} has no quantized variant; \
-                 set embeddings.quantized = false or choose {DEFAULT_MODEL:?} \
+                 set embeddings.quantized = false or choose {BGE_SMALL_MODEL:?} \
                  or {ARCTIC_S_MODEL:?}"
             )));
         }
@@ -175,31 +178,31 @@ fn resolve_model(canonical: &str, quantization: Quantization) -> Result<Embeddin
 /// verbatim to the text.
 pub fn instruction_prefix(canonical: &str, role: EmbedRole) -> &'static str {
     match (canonical, role) {
-        (DEFAULT_MODEL, EmbedRole::Query) | (ARCTIC_S_MODEL, EmbedRole::Query) => {
+        (BGE_SMALL_MODEL, EmbedRole::Query) | (ARCTIC_S_MODEL, EmbedRole::Query) => {
             "Represent this sentence for searching relevant passages: "
         }
-        (DEFAULT_MODEL, EmbedRole::Passage) | (ARCTIC_S_MODEL, EmbedRole::Passage) => "",
+        (BGE_SMALL_MODEL, EmbedRole::Passage) | (ARCTIC_S_MODEL, EmbedRole::Passage) => "",
         (E5_SMALL_MODEL, EmbedRole::Query) => "query: ",
         (E5_SMALL_MODEL, EmbedRole::Passage) => "passage: ",
         _ => "",
     }
 }
 
-/// Resolve a user-supplied model name to its canonical form, accepting the
-/// legacy `bge-small-en-v1.5` alias for [`DEFAULT_MODEL`].
+/// Resolve a user-supplied model name to its canonical form.
 ///
 /// # Errors
 /// Returns [`HallouminateError::Config`] when `name` is not one of the
-/// supported models (or the legacy alias), with a message listing the valid
-/// choices.
+/// supported models, with a message listing the valid choices. The bare
+/// `bge-small-en-v1.5` alias is no longer accepted — use the full
+/// [`BGE_SMALL_MODEL`] id.
 pub fn canonical_model_name(name: &str) -> Result<&'static str> {
     match name {
-        DEFAULT_MODEL | LEGACY_DEFAULT_MODEL => Ok(DEFAULT_MODEL),
+        BGE_SMALL_MODEL => Ok(BGE_SMALL_MODEL),
         E5_SMALL_MODEL => Ok(E5_SMALL_MODEL),
         ARCTIC_S_MODEL => Ok(ARCTIC_S_MODEL),
         other => Err(HallouminateError::Config(format!(
             "unsupported embedding model {other:?}; choose one of \
-             {DEFAULT_MODEL:?}, {E5_SMALL_MODEL:?}, {ARCTIC_S_MODEL:?} \
+             {BGE_SMALL_MODEL:?}, {E5_SMALL_MODEL:?}, {ARCTIC_S_MODEL:?} \
              (note: all-MiniLM-L6-v2 was dropped — delete the ground dir and \
              re-run `hallouminate index` after switching)"
         ))),
@@ -243,7 +246,7 @@ mod tests {
     #[test]
     fn resolve_model_maps_each_supported_model_full_precision() {
         assert!(matches!(
-            resolve_model(DEFAULT_MODEL, Quantization::Full).unwrap(),
+            resolve_model(BGE_SMALL_MODEL, Quantization::Full).unwrap(),
             EmbeddingModel::BGESmallENV15
         ));
         assert!(matches!(
@@ -259,7 +262,7 @@ mod tests {
     #[test]
     fn resolve_model_picks_quantized_variant_when_one_exists() {
         assert!(matches!(
-            resolve_model(DEFAULT_MODEL, Quantization::Quantized).unwrap(),
+            resolve_model(BGE_SMALL_MODEL, Quantization::Quantized).unwrap(),
             EmbeddingModel::BGESmallENV15Q
         ));
         assert!(matches!(
@@ -296,10 +299,10 @@ mod tests {
         );
         // bge + arctic: prefix the query, leave the passage bare.
         assert_eq!(
-            instruction_prefix(DEFAULT_MODEL, EmbedRole::Query),
+            instruction_prefix(BGE_SMALL_MODEL, EmbedRole::Query),
             "Represent this sentence for searching relevant passages: "
         );
-        assert_eq!(instruction_prefix(DEFAULT_MODEL, EmbedRole::Passage), "");
+        assert_eq!(instruction_prefix(BGE_SMALL_MODEL, EmbedRole::Passage), "");
         assert_eq!(
             instruction_prefix(ARCTIC_S_MODEL, EmbedRole::Query),
             "Represent this sentence for searching relevant passages: "
@@ -308,12 +311,11 @@ mod tests {
     }
 
     #[test]
-    fn canonical_model_name_accepts_legacy_default_alias_and_three_models() {
+    fn canonical_model_name_accepts_the_three_full_model_ids() {
         assert_eq!(
-            canonical_model_name("bge-small-en-v1.5").unwrap(),
-            DEFAULT_MODEL
+            canonical_model_name(BGE_SMALL_MODEL).unwrap(),
+            BGE_SMALL_MODEL
         );
-        assert_eq!(canonical_model_name(DEFAULT_MODEL).unwrap(), DEFAULT_MODEL);
         assert_eq!(
             canonical_model_name(E5_SMALL_MODEL).unwrap(),
             E5_SMALL_MODEL
@@ -322,6 +324,19 @@ mod tests {
             canonical_model_name(ARCTIC_S_MODEL).unwrap(),
             ARCTIC_S_MODEL
         );
+    }
+
+    #[test]
+    fn canonical_model_name_rejects_dropped_bare_bge_alias() {
+        // The bare `bge-small-en-v1.5` alias was torched (pre-1.0, nobody
+        // depends on it). It must now fail the same unsupported-model gate as
+        // any junk input; the full `BAAI/bge-small-en-v1.5` id stays valid.
+        let err = canonical_model_name("bge-small-en-v1.5")
+            .expect_err("bare bge alias must no longer resolve");
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported embedding model"), "{msg}");
+        // The full id is still the recovery hint.
+        assert!(msg.contains(BGE_SMALL_MODEL), "{msg}");
     }
 
     #[test]
@@ -353,7 +368,7 @@ mod tests {
         let err = canonical_model_name("clip-vit-b32").expect_err("unsupported must error");
         let msg = err.to_string();
         assert!(msg.contains("unsupported embedding model"), "{msg}");
-        assert!(msg.contains(DEFAULT_MODEL), "missing default option: {msg}");
+        assert!(msg.contains(BGE_SMALL_MODEL), "missing bge option: {msg}");
         assert!(msg.contains(E5_SMALL_MODEL), "missing e5 option: {msg}");
         assert!(msg.contains(ARCTIC_S_MODEL), "missing arctic option: {msg}");
     }
@@ -379,5 +394,31 @@ mod tests {
         let norm: f32 = arr.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-6, "norm = {norm}");
         assert!((arr[0] - 1.0).abs() < 1e-6);
+    }
+
+    /// Doc-pin: the README model table is the user-facing menu, and it must
+    /// not drift from the code's `SUPPORTED_MODELS` / `DEFAULT_EMBED_MODEL`.
+    /// Fails CI if a model is added/renamed in code without updating the
+    /// table, or if the table stops marking the real default as the default.
+    #[test]
+    fn readme_model_table_lists_every_supported_model_and_marks_the_default() {
+        const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        for model in SUPPORTED_MODELS {
+            assert!(
+                README.contains(model),
+                "README model table is missing supported model {model:?}; \
+                 update the table in README.md so the docs don't drift from code"
+            );
+        }
+        // The default must be named on the same line as a "default" marker so
+        // a reader (and this test) can tell which model is selected when
+        // `embeddings.model` is omitted.
+        let marks_default = README.lines().any(|line| {
+            line.contains(DEFAULT_EMBED_MODEL) && line.to_ascii_lowercase().contains("default")
+        });
+        assert!(
+            marks_default,
+            "README must mark {DEFAULT_EMBED_MODEL:?} as the default on its table row"
+        );
     }
 }

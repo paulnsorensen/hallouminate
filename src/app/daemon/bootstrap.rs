@@ -11,15 +11,24 @@
 //! cleanly and every `serve` polls the same socket.
 
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use tokio::net::UnixStream;
 
+use super::client::connect_at;
 use super::daemon_socket_path;
+use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Upper bound on the version probe's `Ping` round-trip. `call_raw` has no
+/// built-in timeout, so a daemon that accepts the connection but never replies
+/// would otherwise hang `ensure_daemon_running` at MCP startup. Cap it: an
+/// elapsed probe is treated as unverifiable (→ restart), the same fate as a
+/// transport error or a legacy bare-`"pong"` reply.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ensure a daemon is reachable, spawning a detached one if not.
 ///
@@ -32,7 +41,24 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
 
     let socket = daemon_socket_path();
     if UnixStream::connect(&socket).await.is_ok() {
-        return Ok(());
+        // A daemon is already listening. `flock` guarantees it's the only one,
+        // but NOT that it's our version: after a binary upgrade, this fresh
+        // MCP server could silently drive a daemon spawned from the old
+        // release (Curd C). Adopt it only when its reported version matches
+        // ours.
+        if running_daemon_version_matches(&socket).await {
+            return Ok(());
+        }
+        // Skew: stop the stale daemon, then fall through to the spawn path to
+        // bring up a fresh one. This is exactly `lifecycle::restart`'s
+        // stop→respawn sequence, open-coded here because `restart`'s respawn
+        // step IS `ensure_daemon_running` — calling it would recurse.
+        tracing::info!(
+            target: "hallouminate::daemon",
+            ours = env!("CARGO_PKG_VERSION"),
+            "running daemon version mismatch or unverifiable; restarting it",
+        );
+        super::lifecycle::stop().await?;
     }
 
     // Stderr capture for the auto-spawned daemon. Lives in the XDG state
@@ -83,6 +109,69 @@ fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
     env_value.is_some_and(|v| !v.is_empty())
 }
 
+/// Probe the already-running daemon's version via `Ping`. Returns `true` only
+/// when the daemon reports our `CARGO_PKG_VERSION`.
+///
+/// Tolerant by design (see the [`PongResult`](super::ipc::PongResult) wire-compat
+/// note): a daemon from a release before the version field answers the bare
+/// `"pong"` string — which has no `version` — and any transport or daemon-side
+/// error is likewise unverifiable. All of these resolve to `false` (→ restart)
+/// rather than erroring, so an unverifiable daemon is replaced, never adopted.
+async fn running_daemon_version_matches(socket: &Path) -> bool {
+    let client = match connect_at(socket).await {
+        Ok(c) => c,
+        Err(e) => {
+            // Don't swallow the probe failure silently on this non-interactive
+            // bootstrap path: log it so an alive-but-unprobeable daemon (which
+            // we then treat as skew and restart) is diagnosable.
+            tracing::debug!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "version probe could not connect to the running daemon; treating as unverifiable",
+            );
+            return false;
+        }
+    };
+    let probe = client.call_raw(DaemonRequest {
+        cwd: std::env::current_dir().unwrap_or_default(),
+        payload: DaemonRequestPayload::Ping,
+    });
+    match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        Ok(Ok(resp)) => pong_reports_our_version(&resp),
+        Ok(Err(e)) => {
+            tracing::debug!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "version probe Ping failed; treating the daemon as unverifiable",
+            );
+            false
+        }
+        Err(_elapsed) => {
+            // The daemon accepted the connection but did not answer within
+            // `PROBE_TIMEOUT`. A wedged daemon must not hang startup — treat
+            // the silence as unverifiable so the caller restarts it.
+            tracing::debug!(
+                target: "hallouminate::daemon",
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "version probe Ping timed out; treating the daemon as unverifiable",
+            );
+            false
+        }
+    }
+}
+
+/// Pure skew-detection predicate: does this `Ping` response report OUR
+/// version? Split out from the I/O so the tolerance contract is unit-testable
+/// without a live socket. A non-`Ok` envelope, a missing `version` (the old
+/// bare-`"pong"` daemon), or a different version all yield `false` → restart.
+fn pong_reports_our_version(resp: &DaemonResponse) -> bool {
+    matches!(
+        resp,
+        DaemonResponse::Ok { result }
+            if result.get("version").and_then(|v| v.as_str()) == Some(env!("CARGO_PKG_VERSION"))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,5 +197,49 @@ mod tests {
         assert!(has_explicit_socket_override(Some(std::ffi::OsStr::new(
             "/tmp/test.sock"
         ))));
+    }
+
+    // ── Curd C: version-skew detection ───────────────────────────────────
+
+    #[test]
+    fn pong_with_our_version_is_a_match() {
+        let resp = DaemonResponse::ok(&super::super::ipc::PongResult {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+        assert!(pong_reports_our_version(&resp), "same version must match");
+    }
+
+    #[test]
+    fn pong_with_a_different_version_is_a_mismatch() {
+        // A daemon from another release reports its own version; the new
+        // client must NOT adopt it.
+        let resp = DaemonResponse::ok(&super::super::ipc::PongResult {
+            version: "0.0.0-stale".to_string(),
+        });
+        assert!(
+            !pong_reports_our_version(&resp),
+            "a different version must not match"
+        );
+    }
+
+    #[test]
+    fn bare_pong_string_from_old_daemon_is_a_mismatch() {
+        // Pre-Curd-C daemons answer Ping with the bare string `"pong"`, which
+        // has no `version`. The client must treat that as a mismatch (→
+        // restart), never as a match or a hard error.
+        let resp = DaemonResponse::ok(&"pong");
+        assert!(
+            !pong_reports_our_version(&resp),
+            "legacy bare-pong daemon must be treated as skew"
+        );
+    }
+
+    #[test]
+    fn error_response_is_a_mismatch() {
+        let resp = DaemonResponse::internal("boom");
+        assert!(
+            !pong_reports_our_version(&resp),
+            "an error response is unverifiable → mismatch"
+        );
     }
 }

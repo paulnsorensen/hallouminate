@@ -88,6 +88,17 @@ rm -rf ~/.local/share/hallouminate/ground
 hallouminate index
 ```
 
+### Which embedding models are supported?
+
+Set `embeddings.model` in your config to one of these (all embed to 384-dim
+vectors). Omitting `embeddings.model` selects the default.
+
+| Model | Notes |
+| --- | --- |
+| `snowflake/snowflake-arctic-embed-s` | **Default.** English, symmetric retrieval. |
+| `BAAI/bge-small-en-v1.5` | English, symmetric retrieval. |
+| `intfloat/multilingual-e5-small` | Multilingual, asymmetric retrieval; no quantized variant. |
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

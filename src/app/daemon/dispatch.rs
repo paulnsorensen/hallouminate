@@ -30,7 +30,7 @@ use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::corpus::sandbox::{
     WriteError, WriteErrorKind, atomic_write_no_follow, delete_no_follow,
     ensure_corpus_allows_file, first_corpus_root, list_corpus_files, pick_corpus, read_no_follow,
-    safe_relative_path,
+    resolve_read_root, safe_relative_path,
 };
 use crate::domain::corpus::{MarkdownChunker, blake3_file};
 use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
@@ -43,7 +43,7 @@ use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
     DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GlobalizeMarkdownRequest,
     GlobalizeMarkdownResult, GroundRequest, GroundResult, IndexRequest, ListFilesRequest,
-    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult,
+    ListTreeRequest, ListTreeResult, PongResult, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -58,11 +58,19 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
     // XDG path, or the `--config PATH` override) so scalar-conflict
     // messages name the file the user actually has to edit — AC #7.
     // Shutdown and Ping are config-independent control ops: handle them
-    // before `resolve_for_cwd` so a stop request (or a liveness probe) works
-    // even when the client's cwd has no discoverable repo config.
+    // before `resolve_for_cwd` so a stop request (or a liveness / version
+    // probe) works even when the client's cwd has no discoverable repo
+    // config. Ping reports the daemon binary's version (Curd C) so the MCP
+    // bootstrap can detect cross-version skew; that probe must succeed
+    // regardless of the probing client's cwd, hence the early return.
     if let DaemonRequestPayload::Shutdown = req.payload {
         state.shutdown_token().cancel();
         return DaemonResponse::ok(&"stopping");
+    }
+    if let DaemonRequestPayload::Ping = req.payload {
+        return DaemonResponse::ok(&PongResult {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        });
     }
     let req_cwd = req.cwd.clone();
     let effective = match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
@@ -70,7 +78,12 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         Err(e) => return DaemonResponse::invalid_params(e.to_string()),
     };
     match req.payload {
-        DaemonRequestPayload::Ping => DaemonResponse::ok(&"pong"),
+        DaemonRequestPayload::Ping => {
+            // Handled before `resolve_for_cwd` above; unreachable here.
+            DaemonResponse::ok(&PongResult {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })
+        }
         DaemonRequestPayload::Ground(req) => handle_ground(state, &effective, &req_cwd, req).await,
         DaemonRequestPayload::Index(req) => handle_index(state, &effective, req).await,
         DaemonRequestPayload::ListCorpora => handle_list_corpora(&effective),
@@ -96,14 +109,16 @@ fn effective_corpora(cfg: &Config) -> Result<Vec<CorpusConfig>, DaemonResponse> 
         .map_err(|e| DaemonResponse::internal(e.to_string()))
 }
 
-/// Resolve and validate an explicit corpus + relative path for the mutating /
-/// reading wiki handlers (`add` / `read` / `delete`). Runs the shared
-/// preamble every one of them repeated verbatim: pick the named corpus,
-/// resolve its first root, sandbox the caller-supplied path, confirm the
-/// corpus's filters allow it, and pre-flight the wiki root for symlink swaps.
-/// Returns `(corpus, root, relative)` on success, or the exact
-/// `DaemonResponse` the handler would have returned at the failing step — so
-/// folding handlers onto this preserves their error shapes byte-for-byte.
+/// Resolve and validate an explicit corpus + relative path for the *mutating*
+/// wiki handlers (`add` / `delete`). Runs the shared preamble every one of them
+/// repeated verbatim: pick the named corpus, require it be single-root (Curd B
+/// — multi-root corpora are read/search-only), sandbox the caller-supplied
+/// path, confirm the corpus's filters allow it, and pre-flight the wiki root
+/// for symlink swaps. Returns `(corpus, root, relative)` on success, or the
+/// exact `DaemonResponse` the handler would have returned at the failing step.
+///
+/// `read_markdown` uses [`validate_wiki_read_path`] instead — reads walk every
+/// configured root so a file under `paths[1..]` stays reachable.
 ///
 /// `globalize_markdown` deliberately does NOT use this helper: it resolves two
 /// corpora (source + global) and its source side skips `ensure_wiki_root_safe`,
@@ -115,8 +130,7 @@ fn validate_wiki_path(
 ) -> Result<(CorpusConfig, std::path::PathBuf, std::path::PathBuf), DaemonResponse> {
     let corpus = pick_corpus(corpora, Some(corpus_name))
         .map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
-    let root =
-        first_corpus_root(&corpus).map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    let root = require_single_root(&corpus)?;
     let relative =
         safe_relative_path(path).map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
     let dest = root.join(&relative);
@@ -124,6 +138,51 @@ fn validate_wiki_path(
         .map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
     ensure_wiki_root_safe(&corpus).map_err(DaemonResponse::invalid_params)?;
     Ok((corpus, root, relative))
+}
+
+/// Read-side counterpart to [`validate_wiki_path`]. Picks the named corpus,
+/// sandboxes the path, then resolves the relative path against *every*
+/// configured root (Curd B) — so a file searchable under `paths[1..]` is also
+/// readable, closing the split surface where multi-root corpora were
+/// searchable-but-unreadable. The glob filter and wiki-root symlink pre-flight
+/// run against the resolved root, preserving single-root behaviour exactly.
+fn validate_wiki_read_path(
+    corpora: &[CorpusConfig],
+    corpus_name: &str,
+    path: &str,
+) -> Result<(CorpusConfig, std::path::PathBuf, std::path::PathBuf), DaemonResponse> {
+    let corpus = pick_corpus(corpora, Some(corpus_name))
+        .map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    let relative =
+        safe_relative_path(path).map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    let root = resolve_read_root(&corpus, &relative)
+        .map_err(|WriteError { kind, source }| map_read_error(kind, source, &relative))?;
+    let dest = root.join(&relative);
+    ensure_corpus_allows_file(&corpus, &dest)
+        .map_err(|e| DaemonResponse::invalid_params(e.into_inner()))?;
+    ensure_wiki_root_safe(&corpus).map_err(DaemonResponse::invalid_params)?;
+    Ok((corpus, root, relative))
+}
+
+/// Resolve the single root of a corpus, or refuse loudly when it is multi-root.
+///
+/// Mutations (`add` / `delete` / `globalize`) target exactly one root; a
+/// multi-root corpus has no canonical write destination, so the daemon rejects
+/// the mutation at request time with an `InvalidParams` error explaining *why*
+/// (the asymmetric "searchable but not writable" contract reads as a bug
+/// otherwise). Config validation is intentionally left unchanged — multi-root
+/// corpora stay loadable for search and read.
+fn require_single_root(corpus: &CorpusConfig) -> Result<std::path::PathBuf, DaemonResponse> {
+    if corpus.paths.len() == 1 {
+        return first_corpus_root(corpus)
+            .map_err(|e| DaemonResponse::invalid_params(e.into_inner()));
+    }
+    Err(DaemonResponse::invalid_params(format!(
+        "corpus {:?} has {} roots; mutations (add/delete/globalize) require a \
+         single-root corpus — multi-root corpora are read- and search-only",
+        corpus.name,
+        corpus.paths.len(),
+    )))
 }
 
 /// Read-side corpus selection with wiki-defaulting.
@@ -520,26 +579,26 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let (corpus, root, relative) = match validate_wiki_path(&corpora, &req.corpus, &req.path) {
-        Ok(t) => t,
-        Err(resp) => return resp,
-    };
-    let dest = root.join(&relative);
 
-    // Symlink-safe read via the shared sandbox helper: walks every parent
-    // component with `O_NOFOLLOW` and opens the leaf `O_RDONLY | O_NOFOLLOW`
-    // so a symlinked intermediate dir or leaf bounces with the same
-    // `WriteErrorKind::Symlink` shape `add_markdown` uses for writes.
-    let read_root = root.clone();
-    let read_relative = relative.clone();
-    let error_relative = relative.clone();
-    let read =
-        tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_relative)).await;
-    let bytes = match read {
-        Ok(Ok(b)) => b,
-        Ok(Err(WriteError { kind, source })) => {
-            return map_read_error(kind, source, &error_relative);
-        }
+    // Resolve, sandbox, and read entirely off the async dispatcher thread.
+    // `validate_wiki_read_path` is not just CPU work: `resolve_read_root`
+    // walks every configured root with `symlink_metadata`/`open_dir` and
+    // `ensure_wiki_root_safe` stats the wiki root, then the symlink-safe
+    // `read_no_follow` opens the leaf `O_RDONLY | O_NOFOLLOW`. Running all of
+    // it on a blocking task keeps a slow or remote corpus root from stalling a
+    // Tokio worker and delaying unrelated daemon requests.
+    let corpus_name = req.corpus;
+    let req_path = req.path;
+    let resolved = tokio::task::spawn_blocking(move || {
+        let (corpus, root, relative) = validate_wiki_read_path(&corpora, &corpus_name, &req_path)?;
+        let bytes = read_no_follow(&root, &relative)
+            .map_err(|WriteError { kind, source }| map_read_error(kind, source, &relative))?;
+        Ok::<_, DaemonResponse>((corpus, root, relative, bytes))
+    })
+    .await;
+    let (corpus, root, relative, bytes) = match resolved {
+        Ok(Ok(t)) => t,
+        Ok(Err(resp)) => return resp,
         Err(join_err) => {
             tracing::error!(
                 target: "hallouminate::daemon",
@@ -549,6 +608,7 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
             return DaemonResponse::internal(format!("read task panicked: {join_err}"));
         }
     };
+    let dest = root.join(&relative);
     let content = match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => {
@@ -721,10 +781,11 @@ async fn handle_globalize_markdown(
         ));
     }
 
-    // Read the source entry (symlink-safe).
-    let source_root = match first_corpus_root(&source) {
+    // Read the source entry (symlink-safe). Globalize is a mutation, so both
+    // sides require a single-root corpus (Curd B).
+    let source_root = match require_single_root(&source) {
         Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        Err(resp) => return resp,
     };
     let source_rel = match safe_relative_path(&req.path) {
         Ok(r) => r,
@@ -756,9 +817,9 @@ async fn handle_globalize_markdown(
 
     // Destination path defaults to the source path.
     let dest_raw = req.dest_path.as_deref().unwrap_or(req.path.as_str());
-    let dest_root = match first_corpus_root(&global) {
+    let dest_root = match require_single_root(&global) {
         Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        Err(resp) => return resp,
     };
     let dest_rel = match safe_relative_path(dest_raw) {
         Ok(r) => r,
@@ -1184,12 +1245,12 @@ fn derived_corpus_name(repo_name: &str, kind: RepoCorpusKind) -> Result<String, 
     repo_corpus_name(repo_name, kind).map_err(|e| e.to_string())
 }
 
-/// Canonical `Ping` reply payload — dispatch() encodes `&"pong"` directly,
-/// this helper lets tests match against the same literal without
-/// hand-rolling the JSON.
+/// Canonical `Ping` reply payload — dispatch() encodes a [`PongResult`]
+/// carrying the daemon binary's version; this helper lets tests match against
+/// the same shape without hand-rolling the JSON.
 #[cfg(test)]
 fn pong_value() -> Value {
-    Value::String("pong".into())
+    serde_json::json!({ "version": env!("CARGO_PKG_VERSION") })
 }
 
 #[cfg(test)]
@@ -1218,8 +1279,11 @@ mod tests {
     }
 
     #[test]
-    fn pong_value_returns_pong_string_literal() {
-        assert_eq!(pong_value(), Value::String("pong".to_string()));
+    fn pong_value_carries_the_daemon_binary_version() {
+        // Curd C: the Ping reply is a `{ "version": <CARGO_PKG_VERSION> }`
+        // envelope, not the bare `"pong"` string — the MCP bootstrap reads
+        // this field to detect cross-version skew.
+        assert_eq!(pong_value()["version"], env!("CARGO_PKG_VERSION"));
     }
 
     /// A normal mtime (well under `i64::MAX` ms) converts to the exact
@@ -1420,13 +1484,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_with_valid_cwd_returns_ok_for_ping() {
-        // Discovery walks `req.cwd` upward and finds the tempdir's
-        // `.hallouminate/config.toml`; the merge succeeds and `Ping` returns
-        // the canonical `Ok { result: "pong" }` payload.
+    async fn dispatch_ping_is_config_independent_and_reports_version() {
+        // Curd C: `Ping` is a config-independent control op handled BEFORE
+        // `resolve_for_cwd`, so it returns the versioned pong envelope even
+        // when `cwd` has no discoverable repo config — a liveness/version
+        // probe must not depend on the probing client's working directory.
         let tmp = tempfile::tempdir().expect("tempdir");
+        // Deliberately do NOT seed a repo layer; resolve_for_cwd would fail
+        // for a config-dependent op, but Ping must still succeed.
         let cwd = tmp.path().to_path_buf();
-        write_repo_layer(&cwd, "");
         let ground = tmp.path().join("ground");
         let state = state_with_ground(&ground, "").await;
 
@@ -1437,10 +1503,10 @@ mod tests {
         let resp = dispatch(&state, req).await;
         match resp {
             DaemonResponse::Ok { result } => {
-                assert_eq!(result, pong_value(), "ping must echo `pong`");
+                assert_eq!(result, pong_value(), "ping must return the versioned pong");
             }
             DaemonResponse::Err { kind, message } => {
-                panic!("ping must succeed; got {kind:?}: {message}");
+                panic!("ping must succeed regardless of cwd; got {kind:?}: {message}");
             }
         }
     }
@@ -1457,9 +1523,11 @@ mod tests {
         let ground = tmp.path().join("ground");
         let state = state_with_ground(&ground, "").await;
 
+        // ListCorpora is config-dependent (it runs `resolve_for_cwd`), unlike
+        // Ping which is now a config-independent control op (Curd C).
         let req = DaemonRequest {
             cwd: cwd.clone(),
-            payload: DaemonRequestPayload::Ping,
+            payload: DaemonRequestPayload::ListCorpora,
         };
         let resp = dispatch(&state, req).await;
         match resp {
@@ -1496,9 +1564,10 @@ mod tests {
         let ground = tmp.path().join("ground");
         let state = state_with_ground(&ground, "[embeddings]\ncache_dir = \"/a\"\n").await;
 
+        // ListCorpora runs `resolve_for_cwd`; Ping no longer does (Curd C).
         let req = DaemonRequest {
             cwd,
-            payload: DaemonRequestPayload::Ping,
+            payload: DaemonRequestPayload::ListCorpora,
         };
         let resp = dispatch(&state, req).await;
         match resp {
@@ -1548,9 +1617,10 @@ mod tests {
             .await
             .expect("open with xdg_path");
 
+        // ListCorpora runs `resolve_for_cwd`; Ping no longer does (Curd C).
         let req = DaemonRequest {
             cwd,
-            payload: DaemonRequestPayload::Ping,
+            payload: DaemonRequestPayload::ListCorpora,
         };
         let resp = dispatch(&state, req).await;
         let DaemonResponse::Err { message, .. } = resp else {

@@ -18,8 +18,8 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    ErrorKind, GlobalizeMarkdownRequest, ReadMarkdownRequest, connect_at, serve,
-    spawn_signal_handlers,
+    DeleteMarkdownRequest, ErrorKind, GlobalizeMarkdownRequest, ReadMarkdownRequest, connect_at,
+    serve, spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -519,10 +519,12 @@ enabled = false
 // ─── Hardening: liveness, contract surface, single-instance ────────────
 
 #[tokio::test]
-async fn daemon_ping_returns_pong_string() {
+async fn daemon_ping_returns_versioned_pong() {
     // Smallest possible request — the contract is: client encodes
-    // `{"op":"ping"}`, server returns `{"status":"ok","result":"pong"}`.
-    // If this regresses, every other client call regresses too.
+    // `{"op":"ping"}`, server returns `{"status":"ok","result":{"version":...}}`
+    // (Curd C). The version field is what the MCP bootstrap reads to detect
+    // cross-version daemon skew. If this regresses, every other client call
+    // regresses too.
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let corpus_root = tmp.path().join("corpus");
@@ -550,7 +552,11 @@ ground_dir = "{g}"
         })
         .await
         .expect("ping ok");
-    assert_eq!(value, serde_json::Value::String("pong".to_string()));
+    assert_eq!(
+        value["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "ping must report the daemon binary version: {value}"
+    );
 }
 
 #[tokio::test]
@@ -719,7 +725,7 @@ ground_dir = "{g}"
         })
         .await
         .expect("ping");
-    assert_eq!(pong, serde_json::Value::String("pong".to_string()));
+    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
 }
 
 // ─── Curd 1: graceful shutdown ───────────────────────────────────────────
@@ -850,7 +856,7 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
         })
         .await
         .expect("ping before SIGTERM");
-    assert_eq!(pong, serde_json::Value::String("pong".to_string()));
+    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
 
     // Raise SIGTERM at our own process; the installed handler cancels the
     // shutdown token, the accept loop breaks, and `serve` runs cleanup.
@@ -1050,6 +1056,80 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
         .take()
         .expect("respawn must have stored the second serve handle");
     let client = connect_at(&socket).await.expect("connect to second daemon");
+    let _ = client
+        .call_raw(DaemonRequest {
+            cwd: seed_cwd(tmp.path()),
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await;
+    let second_result = timeout(Duration::from_secs(5), second)
+        .await
+        .expect("second serve must return after teardown shutdown")
+        .expect("second serve join ok");
+    second_result.expect("second serve returns Ok on shutdown");
+}
+
+#[tokio::test]
+async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
+    // Curd C end-to-end: the MCP bootstrap restarts a stale daemon via the
+    // `lifecycle::restart` machinery, then proceeds. This drives that same
+    // stop→respawn path through `restart_with` and proves the post-restart
+    // daemon is reachable AND reports OUR version over the versioned Ping —
+    // i.e. a fresh client adopting the restarted daemon sees no skew.
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let first = spawn_serve(cfg.clone(), &socket).await;
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
+
+    let restarted_cfg = cfg.clone();
+    let restart_socket = socket.clone();
+    let stash: std::sync::Arc<
+        std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let stash_inner = stash.clone();
+    hallouminate::app::daemon::restart_with(|| async move {
+        let handle = spawn_serve(restarted_cfg, &restart_socket).await;
+        *stash_inner.lock().expect("stash lock") = Some(handle);
+        Ok(())
+    })
+    .await
+    .expect("restart_with ok");
+
+    let first_result = timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first serve must return after restart's stop")
+        .expect("first serve join ok");
+    first_result.expect("first serve returns Ok on shutdown");
+
+    // The respawned daemon answers a versioned pong reporting OUR version.
+    let client = connect_at(&socket)
+        .await
+        .expect("connect to restarted daemon");
+    let pong: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: seed_cwd(tmp.path()),
+            payload: DaemonRequestPayload::Ping,
+        })
+        .await
+        .expect("ping restarted daemon");
+    assert_eq!(
+        pong["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "restarted daemon must report the current version: {pong}"
+    );
+
+    // Tear down the respawned daemon.
+    let second = stash
+        .lock()
+        .expect("stash lock")
+        .take()
+        .expect("respawn must have stored the second serve handle");
     let _ = client
         .call_raw(DaemonRequest {
             cwd: seed_cwd(tmp.path()),
@@ -1422,5 +1502,276 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     assert!(
         pruned,
         "watcher must prune watched.md's rows on delete so `ground` no longer returns it"
+    );
+}
+
+// ─── Curd B: multi-root corpus read/mutate split ─────────────────────────
+
+/// Build a daemon config with one explicit corpus that has TWO roots, plus a
+/// ground dir. Mirrors the `SPEC_EXAMPLE` multi-root shape (a single
+/// `[[corpus]]` aggregating several paths) that `ground`/`list_files` already
+/// walk. Embeddings disabled so reads/mutations don't touch the model.
+fn cfg_two_root_corpus(ground: &Path, root_a: &Path, root_b: &Path) -> Config {
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "multi"
+paths = ["{a}", "{b}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        a = root_a.display(),
+        b = root_b.display(),
+        g = ground.display(),
+    );
+    toml::from_str(&toml).expect("two-root corpus toml parses")
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_resolves_file_under_a_non_first_root() {
+    // Curd B core fix: a file that lives under the SECOND configured root is
+    // searchable (the scan walks every root) and must now also be readable —
+    // before, read resolved `paths[0]` only and a paths[1..] file was a
+    // searchable-but-unreadable split surface.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).expect("mkdir a");
+    std::fs::create_dir_all(&root_b).expect("mkdir b");
+    // File only under the second root.
+    let body = "# Under second root\n\nReachable now.\n";
+    std::fs::write(root_b.join("only-b.md"), body).expect("write under b");
+    // And one under the first root, to prove both roots stay readable.
+    let body_a = "# Under first root\n";
+    std::fs::write(root_a.join("only-a.md"), body_a).expect("write under a");
+
+    let harness = DaemonHarness::spawn(cfg_two_root_corpus(&ground, &root_a, &root_b)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let read_b: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: "multi".into(),
+                path: "only-b.md".into(),
+            }),
+        })
+        .await
+        .expect("read of paths[1] file must succeed");
+    assert_eq!(read_b["content"].as_str(), Some(body));
+
+    let read_a: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: "multi".into(),
+                path: "only-a.md".into(),
+            }),
+        })
+        .await
+        .expect("read of paths[0] file must succeed");
+    assert_eq!(read_a["content"].as_str(), Some(body_a));
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_missing_in_all_roots_reports_does_not_exist() {
+    // A path absent from every root surfaces the same "does not exist" shape a
+    // single-root miss does — not a confusing multi-root-specific error.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).expect("mkdir a");
+    std::fs::create_dir_all(&root_b).expect("mkdir b");
+    let harness = DaemonHarness::spawn(cfg_two_root_corpus(&ground, &root_a, &root_b)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: "multi".into(),
+                path: "nowhere.md".into(),
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(message.contains("does not exist"), "got: {message}");
+        }
+        DaemonResponse::Ok { result } => panic!("missing file must error; got Ok({result:?})"),
+    }
+}
+
+#[tokio::test]
+async fn daemon_add_markdown_to_multi_root_corpus_is_rejected() {
+    // Mutations have no canonical destination on a multi-root corpus, so
+    // add_markdown must refuse at request time with an InvalidParams error
+    // that names the reason ("roots"), not silently write to paths[0].
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).expect("mkdir a");
+    std::fs::create_dir_all(&root_b).expect("mkdir b");
+    let harness = DaemonHarness::spawn(cfg_two_root_corpus(&ground, &root_a, &root_b)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "multi".into(),
+                path: "new.md".into(),
+                content: "# nope\n".into(),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(
+                message.contains("roots"),
+                "must explain the reason: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => {
+            panic!("multi-root add must be rejected; got Ok({result:?})")
+        }
+    }
+    // And nothing was written to either root.
+    assert!(
+        !root_a.join("new.md").exists(),
+        "must not write to paths[0]"
+    );
+    assert!(
+        !root_b.join("new.md").exists(),
+        "must not write to paths[1]"
+    );
+}
+
+#[tokio::test]
+async fn daemon_delete_markdown_from_multi_root_corpus_is_rejected() {
+    // delete counts as a mutation → also refused on multi-root, even when the
+    // target file genuinely exists under one of the roots.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).expect("mkdir a");
+    std::fs::create_dir_all(&root_b).expect("mkdir b");
+    std::fs::write(root_b.join("doomed.md"), b"# here\n").expect("seed file under b");
+    let harness = DaemonHarness::spawn(cfg_two_root_corpus(&ground, &root_a, &root_b)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
+                corpus: "multi".into(),
+                path: "doomed.md".into(),
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(
+                message.contains("roots"),
+                "must explain the reason: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => {
+            panic!("multi-root delete must be rejected; got Ok({result:?})")
+        }
+    }
+    assert!(
+        root_b.join("doomed.md").exists(),
+        "rejected delete must leave the file intact"
+    );
+}
+
+#[tokio::test]
+async fn globalize_from_a_multi_root_source_corpus_is_rejected() {
+    // Curd B: globalize is a mutation, so its source side requires a
+    // single-root corpus. A 2-root source has no canonical write/read root
+    // for the mutation contract, so it must refuse with the "roots" reason
+    // rather than silently resolving paths[0].
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let src_a = tmp.path().join("src-a");
+    let src_b = tmp.path().join("src-b");
+    let global_root = tmp.path().join("global");
+    std::fs::create_dir_all(&src_a).expect("mkdir src-a");
+    std::fs::create_dir_all(&src_b).expect("mkdir src-b");
+    std::fs::create_dir_all(&global_root).expect("mkdir global");
+    std::fs::write(src_a.join("note.md"), "").expect("seed");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "src"
+paths = ["{a}", "{b}"]
+globs = ["**/*.md"]
+
+[[corpus]]
+name = "cheese-global"
+paths = ["{gl}"]
+globs = ["**/*.md"]
+global = true
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        a = src_a.display(),
+        b = src_b.display(),
+        gl = global_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
+                source_corpus: "src".into(),
+                path: "note.md".into(),
+                dest_path: None,
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(
+                message.contains("roots"),
+                "must explain the reason: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => {
+            panic!("multi-root source globalize must be rejected; got Ok({result:?})")
+        }
+    }
+    // Nothing copied into the global corpus.
+    assert!(
+        !global_root.join("note.md").exists(),
+        "rejected globalize must not write to the global corpus"
     );
 }

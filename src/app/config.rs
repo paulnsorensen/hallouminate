@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
 
-use crate::domain::embeddings::{ARCTIC_S_MODEL, canonical_model_name};
+use crate::domain::embeddings::{DEFAULT_EMBED_MODEL, canonical_model_name};
 use crate::domain::repository::{RepositoryConfig, effective_corpora};
 
 const DEFAULT_TOP_FILES: usize = 10;
@@ -71,7 +71,7 @@ impl Default for EmbeddingsConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            model: ARCTIC_S_MODEL.into(),
+            model: DEFAULT_EMBED_MODEL.into(),
             quantized: false,
             cache_dir: DEFAULT_EMBED_CACHE.into(),
         }
@@ -616,7 +616,7 @@ fn default_enabled() -> bool {
     true
 }
 fn default_model() -> String {
-    ARCTIC_S_MODEL.into()
+    DEFAULT_EMBED_MODEL.into()
 }
 fn default_embed_cache() -> String {
     DEFAULT_EMBED_CACHE.into()
@@ -795,10 +795,40 @@ ground_dir = "~/.local/share/hallouminate/ground"
     }
 
     #[test]
-    fn parse_legacy_embedding_alias_normalizes_to_canonical_model() {
-        let cfg =
-            parse("[embeddings]\nmodel = \"bge-small-en-v1.5\"\n", None).expect("legacy alias");
-        assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
+    fn parse_rejects_dropped_bare_bge_alias() {
+        // The bare `bge-small-en-v1.5` alias was torched in Curd A. A config
+        // using it now fails the unsupported-model gate at parse time; the
+        // full `BAAI/bge-small-en-v1.5` id stays valid.
+        let err = parse("[embeddings]\nmodel = \"bge-small-en-v1.5\"\n", None)
+            .expect_err("bare bge alias must no longer parse");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("unsupported embedding model"), "got: {msg}");
+                assert!(msg.contains("BAAI/bge-small-en-v1.5"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_embeddings_model_is_the_honest_snowflake_default() {
+        // Pins the actual default behaviour: omitting `embeddings.model`
+        // selects snowflake (ARCTIC_S_MODEL), and the honest-default alias
+        // points at it. Guards against a regression that would reintroduce
+        // the old lie where the const said bge but the default was snowflake.
+        assert_eq!(
+            EmbeddingsConfig::default().model,
+            crate::domain::embeddings::ARCTIC_S_MODEL
+        );
+        assert_eq!(
+            DEFAULT_EMBED_MODEL,
+            crate::domain::embeddings::ARCTIC_S_MODEL
+        );
+        let cfg = parse("[embeddings]\nenabled = true\n", None).expect("partial parses");
+        assert_eq!(
+            cfg.embeddings.model,
+            crate::domain::embeddings::ARCTIC_S_MODEL
+        );
     }
 
     #[test]

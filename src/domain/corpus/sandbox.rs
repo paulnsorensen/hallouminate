@@ -477,6 +477,119 @@ pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteErro
     Ok(buf)
 }
 
+/// Find which configured root of `corpus` holds `relative`, walking the roots
+/// in `corpus.paths` order. Returns the first root under which `relative`
+/// resolves to an existing regular file reached without traversing a symlinked
+/// component. Single-root corpora have exactly one candidate, so the behaviour
+/// is unchanged from resolving against [`first_corpus_root`].
+///
+/// This is the read-side counterpart to the mutation handlers'
+/// single-root requirement: `ground` / `list_files` already walk every root,
+/// so a file under `paths[1..]` is searchable; without this, `read_markdown`
+/// would resolve only `paths[0]` and a searchable file would be unreadable.
+///
+/// The probe is **non-mutating** — unlike [`read_no_follow`], it never creates
+/// intermediate directories, so probing a root that does not contain the file
+/// leaves that root untouched.
+///
+/// # Errors
+///
+/// Returns [`WriteError`] with:
+/// - [`WriteErrorKind::Symlink`] when a candidate root resolves `relative`
+///   through a symlinked path component or leaf. This is a hard stop — it is
+///   surfaced immediately rather than masked by trying the next root.
+/// - [`WriteErrorKind::InvalidPath`] when `relative` is not a non-empty path of
+///   normal file components.
+/// - [`WriteErrorKind::Io`] carrying a `NotFound` source when no configured
+///   root contains the file, matching the shape [`read_no_follow`] returns for
+///   a missing file (so callers map both to the same "does not exist" error).
+pub fn resolve_read_root(corpus: &CorpusConfig, relative: &Path) -> Result<PathBuf, WriteError> {
+    let names = normal_components(relative)?;
+    let (dirs, file) = names.split_at(names.len() - 1);
+    let file_name = file
+        .first()
+        .ok_or_else(|| invalid_path_error("path must name a file"))?;
+
+    let mut last_err: Option<WriteError> = None;
+    for raw in &corpus.paths {
+        let root = expand_tilde(raw);
+        match probe_leaf_exists(&root, dirs, file_name.as_os_str()) {
+            Ok(true) => return Ok(root),
+            Ok(false) => last_err = Some(not_found_error()),
+            // A symlink escape is a security stop, not a "try the next root"
+            // miss — surface it so the caller refuses the read.
+            Err(e) if matches!(e.kind, WriteErrorKind::Symlink) => return Err(e),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(not_found_error))
+}
+
+/// Symlink-safe, NON-mutating existence probe used by [`resolve_read_root`].
+/// Walks every parent component through a `cap-std` `Dir` capability without
+/// creating anything, then checks the leaf is an existing regular file reached
+/// without traversing a symlink.
+///
+/// Returns `Ok(true)` when the leaf is a present regular file, `Ok(false)`
+/// when a component or the leaf is simply absent (or a parent component is a
+/// non-directory, so the file cannot live here) — both let the caller try the
+/// next root. Returns `Err(WriteErrorKind::Symlink)` when a component or the
+/// leaf is a symlink.
+fn probe_leaf_exists(
+    root: &Path,
+    dirs: &[OsString],
+    file_name: &OsStr,
+) -> Result<bool, WriteError> {
+    let mut current = match Dir::open_ambient_dir(root, ambient_authority()) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(WriteError::new(WriteErrorKind::Io, e)),
+    };
+    for dir in dirs {
+        match current.symlink_metadata(dir.as_os_str()) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()));
+                }
+                if !meta.is_dir() {
+                    // A non-directory parent component means the file cannot
+                    // resolve under this root; let the caller try the next.
+                    return Ok(false);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(classify_path_io_error(e)),
+        }
+        current = match current.open_dir(dir.as_os_str()) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(classify_path_io_error(e)),
+        };
+    }
+    match current.symlink_metadata(file_name) {
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if ft.is_symlink() {
+                Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()))
+            } else {
+                Ok(ft.is_file())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(classify_path_io_error(e)),
+    }
+}
+
+/// A `WriteError` carrying a `NotFound` source — the shape `read_no_follow`
+/// produces for a missing leaf, so [`resolve_read_root`] callers map a
+/// no-root-contains-it miss to the same "does not exist" response.
+fn not_found_error() -> WriteError {
+    WriteError::new(
+        WriteErrorKind::Io,
+        std::io::Error::from(std::io::ErrorKind::NotFound),
+    )
+}
+
 /// Unlink `<root>/<relative>` after walking every parent component through a
 /// `cap-std` `Dir` capability. Refuses to delete when the leaf is a symlink
 /// (the pre-fix daemon path silently followed parent symlinks via
@@ -1204,6 +1317,129 @@ mod tests {
             err.source.kind(),
             std::io::ErrorKind::NotFound,
             "source kind: {err:?}"
+        );
+    }
+
+    // ── resolve_read_root: multi-root read resolution (Curd B) ───────────
+
+    #[test]
+    fn resolve_read_root_single_root_returns_that_root_when_file_present() {
+        // Single-root behaviour is unchanged: the one configured root is the
+        // sole candidate and resolves when the file is present under it.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("only");
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/a.md"), b"# a\n").unwrap();
+        let corpus = cfg("docs", vec![root.to_str().unwrap()]);
+        let got =
+            resolve_read_root(&corpus, Path::new("notes/a.md")).expect("present file resolves");
+        assert_eq!(got, root);
+    }
+
+    #[test]
+    fn resolve_read_root_finds_file_under_a_non_first_root() {
+        // The whole point of Curd B: a file living under `paths[1]` (searchable
+        // via the multi-root scan) must be reachable for reads, not just
+        // `paths[0]`.
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("only-here.md"), b"# here\n").unwrap();
+        let corpus = cfg(
+            "docs",
+            vec![first.to_str().unwrap(), second.to_str().unwrap()],
+        );
+        let got =
+            resolve_read_root(&corpus, Path::new("only-here.md")).expect("file under paths[1]");
+        assert_eq!(
+            got, second,
+            "must resolve to the root that actually holds the file"
+        );
+    }
+
+    #[test]
+    fn resolve_read_root_prefers_earlier_root_on_collision() {
+        // When the same relative path exists under more than one root, the
+        // first configured root wins — deterministic, order-stable resolution.
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("dup.md"), b"first\n").unwrap();
+        std::fs::write(second.join("dup.md"), b"second\n").unwrap();
+        let corpus = cfg(
+            "docs",
+            vec![first.to_str().unwrap(), second.to_str().unwrap()],
+        );
+        let got = resolve_read_root(&corpus, Path::new("dup.md")).expect("present");
+        assert_eq!(got, first);
+    }
+
+    #[test]
+    fn resolve_read_root_missing_in_all_roots_is_notfound_io() {
+        // No root contains the file → the same `Io`/`NotFound` shape
+        // `read_no_follow` returns for a missing leaf, so callers map it to a
+        // single "does not exist" response.
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let corpus = cfg(
+            "docs",
+            vec![first.to_str().unwrap(), second.to_str().unwrap()],
+        );
+        let err = resolve_read_root(&corpus, Path::new("nope.md")).expect_err("absent everywhere");
+        assert!(matches!(err.kind, WriteErrorKind::Io), "{err:?}");
+        assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound, "{err:?}");
+    }
+
+    #[test]
+    fn resolve_read_root_symlinked_leaf_bounces_without_falling_through() {
+        // A symlinked leaf under the first root is a security stop: it must
+        // surface as `Symlink`, NOT be silently skipped so a same-named real
+        // file under a later root gets read instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, b"secret\n").unwrap();
+        std::os::unix::fs::symlink(&outside, first.join("link.md")).unwrap();
+        std::fs::write(second.join("link.md"), b"real\n").unwrap();
+        let corpus = cfg(
+            "docs",
+            vec![first.to_str().unwrap(), second.to_str().unwrap()],
+        );
+        let err =
+            resolve_read_root(&corpus, Path::new("link.md")).expect_err("symlinked leaf bounces");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
+    }
+
+    #[test]
+    fn resolve_read_root_does_not_create_directories_while_probing() {
+        // Non-mutating contract: probing a root that lacks the nested parent
+        // dirs must not create them (unlike `read_no_follow`, which walks via
+        // the create-on-missing parent opener).
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(second.join("deep/nested")).unwrap();
+        std::fs::write(second.join("deep/nested/leaf.md"), b"x\n").unwrap();
+        let corpus = cfg(
+            "docs",
+            vec![first.to_str().unwrap(), second.to_str().unwrap()],
+        );
+        resolve_read_root(&corpus, Path::new("deep/nested/leaf.md"))
+            .expect("resolves under second");
+        assert!(
+            !first.join("deep").exists(),
+            "probing the first root must not create the nested parent dirs"
         );
     }
 
