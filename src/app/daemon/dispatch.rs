@@ -579,26 +579,26 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let (corpus, root, relative) = match validate_wiki_read_path(&corpora, &req.corpus, &req.path) {
-        Ok(t) => t,
-        Err(resp) => return resp,
-    };
-    let dest = root.join(&relative);
 
-    // Symlink-safe read via the shared sandbox helper: walks every parent
-    // component with `O_NOFOLLOW` and opens the leaf `O_RDONLY | O_NOFOLLOW`
-    // so a symlinked intermediate dir or leaf bounces with the same
-    // `WriteErrorKind::Symlink` shape `add_markdown` uses for writes.
-    let read_root = root.clone();
-    let read_relative = relative.clone();
-    let error_relative = relative.clone();
-    let read =
-        tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_relative)).await;
-    let bytes = match read {
-        Ok(Ok(b)) => b,
-        Ok(Err(WriteError { kind, source })) => {
-            return map_read_error(kind, source, &error_relative);
-        }
+    // Resolve, sandbox, and read entirely off the async dispatcher thread.
+    // `validate_wiki_read_path` is not just CPU work: `resolve_read_root`
+    // walks every configured root with `symlink_metadata`/`open_dir` and
+    // `ensure_wiki_root_safe` stats the wiki root, then the symlink-safe
+    // `read_no_follow` opens the leaf `O_RDONLY | O_NOFOLLOW`. Running all of
+    // it on a blocking task keeps a slow or remote corpus root from stalling a
+    // Tokio worker and delaying unrelated daemon requests.
+    let corpus_name = req.corpus;
+    let req_path = req.path;
+    let resolved = tokio::task::spawn_blocking(move || {
+        let (corpus, root, relative) = validate_wiki_read_path(&corpora, &corpus_name, &req_path)?;
+        let bytes = read_no_follow(&root, &relative)
+            .map_err(|WriteError { kind, source }| map_read_error(kind, source, &relative))?;
+        Ok::<_, DaemonResponse>((corpus, root, relative, bytes))
+    })
+    .await;
+    let (corpus, root, relative, bytes) = match resolved {
+        Ok(Ok(t)) => t,
+        Ok(Err(resp)) => return resp,
         Err(join_err) => {
             tracing::error!(
                 target: "hallouminate::daemon",
@@ -608,6 +608,7 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
             return DaemonResponse::internal(format!("read task panicked: {join_err}"));
         }
     };
+    let dest = root.join(&relative);
     let content = match String::from_utf8(bytes) {
         Ok(s) => s,
         Err(e) => {
