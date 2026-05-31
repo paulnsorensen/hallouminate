@@ -331,10 +331,11 @@ pub struct ListTreeParams {
 pub struct AddMarkdownParams {
     /// Corpus that owns the markdown file.
     pub corpus: String,
-    /// Relative path under the corpus' FIRST configured root (multi-root
-    /// corpora ignore paths[1..] for writes). The caller owns the directory
-    /// structure and markdown shape — convention: `<slug>.md` or
-    /// `<category>/<slug>.md`, first line `# Title`.
+    /// Relative path under the corpus' single configured root. Writes require
+    /// a single-root corpus — multi-root corpora are read- and search-only and
+    /// reject `add_markdown`. The caller owns the directory structure and
+    /// markdown shape — convention: `<slug>.md` or `<category>/<slug>.md`,
+    /// first line `# Title`.
     pub path: String,
     /// Markdown bytes to write as UTF-8 text. Stored verbatim — hallouminate
     /// does not template or validate the markdown format.
@@ -350,8 +351,10 @@ pub struct AddMarkdownParams {
 pub struct ReadMarkdownParams {
     /// Corpus that owns the markdown file.
     pub corpus: String,
-    /// Relative path under the corpus' first configured root, same shape as
-    /// `add_markdown`. Symlinks are rejected.
+    /// Relative path within the corpus, same shape as `add_markdown`. For a
+    /// multi-root corpus it resolves against every configured root (first
+    /// match wins), so a file searchable under `paths[1..]` is also readable.
+    /// Symlinks are rejected.
     pub path: String,
 }
 
@@ -359,8 +362,9 @@ pub struct ReadMarkdownParams {
 pub struct DeleteMarkdownParams {
     /// Corpus that owns the markdown file.
     pub corpus: String,
-    /// Relative path under the corpus' first configured root, same shape as
-    /// `add_markdown`. Symlinks are rejected. Irreversible.
+    /// Relative path under the corpus' single configured root, same shape as
+    /// `add_markdown`. Requires a single-root corpus — multi-root corpora are
+    /// read- and search-only. Symlinks are rejected. Irreversible.
     pub path: String,
 }
 
@@ -523,7 +527,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Write a markdown file under the corpus' FIRST configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`."
+        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`."
     )]
     pub async fn add_markdown(
         &self,
@@ -577,7 +581,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Unlink a markdown file from the corpus' first configured root and prune its rows from the LanceDB index. Irreversible. Symlinks are rejected. `content` is a one-line summary; `structuredContent` is { corpus, path, absolute_path, file_ref }."
+        description = "Unlink a markdown file from the corpus' single configured root and prune its rows from the LanceDB index. Requires a single-root corpus — multi-root corpora are read- and search-only. Irreversible. Symlinks are rejected. `content` is a one-line summary; `structuredContent` is { corpus, path, absolute_path, file_ref }."
     )]
     pub async fn delete_markdown(
         &self,
@@ -599,7 +603,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Copy a single markdown entry from `source_corpus` into the corpus marked `global = true` in config, making it searchable everywhere. The source stays in place (copy, not move). `dest_path` defaults to the source path; `overwrite=false` (default) errors if the destination already exists. The global corpus row is reindexed synchronously. Errors if no global corpus is configured or if `source_corpus` is itself the global corpus. `structuredContent` is { source_corpus, source_path, global_corpus, dest_path, absolute_path, indexed }."
+        description = "Copy a single markdown entry from `source_corpus` into the corpus marked `global = true` in config, making it searchable everywhere. The source stays in place (copy, not move). Both `source_corpus` and the global corpus must be single-root — globalize is a mutation, so multi-root corpora are rejected. `dest_path` defaults to the source path; `overwrite=false` (default) errors if the destination already exists. The global corpus row is reindexed synchronously. Errors if no global corpus is configured or if `source_corpus` is itself the global corpus. `structuredContent` is { source_corpus, source_path, global_corpus, dest_path, absolute_path, indexed }."
     )]
     pub async fn globalize_markdown(
         &self,

@@ -23,6 +23,12 @@ use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Upper bound on the version probe's `Ping` round-trip. `call_raw` has no
+/// built-in timeout, so a daemon that accepts the connection but never replies
+/// would otherwise hang `ensure_daemon_running` at MCP startup. Cap it: an
+/// elapsed probe is treated as unverifiable (→ restart), the same fate as a
+/// transport error or a legacy bare-`"pong"` reply.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Ensure a daemon is reachable, spawning a detached one if not.
 ///
@@ -126,19 +132,28 @@ async fn running_daemon_version_matches(socket: &Path) -> bool {
             return false;
         }
     };
-    match client
-        .call_raw(DaemonRequest {
-            cwd: std::env::current_dir().unwrap_or_default(),
-            payload: DaemonRequestPayload::Ping,
-        })
-        .await
-    {
-        Ok(resp) => pong_reports_our_version(&resp),
-        Err(e) => {
+    let probe = client.call_raw(DaemonRequest {
+        cwd: std::env::current_dir().unwrap_or_default(),
+        payload: DaemonRequestPayload::Ping,
+    });
+    match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        Ok(Ok(resp)) => pong_reports_our_version(&resp),
+        Ok(Err(e)) => {
             tracing::debug!(
                 target: "hallouminate::daemon",
                 error = %e,
                 "version probe Ping failed; treating the daemon as unverifiable",
+            );
+            false
+        }
+        Err(_elapsed) => {
+            // The daemon accepted the connection but did not answer within
+            // `PROBE_TIMEOUT`. A wedged daemon must not hang startup — treat
+            // the silence as unverifiable so the caller restarts it.
+            tracing::debug!(
+                target: "hallouminate::daemon",
+                timeout_secs = PROBE_TIMEOUT.as_secs(),
+                "version probe Ping timed out; treating the daemon as unverifiable",
             );
             false
         }
