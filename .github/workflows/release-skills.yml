@@ -137,6 +137,12 @@ jobs:
               "${{ steps.pack.outputs.zip }}" \
               "${{ steps.pack.outputs.tar }}" \
               "${{ steps.pack.outputs.sha }}" --clobber
+            # Keep the skills-v tag pointing at the refreshed content. Raw `git push`
+            # is unavailable (persist-credentials: false above), so move the ref via
+            # the GITHUB_TOKEN-backed API — which also does not retrigger the tag-glob
+            # workflows (token ref updates start no runs), matching this file's design.
+            gh api --method PATCH "repos/${{ github.repository }}/git/refs/tags/$tag" \
+              -f sha="$GITHUB_SHA" -F force=true
           else
             gh release create "$tag" \
               --target "$GITHUB_SHA" \

@@ -10,7 +10,16 @@ ci = "github"
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# x86_64-apple-darwin dropped: ort (ONNX Runtime, via fastembed) ships no prebuilt
+# for it (pykeio/ort#556); it can't link without a from-source build (out of scope).
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+
+# Pin the Linux runners to ubuntu-24.04 (glibc 2.39) so the ort prebuilt's glibc-2.38
+# C23 symbols (__isoc23_*) and libstdc++ (__cxa_call_terminate) resolve at link time.
+# cargo-dist's default ubuntu-22.04 (glibc 2.35) is too old.
+[dist.github-custom-runners]
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04"
 
 # System build dependencies. lance-encoding (via lancedb) runs a build script
 # that needs protoc; install it on each release runner like ci.yml does.

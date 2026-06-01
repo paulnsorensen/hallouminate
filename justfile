@@ -14,6 +14,15 @@ ci: _fmt-check _clippy _build _test
 # For agents/LLMs — auto-fix formatting + machine-applicable lints, then verify.
 llm: _fix _clippy _build _test
 
+# Move v<version> to HEAD and push, retriggering release.yml + publish-crates.yml.
+# Use to re-ship the SAME version after landing a release fix on main.
+re-tag version:
+    @git diff --quiet HEAD || { echo "working tree dirty — commit first"; exit 1; }
+    -git push origin :refs/tags/v{{version}}
+    -git tag -d v{{version}}
+    git tag v{{version}}
+    git push origin v{{version}}
+
 _fmt-check:
     cargo fmt --all --check
 
