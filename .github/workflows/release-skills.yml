@@ -1,0 +1,148 @@
+# Releases the hallouminate skill pack (the Claude Code plugin under plugins/).
+#
+# There is no `gh skill publish` / `claude plugin publish` command today —
+# Claude Code plugins are distributed by hosting a `.claude-plugin/marketplace.json`
+# in a git repo (users run `/plugin marketplace add paulnsorensen/hallouminate`
+# then `/plugin install hallouminate@hallouminate`). This job complements that by
+# validating the manifests and publishing a versioned, self-contained archive of
+# the marketplace + plugin to a GitHub Release, so a specific skill-pack version
+# can be pinned, downloaded, and added from a local path.
+#
+# Trigger: manual (`workflow_dispatch`). The release tag is `skills-v<version>`,
+# read from plugins/hallouminate/.claude-plugin/plugin.json. We deliberately do
+# NOT trigger on a `skills-v*` tag push: the cargo-dist release.yml and
+# publish-crates.yml both fire on the greedy `**[0-9]+.[0-9]+.[0-9]+*` tag glob,
+# which a `skills-v0.1.0` tag would also match. Creating the tag here via the
+# GITHUB_TOKEN-backed `gh release create` avoids that — token-created tags don't
+# start new workflow runs.
+#
+# Pull requests touching the pack run the validate + package steps (no release)
+# so breakage is caught in review.
+#
+# To list the pack publicly, submit it once at https://claude.ai/settings/plugins/submit
+name: release-skills
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Validate and package the skill pack but do not create a GitHub Release"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - "plugins/**"
+      - ".claude-plugin/**"
+      - ".github/workflows/release-skills.yml"
+
+permissions:
+  contents: write # create the GitHub Release + tag
+
+jobs:
+  release-skills:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PLUGIN_DIR: plugins/hallouminate
+      MARKETPLACE: .claude-plugin/marketplace.json
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Validate marketplace + plugin manifests
+        run: |
+          set -euo pipefail
+          jq empty "$MARKETPLACE"
+          jq empty "$PLUGIN_DIR/.claude-plugin/plugin.json"
+          # the marketplace must reference the plugin by name
+          jq -e '.plugins[] | select(.name == "hallouminate")' "$MARKETPLACE" > /dev/null
+          # the plugin manifest must carry a name and version
+          jq -e '.name == "hallouminate"' "$PLUGIN_DIR/.claude-plugin/plugin.json" > /dev/null
+
+      - name: Validate skill frontmatter
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r -d '' skill; do
+            echo "checking $skill"
+            if [ "$(head -n1 "$skill")" != "---" ]; then
+              echo "::error file=$skill::SKILL.md must open with a --- frontmatter block"
+              fail=1
+              continue
+            fi
+            front="$(awk 'NR>1 { if ($0 == "---") exit; print }' "$skill")"
+            printf '%s\n' "$front" | grep -qE '^description:' \
+              || { echo "::error file=$skill::frontmatter is missing a description:"; fail=1; }
+          done < <(find "$PLUGIN_DIR/skills" -name SKILL.md -print0)
+          exit $fail
+
+      - name: Read pack version
+        id: ver
+        run: |
+          set -euo pipefail
+          v="$(jq -r '.version' "$PLUGIN_DIR/.claude-plugin/plugin.json")"
+          if [ -z "$v" ] || [ "$v" = "null" ]; then
+            echo "::error::plugin.json is missing a version"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=skills-v$v" >> "$GITHUB_OUTPUT"
+
+      - name: Package skill pack
+        id: pack
+        run: |
+          set -euo pipefail
+          name="hallouminate-skills-${{ steps.ver.outputs.version }}"
+          root="$(mktemp -d)"
+          dest="$root/$name"
+          # Mirror the repo layout so the archive is a drop-in marketplace:
+          #   <name>/.claude-plugin/marketplace.json
+          #   <name>/plugins/hallouminate/...
+          mkdir -p "$dest/.claude-plugin" "$dest/plugins"
+          cp "$MARKETPLACE" "$dest/.claude-plugin/"
+          cp -r "$PLUGIN_DIR" "$dest/plugins/"
+          ( cd "$root" && zip -rq "$GITHUB_WORKSPACE/$name.zip" "$name" )
+          ( cd "$root" && tar -czf "$GITHUB_WORKSPACE/$name.tar.gz" "$name" )
+          sha256sum "$name.zip" "$name.tar.gz" > "$name.sha256"
+          echo "zip=$name.zip" >> "$GITHUB_OUTPUT"
+          echo "tar=$name.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha=$name.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: hallouminate-skills-${{ steps.ver.outputs.version }}
+          path: |
+            ${{ steps.pack.outputs.zip }}
+            ${{ steps.pack.outputs.tar }}
+            ${{ steps.pack.outputs.sha }}
+
+      - name: Create GitHub Release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          notes="hallouminate skill pack ${{ steps.ver.outputs.version }}.
+
+          Install via the in-repo marketplace:
+          \`/plugin marketplace add paulnsorensen/hallouminate\` then
+          \`/plugin install hallouminate@hallouminate\`, and run \`/hallouminate:install\`.
+
+          Or add this pinned archive from a local path after extracting it:
+          \`/plugin marketplace add ./hallouminate-skills-${{ steps.ver.outputs.version }}\`."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — refreshing assets"
+            gh release upload "$tag" \
+              "${{ steps.pack.outputs.zip }}" \
+              "${{ steps.pack.outputs.tar }}" \
+              "${{ steps.pack.outputs.sha }}" --clobber
+          else
+            gh release create "$tag" \
+              --target "$GITHUB_SHA" \
+              --title "Skills $tag" \
+              --notes "$notes" \
+              "${{ steps.pack.outputs.zip }}" \
+              "${{ steps.pack.outputs.tar }}" \
+              "${{ steps.pack.outputs.sha }}"
+          fi

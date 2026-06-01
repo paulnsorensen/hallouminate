@@ -99,6 +99,23 @@ vectors). Omitting `embeddings.model` selects the default.
 | `BAAI/bge-small-en-v1.5` | English, symmetric retrieval. |
 | `intfloat/multilingual-e5-small` | Multilingual, asymmetric retrieval; no quantized variant. |
 
+## Skill pack
+
+A Claude Code skill pack ships in this repo under
+[`plugins/hallouminate`](plugins/hallouminate). It installs hallouminate and
+bootstraps your first wiki for you:
+
+```text
+/plugin marketplace add paulnsorensen/hallouminate
+/plugin install hallouminate@hallouminate
+/hallouminate:install
+```
+
+`/install` runs `cargo install hallouminate`, registers the MCP server, then
+asks where and how your first wiki should live (Socratic style) before
+scaffolding, indexing, and committing it with git. The `release-skills`
+workflow publishes versioned skill-pack archives to GitHub Releases.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
