@@ -196,6 +196,17 @@ fn render_tree_outline(
     }
 }
 
+/// Render file content with 1-based line-number gutters, `cat -n` style:
+/// a right-aligned line number, a tab, then the line. Used only for the
+/// human-readable text block; the structured payload stays verbatim.
+fn number_lines(content: &str) -> String {
+    let mut out = String::new();
+    for (number, line) in content.lines().enumerate() {
+        out.push_str(&format!("{:>6}\t{}\n", number + 1, line));
+    }
+    out
+}
+
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
 }
@@ -356,6 +367,12 @@ pub struct ReadMarkdownParams {
     /// match wins), so a file searchable under `paths[1..]` is also readable.
     /// Symlinks are rejected.
     pub path: String,
+    /// When true, render the human-readable text block with 1-based
+    /// line-number gutters (`cat -n` style) so callers can cite and verify
+    /// `path:line` ranges. The structured `content` stays verbatim. Defaults
+    /// to false.
+    #[serde(default)]
+    pub line_numbers: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -560,7 +577,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search."
+        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim."
     )]
     pub async fn read_markdown(
         &self,
@@ -577,7 +594,12 @@ impl HallouminateTools {
         };
         let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured = to_structured(&response)?;
-        Ok(tool_ok(response.content, structured))
+        let text = if params.line_numbers {
+            number_lines(&response.content)
+        } else {
+            response.content
+        };
+        Ok(tool_ok(text, structured))
     }
 
     #[tool(
@@ -750,5 +772,19 @@ mod tests {
         let mapped = map_daemon_err(err);
         assert_eq!(mapped.code.0, -32603);
         assert!(mapped.message.contains("daemon unavailable"));
+    }
+
+    #[test]
+    fn number_lines_renders_cat_n_gutters() {
+        // The gutter must be 6 chars wide, right-aligned, followed by a tab
+        // and the original line. A regression in alignment would break an
+        // agent's ability to parse `path:line` references from the output.
+        let result = number_lines("foo\nbar");
+        assert_eq!(result, "     1\tfoo\n     2\tbar\n");
+    }
+
+    #[test]
+    fn number_lines_empty_input_produces_empty_output() {
+        assert_eq!(number_lines(""), "");
     }
 }
