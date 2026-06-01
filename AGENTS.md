@@ -42,8 +42,8 @@ Three skills live under `.agents/skills/`. Apply them when working in Rust:
 
 ## Wiki skills (for hallouminate users)
 
-Three skills under `.agents/skills/` drive the wiki lifecycle through the
-hallouminate MCP tools. Each runs an **opus reasoning root** with **haiku
+Three skills under `plugins/hallouminate/skills/` (the distributable plugin
+pack) drive the wiki lifecycle through the hallouminate MCP tools. Each runs an **opus reasoning root** with **haiku
 fan-out** sub-agents for parallel retrieval/drafting.
 
 - **`wiki-init`** — bootstrap an empty wiki by interviewing the user with
