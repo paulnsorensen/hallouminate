@@ -1,0 +1,20 @@
+{
+  "name": "hallouminate",
+  "owner": {
+    "name": "Paul Sorensen",
+    "email": "paulnsorensen@gmail.com"
+  },
+  "description": "Skills for installing and operating hallouminate — the LLM markdown-wiki indexer.",
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "hallouminate",
+      "source": "./hallouminate",
+      "description": "Install hallouminate and bootstrap your first LLM-authored per-repo wiki.",
+      "category": "documentation",
+      "keywords": ["hallouminate", "wiki", "rag", "mcp", "documentation"]
+    }
+  ]
+}
