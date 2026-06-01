@@ -3,3 +3,5 @@
 ralphs/
 .code-review-graph/
 .serena/
+npm/bin/
+npm/node_modules/
