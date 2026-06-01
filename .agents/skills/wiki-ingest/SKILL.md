@@ -17,9 +17,9 @@ unvetted one.
   merge vs. overwrite vs. new, judges contradictions, and writes the final entries.
   Every judgment call lives here.
 - **Fan-out = haiku.** One sub-agent per candidate claim/topic: runs `ground` to
-  find the nearest existing page, reads it, and returns the match + similarity score
-  - the relevant existing lines. Retrieval and reading are fanned out; decisions are
-  not.
+  find the nearest existing page, reads it, and returns the match, its similarity
+  score, and the relevant existing lines. Retrieval and reading are fanned out;
+  decisions are not.
 
 ## Phase 1 — Atomize (root / opus)
 
@@ -37,11 +37,14 @@ Spawn one haiku sub-agent per atomic claim, **in a single message**, each with t
 contract:
 
 > Run `ground { query: "<claim topic>", corpus: "<corpus>", top_files: 3, chunks_per_file: 3 }`.
-> Return the best-matching existing page: its `path`, the top chunk's `score`,
-> `heading_path`, `line_range`, `mtime`, and the matching `snippet`. If the top
+> Return the best-matching existing page: its **corpus-relative path**, the file-level
+> `mtime`, and from the top chunk its `score`, `heading_path`, `line_range`, and
+> `snippet`. (`ground` keys its `docs` by *absolute* path and `mtime` is file-level,
+> not per-chunk — convert the key to the corpus-relative path, the same shape
+> `read_markdown`/`add_markdown` take, since they reject absolute paths.) If the top
 > score is low / nothing relevant, return `{ match: none }`. Do NOT edit anything —
-> you only locate. If the match looks close, `read_markdown` that page and return the
-> section that would be updated.
+> you only locate. If the match looks close, `read_markdown { corpus, path }` that
+> page (relative path) and return the section that would be updated.
 
 ## Phase 3 — Decide (root / opus)
 
@@ -65,7 +68,8 @@ Judge: is the new source more authoritative or more recent (compare `mtime`, sou
 provenance)?
 
 - **Newer + authoritative** → overwrite the stale assertion, and record what
-  superseded what in the provenance footer (`Superseded prior: <what> · <date>`).
+  superseded what in the provenance footer's `Supersedes:` field (`Supersedes:
+  <what> · <date>`).
 - **Unclear** → keep both, mark the conflict inline (`> ⚠️ Conflicts with <other>:
   <summary> — needs human resolution`), and flag it to the user. Never silently pick.
 

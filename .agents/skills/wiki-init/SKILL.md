@@ -76,8 +76,9 @@ your working notes), separating *what was said* from *how it'll be written*.
   maintains each `index.md` link list for you.
 - Write a **`wiki-conventions.md`** first (the wiki's constitution): slug rules, the
   H1 rule, one-topic-per-file, the voice, and a provenance-footer convention
-  (`_Source: <how we know this> · Updated: <date>_`). Later skills (`wiki-ingest`)
-  read it to stay consistent.
+  (`_Source: <how we know this> · Updated: <date> · Supersedes: <if any>_`). Declare
+  the `Supersedes:` field here so `wiki-ingest` writes and reads one key. Later skills
+  (`wiki-ingest`) read it to stay consistent.
 - Pick the corpus: `repo:{name}:wiki` for the repo, or ask if ambiguous
   (`list_corpora`). Confirm the page list with the user before fanning out.
 
@@ -92,8 +93,10 @@ Spawn one haiku sub-agent per planned page, **in a single message**, each with:
 > Draft a one-topic markdown entry from these slots. First non-blank line is
 > `# <Title>`. Lead with the conclusion, ~50–150 lines, concrete over abstract,
 > cite code as `path:line` where the slots name files. Add the provenance footer.
-> Then call `add_markdown { corpus, path, content, overwrite: false }`. Return the
-> path written and any lint `warnings` from the response. Do NOT interview the user.
+> Then call `add_markdown { corpus, path, content, overwrite: false }` — the target
+> corpus must be single-root (`add_markdown` rejects multi-root corpora);
+> `repo:{name}:wiki` is single-root. Return the path written and any lint `warnings`
+> from the response. Do NOT interview the user.
 > Do NOT invent facts beyond the slots — if a slot is thin, write only what's there
 > and note the gap.
 
@@ -105,7 +108,8 @@ automatically on write.
 - Collect the written paths and lint warnings; fix any flagged entry (heading jumps,
   empty links) with an `overwrite: true` redraft.
 - `list_tree` to confirm the shape; write or refine the top-level `index.md` prose
-  (outside the `HALLOUMINATE:INDEX` markers — the daemon owns the link list inside).
+  (outside the `<!-- HALLOUMINATE:INDEX-START -->` / `<!-- HALLOUMINATE:INDEX-END -->`
+  markers — the daemon owns the link list between them).
 - Report the page list to the user and name the gaps the interview didn't reach
   (hand-off candidates for a later `wiki-init` continuation or `wiki-ingest`).
 

@@ -41,12 +41,15 @@ concurrently. Give each the exact `ground` call to make and this contract:
 
 > Run `ground { query: "<sub-question>", corpus: "<corpus>", top_files: 5, chunks_per_file: 3 }`.
 > For each chunk that actually bears on the question, return a row:
-> `{ claim, path, line_range, heading_path, score, snippet (≤200 chars) }`.
+> `{ claim, path, line_range, heading_path, score, snippet (≤200 chars) }`, where
+> `path` is the **corpus-relative** path. (`ground` keys its `docs` by *absolute*
+> path; convert it to the corpus-relative path — the shape `read_markdown` takes,
+> since it rejects absolute paths.)
 > If `ground` returns nothing relevant, return `{ found: false }` for that
 > sub-question. Do NOT paraphrase beyond the snippet. Do NOT answer the user's
 > question — you only gather evidence. If a top chunk is truncated and the answer
-> hinges on it, `read_markdown { …, line_numbers: true }` that one file and quote
-> the exact numbered lines.
+> hinges on it, `read_markdown { corpus, path, line_numbers: true }` (relative path)
+> that one file and quote the exact numbered lines.
 
 `ground` returns per file: `summary, keywords, score, mtime, corpus, chunks[]`,
 and per chunk: `heading_path` (H1→leaf breadcrumb), `line_range` ([start,end],
