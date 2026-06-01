@@ -38,7 +38,7 @@ jobs:
         id: published
         run: |
           v="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
-          if curl -sf --retry 3 --retry-connrefused "https://index.crates.io/ha/ll/hallouminate" | jq -r .vers | grep -qx "$v"; then
+          if curl -sf --retry 3 --retry-connrefused "https://index.crates.io/ha/ll/hallouminate" | jq -r .vers | grep -Fqx "$v"; then
             echo "::notice::hallouminate $v already published — skipping cargo publish"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
