@@ -45,7 +45,8 @@ concurrently. Give each the exact `ground` call to make and this contract:
 > If `ground` returns nothing relevant, return `{ found: false }` for that
 > sub-question. Do NOT paraphrase beyond the snippet. Do NOT answer the user's
 > question — you only gather evidence. If a top chunk is truncated and the answer
-> hinges on it, `read_markdown` that one file and quote the exact lines.
+> hinges on it, `read_markdown { …, line_numbers: true }` that one file and quote
+> the exact numbered lines.
 
 `ground` returns per file: `summary, keywords, score, mtime, corpus, chunks[]`,
 and per chunk: `heading_path` (H1→leaf breadcrumb), `line_range` ([start,end],
@@ -69,8 +70,10 @@ and per chunk: `heading_path` (H1→leaf breadcrumb), `line_range` ([start,end],
 ### 4. Verify before answering
 
 For each citation, confirm the cited `line_range` in that file actually contains
-the claim — `read_markdown` the file if a claim is high-stakes or a snippet was
-truncated. Wrong citations are worse than no citations.
+the claim — `read_markdown { …, line_numbers: true }` the file if a claim is
+high-stakes or a snippet was truncated. The `line_numbers` flag returns the text
+with 1-based gutters, so you can confirm the exact `path:line` you're about to cite
+rather than counting by hand. Wrong citations are worse than no citations.
 
 ## Output shape
 
