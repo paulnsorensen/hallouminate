@@ -39,3 +39,21 @@ Three skills live under `.agents/skills/`. Apply them when working in Rust:
   the same AST-level change across many call sites (API migrations, UFCS
   ↔ method calls, struct-literal ↔ constructor), where a semantic,
   type-aware transform beats text find-and-replace.
+
+## Wiki skills (for hallouminate users)
+
+Three skills under `.agents/skills/` drive the wiki lifecycle through the
+hallouminate MCP tools. Each runs an **opus reasoning root** with **haiku
+fan-out** sub-agents for parallel retrieval/drafting.
+
+- **`wiki-init`** — bootstrap an empty wiki by interviewing the user with
+  Socratic, behavior-first questioning (ACTA: task diagram → knowledge audit
+  → simulation), then fans out haiku drafters to write one-topic-per-file
+  entries via `add_markdown`.
+- **`wiki-query`** — answer a question strictly from the wiki, every claim
+  carrying a `path:line` citation. Haiku sub-agents fan out one `ground`
+  search per sub-question; the opus root synthesizes and verifies citations.
+- **`wiki-ingest`** — fold new sources/facts into an existing wiki: route to
+  the page each claim extends, merge, create-new only when novel, and never
+  blend contradictions. Haiku locates via `ground`; the opus root decides
+  and writes.
