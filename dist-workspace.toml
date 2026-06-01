@@ -15,7 +15,7 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 # System build dependencies. lance-encoding (via lancedb) runs a build script
 # that needs protoc; install it on each release runner like ci.yml does.
 [dist.dependencies.apt]
-protobuf-compiler = '*'
+protobuf-compiler = "*"
 
 [dist.dependencies.homebrew]
-protobuf = '*'
+protobuf = "*"
