@@ -1,7 +1,7 @@
 # Enforcement half of the action-pinning policy: blocks any PR that introduces
 # a GitHub Action or reusable workflow referenced by a mutable tag/branch instead
 # of a full 40-char commit SHA. Dependabot (see dependabot.yml) is the other half
-# — it keeps the pinned SHAs and their `# vX.Y.Z` comments up to date weekly.
+# — it keeps the pinned SHAs and their version/branch comments up to date weekly.
 # Together: pinned now, maintained by Dependabot, regressions blocked here.
 name: actions-pin-check
 
