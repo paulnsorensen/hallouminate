@@ -14,12 +14,15 @@ installers = ["shell"]
 # for it (pykeio/ort#556); it can't link without a from-source build (out of scope).
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 
-# Pin the Linux runners to ubuntu-24.04 (glibc 2.39) so the ort prebuilt's glibc-2.38
-# C23 symbols (__isoc23_*) and libstdc++ (__cxa_call_terminate) resolve at link time.
-# cargo-dist's default ubuntu-22.04 (glibc 2.35) is too old.
+# Pin the runners so the ort/onnxruntime prebuilt links cleanly:
+#  - x86_64 Linux on ubuntu-24.04 (glibc 2.39) resolves the prebuilt's glibc-2.38
+#    C23 symbols (__isoc23_*). cargo-dist's default ubuntu-22.04 (glibc 2.35) is too old.
+#  - aarch64 Linux on a NATIVE arm runner (ubuntu-24.04-arm) instead of cross-compiling
+#    from x86_64 via zigbuild, which fails to link onnxruntime's C++ runtime
+#    (libstdc++ std::* undefined symbols). A native build links it automatically.
 [dist.github-custom-runners]
 x86_64-unknown-linux-gnu = "ubuntu-24.04"
-aarch64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 
 # System build dependencies. lance-encoding (via lancedb) runs a build script
 # that needs protoc; install it on each release runner like ci.yml does.
