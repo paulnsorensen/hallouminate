@@ -20,17 +20,20 @@ writes to the wrong wiki or ambiguous reads.
 ## Tools
 
 ### `list_corpora`
+
 Returns every corpus the daemon knows about — explicit `[[corpus]]`
 entries plus derived `repo:NAME:wiki` and `repo:NAME:corpus` corpora
 from `[[repository]]` declarations. No params. Use this first to learn
 what's available.
 
 ### `list_files`
+
 Returns the files currently visible in a corpus, honoring its
 paths/globs/exclude rules. Param: `corpus` (defaults to wiki-for-cwd).
 Returns an array of `{path, absolute_path}`.
 
 ### `list_tree`
+
 Same files as `list_files`, but grouped into a `{path, absolute_path,
 files, subdirs}` tree rooted at the corpus' first configured path.
 Subdirs without markdown anywhere beneath them are pruned so the tree
@@ -39,14 +42,16 @@ this for progressive disclosure — navigate the wiki tree without
 reading every `index.md` first.
 
 ### `ground`
+
 Semantic search. Embeds the query with the configured embeddings model
-(default `BAAI/bge-small-en-v1.5`), retrieves top chunks from LanceDB,
+(default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from LanceDB,
 rolls up per-file with breadcrumb context. Params: `query` (required),
 `corpus` (defaults to wiki-for-cwd), `top_files`, `chunks_per_file`,
 `limit`, `snippet_chars`. Returns a ripgrep-style outline in `content`
 and the full structured response in `structuredContent.docs`.
 
 ### `add_markdown`
+
 Atomic-write a markdown file to the corpus' first configured root, then
 refresh just that file's LanceDB rows. For `repo:*:wiki` corpora, also
 walks ancestor directories from the corpus root down to the new file's
@@ -61,17 +66,20 @@ Symlinks and parent-dir escapes are rejected by the sandbox at
 `src/domain/corpus/sandbox.rs`.
 
 ### `read_markdown`
+
 Read verbatim UTF-8 contents of a file in a corpus. Params: `corpus`,
 `path`. Returns the on-disk text, not the chunked index view. Use this
 before `add_markdown { overwrite: true }` to inspect current content.
 
 ### `delete_markdown`
+
 Unlink a file from the corpus' first root and prune its rows from the
 index. Irreversible. For `repo:*:wiki` corpora, also re-walks the
 ancestor `index.md`s so they no longer link to the deleted file.
 Params: `corpus`, `path`.
 
 ### `index`
+
 Bulk (re)build the LanceDB index for one or all corpora. Params:
 `corpus` (optional; omit to rebuild every configured corpus). Use this
 when files were touched outside hallouminate — `add_markdown`'s

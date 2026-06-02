@@ -1,0 +1,20 @@
+[book]
+title = "hallouminate"
+description = "A markdown corpus indexer for LLMs to build and query their own per-repo wikis."
+authors = ["Paul Sorensen"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/paulnsorensen/hallouminate"
+edit-url-template = "https://github.com/paulnsorensen/hallouminate/edit/main/docs/{path}"
+site-url = "/hallouminate/"
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
