@@ -21,10 +21,24 @@ mutation locks, and config resolution. The CLI and the stdio MCP server
 both talk to it over a Unix domain socket — one owner, no cross-process
 LanceDB races.
 
+> 📖 **Full documentation:** <https://cheeselord.dev/hallouminate/>
+
 ## Usage
 
+`hallouminate serve` starts the stdio MCP server (auto-spawning the daemon if
+none is running) — this is what an MCP client launches:
+
 ```sh
-cargo run -- --name Cheese
+hallouminate serve
+```
+
+From a source checkout, run subcommands through cargo:
+
+```sh
+cargo run -- serve                       # stdio MCP server
+cargo run -- index                       # bulk (re)index every configured corpus
+cargo run -- ground "how does the daemon work"   # CLI semantic search
+cargo run -- config show                 # print the effective merged config
 ```
 
 ## Build
@@ -41,13 +55,18 @@ The binary lands in `target/release/hallouminate`.
 
 - `ground` — semantic search.
 - `index` — bulk (re)build a corpus index.
-- `list_corpora`, `list_files` — discovery.
+- `list_corpora` — list every configured corpus.
+- `list_files` — flat list of relative paths in a corpus.
+- `list_tree` — the same files grouped into a directory tree, for
+  progressive disclosure without reading every `index.md`.
 - `add_markdown` — write a markdown file under the corpus' first root,
   atomic and no-symlink-follow, with auto-reindex of just that file.
   Returns advisory lint `warnings` (empty-destination links, empty mermaid
   blocks, heading-level jumps) without blocking or rewriting the content.
 - `read_markdown` — verbatim UTF-8 file contents. Use before overwriting.
 - `delete_markdown` — unlink the file and prune its rows from the index.
+- `globalize_markdown` — copy an entry into the global corpus to share it
+  across repos.
 
 Markdown content is stored verbatim — hallouminate imposes no schema.
 Convention for LLM wiki authors: one topic per file, first line `# Title`,
@@ -56,8 +75,14 @@ file stem matches the slug.
 ## Config
 
 The config lives at `$XDG_CONFIG_HOME/hallouminate/config.toml`
-(`~/.config/hallouminate/config.toml` by default). Bootstrap with
-`hallouminate config init`, check with `hallouminate config validate`.
+(`~/.config/hallouminate/config.toml` by default).
+
+- `hallouminate config init` — scaffold a baseline config.
+- `hallouminate config show` — print the effective merged config for the
+  current working directory (baseline + repo layer).
+- `hallouminate config validate` — parse and flag unknown top-level keys.
+- `hallouminate config download` — pre-fetch the configured embedding model
+  so the first `index` doesn't pay the download cost.
 
 ## FAQ
 

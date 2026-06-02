@@ -11,9 +11,14 @@ tool, future agent — dials the daemon over a Unix domain socket.
 
 ## Socket location
 
-- Default: `${XDG_CACHE_HOME:-~/.cache}/hallouminate/daemon.sock`
-- Per-process override: `HALLOUMINATE_SOCKET` env var
-- CLI override: `--socket PATH` on `index`, `ground`, etc.
+Resolved in this order (`src/app/daemon/socket.rs`):
+
+1. `HALLOUMINATE_SOCKET` env var — per-process override.
+2. `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` — the default when a
+   runtime dir exists.
+3. `${XDG_CACHE_HOME:-~/.cache}/hallouminate/daemon.sock` — fallback.
+
+`--socket PATH` on `index`, `ground`, etc. overrides per-invocation.
 
 The daemon takes a flock on `<socket>.lock` to enforce single-instance
 ownership. A second `hallouminate daemon` against the same socket
