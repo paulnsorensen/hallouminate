@@ -1,0 +1,98 @@
+/* hallouminate — easy-cheese brand identity ported to mdBook.
+   Mirrors paulnsorensen/easy-cheese's mkdocs-material palette, fonts, and
+   cheese motif within mdBook's stock rust/ayu themes. */
+
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=JetBrains+Mono:wght@400;500;700&display=swap");
+
+:root {
+  --cheese-rind: #b45309;
+  --cheese-curd: #fde68a;
+  --cheese-wheel: #f59e0b;
+  --cheese-melt: #fb923c;
+  --cheese-wax: #c2410c;
+}
+
+/* Accent links toward the cheese wheel across every theme */
+html .content a:link,
+html .content a:visited {
+  color: var(--cheese-wax);
+}
+html.coal .content a:link,
+html.navy .content a:link,
+html.ayu .content a:link,
+html.coal .content a:visited,
+html.navy .content a:visited,
+html.ayu .content a:visited {
+  color: var(--cheese-wheel);
+}
+
+/* Headings keep the artisanal Fraunces; body stays on the theme's font */
+.content h1,
+.content h2,
+.content h3,
+.content h4 {
+  font-family: "Fraunces", "Source Serif 4", Georgia, serif;
+  font-optical-sizing: auto;
+  letter-spacing: -0.01em;
+}
+
+/* Code in JetBrains Mono to match easy-cheese */
+code {
+  font-family: "JetBrains Mono", "Source Code Pro", Consolas, monospace;
+}
+
+/* Warm the menu bar into a wheel-of-cheese gradient (light themes) */
+#menu-bar.menu-bar {
+  background: linear-gradient(
+    135deg,
+    var(--cheese-wax) 0%,
+    var(--cheese-melt) 55%,
+    var(--cheese-wheel) 100%
+  );
+  color: #fff7ed;
+  border-bottom: none;
+}
+#menu-bar .menu-title,
+#menu-bar .icon-button,
+#menu-bar a {
+  color: #fff7ed;
+}
+
+/* Dark themes: deeper aged-rind gradient so the bar doesn't glare */
+html.coal #menu-bar.menu-bar,
+html.navy #menu-bar.menu-bar,
+html.ayu #menu-bar.menu-bar {
+  background: linear-gradient(135deg, #7c2d12 0%, #92400e 55%, #b45309 100%);
+}
+
+/* Site title: a touch heavier, like a stamped rind */
+#menu-bar .menu-title {
+  font-family: "Fraunces", Georgia, serif;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* Inline code: wax-paper background (light themes) */
+.content :not(pre) > code {
+  background-color: rgba(253, 230, 138, 0.45);
+  border: 1px solid rgba(180, 83, 9, 0.15);
+  border-radius: 4px;
+  padding: 0.1em 0.3em;
+}
+html.coal .content :not(pre) > code,
+html.navy .content :not(pre) > code,
+html.ayu .content :not(pre) > code {
+  background-color: rgba(180, 83, 9, 0.25);
+  border-color: rgba(253, 230, 138, 0.2);
+}
+
+/* Tables: subtle aged-paper alternating rows */
+.content table tbody tr:nth-child(even) {
+  background-color: rgba(253, 230, 138, 0.08);
+}
+
+/* Blockquotes get a cheese-rind stripe */
+.content blockquote {
+  border-inline-start: 4px solid var(--cheese-wheel);
+  background-color: rgba(245, 158, 11, 0.08);
+}

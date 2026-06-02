@@ -1,6 +1,18 @@
-# hallouminate
+# 🧀 hallouminate 🧀
 
+[![CI](https://img.shields.io/github/actions/workflow/status/paulnsorensen/hallouminate/ci.yml?branch=main&label=CI&style=flat-square)](https://github.com/paulnsorensen/hallouminate/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/hallouminate?style=flat-square)](https://crates.io/crates/hallouminate)
+[![License: MIT](https://img.shields.io/github/license/paulnsorensen/hallouminate?style=flat-square)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/paulnsorensen/hallouminate?style=flat-square)](https://github.com/paulnsorensen/hallouminate/releases/latest)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/paulnsorensen/hallouminate/badge)](https://scorecard.dev/viewer/?uri=github.com/paulnsorensen/hallouminate)
+[![Conventional Commits](https://img.shields.io/badge/Conventional%20Commits-1.0.0-yellow?style=flat-square)](https://www.conventionalcommits.org)
+[![Agent Skills](https://img.shields.io/badge/Agent%20Skills-spec-blueviolet?style=flat-square)](https://agentskills.io/specification)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](https://github.com/paulnsorensen/hallouminate/pulls)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=flat-square&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/paulnsorensen)
+
+**Stop hallucinating. Start hallouminating.**
+
+> _"The wiki must flow."_
 
 A markdown corpus indexer for LLMs to build and query their own per-repo
 wikis. Hallouminate stores markdown verbatim on disk, embeds it with
