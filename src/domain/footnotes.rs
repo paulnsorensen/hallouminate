@@ -80,106 +80,86 @@ pub fn get_footnote_target(content: &str, label: &str) -> Option<String> {
 
 // ── private helpers ────────────────────────────────────────────────────────
 
+fn make_parser(content: &str) -> impl Iterator<Item = (Event<'_>, std::ops::Range<usize>)> {
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    Parser::new_ext(content, opts).into_offset_iter()
+}
+
 /// Strip footnote definition blocks and inline `[^label]` markers.
 ///
-/// A footnote definition block starts at a line beginning with `[^...]:`
-/// and continues until the next non-indented, non-blank line (or EOF).
-/// Inline references `[^label]` are stripped from ordinary lines.
+/// Parser-based: `[^...]` inside fenced code blocks or inline code spans is
+/// NOT treated as a footnote marker and survives untouched.
 fn exclude_footnotes(content: &str) -> String {
-    let mut out = String::with_capacity(content.len());
-    let mut skip_block = false;
+    // Collect byte ranges to delete: inline refs + definition blocks.
+    let mut remove: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut def_start: Option<usize> = None;
 
-    for line in content.lines() {
-        if is_footnote_def_start(line) {
-            skip_block = true;
-            continue;
-        }
-        if skip_block {
-            // Continuation lines are indented (at least one space/tab) or blank.
-            if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
-                continue;
+    for (event, range) in make_parser(content) {
+        match event {
+            Event::FootnoteReference(_) => {
+                remove.push(range);
             }
-            skip_block = false;
+            Event::Start(Tag::FootnoteDefinition(_)) => {
+                def_start = Some(range.start);
+            }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                if let Some(start) = def_start.take() {
+                    remove.push(start..range.end);
+                }
+            }
+            _ => {}
         }
-        // Strip inline [^label] references from ordinary lines.
-        let stripped = strip_inline_refs(line);
-        out.push_str(&stripped);
-        out.push('\n');
     }
 
-    // Preserve trailing newline only if the original ended with one.
-    if !content.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
+    if remove.is_empty() {
+        return content.to_string();
     }
-    out
+
+    remove.sort_by_key(|r| r.start);
+    apply_deletions(content, &remove)
 }
 
-/// Return only the footnote definition lines (label + content), one per
-/// definition. Each definition is emitted as its source lines, blank
-/// continuation lines between definitions are dropped.
+/// Return only the footnote definition content (raw source bytes of each
+/// definition block).
+///
+/// Parser-based: definition ranges come from `pulldown-cmark`'s offset
+/// iterator, so `[^...]` inside code is never misidentified as a definition.
 fn only_footnotes(content: &str) -> String {
     let mut out = String::new();
-    let mut in_block = false;
+    let mut def_start: Option<usize> = None;
 
-    for line in content.lines() {
-        if is_footnote_def_start(line) {
-            in_block = true;
-            out.push_str(line);
-            out.push('\n');
-            continue;
-        }
-        if in_block {
-            if line.is_empty() || line.starts_with(' ') || line.starts_with('\t') {
-                if !line.is_empty() {
-                    out.push_str(line);
-                    out.push('\n');
-                }
-            } else {
-                in_block = false;
+    for (event, range) in make_parser(content) {
+        match event {
+            Event::Start(Tag::FootnoteDefinition(_)) => {
+                def_start = Some(range.start);
             }
+            Event::End(TagEnd::FootnoteDefinition) => {
+                if let Some(start) = def_start.take() {
+                    out.push_str(&content[start..range.end]);
+                }
+            }
+            _ => {}
         }
     }
+
     out
 }
 
-fn is_footnote_def_start(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("[^") else {
-        return false;
-    };
-    if let Some(bracket_end) = rest.find(']') {
-        let after = &rest[bracket_end + 1..];
-        return after.starts_with(':');
-    }
-    false
-}
-
-/// Remove `[^label]` inline references from a line (not definition starters).
-fn strip_inline_refs(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.char_indices().peekable();
-
-    while let Some((i, ch)) = chars.next() {
-        if ch == '[' {
-            // Peek ahead to see if this is [^...]  (inline ref, not a def)
-            let rest = &line[i..];
-            if rest.starts_with("[^") && let Some(close) = rest.find(']') {
-                // Check it's not a definition start (followed by ':')
-                let after_bracket = &rest[close + 1..];
-                if !after_bracket.starts_with(':') {
-                    // Skip over the whole [^label]
-                    let end_byte = i + close + 1;
-                    // advance chars iterator past the ref
-                    while let Some(&(next_i, _)) = chars.peek() {
-                        if next_i >= end_byte {
-                            break;
-                        }
-                        chars.next();
-                    }
-                    continue;
-                }
-            }
+/// Copy `content` bytes, skipping every byte range in `ranges`.
+///
+/// `ranges` must be sorted by start and non-overlapping.
+fn apply_deletions(content: &str, ranges: &[std::ops::Range<usize>]) -> String {
+    let mut out = String::with_capacity(content.len());
+    let mut pos = 0usize;
+    for r in ranges {
+        if pos < r.start {
+            out.push_str(&content[pos..r.start]);
         }
-        out.push(ch);
+        pos = pos.max(r.end);
+    }
+    if pos < content.len() {
+        out.push_str(&content[pos..]);
     }
     out
 }
@@ -192,11 +172,7 @@ mod tests {
 
     #[test]
     fn extract_footnotes_returns_ordered_label_text_pairs() {
-        let md = "Some text[^1] and[^note].
-
-[^1]: First source.
-[^note]: Second source.
-";
+        let md = "Some text[^1] and[^note].\n\n[^1]: First source.\n[^note]: Second source.\n";
         let got = extract_footnotes(md);
         assert_eq!(got.len(), 2, "expected 2 footnotes: {got:?}");
         assert_eq!(got[0].0, "1");
@@ -306,5 +282,310 @@ mod tests {
             get_footnote_target(md, "cite").as_deref(),
             Some("Author 2024.")
         );
+    }
+
+    // ── ADVERSARIAL: extract_footnotes edge cases ──────────────────────────
+
+    #[test]
+    fn extract_footnotes_with_unmatched_inline_marker() {
+        // Inline [^missing] with no corresponding definition — should be ignored by extract
+        let md = "Text[^missing] here.\n\n[^1]: Present.\n";
+        let got = extract_footnotes(md);
+        assert_eq!(
+            got.len(),
+            1,
+            "only definition [^1] should be extracted: {got:?}"
+        );
+        assert_eq!(got[0].0, "1");
+    }
+
+    #[test]
+    fn extract_footnotes_with_orphaned_definition() {
+        // Definition [^orphan] with no inline marker — should still be extracted
+        let md = "Some text[^used].\n\n[^used]: Cited.\n[^orphan]: Not cited.\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 2, "both definitions should extract: {got:?}");
+        assert_eq!(got[0].0, "used");
+        assert_eq!(got[1].0, "orphan");
+    }
+
+    #[test]
+    fn extract_footnotes_multiline_definition_captures_all_lines() {
+        // Footnote body spans multiple indented lines
+        let md = "Text[^multi].\n\n[^multi]: First line\n  second line\n  third line\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 1);
+        let target = &got[0].1;
+        assert!(
+            target.contains("First line"),
+            "first line missing: {target:?}"
+        );
+        assert!(
+            target.contains("second line"),
+            "second line missing: {target:?}"
+        );
+        assert!(
+            target.contains("third line"),
+            "third line missing: {target:?}"
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_duplicate_labels_both_extracted() {
+        // pulldown-cmark extracts BOTH definitions when labels duplicate
+        let md = "[^1]: First.\n[^1]: Second.\n";
+        let got = extract_footnotes(md);
+        assert_eq!(
+            got.len(),
+            2,
+            "pulldown-cmark extracts both duplicates: {got:?}"
+        );
+        let labels: Vec<&str> = got.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["1", "1"],
+            "both entries present with same label"
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_special_characters_in_label() {
+        // Labels with hyphens, underscores, etc.
+        let md = "[^my-note]: With hyphen.\n[^ref_2]: With underscore.\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "my-note");
+        assert_eq!(got[1].0, "ref_2");
+    }
+
+    #[test]
+    fn extract_footnotes_substring_labels_distinct() {
+        // [^1] vs [^11] should be treated as different labels
+        let md = "[^1]: First.\n[^11]: Second.\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 2, "labels '1' and '11' are distinct: {got:?}");
+        assert_eq!(got[0].0, "1");
+        assert_eq!(got[1].0, "11");
+    }
+
+    #[test]
+    fn extract_footnotes_consecutive_definitions_no_blank_line() {
+        // Definitions back-to-back without blank separator
+        let md = "[^1]: First.\n[^2]: Second.\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, "1");
+        assert_eq!(got[1].0, "2");
+    }
+
+    #[test]
+    fn extract_footnotes_preserves_definition_order() {
+        // Footnotes should be returned in the order they appear in the document
+        let md = "[^z]: Last.\n[^a]: First.\n[^m]: Middle.\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got[0].0, "z", "first definition order");
+        assert_eq!(got[1].0, "a", "second definition order");
+        assert_eq!(got[2].0, "m", "third definition order");
+    }
+
+    // ── ADVERSARIAL: apply_footnote_mode edge cases ────────────────────────
+
+    #[test]
+    fn apply_exclude_inline_marker_between_words_no_space_loss() {
+        // Ensure we don't accidentally create double-spaces or lose critical spacing
+        let md = "Word1[^1]Word2.\n\n[^1]: Source.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert_eq!(out, "Word1Word2.\n\n", "spacing preserved exactly: {out:?}");
+    }
+
+    #[test]
+    fn apply_exclude_marker_at_line_boundary() {
+        // Marker at end of line
+        let md = "End of line[^1]\nStart of next line.\n\n[^1]: Citation.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(
+            out.contains("End of line\nStart of next"),
+            "line boundary handled: {out:?}"
+        );
+    }
+
+    #[test]
+    fn apply_exclude_multiple_markers_same_line() {
+        // Multiple references on a single line
+        let md = "A[^1] B[^2] C[^3].\n\n[^1]: One.\n[^2]: Two.\n[^3]: Three.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(!out.contains("[^"), "all markers stripped: {out:?}");
+        assert_eq!(out, "A B C.\n\n", "text collapsed correctly: {out:?}");
+    }
+
+    #[test]
+    fn apply_exclude_def_with_blank_continuation_lines() {
+        // Definition has blank lines between continuation lines.
+        // pulldown-cmark includes the trailing whitespace-only line in the definition
+        // range but treats subsequent content-bearing lines as separate paragraphs.
+        let md = "Text[^1].\n\n[^1]: Start.\n  \n  End.\n\nMore.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(!out.contains("[^"), "definition and markers removed");
+        assert!(out.contains("Text"), "body preserved");
+        assert!(out.contains("More."), "content after def preserved");
+    }
+
+    #[test]
+    fn apply_exclude_adjacent_definitions_no_blank_line() {
+        // Definitions immediately following each other
+        let md = "Text[^1][^2].\n\n[^1]: First.\n[^2]: Second.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert_eq!(
+            out, "Text.\n\n",
+            "adjacent markers and defs removed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn apply_exclude_definition_with_inline_formatting() {
+        // Definition contains **bold** or *italic* — should still be identified as a def
+        let md = "Text[^1].\n\n[^1]: **Bold source** and *italic*.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(!out.contains("[^"), "definition removed despite formatting");
+        assert_eq!(out, "Text.\n\n", "body preserved, def gone");
+    }
+
+    #[test]
+    fn apply_exclude_looks_like_ref_in_code_fence_bug() {
+        // [^...] inside a fenced code block is NOT a footnote reference under the
+        // pulldown-cmark parser. The parser-based implementation preserves it.
+        let md = "Normal[^1].\n\n```\nCode with [^fake] inside\n```\n\n[^1]: Real.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(
+            out.contains("[^fake]"),
+            "[^fake] in code fence must survive exclude"
+        );
+        assert!(!out.contains("[^1]"), "real inline ref must be stripped");
+        assert!(
+            !out.contains("[^1]: Real"),
+            "real definition must be stripped"
+        );
+    }
+
+    #[test]
+    fn apply_only_preserves_multiline_definition_structure() {
+        // Only mode should preserve continuation-line indentation
+        let md = "Body.\n\n[^note]: Start\n  continuation\n  more.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Only);
+        assert!(out.contains("[^note]: Start"), "def start preserved");
+        assert!(out.contains("continuation"), "continuation lines preserved");
+    }
+
+    #[test]
+    fn apply_only_with_multiple_definitions_and_blanks() {
+        // Multiple defs separated by blank lines
+        let md = "[^1]: First.\n\n[^2]: Second.\n\n[^3]: Third.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Only);
+        assert!(out.contains("[^1]:"));
+        assert!(out.contains("[^2]:"));
+        assert!(out.contains("[^3]:"));
+    }
+
+    // ── ADVERSARIAL: get_footnote_target edge cases ────────────────────────
+
+    #[test]
+    fn get_footnote_target_exact_match_not_prefix() {
+        // [^note] should NOT match when searching for "not"
+        let md = "[^note]: Content.\n";
+        assert!(
+            get_footnote_target(md, "not").is_none(),
+            "prefix should not match"
+        );
+        assert!(
+            get_footnote_target(md, "note").is_some(),
+            "exact label should match"
+        );
+    }
+
+    #[test]
+    fn get_footnote_target_case_sensitive() {
+        // [^Note] vs [^note] should be different
+        let md = "[^Note]: First.\n[^note]: Second.\n";
+        let upper = get_footnote_target(md, "Note");
+        let lower = get_footnote_target(md, "note");
+        assert_eq!(upper.as_deref(), Some("First."));
+        assert_eq!(lower.as_deref(), Some("Second."));
+    }
+
+    #[test]
+    fn get_footnote_target_with_empty_label_search() {
+        // Searching for empty label should not match or panic
+        let md = "[^1]: Content.\n";
+        let result = get_footnote_target(md, "");
+        assert!(result.is_none(), "empty label should not match");
+    }
+
+    #[test]
+    fn get_footnote_target_numeric_and_word_labels_same_doc() {
+        let md = "[^123]: Numeric.\n[^note]: Word.\n[^9]: Another num.\n";
+        assert_eq!(get_footnote_target(md, "123").as_deref(), Some("Numeric."));
+        assert_eq!(get_footnote_target(md, "note").as_deref(), Some("Word."));
+        assert_eq!(
+            get_footnote_target(md, "9").as_deref(),
+            Some("Another num.")
+        );
+    }
+
+    #[test]
+    fn get_footnote_target_with_special_chars_in_target() {
+        // Target text contains special characters, URLs, etc.
+        let md = "[^src]: https://example.com/path?query=1&other=2\n";
+        let target = get_footnote_target(md, "src").unwrap();
+        assert!(target.contains("https://"));
+        assert!(target.contains("?query=1"));
+    }
+
+    // ── ADVERSARIAL: boundary and recovery ─────────────────────────────────
+
+    #[test]
+    fn apply_exclude_with_line_exactly_indented_one_space() {
+        // Continuation line with exactly 1 space (minimum indentation)
+        let md = "Text[^1].\n\n[^1]: Start\n Second line.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(!out.contains("[^"), "def and marker removed");
+        // "Second line." should also be gone (part of definition)
+        assert!(
+            !out.contains("Second line"),
+            "continuation removed as part of def"
+        );
+    }
+
+    #[test]
+    fn apply_only_with_definition_containing_link_or_code() {
+        // Definition target may contain markdown inline elements
+        let md = "[^cite]: See [my docs](https://example.com) or `code`.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Only);
+        assert!(out.contains("[^cite]:"), "definition preserved");
+        // The function should preserve the raw markdown as-is
+        assert!(
+            out.contains("https://example.com") || out.contains("docs"),
+            "link text preserved"
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_empty_label_boundary() {
+        // pulldown-cmark does not recognize [^]: as a footnote definition
+        // (empty label is rejected by the parser).
+        let md = "[^]: Empty label.\n";
+        let got = extract_footnotes(md);
+        assert!(
+            got.is_empty(),
+            "empty label is not extracted by pulldown-cmark"
+        );
+    }
+
+    #[test]
+    fn apply_exclude_with_unterminated_bracket_in_body() {
+        // Body text has an unmatched [, but not a footnote pattern
+        let md = "Text [with bracket.\n\n[^1]: Citation.\n";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(!out.contains("[^"), "definition removed");
+        assert!(out.contains("[with bracket"), "regular [ preserved");
     }
 }

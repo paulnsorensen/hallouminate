@@ -64,6 +64,7 @@ Tools:
 - `ground` — semantic search; returns ranked chunks with snippet, \
   heading_path, line_range, score.
 - `index` — bulk (re)index a corpus or all corpora.
+- `get_footnote` — resolve a single citation: footnote target for page#footnote_number.
 
 Filesystem is the source of truth; LanceDB rows are derived and refreshed \
 after `add_markdown` / `delete_markdown`. `index` is the only way to pick \

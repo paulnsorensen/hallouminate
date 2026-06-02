@@ -1803,3 +1803,117 @@ path = "{}"
 
     mcp.shutdown().await;
 }
+
+#[tokio::test]
+#[ignore = "requires the real embedder and may download a model on first run"]
+async fn mcp_ground_footnotes_exclude_strips_markers() {
+    // Verifies that `ground` with `footnotes:"exclude"` returns snippets and an
+    // outline with no `[^...]` markers, while the default (omitted) case
+    // returns them intact. Requires the real embedder (model download).
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let ground = tempfile::tempdir().expect("ground tempdir");
+
+    // Seed a markdown file with a footnote reference and definition.
+    let body = "# Evidence\n\nThe sky is blue.[^src]\n\n[^src]: physics/optics.rs:42\n";
+    std::fs::write(corpus.path().join("evidence.md"), body).expect("seed");
+
+    let cfg = write_config_with_corpus_and_ground(
+        xdg.path(),
+        "wiki",
+        &corpus.path().to_string_lossy(),
+        ground.path(),
+    );
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // Index first so ground has something to search.
+    let idx = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({"name": "index", "arguments": {"corpus": "wiki"}}),
+        )
+        .await;
+    assert!(idx.get("error").is_none(), "index errored: {idx}");
+
+    // Case 1: footnotes:"exclude" — no [^...] in snippets or outline.
+    let call = mcp
+        .rpc(
+            3,
+            "tools/call",
+            json!({
+                "name": "ground",
+                "arguments": {
+                    "query": "sky is blue",
+                    "corpus": "wiki",
+                    "footnotes": "exclude"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "ground errored: {call}");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("ground text content");
+    assert!(
+        !text.contains("[^"),
+        "footnote markers must be absent from exclude outline: {text:?}"
+    );
+    let docs = &call["result"]["structuredContent"]["docs"];
+    if let Some(obj) = docs.as_object() {
+        for (_path, doc) in obj {
+            if let Some(chunks) = doc["chunks"].as_array() {
+                for chunk in chunks {
+                    let snippet = chunk["snippet"].as_str().unwrap_or("");
+                    assert!(
+                        !snippet.contains("[^"),
+                        "footnote marker must be absent from exclude snippet: {snippet:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Case 2: footnotes omitted (default = include) — markers present.
+    let call = mcp
+        .rpc(
+            4,
+            "tools/call",
+            json!({
+                "name": "ground",
+                "arguments": {
+                    "query": "sky is blue",
+                    "corpus": "wiki"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "ground errored: {call}");
+    let docs = &call["result"]["structuredContent"]["docs"];
+    let found_marker = docs.as_object().is_some_and(|obj| {
+        obj.values().any(|doc| {
+            doc["chunks"]
+                .as_array()
+                .is_some_and(|chunks| chunks.iter().any(|c| c["snippet"].as_str().unwrap_or("").contains("[^")))
+        })
+    });
+    assert!(
+        found_marker,
+        "footnote marker must appear in default (include) ground result: {docs}"
+    );
+
+    mcp.shutdown().await;
+}
