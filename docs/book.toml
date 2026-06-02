@@ -8,6 +8,7 @@ src = "src"
 [output.html]
 default-theme = "rust"
 preferred-dark-theme = "ayu"
+additional-css = ["theme/custom.css"]
 git-repository-url = "https://github.com/paulnsorensen/hallouminate"
 edit-url-template = "https://github.com/paulnsorensen/hallouminate/edit/main/docs/{path}"
 site-url = "/hallouminate/"
