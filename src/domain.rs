@@ -11,3 +11,4 @@ pub mod ground;
 pub mod indexer;
 pub mod repository;
 pub mod search;
+pub mod footnotes;

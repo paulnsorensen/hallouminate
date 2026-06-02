@@ -422,7 +422,7 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
         .call(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                corpus: Some(repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap()),
                 path: "cheese.md".into(),
             }),
         })
@@ -1558,7 +1558,7 @@ async fn daemon_read_markdown_resolves_file_under_a_non_first_root() {
         .call(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: "multi".into(),
+                corpus: Some("multi".into()),
                 path: "only-b.md".into(),
             }),
         })
@@ -1570,7 +1570,7 @@ async fn daemon_read_markdown_resolves_file_under_a_non_first_root() {
         .call(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: "multi".into(),
+                corpus: Some("multi".into()),
                 path: "only-a.md".into(),
             }),
         })
@@ -1596,7 +1596,7 @@ async fn daemon_read_markdown_missing_in_all_roots_reports_does_not_exist() {
         .call_raw(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: "multi".into(),
+                corpus: Some("multi".into()),
                 path: "nowhere.md".into(),
             }),
         })
