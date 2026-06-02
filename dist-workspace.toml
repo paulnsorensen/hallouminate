@@ -7,6 +7,10 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
+# release.yml is dist-generated, but its actions are hand-pinned to commit SHAs
+# (OpenSSF Scorecard Pinned-Dependencies). allow-dirty stops `dist plan` from
+# failing on that divergence; Dependabot keeps the pinned SHAs current.
+allow-dirty = ["ci"]
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)

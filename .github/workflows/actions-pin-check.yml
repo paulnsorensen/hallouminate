@@ -1,0 +1,41 @@
+# Enforcement half of the action-pinning policy: blocks any PR that introduces
+# a GitHub Action or reusable workflow referenced by a mutable tag/branch instead
+# of a full 40-char commit SHA. Dependabot (see dependabot.yml) is the other half
+# — it keeps the pinned SHAs and their version/branch comments up to date weekly.
+# Together: pinned now, maintained by Dependabot, regressions blocked here.
+name: actions-pin-check
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+
+permissions:
+  contents: read
+
+jobs:
+  pin-check:
+    name: actions pinned to SHA
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Require full-SHA action pins
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r hit; do
+            file="${hit%%:*}"
+            ref="$(printf '%s\n' "$hit" | sed -E 's/.*uses:[[:space:]]*//; s/[[:space:]]*#.*//; s/[[:space:]]*$//; s/^[\x27\"]//; s/[\x27\"]$//')"
+            case "$ref" in
+              ./*|docker://*) continue ;;   # local action or docker image — not a pinnable ref
+              *@*) sha="${ref##*@}" ;;
+              *) continue ;;                 # no @ref at all
+            esac
+            if ! printf '%s' "$sha" | grep -qE '^[0-9a-f]{40}$'; then
+              echo "::error file=$file::unpinned action '$ref' — pin to a full 40-char commit SHA (keep the '# tag' comment so Dependabot can update it)"
+              bad=1
+            fi
+          done < <(grep -rnE '^[[:space:]]*-?[[:space:]]*uses:' .github/workflows .github/actions 2>/dev/null || true)
+          if [ "$bad" -ne 0 ]; then exit 1; fi
+          echo "All actions are pinned to full commit SHAs."
