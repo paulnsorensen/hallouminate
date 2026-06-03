@@ -35,8 +35,9 @@ jobs:
 
   build-test-matrix:
     name: build & test (${{ matrix.os }})
-    # Unix only: the crate is unix-only (libc path handling won't compile on
-    # Windows — tracked in #48).
+    # Unix only: the daemon's IPC transport is Unix-socket bound, so the full
+    # test matrix runs on unix. Windows gets a build-only feasibility probe (the
+    # windows-build-probe job below); its named-pipes port is #48 stage 2.
     strategy:
       fail-fast: false
       matrix:
@@ -101,3 +102,29 @@ jobs:
       - name: Require all matrix legs to pass
         if: needs.build-test-matrix.result != 'success'
         run: exit 1
+
+  windows-build-probe:
+    name: windows build probe (x86_64-pc-windows-msvc)
+    # Feasibility spike for #48 stage 1: prove the native-dependency chain
+    # (ort/onnxruntime, lancedb's zstd-sys/lzma-sys, openssl via vcpkg) LINKS on
+    # windows-msvc. Build-only (lib + bins) — the daemon is cfg-stubbed and
+    # non-functional on Windows until the named-pipes transport (#48 stage 2),
+    # so this is NOT part of the required "build & test" gate.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install protoc
+        # lancedb's lance-encoding build script needs protoc on every OS.
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Point openssl-sys at the runner's vcpkg
+        # lancedb's transitive openssl-sys resolves OpenSSL via vcpkg on Windows;
+        # windows-latest ships a vcpkg at VCPKG_INSTALLATION_ROOT.
+        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+        shell: pwsh
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Build (lib + bins)
+        run: cargo build --locked

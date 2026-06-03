@@ -18,14 +18,20 @@
 //!
 //! Lock order across the dispatcher is documented in `state.rs`.
 
+#[cfg_attr(not(unix), path = "bootstrap_stub.rs")]
 mod bootstrap;
+#[cfg_attr(not(unix), path = "client_stub.rs")]
 mod client;
+#[cfg(unix)]
 mod dispatch;
 mod ipc;
+#[cfg_attr(not(unix), path = "lifecycle_stub.rs")]
 mod lifecycle;
+#[cfg_attr(not(unix), path = "server_stub.rs")]
 mod server;
 mod socket;
 mod state;
+#[cfg(unix)]
 mod watch;
 
 pub use bootstrap::ensure_daemon_running;

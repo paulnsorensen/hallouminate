@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! End-to-end test: spawn `hallouminate serve` as a child process, drive
 //! the MCP JSON-RPC handshake over its stdio, and assert that `tools/list`
 //! and `tools/call list_corpora` produce the expected shapes.

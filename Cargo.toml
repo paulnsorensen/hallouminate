@@ -31,12 +31,6 @@ futures = "0.3"
 # Embeddings
 fastembed = "5"
 
-# Force vendored (compile-from-source) OpenSSL so `openssl-sys` cross-compiles for
-# aarch64-unknown-linux-gnu in the dist release build. openssl-sys is pulled in
-# transitively via native-tls (ort-sys/ureq, fastembed/hf-hub, lancedb/reqwest);
-# vendoring avoids needing the target's system libssl under cargo-zigbuild cross-compile.
-openssl = { version = "0.10", features = ["vendored"] }
-
 # Hashing + filesystem
 blake3 = "1"
 # `cap-std` is the cross-platform `Dir`-relative API the corpus sandbox uses
@@ -88,6 +82,15 @@ chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1"
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"
+
+# Force vendored (compile-from-source) OpenSSL so `openssl-sys` cross-compiles for
+# aarch64-unknown-linux-gnu in the dist release build. openssl-sys is pulled in
+# transitively via native-tls (ort-sys/ureq, fastembed/hf-hub, lancedb/reqwest);
+# vendoring avoids needing the target's system libssl under cargo-zigbuild cross-compile.
+# Scoped to unix so the Windows build skips the perl+nasm openssl-src build and lets
+# lancedb's transitive openssl-sys resolve OpenSSL via vcpkg (VCPKG_ROOT) instead (#48 stage 1).
+[target.'cfg(unix)'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Integration tests for the local hallouminate daemon.
 //!
 //! Three quality-gate buckets from the spec:
