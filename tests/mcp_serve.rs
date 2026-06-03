@@ -1514,7 +1514,10 @@ async fn mcp_read_markdown_footnotes_include_omitted_is_verbatim() {
     let text = call["result"]["content"][0]["text"]
         .as_str()
         .expect("text present");
-    assert_eq!(text, body, "omitted footnotes param must pass content verbatim");
+    assert_eq!(
+        text, body,
+        "omitted footnotes param must pass content verbatim"
+    );
 
     mcp.shutdown().await;
 }
@@ -1559,10 +1562,7 @@ async fn mcp_get_footnote_resolves_label_to_target_text() {
     let text = call["result"]["content"][0]["text"]
         .as_str()
         .expect("text content present");
-    assert_eq!(
-        text, "src/lib.rs:10",
-        "target text mismatch: {text:?}"
-    );
+    assert_eq!(text, "src/lib.rs:10", "target text mismatch: {text:?}");
     let structured = &call["result"]["structuredContent"];
     assert_eq!(
         structured["footnote_number"].as_str(),
@@ -1761,8 +1761,7 @@ path = "{}"
 
     // MCP process cwd = repo root so cwd_for_tool returns the repo path,
     // which causes pick_corpus_or_default to match [[repository]] "repowiki".
-    let mut mcp =
-        Mcp::spawn_with_cwd(xdg.path(), repo.path(), Some(harness.socket()), false).await;
+    let mut mcp = Mcp::spawn_with_cwd(xdg.path(), repo.path(), Some(harness.socket()), false).await;
     mcp.rpc(
         1,
         "initialize",
@@ -1905,9 +1904,11 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
     let docs = &call["result"]["structuredContent"]["docs"];
     let found_marker = docs.as_object().is_some_and(|obj| {
         obj.values().any(|doc| {
-            doc["chunks"]
-                .as_array()
-                .is_some_and(|chunks| chunks.iter().any(|c| c["snippet"].as_str().unwrap_or("").contains("[^")))
+            doc["chunks"].as_array().is_some_and(|chunks| {
+                chunks
+                    .iter()
+                    .any(|c| c["snippet"].as_str().unwrap_or("").contains("[^"))
+            })
         })
     });
     assert!(

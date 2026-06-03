@@ -23,25 +23,43 @@ pub enum FootnoteMode {
 
 /// Return ordered `(label, target_text)` pairs for every footnote definition
 /// in `content`. `target_text` is the plain-text content of the definition
-/// block (heading and inline markup stripped).
+/// block; link and image destinations are preserved as `text (url)`, so a
+/// citation written as `[docs](https://…)` keeps its URL.
 pub fn extract_footnotes(content: &str) -> Vec<(String, String)> {
-    let mut opts = Options::empty();
-    opts.insert(Options::ENABLE_FOOTNOTES);
-    let parser = Parser::new_ext(content, opts);
-
     let mut results = Vec::new();
     let mut current_label: Option<String> = None;
     let mut current_text = String::new();
+    // Stack of (destination_url, text_len_at_open) for open links/images, so
+    // nested image-in-link markup resolves both URLs in source order.
+    let mut open_dests: Vec<(String, usize)> = Vec::new();
 
-    for event in parser {
+    for (event, _range) in make_parser(content) {
         match event {
             Event::Start(Tag::FootnoteDefinition(label)) => {
                 current_label = Some(label.into_string());
                 current_text.clear();
+                open_dests.clear();
             }
             Event::End(TagEnd::FootnoteDefinition) => {
                 if let Some(label) = current_label.take() {
                     results.push((label, current_text.trim().to_string()));
+                }
+            }
+            Event::Start(Tag::Link { dest_url, .. })
+            | Event::Start(Tag::Image { dest_url, .. })
+                if current_label.is_some() =>
+            {
+                open_dests.push((dest_url.into_string(), current_text.len()));
+            }
+            Event::End(TagEnd::Link) | Event::End(TagEnd::Image) if current_label.is_some() => {
+                if let Some((dest, mark)) = open_dests.pop() {
+                    // Autolinks (`<https://…>`) already render the URL as their
+                    // visible text; appending it again would duplicate it.
+                    if !current_text[mark..].contains(dest.as_str()) {
+                        current_text.push_str(" (");
+                        current_text.push_str(&dest);
+                        current_text.push(')');
+                    }
                 }
             }
             Event::Text(t) | Event::Code(t) if current_label.is_some() => {
@@ -194,6 +212,53 @@ mod tests {
     fn extract_footnotes_empty_doc_returns_empty() {
         assert!(extract_footnotes("").is_empty());
         assert!(extract_footnotes("No footnotes here.").is_empty());
+    }
+
+    #[test]
+    fn extract_footnotes_preserves_link_destination() {
+        // Regression: a citation written as a markdown link must keep its URL,
+        // not collapse to the link text alone.
+        let md = "[^1]: See [docs](https://example.com/spec)\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].1.contains("https://example.com/spec"),
+            "link URL dropped: {:?}",
+            got[0].1
+        );
+        assert!(
+            got[0].1.contains("docs"),
+            "link text dropped: {:?}",
+            got[0].1
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_preserves_image_destination() {
+        // Image citations must keep the destination URL too.
+        let md = "[^img]: ![diagram](https://example.com/d.png)\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 1);
+        assert!(
+            got[0].1.contains("https://example.com/d.png"),
+            "image URL dropped: {:?}",
+            got[0].1
+        );
+    }
+
+    #[test]
+    fn extract_footnotes_autolink_not_duplicated() {
+        // An autolink renders its URL as the visible text already — the URL
+        // must appear exactly once, not twice.
+        let md = "[^1]: <https://example.com/spec>\n";
+        let got = extract_footnotes(md);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].1.matches("https://example.com/spec").count(),
+            1,
+            "autolink URL duplicated: {:?}",
+            got[0].1
+        );
     }
 
     // ── apply_footnote_mode: Include ───────────────────────────────────────

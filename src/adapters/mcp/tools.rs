@@ -506,15 +506,10 @@ impl HallouminateTools {
         if params.footnotes != FootnoteMode::Include {
             for doc in result.response.docs.values_mut() {
                 for chunk in &mut doc.chunks {
-                    chunk.snippet =
-                        apply_footnote_mode(&chunk.snippet, params.footnotes);
+                    chunk.snippet = apply_footnote_mode(&chunk.snippet, params.footnotes);
                 }
             }
-            result.outline = render(
-                &result.response,
-                Format::Outline,
-                &RenderOpts::default(),
-            );
+            result.outline = render(&result.response, Format::Outline, &RenderOpts::default());
         }
         let structured = to_structured(&result.response)?;
         Ok(tool_ok(result.outline, structured))
@@ -757,8 +752,8 @@ impl HallouminateTools {
             }),
         };
         let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let target = get_footnote_target(&response.content, &params.footnote_number)
-            .ok_or_else(|| {
+        let target =
+            get_footnote_target(&response.content, &params.footnote_number).ok_or_else(|| {
                 invalid_params(format!(
                     "footnote [^{}] not found in {}",
                     params.footnote_number, params.page
