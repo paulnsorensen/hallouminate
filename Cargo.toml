@@ -99,3 +99,14 @@ tempfile = "3"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# esaxx-rs 0.1.10 (pulled transitively via fastembed/text-splitter -> tokenizers)
+# hardcodes the static MSVC CRT (/MT) in its build.rs, which fails to link
+# against ort's dynamic-CRT (/MD) onnxruntime prebuilt on x86_64-pc-windows-msvc
+# (LNK2038 -> LNK1319, #48). The feature can't be disabled (text-splitter
+# enables tokenizers' default `esaxx_fast`) and no env/RUSTFLAGS overrides the
+# explicit `.static_crt(true)`, so we redirect to a vendored copy with the one
+# build.rs line flipped to /MD. No-op off windows-msvc. Drop once a fixed
+# esaxx-rs ships upstream (Narsil/esaxx-rs PR #19). See vendor/esaxx-rs/README.md.
+[patch.crates-io]
+esaxx-rs = { path = "vendor/esaxx-rs" }
