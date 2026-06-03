@@ -90,6 +90,15 @@ preamble. Cite files and line ranges by path: \
 `src/domain/corpus/walker.rs:42`. Prefer concrete examples to abstract \
 description. ~50-150 lines per entry is the right band.
 
+OPTIONAL FRONTMATTER. A page MAY open with a YAML frontmatter block — a \
+`---` fence on line 1, key/value lines, then a closing `---`. Recognized \
+keys (all optional): `status` (draft|reviewed|trusted|deprecated, \
+case-insensitive), `owner`, `last_verified`, `confidence`, `sources`. \
+Unknown keys are ignored. The block is stripped before indexing, so it \
+never pollutes chunks, summaries, or `ground` hits, and citations still \
+point at the real on-disk lines. A malformed block is left in the body \
+and returns one advisory warning.
+
 # Tree layout & linking
 
 Subdirectories work — write `architecture/dataflow.md` and the daemon \

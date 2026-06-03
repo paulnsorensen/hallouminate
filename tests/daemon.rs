@@ -516,6 +516,104 @@ enabled = false
     );
 }
 
+#[tokio::test]
+async fn daemon_add_markdown_warns_on_malformed_frontmatter_block_and_stores_verbatim() {
+    // Locks the `handle_add_markdown` wiring of `lint_frontmatter`: a page that
+    // opens with a *delimited* `---…---` block whose contents are not valid YAML
+    // must ride back exactly one frontmatter advisory through the real daemon
+    // response — and still be stored byte-for-byte (fail-soft indexing never
+    // rejects or rewrites the author's content). A well-formed frontmatter page
+    // must produce no frontmatter advisory. Without the `warnings.extend(
+    // lint_frontmatter(..))` line in dispatch, the malformed case below carries
+    // no advisory and this test fails.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // A closed `---…---` block whose body is not a YAML mapping → malformed.
+    let malformed = "---\n: : : not valid : :\n---\n# Notes\n\nplain body text\n";
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "bad-fm.md".into(),
+                content: malformed.into(),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("add_markdown ok despite malformed frontmatter");
+
+    // Fail-soft end-to-end: the content is stored verbatim, fence included.
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("bad-fm.md")).unwrap(),
+        malformed,
+        "malformed frontmatter must be stored verbatim, never rewritten"
+    );
+
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present for a malformed frontmatter block");
+    let frontmatter_advisories = warnings
+        .iter()
+        .filter_map(|w| w.as_str())
+        .filter(|w| w.contains("frontmatter"))
+        .count();
+    assert_eq!(
+        frontmatter_advisories, 1,
+        "exactly one frontmatter advisory must ride back: {warnings:?}"
+    );
+
+    // A well-formed frontmatter page produces no frontmatter advisory.
+    let clean: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "good-fm.md".into(),
+                content: "---\nstatus: reviewed\nowner: cheese-lord\n---\n# Notes\n\nbody\n".into(),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("add_markdown ok for well-formed frontmatter");
+    let clean_fm_advisories = clean["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|x| x.contains("frontmatter"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        clean_fm_advisories, 0,
+        "well-formed frontmatter must not warn: {:?}",
+        clean["warnings"]
+    );
+}
+
 // ─── Hardening: liveness, contract surface, single-instance ────────────
 
 #[tokio::test]

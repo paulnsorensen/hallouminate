@@ -480,3 +480,110 @@ async fn chunker_budget_compliance_with_characters_sizer() {
         );
     }
 }
+
+/// Seam E1 acceptance: a page WITH frontmatter and a page WITHOUT both index
+/// and ground cleanly. Frontmatter text never reaches chunk text / summary /
+/// heading paths, and the frontmatter page's line numbers map back to real
+/// on-disk source lines (offset proven by a heading placed below a multi-line
+/// frontmatter block).
+#[tokio::test]
+async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+
+    // 5 frontmatter lines (1..=5); the heading lands on on-disk line 6 and the
+    // distinctive token `zphyxnort` on on-disk line 8.
+    fs::write(
+        corpus_dir.path().join("fm.md"),
+        "---\nstatus: reviewed\nowner: cheese-lord\nlast_verified: 2026-01-02\n---\n# Quokka Wisdom\n\nThe distinctive token zphyxnort lives on a known line.\n",
+    )
+    .expect("write fm fixture");
+    fs::write(
+        corpus_dir.path().join("plain.md"),
+        "# Plain Page\n\nA mundane page about the qwobblefrotz device.\n",
+    )
+    .expect("write plain fixture");
+
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+        global: false,
+    };
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let chunker = MarkdownChunker::new(Characters, 1500);
+    let mut embedder = StubEmbedder;
+
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+        .await
+        .expect("index_corpus");
+    assert_eq!(stats.files_upserted, 2, "both pages indexed");
+
+    let mut emb_for_query = StubEmbedder;
+
+    // The frontmatter page grounds on its body token, with no leaked metadata.
+    let qv = emb_for_query
+        .embed_batch(&["zphyxnort".to_string()], EmbedRole::Query)
+        .expect("embed query")[0];
+    let hits = hybrid_search(&store, "docs", "zphyxnort", &qv, 5)
+        .await
+        .expect("hybrid_search fm");
+    let hit = hits
+        .iter()
+        .find(|h| h.file_ref.ends_with("fm.md"))
+        .expect("fm.md must appear in hits");
+
+    assert!(
+        !hit.text.contains("status:"),
+        "chunk text leaked frontmatter: {:?}",
+        hit.text
+    );
+    assert!(
+        !hit.text.contains("cheese-lord"),
+        "chunk text leaked owner: {:?}",
+        hit.text
+    );
+    assert!(
+        !hit.summary.contains("status:"),
+        "summary leaked frontmatter: {:?}",
+        hit.summary
+    );
+    assert!(
+        !hit.heading_path
+            .iter()
+            .any(|h| h.contains("---") || h.contains("status")),
+        "heading path leaked frontmatter: {:?}",
+        hit.heading_path
+    );
+
+    // Line numbers point at on-disk lines: without the offset they would be in
+    // 1..=3; with it the chunk brackets the token's real line (8).
+    assert!(
+        hit.line_start >= 6,
+        "fm offset not applied: line_start={} (expected >= 6)",
+        hit.line_start
+    );
+    assert!(
+        hit.line_start <= 8 && hit.line_end >= 8,
+        "chunk must bracket on-disk line 8 of `zphyxnort`: got [{}, {}]",
+        hit.line_start,
+        hit.line_end
+    );
+
+    // The plain page (no frontmatter) still grounds normally.
+    let qv2 = emb_for_query
+        .embed_batch(&["qwobblefrotz".to_string()], EmbedRole::Query)
+        .expect("embed query")[0];
+    let hits2 = hybrid_search(&store, "docs", "qwobblefrotz", &qv2, 5)
+        .await
+        .expect("hybrid_search plain");
+    assert!(
+        hits2.iter().any(|h| h.file_ref.ends_with("plain.md")),
+        "plain page must ground: {:?}",
+        hits2.iter().map(|h| h.file_ref.clone()).collect::<Vec<_>>()
+    );
+}

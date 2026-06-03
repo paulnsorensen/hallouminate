@@ -86,6 +86,7 @@ pub fn prepared_file_with_chunks(
         content_hash: content_hash.to_string(),
         summary: format!("summary of {file_ref}"),
         keywords: vec!["docs".into(), "test".into()],
+        frontmatter: None,
         indexed_at_ms: 1_700_000_000_000,
         chunks,
         embeddings: Some(embeddings),
