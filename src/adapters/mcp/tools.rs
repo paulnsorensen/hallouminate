@@ -76,10 +76,11 @@ ONE TOPIC PER FILE. A wiki entry is a slice of knowledge with a clear \
 scope. The chunker splits on headings — two unrelated topics in one file \
 make `ground` rank both sections together, which is rarely what you want.
 
-FIRST NON-BLANK LINE IS H1. Every file's first non-blank line must be \
-`# Topic Name`. The chunker uses the H1 as the breadcrumb root; without \
-it, search results lose navigability. The H1 is also what the auto-index \
-quotes as each entry's gloss.
+FIRST NON-BLANK LINE IS H1. Every file's first non-blank line — or, when \
+an optional frontmatter block is present, the first non-blank line after \
+its closing `---` fence — must be `# Topic Name`. The chunker uses the H1 \
+as the breadcrumb root; without it, search results lose navigability. The \
+H1 is also what the auto-index quotes as each entry's gloss.
 
 FILE STEM MATCHES THE SLUG. \"Corpus walker\" → `corpus-walker.md`. \
 Lowercase, kebab case. No spaces, no capitals, no extensions other than \
@@ -89,6 +90,15 @@ LEAD WITH THE CONCLUSION. Don't bury what the file is about under \
 preamble. Cite files and line ranges by path: \
 `src/domain/corpus/walker.rs:42`. Prefer concrete examples to abstract \
 description. ~50-150 lines per entry is the right band.
+
+OPTIONAL FRONTMATTER. A page MAY open with a YAML frontmatter block — a \
+`---` fence on line 1, key/value lines, then a closing `---`. Recognized \
+keys (all optional): `status` (draft|reviewed|trusted|deprecated, \
+case-insensitive), `owner`, `last_verified`, `confidence`, `sources`. \
+Unknown keys are ignored. The block is stripped before indexing, so it \
+never pollutes chunks, summaries, or `ground` hits, and citations still \
+point at the real on-disk lines. A malformed block is left in the body \
+and returns one advisory warning.
 
 # Tree layout & linking
 

@@ -50,6 +50,10 @@ pub struct PreparedFile {
     pub content_hash: String,
     pub summary: String,
     pub keywords: Vec<String>,
+    /// Canonical JSON of the page's parsed frontmatter, or `None` when the file
+    /// has no frontmatter block (or it was malformed). Denormalized onto every
+    /// chunk row, like `summary`/`keywords`.
+    pub frontmatter: Option<String>,
     pub indexed_at_ms: i64,
     pub chunks: Vec<PreparedChunk>,
     /// `Some(v)` (embeddings ON): one vector per chunk, length-checked
@@ -113,8 +117,12 @@ struct Meta {
     schema_version: u32,
 }
 
+/// The schema version this build reads and writes, bumped whenever the Arrow
+/// `chunks` schema changes shape (v2 added the `frontmatter` column). Also the
+/// serde default, but every LanceDB store ever written records this field, so a
+/// missing value can only come from a hand-edited sidecar.
 fn default_schema_version() -> u32 {
-    1
+    2
 }
 
 fn default_quantized() -> bool {
@@ -137,6 +145,19 @@ fn meta_check_or_init(
         let mut meta: Meta = toml::from_str(&text)
             .map_err(|e| HallouminateError::Config(format!("parse meta.toml: {e}")))?;
         let stored_model = canonical_model_name(&meta.embedding_model_name)?;
+        // Schema-version guard: an older store (v1, pre-frontmatter) carries a
+        // different Arrow `chunks` schema. Catch the mismatch here, before any
+        // query, and return the same "delete + reindex" remedy rather than
+        // letting LanceDB surface a raw Arrow schema-mismatch crash later.
+        if meta.schema_version != default_schema_version() {
+            return Err(HallouminateError::Config(format!(
+                "store schema version mismatch: store has schema_version {}, this build \
+                 expects {}; delete {} and re-run `hallouminate index` to rebuild",
+                meta.schema_version,
+                default_schema_version(),
+                meta_path.parent().unwrap_or(meta_path).display(),
+            )));
+        }
         if stored_model != requested_model
             || meta.quantized != quantized
             || meta.embeddings_enabled != enabled
@@ -165,7 +186,7 @@ fn meta_check_or_init(
         embedding_model_name: requested_model.to_string(),
         quantized,
         embeddings_enabled: enabled,
-        schema_version: 1,
+        schema_version: default_schema_version(),
     };
     write_meta(meta_path, &meta)?;
     Ok(())
@@ -199,6 +220,8 @@ pub fn chunks_schema() -> SchemaRef {
         Field::new("content_hash", DataType::Utf8, false),
         Field::new("summary", DataType::Utf8, false),
         list_utf8_field("keywords"),
+        // Nullable: null = no (or malformed) frontmatter block on the page.
+        Field::new("frontmatter", DataType::Utf8, true),
         Field::new("indexed_at_ms", DataType::Int64, false),
         Field::new("ord", DataType::Int64, false),
         list_utf8_field("heading_path"),
@@ -237,6 +260,7 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
     let mut hashes: Vec<String> = Vec::new();
     let mut summaries: Vec<String> = Vec::new();
     let mut keywords: Vec<Vec<String>> = Vec::new();
+    let mut frontmatters: Vec<Option<String>> = Vec::new();
     let mut indexed_at: Vec<i64> = Vec::new();
     let mut ords: Vec<i64> = Vec::new();
     let mut heading_paths: Vec<Vec<String>> = Vec::new();
@@ -268,6 +292,7 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
             hashes.push(file.content_hash.clone());
             summaries.push(file.summary.clone());
             keywords.push(file.keywords.clone());
+            frontmatters.push(file.frontmatter.clone());
             indexed_at.push(file.indexed_at_ms);
             ords.push(chunk.ord as i64);
             heading_paths.push(chunk.heading_path.clone());
@@ -313,6 +338,7 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
         Arc::new(StringArray::from(hashes)),
         Arc::new(StringArray::from(summaries)),
         Arc::new(build_list_utf8(&keywords)),
+        Arc::new(StringArray::from_iter(frontmatters)),
         Arc::new(Int64Array::from(indexed_at)),
         Arc::new(Int64Array::from(ords)),
         Arc::new(build_list_utf8(&heading_paths)),
@@ -1040,12 +1066,51 @@ mod tests {
             &meta_path,
             r#"# auto-managed by hallouminate; do not edit
 embedding_model_name = "BAAI/bge-small-en-v1.5"
-schema_version = 1
+schema_version = 2
 "#,
         )
         .unwrap();
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
             .expect("pre-feature sidecar must match ON + full-precision config");
+    }
+
+    #[test]
+    fn meta_check_or_init_errors_on_schema_version_mismatch() {
+        // A v1 store predates the frontmatter column. Opening it with this (v2)
+        // build must return the graceful delete+reindex remedy, not crash later
+        // on an Arrow schema mismatch.
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            r#"# auto-managed by hallouminate; do not edit
+embedding_model_name = "BAAI/bge-small-en-v1.5"
+quantized = false
+embeddings_enabled = true
+schema_version = 1
+"#,
+        )
+        .unwrap();
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
+            .expect_err("a v1 store must be rejected by the v2 binary");
+        let msg = err.to_string();
+        assert!(msg.contains("schema version"), "{msg}");
+        assert!(msg.contains("delete"), "{msg}");
+        assert!(msg.contains("hallouminate index"), "{msg}");
+    }
+
+    #[test]
+    fn meta_check_or_init_roundtrips_current_schema_version() {
+        // A store written by this build records the current version and
+        // re-opens cleanly without tripping the schema guard.
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
+        let text = std::fs::read_to_string(&meta_path).unwrap();
+        let meta: Meta = toml::from_str(&text).unwrap();
+        assert_eq!(meta.schema_version, default_schema_version());
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
+            .expect("current-version store must re-open");
     }
 
     #[test]
@@ -1098,6 +1163,7 @@ schema_version = 1
                 "content_hash",
                 "summary",
                 "keywords",
+                "frontmatter",
                 "indexed_at_ms",
                 "ord",
                 "heading_path",
@@ -1134,6 +1200,7 @@ schema_version = 1
             content_hash: "deadbeef".into(),
             summary: "summary".into(),
             keywords: vec!["k1".into(), "k2".into()],
+            frontmatter: None,
             indexed_at_ms: 11,
             chunks: Vec::new(),
             embeddings: None,
@@ -1169,7 +1236,7 @@ schema_version = 1
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
         assert_eq!(rb.num_rows(), 5);
-        assert_eq!(rb.num_columns(), 14);
+        assert_eq!(rb.num_columns(), 15);
     }
 
     #[test]
@@ -1193,6 +1260,31 @@ schema_version = 1
             assert_eq!(file_refs.value(i), "/tmp/dup.md");
             assert_eq!(summaries.value(i), "summary");
         }
+    }
+
+    #[test]
+    fn build_record_batch_denormalizes_frontmatter_with_null_for_absent() {
+        let mut with_fm = synthetic_prepared("/tmp/fm.md", 2);
+        with_fm.frontmatter = Some(r#"{"status":"draft"}"#.to_string());
+        let without_fm = synthetic_prepared("/tmp/plain.md", 1); // frontmatter: None
+        let schema = chunks_schema();
+        let rb = build_record_batch(&[with_fm, without_fm], schema).expect("build batch");
+        let fm = rb
+            .column_by_name("frontmatter")
+            .expect("frontmatter column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("frontmatter is utf8");
+        // First two rows (fm.md chunks) carry the JSON; the third (plain.md) is null.
+        assert!(!fm.is_null(0));
+        assert_eq!(fm.value(0), r#"{"status":"draft"}"#);
+        assert!(!fm.is_null(1));
+        assert_eq!(fm.value(1), r#"{"status":"draft"}"#);
+        assert!(
+            fm.is_null(2),
+            "absent frontmatter must be a null column value"
+        );
+        assert_eq!(fm.null_count(), 1);
     }
 
     #[test]

@@ -52,9 +52,39 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Cache Hugging Face tokenizer downloads
+        # DaemonState::open hard-loads the HF tokenizer (chunking needs it
+        # regardless of embedding mode), so non-ignored tests fetch it from
+        # huggingface.co on a cold cache. Persist the hub cache across runs so
+        # the tokenizer is downloaded at most once per key.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cache/huggingface
+          key: hf-hub-${{ runner.os }}-arctic-embed-s
       - name: Build
         run: cargo build --locked --all-targets
+      - name: Warm tokenizer cache
+        # Fetch the tokenizer once, serially, with backoff. Without this the
+        # parallel test threads each call huggingface.co at startup and trip
+        # its rate limiter (HTTP 429) — the failure that reddened the ubuntu leg.
+        run: |
+          set -euo pipefail
+          printf '[embeddings]\nenabled = false\n' > "${RUNNER_TEMP}/hf-warm.toml"
+          for attempt in 1 2 3 4 5; do
+            if cargo run --locked --quiet -- config download --config "${RUNNER_TEMP}/hf-warm.toml"; then
+              exit 0
+            fi
+            echo "tokenizer warm attempt ${attempt} failed; retrying after backoff"
+            sleep $(( attempt * 20 ))
+          done
+          echo "::error::could not warm the tokenizer cache after 5 attempts"
+          exit 1
       - name: Test
+        # Offline so the warmed cache is served locally and the parallel test
+        # burst makes zero network calls. Safe: every model-downloading test is
+        # #[ignore]-gated and is not run here.
+        env:
+          HF_HUB_OFFLINE: "1"
         run: cargo test --locked
 
   # Aggregation gate: the branch ruleset requires a single status check named

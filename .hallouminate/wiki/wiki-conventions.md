@@ -15,7 +15,9 @@ sections together and that's almost never what you want.
 
 ## First non-blank line is the H1
 
-The first non-blank line of every wiki entry must be `# Topic Name`.
+The first non-blank line of every wiki entry — or, when an optional
+frontmatter block is present, the first non-blank line after its closing
+`---` fence — must be `# Topic Name`.
 The chunker uses the H1 as the breadcrumb root for every chunk in the
 file. Skip the H1 and breadcrumbs degrade to just sub-headings, which
 makes `ground` results less navigable. The auto-index also reads each
@@ -28,6 +30,34 @@ Topic "Corpus walker" → file `corpus-walker.md`. Lowercase, kebab
 case. No spaces, no capitals, no extensions other than `.md`. The file
 stem is what other wiki pages link to and what shows up in `ground`
 outline paths.
+
+## Optional frontmatter (lifecycle + provenance)
+
+A page **may** open with a YAML frontmatter block: a leading `---`
+fence on line 1, key/value lines, then a closing `---` fence. It
+carries lifecycle and provenance metadata and is entirely optional —
+most pages have none, and every field inside is optional too.
+
+```text
+---
+status: reviewed        # draft | reviewed | trusted | deprecated
+owner: cheese-team
+last_verified: 2026-01-02
+confidence: high
+sources:
+  - https://example.com/source
+---
+# Topic Name
+```
+
+The four lifecycle states are `draft`, `reviewed`, `trusted`, and
+`deprecated`, parsed case-insensitively. The block is **stripped
+before indexing**, so it never pollutes chunk text, summaries, or
+`ground` results, and citation line numbers still point at the real
+on-disk lines below it. Unknown keys are ignored (the file on disk
+stays the source of truth). A malformed block — broken YAML between
+the fences — is left in the body verbatim and `add_markdown` returns a
+single advisory warning so you can fix or remove it.
 
 ## Idempotent writes
 

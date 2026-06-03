@@ -440,7 +440,8 @@ async fn handle_add_markdown(
     // Advisory-only lint of the verbatim content. Never blocks or rewrites the
     // write — the messages ride back in the response so the author can fix in
     // a follow-up instead of discovering breakage on a later read.
-    let warnings = crate::domain::corpus::lint_markdown(&req.content);
+    let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
+    warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
 
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
