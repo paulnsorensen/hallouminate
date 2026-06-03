@@ -15,7 +15,9 @@ sections together and that's almost never what you want.
 
 ## First non-blank line is the H1
 
-The first non-blank line of every wiki entry must be `# Topic Name`.
+The first non-blank line of every wiki entry — or, when an optional
+frontmatter block is present, the first non-blank line after its closing
+`---` fence — must be `# Topic Name`.
 The chunker uses the H1 as the breadcrumb root for every chunk in the
 file. Skip the H1 and breadcrumbs degrade to just sub-headings, which
 makes `ground` results less navigable. The auto-index also reads each

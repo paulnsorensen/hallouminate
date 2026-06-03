@@ -76,10 +76,11 @@ ONE TOPIC PER FILE. A wiki entry is a slice of knowledge with a clear \
 scope. The chunker splits on headings — two unrelated topics in one file \
 make `ground` rank both sections together, which is rarely what you want.
 
-FIRST NON-BLANK LINE IS H1. Every file's first non-blank line must be \
-`# Topic Name`. The chunker uses the H1 as the breadcrumb root; without \
-it, search results lose navigability. The H1 is also what the auto-index \
-quotes as each entry's gloss.
+FIRST NON-BLANK LINE IS H1. Every file's first non-blank line — or, when \
+an optional frontmatter block is present, the first non-blank line after \
+its closing `---` fence — must be `# Topic Name`. The chunker uses the H1 \
+as the breadcrumb root; without it, search results lose navigability. The \
+H1 is also what the auto-index quotes as each entry's gloss.
 
 FILE STEM MATCHES THE SLUG. \"Corpus walker\" → `corpus-walker.md`. \
 Lowercase, kebab case. No spaces, no capitals, no extensions other than \
