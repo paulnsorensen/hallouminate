@@ -7,6 +7,7 @@
 pub mod common;
 pub mod corpus;
 pub mod embeddings;
+pub mod footnotes;
 pub mod ground;
 pub mod indexer;
 pub mod repository;

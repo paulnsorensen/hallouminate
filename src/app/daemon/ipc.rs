@@ -113,7 +113,7 @@ pub struct AddMarkdownRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadMarkdownRequest {
-    pub corpus: String,
+    pub corpus: Option<String>,
     pub path: String,
 }
 

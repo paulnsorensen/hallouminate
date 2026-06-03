@@ -27,6 +27,9 @@ use crate::app::daemon::{
     ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
+use crate::domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};
+use crate::domain::ground::{Format, RenderOpts, render};
+
 const SERVER_INSTRUCTIONS: &str = "\
 Hallouminate stores per-repository markdown wikis on disk and exposes them \
 for semantic search. Each `[[repository]]` entry derives a `repo:{name}:wiki` \
@@ -61,6 +64,7 @@ Tools:
 - `ground` — semantic search; returns ranked chunks with snippet, \
   heading_path, line_range, score.
 - `index` — bulk (re)index a corpus or all corpora.
+- `get_footnote` — resolve a single citation: footnote target for page#footnote_number.
 
 Filesystem is the source of truth; LanceDB rows are derived and refreshed \
 after `add_markdown` / `delete_markdown`. `index` is the only way to pick \
@@ -152,6 +156,24 @@ add_markdown { ..., overwrite: true }
 
 Multi-root corpora write all `add_markdown` / `delete_markdown` to the \
 FIRST configured root only — keep one root if you can.
+
+# Cite in footnote format
+
+For any non-obvious claim — a file path, a line reference, an external URL, \
+a version number, or a fact you derived from another document — include an \
+inline `[^N]` marker immediately after the claim and a matching definition \
+block at the end of the file:
+
+```
+The daemon opens one socket.[^1]
+
+[^1]: src/app/daemon/server.rs:42
+```
+
+Authoring agents SHOULD add footnotes for any claim that a future reader \
+could not easily verify without re-reading the cited source. Provenance that \
+travels with the page lets grounding agents call `get_footnote` to resolve a \
+citation without pulling the whole document.
 ";
 
 /// Build a `CallToolResult` with both a human-readable text content block
@@ -308,6 +330,11 @@ pub struct GroundParams {
     /// structured response. Orthogonal to format selection.
     #[serde(default)]
     pub snippet_chars: Option<usize>,
+    /// Controls footnote visibility in snippets. `include` (default) passes
+    /// footnotes through verbatim; `exclude` strips definition blocks and
+    /// inline `[^label]` markers; `only` returns just the definition lines.
+    #[serde(default)]
+    pub footnotes: FootnoteMode,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -373,6 +400,12 @@ pub struct ReadMarkdownParams {
     /// to false.
     #[serde(default)]
     pub line_numbers: bool,
+    /// Controls footnote visibility in the text block. `include` (default)
+    /// passes footnotes through verbatim; `exclude` strips definition blocks
+    /// and inline `[^label]` markers; `only` returns just the definition lines.
+    /// The structured `content` stays verbatim regardless of this setting.
+    #[serde(default)]
+    pub footnotes: FootnoteMode,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -397,6 +430,19 @@ pub struct GlobalizeMarkdownParams {
     /// Replace an existing destination entry. Defaults to false.
     #[serde(default)]
     pub overwrite: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetFootnoteParams {
+    /// Corpus that owns the page. Defaults to the wiki for the repo
+    /// containing the client's MCP workspace root, same as `ground`.
+    #[serde(default)]
+    pub corpus: Option<String>,
+    /// Relative path of the wiki page within the corpus.
+    pub page: String,
+    /// The footnote label (the text after `^`). For `[^1]` use `"1"`;
+    /// for `[^note]` use `"note"`.
+    pub footnote_number: String,
 }
 
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
@@ -456,7 +502,15 @@ impl HallouminateTools {
                 snippet_chars: params.snippet_chars,
             }),
         };
-        let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
+        let mut result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
+        if params.footnotes != FootnoteMode::Include {
+            for doc in result.response.docs.values_mut() {
+                for chunk in &mut doc.chunks {
+                    chunk.snippet = apply_footnote_mode(&chunk.snippet, params.footnotes);
+                }
+            }
+            result.outline = render(&result.response, Format::Outline, &RenderOpts::default());
+        }
         let structured = to_structured(&result.response)?;
         Ok(tool_ok(result.outline, structured))
     }
@@ -588,16 +642,17 @@ impl HallouminateTools {
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: params.corpus,
+                corpus: Some(params.corpus),
                 path: params.path,
             }),
         };
         let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured = to_structured(&response)?;
+        let body = apply_footnote_mode(&response.content, params.footnotes);
         let text = if params.line_numbers {
-            number_lines(&response.content)
+            number_lines(&body)
         } else {
-            response.content
+            body
         };
         Ok(tool_ok(text, structured))
     }
@@ -677,6 +732,39 @@ impl HallouminateTools {
             .join("\n");
         let structured = serde_json::json!({ "corpora": &entries });
         Ok(tool_ok(names, structured))
+    }
+
+    #[tool(
+        description = "Resolve a single citation: return the footnote target (source text / link) \
+                      for page#footnote_number without pulling the whole document."
+    )]
+    pub async fn get_footnote(
+        &self,
+        Parameters(params): Parameters<GetFootnoteParams>,
+        peer: Peer<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (client, cwd) = self.tool_setup(&peer).await?;
+        let req = DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: params.corpus,
+                path: params.page.clone(),
+            }),
+        };
+        let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
+        let target =
+            get_footnote_target(&response.content, &params.footnote_number).ok_or_else(|| {
+                invalid_params(format!(
+                    "footnote [^{}] not found in {}",
+                    params.footnote_number, params.page
+                ))
+            })?;
+        let structured = serde_json::json!({
+            "page": params.page,
+            "footnote_number": params.footnote_number,
+            "target": target,
+        });
+        Ok(tool_ok(target, structured))
     }
 }
 

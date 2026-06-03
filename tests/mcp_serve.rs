@@ -1326,3 +1326,595 @@ async fn mcp_read_markdown_rejects_intermediate_symlinked_directory() {
 
     mcp.shutdown().await;
 }
+
+// ── footnote-mode tests ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn mcp_tools_list_includes_get_footnote() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    write_minimal_config(xdg.path());
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let list = mcp.rpc(2, "tools/list", json!({})).await;
+    assert!(list.get("error").is_none(), "tools/list errored: {list}");
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .collect();
+    assert!(
+        names.contains(&"get_footnote"),
+        "`get_footnote` missing from tool list: {names:?}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_read_markdown_footnotes_only_returns_definition_block() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let body = "# Article\n\nClaim[^1] is well supported.\n\n[^1]: Author 2024, src/foo.rs:42\n";
+    std::fs::write(corpus.path().join("article.md"), body).expect("seed");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // footnotes: "only" — text block should contain only the definition line(s).
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {
+                    "corpus": "wiki",
+                    "path": "article.md",
+                    "footnotes": "only"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "read_markdown errored: {call}");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text present");
+    assert!(
+        text.contains("[^1]:"),
+        "footnote definition missing from 'only' result: {text:?}"
+    );
+    assert!(
+        !text.contains("# Article"),
+        "body should not appear in 'only' result: {text:?}"
+    );
+    // structured content stays verbatim
+    let structured_content = call["result"]["structuredContent"]["content"]
+        .as_str()
+        .expect("structured content present");
+    assert_eq!(
+        structured_content, body,
+        "structured content must stay verbatim regardless of footnotes mode"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_read_markdown_footnotes_exclude_strips_markers_and_defs() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let body = "# Article\n\nClaim[^1] is true.\n\n[^1]: Source URL.\n";
+    std::fs::write(corpus.path().join("article.md"), body).expect("seed");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {
+                    "corpus": "wiki",
+                    "path": "article.md",
+                    "footnotes": "exclude"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "read_markdown errored: {call}");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text present");
+    assert!(
+        !text.contains("[^"),
+        "no footnote markers/defs should appear in 'exclude' result: {text:?}"
+    );
+    assert!(
+        text.contains("Claim is true."),
+        "body text should survive 'exclude': {text:?}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_read_markdown_footnotes_include_omitted_is_verbatim() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let body = "# Article\n\nClaim[^1].\n\n[^1]: Evidence.\n";
+    std::fs::write(corpus.path().join("article.md"), body).expect("seed");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // No `footnotes` param — default is "include" = verbatim.
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"corpus": "wiki", "path": "article.md"}
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "read_markdown errored: {call}");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text present");
+    assert_eq!(
+        text, body,
+        "omitted footnotes param must pass content verbatim"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_get_footnote_resolves_label_to_target_text() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let body = "# Notes\n\nFact[^1] established.\n\n[^1]: src/lib.rs:10\n";
+    std::fs::write(corpus.path().join("notes.md"), body).expect("seed");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "get_footnote",
+                "arguments": {
+                    "corpus": "wiki",
+                    "page": "notes.md",
+                    "footnote_number": "1"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "get_footnote errored: {call}");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content present");
+    assert_eq!(text, "src/lib.rs:10", "target text mismatch: {text:?}");
+    let structured = &call["result"]["structuredContent"];
+    assert_eq!(
+        structured["footnote_number"].as_str(),
+        Some("1"),
+        "structured.footnote_number: {structured}"
+    );
+    assert_eq!(
+        structured["target"].as_str(),
+        Some("src/lib.rs:10"),
+        "structured.target: {structured}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_get_footnote_missing_label_returns_tool_error() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let body = "# Notes\n\n[^1]: Present.\n";
+    std::fs::write(corpus.path().join("notes.md"), body).expect("seed");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // footnote_number "99" does not exist in the page
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "get_footnote",
+                "arguments": {
+                    "corpus": "wiki",
+                    "page": "notes.md",
+                    "footnote_number": "99"
+                }
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("missing footnote must error, got: {call}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "missing label should be invalid_params: {error}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_get_footnote_missing_page_returns_tool_error() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "get_footnote",
+                "arguments": {
+                    "corpus": "wiki",
+                    "page": "does-not-exist.md",
+                    "footnote_number": "1"
+                }
+            }),
+        )
+        .await;
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("missing page must error, got: {call}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "missing page should be invalid_params: {error}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_get_footnote_honors_default_corpus_when_omitted() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let body = "# Page\n\n[^1]: Default corpus target.\n";
+    std::fs::write(corpus.path().join("page.md"), body).expect("seed");
+    // Single corpus configured — no explicit corpus needed.
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // corpus omitted — should default to the single configured corpus
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "get_footnote",
+                "arguments": {
+                    "page": "page.md",
+                    "footnote_number": "1"
+                }
+            }),
+        )
+        .await;
+    assert!(
+        call.get("error").is_none(),
+        "default corpus resolution failed: {call}"
+    );
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert_eq!(
+        text, "Default corpus target.",
+        "target resolved via default corpus: {text:?}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_get_footnote_honors_repository_cwd_default_corpus() {
+    // Verify that get_footnote uses the full pick_corpus_or_default path:
+    // when corpus is omitted and the MCP client's cwd sits inside a
+    // [[repository]], the request should default to repo:<name>:wiki
+    // (not error or fall through to single-corpus-or-error).
+    let xdg = tempfile::tempdir().expect("xdg tempdir");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+
+    // Set up the repo-layer config: [[repository]] pointing at itself.
+    let hallou_dir = repo.path().join(".hallouminate");
+    let wiki_dir = hallou_dir.join("wiki");
+    std::fs::create_dir_all(&wiki_dir).expect("mkdir wiki");
+    std::fs::write(
+        hallou_dir.join("config.toml"),
+        format!(
+            r#"
+[[repository]]
+name = "repowiki"
+path = "{}"
+"#,
+            repo.path().display()
+        ),
+    )
+    .expect("write repo config");
+    let body = "# Findings\n\nClaim[^src]\n\n[^src]: repo/path/file.rs:42\n";
+    std::fs::write(wiki_dir.join("findings.md"), body).expect("seed page");
+
+    // Baseline daemon config: just needs a ground dir; corpora are derived
+    // from the repository config the daemon discovers via req.cwd.
+    let mut baseline = hallouminate::app::config::Config::default();
+    baseline.storage.ground_dir = xdg.path().join("ground").to_string_lossy().into_owned();
+    let harness = DaemonHarness::spawn(baseline).await;
+
+    // MCP process cwd = repo root so cwd_for_tool returns the repo path,
+    // which causes pick_corpus_or_default to match [[repository]] "repowiki".
+    let mut mcp = Mcp::spawn_with_cwd(xdg.path(), repo.path(), Some(harness.socket()), false).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // corpus omitted — must resolve to repo:repowiki:wiki via cwd matching
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "get_footnote",
+                "arguments": {
+                    "page": "findings.md",
+                    "footnote_number": "src"
+                }
+            }),
+        )
+        .await;
+    assert!(
+        call.get("error").is_none(),
+        "repository-cwd default corpus resolution failed: {call}"
+    );
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    assert_eq!(
+        text, "repo/path/file.rs:42",
+        "footnote target via repository-cwd default: {text:?}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the real embedder and may download a model on first run"]
+async fn mcp_ground_footnotes_exclude_strips_markers() {
+    // Verifies that `ground` with `footnotes:"exclude"` returns snippets and an
+    // outline with no `[^...]` markers, while the default (omitted) case
+    // returns them intact. Requires the real embedder (model download).
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let ground = tempfile::tempdir().expect("ground tempdir");
+
+    // Seed a markdown file with a footnote reference and definition.
+    let body = "# Evidence\n\nThe sky is blue.[^src]\n\n[^src]: physics/optics.rs:42\n";
+    std::fs::write(corpus.path().join("evidence.md"), body).expect("seed");
+
+    let cfg = write_config_with_corpus_and_ground(
+        xdg.path(),
+        "wiki",
+        &corpus.path().to_string_lossy(),
+        ground.path(),
+    );
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // Index first so ground has something to search.
+    let idx = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({"name": "index", "arguments": {"corpus": "wiki"}}),
+        )
+        .await;
+    assert!(idx.get("error").is_none(), "index errored: {idx}");
+
+    // Case 1: footnotes:"exclude" — no [^...] in snippets or outline.
+    let call = mcp
+        .rpc(
+            3,
+            "tools/call",
+            json!({
+                "name": "ground",
+                "arguments": {
+                    "query": "sky is blue",
+                    "corpus": "wiki",
+                    "footnotes": "exclude"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "ground errored: {call}");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("ground text content");
+    assert!(
+        !text.contains("[^"),
+        "footnote markers must be absent from exclude outline: {text:?}"
+    );
+    let docs = &call["result"]["structuredContent"]["docs"];
+    if let Some(obj) = docs.as_object() {
+        for (_path, doc) in obj {
+            if let Some(chunks) = doc["chunks"].as_array() {
+                for chunk in chunks {
+                    let snippet = chunk["snippet"].as_str().unwrap_or("");
+                    assert!(
+                        !snippet.contains("[^"),
+                        "footnote marker must be absent from exclude snippet: {snippet:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    // Case 2: footnotes omitted (default = include) — markers present.
+    let call = mcp
+        .rpc(
+            4,
+            "tools/call",
+            json!({
+                "name": "ground",
+                "arguments": {
+                    "query": "sky is blue",
+                    "corpus": "wiki"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "ground errored: {call}");
+    let docs = &call["result"]["structuredContent"]["docs"];
+    let found_marker = docs.as_object().is_some_and(|obj| {
+        obj.values().any(|doc| {
+            doc["chunks"].as_array().is_some_and(|chunks| {
+                chunks
+                    .iter()
+                    .any(|c| c["snippet"].as_str().unwrap_or("").contains("[^"))
+            })
+        })
+    });
+    assert!(
+        found_marker,
+        "footnote marker must appear in default (include) ground result: {docs}"
+    );
+
+    mcp.shutdown().await;
+}

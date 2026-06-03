@@ -90,7 +90,9 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, &req_cwd, req),
         DaemonRequestPayload::ListTree(req) => handle_list_tree(&effective, &req_cwd, req),
         DaemonRequestPayload::AddMarkdown(req) => handle_add_markdown(state, &effective, req).await,
-        DaemonRequestPayload::ReadMarkdown(req) => handle_read_markdown(&effective, req).await,
+        DaemonRequestPayload::ReadMarkdown(req) => {
+            handle_read_markdown(&effective, &req_cwd, req).await
+        }
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
         }
@@ -574,7 +576,11 @@ async fn handle_add_markdown(
     })
 }
 
-async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonResponse {
+async fn handle_read_markdown(
+    cfg: &Config,
+    cwd: &Path,
+    req: ReadMarkdownRequest,
+) -> DaemonResponse {
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -587,7 +593,11 @@ async fn handle_read_markdown(cfg: &Config, req: ReadMarkdownRequest) -> DaemonR
     // `read_no_follow` opens the leaf `O_RDONLY | O_NOFOLLOW`. Running all of
     // it on a blocking task keeps a slow or remote corpus root from stalling a
     // Tokio worker and delaying unrelated daemon requests.
-    let corpus_name = req.corpus;
+    let corpus_name =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => c.name,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
     let req_path = req.path;
     let resolved = tokio::task::spawn_blocking(move || {
         let (corpus, root, relative) = validate_wiki_read_path(&corpora, &corpus_name, &req_path)?;
