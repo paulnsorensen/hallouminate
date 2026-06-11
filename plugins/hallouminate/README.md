@@ -55,6 +55,15 @@ The `install` skill walks you from zero to a working wiki:
 8. **Index & verify** — indexes and proves it with a `ground` query.
 9. **Commit** — branches and commits the scaffolding with git.
 
+## Templates
+
+`templates/wiki-entry.md` is the formal shape of a wiki entry — optional
+lifecycle frontmatter, H1-first, footnote citations, provenance footer.
+`templates/roadmap/` holds the roadmap `index.md` + goal-file pair in exactly
+the format [milknado](https://github.com/paulnsorensen/milknado) imports:
+author with `/wiki-roadmap`, then `milknado roadmap import <slug>` seeds the
+roadmap into an executable graph with no rework.
+
 ## Layout
 
 ```text
@@ -66,6 +75,9 @@ plugins/hallouminate/
 ├── skills/wiki-init/SKILL.md      # Socratic wiki bootstrap
 ├── skills/wiki-ingest/SKILL.md    # fold source docs into the wiki
 ├── skills/wiki-query/SKILL.md     # answer questions from the wiki
+├── skills/wiki-roadmap/SKILL.md   # author milknado-importable roadmaps
+├── templates/wiki-entry.md        # formal wiki-entry shape
+├── templates/roadmap/             # roadmap index.md + goal templates (milknado import format)
 └── README.md
 ```
 

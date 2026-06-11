@@ -174,4 +174,17 @@ mod tests {
             "name must round-trip through TOML escaping"
         );
     }
+
+    #[test]
+    fn seeds_a_target_directory_that_does_not_exist_yet() {
+        // `--path` may name a directory that isn't created yet; init-repo
+        // creates it (git-init-style convenience) rather than erroring.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("brand/new/repo");
+        init("demo", &target, false).expect("init-repo into missing dir");
+        let (effective, _) =
+            resolve_for_cwd(&Config::default(), &target, None).expect("resolve seeded repo");
+        assert_eq!(effective.repositories[0].name, "demo");
+        assert!(target.join(".hallouminate/wiki/index.md").is_file());
+    }
 }
