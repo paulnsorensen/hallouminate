@@ -21,10 +21,9 @@ use std::time::Duration;
 use crate::app::config::discover_repo_config;
 use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
-    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
-    GlobalizeMarkdownRequest, GlobalizeMarkdownResult, GroundRequest, GroundResult, IndexRequest,
-    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
-    ReadMarkdownRequest, ReadMarkdownResult, client_for,
+    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
+    GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
+    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 use crate::domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};
@@ -292,7 +291,9 @@ async fn cwd_for_tool(fallback: &Path, peer: &Peer<RoleServer>) -> PathBuf {
 }
 
 fn has_repo_config_ancestor(path: &Path) -> bool {
-    discover_repo_config(path).is_ok()
+    // `Ok(None)` means the walk reached the filesystem root with no `.git`
+    // boundary — no repo config — so only `Ok(Some(_))` counts as a hit.
+    matches!(discover_repo_config(path), Ok(Some(_)))
 }
 
 fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
@@ -426,20 +427,6 @@ pub struct DeleteMarkdownParams {
     /// `add_markdown`. Requires a single-root corpus — multi-root corpora are
     /// read- and search-only. Symlinks are rejected. Irreversible.
     pub path: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GlobalizeMarkdownParams {
-    /// Corpus the entry currently lives in.
-    pub source_corpus: String,
-    /// Relative path of the entry within `source_corpus`.
-    pub path: String,
-    /// Destination path within the global corpus. Defaults to `path`.
-    #[serde(default)]
-    pub dest_path: Option<String>,
-    /// Replace an existing destination entry. Defaults to false.
-    #[serde(default)]
-    pub overwrite: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -686,36 +673,6 @@ impl HallouminateTools {
         };
         let response: DeleteMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let text = format!("deleted {} from corpus {}", response.path, response.corpus);
-        let structured = to_structured(&response)?;
-        Ok(tool_ok(text, structured))
-    }
-
-    #[tool(
-        description = "Copy a single markdown entry from `source_corpus` into the corpus marked `global = true` in config, making it searchable everywhere. The source stays in place (copy, not move). Both `source_corpus` and the global corpus must be single-root — globalize is a mutation, so multi-root corpora are rejected. `dest_path` defaults to the source path; `overwrite=false` (default) errors if the destination already exists. The global corpus row is reindexed synchronously. Errors if no global corpus is configured or if `source_corpus` is itself the global corpus. `structuredContent` is { source_corpus, source_path, global_corpus, dest_path, absolute_path, indexed }."
-    )]
-    pub async fn globalize_markdown(
-        &self,
-        Parameters(params): Parameters<GlobalizeMarkdownParams>,
-        peer: Peer<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
-                source_corpus: params.source_corpus,
-                path: params.path,
-                dest_path: params.dest_path,
-                overwrite: params.overwrite,
-            }),
-        };
-        let response: GlobalizeMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let text = format!(
-            "globalized {} from {} into {} as {}",
-            response.source_path,
-            response.source_corpus,
-            response.global_corpus,
-            response.dest_path,
-        );
         let structured = to_structured(&response)?;
         Ok(tool_ok(text, structured))
     }

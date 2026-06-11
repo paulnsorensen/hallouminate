@@ -48,9 +48,10 @@ pub enum Command {
         action: ConfigAction,
     },
     /// Boot the MCP server on stdio. Exposes `ground`, `index`,
-    /// `list_corpora`, `list_files`, `add_markdown`, `read_markdown`, and
-    /// `delete_markdown` tools to MCP-aware clients (Claude Desktop, Claude
-    /// Code, etc.). The process runs until stdin closes.
+    /// `list_corpora`, `list_files`, `list_tree`, `add_markdown`,
+    /// `read_markdown`, `delete_markdown`, and `get_footnote` tools to
+    /// MCP-aware clients (Claude Desktop, Claude Code, etc.). The process
+    /// runs until stdin closes.
     Serve,
     /// Manage the local daemon: single owner of the LanceDB ground directory,
     /// repository registry, and per-corpus mutation locks. CLI and MCP

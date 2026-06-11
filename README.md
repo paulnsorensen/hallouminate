@@ -35,6 +35,40 @@ LanceDB races.
 
 > 📖 **Full documentation:** <https://cheeselord.dev/hallouminate/>
 
+## Install
+
+### Prebuilt binary (recommended)
+
+No Rust toolchain, no `protoc`, no compile — downloads a prebuilt binary and
+adds it to your PATH:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.sh | sh
+```
+
+Prebuilts cover **macOS (Apple Silicon)** and **Linux x86-64 / arm64**
+(glibc ≥ 2.39). Re-run the one-liner any time to upgrade. On Intel Mac, Windows,
+or an older glibc, build with cargo instead.
+
+### From crates.io
+
+Builds from source — needs a Rust toolchain and `protoc` (the `lancedb` build
+dependency: `brew install protobuf` / `apt install protobuf-compiler`):
+
+```sh
+cargo install hallouminate --locked
+```
+
+### From source
+
+```sh
+git clone https://github.com/paulnsorensen/hallouminate.git
+cd hallouminate
+cargo build --release   # binary at target/release/hallouminate
+```
+
+Verify any install with `hallouminate --version`.
+
 ## Usage
 
 `hallouminate serve` starts the stdio MCP server (auto-spawning the daemon if
@@ -53,14 +87,6 @@ cargo run -- ground "how does the daemon work"   # CLI semantic search
 cargo run -- config show                 # print the effective merged config
 ```
 
-## Build
-
-```sh
-cargo build --release
-```
-
-The binary lands in `target/release/hallouminate`.
-
 ## MCP
 
 `hallouminate serve` starts a stdio MCP server. Tools:
@@ -77,8 +103,8 @@ The binary lands in `target/release/hallouminate`.
   blocks, heading-level jumps) without blocking or rewriting the content.
 - `read_markdown` — verbatim UTF-8 file contents. Use before overwriting.
 - `delete_markdown` — unlink the file and prune its rows from the index.
-- `globalize_markdown` — copy an entry into the global corpus to share it
-  across repos.
+- `get_footnote` — resolve a single citation: the footnote target for a
+  page's `#footnote_number`.
 
 Markdown content is stored verbatim — hallouminate imposes no schema.
 Convention for LLM wiki authors: one topic per file, first line `# Title`,
