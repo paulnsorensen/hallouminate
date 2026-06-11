@@ -1960,7 +1960,11 @@ async fn index_skips_missing_corpus_root_and_indexes_the_rest() {
 
     // A warning names the skipped corpus and its missing root, so the user
     // can see why it didn't index instead of getting silent partial output.
-    assert_eq!(report.warnings.len(), 1, "exactly one skip warning expected");
+    assert_eq!(
+        report.warnings.len(),
+        1,
+        "exactly one skip warning expected"
+    );
     let w = &report.warnings[0];
     assert!(
         w.contains("ghost") && w.contains("skipped"),
