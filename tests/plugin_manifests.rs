@@ -127,23 +127,50 @@ fn assert_is_plugin_dir(resolved: &Path) {
 
 #[test]
 fn release_workflow_tag_trigger_stays_anchored_at_v() {
-    // The spec's double-publish risk: a `skills-v*` or greedy `**` tag trigger
-    // would re-fire release-skills.yml on the very `skills-v` tag it creates.
+    // The double-publish risk: a `skills-v*` or greedy `**` tag trigger would
+    // re-fire release-skills.yml on the `skills-v` tag this workflow itself
+    // creates, publishing a second release. Only the `v[0-9]+` pattern is safe.
     let path = repo_root().join(".github/workflows/release-skills.yml");
-    let workflow =
+    let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert!(
-        workflow.contains(r#"- "v[0-9]+.[0-9]+.[0-9]+*""#),
-        "release-skills.yml must keep the v-anchored crate-tag trigger"
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+
+    // serde_yaml 0.9 parses bare `on` as Value::String("on") (YAML 1.2 semantics —
+    // only true/false are booleans, not on/off/yes/no).
+    let tags = workflow
+        .get("on")
+        .and_then(|o| o.get("push"))
+        .and_then(|p| p.get("tags"))
+        .and_then(|t| t.as_sequence())
+        .expect("release-skills.yml: on.push.tags must be a sequence");
+
+    // Exactly the anchored crate-tag pattern must be present.
+    let tag_strs: Vec<&str> = tags
+        .iter()
+        .map(|v| v.as_str().expect("tag pattern must be a string"))
+        .collect();
+    assert_eq!(
+        tag_strs,
+        ["v[0-9]+.[0-9]+.[0-9]+*"],
+        "release-skills.yml on.push.tags must equal exactly [\"v[0-9]+.[0-9]+.[0-9]+*\"]"
     );
-    assert!(
-        !workflow.contains(r#"- "skills-v"#),
-        "release-skills.yml must not trigger on skills-v tags"
-    );
-    assert!(
-        !workflow.contains(r#"- "**"#),
-        "release-skills.yml tag trigger must stay anchored (no greedy ** glob)"
-    );
+
+    // Every entry must start with `v` (anchored). No `skills-v` or `**` globs.
+    for pattern in &tag_strs {
+        assert!(
+            pattern.starts_with('v'),
+            "tag pattern {pattern:?} must start with 'v' to stay anchored"
+        );
+        assert!(
+            !pattern.starts_with("skills-v"),
+            "tag pattern {pattern:?} must not start with 'skills-v' (re-trigger risk)"
+        );
+        assert!(
+            !pattern.starts_with("**"),
+            "tag pattern {pattern:?} must not be a greedy ** glob"
+        );
+    }
 }
 
 #[test]
@@ -355,5 +382,56 @@ fn roadmap_index_template_carries_the_daemon_index_markers() {
     assert!(
         text.contains(INDEX_START_MARKER) && text.contains(INDEX_END_MARKER),
         "roadmap index template must carry the daemon's exact marker pair"
+    );
+}
+
+#[test]
+fn release_workflow_guards_against_double_publish() {
+    // Two safety invariants in release-skills.yml prevent a second `gh release
+    // create` from running on a tag whose release already exists, and prevent a
+    // version/tag mismatch from silently shipping the wrong pack.
+    let path = repo_root().join(".github/workflows/release-skills.yml");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let workflow: serde_yaml::Value =
+        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+
+    let steps = workflow
+        .get("jobs")
+        .and_then(|j| j.get("release-skills"))
+        .and_then(|j| j.get("steps"))
+        .and_then(|s| s.as_sequence())
+        .expect("release-skills.yml: jobs.release-skills.steps must be a sequence");
+
+    let release_run = steps
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Create GitHub Release"))
+        .and_then(|s| s.get("run"))
+        .and_then(|r| r.as_str())
+        .expect("release-skills.yml: 'Create GitHub Release' step must have a run field");
+
+    // The existing-release branch: check before creating, refresh assets with
+    // --clobber instead of double-publishing.
+    assert!(
+        release_run.contains("gh release view"),
+        "'Create GitHub Release' must check for an existing release with `gh release view`"
+    );
+    assert!(
+        release_run.contains("--clobber"),
+        "'Create GitHub Release' must refresh existing assets with --clobber (not double-publish)"
+    );
+
+    // The version/tag mismatch guard lives in the 'Read pack version' step.
+    let ver_run = steps
+        .iter()
+        .find(|s| s.get("name").and_then(|n| n.as_str()) == Some("Read pack version"))
+        .and_then(|s| s.get("run"))
+        .and_then(|r| r.as_str())
+        .expect("release-skills.yml: 'Read pack version' step must have a run field");
+
+    // The comparison that aborts when the pushed tag doesn't match plugin.json.
+    assert!(
+        ver_run.contains("\"$GITHUB_REF_NAME\" != \"v$v\""),
+        "'Read pack version' must guard against tag/plugin-version mismatch via GITHUB_REF_NAME != v$v"
     );
 }
