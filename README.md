@@ -103,8 +103,8 @@ cargo run -- config show                 # print the effective merged config
   blocks, heading-level jumps) without blocking or rewriting the content.
 - `read_markdown` — verbatim UTF-8 file contents. Use before overwriting.
 - `delete_markdown` — unlink the file and prune its rows from the index.
-- `globalize_markdown` — copy an entry into the global corpus to share it
-  across repos.
+- `get_footnote` — resolve a single citation: the footnote target for a
+  page's `#footnote_number`.
 
 Markdown content is stored verbatim — hallouminate imposes no schema.
 Convention for LLM wiki authors: one topic per file, first line `# Title`,

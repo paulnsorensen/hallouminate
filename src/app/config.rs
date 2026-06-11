@@ -600,10 +600,9 @@ fn validate(cfg: &Config) -> Result<()> {
             )));
         }
     }
-    // At most one corpus may carry `global = true`. `globalize_markdown`
-    // resolves its destination by finding the single global corpus; two
-    // would make the target ambiguous, so reject the config outright rather
-    // than picking one nondeterministically at request time.
+    // At most one corpus may carry `global = true`. A single global corpus
+    // must be unambiguous; two would make the target nondeterministic, so
+    // reject the config outright rather than picking one at request time.
     let globals: Vec<&str> = cfg
         .corpora
         .iter()
@@ -651,9 +650,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_two_global_corpora() {
-        // Curd 4: globalize resolves its destination by finding the single
-        // corpus with `global = true`; two would be ambiguous, so config
-        // validation must reject the file outright.
+        // The single corpus with `global = true` must be unambiguous; two
+        // would be ambiguous, so config validation must reject the file
+        // outright.
         let err = parse(
             r#"
 [[corpus]]
