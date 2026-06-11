@@ -35,6 +35,40 @@ LanceDB races.
 
 > 📖 **Full documentation:** <https://cheeselord.dev/hallouminate/>
 
+## Install
+
+### Prebuilt binary (recommended)
+
+No Rust toolchain, no `protoc`, no compile — downloads a prebuilt binary and
+adds it to your PATH:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.sh | sh
+```
+
+Prebuilts cover **macOS (Apple Silicon)** and **Linux x86-64 / arm64**
+(glibc ≥ 2.39). Re-run the one-liner any time to upgrade. On Intel Mac, Windows,
+or an older glibc, build with cargo instead.
+
+### From crates.io
+
+Builds from source — needs a Rust toolchain and `protoc` (the `lancedb` build
+dependency: `brew install protobuf` / `apt install protobuf-compiler`):
+
+```sh
+cargo install hallouminate --locked
+```
+
+### From source
+
+```sh
+git clone https://github.com/paulnsorensen/hallouminate.git
+cd hallouminate
+cargo build --release   # binary at target/release/hallouminate
+```
+
+Verify any install with `hallouminate --version`.
+
 ## Usage
 
 `hallouminate serve` starts the stdio MCP server (auto-spawning the daemon if
@@ -52,14 +86,6 @@ cargo run -- index                       # bulk (re)index every configured corpu
 cargo run -- ground "how does the daemon work"   # CLI semantic search
 cargo run -- config show                 # print the effective merged config
 ```
-
-## Build
-
-```sh
-cargo build --release
-```
-
-The binary lands in `target/release/hallouminate`.
 
 ## MCP
 
