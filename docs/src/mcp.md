@@ -77,10 +77,6 @@ Bulk (re)build the LanceDB index for one or all corpora. Param: `corpus`
 (optional; omit to rebuild every configured corpus). Use this when files were
 touched outside hallouminate.
 
-### `globalize_markdown`
-
-Copy a wiki entry into the global corpus so it can be shared across repos.
-
 ## Conventions for LLM authors
 
 Markdown is stored verbatim — hallouminate imposes no schema. The convention

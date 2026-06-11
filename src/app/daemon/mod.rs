@@ -35,7 +35,7 @@ pub use client::{
 pub use ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
     DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
-    GlobalizeMarkdownRequest, GlobalizeMarkdownResult, GroundRequest, GroundResult, IndexRequest,
+    GroundRequest, GroundResult, IndexRequest,
     ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
     ReadMarkdownRequest, ReadMarkdownResult,
 };
