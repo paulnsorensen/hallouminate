@@ -83,7 +83,11 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
         )?;
     print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
-    if let Some(advisory) = unregistered_wiki_advisory(&layers.repo_path, &effective) {
+    if let Some(advisory) = layers
+        .repo_path
+        .as_deref()
+        .and_then(|p| unregistered_wiki_advisory(p, &effective))
+    {
         println!();
         println!("warning: {advisory}");
     }
@@ -145,7 +149,10 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     // Non-fatal advisory: an on-disk wiki that no corpus serves. Printed
     // alongside the fatal warnings but excluded from the exit-code count —
     // it's a hint, not an error (issue #32).
-    let advisory = unregistered_wiki_advisory(&layers.repo_path, &effective);
+    let advisory = layers
+        .repo_path
+        .as_deref()
+        .and_then(|p| unregistered_wiki_advisory(p, &effective));
     let warnings = collect_warnings(raw.as_deref(), &effective);
 
     if advisory.is_some() || !warnings.is_empty() {
@@ -220,7 +227,10 @@ fn print_layered_header(baseline: &BaselineSource, layers: &ResolvedLayers) {
     // public shape; the header above already named it under the
     // source-agnostic "baseline" label.
     let _ = &layers.xdg_path;
-    println!("repo: {} (loaded)", layers.repo_path.display());
+    match &layers.repo_path {
+        Some(p) => println!("repo: {} (loaded)", p.display()),
+        None => println!("repo: not found (baseline-only)"),
+    }
 }
 
 fn print_effective_summary(cfg: &Config) -> anyhow::Result<()> {

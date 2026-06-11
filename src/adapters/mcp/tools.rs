@@ -292,7 +292,9 @@ async fn cwd_for_tool(fallback: &Path, peer: &Peer<RoleServer>) -> PathBuf {
 }
 
 fn has_repo_config_ancestor(path: &Path) -> bool {
-    discover_repo_config(path).is_ok()
+    // `Ok(None)` means the walk reached the filesystem root with no `.git`
+    // boundary — no repo config — so only `Ok(Some(_))` counts as a hit.
+    matches!(discover_repo_config(path), Ok(Some(_)))
 }
 
 fn root_uri_to_path(uri: &str) -> Option<PathBuf> {

@@ -158,11 +158,13 @@ impl Config {
 /// `xdg_path` is `None` when the baseline came from `--config PATH`; otherwise
 /// it carries the XDG location actually consulted (even if the file was
 /// absent — `load_xdg` defaults silently on `NotFound`). `repo_path` is
-/// always populated because `resolve_for_cwd` errors when discovery fails.
+/// `None` when discovery reached the filesystem root with no `.git` boundary
+/// and `resolve_for_cwd` resolved baseline-only (issue #102); otherwise it
+/// carries the discovered repo config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedLayers {
     pub xdg_path: Option<PathBuf>,
-    pub repo_path: PathBuf,
+    pub repo_path: Option<PathBuf>,
 }
 
 /// Load the XDG baseline (or `--config PATH`).
@@ -197,16 +199,21 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
 
 /// Walk from `cwd` up looking for `.hallouminate/config.toml`.
 ///
-/// First-match-wins; never composes multiple repo configs. Stops at the first
-/// `.git` entry (file *or* directory — git worktrees use a file) and returns
-/// an error. Stops at the filesystem root and returns an error.
+/// First-match-wins; never composes multiple repo configs. Three outcomes:
+///   - found a config → `Ok(Some(path))`.
+///   - hit a `.git` entry (file *or* directory — git worktrees use a file)
+///     with no config in between → `Err`. Inside a repo, the daemon refuses
+///     to fall back to baseline-only; explicit repo config is required.
+///   - reached the filesystem root without ever hitting a `.git` boundary →
+///     `Ok(None)`. There is no repo context to be strict about, so callers
+///     degrade to baseline-only instead of failing (issue #102).
 ///
 /// Relative `cwd` is normalized to an absolute path against the process'
 /// `current_dir()` before walking, so `Path::parent()` walks reliably reach
 /// the real filesystem root (a relative path bottoms out at the empty
 /// component instead, producing a misleading "reached filesystem root"
 /// error).
-pub fn discover_repo_config(cwd: &Path) -> Result<PathBuf> {
+pub fn discover_repo_config(cwd: &Path) -> Result<Option<PathBuf>> {
     let absolute_cwd = if cwd.is_absolute() {
         cwd.to_path_buf()
     } else {
@@ -220,7 +227,7 @@ pub fn discover_repo_config(cwd: &Path) -> Result<PathBuf> {
         // symlink), which is the right call here — we want to continue
         // walking instead of erroring out partway up the tree.
         if candidate.is_file() {
-            return Ok(candidate);
+            return Ok(Some(candidate));
         }
         let git_marker = level.join(".git");
         // `exists` matches both `.git` directories (normal clone) and `.git`
@@ -235,11 +242,10 @@ pub fn discover_repo_config(cwd: &Path) -> Result<PathBuf> {
         }
         current = level.parent();
     }
-    Err(HallouminateError::Config(format!(
-        "no .hallouminate/config.toml found walking up from {} \
-         (reached filesystem root without hitting a .git boundary)",
-        cwd.display(),
-    )))
+    // Reached the filesystem root without a `.git` boundary: no repo context
+    // at all. Soft-fall-back to baseline-only rather than stranding the
+    // baseline-declared corpora (issue #102).
+    Ok(None)
 }
 
 /// Normalize a relative `cwd` to an absolute path by joining it against `base`
@@ -433,14 +439,28 @@ pub fn resolve_for_cwd(
     cwd: &Path,
     xdg_path: Option<&Path>,
 ) -> Result<(Config, ResolvedLayers)> {
-    let repo_path = discover_repo_config(cwd)?;
+    // No `.git` boundary anywhere up the walk: there is no repo context to
+    // merge, so resolve baseline-only instead of erroring. This keeps the
+    // baseline-declared corpora reachable from a parent-of-repos directory
+    // (issue #102). A `.git` boundary with no config still errors via `?`.
+    let Some(repo_path) = discover_repo_config(cwd)? else {
+        let baseline_only = baseline.clone();
+        validate(&baseline_only)?;
+        return Ok((
+            baseline_only,
+            ResolvedLayers {
+                xdg_path: xdg_path.map(Path::to_path_buf),
+                repo_path: None,
+            },
+        ));
+    };
     let repo = load_repo_layer(&repo_path)?;
     let effective = merge_layers_with_sources(baseline, &repo, xdg_path, Some(&repo_path))?;
     Ok((
         effective,
         ResolvedLayers {
             xdg_path: xdg_path.map(Path::to_path_buf),
-            repo_path,
+            repo_path: Some(repo_path),
         },
     ))
 }
@@ -1175,7 +1195,9 @@ rrf_k                   = 60
         let dir = tempfile::tempdir().expect("tempdir");
         let root = canon(dir.path());
         let expected = write_repo_config(&root, "");
-        let found = discover_repo_config(&root).expect("found at cwd");
+        let found = discover_repo_config(&root)
+            .expect("found at cwd")
+            .expect("config present");
         assert_eq!(canon(&found), canon(&expected));
     }
 
@@ -1186,7 +1208,9 @@ rrf_k                   = 60
         let expected = write_repo_config(&root, "");
         let nested = root.join("a").join("b").join("c");
         std::fs::create_dir_all(&nested).expect("mkdir nested");
-        let found = discover_repo_config(&nested).expect("walked up to ancestor");
+        let found = discover_repo_config(&nested)
+            .expect("walked up to ancestor")
+            .expect("config present");
         assert_eq!(canon(&found), canon(&expected));
     }
 
@@ -1262,53 +1286,47 @@ rrf_k                   = 60
         );
 
         // End-to-end against the absolute, normalized path: walking it must
-        // ascend a real parent chain and bottom out at the filesystem-root
-        // exhaust branch (the base tempdir has no `.git` and no
-        // `.hallouminate/config.toml` ancestor). This is the regression the fix
-        // guards: before normalization, a relative cwd's `Path::parent()` walk
-        // bottomed out at the empty component, producing a misleading error
-        // rather than ascending to the real root.
+        // ascend a real parent chain and bottom out at a boundary — either the
+        // filesystem-root exhaust branch (`Ok(None)` soft-fallback, the base
+        // tempdir has no `.git` and no `.hallouminate/config.toml` ancestor) or
+        // a `.git` boundary in an unusual CI sandbox (`Err`). This is the
+        // regression the fix guards: before normalization, a relative cwd's
+        // `Path::parent()` walk bottomed out at the empty component, which would
+        // surface as a (misleading) filesystem-root result without ascending to
+        // the real root. What it must NOT do is find a config.
         match discover_repo_config(&normalized) {
+            Ok(None) => {}
             Err(HallouminateError::Config(m)) => {
                 assert!(
-                    m.contains("reached filesystem root") || m.contains("stopped at repo root"),
-                    "the normalized path must walk a real parent chain to a \
-                     boundary, not bottom out at an empty component; got: {m}",
-                );
-                assert!(
-                    m.contains(&normalized.display().to_string()),
-                    "the error must name the normalized cwd it walked from; got: {m}",
+                    m.contains("stopped at repo root"),
+                    "the only non-fallback outcome here is a `.git` boundary; got: {m}",
                 );
             }
-            other => panic!("normalized relative input must error: {other:?}"),
+            other => panic!("normalized relative input must not find a config: {other:?}"),
         }
     }
 
     #[test]
-    fn discover_repo_config_errors_walking_past_no_git_no_config() {
-        // A subtree with no `.git` and no `.hallouminate/config.toml`
-        // anywhere up to the filesystem root must error rather than walk
-        // forever or silently succeed. We can't realistically test "all the
-        // way to /" so simulate by walking from a tempdir whose ancestors
-        // are guaranteed not to host `.hallouminate/config.toml` (the system
-        // tmp tree). The error message must mention the filesystem-root
-        // exhaust path because we never hit a `.git`.
+    fn discover_repo_config_soft_falls_back_walking_past_no_git_no_config() {
+        // A subtree with no `.git` and no `.hallouminate/config.toml` anywhere
+        // up to the filesystem root must soft-fall-back (`Ok(None)`) rather than
+        // error — there is no repo context to be strict about, and erroring
+        // would strand the baseline-declared corpora (issue #102). We can't
+        // realistically test "all the way to /" so simulate by walking from a
+        // tempdir whose ancestors are guaranteed not to host
+        // `.hallouminate/config.toml` (the system tmp tree).
         let dir = tempfile::tempdir().expect("tempdir");
-        // The system tmp dir on macOS *might* have a `.git` ancestor in
-        // weird CI sandboxes; skip the assertion if it does. The point of
-        // this test is the message-shape contract.
+        // The system tmp dir on macOS *might* have a `.git` ancestor in weird
+        // CI sandboxes; that path is the still-strict `.git`-boundary error.
         let cwd = canon(dir.path());
         match discover_repo_config(&cwd) {
+            // The expected outcome: no `.git` boundary, so baseline-only.
+            Ok(None) => {}
+            // Unusual CI sandbox with a `.git` ancestor: still a hard error.
             Err(HallouminateError::Config(msg)) => {
-                // Either we hit FS root (unusual CI sandboxes) or a `.git`
-                // somewhere up the chain. Both are valid "no config here"
-                // outcomes; the message just has to be non-empty.
-                assert!(
-                    msg.contains("filesystem root") || msg.contains("stopped at repo root"),
-                    "got: {msg}"
-                );
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
             }
-            Ok(p) => panic!("did not expect to find a config; got {}", p.display()),
+            Ok(Some(p)) => panic!("did not expect to find a config; got {}", p.display()),
             Err(other) => panic!("unexpected error: {other:?}"),
         }
     }
@@ -1598,8 +1616,9 @@ paths = ["/g"]
         let names: Vec<&str> = effective.corpora.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["global", "repo-docs"]);
         assert_eq!(layers.xdg_path, Some(xdg));
+        let repo_path = layers.repo_path.expect("repo config discovered");
         assert_eq!(
-            canon(&layers.repo_path),
+            canon(&repo_path),
             canon(&repo_root.join(".hallouminate").join("config.toml")),
         );
     }
@@ -1665,6 +1684,41 @@ corpus_paths = ["docs"]
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_for_cwd_falls_back_to_baseline_when_cwd_above_all_repos() {
+        // Issue #102: from a parent-of-repos directory — no `.hallouminate/`,
+        // no `.git`, the walk reaches the filesystem root — `resolve_for_cwd`
+        // must resolve *baseline-only* instead of hard-erroring. Otherwise the
+        // baseline-declared corpora become unreachable the moment the cwd sits
+        // above all repos, stranding stateless ops (`list_corpora`, `ground`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let above_repos = canon(dir.path());
+
+        // A baseline that declares a globally-searchable corpus, mirroring the
+        // XDG `cheese-global` / `cheez-wiki` entries in the issue repro.
+        let baseline = parse(
+            r#"
+[[corpus]]
+name = "cheese-global"
+paths = ["/srv/cheese-global"]
+"#,
+            None,
+        )
+        .expect("baseline parse");
+
+        let (effective, layers) =
+            resolve_for_cwd(&baseline, &above_repos, None).expect("baseline-only must resolve");
+
+        // The baseline corpus is reachable from above-all-repos.
+        let corpora = effective.effective_corpora().expect("derive corpora");
+        let names: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["cheese-global"]);
+
+        // No repo config was discovered, so the diagnostic records `None`
+        // rather than fabricating a path.
+        assert_eq!(layers.repo_path, None);
     }
 
     #[test]
