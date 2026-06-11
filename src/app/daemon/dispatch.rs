@@ -1523,21 +1523,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_with_no_repo_config_returns_config_error() {
-        // A `cwd` whose ancestry contains neither `.hallouminate/` nor `.git`
-        // until the filesystem root must surface as
-        // `DaemonResponse::Err { kind: InvalidParams, .. }` carrying the
-        // "filesystem root" discovery-walk error. The dispatcher must NOT
-        // fall back to baseline-only here.
+    async fn dispatch_above_all_repos_falls_back_to_baseline_corpora() {
+        // Issue #102: a `cwd` whose ancestry contains neither `.hallouminate/`
+        // nor `.git` until the filesystem root must NOT hard-error every op.
+        // The discovery walk reaches the root with no boundary, so dispatch
+        // resolves baseline-only — the baseline-declared corpora stay reachable
+        // from a parent-of-repos directory instead of being stranded.
         let tmp = tempfile::tempdir().expect("tempdir");
         let cwd = tmp.path().to_path_buf();
         let ground = tmp.path().join("ground");
-        let state = state_with_ground(&ground, "").await;
+        // Baseline declares a globally-searchable corpus (the XDG analogue of
+        // `cheese-global` in the issue repro).
+        let state = state_with_ground(
+            &ground,
+            "[[corpus]]\nname = \"cheese-global\"\npaths = [\"/srv/cheese-global\"]\n",
+        )
+        .await;
 
-        // ListCorpora is config-dependent (it runs `resolve_for_cwd`), unlike
-        // Ping which is now a config-independent control op (Curd C).
+        // ListCorpora is config-dependent (it runs `resolve_for_cwd`); from
+        // above all repos it must list the baseline corpus, not error.
         let req = DaemonRequest {
             cwd: cwd.clone(),
+            payload: DaemonRequestPayload::ListCorpora,
+        };
+        let resp = dispatch(&state, req).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                let entries = result.as_array().expect("ListCorpora returns an array");
+                let names: Vec<&str> = entries
+                    .iter()
+                    .filter_map(|e| e.get("name").and_then(serde_json::Value::as_str))
+                    .collect();
+                assert!(
+                    names.contains(&"cheese-global"),
+                    "baseline corpus must be reachable from above all repos; got {names:?}",
+                );
+            }
+            // Unusual CI sandbox whose tmp tree sits inside a checkout trips a
+            // `.git` boundary before the root — that path is still a hard error
+            // (covered explicitly below), and acceptable here.
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+                assert!(message.contains("stopped at repo root"), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_inside_repo_without_config_still_hard_errors() {
+        // Issue #102 keeps the deliberate in-repo strictness: a `.git` boundary
+        // with no `.hallouminate/config.toml` between cwd and the repo root must
+        // still fail every config-dependent op rather than silently fall back to
+        // baseline-only. Only the no-`.git` parent-dir case soft-falls-back.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir(repo_root.join(".git")).expect("mkdir .git");
+        let cwd = repo_root.join("src");
+        std::fs::create_dir_all(&cwd).expect("mkdir nested");
+        let ground = tmp.path().join("ground");
+        let state = state_with_ground(&ground, "").await;
+
+        let req = DaemonRequest {
+            cwd,
             payload: DaemonRequestPayload::ListCorpora,
         };
         let resp = dispatch(&state, req).await;
@@ -1548,17 +1595,13 @@ mod tests {
                     ErrorKind::InvalidParams,
                     "discovery failure must map to InvalidParams: {message}",
                 );
-                // The discovery walk either reaches the filesystem root
-                // (most environments) or trips a `.git` boundary in unusual
-                // CI sandboxes whose tmp tree sits inside a checkout. Both
-                // outcomes prove dispatch refused to silently fall back.
                 assert!(
-                    message.contains("filesystem root") || message.contains("stopped at repo root"),
-                    "discovery error must explain the boundary: {message}",
+                    message.contains("stopped at repo root"),
+                    "in-repo discovery error must explain the boundary: {message}",
                 );
             }
             DaemonResponse::Ok { result } => {
-                panic!("must not fall back to baseline-only; got Ok({result:?})");
+                panic!("must not fall back to baseline-only inside a repo; got Ok({result:?})");
             }
         }
     }
