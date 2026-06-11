@@ -689,6 +689,7 @@ ground_dir = "{g}"
             payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
+                strict: false,
             }),
         })
         .await
@@ -1872,4 +1873,143 @@ enabled = false
         !global_root.join("note.md").exists(),
         "rejected globalize must not write to the global corpus"
     );
+}
+
+// ─── Issue #101: a missing corpus root must not abort the whole run ───────
+
+/// Embeddings-off baseline config with two `[[corpus]]` entries: a healthy
+/// root (exists, empty) and a ghost root (does not exist). The daemon boots
+/// in lexical-only mode so the test indexes without downloading a model.
+fn cfg_two_corpora_one_missing(
+    ground_dir: &Path,
+    healthy_root: &Path,
+    ghost_root: &Path,
+) -> Config {
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "healthy"
+paths = ["{healthy}"]
+globs = ["**/*.md"]
+
+[[corpus]]
+name = "ghost"
+paths = ["{ghost}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{ground}"
+
+[embeddings]
+enabled = false
+"#,
+        healthy = healthy_root.display(),
+        ghost = ghost_root.display(),
+        ground = ground_dir.display(),
+    );
+    toml::from_str(&toml).expect("two-corpora toml parses")
+}
+
+#[tokio::test]
+async fn index_skips_missing_corpus_root_and_indexes_the_rest() {
+    // Regression for #101: a single configured corpus whose root does not
+    // exist on disk used to abort the ENTIRE index run with a fatal walk
+    // error ("No such file or directory"), taking down every healthy corpus
+    // on the box. The run must instead skip the missing corpus with a warning
+    // and still index the rest — the whole point of a portable/synced
+    // baseline config where some roots only exist on some machines.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let healthy_root = tmp.path().join("healthy-corpus");
+    std::fs::create_dir_all(&healthy_root).expect("mkdir healthy corpus");
+    // Never created on disk — this is the ghost root that used to be fatal.
+    let ghost_root = tmp.path().join("does-not-exist-xyz");
+
+    let cfg = cfg_two_corpora_one_missing(&ground, &healthy_root, &ghost_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
+                corpus: None,
+                paths_from: None,
+                strict: false,
+            }),
+        })
+        .await
+        .expect("index transport ok");
+
+    let report: hallouminate::app::cli::IndexReport = match resp {
+        DaemonResponse::Ok { result } => {
+            serde_json::from_value(result).expect("index payload shape")
+        }
+        DaemonResponse::Err { kind, message } => {
+            panic!("missing root must NOT abort the run, got {kind:?}: {message}");
+        }
+    };
+
+    // The healthy corpus was indexed; the ghost corpus was skipped entirely.
+    let indexed: Vec<&str> = report.corpora.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        indexed,
+        vec!["healthy"],
+        "only the healthy corpus should be indexed; ghost must be skipped: {indexed:?}"
+    );
+
+    // A warning names the skipped corpus and its missing root, so the user
+    // can see why it didn't index instead of getting silent partial output.
+    assert_eq!(report.warnings.len(), 1, "exactly one skip warning expected");
+    let w = &report.warnings[0];
+    assert!(
+        w.contains("ghost") && w.contains("skipped"),
+        "warning must name the skipped corpus: {w}"
+    );
+    assert!(
+        w.contains(&ghost_root.display().to_string()),
+        "warning must name the missing root path: {w}"
+    );
+}
+
+#[tokio::test]
+async fn index_strict_aborts_on_missing_corpus_root() {
+    // The `--strict` opt-out restores fail-fast: a caller who wants every
+    // configured root guaranteed present gets a hard error rather than a
+    // silent skip.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let healthy_root = tmp.path().join("healthy-corpus");
+    std::fs::create_dir_all(&healthy_root).expect("mkdir healthy corpus");
+    let ghost_root = tmp.path().join("does-not-exist-xyz");
+
+    let cfg = cfg_two_corpora_one_missing(&ground, &healthy_root, &ghost_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
+                corpus: None,
+                paths_from: None,
+                strict: true,
+            }),
+        })
+        .await
+        .expect("index transport ok");
+
+    match resp {
+        DaemonResponse::Err {
+            kind: ErrorKind::InvalidParams,
+            message,
+        } => {
+            assert!(
+                message.contains("does not exist")
+                    && message.contains(&ghost_root.display().to_string()),
+                "strict error must name the missing root: {message}"
+            );
+        }
+        other => panic!("strict mode must reject a missing root, got: {other:?}"),
+    }
 }

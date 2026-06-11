@@ -539,6 +539,7 @@ impl HallouminateTools {
             payload: DaemonRequestPayload::Index(IndexRequest {
                 corpus: params.corpus,
                 paths_from: None,
+                strict: false,
             }),
         };
         let report: crate::app::cli::IndexReport =

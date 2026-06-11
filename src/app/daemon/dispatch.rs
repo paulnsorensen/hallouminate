@@ -393,6 +393,25 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             Err(msg) => return DaemonResponse::internal(msg),
         };
         ensure_paths_exist(&corpus);
+        let missing = crate::domain::corpus::missing_roots(&corpus);
+        if !missing.is_empty() {
+            let roots = missing
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if req.strict {
+                return DaemonResponse::invalid_params(format!(
+                    "corpus {:?}: root {roots} does not exist",
+                    corpus.name
+                ));
+            }
+            report.warnings.push(format!(
+                "corpus {:?}: root {roots} does not exist; skipped",
+                corpus.name
+            ));
+            continue;
+        }
         let mut embedder = if state.embeddings_enabled() {
             match state.embedder().await {
                 Ok(g) => Some(g),
@@ -567,6 +586,7 @@ async fn handle_add_markdown(
             chunks_inserted: stats.chunks_inserted,
             embeddings_inserted: stats.embeddings_inserted,
         }],
+        warnings: Vec::new(),
     };
     DaemonResponse::ok(&AddMarkdownResult {
         corpus: corpus.name,
@@ -923,6 +943,7 @@ async fn handle_globalize_markdown(
             chunks_inserted: stats.chunks_inserted,
             embeddings_inserted: stats.embeddings_inserted,
         }],
+        warnings: Vec::new(),
     };
     DaemonResponse::ok(&GlobalizeMarkdownResult {
         source_corpus: source.name,

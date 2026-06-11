@@ -114,6 +114,11 @@ pub struct IndexCli {
     /// sockets without env mutation.
     #[arg(long, value_name = "PATH")]
     pub socket: Option<PathBuf>,
+    /// Abort the run if any selected corpus root is missing, instead of the
+    /// default skip-with-warning (the missing corpus is skipped and the rest
+    /// still index).
+    #[arg(long)]
+    pub strict: bool,
 }
 
 impl From<IndexCli> for IndexArgs {
@@ -123,6 +128,7 @@ impl From<IndexCli> for IndexArgs {
             paths_from: cli.paths_from,
             config: cli.config,
             socket: cli.socket,
+            strict: cli.strict,
         }
     }
 }
