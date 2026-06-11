@@ -34,6 +34,26 @@ pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
     Ok(out)
 }
 
+/// Corpus `paths` entries whose expanded root is confirmed absent on disk.
+///
+/// A nonexistent root makes [`scan`] fail fatally (the underlying directory
+/// walk yields an IO error on the first iteration). Callers that want to skip
+/// a missing corpus rather than abort the whole run check this first; an empty
+/// result means every root is present and `scan` is safe to call.
+///
+/// Only `try_exists() == Ok(false)` counts as missing. A root that errors on
+/// the existence probe (e.g. permission denied on a parent component) is *not*
+/// reported here, so the real IO error still surfaces through `scan`/`walk_root`
+/// instead of being masked as a misleading "does not exist" skip.
+pub fn missing_roots(corpus: &CorpusConfig) -> Vec<PathBuf> {
+    corpus
+        .paths
+        .iter()
+        .map(|raw| expand_tilde(raw))
+        .filter(|root| matches!(root.try_exists(), Ok(false)))
+        .collect()
+}
+
 fn walk_root(
     root: &Path,
     include: Option<&GlobSet>,

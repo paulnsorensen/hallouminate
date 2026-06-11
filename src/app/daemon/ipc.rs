@@ -87,6 +87,11 @@ pub struct GroundRequest {
 pub struct IndexRequest {
     pub corpus: Option<String>,
     pub paths_from: Option<PathBuf>,
+    /// Fail the whole run if any selected corpus root is missing, instead of
+    /// the default skip-with-warning. Defaults to `false` so older clients
+    /// that omit the field keep the lenient behavior.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

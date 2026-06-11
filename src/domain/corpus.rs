@@ -18,4 +18,4 @@ pub use keywords::extract_keywords;
 pub use snippet::make_snippet;
 pub use summary::extract_summary;
 pub use validate::lint_markdown;
-pub use walker::scan;
+pub use walker::{missing_roots, scan};
