@@ -18,8 +18,8 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    DeleteMarkdownRequest, ErrorKind, ReadMarkdownRequest, connect_at,
-    serve, spawn_signal_handlers,
+    DeleteMarkdownRequest, ErrorKind, ReadMarkdownRequest, connect_at, serve,
+    spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;

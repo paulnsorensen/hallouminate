@@ -77,6 +77,14 @@ Bulk (re)build the LanceDB index for one or all corpora. Param: `corpus`
 (optional; omit to rebuild every configured corpus). Use this when files were
 touched outside hallouminate.
 
+### `get_footnote`
+
+Resolve a single citation: the footnote target for a page's `#footnote_number`.
+Params: `corpus` (defaults to wiki-for-cwd, same as `ground`), `page` (the
+wiki page's relative path), `footnote_number` (the label after `^` — `"1"` for
+`[^1]`, `"note"` for `[^note]`). Use this to expand one footnote without reading
+the whole page.
+
 ## Conventions for LLM authors
 
 Markdown is stored verbatim — hallouminate imposes no schema. The convention

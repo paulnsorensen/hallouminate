@@ -41,9 +41,9 @@ use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult,
-    GroundRequest, GroundResult, IndexRequest, ListFilesRequest,
-    ListTreeRequest, ListTreeResult, PongResult, ReadMarkdownRequest, ReadMarkdownResult,
+    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
+    IndexRequest, ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult,
+    ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 

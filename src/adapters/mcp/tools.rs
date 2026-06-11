@@ -21,10 +21,9 @@ use std::time::Duration;
 use crate::app::config::discover_repo_config;
 use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
-    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
-    GroundRequest, GroundResult, IndexRequest,
-    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
-    ReadMarkdownRequest, ReadMarkdownResult, client_for,
+    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
+    GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
+    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 use crate::domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};

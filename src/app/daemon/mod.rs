@@ -34,10 +34,9 @@ pub use client::{
 };
 pub use ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
-    GroundRequest, GroundResult, IndexRequest,
-    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
-    ReadMarkdownRequest, ReadMarkdownResult,
+    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
+    GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
+    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult,
 };
 pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
 pub use server::{DaemonArgs, run_daemon, serve, spawn_signal_handlers};
