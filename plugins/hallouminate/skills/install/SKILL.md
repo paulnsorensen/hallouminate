@@ -1,8 +1,8 @@
 ---
 name: install
-description: Install hallouminate and bootstrap the user's first LLM-authored per-repo wiki. Use when the user runs /install from the hallouminate skill pack, or asks to "install hallouminate", "set up hallouminate", or "start a hallouminate wiki". Installs the cargo binary, registers the MCP server, then uses Socratic questioning to decide where and how the wiki lives, scaffolds it under .hallouminate/, indexes it, and commits the result with git.
+description: Install hallouminate and bootstrap the user's first LLM-authored per-repo wiki. Use when the user runs /install from the hallouminate skill pack, or asks to "install hallouminate", "set up hallouminate", or "start a hallouminate wiki". Installs a prebuilt binary (no Rust toolchain needed on supported targets), makes the MCP server available for the current harness, then uses Socratic questioning to decide where and how the wiki lives, seeds it with `hallouminate init-repo`, indexes it, and commits the result with git.
 argument-hint: "[target repo path]"
-allowed-tools: AskUserQuestion, Read, Write, Edit, Bash(cargo:*), Bash(rustup:*), Bash(hallouminate:*), Bash(git:*), Bash(claude:*), Bash(which:*), Bash(command:*), Bash(protoc:*)
+allowed-tools: AskUserQuestion, Read, Write, Edit, Bash(curl:*), Bash(sh:*), Bash(uname:*), Bash(cargo:*), Bash(rustup:*), Bash(hallouminate:*), Bash(git:*), Bash(claude:*), Bash(codex:*), Bash(which:*), Bash(command:*), Bash(protoc:*)
 ---
 
 # Install hallouminate & start your first wiki
@@ -19,38 +19,89 @@ wikis live under `<repo>/.hallouminate/wiki/`.
 If the user passed a target repo path as an argument, treat that as the wiki's
 home and skip the "where" question in Phase 5.
 
-## Phase 1 — Preflight
+## Phase 1 — Platform check
 
-1. Confirm the toolchain: `cargo --version`. If cargo is missing, point the user
-   at https://rustup.rs to install Rust, then stop until it's available.
-2. `protoc` is required to build the `lancedb` dependency. Check
-   `protoc --version`. If it's missing, tell the user to install it
-   (`brew install protobuf` on macOS, `sudo apt-get install -y protobuf-compiler`
-   on Debian/Ubuntu) and stop until resolved — the build fails without it.
+Run `uname -sm`. Prebuilt binaries exist for:
 
-## Phase 2 — Install the binary
+| `uname -sm` | target |
+| --- | --- |
+| `Darwin arm64` | aarch64-apple-darwin |
+| `Linux aarch64` | aarch64-unknown-linux-gnu |
+| `Linux x86_64` | x86_64-unknown-linux-gnu |
 
-Run `cargo install hallouminate --locked`. This pulls from crates.io and can
-take a few minutes — it compiles native dependencies. Verify with
-`hallouminate --version`. If `hallouminate` isn't on PATH afterward, remind the
-user that cargo installs to `~/.cargo/bin`, which must be on their PATH.
+Two platforms need special handling — tell the user plainly, don't silently
+fall through:
 
-## Phase 3 — Register the MCP server
+- **Intel macOS (`Darwin x86_64`)**: no prebuilt — the `ort` (ONNX Runtime)
+  dependency ships no x86_64-darwin binary. Say so loudly and go straight to
+  the source build (Phase 2, step 3), which needs Rust and `protoc`.
+- **Windows**: unsupported entirely (prebuilt *and* source) — the daemon is
+  Unix-only (Unix domain socket + `flock`). Point at
+  <https://github.com/paulnsorensen/hallouminate/issues/48> and stop.
 
-hallouminate exposes its tools over stdio via `hallouminate serve`. Register it
-with this agent so the wiki tools (`ground`, `add_markdown`, …) become
-available. Ask the user whether they want it at **project** scope (this repo
-only, written to `.mcp.json`) or **user** scope (all their projects), then run:
+## Phase 2 — Install the binary (cascade)
 
-```sh
-claude mcp add hallouminate --scope project -- hallouminate serve
-# or: claude mcp add hallouminate --scope user -- hallouminate serve
-```
+Try each step in order and stop at the first that leaves `hallouminate
+--version` working. No Rust toolchain or `protoc` is needed unless you reach
+step 3.
 
-After adding, the tools surface as `mcp__hallouminate__*`. They may only load
-after the session reloads its MCP servers — if they aren't callable yet this
-session, fall back to the CLI (`hallouminate index` / `hallouminate ground`) in
-the later phases and tell the user to re-run later to pick up the tools.
+1. **Prebuilt installer (default):**
+
+   ```sh
+   curl --proto '=https' --tlsv1.2 -LsSf \
+     https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.sh | sh
+   ```
+
+   The installer downloads the prebuilt for the detected platform and prints
+   where it installed (typically `~/.cargo/bin` if you have one, else
+   `~/.local/bin`). Make sure that directory is on PATH.
+
+2. **cargo binstall (if already installed):** `cargo binstall hallouminate`
+   — fetches the same prebuilt via the Release's `dist-manifest.json`.
+
+3. **Source build (fallback; required on Intel macOS):** needs `cargo`
+   (<https://rustup.rs>) and `protoc` (`brew install protobuf` on macOS,
+   `sudo apt-get install -y protobuf-compiler` on Debian/Ubuntu). Then:
+
+   ```sh
+   cargo install hallouminate --locked
+   ```
+
+   This compiles native dependencies and takes a few minutes. Cargo installs
+   to `~/.cargo/bin`, which must be on PATH.
+
+## Phase 3 — Make the MCP tools available
+
+The MCP server is `hallouminate serve` (stdio). How it gets registered depends
+on the harness you are running in:
+
+- **Claude Code (this plugin)**: nothing to do for the current project — the
+  plugin bundles a `.mcp.json` that registers `hallouminate serve`
+  declaratively when the plugin is installed. If the user wants the server in
+  **every** project (user scope), or the bundled registration hasn't loaded,
+  fall back to the imperative form:
+
+  ```sh
+  claude mcp add hallouminate --scope user -- hallouminate serve
+  ```
+
+- **Codex**: the plugin payload's `.mcp.json` registers the server when the
+  plugin is installed (`codex plugin marketplace add paulnsorensen/hallouminate`,
+  restart, then install from the `/plugins` directory).
+
+- **opencode**: add to `opencode.json` (project or home directory):
+
+  ```json
+  { "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }
+  ```
+
+- **Anything else**: any MCP client can launch `hallouminate serve` over stdio.
+
+After registering, the tools surface as `mcp__hallouminate__*`. They may only
+load after the session reloads its MCP servers — if they aren't callable yet
+this session, fall back to the CLI (`hallouminate index` / `hallouminate
+ground`) in the later phases and tell the user to re-run later to pick up the
+tools.
 
 ## Phase 4 — Initialize config
 
@@ -80,22 +131,31 @@ decision at a time, Socratic style, each building on the last. Use the
 Keep it to 3–4 crisp questions. Reflect each answer back in one line before
 moving on, so the user can course-correct early.
 
-## Phase 6 — Scaffold the repo-layer config
+## Phase 6 — Seed the repo
 
-In the target repo, create `.hallouminate/config.toml` declaring the repo as a
-tenant, so its wiki is searchable as the `repo:<name>:wiki` corpus:
+In the target repo, run the seeding subcommand (identical on every harness):
 
-```toml
-[[repository]]
-name = "<repo-name>"
-path = "."
+```sh
+hallouminate init-repo <repo-name>          # seeds the current directory
+# or: hallouminate init-repo <repo-name> --path <repo-root>
 ```
 
-`path = "."` resolves against the repo root (the parent of `.hallouminate/`), so
-it works from any checkout or worktree with no per-machine config — the daemon
-reads the repo layer fresh on every request. Choose a unique `<repo-name>`, and
-do **not** also declare the same name in the XDG baseline, or the two layers
-collide on the duplicate-name check. Create the `.hallouminate/wiki/` directory.
+It writes `.hallouminate/config.toml` declaring the repo as a tenant
+(`[[repository]]` with `path = "."`, which resolves against the repo root so it
+works from any checkout or worktree) and a `.hallouminate/wiki/` skeleton. The
+wiki becomes searchable as the `repo:<repo-name>:wiki` corpus. Choose a unique
+`<repo-name>`, and do **not** also declare the same name in the XDG baseline,
+or the two layers collide on the duplicate-name check. If a repo config already
+exists, `init-repo` refuses; `--force` overwrites the config but never touches
+an existing wiki.
+
+**Narrate the first daemon spawn.** The first `hallouminate index` / `ground` /
+`serve` after install auto-spawns a background daemon — the single owner of the
+LanceDB ground directory; CLI and MCP talk to it over a Unix socket. Tell the
+user this once so the background process isn't a surprise, and where to look:
+`hallouminate daemon status` / `stop` / `restart`, with early-startup errors
+landing in `~/.local/state/hallouminate/daemon-bootstrap.log`. The README's
+"How the daemon works" section has the full lifecycle.
 
 ## Phase 7 — Author the first wiki page
 
@@ -145,6 +205,6 @@ Show the diff and summarize what landed. Then offer next steps:
 
 ## Done
 
-Recap for the user: binary installed, MCP server registered, config
-initialized, first wiki page authored + indexed + committed, and how to grow it
-from here.
+Recap for the user: binary installed (prebuilt, no toolchain), MCP server
+available for their harness, config initialized, repo seeded with `init-repo`,
+first wiki page authored + indexed + committed, and how to grow it from here.

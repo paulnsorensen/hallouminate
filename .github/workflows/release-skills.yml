@@ -8,13 +8,17 @@
 # the marketplace + plugin to a GitHub Release, so a specific skill-pack version
 # can be pinned, downloaded, and added from a local path.
 #
-# Trigger: manual (`workflow_dispatch`). The release tag is `skills-v<version>`,
-# read from plugins/hallouminate/.claude-plugin/plugin.json. We deliberately do
+# Triggers: a crate release tag push (`v*` — the same tag that fires the
+# cargo-dist release.yml and publish-crates.yml, so the skill pack ships in
+# lockstep with the crate; versions are coupled by tests/plugin_manifests.rs)
+# or manual `workflow_dispatch`. The release tag is `skills-v<version>`, read
+# from plugins/hallouminate/.claude-plugin/plugin.json. We deliberately do
 # NOT trigger on a `skills-v*` tag push: the cargo-dist release.yml and
 # publish-crates.yml both fire on the greedy `**[0-9]+.[0-9]+.[0-9]+*` tag glob,
 # which a `skills-v0.1.0` tag would also match. Creating the tag here via the
 # GITHUB_TOKEN-backed `gh release create` avoids that — token-created tags don't
-# start new workflow runs.
+# start new workflow runs. Re-running on a tag whose `skills-v` release already
+# exists refreshes its assets instead of double-publishing.
 #
 # Pull requests touching the pack run the validate + package steps (no release)
 # so breakage is caught in review.
@@ -23,6 +27,10 @@
 name: release-skills
 
 on:
+  push:
+    tags:
+      # Anchored at `v`, so `skills-v*` tags do not re-trigger this workflow.
+      - "v[0-9]+.[0-9]+.[0-9]+*"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -55,6 +63,9 @@ jobs:
           set -euo pipefail
           jq empty "$MARKETPLACE"
           jq empty "$PLUGIN_DIR/.claude-plugin/plugin.json"
+          jq empty "$PLUGIN_DIR/.codex-plugin/plugin.json"
+          jq empty "$PLUGIN_DIR/.mcp.json"
+          jq empty .agents/plugins/marketplace.json
           # the marketplace must reference the plugin by name
           jq -e '.plugins[] | select(.name == "hallouminate")' "$MARKETPLACE" > /dev/null
           # the plugin manifest must carry a name and version
@@ -84,6 +95,12 @@ jobs:
           v="$(jq -r '.version' "$PLUGIN_DIR/.claude-plugin/plugin.json")"
           if [ -z "$v" ] || [ "$v" = "null" ]; then
             echo "::error::plugin.json is missing a version"
+            exit 1
+          fi
+          # On a crate tag push, the pack version must match the tag — the
+          # coupling tests/plugin_manifests.rs enforces in CI.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match plugin.json version $v"
             exit 1
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
@@ -119,7 +136,7 @@ jobs:
             ${{ steps.pack.outputs.sha }}
 
       - name: Create GitHub Release
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == false }}
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) || github.event_name == 'push' }}
         run: |
           set -euo pipefail
           tag="${{ steps.ver.outputs.tag }}"

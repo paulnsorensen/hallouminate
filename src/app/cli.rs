@@ -6,6 +6,7 @@ mod config;
 mod ground;
 mod hook;
 mod index;
+mod init_repo;
 
 pub use config::{
     ConfigDownloadArgs, ConfigInitArgs, ConfigShowArgs, ConfigValidateArgs, cmd_config_download,
@@ -16,6 +17,7 @@ pub use hook::{HookArgs, cmd_hook_install, cmd_hook_uninstall};
 pub use index::{
     AD_HOC_CORPUS_NAME, CorpusReport, IndexArgs, IndexReport, cmd_index, run_index, select_corpora,
 };
+pub use init_repo::{InitRepoArgs, cmd_init_repo};
 
 /// CLI surface for output format selection. Mirrors `domain::ground::Format`
 /// but kept in the app layer to keep `ValueEnum` (a clap dep) out of the
@@ -43,6 +45,10 @@ pub enum Command {
         #[command(subcommand)]
         action: HookAction,
     },
+    /// Seed a repository as a hallouminate tenant: writes
+    /// `.hallouminate/config.toml` declaring the `[[repository]]` plus a
+    /// `.hallouminate/wiki/` skeleton. Identical on every harness.
+    InitRepo(InitRepoCli),
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -58,6 +64,29 @@ pub enum Command {
     /// the foreground until killed; `stop`/`restart`/`status` are lifecycle
     /// controls. Only one instance per socket can run.
     Daemon(DaemonCli),
+}
+
+#[derive(Debug, Args)]
+pub struct InitRepoCli {
+    /// `[[repository]]` name; the wiki becomes the `repo:<name>:wiki` corpus.
+    pub name: String,
+    /// Repo root to seed (defaults to the current directory).
+    #[arg(long, value_name = "PATH")]
+    pub path: Option<PathBuf>,
+    /// Overwrite an existing `.hallouminate/config.toml`. Never clobbers an
+    /// existing wiki.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl From<InitRepoCli> for InitRepoArgs {
+    fn from(cli: InitRepoCli) -> Self {
+        Self {
+            name: cli.name,
+            path: cli.path,
+            force: cli.force,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -239,6 +268,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             HookAction::Install { repo } => cmd_hook_install(HookArgs { repo }),
             HookAction::Uninstall { repo } => cmd_hook_uninstall(HookArgs { repo }),
         },
+        Command::InitRepo(args) => cmd_init_repo(args.into()),
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
             ConfigAction::Show { config, cwd } => cmd_config_show(ConfigShowArgs { config, cwd }),
@@ -564,5 +594,45 @@ mod tests {
         let err = Cli::try_parse_from(["hallouminate", "hook", "frobnicate"])
             .expect_err("unknown hook action");
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    }
+
+    #[test]
+    fn parses_init_repo_with_name_only() {
+        let cli = Cli::try_parse_from(["hallouminate", "init-repo", "demo"]).expect("parse");
+        match cli.command {
+            Command::InitRepo(args) => {
+                assert_eq!(args.name, "demo");
+                assert_eq!(args.path, None);
+                assert!(!args.force);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_init_repo_with_path_and_force() {
+        let cli = Cli::try_parse_from([
+            "hallouminate",
+            "init-repo",
+            "demo",
+            "--path",
+            "/tmp/repo",
+            "--force",
+        ])
+        .expect("parse");
+        match cli.command {
+            Command::InitRepo(args) => {
+                assert_eq!(args.name, "demo");
+                assert_eq!(args.path, Some(PathBuf::from("/tmp/repo")));
+                assert!(args.force);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_init_repo_without_name() {
+        let err = Cli::try_parse_from(["hallouminate", "init-repo"]).expect_err("name required");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 }
