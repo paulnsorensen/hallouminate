@@ -31,7 +31,10 @@ codex plugin add hallouminate@hallouminate
 
 Restart Codex after adding the marketplace so the plugin appears in `/plugins`.
 
-**opencode:** copy the skills and register the MCP server — see the
+**opencode:** see the per-harness matrix in the root README. The pack
+ships an `.opencode-plugin/plugin.json` manifest for future auto-discovery;
+for now, add the MCP server to `opencode.json` and copy the skills to
+`~/.config/opencode/skills/`.
 [install matrix](../../README.md#per-harness-setup) in the root README.
 
 ## What `/install` does
@@ -69,8 +72,10 @@ roadmap into an executable graph with no rework.
 
 ```text
 plugins/hallouminate/
+plugins/hallouminate/
 ├── .claude-plugin/plugin.json     # Claude Code plugin manifest
 ├── .codex-plugin/plugin.json      # Codex plugin manifest
+├── .opencode-plugin/plugin.json   # opencode plugin manifest
 ├── .mcp.json                      # declarative MCP registration (hallouminate serve)
 ├── skills/install/SKILL.md        # the /install workflow
 ├── skills/wiki-init/SKILL.md      # Socratic wiki bootstrap

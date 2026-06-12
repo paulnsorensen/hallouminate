@@ -1,5 +1,12 @@
 //! Cross-manifest drift test for the plugin pack (issue #107).
 //!
+//! The plugin ships manifests for three harnesses (Claude Code under
+//! `.claude-plugin/`, Codex under `.codex-plugin/`, opencode under
+//! `.opencode-plugin/`) plus a declarative MCP registration (`.mcp.json`)
+//! and two marketplace files. These must agree with each other and with
+//! the crate version in `Cargo.toml`, or installs silently drift (the pack
+//! shipped 0.1.0 while the crate was at 0.1.3).
+//!
 //! The plugin ships manifests for two harnesses (Claude Code under
 //! `.claude-plugin/`, Codex under `.codex-plugin/`) plus a declarative MCP
 //! registration (`.mcp.json`) and two marketplace files. These must agree
@@ -33,11 +40,16 @@ fn str_at<'a>(value: &'a serde_json::Value, pointer: &str, file: &str) -> &'a st
 fn plugin_manifests_share_the_crate_name() {
     let claude = read_json("plugins/hallouminate/.claude-plugin/plugin.json");
     let codex = read_json("plugins/hallouminate/.codex-plugin/plugin.json");
+    let opencode = read_json("plugins/hallouminate/.opencode-plugin/plugin.json");
     assert_eq!(
         str_at(&claude, "/name", "claude plugin.json"),
         "hallouminate"
     );
     assert_eq!(str_at(&codex, "/name", "codex plugin.json"), "hallouminate");
+    assert_eq!(
+        str_at(&opencode, "/name", "opencode plugin.json"),
+        "hallouminate"
+    );
 }
 
 #[test]
@@ -45,6 +57,7 @@ fn plugin_versions_match_the_crate_version() {
     let crate_version = env!("CARGO_PKG_VERSION");
     let claude = read_json("plugins/hallouminate/.claude-plugin/plugin.json");
     let codex = read_json("plugins/hallouminate/.codex-plugin/plugin.json");
+    let opencode = read_json("plugins/hallouminate/.opencode-plugin/plugin.json");
     assert_eq!(
         str_at(&claude, "/version", "claude plugin.json"),
         crate_version,
@@ -54,6 +67,10 @@ fn plugin_versions_match_the_crate_version() {
         str_at(&codex, "/version", "codex plugin.json"),
         crate_version,
         "codex plugin.json version drifted from Cargo.toml"
+    );
+    assert_eq!(
+        str_at(&opencode, "/version", "opencode plugin.json"),
+        crate_version,
     );
 }
 
@@ -160,6 +177,11 @@ fn assert_is_plugin_dir(resolved: &Path) {
     assert!(
         resolved.join(".codex-plugin/plugin.json").is_file(),
         "{} does not contain .codex-plugin/plugin.json",
+        resolved.display()
+    );
+    assert!(
+        resolved.join(".opencode-plugin/plugin.json").is_file(),
+        "{} does not contain .opencode-plugin/plugin.json",
         resolved.display()
     );
     assert!(

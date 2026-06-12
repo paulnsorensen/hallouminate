@@ -90,11 +90,37 @@ on the harness you are running in:
   restart, then `codex plugin add hallouminate@hallouminate` or install from
   `/plugins`).
 
-- **opencode**: add to `opencode.json` (project or home directory):
+- **opencode**: the plugin now ships a `.opencode-plugin/plugin.json`
+  manifest. Add the MCP server to the active `opencode.json` (project or
+  home directory):
 
   ```json
-  { "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }
+  {
+    "mcp": {
+      "hallouminate": {
+        "type": "local",
+        "command": ["hallouminate", "serve"]
+      }
+    }
+  }
   ```
+
+  Copy the skills to the opencode skills directory:
+
+  ```sh
+  cp -r plugins/hallouminate/skills/ ~/.config/opencode/skills/
+  ```
+
+  Or, if this repo is cloned locally, symlink them:
+
+  ```sh
+  ln -sf "$PWD/plugins/hallouminate/skills/"* ~/.config/opencode/skills/
+  ```
+
+  The hallouminate MCP tools (`ground`, `add_markdown`, `read_markdown`,
+  etc.) surface after an MCP server reload. If they haven't loaded this
+  session, fall back to the CLI for the remaining phases.
+
 
 - **Anything else**: any MCP client can launch `hallouminate serve` over stdio.
 

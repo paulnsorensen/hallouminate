@@ -74,7 +74,7 @@ What differs per harness is how it gets registered:
 | --- | --- | --- |
 | **Claude Code** | `/plugin marketplace add paulnsorensen/hallouminate` → `/plugin install hallouminate@hallouminate` → run `/hallouminate:install` | Declarative — the plugin bundles `.mcp.json` (project scope). User scope fallback: `claude mcp add hallouminate --scope user -- hallouminate serve` |
 | **Codex** | `codex plugin marketplace add paulnsorensen/hallouminate`, restart, then `codex plugin add hallouminate@hallouminate` (or install from `/plugins`) | Bundled `.mcp.json` in the plugin payload |
-| **opencode** | Copy the skills: `cp -r plugins/hallouminate/skills/ .agents/skills/` (or `~/.config/opencode/skills/`) | Add to `opencode.json`: `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` |
+| **opencode** | `.opencode-plugin/plugin.json` in the plugin payload — auto-discovery coming. Manual: copy skills from `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` | Add to `opencode.json`: `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` |
 | **Copilot CLI** | — (binary + MCP only) | Add to `~/.copilot/mcp-config.json`: `{ "mcpServers": { "hallouminate": { "command": "hallouminate", "args": ["serve"] } } }` |
 | **Cursor** | — (binary + MCP only) | Add to `~/.cursor/mcp.json`: `{ "mcpServers": { "hallouminate": { "command": "hallouminate", "args": ["serve"] } } }` |
 
