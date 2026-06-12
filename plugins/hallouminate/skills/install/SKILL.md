@@ -90,9 +90,9 @@ on the harness you are running in:
   restart, then `codex plugin add hallouminate@hallouminate` or install from
   `/plugins`).
 
-- **opencode**: the plugin now ships a `.opencode-plugin/plugin.json`
-  manifest. Add the MCP server to the active `opencode.json` (project or
-  home directory):
+- **opencode**: opencode loads the MCP server and skills directly (no
+  plugin manifest). Add the MCP server to the active `opencode.json`
+  (project or home directory):
 
   ```json
   {
@@ -120,7 +120,6 @@ on the harness you are running in:
   The hallouminate MCP tools (`ground`, `add_markdown`, `read_markdown`,
   etc.) surface after an MCP server reload. If they haven't loaded this
   session, fall back to the CLI for the remaining phases.
-
 
 - **Anything else**: any MCP client can launch `hallouminate serve` over stdio.
 
