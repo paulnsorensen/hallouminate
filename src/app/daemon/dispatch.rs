@@ -41,9 +41,9 @@ use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GlobalizeMarkdownRequest,
-    GlobalizeMarkdownResult, GroundRequest, GroundResult, IndexRequest, ListFilesRequest,
-    ListTreeRequest, ListTreeResult, PongResult, ReadMarkdownRequest, ReadMarkdownResult,
+    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
+    IndexRequest, ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult,
+    ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -96,9 +96,6 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
         }
-        DaemonRequestPayload::GlobalizeMarkdown(req) => {
-            handle_globalize_markdown(state, &effective, req).await
-        }
         DaemonRequestPayload::Shutdown => {
             // Handled before `resolve_for_cwd` above; unreachable here.
             DaemonResponse::ok(&"stopping")
@@ -121,10 +118,6 @@ fn effective_corpora(cfg: &Config) -> Result<Vec<CorpusConfig>, DaemonResponse> 
 ///
 /// `read_markdown` uses [`validate_wiki_read_path`] instead — reads walk every
 /// configured root so a file under `paths[1..]` stays reachable.
-///
-/// `globalize_markdown` deliberately does NOT use this helper: it resolves two
-/// corpora (source + global) and its source side skips `ensure_wiki_root_safe`,
-/// so routing it through here would add a check it does not have today.
 fn validate_wiki_path(
     corpora: &[CorpusConfig],
     corpus_name: &str,
@@ -168,7 +161,7 @@ fn validate_wiki_read_path(
 
 /// Resolve the single root of a corpus, or refuse loudly when it is multi-root.
 ///
-/// Mutations (`add` / `delete` / `globalize`) target exactly one root; a
+/// Mutations (`add` / `delete`) target exactly one root; a
 /// multi-root corpus has no canonical write destination, so the daemon rejects
 /// the mutation at request time with an `InvalidParams` error explaining *why*
 /// (the asymmetric "searchable but not writable" contract reads as a bug
@@ -180,7 +173,7 @@ fn require_single_root(corpus: &CorpusConfig) -> Result<std::path::PathBuf, Daem
             .map_err(|e| DaemonResponse::invalid_params(e.into_inner()));
     }
     Err(DaemonResponse::invalid_params(format!(
-        "corpus {:?} has {} roots; mutations (add/delete/globalize) require a \
+        "corpus {:?} has {} roots; mutations (add/delete) require a \
          single-root corpus — multi-root corpora are read- and search-only",
         corpus.name,
         corpus.paths.len(),
@@ -393,6 +386,25 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             Err(msg) => return DaemonResponse::internal(msg),
         };
         ensure_paths_exist(&corpus);
+        let missing = crate::domain::corpus::missing_roots(&corpus);
+        if !missing.is_empty() {
+            let roots = missing
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if req.strict {
+                return DaemonResponse::invalid_params(format!(
+                    "corpus {:?}: root {roots} does not exist",
+                    corpus.name
+                ));
+            }
+            report.warnings.push(format!(
+                "corpus {:?}: root {roots} does not exist; skipped",
+                corpus.name
+            ));
+            continue;
+        }
         let mut embedder = if state.embeddings_enabled() {
             match state.embedder().await {
                 Ok(g) => Some(g),
@@ -567,6 +579,7 @@ async fn handle_add_markdown(
             chunks_inserted: stats.chunks_inserted,
             embeddings_inserted: stats.embeddings_inserted,
         }],
+        warnings: Vec::new(),
     };
     DaemonResponse::ok(&AddMarkdownResult {
         corpus: corpus.name,
@@ -745,192 +758,6 @@ async fn handle_delete_markdown(
         path: relative.to_string_lossy().into_owned(),
         absolute_path: dest.to_string_lossy().into_owned(),
         file_ref: file_ref_str,
-    })
-}
-
-/// Copy a single markdown entry from `source_corpus` into the corpus marked
-/// `global = true`, reindexing the global corpus row synchronously. Mirrors
-/// `add_markdown`'s contract: read via the no-follow reader, write via the
-/// no-follow atomic writer, collision gated by `overwrite`. Source stays.
-async fn handle_globalize_markdown(
-    state: &DaemonState,
-    cfg: &Config,
-    req: GlobalizeMarkdownRequest,
-) -> DaemonResponse {
-    let corpora = match effective_corpora(cfg) {
-        Ok(v) => v,
-        Err(resp) => return resp,
-    };
-
-    // Resolve the single global corpus. None / more-than-one is a config
-    // error the caller can't fix per-request, so surface it as InvalidParams.
-    let globals: Vec<&CorpusConfig> = corpora.iter().filter(|c| c.global).collect();
-    let global = match globals.as_slice() {
-        [] => {
-            return DaemonResponse::invalid_params(
-                "no global corpus configured; mark one [[corpus]] with global = true",
-            );
-        }
-        [only] => (*only).clone(),
-        _ => {
-            return DaemonResponse::internal(
-                "more than one corpus marked global = true; config validation should have rejected this",
-            );
-        }
-    };
-
-    let source = match pick_corpus(&corpora, Some(&req.source_corpus)) {
-        Ok(c) => c,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-
-    // Reject the no-op self-copy (spec open question, leaning reject).
-    if source.name == global.name {
-        return DaemonResponse::invalid_params(format!(
-            "source corpus {:?} is already the global corpus; nothing to globalize",
-            source.name,
-        ));
-    }
-
-    // Read the source entry (symlink-safe). Globalize is a mutation, so both
-    // sides require a single-root corpus (Curd B).
-    let source_root = match require_single_root(&source) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-    let source_rel = match safe_relative_path(&req.path) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let source_abs = source_root.join(&source_rel);
-    if let Err(e) = ensure_corpus_allows_file(&source, &source_abs) {
-        return DaemonResponse::invalid_params(e.into_inner());
-    }
-
-    let read_root = source_root.clone();
-    let read_rel = source_rel.clone();
-    let read_err_rel = source_rel.clone();
-    let read = tokio::task::spawn_blocking(move || read_no_follow(&read_root, &read_rel)).await;
-    let bytes = match read {
-        Ok(Ok(b)) => b,
-        Ok(Err(WriteError { kind, source })) => {
-            return map_read_error(kind, source, &read_err_rel);
-        }
-        Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "globalize_markdown read task panicked",
-            );
-            return DaemonResponse::internal(format!("read task panicked: {join_err}"));
-        }
-    };
-
-    // Destination path defaults to the source path.
-    let dest_raw = req.dest_path.as_deref().unwrap_or(req.path.as_str());
-    let dest_root = match require_single_root(&global) {
-        Ok(r) => r,
-        Err(resp) => return resp,
-    };
-    let dest_rel = match safe_relative_path(dest_raw) {
-        Ok(r) => r,
-        Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-    };
-    let dest_check = dest_root.join(&dest_rel);
-    if let Err(e) = ensure_corpus_allows_file(&global, &dest_check) {
-        return DaemonResponse::invalid_params(e.into_inner());
-    }
-
-    let guard = match state.acquire_mutation_guard(&global.name).await {
-        Ok(g) => g,
-        Err(msg) => return DaemonResponse::internal(msg),
-    };
-
-    let write_root = dest_root.clone();
-    let write_rel = dest_rel.clone();
-    let write_err_rel = dest_rel.clone();
-    let overwrite = req.overwrite;
-    let written = tokio::task::spawn_blocking(move || {
-        atomic_write_no_follow(&write_root, &write_rel, &bytes, overwrite)
-    })
-    .await;
-    let dest_abs = match written {
-        Ok(Ok(p)) => p,
-        Ok(Err(WriteError { kind, source })) => {
-            let resp = match kind {
-                WriteErrorKind::Exists => DaemonResponse::invalid_params(format!(
-                    "{} already exists in the global corpus; pass overwrite=true to replace it",
-                    write_err_rel.display()
-                )),
-                WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => {
-                    DaemonResponse::invalid_params(format!(
-                        "refusing unsafe path {}: {source}",
-                        write_err_rel.display()
-                    ))
-                }
-                WriteErrorKind::Io => DaemonResponse::internal(source.to_string()),
-            };
-            drop(guard);
-            return resp;
-        }
-        Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "globalize_markdown write task panicked",
-            );
-            drop(guard);
-            return DaemonResponse::internal(format!("write task panicked: {join_err}"));
-        }
-    };
-
-    // Reindex the global corpus row for the just-written file. Empty content
-    // produces zero chunks; the indexer counts it as files_skipped_empty.
-    let stats = {
-        let store = state.store();
-        let chunker = state.make_chunker();
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    drop(guard);
-                    return DaemonResponse::internal(e.to_string());
-                }
-            }
-        } else {
-            None
-        };
-        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
-            .as_mut()
-            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(&store, embedder_dyn, &chunker, &global, &dest_abs).await {
-            Ok(s) => s,
-            Err(e) => {
-                drop(guard);
-                return DaemonResponse::internal(e.to_string());
-            }
-        }
-    };
-    drop(guard);
-
-    let report = IndexReport {
-        corpora: vec![CorpusReport {
-            name: global.name.clone(),
-            files_upserted: stats.files_upserted,
-            files_touched: stats.files_touched,
-            files_deleted: stats.files_deleted,
-            files_skipped_empty: stats.files_skipped_empty,
-            chunks_inserted: stats.chunks_inserted,
-            embeddings_inserted: stats.embeddings_inserted,
-        }],
-    };
-    DaemonResponse::ok(&GlobalizeMarkdownResult {
-        source_corpus: source.name,
-        source_path: source_rel.to_string_lossy().into_owned(),
-        global_corpus: global.name,
-        dest_path: dest_rel.to_string_lossy().into_owned(),
-        absolute_path: dest_abs.to_string_lossy().into_owned(),
-        indexed: report,
     })
 }
 
@@ -1523,21 +1350,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_with_no_repo_config_returns_config_error() {
-        // A `cwd` whose ancestry contains neither `.hallouminate/` nor `.git`
-        // until the filesystem root must surface as
-        // `DaemonResponse::Err { kind: InvalidParams, .. }` carrying the
-        // "filesystem root" discovery-walk error. The dispatcher must NOT
-        // fall back to baseline-only here.
+    async fn dispatch_above_all_repos_falls_back_to_baseline_corpora() {
+        // Issue #102: a `cwd` whose ancestry contains neither `.hallouminate/`
+        // nor `.git` until the filesystem root must NOT hard-error every op.
+        // The discovery walk reaches the root with no boundary, so dispatch
+        // resolves baseline-only — the baseline-declared corpora stay reachable
+        // from a parent-of-repos directory instead of being stranded.
         let tmp = tempfile::tempdir().expect("tempdir");
         let cwd = tmp.path().to_path_buf();
         let ground = tmp.path().join("ground");
-        let state = state_with_ground(&ground, "").await;
+        // Baseline declares a globally-searchable corpus (the XDG analogue of
+        // `cheese-global` in the issue repro).
+        let state = state_with_ground(
+            &ground,
+            "[[corpus]]\nname = \"cheese-global\"\npaths = [\"/srv/cheese-global\"]\n",
+        )
+        .await;
 
-        // ListCorpora is config-dependent (it runs `resolve_for_cwd`), unlike
-        // Ping which is now a config-independent control op (Curd C).
+        // ListCorpora is config-dependent (it runs `resolve_for_cwd`); from
+        // above all repos it must list the baseline corpus, not error.
         let req = DaemonRequest {
             cwd: cwd.clone(),
+            payload: DaemonRequestPayload::ListCorpora,
+        };
+        let resp = dispatch(&state, req).await;
+        match resp {
+            DaemonResponse::Ok { result } => {
+                let entries = result.as_array().expect("ListCorpora returns an array");
+                let names: Vec<&str> = entries
+                    .iter()
+                    .filter_map(|e| e.get("name").and_then(serde_json::Value::as_str))
+                    .collect();
+                assert!(
+                    names.contains(&"cheese-global"),
+                    "baseline corpus must be reachable from above all repos; got {names:?}",
+                );
+            }
+            // Unusual CI sandbox whose tmp tree sits inside a checkout trips a
+            // `.git` boundary before the root — that path is still a hard error
+            // (covered explicitly below), and acceptable here.
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+                assert!(message.contains("stopped at repo root"), "{message}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_inside_repo_without_config_still_hard_errors() {
+        // Issue #102 keeps the deliberate in-repo strictness: a `.git` boundary
+        // with no `.hallouminate/config.toml` between cwd and the repo root must
+        // still fail every config-dependent op rather than silently fall back to
+        // baseline-only. Only the no-`.git` parent-dir case soft-falls-back.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().to_path_buf();
+        std::fs::create_dir(repo_root.join(".git")).expect("mkdir .git");
+        let cwd = repo_root.join("src");
+        std::fs::create_dir_all(&cwd).expect("mkdir nested");
+        let ground = tmp.path().join("ground");
+        let state = state_with_ground(&ground, "").await;
+
+        let req = DaemonRequest {
+            cwd,
             payload: DaemonRequestPayload::ListCorpora,
         };
         let resp = dispatch(&state, req).await;
@@ -1548,17 +1422,13 @@ mod tests {
                     ErrorKind::InvalidParams,
                     "discovery failure must map to InvalidParams: {message}",
                 );
-                // The discovery walk either reaches the filesystem root
-                // (most environments) or trips a `.git` boundary in unusual
-                // CI sandboxes whose tmp tree sits inside a checkout. Both
-                // outcomes prove dispatch refused to silently fall back.
                 assert!(
-                    message.contains("filesystem root") || message.contains("stopped at repo root"),
-                    "discovery error must explain the boundary: {message}",
+                    message.contains("stopped at repo root"),
+                    "in-repo discovery error must explain the boundary: {message}",
                 );
             }
             DaemonResponse::Ok { result } => {
-                panic!("must not fall back to baseline-only; got Ok({result:?})");
+                panic!("must not fall back to baseline-only inside a repo; got Ok({result:?})");
             }
         }
     }

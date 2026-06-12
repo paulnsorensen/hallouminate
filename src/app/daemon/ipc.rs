@@ -67,9 +67,6 @@ pub enum DaemonRequestPayload {
     ReadMarkdown(ReadMarkdownRequest),
     /// Unlink a markdown file from a corpus root and prune its index rows.
     DeleteMarkdown(DeleteMarkdownRequest),
-    /// Copy a single markdown entry from `source_corpus` into the corpus
-    /// marked `global = true`, reindexing the global corpus row synchronously.
-    GlobalizeMarkdown(GlobalizeMarkdownRequest),
     /// Ask the daemon to shut down gracefully: cancel the accept loop, drop
     /// the flock guard, and remove the socket file. The server acks with
     /// `"stopping"` before tearing down.
@@ -90,6 +87,11 @@ pub struct GroundRequest {
 pub struct IndexRequest {
     pub corpus: Option<String>,
     pub paths_from: Option<PathBuf>,
+    /// Fail the whole run if any selected corpus root is missing, instead of
+    /// the default skip-with-warning. Defaults to `false` so older clients
+    /// that omit the field keep the lenient behavior.
+    #[serde(default)]
+    pub strict: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,20 +123,6 @@ pub struct ReadMarkdownRequest {
 pub struct DeleteMarkdownRequest {
     pub corpus: String,
     pub path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlobalizeMarkdownRequest {
-    /// Corpus the entry currently lives in.
-    pub source_corpus: String,
-    /// Relative path of the entry within `source_corpus`.
-    pub path: String,
-    /// Destination path within the global corpus. Defaults to `path`.
-    #[serde(default)]
-    pub dest_path: Option<String>,
-    /// Replace an existing destination entry. Defaults to false.
-    #[serde(default)]
-    pub overwrite: bool,
 }
 
 /// Daemon response envelope. `Ok` carries an opaque JSON payload — each
@@ -239,17 +227,6 @@ pub struct DeleteMarkdownResult {
     pub path: String,
     pub absolute_path: String,
     pub file_ref: String,
-}
-
-/// `GlobalizeMarkdown` payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GlobalizeMarkdownResult {
-    pub source_corpus: String,
-    pub source_path: String,
-    pub global_corpus: String,
-    pub dest_path: String,
-    pub absolute_path: String,
-    pub indexed: IndexReport,
 }
 
 /// `Ping` reply payload (Curd C — cross-version daemon skew). Carries the

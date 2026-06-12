@@ -45,17 +45,23 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 ```
 
 Prebuilts cover Apple-silicon macOS (`aarch64-apple-darwin`) and x86_64 /
-aarch64 Linux. Alternatives, in cascade order:
+aarch64 Linux (glibc ≥ 2.39). Re-run the one-liner any time to upgrade.
+Alternatives, in cascade order:
 
 ```sh
 cargo binstall hallouminate          # same prebuilts, via dist-manifest.json
 cargo install hallouminate --locked  # source build — needs Rust + protoc
 ```
 
-Intel macOS has no prebuilt (`ort`/ONNX Runtime ships none — pykeio/ort#556);
-use the source build there. **Windows is unsupported** — the daemon is
-Unix-only (Unix domain socket + `flock`); see
-[#48](https://github.com/paulnsorensen/hallouminate/issues/48).
+Source builds need `protoc` (the `lancedb` build dependency:
+`brew install protobuf` / `apt install protobuf-compiler`); from a git
+checkout, `cargo build --release` lands the binary at
+`target/release/hallouminate`.
+
+Intel macOS and older-glibc Linux have no prebuilt (`ort`/ONNX Runtime ships
+no Intel-mac build — pykeio/ort#556); use the source build there. **Windows
+is unsupported** — the daemon is Unix-only (Unix domain socket + `flock`);
+see [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
 
 Verify with `hallouminate --version`.
 
@@ -100,14 +106,6 @@ cargo run -- ground "how does the daemon work"   # CLI semantic search
 cargo run -- config show                 # print the effective merged config
 ```
 
-## Build
-
-```sh
-cargo build --release
-```
-
-The binary lands in `target/release/hallouminate`.
-
 ## MCP
 
 `hallouminate serve` starts a stdio MCP server. Tools:
@@ -124,8 +122,8 @@ The binary lands in `target/release/hallouminate`.
   blocks, heading-level jumps) without blocking or rewriting the content.
 - `read_markdown` — verbatim UTF-8 file contents. Use before overwriting.
 - `delete_markdown` — unlink the file and prune its rows from the index.
-- `globalize_markdown` — copy an entry into the global corpus to share it
-  across repos.
+- `get_footnote` — resolve a single citation: the footnote target for a
+  page's `#footnote_number`.
 
 Markdown content is stored verbatim — hallouminate imposes no schema.
 Convention for LLM wiki authors: one topic per file, first line `# Title`,

@@ -83,7 +83,11 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
         )?;
     print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
-    if let Some(advisory) = unregistered_wiki_advisory(&layers.repo_path, &effective) {
+    if let Some(advisory) = layers
+        .repo_path
+        .as_deref()
+        .and_then(|p| unregistered_wiki_advisory(p, &effective))
+    {
         println!();
         println!("warning: {advisory}");
     }
@@ -145,14 +149,22 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     // Non-fatal advisory: an on-disk wiki that no corpus serves. Printed
     // alongside the fatal warnings but excluded from the exit-code count —
     // it's a hint, not an error (issue #32).
-    let advisory = unregistered_wiki_advisory(&layers.repo_path, &effective);
+    let advisory = layers
+        .repo_path
+        .as_deref()
+        .and_then(|p| unregistered_wiki_advisory(p, &effective));
+    let root_advisories = missing_root_advisories(&effective);
     let warnings = collect_warnings(raw.as_deref(), &effective);
 
-    if advisory.is_some() || !warnings.is_empty() {
+    let any_advisory = advisory.is_some() || !root_advisories.is_empty();
+    if any_advisory || !warnings.is_empty() {
         println!();
     }
     if let Some(advisory) = &advisory {
         println!("warning: {advisory}");
+    }
+    for a in &root_advisories {
+        println!("warning: {a}");
     }
     for w in &warnings {
         println!("warning: {w}");
@@ -220,7 +232,10 @@ fn print_layered_header(baseline: &BaselineSource, layers: &ResolvedLayers) {
     // public shape; the header above already named it under the
     // source-agnostic "baseline" label.
     let _ = &layers.xdg_path;
-    println!("repo: {} (loaded)", layers.repo_path.display());
+    match &layers.repo_path {
+        Some(p) => println!("repo: {} (loaded)", p.display()),
+        None => println!("repo: not found (baseline-only)"),
+    }
 }
 
 fn print_effective_summary(cfg: &Config) -> anyhow::Result<()> {
@@ -348,6 +363,33 @@ fn unregistered_wiki_advisory(repo_config_path: &Path, cfg: &Config) -> Option<S
          add a [[repository]] entry to make it searchable",
         wiki_dir.display()
     ))
+}
+
+/// Non-fatal advisory: effective corpora whose declared roots don't exist on
+/// disk. Surfaces the same condition `hallouminate index` skips-with-warning,
+/// so the problem is visible before index time (issue #101). One line per
+/// corpus, naming the missing roots; empty when every root is present.
+fn missing_root_advisories(cfg: &Config) -> Vec<String> {
+    let Ok(corpora) = cfg.effective_corpora() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for corpus in &corpora {
+        let missing = crate::domain::corpus::missing_roots(corpus);
+        if missing.is_empty() {
+            continue;
+        }
+        let roots = missing
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!(
+            "corpus {:?}: root {roots} does not exist — `index` will skip it",
+            corpus.name
+        ));
+    }
+    out
 }
 
 /// True for the canonical `repo:{name}:wiki` derived-corpus naming.

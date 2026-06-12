@@ -18,8 +18,8 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    DeleteMarkdownRequest, ErrorKind, GlobalizeMarkdownRequest, ReadMarkdownRequest, connect_at,
-    serve, spawn_signal_handlers,
+    DeleteMarkdownRequest, ErrorKind, ReadMarkdownRequest, connect_at, serve,
+    spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -689,6 +689,7 @@ ground_dir = "{g}"
             payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
+                strict: false,
             }),
         })
         .await
@@ -1263,242 +1264,6 @@ impl Drop for EnvGuard {
     }
 }
 
-// ─── Curd 5: globalize_markdown ──────────────────────────────────────────
-
-fn global_corpus_cfg(ground_dir: &Path, src_root: &Path, global_root: &Path) -> Config {
-    let toml = format!(
-        r#"
-[[corpus]]
-name = "src"
-paths = ["{s}"]
-globs = ["**/*.md"]
-
-[[corpus]]
-name = "cheese-global"
-paths = ["{gl}"]
-globs = ["**/*.md"]
-global = true
-
-[storage]
-ground_dir = "{g}"
-"#,
-        s = src_root.display(),
-        gl = global_root.display(),
-        g = ground_dir.display(),
-    );
-    toml::from_str(&toml).expect("parse cfg")
-}
-
-#[tokio::test]
-async fn globalize_copies_entry_into_global_corpus_source_stays() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ground = tmp.path().join("ground");
-    let src_root = tmp.path().join("src");
-    let global_root = tmp.path().join("global");
-    std::fs::create_dir_all(&src_root).expect("mkdir src");
-    std::fs::create_dir_all(&global_root).expect("mkdir global");
-    // Empty body keeps the indexer off the embedding model.
-    std::fs::write(src_root.join("note.md"), "").expect("seed source entry");
-    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
-    // DaemonHarness seeds its own tempdir cwd with an empty repo-layer config,
-    // so requests using `harness.cwd()` resolve discovery trivially.
-    let harness = DaemonHarness::spawn(cfg).await;
-    let client = connect_at(harness.socket()).await.expect("connect");
-
-    let resp: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
-                source_corpus: "src".into(),
-                path: "note.md".into(),
-                dest_path: None,
-                overwrite: false,
-            }),
-        })
-        .await
-        .expect("globalize ok");
-
-    assert_eq!(resp["global_corpus"].as_str(), Some("cheese-global"));
-    assert_eq!(resp["dest_path"].as_str(), Some("note.md"));
-    // Source stays (copy, not move).
-    assert!(src_root.join("note.md").exists(), "source must remain");
-    // Global copy exists.
-    assert!(
-        global_root.join("note.md").exists(),
-        "global copy must exist"
-    );
-}
-
-#[tokio::test]
-async fn globalize_without_global_corpus_errors() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ground = tmp.path().join("ground");
-    let corpus_root = tmp.path().join("corpus");
-    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
-    std::fs::write(corpus_root.join("note.md"), "").expect("seed");
-    let cfg = docs_cfg(&ground, &corpus_root);
-    let harness = DaemonHarness::spawn(cfg).await;
-    let client = connect_at(harness.socket()).await.expect("connect");
-
-    let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
-                source_corpus: "docs".into(),
-                path: "note.md".into(),
-                dest_path: None,
-                overwrite: false,
-            }),
-        })
-        .await
-        .expect("transport ok");
-    match resp {
-        DaemonResponse::Err {
-            kind: ErrorKind::InvalidParams,
-            message,
-        } => {
-            assert!(
-                message.contains("global"),
-                "must mention global corpus: {message}"
-            );
-        }
-        other => panic!("expected InvalidParams when no global corpus, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn globalize_existing_dest_without_overwrite_errors() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ground = tmp.path().join("ground");
-    let src_root = tmp.path().join("src");
-    let global_root = tmp.path().join("global");
-    std::fs::create_dir_all(&src_root).expect("mkdir src");
-    std::fs::create_dir_all(&global_root).expect("mkdir global");
-    std::fs::write(src_root.join("note.md"), "").expect("seed source");
-    std::fs::write(global_root.join("note.md"), "").expect("pre-existing dest");
-    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
-    let harness = DaemonHarness::spawn(cfg).await;
-    let client = connect_at(harness.socket()).await.expect("connect");
-
-    let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
-                source_corpus: "src".into(),
-                path: "note.md".into(),
-                dest_path: None,
-                overwrite: false,
-            }),
-        })
-        .await
-        .expect("transport ok");
-    match resp {
-        DaemonResponse::Err {
-            kind: ErrorKind::InvalidParams,
-            message,
-        } => {
-            assert!(
-                message.contains("already exists"),
-                "must report collision: {message}"
-            );
-        }
-        other => panic!("expected InvalidParams on existing dest, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn globalize_self_copy_into_global_corpus_errors() {
-    // Spec open question (Curd 5), leaning reject: globalizing FROM the
-    // global corpus itself is a no-op self-copy. The handler must refuse it
-    // with InvalidParams rather than redundantly re-copying a file onto
-    // itself. Without this guard a caller could pass source_corpus ==
-    // cheese-global and silently round-trip the file through the same root.
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ground = tmp.path().join("ground");
-    let src_root = tmp.path().join("src");
-    let global_root = tmp.path().join("global");
-    std::fs::create_dir_all(&src_root).expect("mkdir src");
-    std::fs::create_dir_all(&global_root).expect("mkdir global");
-    std::fs::write(global_root.join("note.md"), "").expect("seed global entry");
-    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
-    let harness = DaemonHarness::spawn(cfg).await;
-    let client = connect_at(harness.socket()).await.expect("connect");
-
-    let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
-                // Source IS the global corpus.
-                source_corpus: "cheese-global".into(),
-                path: "note.md".into(),
-                dest_path: None,
-                overwrite: false,
-            }),
-        })
-        .await
-        .expect("transport ok");
-    match resp {
-        DaemonResponse::Err {
-            kind: ErrorKind::InvalidParams,
-            message,
-        } => {
-            assert!(
-                message.contains("already the global corpus"),
-                "self-copy rejection must explain the no-op: {message}"
-            );
-        }
-        other => panic!("expected InvalidParams on self-copy, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn globalize_honors_dest_path_override() {
-    // Boundary: `dest_path` defaults to the source path, but when supplied
-    // it must rename the entry inside the global corpus. The renamed file
-    // must exist at the override path, and the source-named path must NOT be
-    // created in the global root — proving the override is honored, not
-    // ignored (which would silently write to the default source path).
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ground = tmp.path().join("ground");
-    let src_root = tmp.path().join("src");
-    let global_root = tmp.path().join("global");
-    std::fs::create_dir_all(&src_root).expect("mkdir src");
-    std::fs::create_dir_all(&global_root).expect("mkdir global");
-    std::fs::write(src_root.join("note.md"), "").expect("seed source entry");
-    let cfg = global_corpus_cfg(&ground, &src_root, &global_root);
-    let harness = DaemonHarness::spawn(cfg).await;
-    let client = connect_at(harness.socket()).await.expect("connect");
-
-    let resp: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
-                source_corpus: "src".into(),
-                path: "note.md".into(),
-                dest_path: Some("renamed/elsewhere.md".into()),
-                overwrite: false,
-            }),
-        })
-        .await
-        .expect("globalize ok");
-
-    assert_eq!(
-        resp["dest_path"].as_str(),
-        Some("renamed/elsewhere.md"),
-        "response must echo the override dest_path: {resp:?}"
-    );
-    assert!(
-        global_root.join("renamed/elsewhere.md").exists(),
-        "global copy must land at the override path"
-    );
-    assert!(
-        !global_root.join("note.md").exists(),
-        "override must not also write the default source-named path"
-    );
-    // Source stays untouched (copy, not move).
-    assert!(src_root.join("note.md").exists(), "source must remain");
-}
-
 // ─── Curd 3: corpus watcher ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -1800,76 +1565,145 @@ async fn daemon_delete_markdown_from_multi_root_corpus_is_rejected() {
     );
 }
 
-#[tokio::test]
-async fn globalize_from_a_multi_root_source_corpus_is_rejected() {
-    // Curd B: globalize is a mutation, so its source side requires a
-    // single-root corpus. A 2-root source has no canonical write/read root
-    // for the mutation contract, so it must refuse with the "roots" reason
-    // rather than silently resolving paths[0].
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let ground = tmp.path().join("ground");
-    let src_a = tmp.path().join("src-a");
-    let src_b = tmp.path().join("src-b");
-    let global_root = tmp.path().join("global");
-    std::fs::create_dir_all(&src_a).expect("mkdir src-a");
-    std::fs::create_dir_all(&src_b).expect("mkdir src-b");
-    std::fs::create_dir_all(&global_root).expect("mkdir global");
-    std::fs::write(src_a.join("note.md"), "").expect("seed");
+// ─── Issue #101: a missing corpus root must not abort the whole run ───────
+
+/// Embeddings-off baseline config with two `[[corpus]]` entries: a healthy
+/// root (exists, empty) and a ghost root (does not exist). The daemon boots
+/// in lexical-only mode so the test indexes without downloading a model.
+fn cfg_two_corpora_one_missing(
+    ground_dir: &Path,
+    healthy_root: &Path,
+    ghost_root: &Path,
+) -> Config {
     let toml = format!(
         r#"
 [[corpus]]
-name = "src"
-paths = ["{a}", "{b}"]
+name = "healthy"
+paths = ["{healthy}"]
 globs = ["**/*.md"]
 
 [[corpus]]
-name = "cheese-global"
-paths = ["{gl}"]
+name = "ghost"
+paths = ["{ghost}"]
 globs = ["**/*.md"]
-global = true
 
 [storage]
-ground_dir = "{g}"
+ground_dir = "{ground}"
 
 [embeddings]
 enabled = false
 "#,
-        a = src_a.display(),
-        b = src_b.display(),
-        gl = global_root.display(),
-        g = ground.display(),
+        healthy = healthy_root.display(),
+        ghost = ghost_root.display(),
+        ground = ground_dir.display(),
     );
-    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    toml::from_str(&toml).expect("two-corpora toml parses")
+}
+
+#[tokio::test]
+async fn index_skips_missing_corpus_root_and_indexes_the_rest() {
+    // Regression for #101: a single configured corpus whose root does not
+    // exist on disk used to abort the ENTIRE index run with a fatal walk
+    // error ("No such file or directory"), taking down every healthy corpus
+    // on the box. The run must instead skip the missing corpus with a warning
+    // and still index the rest — the whole point of a portable/synced
+    // baseline config where some roots only exist on some machines.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let healthy_root = tmp.path().join("healthy-corpus");
+    std::fs::create_dir_all(&healthy_root).expect("mkdir healthy corpus");
+    // Never created on disk — this is the ghost root that used to be fatal.
+    let ghost_root = tmp.path().join("does-not-exist-xyz");
+
+    let cfg = cfg_two_corpora_one_missing(&ground, &healthy_root, &ghost_root);
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
         .call_raw(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::GlobalizeMarkdown(GlobalizeMarkdownRequest {
-                source_corpus: "src".into(),
-                path: "note.md".into(),
-                dest_path: None,
-                overwrite: false,
+            payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
+                corpus: None,
+                paths_from: None,
+                strict: false,
             }),
         })
         .await
-        .expect("transport ok");
-    match resp {
+        .expect("index transport ok");
+
+    let report: hallouminate::app::cli::IndexReport = match resp {
+        DaemonResponse::Ok { result } => {
+            serde_json::from_value(result).expect("index payload shape")
+        }
         DaemonResponse::Err { kind, message } => {
-            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            panic!("missing root must NOT abort the run, got {kind:?}: {message}");
+        }
+    };
+
+    // The healthy corpus was indexed; the ghost corpus was skipped entirely.
+    let indexed: Vec<&str> = report.corpora.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        indexed,
+        vec!["healthy"],
+        "only the healthy corpus should be indexed; ghost must be skipped: {indexed:?}"
+    );
+
+    // A warning names the skipped corpus and its missing root, so the user
+    // can see why it didn't index instead of getting silent partial output.
+    assert_eq!(
+        report.warnings.len(),
+        1,
+        "exactly one skip warning expected"
+    );
+    let w = &report.warnings[0];
+    assert!(
+        w.contains("ghost") && w.contains("skipped"),
+        "warning must name the skipped corpus: {w}"
+    );
+    assert!(
+        w.contains(&ghost_root.display().to_string()),
+        "warning must name the missing root path: {w}"
+    );
+}
+
+#[tokio::test]
+async fn index_strict_aborts_on_missing_corpus_root() {
+    // The `--strict` opt-out restores fail-fast: a caller who wants every
+    // configured root guaranteed present gets a hard error rather than a
+    // silent skip.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let healthy_root = tmp.path().join("healthy-corpus");
+    std::fs::create_dir_all(&healthy_root).expect("mkdir healthy corpus");
+    let ghost_root = tmp.path().join("does-not-exist-xyz");
+
+    let cfg = cfg_two_corpora_one_missing(&ground, &healthy_root, &ghost_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Index(hallouminate::app::daemon::IndexRequest {
+                corpus: None,
+                paths_from: None,
+                strict: true,
+            }),
+        })
+        .await
+        .expect("index transport ok");
+
+    match resp {
+        DaemonResponse::Err {
+            kind: ErrorKind::InvalidParams,
+            message,
+        } => {
             assert!(
-                message.contains("roots"),
-                "must explain the reason: {message}"
+                message.contains("does not exist")
+                    && message.contains(&ghost_root.display().to_string()),
+                "strict error must name the missing root: {message}"
             );
         }
-        DaemonResponse::Ok { result } => {
-            panic!("multi-root source globalize must be rejected; got Ok({result:?})")
-        }
+        other => panic!("strict mode must reject a missing root, got: {other:?}"),
     }
-    // Nothing copied into the global corpus.
-    assert!(
-        !global_root.join("note.md").exists(),
-        "rejected globalize must not write to the global corpus"
-    );
 }

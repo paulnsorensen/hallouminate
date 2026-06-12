@@ -202,6 +202,7 @@ path = "."
             payload: DaemonRequestPayload::Index(IndexRequest {
                 corpus: Some("repo:rcd-test:wiki".into()),
                 paths_from: None,
+                strict: false,
             }),
         })
         .await

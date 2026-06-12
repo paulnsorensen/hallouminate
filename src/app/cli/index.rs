@@ -19,6 +19,9 @@ pub struct IndexArgs {
     /// Optional daemon socket override. Mirrors `HALLOUMINATE_SOCKET` so
     /// test fixtures can pin the socket per-test without env mutation.
     pub socket: Option<PathBuf>,
+    /// Abort the run if any selected corpus root is missing, instead of the
+    /// default skip-with-warning.
+    pub strict: bool,
 }
 
 pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
@@ -61,6 +64,7 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
         payload: DaemonRequestPayload::Index(IndexRequest {
             corpus: args.corpus.clone(),
             paths_from: None,
+            strict: args.strict,
         }),
     };
     let report: IndexReport = client.call(req).await?;
@@ -139,6 +143,11 @@ fn ad_hoc_corpus_unsupported(file: &Path) -> anyhow::Error {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct IndexReport {
     pub corpora: Vec<CorpusReport>,
+    /// Corpora skipped during the run, one human-readable line each (e.g. a
+    /// missing root). Empty in the common all-healthy case, so it is omitted
+    /// from the JSON rather than serialized as `[]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
