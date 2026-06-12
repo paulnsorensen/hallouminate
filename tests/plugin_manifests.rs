@@ -79,6 +79,20 @@ fn claude_marketplace_resolves_to_the_plugin_directory() {
 #[test]
 fn codex_marketplace_resolves_to_the_plugin_directory() {
     let marketplace = read_json(".agents/plugins/marketplace.json");
+    assert_eq!(
+        str_at(&marketplace, "/name", ".agents/plugins/marketplace.json"),
+        "hallouminate",
+        "codex marketplace must have a stable install selector"
+    );
+    assert_eq!(
+        str_at(
+            &marketplace,
+            "/plugins/0/name",
+            ".agents/plugins/marketplace.json",
+        ),
+        "hallouminate",
+        "codex marketplace entry must name the plugin"
+    );
     let path = str_at(
         &marketplace,
         "/plugins/0/source/path",
@@ -95,6 +109,31 @@ fn codex_marketplace_resolves_to_the_plugin_directory() {
         "codex marketplace must keep a local path source"
     );
     assert_is_plugin_dir(&repo_root().join(path));
+}
+
+#[test]
+fn codex_plugin_manifest_declares_bundled_components() {
+    let codex = read_json("plugins/hallouminate/.codex-plugin/plugin.json");
+    assert_eq!(
+        str_at(&codex, "/skills", "codex plugin.json"),
+        "./skills/",
+        "codex plugin must expose the bundled skills"
+    );
+    assert_eq!(
+        str_at(&codex, "/mcpServers", "codex plugin.json"),
+        "./.mcp.json",
+        "codex plugin must expose the bundled MCP config"
+    );
+    assert_eq!(
+        str_at(&codex, "/author/name", "codex plugin.json"),
+        "Paul Sorensen",
+        "codex plugin must include required author metadata"
+    );
+    assert_eq!(
+        str_at(&codex, "/interface/displayName", "codex plugin.json"),
+        "Hallouminate",
+        "codex plugin must include required interface metadata"
+    );
 }
 
 #[test]
@@ -116,6 +155,11 @@ fn assert_is_plugin_dir(resolved: &Path) {
     assert!(
         resolved.join(".claude-plugin/plugin.json").is_file(),
         "{} does not contain .claude-plugin/plugin.json",
+        resolved.display()
+    );
+    assert!(
+        resolved.join(".codex-plugin/plugin.json").is_file(),
+        "{} does not contain .codex-plugin/plugin.json",
         resolved.display()
     );
     assert!(

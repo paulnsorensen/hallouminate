@@ -26,9 +26,10 @@ model-invocable too.)
 
 ```text
 codex plugin marketplace add paulnsorensen/hallouminate
+codex plugin add hallouminate@hallouminate
 ```
 
-Then restart Codex and install from the `/plugins` directory.
+Restart Codex after adding the marketplace so the plugin appears in `/plugins`.
 
 **opencode:** copy the skills and register the MCP server — see the
 [install matrix](../../README.md#per-harness-setup) in the root README.

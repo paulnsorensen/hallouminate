@@ -87,7 +87,8 @@ on the harness you are running in:
 
 - **Codex**: the plugin payload's `.mcp.json` registers the server when the
   plugin is installed (`codex plugin marketplace add paulnsorensen/hallouminate`,
-  restart, then install from the `/plugins` directory).
+  restart, then `codex plugin add hallouminate@hallouminate` or install from
+  `/plugins`).
 
 - **opencode**: add to `opencode.json` (project or home directory):
 

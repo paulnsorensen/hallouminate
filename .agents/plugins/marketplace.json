@@ -1,9 +1,11 @@
 {
+  "name": "hallouminate",
   "interface": {
-    "displayName": "hallouminate"
+    "displayName": "Hallouminate"
   },
   "plugins": [
     {
+      "name": "hallouminate",
       "source": {
         "source": "local",
         "path": "./plugins/hallouminate"
@@ -12,7 +14,7 @@
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
-      "category": "documentation"
+      "category": "Documentation"
     }
   ]
 }

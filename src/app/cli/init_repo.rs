@@ -96,12 +96,15 @@ mod tests {
         // discovery + merge — the same path `config validate --cwd` takes.
         let (effective, layers) =
             resolve_for_cwd(&Config::default(), dir.path(), None).expect("resolve seeded repo");
+        let repo_path = layers.repo_path.expect("repo config path");
         assert_eq!(
-            layers.repo_path,
+            repo_path.canonicalize().expect("canonicalize repo path"),
             dir.path()
                 .canonicalize()
                 .expect("canonicalize")
                 .join(".hallouminate/config.toml")
+                .canonicalize()
+                .expect("canonicalize expected config path")
         );
         let names: Vec<String> = effective
             .effective_corpora()
