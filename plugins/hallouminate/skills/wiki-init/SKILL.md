@@ -74,6 +74,9 @@ your working notes), separating *what was said* from *how it'll be written*.
 - Top-level files for foundational topics (`architecture.md`, `mcp-surface.md`);
   subdirectories for clusters (`adapters/lance.md`). The daemon creates dirs and
   maintains each `index.md` link list for you.
+- Shape every page on the pack's formal entry template
+  (`../../templates/wiki-entry.md` from this skill's directory): lifecycle
+  frontmatter, H1 first, footnote citations, provenance footer.
 - Write a **`wiki-conventions.md`** first (the wiki's constitution): slug rules, the
   H1 rule, one-topic-per-file, the voice, and a provenance-footer convention
   (`_Source: <how we know this> · Updated: <date> · Supersedes: <if any>_`). Declare
