@@ -277,7 +277,7 @@ fn first_body_line(text: &str) -> &str {
     let body = text
         .splitn(3, "---\n")
         .nth(2)
-        .expect("template must open with a ----fenced frontmatter block");
+        .expect("template must open with a ---fenced frontmatter block");
     body.lines().find(|l| !l.trim().is_empty()).unwrap_or("")
 }
 
@@ -285,7 +285,7 @@ fn first_body_line(text: &str) -> &str {
 fn frontmatter_block(text: &str) -> &str {
     text.split("---\n")
         .nth(1)
-        .expect("template must open with a ----fenced frontmatter block")
+        .expect("template must open with a ---fenced frontmatter block")
 }
 
 /// True when the frontmatter block (not the body) carries a `key:` line.

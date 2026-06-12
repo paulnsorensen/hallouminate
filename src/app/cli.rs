@@ -71,7 +71,7 @@ pub enum Command {
 pub struct InitRepoCli {
     /// `[[repository]]` name; the wiki becomes the `repo:<name>:wiki` corpus.
     pub name: String,
-    /// Repo root to seed (defaults to the current directory).
+    /// Repo root to seed (created if absent; defaults to the current directory).
     #[arg(long, value_name = "PATH")]
     pub path: Option<PathBuf>,
     /// Overwrite an existing `.hallouminate/config.toml`. Never clobbers an
