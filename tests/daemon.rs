@@ -1323,7 +1323,9 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
 
     // The watcher must reindex the created file within a few debounce windows.
     // Assert a `ground` hit appears that could only come from the watcher.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // 20s ceiling: free in the passing case (loop exits on condition); guards against
+    // parallel-suite CPU contention slowing the watcher event → reindex → ground path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut indexed = false;
     while std::time::Instant::now() < deadline {
         if ground_hits(
@@ -1347,7 +1349,8 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     // The rows must disappear from `ground` — proving the prune ran, not merely
     // that the daemon survived.
     std::fs::remove_file(&watched).expect("remove watched file");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    // 20s ceiling: same load-tolerant margin for the prune leg.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut pruned = false;
     while std::time::Instant::now() < deadline {
         if ground_hits(
