@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result, expand_tilde};
+use crate::domain::corpus::blake3_bytes;
 
 /// Declaration of a single repository tenant.
 ///
@@ -233,7 +234,6 @@ pub fn union_discovered_repositories(
 ) -> (Vec<RepositoryConfig>, Vec<String>) {
     let baseline_wiki_paths: std::collections::HashSet<PathBuf> =
         baseline.iter().map(canonical_wiki_path).collect();
-    let baseline_count = baseline.len();
     let mut out: Vec<RepositoryConfig> = baseline.to_vec();
     let mut warnings: Vec<String> = Vec::new();
     for mut repo in discovered {
@@ -246,7 +246,13 @@ pub fn union_discovered_repositories(
             continue;
         };
         if let Some(pos) = position_by_derived_name(&out, &name) {
-            if pos < baseline_count {
+            // Decide baseline-vs-discovered by the matched entry's wiki path,
+            // not by a frozen index boundary: `out.remove` below shifts indices,
+            // so an index captured once would mis-classify a later sibling after
+            // any baseline removal (re-opening the silent-drop bug this cure
+            // closed). Membership in `baseline_wiki_paths` is removal-stable.
+            let matched_is_baseline = baseline_wiki_paths.contains(&canonical_wiki_path(&out[pos]));
+            if matched_is_baseline {
                 // Discovered vs. baseline: prefer the discovered local repo and
                 // drop the baseline entry of the same derived name.
                 warnings.push(format!(
@@ -259,10 +265,7 @@ pub fn union_discovered_repositories(
                 // keep, so disambiguate the later repo's name instead of
                 // dropping it — silently losing one would violate "union of all
                 // discovered wikis".
-                disambiguate_discovered_name(&mut repo, &out);
-                let new_name = repo_corpus_name(&repo.name, RepoCorpusKind::Wiki)
-                    .ok()
-                    .unwrap_or_else(|| name.clone());
+                let new_name = disambiguate_discovered_name(&mut repo, &out);
                 warnings.push(format!(
                     "discovered sub-repo wiki {name:?} (at {path:?}) collides with another \
                      discovered sub-repo of the same name; keeping both, renaming this one to \
@@ -288,17 +291,24 @@ fn position_by_derived_name(repos: &[RepositoryConfig], derived_name: &str) -> O
 }
 
 /// Rename a discovered repo so its derived wiki name no longer collides with
-/// any entry already in `existing`.
+/// any entry already in `existing`, and return the new derived corpus name.
 ///
 /// Qualifies the basename with parent directory segments (`tern` →
 /// `personal-tern` → `dev-personal-tern` → …), walking up one segment at a
 /// time until the derived name is unique. Segments bearing `':'` are sanitized
-/// to `-` so the qualified name still passes `repo_corpus_name`. Falls back to
-/// the un-prefixed name when no further parent segment is available — the rare
-/// case of two same-named roots whose full paths offer no distinguishing
-/// ancestor leaves the original collision in place rather than fabricating a
-/// name.
-fn disambiguate_discovered_name(repo: &mut RepositoryConfig, existing: &[RepositoryConfig]) {
+/// to `-` so the qualified name still passes `repo_corpus_name`.
+///
+/// When no parent segment disambiguates (an empty-segment path, or every
+/// qualified candidate re-collides), it appends a deterministic short hash of
+/// the repo path (`tern` → `tern-3f9a2b1c`) and bumps the digest length until
+/// the name is unique. This *guarantees* a unique, valid name on return —
+/// pushing a duplicate would trip `effective_corpora`'s dup-name guard and
+/// error-abort the whole ground request (spec: do not error-abort on
+/// collision). `repo.name` is always mutated to the returned base name.
+fn disambiguate_discovered_name(
+    repo: &mut RepositoryConfig,
+    existing: &[RepositoryConfig],
+) -> String {
     let base = repo.name.clone();
     let segments: Vec<String> = Path::new(&repo.path)
         .parent()
@@ -316,14 +326,38 @@ fn disambiguate_discovered_name(repo: &mut RepositoryConfig, existing: &[Reposit
     for take in 1..=segments.len() {
         let prefix = segments[segments.len() - take..].join("-");
         let candidate = format!("{prefix}-{base}");
-        let Ok(derived) = repo_corpus_name(&candidate, RepoCorpusKind::Wiki) else {
-            continue;
-        };
-        if position_by_derived_name(existing, &derived).is_none() {
+        if let Some(derived) = unique_derived_name(&candidate, existing) {
             repo.name = candidate;
-            return;
+            return derived;
         }
     }
+    // No parent segment disambiguated. Append a deterministic short path hash
+    // and lengthen it until unique, so the union always keeps both wikis under
+    // distinct names rather than pushing a duplicate that aborts the request.
+    let digest = blake3_bytes(repo.path.as_bytes());
+    for len in 8..=digest.len() {
+        let candidate = format!("{base}-{}", &digest[..len]);
+        if let Some(derived) = unique_derived_name(&candidate, existing) {
+            repo.name = candidate;
+            return derived;
+        }
+    }
+    // Unreachable in practice (a full 64-hex BLAKE3 collision against an
+    // existing name), but keep both wikis rather than panicking: fall back to
+    // the full-digest candidate.
+    let candidate = format!("{base}-{digest}");
+    let derived = repo_corpus_name(&candidate, RepoCorpusKind::Wiki).unwrap_or(base);
+    repo.name = candidate;
+    derived
+}
+
+/// Derive the `repo:{candidate}:wiki` name for `candidate` and return it only
+/// if it is valid and collides with no entry already in `existing`.
+fn unique_derived_name(candidate: &str, existing: &[RepositoryConfig]) -> Option<String> {
+    let derived = repo_corpus_name(candidate, RepoCorpusKind::Wiki).ok()?;
+    position_by_derived_name(existing, &derived)
+        .is_none()
+        .then_some(derived)
 }
 
 /// Canonicalized wiki directory for dedupe comparison. Best-effort: tilde is
@@ -675,6 +709,107 @@ mod tests {
         assert!(
             w.contains("keeping both"),
             "warning must state that both wikis are kept, not that one was dropped: {w:?}"
+        );
+    }
+
+    #[test]
+    fn union_baseline_tern_plus_two_discovered_tern_siblings_keeps_all_three_wikis() {
+        // Regression for the stale-`baseline_count` boundary: a baseline repo
+        // whose derived name collides with TWO discovered siblings. Iter 1
+        // removes the baseline `tern` (shifting indices); iter 2 must still
+        // recognize the surviving entry as discovered — not mis-branch it as
+        // baseline and silently drop it with a misleading shadow warning.
+        let baseline = vec![repo("tern", "/baseline/tern")];
+        let discovered = vec![
+            repo("tern", "/dev/work/tern"),
+            repo("tern", "/dev/personal/tern"),
+        ];
+        let (merged, warnings) = union_discovered_repositories(&baseline, discovered);
+
+        // Both discovered wikis survive (the baseline is the one shadowed/dropped).
+        let paths: Vec<&str> = merged.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/dev/work/tern") && paths.contains(&"/dev/personal/tern"),
+            "both discovered sibling wikis must survive, not be dropped: {paths:?}"
+        );
+        assert!(
+            !paths.contains(&"/baseline/tern"),
+            "the baseline `tern` is the entry shadowed by the discovered configs: {paths:?}"
+        );
+
+        // Derived corpus names must all be distinct so `effective_corpora`'s
+        // dup-name guard does not reject the set (the abort path).
+        effective_corpora(&[], &merged)
+            .expect("merged repos must derive a dup-free corpus set, not error-abort");
+
+        // Exactly one baseline-shadow warning (for the baseline), and the
+        // sibling collision is described as a discovered-vs-discovered rename,
+        // never a second silent drop with a baseline-shadow warning.
+        let shadow_warnings = warnings.iter().filter(|w| w.contains("shadows")).count();
+        assert_eq!(
+            shadow_warnings, 1,
+            "only the genuine baseline shadow warns about shadowing: {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("keeping both")),
+            "the discovered sibling collision must warn it kept both wikis: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn union_fallback_when_parent_segments_exhausted_still_keeps_both_with_unique_name() {
+        // A bare-basename path has no `Normal` parent segments to qualify with,
+        // so parent-segment disambiguation is exhausted on the second sibling.
+        // The fallback must still land a unique name (hash suffix) — never push
+        // a duplicate that trips `effective_corpora`'s dup-name guard and aborts
+        // the whole ground request (spec line 42: do not error-abort).
+        let baseline: Vec<RepositoryConfig> = Vec::new();
+        let discovered = vec![repo("tern", "tern"), repo("tern", "tern")];
+        let (merged, warnings) = union_discovered_repositories(&baseline, discovered);
+
+        assert_eq!(merged.len(), 2, "both bare-path siblings must be kept");
+        let corpora =
+            effective_corpora(&[], &merged).expect("fallback must not produce a duplicate name");
+        let mut names: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        let unique = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            unique,
+            "derived corpus names must be unique: {names:?}"
+        );
+        let renamed = &warnings[0];
+        assert!(
+            renamed.contains("keeping both") && !renamed.contains("repo:tern:wiki\" so"),
+            "warning must name the actual unique new name, not the original: {renamed:?}"
+        );
+    }
+
+    #[test]
+    fn union_fallback_when_qualified_candidate_recollides_lands_a_unique_name() {
+        // The first parent-segment candidate for `/x/personal/tern` is
+        // `personal-tern`, which already exists as a discovered repo. The
+        // disambiguator must keep climbing (or hash-suffix) to a unique name
+        // rather than re-colliding and pushing a duplicate.
+        let baseline: Vec<RepositoryConfig> = Vec::new();
+        let discovered = vec![
+            repo("tern", "/x/work/tern"),
+            repo("personal-tern", "/x/elsewhere/personal-tern"),
+            repo("tern", "/x/personal/tern"),
+        ];
+        let (merged, _warnings) = union_discovered_repositories(&baseline, discovered);
+        assert_eq!(merged.len(), 3, "all three distinct wikis must be kept");
+        let corpora = effective_corpora(&[], &merged)
+            .expect("a re-colliding qualified candidate must not abort the union");
+        let mut names: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            total,
+            "every derived corpus name must be unique: {names:?}"
         );
     }
 }
