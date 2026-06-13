@@ -89,31 +89,47 @@ pub fn discover_wiki_roots(
         // looks for `<dir>/.hallouminate`, so allow one extra level to reach
         // the `.hallouminate` directory entry sitting under a max-depth repo.
         .max_depth(Some(max_depth + 1));
-    if ignore.skip_hidden {
-        // `filter_entry` returning false prunes the entry and, for a
-        // directory, its whole subtree. Skip hidden dot directories so the
-        // walk never descends into `.git`, `.cache`, etc. — but always keep
-        // `.hallouminate`, which is the discovery target. The root entry is
-        // always kept: pruning it (when the root's own basename starts with a
-        // dot, e.g. a tempdir under `/tmp/.tmpXXXX`) would abort the walk.
-        let root = root.to_path_buf();
-        builder.filter_entry(move |entry| {
-            if entry.path() == root {
-                return true;
-            }
-            let name = entry.file_name();
-            name == ".hallouminate" || !name.to_str().map(|n| n.starts_with('.')).unwrap_or(false)
-        });
-    }
+    // Install a `filter_entry` unconditionally to prune `.git` directories
+    // regardless of `skip_hidden`. The walk doc promises ".git is skipped
+    // unconditionally"; gating this on `skip_hidden` would violate that
+    // guarantee when the caller passes `skip_hidden: false`. Other hidden
+    // dot directories are pruned only when `skip_hidden` is true.
+    let root_path = root.to_path_buf();
+    let skip_hidden = ignore.skip_hidden;
+    builder.filter_entry(move |entry| {
+        // Always keep the walk root (even if its own name starts with a dot).
+        if entry.path() == root_path {
+            return true;
+        }
+        let name = entry.file_name();
+        // Always keep `.hallouminate` — it is the discovery target.
+        if name == ".hallouminate" {
+            return true;
+        }
+        // Always prune `.git`, regardless of skip_hidden.
+        if name == ".git" {
+            return false;
+        }
+        // Prune all other dot directories only when skip_hidden is set.
+        if skip_hidden {
+            return !name.to_str().map(|n| n.starts_with('.')).unwrap_or(false);
+        }
+        true
+    });
 
     let mut out: Vec<DiscoveredWiki> = Vec::new();
     let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for entry in builder.build() {
-        let Ok(entry) = entry else {
-            // A per-entry walk error (permission denied, vanished dir) skips
-            // that entry rather than aborting the whole discovery — a single
-            // unreadable subtree must not strand every other repo's wiki.
-            continue;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(
+                    target: "hallouminate::discovery",
+                    error = %err,
+                    "discovery walk: skipping unreadable entry"
+                );
+                continue;
+            }
         };
         if entry.file_name() != ".hallouminate" {
             continue;
@@ -151,6 +167,12 @@ pub fn discover_wiki_roots(
             });
         }
     }
+    tracing::debug!(
+        target: "hallouminate::discovery",
+        roots = out.len(),
+        root = %root.display(),
+        "discovered sub-repo wikis"
+    );
     out
 }
 
@@ -349,6 +371,44 @@ mod tests {
         assert_eq!(
             found[0].wiki_dir,
             Some(repo_root.join(".hallouminate").join("wiki"))
+        );
+    }
+
+    #[test]
+    fn prunes_git_dirs_unconditionally_even_when_skip_hidden_false() {
+        // Fix 4: the `.git` prune was gated on `skip_hidden`, so a walk with
+        // `skip_hidden: false` would descend into `.git` subtrees. The filter is
+        // now unconditional: `.git` is always pruned; only OTHER hidden dirs are
+        // conditional.
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // A wiki buried under `.git/` — must NEVER be discovered.
+        let git_buried = tmp.path().join(".git").join("buried");
+        let hallou_git = git_buried.join(".hallouminate");
+        fs::create_dir_all(hallou_git.join("wiki")).expect("mkdir .git buried wiki");
+        fs::write(hallou_git.join("config.toml"), "").expect("write .git buried config");
+
+        // A wiki buried under `.cache/` — must be discovered when skip_hidden=false.
+        let cache_buried = tmp.path().join(".cache").join("cached");
+        let hallou_cache = cache_buried.join(".hallouminate");
+        fs::create_dir_all(hallou_cache.join("wiki")).expect("mkdir .cache buried wiki");
+        fs::write(hallou_cache.join("config.toml"), "").expect("write .cache buried config");
+
+        let rules = IgnoreRules {
+            respect_gitignore: false,
+            skip_hidden: false,
+        };
+        let found = discover_wiki_roots(tmp.path(), DEFAULT_MAX_DEPTH, &rules);
+        let roots: std::collections::HashSet<std::path::PathBuf> =
+            found.iter().map(|w| w.repo_root.clone()).collect();
+
+        assert!(
+            !roots.contains(&git_buried),
+            ".git-buried wiki must not be discovered (unconditional .git prune): {roots:?}"
+        );
+        assert!(
+            roots.contains(&cache_buried),
+            ".cache-buried wiki must be discovered when skip_hidden=false: {roots:?}"
         );
     }
 }

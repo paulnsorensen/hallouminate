@@ -494,3 +494,79 @@ async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpu
         }
     }
 }
+
+/// Fix 1 regression guard: when two corpora index the same absolute file path,
+/// their chunk_ids collide (chunk_id = blake3(file_ref#ord), file_ref = absolute
+/// path). A HashMap<chunk_id, corpus> collapses both attributions to one. The
+/// VecDeque queue must preserve both so BOTH corpora appear in the result.
+#[tokio::test]
+async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpora() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+
+    // One wiki file that BOTH corpora will index. Same absolute path => same
+    // chunk_id for every chunk in both corpora.
+    let wiki_dir = parent.path().join("shared_wiki");
+    fs::create_dir_all(&wiki_dir).expect("mkdir shared_wiki");
+    let wiki_file = wiki_dir.join("shared.md");
+    fs::write(
+        &wiki_file,
+        "# Shared\n\nThe distinctive token zphyxnort lives here.\n",
+    )
+    .expect("write shared wiki");
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let chunker =
+        hallouminate::domain::corpus::MarkdownChunker::new(text_splitter::Characters, 1500);
+
+    // Index the same directory under two distinct corpus names.
+    let corpus_a = hallouminate::domain::common::CorpusConfig {
+        name: "repo:alpha:wiki".to_string(),
+        paths: vec![wiki_dir.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".to_string()],
+        exclude: Vec::new(),
+        global: false,
+    };
+    let corpus_b = hallouminate::domain::common::CorpusConfig {
+        name: "repo:beta:wiki".to_string(),
+        paths: vec![wiki_dir.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".to_string()],
+        exclude: Vec::new(),
+        global: false,
+    };
+    let mut embedder = StubEmbedder;
+    index_corpus(&corpus_a, &store, Some(&mut embedder), &chunker)
+        .await
+        .expect("index alpha");
+    let mut embedder = StubEmbedder;
+    index_corpus(&corpus_b, &store, Some(&mut embedder), &chunker)
+        .await
+        .expect("index beta");
+
+    let targets = vec![
+        (corpus_a.name.clone(), corpus_a.paths.clone()),
+        (corpus_b.name.clone(), corpus_b.paths.clone()),
+    ];
+    let mut embedder = StubEmbedder;
+    let resp = ground_union(
+        "distinctive token",
+        &targets,
+        &store,
+        Some(&mut embedder),
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("union ground with colliding chunk_ids");
+
+    // Both corpora must appear in the attribution — the VecDeque queue must not
+    // have collapsed them to one.
+    let corpora_seen: std::collections::HashSet<&str> =
+        resp.docs.values().map(|d| d.corpus.as_str()).collect();
+    assert!(
+        corpora_seen.contains("repo:alpha:wiki") && corpora_seen.contains("repo:beta:wiki"),
+        "both corpora must appear in attribution even when chunk_ids collide; saw: {corpora_seen:?}"
+    );
+}

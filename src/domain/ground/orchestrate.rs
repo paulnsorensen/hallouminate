@@ -134,11 +134,18 @@ pub async fn ground_union(
     // One crossencoder pass over the MERGED set. The trait contract guarantees
     // rerank only reshuffles (no inserts/deletes), so the corpus tags stay
     // valid; rebuild the corpus lookup from the reordered hit list afterward.
+    // Use a FIFO queue per chunk_id so cross-corpus chunk_id collisions survive
+    // — two corpora indexing the same file path produce the same chunk_id, but
+    // both attributions must be preserved (same content, different corpus).
     let mut hits: Vec<SearchHit> = tagged.iter().map(|(h, _)| h.clone()).collect();
-    let corpus_of: std::collections::HashMap<String, String> = tagged
-        .into_iter()
-        .map(|(h, name)| (h.chunk_id, name))
-        .collect();
+    let mut corpus_queues: std::collections::HashMap<String, std::collections::VecDeque<String>> =
+        std::collections::HashMap::new();
+    for (h, name) in tagged.iter() {
+        corpus_queues
+            .entry(h.chunk_id.clone())
+            .or_default()
+            .push_back(name.clone());
+    }
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
@@ -151,7 +158,10 @@ pub async fn ground_union(
     let mut by_corpus: std::collections::HashMap<String, Vec<SearchHit>> =
         std::collections::HashMap::new();
     for hit in hits {
-        let corpus = corpus_of.get(&hit.chunk_id).cloned().unwrap_or_default();
+        let corpus = corpus_queues
+            .get_mut(&hit.chunk_id)
+            .and_then(|q| q.pop_front())
+            .unwrap_or_default();
         by_corpus.entry(corpus).or_default().push(hit);
     }
 
@@ -164,8 +174,18 @@ pub async fn ground_union(
                 chunk.provenance.corpus = corpus.clone();
             }
         }
-        // Paths are unique across corpora, so a plain extend is a clean union.
-        docs.extend(built);
+        // When two corpora index the same absolute path the file_ref keys
+        // collide. Disambiguate by appending the corpus to the key so both
+        // docs survive the union; the doc's `corpus` field still names the
+        // true source. The common case (unique paths) is unchanged.
+        for (path, doc) in built {
+            let key = if docs.contains_key(&path) {
+                format!("{path} [{corpus}]")
+            } else {
+                path
+            };
+            docs.insert(key, doc);
+        }
     }
 
     // Global top-N truncation over the merged docs, by doc score descending

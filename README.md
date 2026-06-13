@@ -148,11 +148,12 @@ working directory:
 
 - **Inside a repo** — the request defaults to that repo's `repo:<name>:wiki`.
 - **Above all repos** (e.g. `cd ~/Dev`) — a `ground` call with **no explicit
-  `corpus`** searches the _union_ of every sub-repo wiki discovered by a
-  bounded downward walk, plus the baseline-registered `[[repository]]` wikis.
-  The results are merged and re-ranked into one response, and **each hit is
-  attributed to its source corpus** (file-level `corpus` plus per-chunk
-  `provenance.corpus`).
+  `corpus`** searches the _union_ of every effective corpus: discovered sub-repo
+  wikis + baseline-registered `[[repository]]` wikis, plus user-declared
+  `[[corpus]]` entries and each repository's `repo:<name>:corpus` source corpus
+  when configured. The results are merged and re-ranked into one response, and
+  **each hit is attributed to its source corpus** (file-level `corpus` plus
+  per-chunk `provenance.corpus`).
 
 The downward walk is bounded: it honours `.gitignore`, skips hidden
 directories (except `.hallouminate` itself), caps its depth, and never scans

@@ -195,7 +195,7 @@ pub fn default_wiki_for_cwd(repositories: &[RepositoryConfig], cwd: &Path) -> Op
 /// a repo is skipped silently rather than aborting the union.
 pub fn repository_for_discovered_wiki(repo_root: &Path) -> Option<RepositoryConfig> {
     let name = repo_root.file_name()?.to_str()?.to_string();
-    if name.is_empty() || name.contains(':') {
+    if name.trim().is_empty() || name.contains(':') {
         return None;
     }
     Some(RepositoryConfig {
@@ -580,6 +580,24 @@ mod tests {
         assert!(
             repository_for_discovered_wiki(Path::new("/home/dev/a:b")).is_none(),
             "':'-bearing basename must yield None"
+        );
+    }
+
+    #[test]
+    fn repository_for_discovered_wiki_skips_whitespace_only_basename() {
+        // A sibling dir whose basename is whitespace-only (e.g. created by an
+        // unusual filesystem or symlink) passes the raw `is_empty()` check but
+        // fails `validate` which calls `trim().is_empty()`. The fix trims before
+        // the check so such a repo is dropped silently rather than hard-erroring
+        // the whole union resolve path.
+        //
+        // PathBuf lets us construct a path ending in a whitespace-only segment
+        // by pushing the literal segment onto an existing prefix.
+        let mut p = std::path::PathBuf::from("/home/dev");
+        p.push("   "); // whitespace-only basename
+        assert!(
+            repository_for_discovered_wiki(&p).is_none(),
+            "whitespace-only basename must yield None"
         );
     }
 
