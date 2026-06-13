@@ -38,7 +38,7 @@ parent checkout.
   parent checkout is left clean.
 
 The same class of issue applies to hallouminate's own `add_markdown` when
-run from a worktree — see [[wiki-conventions]] ("Where this wiki lives"):
+run from a worktree — see [wiki-conventions](wiki-conventions.md) ("Where this wiki lives"):
 pass an explicit `corpus`, or author from the main checkout.
 
 ## /tmp scratch builds fail: disk quota + cargo wrapper (exit 134)
