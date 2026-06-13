@@ -66,6 +66,30 @@ pub struct DocChunk {
     pub score: f64,
     /// Chunk text, trimmed to the request's `snippet_chars` when set.
     pub snippet: String,
+    /// Per-chunk provenance: which corpus this chunk came from (#106), and the
+    /// extension point for #88's claim-status marks. `#[serde(default)]` so a
+    /// strict-schema client reading a payload that predates this field (or one
+    /// that omits it) still deserializes, with `corpus` defaulting to empty.
+    #[serde(default)]
+    pub provenance: ChunkProvenance,
+}
+
+/// Provenance of a [`DocChunk`]: where it came from and (later) how trustworthy
+/// it is.
+///
+/// A nested sub-struct rather than flat fields on `DocChunk` so #88 extends
+/// *here* (`claim_status: Option<ClaimStatus>`) without a breaking wire-contract
+/// change to `DocChunk` itself. `#[serde(default)]` at the `DocChunk.provenance`
+/// site plus `Default` here keeps strict-schema clients from hard-breaking when
+/// the field is absent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChunkProvenance {
+    /// Name of the corpus this chunk's file belongs to. In a single-corpus
+    /// ground it mirrors the parent [`DocFile::corpus`]; in a cross-repo union
+    /// ground (#106) it attributes each chunk to its source wiki.
+    #[serde(default)]
+    pub corpus: String,
+    // #88 extends here: pub claim_status: Option<ClaimStatus>,
 }
 
 /// A non-fatal advisory attached to a [`GroundResponse`].
@@ -98,6 +122,9 @@ mod tests {
                     line_range: [134, 198],
                     score: 0.91,
                     snippet: "first ~200 chars of chunk text…".into(),
+                    provenance: ChunkProvenance {
+                        corpus: "tern-docs".into(),
+                    },
                 }],
             },
         );
@@ -130,7 +157,8 @@ mod tests {
                         "heading_path": ["Indexing pipeline", "Phase B"],
                         "line_range": [134, 198],
                         "score": 0.91,
-                        "snippet": "first ~200 chars of chunk text…"
+                        "snippet": "first ~200 chars of chunk text…",
+                        "provenance": { "corpus": "tern-docs" }
                     }]
                 }
             },
@@ -181,5 +209,26 @@ mod tests {
         assert!(actual["docs"].is_object());
         assert!(actual["code"].is_object());
         assert!(actual["warnings"].is_array());
+    }
+
+    #[test]
+    fn deserialize_chunk_without_provenance_defaults_corpus_to_empty() {
+        // #106 wire-contract guarantee: a payload predating `provenance` (or a
+        // strict-schema client that omits it) must still deserialize — the
+        // `#[serde(default)]` fills an empty-corpus provenance rather than
+        // hard-erroring. This is what makes #88's later `claim_status`
+        // extension non-breaking.
+        let legacy = json!({
+            "chunk_id": "abc123",
+            "heading_path": ["A", "B"],
+            "line_range": [1, 9],
+            "score": 0.5,
+            "snippet": "text"
+        });
+        let chunk: DocChunk = serde_json::from_value(legacy).expect("must deserialize");
+        assert_eq!(
+            chunk.provenance.corpus, "",
+            "absent provenance must default to an empty corpus, not error"
+        );
     }
 }

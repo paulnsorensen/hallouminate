@@ -134,7 +134,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::domain::ground::types::{DocChunk, Stats, Warning};
+    use crate::domain::ground::types::{ChunkProvenance, DocChunk, Stats, Warning};
 
     fn fixture() -> GroundResponse {
         let mut docs = BTreeMap::new();
@@ -153,6 +153,9 @@ mod tests {
                         line_range: [26, 28],
                         score: 0.91,
                         snippet: "Three research rounds on planning LLMs handling code.".into(),
+                        provenance: ChunkProvenance {
+                            corpus: "cheese".into(),
+                        },
                     },
                     DocChunk {
                         chunk_id: "def456".into(),
@@ -160,6 +163,9 @@ mod tests {
                         line_range: [44, 52],
                         score: 0.84,
                         snippet: "Signature-graph planning is unexplored in detail.".into(),
+                        provenance: ChunkProvenance {
+                            corpus: "cheese".into(),
+                        },
                     },
                 ],
             },

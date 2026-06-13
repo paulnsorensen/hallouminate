@@ -141,6 +141,31 @@ The config lives at `$XDG_CONFIG_HOME/hallouminate/config.toml`
 - `hallouminate config download` — pre-fetch the configured embedding model
   so the first `index` doesn't pay the download cost.
 
+## Cross-repo union search
+
+`ground` (and the read/list tools) resolve corpora relative to the caller's
+working directory:
+
+- **Inside a repo** — the request defaults to that repo's `repo:<name>:wiki`.
+- **Above all repos** (e.g. `cd ~/Dev`) — a `ground` call with **no explicit
+  `corpus`** searches the _union_ of every effective corpus: discovered sub-repo
+  wikis + baseline-registered `[[repository]]` wikis, plus user-declared
+  `[[corpus]]` entries and each repository's `repo:<name>:corpus` source corpus
+  when configured. The results are merged and re-ranked into one response, and
+  **each hit is attributed to its source corpus** (file-level `corpus` plus
+  per-chunk `provenance.corpus`).
+
+The downward walk is bounded: it honours `.gitignore`, skips hidden
+directories (except `.hallouminate` itself), caps its depth, and never scans
+above the working directory. Walk-discovered wikis are deduped against the
+baseline by resolved path; a discovered local config that collides with a
+baseline repository of the same name wins, with a `cross-repo-union` warning
+on the response rather than a silent shadow.
+
+Passing an explicit `corpus` always pins the search to that one corpus,
+unchanged. **Writes** (`add_markdown` / `delete_markdown`) still require an
+explicit single-root corpus — the multi-root union is read- and search-only.
+
 ## How the daemon works
 
 A long-lived local daemon owns the LanceDB ground directory, the repository

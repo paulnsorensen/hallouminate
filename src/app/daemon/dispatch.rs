@@ -23,7 +23,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::cli::{CorpusReport, IndexReport};
-use crate::app::config::{Config, resolve_for_cwd};
+use crate::app::config::{Config, ResolvedLayers, resolve_for_cwd};
 use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
@@ -33,7 +33,9 @@ use crate::domain::corpus::sandbox::{
     resolve_read_root, safe_relative_path,
 };
 use crate::domain::corpus::{MarkdownChunker, blake3_file};
-use crate::domain::ground::{Format, GroundOpts, RenderOpts, ground, render, trim_snippets};
+use crate::domain::ground::{
+    Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
+};
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
 #[cfg(test)]
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
@@ -73,10 +75,11 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         });
     }
     let req_cwd = req.cwd.clone();
-    let effective = match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
-        Ok((cfg, _layers)) => cfg,
-        Err(e) => return DaemonResponse::invalid_params(e.to_string()),
-    };
+    let (effective, layers) =
+        match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
+            Ok(resolved) => resolved,
+            Err(e) => return DaemonResponse::invalid_params(e.to_string()),
+        };
     match req.payload {
         DaemonRequestPayload::Ping => {
             // Handled before `resolve_for_cwd` above; unreachable here.
@@ -84,7 +87,9 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
                 version: env!("CARGO_PKG_VERSION").to_string(),
             })
         }
-        DaemonRequestPayload::Ground(req) => handle_ground(state, &effective, &req_cwd, req).await,
+        DaemonRequestPayload::Ground(req) => {
+            handle_ground(state, &effective, &layers, &req_cwd, req).await
+        }
         DaemonRequestPayload::Index(req) => handle_index(state, &effective, req).await,
         DaemonRequestPayload::ListCorpora => handle_list_corpora(&effective),
         DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, &req_cwd, req),
@@ -261,6 +266,7 @@ fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonRes
 async fn handle_ground(
     state: &DaemonState,
     cfg: &Config,
+    layers: &ResolvedLayers,
     cwd: &Path,
     req: GroundRequest,
 ) -> DaemonResponse {
@@ -268,11 +274,6 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let corpus =
-        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
-            Ok(c) => c,
-            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-        };
     let store = state.store();
     let opts = GroundOpts {
         top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
@@ -281,7 +282,25 @@ async fn handle_ground(
             .unwrap_or(cfg.search.chunks_per_file_default),
         limit: req.limit.unwrap_or(50),
     };
-    // Embeddings-OFF: skip the embedder entirely and let `ground` run the
+
+    // Union ground (#106): a no-corpus request from above all repos fans the
+    // query across EVERY effective corpus and merges into one re-ranked set.
+    // An explicit corpus, or a no-corpus request whose cwd defaults to a
+    // single repo wiki, takes the unchanged single-corpus path below.
+    let union = req.corpus.is_none() && default_wiki_for_cwd(&cfg.repositories, cwd).is_none();
+
+    // Resolve the single corpus up front for the non-union path; on the union
+    // path the corpus list is the whole `corpora` set.
+    let single_corpus = if union {
+        None
+    } else {
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => Some(c),
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        }
+    };
+
+    // Embeddings-OFF: skip the embedder entirely and let the search run the
     // lexical-only path. ON: borrow the shared embedder (lazy-loaded).
     let mut embedder = if state.embeddings_enabled() {
         match state.embedder().await {
@@ -312,22 +331,51 @@ async fn handle_ground(
     let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
         .as_mut()
         .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-    let response = match ground(
-        &req.query,
-        &corpus.name,
-        &corpus.paths,
-        &store,
-        embedder_dyn,
-        crossencoder_dyn,
-        opts,
-    )
-    .await
-    {
+
+    let response = if let Some(corpus) = &single_corpus {
+        ground(
+            &req.query,
+            &corpus.name,
+            &corpus.paths,
+            &store,
+            embedder_dyn,
+            crossencoder_dyn,
+            opts,
+        )
+        .await
+    } else {
+        let targets: Vec<(String, Vec<String>)> = corpora
+            .iter()
+            .map(|c| (c.name.clone(), c.paths.clone()))
+            .collect();
+        ground_union(
+            &req.query,
+            &targets,
+            &store,
+            embedder_dyn,
+            crossencoder_dyn,
+            opts,
+        )
+        .await
+    };
+    let mut response = match response {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
     drop(crossencoder);
     drop(embedder);
+
+    // Surface the cross-repo resolution advisories (name-collision shadowing)
+    // on the union response so the merge is auditable rather than silent.
+    if union {
+        for w in &layers.warnings {
+            response.warnings.push(Warning {
+                code: "cross-repo-union".to_string(),
+                message: w.clone(),
+            });
+        }
+    }
+
     let response = if let Some(limit) = req.snippet_chars {
         trim_snippets(&response, limit)
     } else {

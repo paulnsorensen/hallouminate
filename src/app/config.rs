@@ -3,9 +3,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
-
+use crate::domain::discovery::{DEFAULT_MAX_DEPTH, IgnoreRules, discover_wiki_roots};
 use crate::domain::embeddings::{DEFAULT_EMBED_MODEL, canonical_model_name};
-use crate::domain::repository::{RepositoryConfig, effective_corpora};
+use crate::domain::repository::{
+    RepositoryConfig, effective_corpora, repository_for_discovered_wiki,
+    union_discovered_repositories,
+};
 
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
@@ -161,10 +164,16 @@ impl Config {
 /// `None` when discovery reached the filesystem root with no `.git` boundary
 /// and `resolve_for_cwd` resolved baseline-only (issue #102); otherwise it
 /// carries the discovered repo config.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResolvedLayers {
     pub xdg_path: Option<PathBuf>,
     pub repo_path: Option<PathBuf>,
+    /// Non-fatal advisories raised while resolving corpora — currently only
+    /// the cross-repo union (#106) name-collision warning, when a
+    /// walk-discovered sub-repo wiki shadows a baseline `[[repository]]` of
+    /// the same derived corpus name. `handle_ground` surfaces these on the
+    /// `GroundResponse.warnings` list. Empty in the common case.
+    pub warnings: Vec<String>,
 }
 
 /// Load the XDG baseline (or `--config PATH`).
@@ -444,13 +453,26 @@ pub fn resolve_for_cwd(
     // baseline-declared corpora reachable from a parent-of-repos directory
     // (issue #102). A `.git` boundary with no config still errors via `?`.
     let Some(repo_path) = discover_repo_config(cwd)? else {
-        let baseline_only = baseline.clone();
+        // Baseline-only mode: cwd sits above all repos. Walk downward for
+        // sub-repo wikis and union them with the baseline `[[repository]]`
+        // entries (#106) so a `cd ~/Dev && ground "..."` searches every
+        // repo's wiki at once, not just baseline-registered ones.
+        let mut baseline_only = baseline.clone();
+        let discovered: Vec<RepositoryConfig> =
+            discover_wiki_roots(cwd, DEFAULT_MAX_DEPTH, &IgnoreRules::default())
+                .into_iter()
+                .filter_map(|w| repository_for_discovered_wiki(&w.repo_root))
+                .collect();
+        let (repositories, warnings) =
+            union_discovered_repositories(&baseline_only.repositories, discovered);
+        baseline_only.repositories = repositories;
         validate(&baseline_only)?;
         return Ok((
             baseline_only,
             ResolvedLayers {
                 xdg_path: xdg_path.map(Path::to_path_buf),
                 repo_path: None,
+                warnings,
             },
         ));
     };
@@ -461,6 +483,7 @@ pub fn resolve_for_cwd(
         ResolvedLayers {
             xdg_path: xdg_path.map(Path::to_path_buf),
             repo_path: Some(repo_path),
+            warnings: Vec::new(),
         },
     ))
 }
@@ -1718,6 +1741,123 @@ paths = ["/srv/cheese-global"]
         // No repo config was discovered, so the diagnostic records `None`
         // rather than fabricating a path.
         assert_eq!(layers.repo_path, None);
+    }
+
+    #[test]
+    fn resolve_for_cwd_unions_discovered_sub_repo_wikis_from_above_all_repos() {
+        // #106: from a parent-of-repos dir, the downward walk discovers each
+        // sub-repo's local `.hallouminate` wiki and unions them with the
+        // baseline corpora, so a no-corpus ground searches all of them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let above_repos = canon(dir.path());
+
+        // Two sub-repos, each with only a LOCAL `.hallouminate/config.toml`
+        // (and wiki dir) — neither is a baseline `[[repository]]`.
+        for repo in ["alpha", "beta"] {
+            let repo_root = above_repos.join(repo);
+            std::fs::create_dir_all(repo_root.join(".hallouminate").join("wiki"))
+                .expect("mkdir wiki");
+            std::fs::write(repo_root.join(".hallouminate").join("config.toml"), "")
+                .expect("write local config");
+        }
+
+        let baseline = parse(
+            r#"
+[[corpus]]
+name = "cheese-global"
+paths = ["/srv/cheese-global"]
+"#,
+            None,
+        )
+        .expect("baseline parse");
+
+        let (effective, layers) =
+            resolve_for_cwd(&baseline, &above_repos, None).expect("baseline-only must resolve");
+
+        let corpora = effective.effective_corpora().expect("derive corpora");
+        let names: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"cheese-global"),
+            "baseline corpus preserved: {names:?}"
+        );
+        assert!(
+            names.contains(&"repo:alpha:wiki") && names.contains(&"repo:beta:wiki"),
+            "both discovered sub-repo wikis must be unioned in: {names:?}"
+        );
+        assert_eq!(
+            layers.repo_path, None,
+            "no single repo discovered above all"
+        );
+        assert!(
+            layers.warnings.is_empty(),
+            "no name collision => no warnings: {:?}",
+            layers.warnings
+        );
+    }
+
+    #[test]
+    fn resolve_for_cwd_keeps_both_same_basename_sibling_wikis_and_warns() {
+        // #106 regression: two discovered sub-repos sharing a directory
+        // basename at different paths (`work/tern` and `personal/tern`) both
+        // derive `repo:tern:wiki`. The earlier union dropped one silently,
+        // contradicting "search the union of ALL discovered wikis". Both must
+        // survive end-to-end through `resolve_for_cwd` -> `effective_corpora`,
+        // and a `cross-repo-union` warning (the payload the dispatch copy-loop
+        // surfaces verbatim) must be generated naming the discovered sibling.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let above_repos = canon(dir.path());
+
+        for parent in ["work", "personal"] {
+            let repo_root = above_repos.join(parent).join("tern");
+            std::fs::create_dir_all(repo_root.join(".hallouminate").join("wiki"))
+                .expect("mkdir wiki");
+            std::fs::write(repo_root.join(".hallouminate").join("config.toml"), "")
+                .expect("write local config");
+        }
+
+        let baseline = parse("", None).expect("empty baseline parse");
+
+        let (effective, layers) =
+            resolve_for_cwd(&baseline, &above_repos, None).expect("baseline-only must resolve");
+
+        // `effective_corpora` must NOT collapse or reject the pair: the
+        // disambiguated names round-trip through the duplicate-name guard.
+        let corpora = effective.effective_corpora().expect("derive corpora");
+        let wiki_names: Vec<&str> = corpora
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| n.starts_with("repo:") && n.ends_with(":wiki"))
+            .collect();
+        assert_eq!(
+            wiki_names.len(),
+            2,
+            "both same-basename sibling wikis must survive, not one: {wiki_names:?}"
+        );
+        assert!(
+            wiki_names.contains(&"repo:tern:wiki"),
+            "the first sibling keeps the canonical corpus name: {wiki_names:?}"
+        );
+        assert!(
+            wiki_names
+                .iter()
+                .any(|n| n.contains("tern") && *n != "repo:tern:wiki"),
+            "the second sibling is parent-qualified to stay distinct: {wiki_names:?}"
+        );
+
+        // The collision is surfaced as a `cross-repo-union` advisory, and its
+        // text names the discovered sibling rather than a (non-existent)
+        // baseline shadow.
+        assert_eq!(
+            layers.warnings.len(),
+            1,
+            "one sibling collision => exactly one warning: {:?}",
+            layers.warnings
+        );
+        let w = &layers.warnings[0];
+        assert!(
+            w.contains("another discovered sub-repo") && !w.contains("baseline"),
+            "warning must name the discovered sibling, not a baseline shadow: {w:?}"
+        );
     }
 
     #[test]
