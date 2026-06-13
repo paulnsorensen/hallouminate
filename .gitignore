@@ -5,3 +5,6 @@ ralphs/
 .code-review-graph/
 .serena/
 .claude/worktrees/
+.claude/settings.json
+.milknado/
+milknado.toml

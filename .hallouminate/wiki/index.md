@@ -14,6 +14,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [corpus-walker](corpus-walker.md) — gitignore-aware corpus walking and the explicit-root opt-in escape hatch.
 - [config-layering](config-layering.md) — XDG baseline plus repo-layer merge; how a single daemon serves many repos.
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
+- [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
 
 ## How to use this index
 
