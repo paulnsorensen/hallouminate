@@ -210,22 +210,33 @@ pub fn repository_for_discovered_wiki(repo_root: &Path) -> Option<RepositoryConf
 /// deduped by resolved wiki path (#106).
 ///
 /// A discovered repo whose wiki directory matches a baseline repo's wiki
-/// directory is dropped (the baseline already covers it — no double-count). A
-/// discovered repo whose derived `repo:{name}:wiki` *name* collides with a
-/// baseline repo at a *different* path is preferred over the baseline (the
-/// local config the user is sitting above wins), and a warning is emitted so
-/// the shadowing is visible rather than silent. Returns the merged repo list
-/// (baseline order first, surviving discovered repos appended) plus the
-/// collision warnings.
+/// directory is dropped (the baseline already covers it — no double-count).
+///
+/// Two kinds of derived-name (`repo:{name}:wiki`) collision at *different*
+/// paths are handled distinctly:
+///
+/// - **Discovered vs. baseline** — the discovered local config the user is
+///   sitting above wins; the baseline entry of the same derived name is
+///   dropped and a warning names the shadowed baseline repository.
+/// - **Discovered vs. discovered** — both are real sub-repo wikis the user
+///   asked to union, so dropping either would violate "search the union of
+///   **all** discovered wikis". Instead the later repo is kept under a
+///   parent-segment-qualified name (e.g. two `tern` siblings become
+///   `repo:tern:wiki` and `repo:personal-tern:wiki`) so both wikis survive,
+///   and a warning names the colliding sibling rather than a baseline repo.
+///
+/// Returns the merged repo list (baseline order first, surviving discovered
+/// repos appended) plus the collision warnings.
 pub fn union_discovered_repositories(
     baseline: &[RepositoryConfig],
     discovered: Vec<RepositoryConfig>,
 ) -> (Vec<RepositoryConfig>, Vec<String>) {
     let baseline_wiki_paths: std::collections::HashSet<PathBuf> =
         baseline.iter().map(canonical_wiki_path).collect();
+    let baseline_count = baseline.len();
     let mut out: Vec<RepositoryConfig> = baseline.to_vec();
     let mut warnings: Vec<String> = Vec::new();
-    for repo in discovered {
+    for mut repo in discovered {
         // Dedupe by resolved wiki path: a baseline repo living below cwd is
         // already represented, so skip the discovered duplicate.
         if baseline_wiki_paths.contains(&canonical_wiki_path(&repo)) {
@@ -234,23 +245,85 @@ pub fn union_discovered_repositories(
         let Ok(name) = repo_corpus_name(&repo.name, RepoCorpusKind::Wiki) else {
             continue;
         };
-        // Name collision at a different path: prefer the discovered local repo
-        // and drop the baseline entry of the same derived name, warning loudly.
-        if let Some(pos) = out.iter().position(|r| {
-            repo_corpus_name(&r.name, RepoCorpusKind::Wiki)
-                .ok()
-                .as_deref()
-                == Some(name.as_str())
-        }) {
-            warnings.push(format!(
-                "discovered sub-repo wiki {name:?} shadows a baseline repository \
-                 of the same name; preferring the discovered local config",
-            ));
-            out.remove(pos);
+        if let Some(pos) = position_by_derived_name(&out, &name) {
+            if pos < baseline_count {
+                // Discovered vs. baseline: prefer the discovered local repo and
+                // drop the baseline entry of the same derived name.
+                warnings.push(format!(
+                    "discovered sub-repo wiki {name:?} shadows a baseline repository \
+                     of the same name; preferring the discovered local config",
+                ));
+                out.remove(pos);
+            } else {
+                // Discovered vs. discovered: both are real wikis the union must
+                // keep, so disambiguate the later repo's name instead of
+                // dropping it — silently losing one would violate "union of all
+                // discovered wikis".
+                disambiguate_discovered_name(&mut repo, &out);
+                let new_name = repo_corpus_name(&repo.name, RepoCorpusKind::Wiki)
+                    .ok()
+                    .unwrap_or_else(|| name.clone());
+                warnings.push(format!(
+                    "discovered sub-repo wiki {name:?} (at {path:?}) collides with another \
+                     discovered sub-repo of the same name; keeping both, renaming this one to \
+                     {new_name:?} so its wiki is not dropped",
+                    path = repo.path,
+                ));
+            }
         }
         out.push(repo);
     }
     (out, warnings)
+}
+
+/// Index in `repos` of the first entry whose derived `repo:{name}:wiki` name
+/// equals `derived_name`, if any.
+fn position_by_derived_name(repos: &[RepositoryConfig], derived_name: &str) -> Option<usize> {
+    repos.iter().position(|r| {
+        repo_corpus_name(&r.name, RepoCorpusKind::Wiki)
+            .ok()
+            .as_deref()
+            == Some(derived_name)
+    })
+}
+
+/// Rename a discovered repo so its derived wiki name no longer collides with
+/// any entry already in `existing`.
+///
+/// Qualifies the basename with parent directory segments (`tern` →
+/// `personal-tern` → `dev-personal-tern` → …), walking up one segment at a
+/// time until the derived name is unique. Segments bearing `':'` are sanitized
+/// to `-` so the qualified name still passes `repo_corpus_name`. Falls back to
+/// the un-prefixed name when no further parent segment is available — the rare
+/// case of two same-named roots whose full paths offer no distinguishing
+/// ancestor leaves the original collision in place rather than fabricating a
+/// name.
+fn disambiguate_discovered_name(repo: &mut RepositoryConfig, existing: &[RepositoryConfig]) {
+    let base = repo.name.clone();
+    let segments: Vec<String> = Path::new(&repo.path)
+        .parent()
+        .map(|parent| {
+            parent
+                .components()
+                .filter_map(|c| match c {
+                    std::path::Component::Normal(s) => Some(s.to_string_lossy().replace(':', "-")),
+                    _ => None,
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    for take in 1..=segments.len() {
+        let prefix = segments[segments.len() - take..].join("-");
+        let candidate = format!("{prefix}-{base}");
+        let Ok(derived) = repo_corpus_name(&candidate, RepoCorpusKind::Wiki) else {
+            continue;
+        };
+        if position_by_derived_name(existing, &derived).is_none() {
+            repo.name = candidate;
+            return;
+        }
+    }
 }
 
 /// Canonicalized wiki directory for dedupe comparison. Best-effort: tilde is
@@ -526,6 +599,82 @@ mod tests {
         assert!(
             warnings[0].contains("repo:tern:wiki") && warnings[0].contains("shadows"),
             "warning must name the shadowed corpus: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn union_keeps_both_same_basename_discovered_siblings_with_distinct_corpora() {
+        // Two discovered sub-repos share a basename (`tern`) at different paths
+        // — e.g. `~/Dev/work/tern` and `~/Dev/personal/tern`. The union must
+        // keep BOTH wikis (the headline acceptance criterion: "search the union
+        // of ALL discovered wikis"); the earlier code silently dropped one.
+        let baseline: Vec<RepositoryConfig> = Vec::new();
+        let discovered = vec![
+            repo("tern", "/dev/work/tern"),
+            repo("tern", "/dev/personal/tern"),
+        ];
+        let (merged, _warnings) = union_discovered_repositories(&baseline, discovered);
+        assert_eq!(
+            merged.len(),
+            2,
+            "both same-basename siblings must survive the union, not one"
+        );
+        // Both wiki paths are preserved — neither repo's wiki dir is dropped.
+        let paths: Vec<&str> = merged.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.contains(&"/dev/work/tern") && paths.contains(&"/dev/personal/tern"),
+            "both wiki roots must be present: {paths:?}"
+        );
+        // Derived corpus names must be distinct so `effective_corpora`'s
+        // duplicate-name guard does not collapse or reject the pair.
+        let mut corpora: Vec<String> = merged
+            .iter()
+            .map(|r| repo_corpus_name(&r.name, RepoCorpusKind::Wiki).unwrap())
+            .collect();
+        corpora.sort();
+        corpora.dedup();
+        assert_eq!(
+            corpora.len(),
+            2,
+            "the two siblings must derive distinct corpus names: {corpora:?}"
+        );
+        assert!(
+            corpora.iter().any(|c| c == "repo:tern:wiki"),
+            "first sibling keeps the canonical name: {corpora:?}"
+        );
+        assert!(
+            corpora
+                .iter()
+                .any(|c| c.contains("tern") && c != "repo:tern:wiki"),
+            "second sibling is parent-qualified: {corpora:?}"
+        );
+    }
+
+    #[test]
+    fn union_warning_for_discovered_sibling_collision_names_sibling_not_baseline() {
+        // With NO baseline, a same-basename collision is between two discovered
+        // repos. The warning must describe that accurately — not claim the wiki
+        // "shadows a baseline repository", which would point the user at a
+        // cause that does not exist in the all-discovered case.
+        let baseline: Vec<RepositoryConfig> = Vec::new();
+        let discovered = vec![
+            repo("tern", "/dev/work/tern"),
+            repo("tern", "/dev/personal/tern"),
+        ];
+        let (_merged, warnings) = union_discovered_repositories(&baseline, discovered);
+        assert_eq!(warnings.len(), 1, "one collision => one warning");
+        let w = &warnings[0];
+        assert!(
+            w.contains("another discovered sub-repo"),
+            "warning must name the colliding discovered sibling: {w:?}"
+        );
+        assert!(
+            !w.contains("baseline"),
+            "all-discovered collision must NOT misdescribe the cause as a baseline shadow: {w:?}"
+        );
+        assert!(
+            w.contains("keeping both"),
+            "warning must state that both wikis are kept, not that one was dropped: {w:?}"
         );
     }
 }

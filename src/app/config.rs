@@ -1796,6 +1796,71 @@ paths = ["/srv/cheese-global"]
     }
 
     #[test]
+    fn resolve_for_cwd_keeps_both_same_basename_sibling_wikis_and_warns() {
+        // #106 regression: two discovered sub-repos sharing a directory
+        // basename at different paths (`work/tern` and `personal/tern`) both
+        // derive `repo:tern:wiki`. The earlier union dropped one silently,
+        // contradicting "search the union of ALL discovered wikis". Both must
+        // survive end-to-end through `resolve_for_cwd` -> `effective_corpora`,
+        // and a `cross-repo-union` warning (the payload the dispatch copy-loop
+        // surfaces verbatim) must be generated naming the discovered sibling.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let above_repos = canon(dir.path());
+
+        for parent in ["work", "personal"] {
+            let repo_root = above_repos.join(parent).join("tern");
+            std::fs::create_dir_all(repo_root.join(".hallouminate").join("wiki"))
+                .expect("mkdir wiki");
+            std::fs::write(repo_root.join(".hallouminate").join("config.toml"), "")
+                .expect("write local config");
+        }
+
+        let baseline = parse("", None).expect("empty baseline parse");
+
+        let (effective, layers) =
+            resolve_for_cwd(&baseline, &above_repos, None).expect("baseline-only must resolve");
+
+        // `effective_corpora` must NOT collapse or reject the pair: the
+        // disambiguated names round-trip through the duplicate-name guard.
+        let corpora = effective.effective_corpora().expect("derive corpora");
+        let wiki_names: Vec<&str> = corpora
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| n.starts_with("repo:") && n.ends_with(":wiki"))
+            .collect();
+        assert_eq!(
+            wiki_names.len(),
+            2,
+            "both same-basename sibling wikis must survive, not one: {wiki_names:?}"
+        );
+        assert!(
+            wiki_names.contains(&"repo:tern:wiki"),
+            "the first sibling keeps the canonical corpus name: {wiki_names:?}"
+        );
+        assert!(
+            wiki_names
+                .iter()
+                .any(|n| n.contains("tern") && *n != "repo:tern:wiki"),
+            "the second sibling is parent-qualified to stay distinct: {wiki_names:?}"
+        );
+
+        // The collision is surfaced as a `cross-repo-union` advisory, and its
+        // text names the discovered sibling rather than a (non-existent)
+        // baseline shadow.
+        assert_eq!(
+            layers.warnings.len(),
+            1,
+            "one sibling collision => exactly one warning: {:?}",
+            layers.warnings
+        );
+        let w = &layers.warnings[0];
+        assert!(
+            w.contains("another discovered sub-repo") && !w.contains("baseline"),
+            "warning must name the discovered sibling, not a baseline shadow: {w:?}"
+        );
+    }
+
+    #[test]
     fn resolve_for_cwd_passes_xdg_path_into_conflict_messages() {
         // Verifies the source-path threading: a scalar conflict between
         // baseline (XDG) and the repo layer should name *both* paths.
