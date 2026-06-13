@@ -4,7 +4,7 @@ use crate::adapters::lance::SearchHit;
 use crate::domain::common::Result;
 use crate::domain::corpus::make_snippet;
 
-use super::types::{DocChunk, DocFile};
+use super::types::{ChunkProvenance, DocChunk, DocFile};
 
 /// Bucket `hits` by `file_ref`, sort by max-score descending (file_ref tiebreak),
 /// truncate to `top_files`, then take the top `chunks_per_file` chunks per
@@ -85,6 +85,10 @@ impl FileBucket {
                 line_range: [h.line_start as u32, h.line_end as u32],
                 score: h.score as f64,
                 snippet: make_snippet(&h.text),
+                // Stamped by the orchestrator from its corpus arg (same as
+                // DocFile.corpus); the LanceDB row implies corpus by query
+                // scope and doesn't carry it per-row.
+                provenance: ChunkProvenance::default(),
             })
             .collect();
         // mtime is sourced from SearchHit.mtime_ms (decoded from the

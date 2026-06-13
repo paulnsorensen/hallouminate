@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use crate::adapters::lance::LanceStore;
+use crate::adapters::lance::{LanceStore, SearchHit};
 use crate::domain::common::{HallouminateError, Result};
 use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 use crate::domain::search::{Crossencoder, fts_with_ripgrep, hybrid_with_ripgrep};
 
 use super::bucket::build_docs;
-use super::types::{GroundResponse, Stats};
+use super::types::{DocFile, GroundResponse, Stats};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroundOpts {
@@ -36,19 +36,7 @@ pub async fn ground(
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-    // ON mode (embedder present): embed the query and fuse FTS + vector + rg.
-    // OFF mode (None): lexical-only FTS + rg. The cross-encoder rerank below
-    // applies in BOTH paths.
-    let mut hits = match embedder {
-        Some(embedder) => {
-            let embeddings = embedder.embed_batch(&[query.to_string()], EmbedRole::Query)?;
-            let query_vec = embeddings.into_iter().next().ok_or_else(|| {
-                HallouminateError::Embed("embed_batch returned no vector for query".into())
-            })?;
-            hybrid_with_ripgrep(store, corpus, corpus_paths, query, &query_vec, opts.limit).await?
-        }
-        None => fts_with_ripgrep(store, corpus, corpus_paths, query, opts.limit).await?,
-    };
+    let mut hits = search_corpus(query, corpus, corpus_paths, store, embedder, opts.limit).await?;
     if let Some(rerank) = crossencoder {
         // The crossencoder is the most expensive step; skip it on empty
         // hit lists so a no-match query doesn't pay the model latency.
@@ -60,7 +48,140 @@ pub async fn ground(
     let mut docs = build_docs(&hits, opts.top_files, opts.chunks_per_file)?;
     for doc in docs.values_mut() {
         doc.corpus = corpus.to_string();
+        for chunk in &mut doc.chunks {
+            chunk.provenance.corpus = corpus.to_string();
+        }
     }
+    Ok(GroundResponse {
+        query: query.to_string(),
+        took_ms: started.elapsed().as_millis() as u64,
+        stats,
+        docs,
+        code: BTreeMap::new(),
+        warnings: vec![],
+    })
+}
+
+/// Search one corpus, returning its un-reranked hits.
+///
+/// ON mode (embedder present): embed the query and fuse FTS + vector + rg.
+/// OFF mode (None): lexical-only FTS + rg. The crossencoder rerank is the
+/// caller's concern — `ground` reranks per corpus, `ground_union` hoists the
+/// single rerank past the cross-corpus merge (#106).
+async fn search_corpus(
+    query: &str,
+    corpus: &str,
+    corpus_paths: &[String],
+    store: &LanceStore,
+    embedder: Option<&mut dyn EmbedBatch>,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    match embedder {
+        Some(embedder) => {
+            let embeddings = embedder.embed_batch(&[query.to_string()], EmbedRole::Query)?;
+            let query_vec = embeddings.into_iter().next().ok_or_else(|| {
+                HallouminateError::Embed("embed_batch returned no vector for query".into())
+            })?;
+            hybrid_with_ripgrep(store, corpus, corpus_paths, query, &query_vec, limit).await
+        }
+        None => fts_with_ripgrep(store, corpus, corpus_paths, query, limit).await,
+    }
+}
+
+/// Fan one query across every effective corpus and merge into a single,
+/// globally-ranked `GroundResponse` (#106).
+///
+/// Each corpus is searched independently (un-reranked), the hits are tagged
+/// with their source corpus and merged, then a **single** crossencoder pass
+/// runs over the merged set so the final ranking is globally coherent rather
+/// than per-corpus-then-concatenated. Docs are built per corpus (so each
+/// carries its `corpus` attribution and per-chunk provenance), unioned by
+/// path-unique key, and truncated to the global `top_files`. `stats.hits`
+/// sums the raw hit counts across corpora.
+///
+/// The shared single embedder means per-corpus scores are on the same scale,
+/// so the merged crossencoder pass produces a coherent ordering without
+/// per-corpus normalization (YAGNI until heterogeneous models exist).
+pub async fn ground_union(
+    query: &str,
+    corpora: &[(String, Vec<String>)],
+    store: &LanceStore,
+    embedder: Option<&mut dyn EmbedBatch>,
+    crossencoder: Option<&mut dyn Crossencoder>,
+    opts: GroundOpts,
+) -> Result<GroundResponse> {
+    let started = Instant::now();
+
+    // Search each corpus independently, tagging every hit with its source so
+    // the per-corpus partition survives the shared rerank's reshuffle. The
+    // `&mut dyn` is reborrowed per iteration so the shared embedder is used
+    // across all corpora without the borrow outliving the loop.
+    let mut embedder = embedder;
+    let mut tagged: Vec<(SearchHit, String)> = Vec::new();
+    for (name, paths) in corpora {
+        let reborrow: Option<&mut dyn EmbedBatch> = match &mut embedder {
+            Some(e) => Some(&mut **e),
+            None => None,
+        };
+        let hits = search_corpus(query, name, paths, store, reborrow, opts.limit).await?;
+        for hit in hits {
+            tagged.push((hit, name.clone()));
+        }
+    }
+
+    let stats = Stats { hits: tagged.len() };
+
+    // One crossencoder pass over the MERGED set. The trait contract guarantees
+    // rerank only reshuffles (no inserts/deletes), so the corpus tags stay
+    // valid; rebuild the corpus lookup from the reordered hit list afterward.
+    let mut hits: Vec<SearchHit> = tagged.iter().map(|(h, _)| h.clone()).collect();
+    let corpus_of: std::collections::HashMap<String, String> = tagged
+        .into_iter()
+        .map(|(h, name)| (h.chunk_id, name))
+        .collect();
+    if let Some(rerank) = crossencoder
+        && !hits.is_empty()
+    {
+        rerank.rerank(query, &mut hits)?;
+    }
+
+    // Build docs per corpus partition so each doc + chunk carries its source
+    // corpus. Build with an unbounded per-corpus `top_files` and apply the
+    // global truncation after the union, so `top_files` bounds the merged set.
+    let mut by_corpus: std::collections::HashMap<String, Vec<SearchHit>> =
+        std::collections::HashMap::new();
+    for hit in hits {
+        let corpus = corpus_of.get(&hit.chunk_id).cloned().unwrap_or_default();
+        by_corpus.entry(corpus).or_default().push(hit);
+    }
+
+    let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
+    for (corpus, corpus_hits) in by_corpus {
+        let mut built = build_docs(&corpus_hits, usize::MAX, opts.chunks_per_file)?;
+        for doc in built.values_mut() {
+            doc.corpus = corpus.clone();
+            for chunk in &mut doc.chunks {
+                chunk.provenance.corpus = corpus.clone();
+            }
+        }
+        // Paths are unique across corpora, so a plain extend is a clean union.
+        docs.extend(built);
+    }
+
+    // Global top-N truncation over the merged docs, by doc score descending
+    // (path tiebreak for determinism).
+    if docs.len() > opts.top_files {
+        let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
+        ranked.sort_by(|a, b| {
+            b.1.score
+                .partial_cmp(&a.1.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        ranked.truncate(opts.top_files);
+        docs = ranked.into_iter().collect();
+    }
+
     Ok(GroundResponse {
         query: query.to_string(),
         took_ms: started.elapsed().as_millis() as u64,
