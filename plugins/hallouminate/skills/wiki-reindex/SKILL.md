@@ -14,22 +14,32 @@ store schema version mismatch: store has schema_version <old>, this build
 expects <new>; delete <store-path> and re-run `hallouminate index` to rebuild
 ```
 
-This skill turns that message into a safe, four-step repair sequence.
+This skill turns that message into a safe, five-step repair sequence.
 
 **Engine source:** `src/adapters/lance.rs` — `meta_check_or_init` (lines 152-159).
 
 ## Prerequisites
 
 Before deleting anything, confirm you are looking at a genuine schema mismatch
-(not a permissions error or a missing config):
+(not a permissions error or a missing config). The mismatch surfaces at daemon
+**startup**, inside `meta_check_or_init` — not via `daemon status`, which is a
+liveness probe that only ever prints `running` / `not running` and never reads
+the store. To see the startup error, run the daemon in the foreground:
 
 ```bash
-# The error surfaces at daemon startup — check the daemon's output or run:
-hallouminate daemon status
+# Prints the startup error straight to your terminal (Ctrl-C to exit):
+hallouminate daemon
 ```
 
-If the output contains `store schema version mismatch`, proceed. If it shows
-`running`, the store is healthy — stop here.
+If a corpus is auto-spawned (e.g. by `hallouminate serve`) the same startup
+error is captured in the bootstrap log instead of your terminal:
+
+```bash
+cat ~/.local/state/hallouminate/daemon-bootstrap.log
+```
+
+If either contains `store schema version mismatch`, proceed. If the daemon
+comes up cleanly, the store is healthy — stop here.
 
 ## Step 1 — Identify the store directory
 
@@ -47,7 +57,7 @@ lives at:
 ```
 
 This path is overridable via `[storage] ground_dir` in your
-`~/.config/hallouminate/config.toml` (or `XDG_DATA_HOME`). Verify:
+`~/.config/hallouminate/config.toml`. Verify:
 
 ```bash
 hallouminate config show | grep ground_dir
@@ -145,5 +155,5 @@ binary upgrade with a reindex so your team's daemons stay in sync.
 - The store is derived data — rebuild time grows with corpus size. On very
   large corpora, plan for the index step to take several minutes.
 - If `hallouminate daemon stop` times out (> 10 s), kill the process directly
-  (`kill $(lsof -t <socket-path)`) and then delete the socket file before
+  (`kill $(lsof -t -- <socket-path>)`) and then delete the socket file before
   proceeding.
