@@ -16,9 +16,9 @@ them the hard way.
 
 When a sub-agent runs in an isolated git worktree but edits code through
 the **tilth MCP server**, the edits land in the parent checkout
-(`/home/paul/Dev/hallouminate`) instead of the worktree. The reported
+(for example, `$HOME/Dev/hallouminate`) instead of the worktree. The reported
 cause is that the tilth server process's working directory is the parent
-repo, so tilth-relative paths resolve there rather than in the worktree.
+checkout, so tilth-relative paths resolve there rather than in the worktree.
 The mechanism is `<speculative>`; the symptom is `<certain>` — three
 separate agents observed it (issues #101, #92, and the affinage PR runs).
 
