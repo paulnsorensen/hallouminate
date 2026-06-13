@@ -179,3 +179,318 @@ fn discovery_respects_depth_cap_and_gitignore_above_all_repos() {
         "discovered wiki dir must point at <repo>/.hallouminate/wiki"
     );
 }
+
+// ── ground_union ranking + attribution hardening (#106 /press) ───────────
+//
+// The e2e above covers the happy multi-corpus path with no crossencoder. These
+// tests pin the edge cases the cook agent flagged: single-corpus union sets,
+// empty / all-empty corpora, and — the riskiest correctness claim — that each
+// hit stays attributed to its TRUE source corpus after the single crossencoder
+// pass reshuffles the merged hit list. `ground_union` rebuilds the corpus
+// lookup from `chunk_id` after the rerank, relying on the trait contract that
+// rerank only reshuffles (no inserts/deletes); a reversing stub exercises that
+// reshuffle hard.
+
+use hallouminate::adapters::lance::{LanceStore, SearchHit};
+use hallouminate::domain::ground::{GroundResponse, ground};
+use hallouminate::domain::search::Crossencoder;
+
+/// A crossencoder that reverses the hit list in place. It changes the order of
+/// every hit (maximally stressing the post-rerank corpus-tag rebuild) while
+/// honoring the trait contract: contents are preserved, only reshuffled.
+struct ReversingCrossencoder;
+
+impl Crossencoder for ReversingCrossencoder {
+    fn rerank(
+        &mut self,
+        _query: &str,
+        hits: &mut [SearchHit],
+    ) -> hallouminate::domain::common::Result<()> {
+        hits.reverse();
+        Ok(())
+    }
+}
+
+/// Boot a store and index each `(corpus_name, repo_root)` pair's wiki into its
+/// own corpus, returning the `(name, paths)` targets `ground_union` consumes.
+async fn index_wikis(
+    store: &LanceStore,
+    repos: &[std::path::PathBuf],
+) -> Vec<(String, Vec<String>)> {
+    let discovered: Vec<RepositoryConfig> = repos
+        .iter()
+        .filter_map(|r| repository_for_discovered_wiki(r))
+        .collect();
+    let (repos, _warnings) = union_discovered_repositories(&[], discovered);
+    let chunker = MarkdownChunker::new(Characters, 1500);
+    let mut targets = Vec::new();
+    for repo in &repos {
+        let corpus = repository_wiki_corpus(repo).expect("derive wiki corpus");
+        let mut embedder = StubEmbedder;
+        index_corpus(&corpus, store, Some(&mut embedder), &chunker)
+            .await
+            .unwrap_or_else(|e| panic!("index {}: {e}", corpus.name));
+        targets.push((corpus.name.clone(), corpus.paths.clone()));
+    }
+    targets
+}
+
+/// AC: each hit must be attributed to the RIGHT source corpus — not merely a
+/// non-empty one — even after the crossencoder reshuffles the merged hit list.
+/// A regression that rebuilt the corpus tags positionally (instead of keyed by
+/// chunk_id) would survive the e2e (which runs no crossencoder) but cross-wire
+/// attributions here, where the reversing rerank guarantees the merged order
+/// differs from the per-corpus search order.
+#[tokio::test]
+async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuffle() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+
+    // Three sibling wikis, each carrying a token UNIQUE to that repo, so the
+    // token a chunk contains is ground truth for which corpus it belongs to.
+    let alpha = seed_repo_wiki(parent.path(), "alpha", "zphyxnort");
+    let beta = seed_repo_wiki(parent.path(), "beta", "qwobblefrotz");
+    let gamma = seed_repo_wiki(parent.path(), "gamma", "vummelthwap");
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let targets = index_wikis(&store, &[alpha, beta, gamma]).await;
+
+    let mut embedder = StubEmbedder;
+    let mut crossencoder = ReversingCrossencoder;
+    let resp = ground_union(
+        "distinctive token wiki",
+        &targets,
+        &store,
+        Some(&mut embedder),
+        Some(&mut crossencoder),
+        GroundOpts::default(),
+    )
+    .await
+    .expect("union ground with rerank");
+
+    // Ground truth: token -> owning corpus. Each chunk's snippet contains
+    // exactly one repo's unique token; its provenance MUST name that repo's
+    // corpus.
+    let token_owner = |snippet: &str| -> Option<&'static str> {
+        if snippet.contains("zphyxnort") {
+            Some("repo:alpha:wiki")
+        } else if snippet.contains("qwobblefrotz") {
+            Some("repo:beta:wiki")
+        } else if snippet.contains("vummelthwap") {
+            Some("repo:gamma:wiki")
+        } else {
+            None
+        }
+    };
+
+    let mut checked = 0usize;
+    for (path, doc) in &resp.docs {
+        for chunk in &doc.chunks {
+            let Some(true_corpus) = token_owner(&chunk.snippet) else {
+                continue;
+            };
+            assert_eq!(
+                chunk.provenance.corpus, true_corpus,
+                "chunk in {path} carries {true_corpus}'s token but was attributed to \
+                 {:?} after the rerank reshuffle",
+                chunk.provenance.corpus,
+            );
+            assert_eq!(
+                doc.corpus, true_corpus,
+                "file {path} carries {true_corpus}'s token but DocFile.corpus is {:?}",
+                doc.corpus,
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 3,
+        "expected at least one token-bearing chunk per corpus, checked {checked}"
+    );
+}
+
+/// Edge case: a union set of exactly ONE corpus must behave like a single
+/// search — every hit attributed to that one corpus, no panic, hits present.
+#[tokio::test]
+async fn union_ground_with_single_corpus_attributes_all_hits_to_it() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let solo = seed_repo_wiki(parent.path(), "solo", "zphyxnort");
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let targets = index_wikis(&store, &[solo]).await;
+    assert_eq!(targets.len(), 1, "exactly one corpus in the union set");
+
+    let mut embedder = StubEmbedder;
+    let resp = ground_union(
+        "distinctive token wiki",
+        &targets,
+        &store,
+        Some(&mut embedder),
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("single-corpus union ground");
+
+    assert!(
+        !resp.docs.is_empty(),
+        "single corpus must still return hits"
+    );
+    for (path, doc) in &resp.docs {
+        assert_eq!(
+            doc.corpus, "repo:solo:wiki",
+            "single-corpus union must attribute {path} to repo:solo:wiki"
+        );
+        for chunk in &doc.chunks {
+            assert_eq!(
+                chunk.provenance.corpus, "repo:solo:wiki",
+                "every chunk in a single-corpus union is attributed to that corpus"
+            );
+        }
+    }
+}
+
+/// Edge case: when a corpus in the union set yields NO hits, it must contribute
+/// nothing while the other corpora's hits survive — the empty partition must
+/// not strand or mis-tag the non-empty ones. Models a discovered-but-unindexed
+/// wiki: a real `repo:empty:wiki` target whose corpus has zero rows in the
+/// store, so `search_corpus` returns an empty `Vec` for it (the store is
+/// populated, but the corpus filter matches nothing).
+#[tokio::test]
+async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let full = seed_repo_wiki(parent.path(), "full", "zphyxnort");
+
+    // The empty wiki: a real, existing `.hallouminate/wiki` dir with no
+    // markdown pages, so the on-disk ripgrep leg has a valid path to scan and
+    // finds nothing.
+    let empty_wiki = parent
+        .path()
+        .join("empty")
+        .join(".hallouminate")
+        .join("wiki");
+    fs::create_dir_all(&empty_wiki).expect("mkdir empty wiki");
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    // Index only the full wiki. The empty corpus is a valid target with no
+    // indexed rows — exactly what a discovered-but-never-indexed sub-repo wiki
+    // looks like in the live union: the corpus filter matches zero LanceDB rows.
+    let mut targets = index_wikis(&store, &[full]).await;
+    targets.push((
+        "repo:empty:wiki".to_string(),
+        vec![empty_wiki.to_string_lossy().into_owned()],
+    ));
+    assert_eq!(targets.len(), 2, "both corpora present in the union set");
+
+    let mut embedder = StubEmbedder;
+    let resp = ground_union(
+        "distinctive token wiki",
+        &targets,
+        &store,
+        Some(&mut embedder),
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("union ground with an empty corpus");
+
+    assert!(
+        !resp.docs.is_empty(),
+        "the non-empty corpus's hits must survive alongside the empty one"
+    );
+    let corpora_seen: std::collections::HashSet<&str> =
+        resp.docs.values().map(|d| d.corpus.as_str()).collect();
+    assert!(
+        corpora_seen.contains("repo:full:wiki"),
+        "the full corpus must be represented: {corpora_seen:?}"
+    );
+    assert!(
+        !corpora_seen.contains("repo:empty:wiki"),
+        "an empty corpus must contribute no docs, saw: {corpora_seen:?}"
+    );
+}
+
+/// Edge case: all corpora empty (or no corpora at all) must yield a well-formed
+/// empty response, not a panic — this also exercises the crossencoder-skip
+/// branch (`!hits.is_empty()`), which a reversing rerank on an empty slice would
+/// otherwise be asked to run.
+#[tokio::test]
+async fn union_ground_over_all_empty_corpora_returns_empty_response_without_panic() {
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+
+    // No corpora at all is the degenerate floor; a crossencoder is supplied so
+    // the empty-hit skip is exercised rather than handed an empty slice.
+    let mut embedder = StubEmbedder;
+    let mut crossencoder = ReversingCrossencoder;
+    let resp = ground_union(
+        "distinctive token wiki",
+        &[],
+        &store,
+        Some(&mut embedder),
+        Some(&mut crossencoder),
+        GroundOpts::default(),
+    )
+    .await
+    .expect("empty union ground must not error");
+
+    assert!(resp.docs.is_empty(), "no corpora => no docs");
+    assert_eq!(resp.stats.hits, 0, "no corpora => zero summed hits");
+    assert_eq!(resp.query, "distinctive token wiki", "query echoed back");
+}
+
+/// Regression guard for the spec's byte-for-byte-unchanged guarantee: the
+/// `corpus=Some(name)` single-corpus path (`ground`) must attribute every chunk
+/// to exactly the requested corpus, and the per-chunk provenance must mirror the
+/// parent DocFile.corpus. #106 added the additive `provenance.corpus` stamp on
+/// this path; this locks that the stamp equals the single requested corpus and
+/// nothing leaked from the union machinery.
+#[tokio::test]
+async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpus() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let only = seed_repo_wiki(parent.path(), "only", "zphyxnort");
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let targets = index_wikis(&store, &[only]).await;
+    let (corpus_name, corpus_paths) = &targets[0];
+
+    let mut embedder = StubEmbedder;
+    let resp: GroundResponse = ground(
+        "distinctive token wiki",
+        corpus_name,
+        corpus_paths,
+        &store,
+        Some(&mut embedder),
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("single-corpus ground");
+
+    assert!(!resp.docs.is_empty(), "requested corpus must return hits");
+    for (path, doc) in &resp.docs {
+        assert_eq!(
+            &doc.corpus, corpus_name,
+            "single-corpus ground must attribute {path} to the requested corpus"
+        );
+        for chunk in &doc.chunks {
+            assert_eq!(
+                &chunk.provenance.corpus, corpus_name,
+                "provenance.corpus must equal the requested corpus, not empty or another"
+            );
+        }
+    }
+}

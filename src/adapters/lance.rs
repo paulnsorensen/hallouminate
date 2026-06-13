@@ -396,6 +396,15 @@ fn decode_list(list: &ListArray, row: usize) -> Vec<String> {
 }
 
 fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
+    // A zero-row batch contributes no hits and may carry a projected-away
+    // schema (LanceDB can return an empty result whose columns are absent when
+    // a `corpus = '...'` filter matches nothing in a populated store). Demanding
+    // every column then would error `missing column chunk_id`; return early so
+    // an empty corpus in a union ground yields no hits rather than failing the
+    // whole call.
+    if rb.num_rows() == 0 {
+        return Ok(());
+    }
     let chunk_id = string_col(rb, "chunk_id")?;
     let file_ref = string_col(rb, "file_ref")?;
     let summary = string_col(rb, "summary")?;
@@ -1462,6 +1471,58 @@ schema_version = 1
         assert!(
             !hits.is_empty(),
             "FTS must still return results after the cached-path batch"
+        );
+    }
+
+    /// Regression (#106 /press): searching a corpus that has ZERO rows in a
+    /// POPULATED store must return an empty hit list, not error. LanceDB can
+    /// return an empty result whose schema columns are projected away; before
+    /// the `decode_hits` zero-row guard this surfaced as
+    /// `Indexer("missing column chunk_id")` and crashed the whole call. The
+    /// cross-repo union ground fans across every effective corpus, so a single
+    /// empty / unindexed sub-repo wiki would otherwise take down results from
+    /// every other repo. Both the ON-mode (`hybrid_search`) and OFF-mode
+    /// (`fts_search`) decode paths must tolerate it.
+    #[tokio::test]
+    async fn searching_an_empty_corpus_in_a_populated_store_returns_no_hits_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
+            .await
+            .expect("open store");
+        // Populate the store under corpus "docs" so count_rows() > 0 and the
+        // FTS index exists — the empty-corpus query then hits the real search
+        // path rather than the early count_rows()==0 / no-index short-circuits.
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 3)])
+            .await
+            .expect("seed docs corpus");
+        assert!(
+            store.count_rows().await.unwrap() > 0,
+            "store must be populated"
+        );
+
+        // OFF-mode decode path.
+        let fts = store
+            .fts_search("repo:empty:wiki", "chunk", 10)
+            .await
+            .expect("fts on an empty corpus must not error");
+        assert!(
+            fts.is_empty(),
+            "a zero-row corpus must yield no FTS hits, got {}",
+            fts.len()
+        );
+
+        // ON-mode decode path: a well-formed (zero) query vector exercises the
+        // hybrid query + decode without needing a real embedding model.
+        let query_vec = [0.0_f32; EMBEDDING_DIM];
+        let hybrid = store
+            .hybrid_search("repo:empty:wiki", "chunk", &query_vec, 10)
+            .await
+            .expect("hybrid on an empty corpus must not error");
+        assert!(
+            hybrid.is_empty(),
+            "a zero-row corpus must yield no hybrid hits, got {}",
+            hybrid.len()
         );
     }
 }
