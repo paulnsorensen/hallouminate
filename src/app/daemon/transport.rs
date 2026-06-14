@@ -455,4 +455,188 @@ mod tests {
         let b = pipe_path(Path::new(r"C:\b\daemon.sock"));
         assert_ne!(a, b);
     }
+
+    // ── Windows owner-only DACL (spec Decision D + acceptance criterion #3) ──
+
+    /// `DACL_SECURITY_INFORMATION` (winnt.h) — the selector that tells
+    /// `ConvertSecurityDescriptorToStringSecurityDescriptorW` to emit the
+    /// `D:`-prefixed DACL portion of the SDDL. Defined locally so this
+    /// transport-level test needs no `windows-sys` dependency.
+    #[cfg(windows)]
+    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
+
+    /// Render a `SecurityDescriptor`'s DACL back to an SDDL string via
+    /// interprocess's `serialize` (which wraps
+    /// `ConvertSecurityDescriptorToStringSecurityDescriptorW`). This is the
+    /// canonical form Windows itself produces for the descriptor, so asserting
+    /// against it asserts against what the kernel parsed.
+    #[cfg(windows)]
+    fn dacl_sddl_of(
+        sd: &interprocess::os::windows::security_descriptor::SecurityDescriptor,
+    ) -> String {
+        use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt;
+        sd.serialize(DACL_SECURITY_INFORMATION, |s| s.to_string_lossy())
+            .expect("serialize security descriptor to SDDL")
+    }
+
+    /// The owner-only SDDL constant must (a) be well-formed — i.e. round-trip
+    /// through the Win32 parser without error — and (b) grant access only to
+    /// Creator-Owner / SYSTEM / Administrators, never Everyone or Anonymous.
+    /// This is the transport-level half of acceptance criterion #3: it pins the
+    /// *constant* itself, independent of any bound pipe, so a typo that widened
+    /// access (e.g. dropping the `P` protect flag or adding `WD`) fails here.
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_sddl_is_well_formed_and_excludes_everyone_and_anonymous() {
+        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+        use widestring::U16CString;
+
+        let sddl = U16CString::from_str(OWNER_ONLY_SDDL).expect("encode SDDL as UTF-16");
+        // `deserialize` calls `ConvertStringSecurityDescriptorToSecurityDescriptorW`;
+        // a malformed SDDL string errors here, so a successful parse proves the
+        // constant is well-formed.
+        let sd =
+            SecurityDescriptor::deserialize(&sddl).expect("OWNER_ONLY_SDDL must be valid SDDL");
+
+        let rendered = dacl_sddl_of(&sd).to_ascii_uppercase();
+
+        // The three owner-only principals must each carry a GENERIC_ALL ACE.
+        for sid in ["CO", "SY", "BA"] {
+            assert!(
+                rendered.contains(&format!(";;GA;;;{sid}")),
+                "DACL must grant GENERIC_ALL to {sid}: {rendered}"
+            );
+        }
+        // The DACL must be PROTECTED so no inherited ACE can re-widen it. A
+        // DACL-only serialization always opens with the `D:` tag, so the
+        // protect flag is the very next char — assert the exact `D:P` prefix.
+        assert!(
+            rendered.starts_with("D:P"),
+            "DACL must be protected (D:P…): {rendered}"
+        );
+        // Neither Everyone (WD / S-1-1-0) nor Anonymous (AN / S-1-5-7) may
+        // appear — those are the principals a default named-pipe SD would grant
+        // READ to. Check both the SDDL abbreviation and the raw SID string.
+        for forbidden in ["WD", "AN", "S-1-1-0", "S-1-5-7"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "DACL must not reference {forbidden}: {rendered}"
+            );
+        }
+    }
+
+    /// Acceptance criterion #3, behavior-verified end of it: bind a *real*
+    /// named pipe through the same `PipeListenerOptions.security_descriptor`
+    /// path the production transport uses, then read the bound kernel object's
+    /// *effective* DACL via `GetSecurityInfo` and assert it excludes Everyone
+    /// and Anonymous. This catches the "runtime-green-but-wrong" risk the spec
+    /// calls out — where the SD constant is correct but the kernel silently
+    /// fails to apply it — which the constant-only test above cannot see.
+    ///
+    /// Uses the *blocking* `PipeListener` (the tokio variant does not expose a
+    /// handle); both go through the identical `CreateNamedPipeW` +
+    /// `security_descriptor` codepath, so the applied DACL is the same.
+    #[cfg(windows)]
+    #[test]
+    fn bound_pipe_effective_dacl_excludes_everyone_and_anonymous() {
+        use std::os::windows::io::AsRawHandle;
+        use std::ptr;
+
+        use interprocess::os::windows::named_pipe::{PipeListenerOptions, pipe_mode};
+        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+        use widestring::{U16CStr, U16CString};
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+            SE_KERNEL_OBJECT,
+        };
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        // A per-process unique pipe name so concurrent test runs don't collide.
+        let pipe = format!(r"\\.\pipe\hallouminate-acl-test-{}", std::process::id());
+
+        let sddl = U16CString::from_str(OWNER_ONLY_SDDL).expect("encode SDDL");
+        let sd = SecurityDescriptor::deserialize(&sddl).expect("build SD");
+        let listener = PipeListenerOptions::new()
+            .path(Path::new(&pipe))
+            .security_descriptor(Some(sd))
+            .create::<pipe_mode::Bytes, pipe_mode::Bytes>()
+            .expect("bind named pipe with owner-only DACL");
+
+        let handle = listener.as_raw_handle();
+
+        // Pull the bound object's DACL out of the kernel, then render it to SDDL.
+        let mut psd: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        let rc = unsafe {
+            GetSecurityInfo(
+                handle as _,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                &mut psd,
+            )
+        };
+        assert_eq!(rc, 0, "GetSecurityInfo must succeed (WIN32_ERROR {rc})");
+        assert!(!psd.is_null(), "GetSecurityInfo returned a null SD");
+
+        let mut sddl_out: *mut u16 = ptr::null_mut();
+        let mut sddl_len: u32 = 0;
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                psd,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut sddl_out,
+                &mut sddl_len,
+            )
+        };
+        assert_ne!(ok, 0, "ConvertSecurityDescriptorToString... must succeed");
+
+        // `sddl_len` is the TCHAR count of the LocalAlloc'd buffer; truncate at
+        // the NUL exactly as interprocess's own `serialize` wrapper does
+        // (c_wrappers::serialize → `U16CStr::from_ptr_truncate`).
+        let rendered = unsafe { U16CStr::from_ptr_truncate(sddl_out, sddl_len as usize) }
+            .expect("rendered SDDL is a valid NUL-terminated UTF-16 string")
+            .to_string_lossy()
+            .to_ascii_uppercase();
+
+        // Free the two LocalAlloc buffers Windows handed us.
+        unsafe {
+            LocalFree(sddl_out as _);
+            LocalFree(psd as _);
+        }
+
+        // The whole point: the effective DACL the kernel applied must not grant
+        // Everyone or Anonymous anything.
+        for forbidden in ["WD", "AN", "S-1-1-0", "S-1-5-7"] {
+            assert!(
+                !rendered.contains(forbidden),
+                "bound pipe's effective DACL must not reference {forbidden}: {rendered}"
+            );
+        }
+        // The SD was actually applied (not silently dropped for a default
+        // everyone-readable DACL). Assert on the two fixed well-known SIDs:
+        // SYSTEM (`SY`) and Administrators (`BA`) survive verbatim. We do NOT
+        // assert on `CO` here: Creator-Owner (S-1-3-0) is a template SID the
+        // kernel *substitutes* with the creating user's real SID at object
+        // creation, so the bound pipe's effective DACL carries that user's SID
+        // in CO's place — its literal text is environment-dependent. The
+        // constant-only test above pins `CO` against the un-substituted
+        // template; here we assert the owner-only ACE *count* (exactly three,
+        // matching CO+SY+BA) so a widened DACL still fails.
+        for sid in ["SY", "BA"] {
+            assert!(
+                rendered.contains(&format!(";;GA;;;{sid}")),
+                "bound pipe's effective DACL must grant GENERIC_ALL to {sid}: {rendered}"
+            );
+        }
+        assert_eq!(
+            rendered.matches(";;GA;;;").count(),
+            3,
+            "effective DACL must hold exactly the three owner-only ACEs (CO→owner, SY, BA): {rendered}"
+        );
+    }
 }

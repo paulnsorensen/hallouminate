@@ -52,6 +52,19 @@ pub fn daemon_client_unavailable(reason: impl std::fmt::Display) -> anyhow::Erro
     anyhow::anyhow!("daemon unavailable: {reason} (start it with `hallouminate daemon`)")
 }
 
+/// Test entry point: open a *raw* transport stream to a specific socket path,
+/// bypassing the JSON request/response envelope. Production callers always go
+/// through `DaemonClient`, which only writes well-formed `DaemonRequest`s; tests
+/// that need to send malformed bytes (to exercise the dispatcher's framing-error
+/// contract) reach the wire through here. Cross-platform by construction — the
+/// returned `ClientStream` is the unix socket or the Windows named pipe behind
+/// one `AsyncRead + AsyncWrite` type, so the same garbage-input test runs on
+/// every OS instead of being pinned to `tokio::net::UnixStream`.
+pub async fn connect_raw_at(socket: &Path) -> std::io::Result<transport::ClientStream> {
+    let endpoint = daemon_endpoint(socket);
+    transport::connect(&endpoint).await
+}
+
 /// Test entry point: dial a specific socket path. Production code goes
 /// through `daemon_client()` or `client_for()`.
 pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {

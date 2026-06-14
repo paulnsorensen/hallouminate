@@ -720,8 +720,16 @@ async fn daemon_malformed_json_request_returns_invalid_params() {
     // hang. Send raw bytes that look nothing like a DaemonRequest and
     // confirm the server still answers with one JSON line on the same
     // connection.
+    //
+    // Connect through the transport's own raw-stream entry point
+    // (`connect_raw_at`) rather than `tokio::net::UnixStream`: the latter does
+    // not exist on Windows, which would fail to compile the whole daemon test
+    // crate on the windows-latest leg (spec AC #2 wants these tests to RUN on
+    // Windows, not be cfg-stubbed away). `connect_raw_at` returns the unix
+    // socket or the Windows named pipe behind one `AsyncRead + AsyncWrite`
+    // type, so this exact garbage-input contract is exercised on every OS.
+    use hallouminate::app::daemon::connect_raw_at;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
@@ -743,16 +751,13 @@ ground_dir = "{g}"
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
 
-    let mut stream = UnixStream::connect(harness.socket())
-        .await
-        .expect("connect");
+    let mut stream = connect_raw_at(harness.socket()).await.expect("raw connect");
     stream
         .write_all(b"this is not json at all\n")
         .await
         .expect("write");
     stream.flush().await.expect("flush");
-    let (read_half, _) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = BufReader::new(stream);
     let mut line = String::new();
     timeout(Duration::from_secs(5), reader.read_line(&mut line))
         .await

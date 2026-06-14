@@ -108,6 +108,19 @@ widestring = "1"
 [dev-dependencies]
 tempfile = "3"
 
+# Windows-only: the AC #3 owner-only-DACL test queries a bound named pipe's
+# effective security descriptor via `GetSecurityInfo` and renders it back to
+# SDDL to assert Everyone/Anonymous are excluded. Pinned to 0.61 to unify with
+# the copy `interprocess` already pulls in (its own dep is windows-sys 0.61), so
+# this adds features, not a new crate version. Runs only on the windows-latest
+# CI leg.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

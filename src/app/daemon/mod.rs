@@ -34,7 +34,8 @@ mod watch;
 
 pub use bootstrap::ensure_daemon_running;
 pub use client::{
-    DaemonClient, DaemonRpcError, client_for, connect_at, daemon_client, daemon_client_unavailable,
+    DaemonClient, DaemonRpcError, client_for, connect_at, connect_raw_at, daemon_client,
+    daemon_client_unavailable,
 };
 pub use ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
@@ -46,3 +47,4 @@ pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
 pub use server::{DaemonArgs, run_daemon, serve, spawn_signal_handlers};
 pub use socket::daemon_socket_path;
 pub use state::DaemonState;
+pub use transport::ClientStream;
