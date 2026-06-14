@@ -59,8 +59,16 @@ jobs:
         run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
         shell: pwsh
       - name: Install Rust toolchain
-        run: rustup show
+        run: rustup show && rustup component add clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Clippy
+        # AC #6 demands clippy clean on all three OSes. Clippy only lints the
+        # active cfg, so the standalone Linux `clippy` job never sees the
+        # Windows-only cfg arms (named-pipe transport, DACL/SDDL, the
+        # #[cfg(not(unix))] errno + detach + signal arms). Run it here, reusing
+        # this job's protoc/vcpkg/openssl setup so the Windows leg resolves its
+        # native deps.
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Cache Hugging Face tokenizer downloads
         # DaemonState::open hard-loads the HF tokenizer (chunking needs it
         # regardless of embedding mode), so non-ignored tests fetch it from

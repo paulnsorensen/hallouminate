@@ -868,10 +868,12 @@ fn cleanup_temp(parent: &Dir, name: &OsStr) {
 // The #48 Windows spike disproved that premise: `Errno::NOTDIR` and
 // `Errno::ISDIR` are gated `#[cfg(not(windows))]` upstream and do not exist on
 // windows-msvc. So the rustix path is unix-only here and a `#[cfg(not(unix))]`
-// arm supplies the MSVC CRT errno values directly. cap-std maps native Windows
-// errors into this errno namespace at runtime, but matching them is deferred to
-// #48 stage 2 — this is the build-only spike, where the values only need to
-// compile and not collide with a live Windows error code.
+// arm supplies the MSVC CRT errno values directly. cap-std on Windows surfaces
+// Win32 error codes rather than MSVC-CRT errno, so these matches may not fire
+// at runtime and `WriteErrorKind::{Symlink,InvalidPath}` may degrade to `::Io`
+// on Windows — a residual, spec-accepted (Risk Register) and CI-runtime-verified
+// item, not a build concern: the literals compile and do not collide with a
+// live Windows error code.
 #[cfg(unix)]
 const ELOOP: i32 = rustix::io::Errno::LOOP.raw_os_error();
 #[cfg(unix)]
