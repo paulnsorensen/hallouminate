@@ -35,13 +35,14 @@ jobs:
 
   build-test-matrix:
     name: build & test (${{ matrix.os }})
-    # Unix only: the daemon's IPC transport is Unix-socket bound, so the full
-    # test matrix runs on unix. Windows gets a build-only feasibility probe (the
-    # windows-build-probe job below); its named-pipes port is #48 stage 2.
+    # All three OSes run the full build + test: the daemon's IPC transport is
+    # cross-platform (Unix domain sockets on unix, owner-only named pipes on
+    # Windows — #48 stage 2), so the daemon integration suites run on Windows,
+    # not cfg-stubbed away.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -50,6 +51,13 @@ jobs:
         uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Point openssl-sys at the runner's vcpkg
+        # On Windows, lancedb's transitive openssl-sys resolves OpenSSL via vcpkg
+        # (the vendored-openssl dep is scoped to cfg(unix)); windows-latest ships
+        # a vcpkg at VCPKG_INSTALLATION_ROOT. No-op on unix runners.
+        if: runner.os == 'Windows'
+        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
+        shell: pwsh
       - name: Install Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -68,6 +76,9 @@ jobs:
         # Fetch the tokenizer once, serially, with backoff. Without this the
         # parallel test threads each call huggingface.co at startup and trip
         # its rate limiter (HTTP 429) — the failure that reddened the ubuntu leg.
+        # `shell: bash` so this runs identically on the Windows runner (Git Bash
+        # is preinstalled there) instead of pwsh.
+        shell: bash
         run: |
           set -euo pipefail
           printf '[embeddings]\nenabled = false\n' > "${RUNNER_TEMP}/hf-warm.toml"
@@ -84,6 +95,7 @@ jobs:
         # Offline so the warmed cache is served locally and the parallel test
         # burst makes zero network calls. Safe: every model-downloading test is
         # #[ignore]-gated and is not run here.
+        shell: bash
         env:
           HF_HUB_OFFLINE: "1"
         run: cargo test --locked
@@ -102,29 +114,6 @@ jobs:
       - name: Require all matrix legs to pass
         if: needs.build-test-matrix.result != 'success'
         run: exit 1
-
-  windows-build-probe:
-    name: windows build probe (x86_64-pc-windows-msvc)
-    # Feasibility spike for #48 stage 1: prove the native-dependency chain
-    # (ort/onnxruntime, lancedb's zstd-sys/lzma-sys, openssl via vcpkg) LINKS on
-    # windows-msvc. Build-only (lib + bins) — the daemon is cfg-stubbed and
-    # non-functional on Windows until the named-pipes transport (#48 stage 2),
-    # so this is NOT part of the required "build & test" gate.
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-      - name: Install protoc
-        # lancedb's lance-encoding build script needs protoc on every OS.
-        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Point openssl-sys at the runner's vcpkg
-        # lancedb's transitive openssl-sys resolves OpenSSL via vcpkg on Windows;
-        # windows-latest ships a vcpkg at VCPKG_INSTALLATION_ROOT.
-        run: echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-        shell: pwsh
-      - name: Install Rust toolchain
-        run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Build (lib + bins)
-        run: cargo build --locked
+    # The standalone windows-build-probe job (#48 stage 1) is gone: windows-latest
+    # is now a full build+test leg of the matrix above, so the daemon's
+    # named-pipe transport is exercised, not just compiled.

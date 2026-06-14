@@ -6,7 +6,6 @@
 
 #![allow(dead_code)]
 
-#[cfg(unix)]
 pub mod daemon;
 
 use hallouminate::adapters::lance::{EMBEDDING_DIM, PreparedChunk, PreparedFile};

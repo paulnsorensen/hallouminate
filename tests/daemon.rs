@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! Integration tests for the local hallouminate daemon.
 //!
 //! Three quality-gate buckets from the spec:
@@ -10,6 +9,12 @@
 //!      `<repo>/.hallouminate/wiki` and refreshes LanceDB rows through the
 //!      daemon end-to-end.
 //!
+//! These run on every OS (the IPC transport is cross-platform: Unix domain
+//! sockets on unix, named pipes on Windows). The one exception is the SIGTERM
+//! test, which raises a real POSIX signal and so stays `#[cfg(unix)]`; its
+//! Windows sibling drives the same graceful exit through the IPC `Shutdown`
+//! request instead.
+//!
 //! The e2e test downloads the embedding model on first run and is gated
 //! `#[ignore]` to keep CI fast, mirroring `tests/cli_index.rs`.
 
@@ -20,7 +25,6 @@ use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
     DeleteMarkdownRequest, ErrorKind, ReadMarkdownRequest, connect_at, serve,
-    spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -911,8 +915,15 @@ async fn ipc_shutdown_removes_socket_and_lockfile_and_refuses_new_connections() 
     );
 }
 
+// Raises a real POSIX SIGTERM at the test process, so it is inherently
+// unix-only. The Windows graceful-shutdown path is covered by
+// `ipc_shutdown_drains_and_refuses_new_connections` below, which drives the
+// same drain through the IPC `Shutdown` request the production stop path uses.
+#[cfg(unix)]
 #[tokio::test]
 async fn sigterm_removes_socket_and_refuses_new_connections() {
+    use hallouminate::app::daemon::spawn_signal_handlers;
+
     // Quality gate (Curd 1): a SIGTERM must drive the *same* graceful exit as
     // the IPC `Shutdown` path — accept loop drained, socket removed, a
     // subsequent connect fails — rather than dying on the default-terminate
@@ -979,6 +990,74 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
     assert!(
         format!("{err:#}").contains("daemon unavailable"),
         "post-SIGTERM connect must report daemon unavailable: {err:#}"
+    );
+}
+
+// Cross-platform graceful-shutdown gate, and the canonical Windows sibling to
+// the SIGTERM test above: the IPC `Shutdown` request — which is the production
+// stop path on every OS — must drain the accept loop and make a subsequent
+// connect fail. On Windows there is no SIGTERM and no on-disk socket to stat, so
+// "shutdown happened" is asserted purely by a refused reconnect, the one
+// cross-platform liveness signal.
+#[tokio::test]
+async fn ipc_shutdown_drains_and_refuses_new_connections() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let serve_state = state.clone();
+    let socket_clone = socket.clone();
+    let handle = tokio::spawn(async move { serve(&serve_state, &socket_clone).await });
+
+    // Wait until the daemon accepts a connection (cross-platform readiness).
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let client = loop {
+        if let Ok(c) = connect_at(&socket).await {
+            break c;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "daemon never became reachable: {}",
+            socket.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+
+    // Sanity: reachable before the Shutdown.
+    let pong: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: seed_cwd(tmp.path()),
+            payload: DaemonRequestPayload::Ping,
+        })
+        .await
+        .expect("ping before shutdown");
+    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+
+    // The production stop path: send IPC `Shutdown`; the dispatcher cancels the
+    // shutdown token, the accept loop breaks, and `serve` runs cleanup.
+    let _ = client
+        .call_raw(DaemonRequest {
+            cwd: seed_cwd(tmp.path()),
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await;
+
+    let served = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve must return after Shutdown")
+        .expect("join ok");
+    served.expect("serve returns Ok on IPC-Shutdown-driven shutdown");
+
+    let err = connect_at(&socket)
+        .await
+        .expect_err("connect must fail after Shutdown");
+    assert!(
+        format!("{err:#}").contains("daemon unavailable"),
+        "post-Shutdown connect must report daemon unavailable: {err:#}"
     );
 }
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hallouminate::app::config::Config;
-use hallouminate::app::daemon::{DaemonState, serve};
+use hallouminate::app::daemon::{DaemonState, connect_at, serve};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -29,6 +29,9 @@ impl DaemonHarness {
     /// channel; drop tears them all down.
     pub async fn spawn(cfg: Config) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
+        // On unix this is the real socket file path; on Windows the transport
+        // derives a per-path named pipe from it (no on-disk artifact), so the
+        // readiness wait below must connect-probe rather than stat the path.
         let socket = tmp.path().join("daemon.sock");
 
         // Per repo-config-discovery: every daemon request walks its `cwd`
@@ -50,12 +53,18 @@ impl DaemonHarness {
                 _ = rx => Ok(()),
             }
         });
-        // Wait for the socket to appear so the first client connect
-        // doesn't race the bind.
+        // Wait until the daemon accepts a connection so the first real client
+        // call doesn't race the bind. A connect-probe is the one cross-platform
+        // readiness check — `socket.exists()` is meaningless for a named pipe
+        // (there is no on-disk file) and racy even on unix (a stale socket file
+        // can exist before the listener binds).
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
+        loop {
+            if connect_at(&socket).await.is_ok() {
+                break;
+            }
             if std::time::Instant::now() > deadline {
-                panic!("daemon socket never appeared: {}", socket.display());
+                panic!("daemon never became reachable: {}", socket.display());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

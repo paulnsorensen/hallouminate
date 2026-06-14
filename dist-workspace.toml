@@ -11,12 +11,21 @@ ci = "github"
 # (OpenSSF Scorecard Pinned-Dependencies). allow-dirty stops `dist plan` from
 # failing on that divergence; Dependabot keeps the pinned SHAs current.
 allow-dirty = ["ci"]
-# The installers to generate for each app
-installers = ["shell"]
+# The installers to generate for each app. `powershell` is the Windows
+# counterpart to the unix `shell` installer (#48 stage 2).
+installers = ["shell", "powershell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 # x86_64-apple-darwin dropped: ort (ONNX Runtime, via fastembed) ships no prebuilt
 # for it (pykeio/ort#556); it can't link without a from-source build (out of scope).
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+# x86_64-pc-windows-msvc added (#48 stage 2): ort/onnxruntime + lancedb's native
+# deps link on windows-msvc (proven by the CI build+test matrix); OpenSSL resolves
+# via vcpkg (the vendored-openssl dep is scoped to cfg(unix)).
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 
 # Pin the runners so the ort/onnxruntime prebuilt links cleanly:
 #  - x86_64 Linux on ubuntu-24.04 (glibc 2.39) resolves the prebuilt's glibc-2.38
@@ -35,3 +44,8 @@ protobuf-compiler = "*"
 
 [dist.dependencies.homebrew]
 protobuf = "*"
+
+# Windows protoc for the x86_64-pc-windows-msvc release runner (chocolatey is
+# preinstalled on cargo-dist's windows-2022 runner).
+[dist.dependencies.chocolatey]
+protoc = "*"

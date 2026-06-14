@@ -8,12 +8,11 @@
 
 use std::time::Duration;
 
-use tokio::net::UnixStream;
-
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_at;
 use super::ipc::{DaemonRequest, DaemonRequestPayload};
 use super::socket::daemon_socket_path;
+use super::transport::{self, daemon_endpoint};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_POLL: Duration = Duration::from_millis(50);
@@ -67,11 +66,15 @@ pub async fn stop() -> anyhow::Result<()> {
         })
         .await;
 
+    let endpoint = daemon_endpoint(&socket);
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     loop {
-        // Socket file removed by the daemon's cleanup, OR present-but-dead
-        // (connect refused) — either means it's down.
-        if !socket.exists() || UnixStream::connect(&socket).await.is_err() {
+        // A failed connect means it's down: the unix socket was removed by the
+        // daemon's cleanup (or is present-but-dead), and the Windows pipe name
+        // is freed when the daemon's last handle closes. `is_live` is the one
+        // cross-platform liveness check — there is no on-disk file to stat for
+        // a named pipe.
+        if !transport::is_live(&endpoint).await {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {

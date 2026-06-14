@@ -39,11 +39,18 @@ blake3 = "1"
 # rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
 cap-std = "4"
 # rustix is still pulled in transitively by cap-std; the direct dep is kept
-# for `process::kill_process` (daemon shutdown tests) and `fs::flock`
-# (single-instance daemon lock in `server.rs`).
+# for `process::kill_process` (daemon shutdown tests, unix) and `io::Errno`
+# (the `sandbox.rs` errno classifier, unix). The single-instance lock moved
+# off `fs::flock` to `std::fs::File::try_lock()` (stable 1.89, cross-platform),
+# but the `fs` feature stays — `io::Errno` is gated behind it.
 rustix = { version = "1", features = ["fs", "process"] }
 ignore = "0.4"
 globset = "0.4"
+# Cross-platform local-socket IPC for the daemon control channel: unix domain
+# sockets (tokio UnixStream underneath, byte-identical to the prior transport)
+# and Windows named pipes from one bind/connect seam. The named-pipe DACL is
+# set at creation via the os::windows::named_pipe path (transport.rs).
+interprocess = { version = "2.4.2", features = ["tokio"] }
 
 # Markdown + text
 pulldown-cmark = { version = "0.13", default-features = false }
@@ -91,6 +98,12 @@ schemars = "1"
 # lancedb's transitive openssl-sys resolve OpenSSL via vcpkg (VCPKG_ROOT) instead (#48 stage 1).
 [target.'cfg(unix)'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
+
+# `widestring` builds the UTF-16 SDDL string that `SecurityDescriptor::deserialize`
+# requires (it takes `&U16CStr`, not `&str`) for the owner-only named-pipe DACL.
+# Windows-only — the unix transport sets owner access via the socket file mode.
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
 
 [dev-dependencies]
 tempfile = "3"
