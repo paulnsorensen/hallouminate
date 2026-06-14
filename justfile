@@ -14,10 +14,16 @@ ci: _fmt-check _clippy _build _test
 # For agents/LLMs — auto-fix formatting + machine-applicable lints, then verify.
 llm: _fix _clippy _build _test
 
-# Move v<version> to HEAD and push, retriggering release.yml + publish-crates.yml.
+# Move v<version> to HEAD and push, retriggering release.yml + publish-crates.yml + release-skills.yml.
 # Use to re-ship the SAME version after landing a release fix on main.
+# Deleting the existing v<version> GitHub Release first makes the re-run idempotent:
+# cargo-dist's host job runs a plain `gh release create`, which errors on an
+# existing release. Re-created binaries replace it; crates.io publish self-skips
+# (already published); the skill pack lives on the separate skills-v<version>
+# release, so it is untouched here and clobbered by release-skills.yml anyway.
 re-tag version:
     @git diff --quiet HEAD || { echo "working tree dirty — commit first"; exit 1; }
+    -gh release delete v{{version}} --yes
     -git push origin :refs/tags/v{{version}}
     -git tag -d v{{version}}
     git tag v{{version}}
