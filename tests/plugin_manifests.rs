@@ -63,8 +63,11 @@ fn plugin_versions_match_the_crate_version() {
 
 #[test]
 fn claude_marketplace_resolves_to_the_plugin_directory() {
+    // The installer resolves `plugins[].source` relative to the repo root and
+    // ignores `metadata.pluginRoot` (issue #118), so `source` must carry the
+    // full payload path. Mirror the codex sibling's flat resolution; do not
+    // reintroduce `pluginRoot`.
     let marketplace = read_json(".claude-plugin/marketplace.json");
-    let root = str_at(&marketplace, "/metadata/pluginRoot", "marketplace.json");
     let entry = marketplace
         .pointer("/plugins")
         .and_then(|p| p.as_array())
@@ -75,9 +78,8 @@ fn claude_marketplace_resolves_to_the_plugin_directory() {
         })
         .expect("marketplace.json: no plugin entry named hallouminate");
     let source = str_at(entry, "/source", "marketplace.json");
-    assert_eq!(source, "./hallouminate");
-    let resolved = repo_root().join(root).join(source);
-    assert_is_plugin_dir(&resolved);
+    assert_eq!(source, "./plugins/hallouminate");
+    assert_is_plugin_dir(&repo_root().join(source));
 }
 
 #[test]
