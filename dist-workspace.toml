@@ -25,6 +25,10 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-
 #    from x86_64 via zigbuild, which fails to link onnxruntime's C++ runtime
 #    (libstdc++ std::* undefined symbols). A native build links it automatically.
 [dist.github-custom-runners]
+# global: the orchestration jobs (plan/host/global-artifacts/announce) that don't
+# link onnxruntime. Kept on ubuntu-24.04 so they match the build runners and the
+# rest of CI instead of lagging on dist's default ubuntu-22.04.
+global = "ubuntu-24.04"
 x86_64-unknown-linux-gnu = "ubuntu-24.04"
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 
