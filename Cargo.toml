@@ -24,7 +24,7 @@ notify-debouncer-full = "0.7"
 lancedb = "0.29"
 # Only the `arrow` umbrella: its `arrow::array` / `arrow::datatypes` re-exports
 # replace direct arrow-array/arrow-schema deps, so they can never drift apart.
-arrow = "58"
+arrow = "59"
 async-trait = "0.1"
 futures = "0.3"
 
