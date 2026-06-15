@@ -664,4 +664,42 @@ mod tests {
         );
         assert!(warnings[0].contains("ref="), "{}", warnings[0]);
     }
+
+    #[test]
+    fn embedded_close_delimiter_in_note_truncates_and_leaves_tail_in_body() {
+        // An author who writes `note="repealed --> see X"` has put the comment's
+        // own close delimiter (`-->`) *inside* the quoted note. Per HTML-comment
+        // semantics the comment ends at the FIRST `-->`, so the parser only ever
+        // sees `claim:contradicted note="repealed `. This pins that decision:
+        //   - the parsed note is the (now-unterminated) text up to the first `-->`,
+        //     i.e. `repealed` (the trailing space is trimmed off `inner`);
+        //   - the residual tail ` see X"-->` is legitimate body text after the
+        //     comment closed, so strip leaves it in place (deleting it would guess
+        //     at author intent and could remove real prose);
+        //   - line count is unchanged so citations stay valid.
+        let text = "text<!--claim:contradicted note=\"repealed --> see X\"-->\n";
+        let marks = extract_claim_marks(text);
+        assert_eq!(
+            marks.len(),
+            1,
+            "the truncated comment still parses one mark"
+        );
+        assert_eq!(marks[0].status, ClaimStatus::Contradicted);
+        assert_eq!(
+            marks[0].note.as_deref(),
+            Some("repealed"),
+            "note is truncated at the first `-->`, not the author's intended close quote"
+        );
+
+        let stripped = strip_claim_marks(text);
+        assert_eq!(
+            stripped, "text see X\"-->\n",
+            "the post-`-->` tail is body text and must survive strip verbatim"
+        );
+        assert_eq!(
+            stripped.lines().count(),
+            text.lines().count(),
+            "strip must preserve line count"
+        );
+    }
 }
