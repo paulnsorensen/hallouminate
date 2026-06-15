@@ -587,3 +587,146 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
         hits2.iter().map(|h| h.file_ref.clone()).collect::<Vec<_>>()
     );
 }
+
+/// Seam #88 acceptance: a page with all four claim statuses round-trips through
+/// the full index → store → `ground` pipeline. Marks surface on
+/// `ChunkProvenance.claim_marks` with on-disk (frontmatter-adjusted) lines,
+/// references, and notes; embeddings/snippets carry no raw `<!--claim:...-->`
+/// text; the on-disk file is untouched (what `read_markdown` returns verbatim);
+/// and `line_start`/`line_end` still match on-disk lines after the strip.
+#[tokio::test]
+async fn claim_marks_round_trip_through_ground_with_clean_snippets() {
+    use hallouminate::domain::corpus::{ClaimMark, ClaimStatus};
+    use hallouminate::domain::ground::{GroundOpts, ground};
+
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+
+    // 3 frontmatter lines (1..=3) → fm_lines = 3. On-disk anchor lines:
+    // confirmed=6, qualified=8, superseded=10, contradicted=12. An ordinary
+    // HTML comment on line 14 must be left intact (no mark, no strip).
+    let page = "---\nstatus: reviewed\n---\n# Claims\n\n\
+The confirmed fact about alphamelange.<!--claim:confirmed-->\n\n\
+A qualified point about betamelange.<!--claim:qualified note=\"only on macOS\"-->\n\n\
+A superseded statement about gammamelange.<!--claim:superseded ref=old/page.md-->\n\n\
+A contradicted statement about deltamelange.<!--claim:contradicted ref=https://example.com/rfc note=\"repealed in v3\"-->\n\n\
+A note about epsilonmelange with an ordinary comment.<!-- ordinary note -->\n";
+    let page_path = corpus_dir.path().join("claims.md");
+    fs::write(&page_path, page).expect("write claims fixture");
+
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+        global: false,
+    };
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    // Budget large enough to keep the whole short page in one chunk so every
+    // mark lands in one bucket; the assertions below collect across chunks
+    // anyway, so a split would not break them.
+    let chunker = MarkdownChunker::new(Characters, 1500);
+    let mut embedder = StubEmbedder;
+
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+        .await
+        .expect("index_corpus");
+    assert_eq!(stats.files_upserted, 1, "the claims page indexed");
+
+    // Ground on a distinctive body token so the claims page is the top hit.
+    let mut embedder2 = StubEmbedder;
+    let resp = ground(
+        "alphamelange",
+        &corpus.name,
+        &corpus.paths,
+        &store,
+        Some(&mut embedder2),
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("ground");
+
+    let doc = resp
+        .docs
+        .iter()
+        .find(|(path, _)| path.ends_with("claims.md"))
+        .map(|(_, d)| d)
+        .expect("claims.md must appear in ground results");
+
+    // Collect every mark surfaced across the doc's chunks.
+    let mut marks: Vec<ClaimMark> = doc
+        .chunks
+        .iter()
+        .flat_map(|c| c.provenance.claim_marks.clone())
+        .collect();
+    marks.sort_by_key(|m| m.line);
+
+    assert_eq!(
+        marks,
+        vec![
+            ClaimMark {
+                status: ClaimStatus::Confirmed,
+                line: 6,
+                reference: None,
+                note: None,
+            },
+            ClaimMark {
+                status: ClaimStatus::Qualified,
+                line: 8,
+                reference: None,
+                note: Some("only on macOS".into()),
+            },
+            ClaimMark {
+                status: ClaimStatus::Superseded,
+                line: 10,
+                reference: Some("old/page.md".into()),
+                note: None,
+            },
+            ClaimMark {
+                status: ClaimStatus::Contradicted,
+                line: 12,
+                reference: Some("https://example.com/rfc".into()),
+                note: Some("repealed in v3".into()),
+            },
+        ],
+        "all four statuses must round-trip with on-disk lines, refs, and notes"
+    );
+
+    // Snippets carry no raw claim-comment text — the retrieval prose is clean.
+    // (The embedding input is the same `PreparedChunk.text` as the snippet
+    // source, so a clean snippet proves the embedding input is clean too.)
+    for c in &doc.chunks {
+        assert!(
+            !c.snippet.contains("<!--claim:"),
+            "snippet leaked a raw claim comment: {:?}",
+            c.snippet
+        );
+    }
+
+    // Embeddings input is the same `PreparedChunk.text` as the snippet source,
+    // so a clean snippet proves the embedding input is clean too. Assert the
+    // chunk's line range still brackets the on-disk lines after the strip
+    // (strip preserves line count, so citations stay valid).
+    let bracketing = doc.chunks.iter().any(|c| {
+        let [start, end] = c.line_range;
+        start <= 6 && end >= 12
+    });
+    assert!(
+        bracketing,
+        "a chunk must bracket on-disk lines 6..=12 after strip: {:?}",
+        doc.chunks.iter().map(|c| c.line_range).collect::<Vec<_>>()
+    );
+
+    // `read_markdown` reads file bytes directly, so the on-disk file is the
+    // verbatim source it returns — the claim comments remain present on disk.
+    let on_disk = fs::read_to_string(&page_path).expect("read back claims.md");
+    assert_eq!(on_disk, page, "on-disk bytes must be untouched (verbatim)");
+    assert!(
+        on_disk.contains("<!--claim:confirmed-->"),
+        "claim comments must remain on disk for read_markdown"
+    );
+}

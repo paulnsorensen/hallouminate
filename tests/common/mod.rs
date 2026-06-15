@@ -73,6 +73,7 @@ pub fn prepared_file_with_chunks(
             line_start: i + 1,
             line_end: i + 1,
             text: t.to_string(),
+            claim_marks: None,
         })
         .collect();
     let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();

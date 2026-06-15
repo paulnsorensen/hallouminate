@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::corpus::ClaimMark;
+
 /// Structured payload of the `ground` MCP tool: one semantic-search query and
 /// its per-file ranked results.
 ///
@@ -89,7 +91,12 @@ pub struct ChunkProvenance {
     /// ground (#106) it attributes each chunk to its source wiki.
     #[serde(default)]
     pub corpus: String,
-    // #88 extends here: pub claim_status: Option<ClaimStatus>,
+    /// Claim-level provenance marks (#88) anchored within this chunk's line
+    /// range. A chunk can tag several claims, so this is a `Vec` (empty when the
+    /// chunk carries none). `#[serde(default)]` keeps a strict-schema client
+    /// reading a payload that predates the field from hard-breaking.
+    #[serde(default)]
+    pub claim_marks: Vec<ClaimMark>,
 }
 
 /// A non-fatal advisory attached to a [`GroundResponse`].
@@ -104,6 +111,7 @@ pub struct Warning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::corpus::ClaimStatus;
     use serde_json::json;
 
     fn fixture_response() -> GroundResponse {
@@ -124,6 +132,12 @@ mod tests {
                     snippet: "first ~200 chars of chunk text…".into(),
                     provenance: ChunkProvenance {
                         corpus: "tern-docs".into(),
+                        claim_marks: vec![ClaimMark {
+                            status: ClaimStatus::Confirmed,
+                            line: 140,
+                            reference: None,
+                            note: None,
+                        }],
                     },
                 }],
             },
@@ -158,7 +172,15 @@ mod tests {
                         "line_range": [134, 198],
                         "score": 0.91,
                         "snippet": "first ~200 chars of chunk text…",
-                        "provenance": { "corpus": "tern-docs" }
+                        "provenance": {
+                            "corpus": "tern-docs",
+                            "claim_marks": [{
+                                "status": "confirmed",
+                                "line": 140,
+                                "reference": null,
+                                "note": null
+                            }]
+                        }
                     }]
                 }
             },

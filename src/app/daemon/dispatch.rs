@@ -502,6 +502,7 @@ async fn handle_add_markdown(
     // a follow-up instead of discovering breakage on a later read.
     let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
     warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
+    warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
 
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,

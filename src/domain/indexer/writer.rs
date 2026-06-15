@@ -3,7 +3,8 @@ use std::fs;
 use crate::adapters::lance::{PreparedChunk, PreparedFile};
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::{
-    CorpusChunker, Frontmatter, blake3_bytes, extract_keywords, extract_summary, split_frontmatter,
+    ClaimMark, CorpusChunker, Frontmatter, blake3_bytes, extract_claim_marks, extract_keywords,
+    extract_summary, marks_to_canonical_json, split_frontmatter, strip_claim_marks,
 };
 
 pub(super) struct WriteRequest<'a> {
@@ -30,6 +31,10 @@ pub(super) fn prepare_file(
     // each chunk's line numbers so citations point at the real on-disk lines.
     let (frontmatter, content, fm_lines) = split_frontmatter(&body);
     let chunks_raw = chunker.chunk_text(content);
+    // Claim marks are parsed once on the (frontmatter-stripped) body; their lines
+    // are body-relative, matching the chunker's body-relative chunk line ranges.
+    // Each mark is then bucketed into the chunk whose range contains it.
+    let marks = extract_claim_marks(content);
     let fallback = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -39,12 +44,28 @@ pub(super) fn prepare_file(
     let file_ref_str = file_ref_string(req.file)?;
     let mut chunks: Vec<PreparedChunk> = Vec::with_capacity(chunks_raw.len());
     for c in chunks_raw {
+        // Filter marks to this chunk's body-relative range, then shift their
+        // lines by `fm_lines` for the on-disk citation (same offset the chunk's
+        // line numbers get below).
+        let chunk_marks: Vec<ClaimMark> = marks
+            .iter()
+            .filter(|m| m.line >= c.line_start && m.line <= c.line_end)
+            .map(|m| ClaimMark {
+                line: m.line + fm_lines,
+                ..m.clone()
+            })
+            .collect();
         chunks.push(PreparedChunk {
             ord: c.ord,
             heading_path: c.heading_path,
             line_start: c.line_start + fm_lines,
             line_end: c.line_end + fm_lines,
-            text: c.text,
+            // Strip claim comments from the retrieval text. This single edit
+            // cleans both the embedding input and the stored snippet (they share
+            // `PreparedChunk.text`); strip preserves line count so the chunk's
+            // line numbers and the per-chunk mark filter above stay aligned.
+            text: strip_claim_marks(&c.text),
+            claim_marks: marks_to_canonical_json(&chunk_marks),
         });
     }
     Ok(PreparedFile {
