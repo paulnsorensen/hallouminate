@@ -183,10 +183,10 @@ fn release_workflow_tag_trigger_stays_anchored_at_v() {
     let path = repo_root().join(".github/workflows/release-skills.yml");
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let workflow: serde_yaml::Value =
-        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
 
-    // serde_yaml 0.9 parses bare `on` as Value::String("on") (YAML 1.2 semantics —
+    // serde_yaml_ng parses bare `on` as Value::String("on") (YAML 1.2 semantics —
     // only true/false are booleans, not on/off/yes/no).
     let tags = workflow
         .get("on")
@@ -443,8 +443,8 @@ fn release_workflow_guards_against_double_publish() {
     let path = repo_root().join(".github/workflows/release-skills.yml");
     let text =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let workflow: serde_yaml::Value =
-        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
 
     let steps = workflow
         .get("jobs")

@@ -67,10 +67,11 @@ tokenizers = { version = "0.23", features = ["http"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"
-# Page-level frontmatter parsing. `serde_yaml` is archived upstream but already
-# in the build graph (lancedb -> lance -> lindera pin 0.9.34), so taking a direct
-# dep adds zero new compilation and avoids introducing a duplicate YAML crate.
-serde_yaml = "0.9"
+# Page-level frontmatter parsing via serde_yaml_ng, the maintained fork of the
+# archived serde_yaml. lindera 3.x already pulls serde_yaml_ng into the build
+# graph, so this direct dep adds zero new compilation and keeps a single YAML
+# crate in the tree.
+serde_yaml_ng = "0.10"
 
 # Error handling
 thiserror = "2"

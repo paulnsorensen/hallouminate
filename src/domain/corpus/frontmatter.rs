@@ -153,7 +153,7 @@ fn parse_block(body: &str) -> Block<'_> {
         };
     }
 
-    match serde_yaml::from_str::<Frontmatter>(yaml) {
+    match serde_yaml_ng::from_str::<Frontmatter>(yaml) {
         Ok(fm) => Block::Parsed { fm, rest, lines },
         Err(_) => Block::Malformed,
     }
