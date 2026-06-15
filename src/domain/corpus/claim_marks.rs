@@ -584,4 +584,84 @@ mod tests {
     fn lint_silent_on_ordinary_comment() {
         assert!(lint_claim_marks("body <!-- not a claim -->\n").is_empty());
     }
+
+    #[test]
+    fn empty_status_is_malformed_no_mark_and_lint_warns() {
+        // `<!--claim:-->` has an empty status token, which from_str_ci("") rejects
+        // as unrecognized. This must: produce no mark, fire one lint warning
+        // (malformed), and be stripped from the text (same as any malformed claim
+        // comment — it's not a NotClaim, so strip_claim_comments_in_line drops it).
+        let text = "intro<!--claim:-->\nmore\n";
+        assert!(
+            extract_claim_marks(text).is_empty(),
+            "empty status must not produce a mark"
+        );
+        let warnings = lint_claim_marks(text);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "empty status must warn as malformed: {warnings:?}"
+        );
+        assert!(
+            warnings[0].contains("unrecognized status"),
+            "warning must name the problem: {}",
+            warnings[0]
+        );
+        let stripped = strip_claim_marks(text);
+        assert!(
+            !stripped.contains("<!--claim:"),
+            "malformed claim comment must be stripped: {stripped:?}"
+        );
+        assert_eq!(
+            stripped.lines().count(),
+            text.lines().count(),
+            "strip must preserve line count"
+        );
+    }
+
+    #[test]
+    fn unterminated_comment_produces_no_mark_no_warning_and_survives_strip() {
+        // An HTML comment missing `-->` is never a claim mark by grammar (the
+        // scanner only yields comments with both delimiters on the same line).
+        // It must not produce a mark, must not lint-warn, and must be left
+        // byte-for-byte intact by strip_claim_marks.
+        let text = "text<!--claim:confirmed\nmore\n";
+        assert!(
+            extract_claim_marks(text).is_empty(),
+            "unterminated comment must not yield a mark"
+        );
+        assert!(
+            lint_claim_marks(text).is_empty(),
+            "unterminated comment must not lint-warn"
+        );
+        assert_eq!(
+            strip_claim_marks(text),
+            text,
+            "unterminated comment must survive strip unchanged"
+        );
+    }
+
+    #[test]
+    fn ref_with_empty_value_yields_none_reference() {
+        // `ref=` followed immediately by whitespace (empty bare token) must not
+        // set reference — the guard `if !value.is_empty()` ensures reference
+        // stays None so downstream null-checks work correctly.
+        let body = "x<!--claim:superseded ref= note=\"reason\"-->\n";
+        let marks = extract_claim_marks(body);
+        assert_eq!(marks.len(), 1, "must still produce a mark");
+        assert_eq!(marks[0].status, ClaimStatus::Superseded);
+        assert_eq!(
+            marks[0].reference, None,
+            "empty ref= must leave reference None"
+        );
+        assert_eq!(marks[0].note.as_deref(), Some("reason"));
+        // The linter must warn because superseded with no ref=.
+        let warnings = lint_claim_marks(body);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "empty ref= is treated as absent: {warnings:?}"
+        );
+        assert!(warnings[0].contains("ref="), "{}", warnings[0]);
+    }
 }
