@@ -55,10 +55,13 @@ globset = "0.4"
 pulldown-cmark = { version = "0.13", default-features = false }
 stop-words = "0.10"
 unicode-segmentation = "1"
-text-splitter = { version = "0.30", features = ["markdown", "tokenizers"] }
-# Pinned to ^0.22 to match text-splitter's tokenizers requirement; bumping to
-# 0.23 splits the crate graph and breaks the `ChunkSizer for Tokenizer` impl.
-tokenizers = { version = "0.22", features = ["http"] }
+text-splitter = { version = "0.31", features = ["markdown", "tokenizers"] }
+# Kept in lockstep with text-splitter's `tokenizers` requirement (now ^0.23):
+# text-splitter's `ChunkSizer for Tokenizer` impl targets a specific tokenizers
+# major, so this direct dep MUST match text-splitter or the `ChunkSizer` impl no
+# longer applies to our `Tokenizer`. fastembed pins its own tokenizers 0.22
+# internally, so the lock carries both — benign, since those types never cross.
+tokenizers = { version = "0.23", features = ["http"] }
 
 # Serialization + config
 serde = { version = "1", features = ["derive"] }

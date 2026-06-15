@@ -17,5 +17,22 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      # text-splitter's `ChunkSizer for Tokenizer` impl targets a specific
+      # tokenizers major; they must bump in one PR or the crate graph splits.
+      text-processing:
+        patterns:
+          - text-splitter
+          - tokenizers
+      # arrow must match the arrow major lancedb re-exports; bundle them so the
+      # coupled bump arrives as one (mergeable) PR, not two singletons.
+      lance-storage:
+        patterns:
+          - lancedb
+          - arrow
       cargo-minor-and-patch:
         update-types: [minor, patch]
+    ignore:
+      # arrow majors ahead of lancedb create two arrow versions in the graph
+      # (un-mergeable). Re-allow once lancedb ships a release built on arrow 59+.
+      - dependency-name: arrow
+        update-types: [version-update:semver-major]
