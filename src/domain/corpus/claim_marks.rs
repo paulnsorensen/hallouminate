@@ -12,9 +12,11 @@
 //! structured marks live in metadata, so the prose stays clean and the on-disk
 //! file remains the verbatim source of truth.
 //!
-//! Parsing is fail-soft: an unrecognized `STATUS` is ignored (treated as an
-//! ordinary HTML comment), mirroring `LifecycleStatus::from_str_ci` returning
-//! `None`. Non-claim HTML comments are never consumed.
+//! Parsing is fail-soft: an unrecognized `STATUS` produces no structured mark
+//! and fires an advisory lint warning (mirroring `LifecycleStatus::from_str_ci`
+//! returning `None`), but because the comment is still recognized as
+//! claim-shaped it IS stripped from retrieval text (embeddings + snippets).
+//! Only non-`claim:` HTML comments are left intact (never parsed, never stripped).
 
 use serde::{Deserialize, Serialize};
 

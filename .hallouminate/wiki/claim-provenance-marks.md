@@ -17,8 +17,10 @@ Syntax — an HTML comment at the end of the claim it annotates:
 ```
 
 `STATUS` ∈ `confirmed | qualified | superseded | contradicted`, case-insensitive.
-An unrecognized status is treated as an ordinary HTML comment and ignored
-(mirrors `LifecycleStatus::from_str_ci` returning `None`). `ref=` is an opaque
+An unrecognized status yields no structured mark and an advisory lint warning
+(mirrors `LifecycleStatus::from_str_ci` returning `None`), but the comment is
+still stripped from retrieval text because it is claim-shaped; only non-`claim:`
+HTML comments survive in retrieval text. `ref=` is an opaque
 pointer (page path, footnote label, or URL); `note=` an optional quoted rationale.
 
 ## Two provenance vocabularies, two columns
