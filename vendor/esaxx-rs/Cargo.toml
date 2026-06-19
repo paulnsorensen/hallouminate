@@ -1,0 +1,26 @@
+# Vendored from esaxx-rs 0.1.10 (https://github.com/Narsil/esaxx-rs, Apache-2.0)
+# with ONE change: build.rs links the C++ against the DYNAMIC MSVC CRT (/MD)
+# instead of the static CRT (/MT). Upstream hardcodes `.static_crt(true)`, which
+# produces /MT objects that cannot link against ort's dynamic-CRT (/MD)
+# onnxruntime prebuilt on x86_64-pc-windows-msvc (LNK2038 -> LNK1319). See #48
+# and upstream Narsil/esaxx-rs PR #19. Patched in via [patch.crates-io] in the
+# root manifest. Example/bench targets (and their criterion dev-dep + 392 KB
+# bench corpus) are dropped here — only the library is consumed (transitively by
+# fastembed/text-splitter -> tokenizers, for Unigram suffix-automaton support).
+
+[package]
+edition = "2018"
+name = "esaxx-rs"
+version = "0.1.10"
+authors = ["Nicolas Patry <patry.nicolas@protonmail.com>"]
+description = "Wrapping around sentencepiece's esaxxx library."
+license = "Apache-2.0"
+repository = "https://github.com/Narsil/esaxx-rs"
+
+[build-dependencies.cc]
+version = "1.0"
+optional = true
+
+[features]
+cpp = ["cc"]
+default = ["cpp"]

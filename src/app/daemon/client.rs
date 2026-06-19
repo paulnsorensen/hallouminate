@@ -2,19 +2,21 @@
 //!
 //! `DaemonClient::connect` resolves the socket path from
 //! `daemon_socket_path()` (test-overridable via `HALLOUMINATE_SOCKET`) and
-//! returns a clear `daemon unavailable` error when the socket is missing or
+//! returns a clear `daemon unavailable` error when the endpoint is missing or
 //! unreachable. Callers that fall back to a non-daemon path do so
 //! explicitly; the client never auto-starts a daemon.
+//!
+//! The transport (unix domain socket / Windows named pipe) is abstracted by
+//! `transport.rs`; this module owns the JSON request/response envelope, the
+//! daemon-down error vocabulary, and the typed error surface.
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use super::ipc::{DaemonRequest, DaemonResponse, ErrorKind};
 use super::socket::daemon_socket_path;
+use super::transport::{self, daemon_endpoint};
 
 /// Client handle: just remembers which socket path to dial. Stateless
 /// otherwise — every `call` opens a fresh connection.
@@ -24,7 +26,7 @@ pub struct DaemonClient {
 }
 
 /// Connect to the daemon. Returns `Err` with a clear "daemon unavailable"
-/// message when the socket is missing, unreadable, or the connect fails.
+/// message when the endpoint is missing, unreadable, or the connect fails.
 pub async fn daemon_client() -> anyhow::Result<DaemonClient> {
     let socket = daemon_socket_path();
     connect_at(&socket).await
@@ -50,17 +52,27 @@ pub fn daemon_client_unavailable(reason: impl std::fmt::Display) -> anyhow::Erro
     anyhow::anyhow!("daemon unavailable: {reason} (start it with `hallouminate daemon`)")
 }
 
+/// Test entry point: open a *raw* transport stream to a specific socket path,
+/// bypassing the JSON request/response envelope. Production callers always go
+/// through `DaemonClient`, which only writes well-formed `DaemonRequest`s; tests
+/// that need to send malformed bytes (to exercise the dispatcher's framing-error
+/// contract) reach the wire through here. Cross-platform by construction — the
+/// returned `ClientStream` is the unix socket or the Windows named pipe behind
+/// one `AsyncRead + AsyncWrite` type, so the same garbage-input test runs on
+/// every OS instead of being pinned to `tokio::net::UnixStream`.
+pub async fn connect_raw_at(socket: &Path) -> std::io::Result<transport::ClientStream> {
+    let endpoint = daemon_endpoint(socket);
+    transport::connect(&endpoint).await
+}
+
 /// Test entry point: dial a specific socket path. Production code goes
 /// through `daemon_client()` or `client_for()`.
 pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {
-    // Probe the socket with a quick connect to confirm a daemon is alive,
+    // Probe the endpoint with a quick connect to confirm a daemon is alive,
     // surfacing the failure here instead of inside the first `call`.
-    UnixStream::connect(socket).await.with_context(|| {
-        format!(
-            "daemon unavailable: cannot connect to {} \
-             (start it with `hallouminate daemon`)",
-            socket.display()
-        )
+    let endpoint = daemon_endpoint(socket);
+    transport::connect(&endpoint).await.map_err(|e| {
+        daemon_client_unavailable(format!("cannot connect to {}: {e}", socket.display()))
     })?;
     Ok(DaemonClient {
         socket: socket.to_path_buf(),
@@ -73,37 +85,26 @@ impl DaemonClient {
     }
 
     /// Send one request, parse one response. The daemon protocol is
-    /// one-shot per connection, so each call opens a new socket.
+    /// one-shot per connection, so each call opens a new connection.
     pub async fn call_raw(&self, req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
-        let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
+        let endpoint = daemon_endpoint(&self.socket);
+        let stream = transport::connect(&endpoint).await.map_err(|e| {
             daemon_client_unavailable(format!("connect to {} failed: {e}", self.socket.display()))
         })?;
-        let mut text = serde_json::to_string(&req)?;
-        text.push('\n');
-        // Wrap mid-call I/O errors with the same `daemon unavailable` hint
-        // the initial connect uses. Without this, a daemon that dies after
-        // the connect succeeds (write fails, read returns EOF, response
-        // truncates) surfaces as a bare I/O / JSON error and MCP/CLI
-        // callers lose the actionable "start it with `hallouminate daemon`"
-        // recovery suffix.
-        stream.write_all(text.as_bytes()).await.map_err(|e| {
-            daemon_client_unavailable(format!("write to {} failed: {e}", self.socket.display()))
+        // Wrap mid-call I/O errors with the same `daemon unavailable` hint the
+        // initial connect uses. Without this, a daemon that dies after the
+        // connect succeeds (write fails, read returns EOF, response truncates)
+        // surfaces as a bare I/O / JSON error and MCP/CLI callers lose the
+        // actionable "start it with `hallouminate daemon`" recovery suffix.
+        let line = transport::round_trip(stream, &req).await.map_err(|e| {
+            daemon_client_unavailable(format!("rpc to {} failed: {e}", self.socket.display()))
         })?;
-        stream.flush().await.map_err(|e| {
-            daemon_client_unavailable(format!("flush {} failed: {e}", self.socket.display()))
-        })?;
-        let (read_half, _) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.map_err(|e| {
-            daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
-        })?;
-        if n == 0 {
-            return Err(daemon_client_unavailable(format!(
+        let line = line.ok_or_else(|| {
+            daemon_client_unavailable(format!(
                 "daemon at {} closed the connection before responding",
                 self.socket.display(),
-            )));
-        }
+            ))
+        })?;
         let response: DaemonResponse = serde_json::from_str(line.trim_end()).map_err(|e| {
             daemon_client_unavailable(format!(
                 "invalid daemon response from {}: {e} (response: {line:?})",

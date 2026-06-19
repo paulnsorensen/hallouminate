@@ -854,37 +854,42 @@ fn cleanup_temp(parent: &Dir, name: &OsStr) {
 
 // Numeric errno constants used in path-error classification.
 //
-// AC2 of the cap-std migration spec ("`rustix::io::Errno` is also removed")
-// is intentionally partial here, as an explicit reviewed trade-off rather
-// than inherited rustix coupling. The reason: `std::io::ErrorKind` gates
-// `NotADirectory`, `IsADirectory`, `FilesystemLoop`, and `InvalidFilename`
-// behind the unstable `io_error_more` feature on Rust 1.91 (the project's
-// MSRV), so the public `WriteErrorKind` discrimination callers depend on
-// has to come from `raw_os_error()` matches. The three alternatives all
-// have worse trade-offs:
+// `std::io::ErrorKind` gates `NotADirectory`, `IsADirectory`, `FilesystemLoop`,
+// and `InvalidFilename` behind the unstable `io_error_more` feature on Rust
+// 1.91 (the project's MSRV), so the `WriteErrorKind` discrimination callers
+// depend on has to come from `raw_os_error()` matches.
 //
-//   1. Hand-rolled platform-cfg-gated constants — banned by the spec
-//      ("No new `#[cfg(unix)]` / `#[cfg(windows)]` gates inside
-//      `sandbox.rs`").
-//   2. Add `libc` as a direct dep just for the constants — heavyweight
-//      for a four-constant ask.
-//   3. Wait for `io_error_more` to stabilise — open-ended, MSRV-bound.
+// On unix these come from `rustix::io::Errno` (rustix is already a workspace
+// dep — `process::kill_process` in tests, `fs::flock` in the daemon), which
+// resolves the right raw value per target: ELOOP is 40 on Linux, 62 on macOS.
+// The cap-std migration spec chose this over a direct `libc` dep or hand-rolled
+// constants, on the premise that the rustix names are fully cross-platform.
 //
-// The spec's Risk Register entry on `classify_path_error` already
-// anticipated this gap. `rustix::io::Errno`'s associated constants are
-// stable, cross-platform names that resolve to the right raw errno per
-// target, and rustix is already a workspace dep (kept for
-// `process::kill_process` in tests and `fs::flock` in
-// `src/app/daemon/server.rs`).
-//
-// Linux/macOS: ELOOP=Linux 40 / macOS 62, ENOTDIR=20, EISDIR=21, EINVAL=22.
-// Windows: cap-std maps native errors into the rustix errno namespace via
-// its translation layer; runtime verification is deferred to a later curd
-// per the spec's Verification Plan.
+// The #48 Windows spike disproved that premise: `Errno::NOTDIR` and
+// `Errno::ISDIR` are gated `#[cfg(not(windows))]` upstream and do not exist on
+// windows-msvc. So the rustix path is unix-only here and a `#[cfg(not(unix))]`
+// arm supplies the MSVC CRT errno values directly. cap-std on Windows surfaces
+// Win32 error codes rather than MSVC-CRT errno, so these matches may not fire
+// at runtime and `WriteErrorKind::{Symlink,InvalidPath}` may degrade to `::Io`
+// on Windows — a residual, spec-accepted (Risk Register) and CI-runtime-verified
+// item, not a build concern: the literals compile and do not collide with a
+// live Windows error code.
+#[cfg(unix)]
 const ELOOP: i32 = rustix::io::Errno::LOOP.raw_os_error();
+#[cfg(unix)]
 const ENOTDIR: i32 = rustix::io::Errno::NOTDIR.raw_os_error();
+#[cfg(unix)]
 const EISDIR: i32 = rustix::io::Errno::ISDIR.raw_os_error();
+#[cfg(unix)]
 const EINVAL: i32 = rustix::io::Errno::INVAL.raw_os_error();
+#[cfg(not(unix))]
+const ELOOP: i32 = 114;
+#[cfg(not(unix))]
+const ENOTDIR: i32 = 20;
+#[cfg(not(unix))]
+const EISDIR: i32 = 21;
+#[cfg(not(unix))]
+const EINVAL: i32 = 22;
 
 /// Classify an error from a non-create path operation (open_dir, open,
 /// symlink_metadata on an intermediate component). Preserves the historical

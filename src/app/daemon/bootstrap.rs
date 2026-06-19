@@ -6,20 +6,18 @@
 //! the caller is Claude Code or another MCP host, and the user does not see
 //! daemon-bootstrap errors. So `serve` auto-spawns a daemon on first launch.
 //!
-//! The flock in `acquire_single_instance` makes this safe under concurrent
-//! `serve` launches: only one spawned daemon wins the lock; the others exit
-//! cleanly and every `serve` polls the same socket.
+//! The single-instance lock in `acquire_single_instance` makes this safe under
+//! concurrent `serve` launches: only one spawned daemon wins the lock; the
+//! others exit cleanly and every `serve` polls the same endpoint.
 
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use tokio::net::UnixStream;
-
 use super::client::connect_at;
 use super::daemon_socket_path;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
+use super::transport::{self, daemon_endpoint};
 
 const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -29,6 +27,28 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// elapsed probe is treated as unverifiable (→ restart), the same fate as a
 /// transport error or a legacy bare-`"pong"` reply.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Detach a spawned daemon from the parent so a foreground Ctrl-C / console
+/// close does not take it down.
+///
+/// On unix this puts the child in its own process group (`process_group(0)`).
+/// On Windows there is no process group; the equivalent is `DETACHED_PROCESS`
+/// (the child runs with no console). That is safe here because the daemon
+/// redirects stdin/stdout/stderr to a log file + null before this spawn, so it
+/// never touches a console. The constant is hand-defined rather than pulling
+/// `windows-sys` in for one integer.
+#[cfg(unix)]
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    cmd.creation_flags(DETACHED_PROCESS);
+}
 
 /// Ensure a daemon is reachable, spawning a detached one if not.
 ///
@@ -40,8 +60,9 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     }
 
     let socket = daemon_socket_path();
-    if UnixStream::connect(&socket).await.is_ok() {
-        // A daemon is already listening. `flock` guarantees it's the only one,
+    let endpoint = daemon_endpoint(&socket);
+    if transport::is_live(&endpoint).await {
+        // A daemon is already listening. The lock guarantees it's the only one,
         // but NOT that it's our version: after a binary upgrade, this fresh
         // MCP server could silently drive a daemon spawned from the old
         // release (Curd C). Adopt it only when its reported version matches
@@ -81,17 +102,17 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     let log_err = log.try_clone()?;
 
     let exe = std::env::current_exe()?;
-    Command::new(&exe)
-        .arg("daemon")
+    let mut cmd = Command::new(&exe);
+    cmd.arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
-        .process_group(0)
-        .spawn()?;
+        .stderr(Stdio::from(log_err));
+    detach(&mut cmd);
+    cmd.spawn()?;
 
     let deadline = std::time::Instant::now() + SPAWN_TIMEOUT;
     while std::time::Instant::now() < deadline {
-        if UnixStream::connect(&socket).await.is_ok() {
+        if transport::is_live(&endpoint).await {
             return Ok(());
         }
         tokio::time::sleep(POLL_INTERVAL).await;

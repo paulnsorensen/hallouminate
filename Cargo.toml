@@ -31,12 +31,6 @@ futures = "0.3"
 # Embeddings
 fastembed = "5"
 
-# Force vendored (compile-from-source) OpenSSL so `openssl-sys` cross-compiles for
-# aarch64-unknown-linux-gnu in the dist release build. openssl-sys is pulled in
-# transitively via native-tls (ort-sys/ureq, fastembed/hf-hub, lancedb/reqwest);
-# vendoring avoids needing the target's system libssl under cargo-zigbuild cross-compile.
-openssl = { version = "0.10", features = ["vendored"] }
-
 # Hashing + filesystem
 blake3 = "1"
 # `cap-std` is the cross-platform `Dir`-relative API the corpus sandbox uses
@@ -45,11 +39,18 @@ blake3 = "1"
 # rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
 cap-std = "4"
 # rustix is still pulled in transitively by cap-std; the direct dep is kept
-# for `process::kill_process` (daemon shutdown tests) and `fs::flock`
-# (single-instance daemon lock in `server.rs`).
+# for `process::kill_process` (daemon shutdown tests, unix) and `io::Errno`
+# (the `sandbox.rs` errno classifier, unix). The single-instance lock moved
+# off `fs::flock` to `std::fs::File::try_lock()` (stable 1.89, cross-platform),
+# but the `fs` feature stays — `io::Errno` is gated behind it.
 rustix = { version = "1", features = ["fs", "process"] }
 ignore = "0.4"
 globset = "0.4"
+# Cross-platform local-socket IPC for the daemon control channel: unix domain
+# sockets (tokio UnixStream underneath, byte-identical to the prior transport)
+# and Windows named pipes from one bind/connect seam. The named-pipe DACL is
+# set at creation via the os::windows::named_pipe path (transport.rs).
+interprocess = { version = "2.4.2", features = ["tokio"] }
 
 # Markdown + text
 pulldown-cmark = { version = "0.13", default-features = false }
@@ -93,10 +94,49 @@ once_cell = "1"
 rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"
 
+# Force vendored (compile-from-source) OpenSSL so `openssl-sys` cross-compiles for
+# aarch64-unknown-linux-gnu in the dist release build. openssl-sys is pulled in
+# transitively via native-tls (ort-sys/ureq, fastembed/hf-hub, lancedb/reqwest);
+# vendoring avoids needing the target's system libssl under cargo-zigbuild cross-compile.
+# Scoped to unix so the Windows build skips the perl+nasm openssl-src build and lets
+# lancedb's transitive openssl-sys resolve OpenSSL via vcpkg (VCPKG_ROOT) instead (#48 stage 1).
+[target.'cfg(unix)'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
+# `widestring` builds the UTF-16 SDDL string that `SecurityDescriptor::deserialize`
+# requires (it takes `&U16CStr`, not `&str`) for the owner-only named-pipe DACL.
+# Windows-only — the unix transport sets owner access via the socket file mode.
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+
 [dev-dependencies]
 tempfile = "3"
+
+# Windows-only: the AC #3 owner-only-DACL test queries a bound named pipe's
+# effective security descriptor via `GetSecurityInfo` and renders it back to
+# SDDL to assert Everyone/Anonymous are excluded. Pinned to 0.61 to unify with
+# the copy `interprocess` already pulls in (its own dep is windows-sys 0.61), so
+# this adds features, not a new crate version. Runs only on the windows-latest
+# CI leg.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# esaxx-rs 0.1.10 (pulled transitively via fastembed/text-splitter -> tokenizers)
+# hardcodes the static MSVC CRT (/MT) in its build.rs, which fails to link
+# against ort's dynamic-CRT (/MD) onnxruntime prebuilt on x86_64-pc-windows-msvc
+# (LNK2038 -> LNK1319, #48). The feature can't be disabled (text-splitter
+# enables tokenizers' default `esaxx_fast`) and no env/RUSTFLAGS overrides the
+# explicit `.static_crt(true)`, so we redirect to a vendored copy with the one
+# build.rs line flipped to /MD. No-op off windows-msvc. Drop once a fixed
+# esaxx-rs ships upstream (Narsil/esaxx-rs PR #19). See vendor/esaxx-rs/README.md.
+[patch.crates-io]
+esaxx-rs = { path = "vendor/esaxx-rs" }
