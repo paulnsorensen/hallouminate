@@ -55,7 +55,7 @@ globset = "0.4"
 pulldown-cmark = { version = "0.13", default-features = false }
 stop-words = "0.10"
 unicode-segmentation = "1"
-text-splitter = { version = "0.31", features = ["markdown", "tokenizers"] }
+text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
 # Kept in lockstep with text-splitter's `tokenizers` requirement (now ^0.23):
 # text-splitter's `ChunkSizer for Tokenizer` impl targets a specific tokenizers
 # major, so this direct dep MUST match text-splitter or the `ChunkSizer` impl no
