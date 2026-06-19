@@ -85,10 +85,14 @@ impl FileBucket {
                 line_range: [h.line_start as u32, h.line_end as u32],
                 score: h.score as f64,
                 snippet: make_snippet(&h.text),
-                // Stamped by the orchestrator from its corpus arg (same as
-                // DocFile.corpus); the LanceDB row implies corpus by query
-                // scope and doesn't carry it per-row.
-                provenance: ChunkProvenance::default(),
+                // `corpus` is stamped by the orchestrator from its corpus arg
+                // (the LanceDB row implies corpus by query scope and doesn't
+                // carry it per-row); `claim_marks` is per-row, so it flows from
+                // the decoded hit here.
+                provenance: ChunkProvenance {
+                    claim_marks: h.claim_marks.clone(),
+                    ..ChunkProvenance::default()
+                },
             })
             .collect();
         // mtime is sourced from SearchHit.mtime_ms (decoded from the
@@ -144,6 +148,7 @@ mod tests {
             keywords: vec!["docs".into(), "test".into()],
             score,
             mtime_ms: FIXTURE_MTIME_MS,
+            claim_marks: vec![],
         }
     }
 
@@ -163,6 +168,30 @@ mod tests {
         assert!(a.chunks[0].score >= a.chunks[1].score);
         assert_eq!(a.summary.as_deref(), Some("summary of /a.md"));
         assert_eq!(a.keywords, vec!["docs".to_string(), "test".into()]);
+    }
+
+    #[test]
+    fn claim_marks_flow_from_hit_into_chunk_provenance() {
+        use crate::domain::corpus::{ClaimMark, ClaimStatus};
+        let mut h = hit("/a.md", 0, 0.9);
+        h.claim_marks = vec![ClaimMark {
+            status: ClaimStatus::Superseded,
+            line: 12,
+            reference: Some("old.md".into()),
+            note: None,
+        }];
+        let docs = build_docs(&[h], 5, 5).expect("build");
+        let chunk = &docs.get("/a.md").expect("a present").chunks[0];
+        assert_eq!(
+            chunk.provenance.claim_marks,
+            vec![ClaimMark {
+                status: ClaimStatus::Superseded,
+                line: 12,
+                reference: Some("old.md".into()),
+                note: None,
+            }],
+            "per-row claim marks must surface on DocChunk.provenance, not be dropped"
+        );
     }
 
     #[test]

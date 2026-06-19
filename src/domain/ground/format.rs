@@ -155,6 +155,7 @@ mod tests {
                         snippet: "Three research rounds on planning LLMs handling code.".into(),
                         provenance: ChunkProvenance {
                             corpus: "cheese".into(),
+                            ..Default::default()
                         },
                     },
                     DocChunk {
@@ -165,6 +166,7 @@ mod tests {
                         snippet: "Signature-graph planning is unexplored in detail.".into(),
                         provenance: ChunkProvenance {
                             corpus: "cheese".into(),
+                            ..Default::default()
                         },
                     },
                 ],

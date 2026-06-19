@@ -3,7 +3,8 @@ use std::fs;
 use crate::adapters::lance::{PreparedChunk, PreparedFile};
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::{
-    CorpusChunker, Frontmatter, blake3_bytes, extract_keywords, extract_summary, split_frontmatter,
+    ClaimMark, CorpusChunker, Frontmatter, blake3_bytes, extract_claim_marks, extract_keywords,
+    extract_summary, marks_to_canonical_json, split_frontmatter, strip_claim_marks,
 };
 
 pub(super) struct WriteRequest<'a> {
@@ -30,6 +31,26 @@ pub(super) fn prepare_file(
     // each chunk's line numbers so citations point at the real on-disk lines.
     let (frontmatter, content, fm_lines) = split_frontmatter(&body);
     let chunks_raw = chunker.chunk_text(content);
+    // Claim marks are parsed once on the (frontmatter-stripped) body; their lines
+    // are body-relative, matching the chunker's body-relative chunk line ranges.
+    // Each mark is bucketed into exactly one chunk below.
+    let marks = extract_claim_marks(content);
+    // Assign each mark to exactly ONE chunk. The naive inclusive range test
+    // (`line_start <= m.line <= line_end`) double-buckets when a single
+    // over-budget line is split across chunks: every sub-chunk then carries
+    // `line_start == line_end == N`, so a mark on line N matches all of them and
+    // surfaces N times in `ground`. Pick the LAST matching chunk — a mark's
+    // `<!--claim:...-->` text sits at the end of its line, so it belongs to the
+    // final sub-chunk of a split line. For an unsplit line exactly one chunk
+    // matches, so this is identical to the old behaviour there.
+    let mark_chunk_idx: Vec<Option<usize>> = marks
+        .iter()
+        .map(|m| {
+            chunks_raw
+                .iter()
+                .rposition(|c| m.line >= c.line_start && m.line <= c.line_end)
+        })
+        .collect();
     let fallback = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -39,12 +60,30 @@ pub(super) fn prepare_file(
     let file_ref_str = file_ref_string(req.file)?;
     let mut chunks: Vec<PreparedChunk> = Vec::with_capacity(chunks_raw.len());
     for c in chunks_raw {
+        // Take only the marks assigned to this chunk (each mark lands in exactly
+        // one chunk via `mark_chunk_idx`), then shift their lines by `fm_lines`
+        // for the on-disk citation (same offset the chunk's line numbers get
+        // below).
+        let chunk_marks: Vec<ClaimMark> = marks
+            .iter()
+            .enumerate()
+            .filter(|(mi, _)| mark_chunk_idx[*mi] == Some(c.ord))
+            .map(|(_, m)| ClaimMark {
+                line: m.line + fm_lines,
+                ..m.clone()
+            })
+            .collect();
         chunks.push(PreparedChunk {
             ord: c.ord,
             heading_path: c.heading_path,
             line_start: c.line_start + fm_lines,
             line_end: c.line_end + fm_lines,
-            text: c.text,
+            // Strip claim comments from the retrieval text. This single edit
+            // cleans both the embedding input and the stored snippet (they share
+            // `PreparedChunk.text`); strip preserves line count so the chunk's
+            // line numbers and the per-chunk mark filter above stay aligned.
+            text: strip_claim_marks(&c.text),
+            claim_marks: marks_to_canonical_json(&chunk_marks),
         });
     }
     Ok(PreparedFile {
@@ -329,5 +368,48 @@ mod tests {
         .expect("malformed frontmatter must not error the index run");
         assert!(pf.frontmatter.is_none(), "malformed → null column");
         assert!(!pf.chunks.is_empty(), "content still indexes");
+    }
+
+    #[test]
+    fn marked_long_line_split_across_chunks_buckets_to_exactly_one_chunk() {
+        // Finding B (correctness): a single line longer than the chunk budget that
+        // also carries a claim mark. If `MarkdownSplitter` split that one line into
+        // two chunks with inclusive line ranges that share line N (chunk A's
+        // `line_end` == chunk B's `line_start`), the inclusive per-chunk filter
+        // would bucket the mark into BOTH chunks and surface it twice in `ground`.
+        // This forces the split and asserts the mark lands in exactly one chunk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.md");
+        // One physical line, no internal newlines, far over an 8-char budget, with
+        // a claim mark at its end (so the mark anchors to line 1).
+        let long_line = "word ".repeat(40);
+        fs::write(&path, format!("{long_line}<!--claim:confirmed-->\n")).unwrap();
+        let chunker = MarkdownChunker::new(Characters, 8);
+        let file = FileRef::new(PathBuf::from(&path));
+        let pf = prepare_file(
+            WriteRequest {
+                corpus: &corpus(),
+                file: &file,
+                mtime: Mtime(0),
+            },
+            &chunker,
+            0,
+        )
+        .expect("prepare_file");
+
+        // The tiny budget must actually split the line into multiple chunks; the
+        // mark on line 1 must then be bucketed into exactly one of them.
+        assert!(
+            pf.chunks.len() >= 2,
+            "tiny budget must split the long line into multiple chunks, got {}",
+            pf.chunks.len()
+        );
+        let carrying = pf.chunks.iter().filter(|c| c.claim_marks.is_some()).count();
+        assert_eq!(
+            carrying, 1,
+            "a mark on a split line must surface in exactly one chunk, not be \
+             double-bucketed across the inclusive boundary; chunks={:#?}",
+            pf.chunks
+        );
     }
 }

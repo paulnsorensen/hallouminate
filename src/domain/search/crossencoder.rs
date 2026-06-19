@@ -191,6 +191,7 @@ mod tests {
             keywords: vec![],
             score,
             mtime_ms: 0,
+            claim_marks: vec![],
         }
     }
 

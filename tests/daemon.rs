@@ -614,6 +614,114 @@ enabled = false
     );
 }
 
+#[tokio::test]
+async fn daemon_add_markdown_warns_on_claim_marks_and_stores_verbatim() {
+    // Locks the `handle_add_markdown` wiring of `lint_claim_marks`: a page with
+    // a `contradicted` mark missing `ref=` and a malformed (unknown-status)
+    // claim comment must ride back two advisories through the real daemon
+    // response — and still be stored byte-for-byte, claim comments included
+    // (advisory lint never blocks or rewrites the write). A page whose marks are
+    // all well-formed produces no claim advisory.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Two claim advisories: a contradicted mark with no ref, and an unknown
+    // status. The ordinary HTML comment must not warn.
+    let body = "# Notes\n\nA contradicted claim.<!--claim:contradicted-->\n\nBogus.<!--claim:bananas-->\n\nFine.<!--claim:confirmed-->\n\nPlain <!-- ordinary note -->\n";
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "claims.md".into(),
+                content: body.into(),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("add_markdown ok despite claim advisories");
+
+    // Stored verbatim, claim comments included — the linter never edits content.
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("claims.md")).unwrap(),
+        body,
+        "claim marks must be stored verbatim, never rewritten by the linter"
+    );
+
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present for claim-mark issues");
+    let claim_advisories: Vec<&str> = warnings
+        .iter()
+        .filter_map(|w| w.as_str())
+        .filter(|w| w.contains("claim"))
+        .collect();
+    assert_eq!(
+        claim_advisories.len(),
+        2,
+        "exactly two claim advisories must ride back: {warnings:?}"
+    );
+    let joined = claim_advisories.join("\n");
+    assert!(
+        joined.contains("contradicted") && joined.contains("ref="),
+        "missing-ref advisory expected: {joined}"
+    );
+    assert!(
+        joined.contains("unrecognized status"),
+        "malformed-status advisory expected: {joined}"
+    );
+
+    // A page whose marks are all well-formed (and confirmed/qualified need no
+    // ref) produces no claim advisory.
+    let clean: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "clean-claims.md".into(),
+                content: "# Notes\n\nGood.<!--claim:superseded ref=old.md-->\n".into(),
+                overwrite: false,
+            }),
+        })
+        .await
+        .expect("add_markdown ok for well-formed claim marks");
+    let clean_claim_advisories = clean["warnings"]
+        .as_array()
+        .map(|w| {
+            w.iter()
+                .filter_map(|x| x.as_str())
+                .filter(|x| x.contains("claim"))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        clean_claim_advisories, 0,
+        "well-formed claim marks must not warn: {:?}",
+        clean["warnings"]
+    );
+}
+
 // ─── Hardening: liveness, contract surface, single-instance ────────────
 
 #[tokio::test]

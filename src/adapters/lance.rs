@@ -15,6 +15,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::common::{FileRef, HallouminateError, Result};
+use crate::domain::corpus::ClaimMark;
 use crate::domain::embeddings::canonical_model_name;
 use crate::domain::indexer::plan::FileSnapshot;
 
@@ -36,6 +37,11 @@ pub struct PreparedChunk {
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
+    /// Canonical JSON of the claim marks anchored within this chunk's line
+    /// range, or `None` when the chunk has no marks. Per-chunk (positional),
+    /// unlike the page-level `frontmatter` denormalized identically onto every
+    /// row. Stored in the nullable `claim_marks` column.
+    pub claim_marks: Option<String>,
 }
 
 /// A single source file plus all of its chunks, ready for `apply_batch`.
@@ -78,6 +84,9 @@ pub struct SearchHit {
     pub keywords: Vec<String>,
     pub score: f32,
     pub mtime_ms: i64,
+    /// Claim marks decoded from the chunk's `claim_marks` JSON column. Empty
+    /// when the chunk carried no marks (a null column value).
+    pub claim_marks: Vec<ClaimMark>,
 }
 
 /// Stable, deterministic chunk identifier derived from (file_ref, ord).
@@ -118,11 +127,12 @@ struct Meta {
 }
 
 /// The schema version this build reads and writes, bumped whenever the Arrow
-/// `chunks` schema changes shape (v2 added the `frontmatter` column). Also the
+/// `chunks` schema changes shape (v2 added the `frontmatter` column; v3 added
+/// the per-chunk `claim_marks` column). Also the
 /// serde default, but every LanceDB store ever written records this field, so a
 /// missing value can only come from a hand-edited sidecar.
 fn default_schema_version() -> u32 {
-    2
+    3
 }
 
 fn default_quantized() -> bool {
@@ -228,6 +238,8 @@ pub fn chunks_schema() -> SchemaRef {
         Field::new("line_start", DataType::Int64, false),
         Field::new("line_end", DataType::Int64, false),
         Field::new("text", DataType::Utf8, false),
+        // Nullable: null = no claim marks anchored within this chunk.
+        Field::new("claim_marks", DataType::Utf8, true),
         Field::new(
             "embedding",
             DataType::FixedSizeList(
@@ -267,6 +279,7 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
     let mut line_starts: Vec<i64> = Vec::new();
     let mut line_ends: Vec<i64> = Vec::new();
     let mut texts: Vec<String> = Vec::new();
+    let mut claim_marks: Vec<Option<String>> = Vec::new();
     let mut embeddings_flat: Vec<f32> = Vec::new();
     // One validity bit per chunk row: true = real vector, false = null
     // (embeddings-OFF mode). Stays all-true on the ON path so the null
@@ -299,6 +312,7 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
             line_starts.push(chunk.line_start as i64);
             line_ends.push(chunk.line_end as i64);
             texts.push(chunk.text.clone());
+            claim_marks.push(chunk.claim_marks.clone());
             match &file.embeddings {
                 Some(embeddings) => {
                     embeddings_flat.extend_from_slice(&embeddings[idx]);
@@ -345,6 +359,7 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
         Arc::new(Int64Array::from(line_starts)),
         Arc::new(Int64Array::from(line_ends)),
         Arc::new(StringArray::from(texts)),
+        Arc::new(StringArray::from_iter(claim_marks)),
         Arc::new(embedding_array),
     ];
     RecordBatch::try_new(schema, columns)
@@ -395,6 +410,28 @@ fn decode_list(list: &ListArray, row: usize) -> Vec<String> {
     (0..s.len()).map(|i| s.value(i).to_string()).collect()
 }
 
+/// Decode a chunk's `claim_marks` JSON column value into structured marks. A
+/// null cell (no marks anchored in the chunk) yields an empty `Vec`. Malformed
+/// JSON is logged and treated as no marks rather than failing the whole search —
+/// a corrupt stored payload must not take down a query.
+fn decode_claim_marks(col: &StringArray, row: usize) -> Vec<ClaimMark> {
+    if col.is_null(row) {
+        return Vec::new();
+    }
+    let raw = col.value(row);
+    match serde_json::from_str::<Vec<ClaimMark>>(raw) {
+        Ok(marks) => marks,
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::lance",
+                error = %e,
+                "failed to decode claim_marks JSON; treating chunk as having no marks"
+            );
+            Vec::new()
+        }
+    }
+}
+
 fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
     // A zero-row batch contributes no hits and may carry a projected-away
     // schema (LanceDB can return an empty result whose columns are absent when
@@ -414,6 +451,7 @@ fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
     let mtime_ms = int64_col(rb, "mtime_ms")?;
     let heading_path = list_utf8_col(rb, "heading_path")?;
     let keywords = list_utf8_col(rb, "keywords")?;
+    let claim_marks = string_col(rb, "claim_marks")?;
     let score = rb
         .column_by_name("_relevance_score")
         .or_else(|| rb.column_by_name("_score"))
@@ -435,6 +473,7 @@ fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
             keywords: decode_list(keywords, i),
             score: s,
             mtime_ms: mtime_ms.value(i),
+            claim_marks: decode_claim_marks(claim_marks, i),
         });
     }
     Ok(())
@@ -1075,7 +1114,7 @@ mod tests {
             &meta_path,
             r#"# auto-managed by hallouminate; do not edit
 embedding_model_name = "BAAI/bge-small-en-v1.5"
-schema_version = 2
+schema_version = 3
 "#,
         )
         .unwrap();
@@ -1085,7 +1124,7 @@ schema_version = 2
 
     #[test]
     fn meta_check_or_init_errors_on_schema_version_mismatch() {
-        // A v1 store predates the frontmatter column. Opening it with this (v2)
+        // A v1 store predates the frontmatter column. Opening it with this (v3)
         // build must return the graceful delete+reindex remedy, not crash later
         // on an Arrow schema mismatch.
         let dir = tempfile::tempdir().unwrap();
@@ -1101,9 +1140,37 @@ schema_version = 1
         )
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect_err("a v1 store must be rejected by the v2 binary");
+            .expect_err("a v1 store must be rejected by the v3 binary");
         let msg = err.to_string();
         assert!(msg.contains("schema version"), "{msg}");
+        assert!(msg.contains("delete"), "{msg}");
+        assert!(msg.contains("hallouminate index"), "{msg}");
+    }
+
+    #[test]
+    fn meta_check_or_init_errors_on_v2_store_so_it_reindexes_cleanly() {
+        // A v2 store predates the per-chunk `claim_marks` column. Opening it with
+        // this (v3) build must trip the same graceful delete+reindex remedy as
+        // the v1 case, so the operator rebuilds through the documented path
+        // rather than hitting a raw Arrow schema-mismatch crash on first query.
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            r#"# auto-managed by hallouminate; do not edit
+embedding_model_name = "BAAI/bge-small-en-v1.5"
+quantized = false
+embeddings_enabled = true
+schema_version = 2
+"#,
+        )
+        .unwrap();
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
+            .expect_err("a v2 store must be rejected by the v3 binary");
+        let msg = err.to_string();
+        assert!(msg.contains("schema version"), "{msg}");
+        assert!(msg.contains('2'), "must name the stored version: {msg}");
+        assert!(msg.contains('3'), "must name the expected version: {msg}");
         assert!(msg.contains("delete"), "{msg}");
         assert!(msg.contains("hallouminate index"), "{msg}");
     }
@@ -1179,6 +1246,7 @@ schema_version = 1
                 "line_start",
                 "line_end",
                 "text",
+                "claim_marks",
                 "embedding",
             ]
         );
@@ -1221,6 +1289,7 @@ schema_version = 1
                 line_start: 1,
                 line_end: 2,
                 text: format!("chunk-{i}"),
+                claim_marks: None,
             });
             embeddings.push([0.0_f32; EMBEDDING_DIM]);
         }
@@ -1245,7 +1314,7 @@ schema_version = 1
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
         assert_eq!(rb.num_rows(), 5);
-        assert_eq!(rb.num_columns(), 15);
+        assert_eq!(rb.num_columns(), 16);
     }
 
     #[test]
@@ -1294,6 +1363,32 @@ schema_version = 1
             "absent frontmatter must be a null column value"
         );
         assert_eq!(fm.null_count(), 1);
+    }
+
+    #[test]
+    fn build_record_batch_denormalizes_claim_marks_with_null_for_absent() {
+        // Per-chunk (not per-file): only the chunk carrying marks gets the JSON;
+        // the rest are null. Mirrors the frontmatter null-handling test but at
+        // chunk granularity.
+        let mut pf = synthetic_prepared("/tmp/marks.md", 3);
+        pf.chunks[1].claim_marks =
+            Some(r#"[{"status":"confirmed","line":2,"reference":null,"note":null}]"#.to_string());
+        let schema = chunks_schema();
+        let rb = build_record_batch(&[pf], schema).expect("build batch");
+        let cm = rb
+            .column_by_name("claim_marks")
+            .expect("claim_marks column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("claim_marks is utf8");
+        assert!(cm.is_null(0), "chunk 0 has no marks → null");
+        assert!(!cm.is_null(1), "chunk 1 carries the marks JSON");
+        assert_eq!(
+            cm.value(1),
+            r#"[{"status":"confirmed","line":2,"reference":null,"note":null}]"#
+        );
+        assert!(cm.is_null(2), "chunk 2 has no marks → null");
+        assert_eq!(cm.null_count(), 2);
     }
 
     #[test]
