@@ -19,7 +19,7 @@ use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
     DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest,
-    ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
+    ListFilesRequest, ListFilesResult, ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -1940,5 +1940,273 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
     assert!(
         !fresh_doc.stale,
         "file unchanged since index must NOT be marked stale"
+    );
+}
+
+// ─── Issue #127: store-schema auto-rebuild ────────────────────────────────────────
+
+/// Write a meta.toml with an explicit schema_version into `ground_dir`.
+/// `ground_dir` is created if absent.
+fn write_stale_meta(ground_dir: &Path, schema_version: u32) {
+    std::fs::create_dir_all(ground_dir).expect("mkdir ground");
+    let meta = format!(
+        "# auto-managed by hallouminate; do not edit\n\
+         embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
+         quantized = false\n\
+         embeddings_enabled = false\n\
+         schema_version = {schema_version}\n"
+    );
+    std::fs::write(ground_dir.join("meta.toml"), meta).expect("write meta.toml");
+}
+
+/// Config with one corpus and embeddings disabled, model pinned to BGE so it
+/// matches the `write_stale_meta` sidecar (both must agree on model name).
+fn cfg_with_corpus(ground_dir: &Path, corpus_root: &Path) -> Config {
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n\
+         [storage]\nground_dir = \"{g}\"\n\n\
+         [embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+        c = corpus_root.display(),
+        g = ground_dir.display(),
+    );
+    toml::from_str(&toml).expect("cfg_with_corpus toml parses")
+}
+
+/// Read the schema_version from a ground dir's meta.toml.
+fn read_schema_version(ground_dir: &Path) -> u32 {
+    let text = std::fs::read_to_string(ground_dir.join("meta.toml"))
+        .expect("read meta.toml");
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("schema_version = ") {
+            return rest.trim().parse().expect("parse schema_version");
+        }
+    }
+    panic!("schema_version not found in meta.toml")
+}
+
+// T1: stale store auto-rebuilds
+#[tokio::test]
+async fn stale_store_auto_rebuilds_on_daemon_open() {
+    // Setup: ground dir with a stale meta.toml (expected - 1) + a seeded wiki
+    // file. DaemonState::open must return Ok, moving the stale store aside and
+    // reindexing from source.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    std::fs::write(corpus_root.join("hello.md"), "# Hello\n\nworld\n").expect("seed");
+
+    // Write a stale meta at schema_version = current - 1.
+    let current = hallouminate::adapters::lance::default_schema_version_pub();
+    let stale = current - 1;
+    write_stale_meta(&ground, stale);
+
+    let cfg = cfg_with_corpus(&ground, &corpus_root);
+    // DaemonState::open must succeed (no crash).
+    DaemonState::open(cfg, None)
+        .await
+        .expect("stale store must be auto-rebuilt, not fatal");
+
+    // The stale store was moved aside.
+    let bak = ground.with_file_name(format!("ground.bak-v{stale}"));
+    assert!(bak.exists(), "backup ground.bak-v{stale} must exist after rebuild");
+    // The backup must contain the original stale meta.toml so the store is
+    // recoverable (spec criterion 4: stale store is recoverable at .bak-v{N}).
+    let bak_version = read_schema_version(&bak);
+    assert_eq!(
+        bak_version, stale,
+        "backup meta.toml must retain the stale schema_version so the data is recoverable"
+    );
+
+    // The fresh store has the current schema version.
+    let fresh_version = read_schema_version(&ground);
+    assert_eq!(
+        fresh_version, current,
+        "fresh meta.toml must record the current schema version"
+    );
+}
+
+// T2: downgrade stays fatal + original store untouched
+#[tokio::test]
+async fn downgrade_store_is_fatal_and_original_untouched() {
+    // A store from a NEWER binary (schema_version > expected) must fail loud
+    // and fatal. The original ground dir must not be touched (no .bak).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+
+    let current = hallouminate::adapters::lance::default_schema_version_pub();
+    let newer = current + 1;
+    write_stale_meta(&ground, newer);
+
+    let cfg = cfg_with_corpus(&ground, &corpus_root);
+    let err = DaemonState::open(cfg, None)
+        .await
+        .expect_err("downgrade must be fatal");
+    let msg = err.to_string();
+    assert!(
+        msg.to_uppercase().contains("NEWER"),
+        "error must say NEWER (downgrade): {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("upgrade"),
+        "error must advise upgrade: {msg}"
+    );
+    // Original ground dir is untouched: no .bak directory created.
+    let bak = ground.with_file_name(format!("ground.bak-v{newer}"));
+    assert!(!bak.exists(), "no .bak must exist after downgrade rejection");
+    // The original meta.toml is still at the newer version.
+    let stored = read_schema_version(&ground);
+    assert_eq!(stored, newer, "original meta.toml must be untouched");
+}
+
+// T3: matching version — store untouched, no backup
+#[tokio::test]
+async fn matching_version_store_is_untouched() {
+    // When the on-disk schema_version equals the build's expected version,
+    // DaemonState::open must succeed and must NOT create any .bak directory.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+
+    let current = hallouminate::adapters::lance::default_schema_version_pub();
+    write_stale_meta(&ground, current);
+
+    let cfg = cfg_with_corpus(&ground, &corpus_root);
+    DaemonState::open(cfg, None)
+        .await
+        .expect("matching version must open cleanly");
+
+    // No backup was created.
+    let bak = ground.with_file_name(format!("ground.bak-v{current}"));
+    assert!(
+        !bak.exists(),
+        "no .bak must exist when versions match"
+    );
+    // The on-disk meta.toml must still record the current version — the
+    // match-branch must not have silently mutated or re-written it.
+    let still_current = read_schema_version(&ground);
+    assert_eq!(
+        still_current, current,
+        "matching-version open must not alter meta.toml"
+    );
+}
+
+// T4: rebuild reproduces content (lexical, no embeddings needed)
+#[tokio::test]
+async fn stale_rebuild_reproduces_corpus_content() {
+    // After a stale-store auto-rebuild, list_files returns the seeded file.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let seeded = corpus_root.join("doc.md");
+    std::fs::write(&seeded, "# Doc\n\ncontent here\n").expect("seed doc");
+
+    let current = hallouminate::adapters::lance::default_schema_version_pub();
+    write_stale_meta(&ground, current - 1);
+
+    let cfg = cfg_with_corpus(&ground, &corpus_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    // list_files for the rebuilt corpus must return the seeded file.
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let result: ListFilesResult = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
+                corpus: Some("docs".into()),
+            }),
+        })
+        .await
+        .expect("list_files ok");
+
+    assert!(
+        !result.is_empty(),
+        "rebuilt corpus must contain the seeded file; list_files was empty"
+    );
+    // The seeded file's path must appear in the results.
+    let paths: Vec<&str> = result.iter().map(|e| e.path.as_str()).collect();
+    assert!(
+        paths.iter().any(|p| p.contains("doc.md")),
+        "seeded doc.md must appear in list_files after rebuild; got: {paths:?}"
+    );
+}
+
+// T5: move-aside overwrites prior backup
+#[tokio::test]
+async fn stale_rebuild_overwrites_prior_backup() {
+    // Pre-create ground.bak-v{N} to simulate a prior failed rebuild.
+    // A fresh stale rebuild must overwrite it (single backup remains).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    std::fs::write(corpus_root.join("doc.md"), "# Doc\n\ncontent\n").expect("seed");
+
+    let current = hallouminate::adapters::lance::default_schema_version_pub();
+    let stale = current - 1;
+    write_stale_meta(&ground, stale);
+
+    // Pre-create a prior backup directory with a sentinel file.
+    let bak = ground.with_file_name(format!("ground.bak-v{stale}"));
+    std::fs::create_dir_all(&bak).expect("mkdir prior backup");
+    std::fs::write(bak.join("sentinel"), "old backup").expect("write sentinel");
+
+    let cfg = cfg_with_corpus(&ground, &corpus_root);
+    DaemonState::open(cfg, None)
+        .await
+        .expect("rebuild must succeed even when prior backup exists");
+
+    // The backup dir exists (rebuilt over the old one).
+    assert!(bak.exists(), "ground.bak-v{stale} must exist after rebuild");
+    // The old sentinel is gone (prior backup was replaced).
+    assert!(
+        !bak.join("sentinel").exists(),
+        "prior backup must be replaced (sentinel file must be gone)"
+    );
+}
+
+// T6: rebuild failure — Err returned, backup preserved
+#[tokio::test]
+async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
+    // Use a corpus with an invalid glob so scan() returns Err and the rebuild
+    // fails. DaemonState::open must return Err (not panic), and the stale
+    // store must still be recoverable at the backup path.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    std::fs::write(corpus_root.join("doc.md"), "# Doc\n\ncontent\n").expect("seed");
+
+    let current = hallouminate::adapters::lance::default_schema_version_pub();
+    let stale = current - 1;
+    write_stale_meta(&ground, stale);
+
+    // Corpus config with an invalid glob pattern so scan() fails.
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"[invalid\"]\n\n\
+         [storage]\nground_dir = \"{g}\"\n\n\
+         [embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("toml parses");
+
+    let err = DaemonState::open(cfg, None)
+        .await
+        .expect_err("rebuild with scan error must fail");
+    assert!(
+        err.to_string().contains("rebuild"),
+        "error must mention rebuild: {err}"
+    );
+
+    // Backup must still exist so the old data is recoverable.
+    let bak = ground.with_file_name(format!("ground.bak-v{stale}"));
+    assert!(
+        bak.exists(),
+        "stale store backup must be preserved after failed rebuild"
     );
 }

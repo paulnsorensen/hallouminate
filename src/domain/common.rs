@@ -103,6 +103,15 @@ pub enum HallouminateError {
     /// Indexing failed while chunking files or applying batches to the store.
     #[error("indexer: {0}")]
     Indexer(String),
+
+    /// The on-disk store was written at an OLDER schema version than this build
+    /// expects; the daemon-open path rebuilds it from source.
+    #[error("store schema stale: found v{found}, expected v{expected} at {}", ground_dir.display())]
+    StoreSchemaStale {
+        found: u32,
+        expected: u32,
+        ground_dir: PathBuf,
+    },
 }
 
 /// Crate-wide result alias, fixing the error type to [`HallouminateError`].
