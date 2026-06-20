@@ -28,9 +28,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::lance::LanceStore;
 use crate::app::config::Config;
-use crate::domain::common::expand_tilde;
-use crate::domain::corpus::{MarkdownChunker, load_tokenizer};
-use crate::domain::embeddings::Embedder;
+use crate::domain::common::{HallouminateError, expand_tilde};
+use crate::domain::corpus::{MarkdownChunker, load_tokenizer, missing_roots};
+use crate::domain::embeddings::{EmbedBatch, Embedder};
+use crate::domain::indexer::index::index_corpus;
 use crate::domain::search::{FastembedCrossencoder, canonical_crossencoder_model};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
@@ -125,18 +126,13 @@ impl DaemonState {
                 .await
                 .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
         }
-        let store = LanceStore::open_or_create(
-            &ground_dir,
-            &cfg.embeddings.model,
-            cfg.embeddings.quantized,
-            cfg.embeddings.enabled,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
+        // Build embedder + tokenizer BEFORE opening the store so we have them
+        // available for a potential stale-store rebuild on the same boot.
+        //
         // Embeddings are opt-in. When disabled, the embedder stays `None` for
         // the daemon's lifetime (no model download, no load) and every
         // retrieval/index path runs lexical-only. The tokenizer is still
-        // loaded below — chunking needs it regardless of the embedding mode.
+        // loaded here — chunking needs it regardless of the embedding mode.
         //
         // When enabled, try to load the embedder eagerly so the first request
         // doesn't pay the load cost mid-call. Tolerate failure (e.g. offline
@@ -145,7 +141,7 @@ impl DaemonState {
         // `read_markdown`, `delete_markdown`); a later embedder() call will
         // retry the load and surface the error then.
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        let embedder = if cfg.embeddings.enabled {
+        let mut embedder: Option<Embedder> = if cfg.embeddings.enabled {
             match Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir) {
                 Ok(e) => Some(e),
                 Err(e) => {
@@ -163,6 +159,99 @@ impl DaemonState {
         };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
+
+        let store = match LanceStore::open_or_create(
+            &ground_dir,
+            &cfg.embeddings.model,
+            cfg.embeddings.quantized,
+            cfg.embeddings.enabled,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(HallouminateError::StoreSchemaStale {
+                found, expected, ..
+            }) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    %found,
+                    %expected,
+                    "ground store schema v{found} < expected v{expected}; rebuilding from source",
+                );
+                move_stale_store(&ground_dir, found).await?;
+                // If anything in the rebuild fails, clean up the partially-created
+                // fresh dir so the next boot re-enters the "no ground dir" path
+                // and retries the rebuild, rather than opening an empty-but-valid store.
+                let rebuild_result: anyhow::Result<LanceStore> = async {
+                    let fresh = LanceStore::open_or_create(
+                        &ground_dir,
+                        &cfg.embeddings.model,
+                        cfg.embeddings.quantized,
+                        cfg.embeddings.enabled,
+                    )
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "rebuild: open fresh ground dir {}: {e}",
+                            ground_dir.display()
+                        )
+                    })?;
+                    let chunker = MarkdownChunker::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+                    for corpus in cfg
+                        .effective_corpora()
+                        .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
+                    {
+                        let missing = missing_roots(&corpus);
+                        if !missing.is_empty() {
+                            tracing::warn!(
+                                target: "hallouminate::daemon",
+                                corpus = %corpus.name,
+                                "rebuild: corpus root missing; skipped",
+                            );
+                            continue;
+                        }
+                        let emb: Option<&mut dyn EmbedBatch> =
+                            embedder.as_mut().map(|e| e as &mut dyn EmbedBatch);
+                        let stats = index_corpus(&corpus, &fresh, emb, &chunker)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
+                        tracing::info!(
+                            target: "hallouminate::daemon",
+                            corpus = %corpus.name,
+                            files = stats.files_upserted,
+                            chunks = stats.chunks_inserted,
+                            "rebuild: reindexed",
+                        );
+                    }
+                    Ok(fresh)
+                }
+                .await;
+                match rebuild_result {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
+                        // Remove the fresh (empty/partial) ground dir so the next boot
+                        // sees "no store" and retries the rebuild rather than booting
+                        // with an empty index.
+                        if ground_dir.exists() {
+                            let _ = tokio::fs::remove_dir_all(&ground_dir).await;
+                            tracing::warn!(
+                                target: "hallouminate::daemon",
+                                "rebuild failed; removed partial ground dir so next boot retries. \
+                                 Backup preserved at {}.bak-v{found}",
+                                ground_dir.display(),
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "open ground dir {}: {e}",
+                    ground_dir.display()
+                ));
+            }
+        };
         // Pre-warm the baseline crossencoder iff configured; tolerate
         // failure so a misconfigured model name (or offline first run)
         // doesn't brick the daemon. The cache stays empty for that model
@@ -352,6 +441,29 @@ impl DaemonState {
             _corpus: corpus,
         })
     }
+}
+
+/// Move the stale ground store aside atomically so a fresh store can be
+/// created in its place. The backup is named `<ground>.bak-v{found_version}`.
+/// A pre-existing backup from a prior failed rebuild is overwritten.
+async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Result<()> {
+    let bak = ground_dir.with_file_name(format!(
+        "{}.bak-v{found_version}",
+        ground_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ground"),
+    ));
+    if bak.exists() {
+        tokio::fs::remove_dir_all(&bak).await?;
+    }
+    tokio::fs::rename(ground_dir, &bak).await?;
+    tracing::info!(
+        target: "hallouminate::daemon",
+        backup = %bak.display(),
+        "moved stale ground store aside; recoverable until pruned",
+    );
+    Ok(())
 }
 
 /// Owned guard around the lazily-loaded embedder. Derefs to `Embedder` so
