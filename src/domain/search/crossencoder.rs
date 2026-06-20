@@ -3,7 +3,8 @@
 //! Bi-encoder retrieval (the FTS+vector+rg fusion in this module's
 //! parent) gives a cheap top-K cut. A crossencoder model scores each
 //! (query, chunk_text) pair jointly, which is much more accurate but
-//! ~1.25 s for the default N=50 candidate pool on a fast desktop CPU
+//! costs ~1.25 s for the default N=50 candidate pool on a fast desktop
+//! CPU, so we only run it on the post-fusion candidates.
 //!
 //! Models are loaded via `fastembed::TextRerank` (ONNX Runtime) and
 //! cached under the same `cache_dir` as the bi-encoder so a single
@@ -265,6 +266,8 @@ mod tests {
             ),
         ];
 
+        let before: std::collections::HashMap<String, f32> =
+            hits.iter().map(|h| (h.chunk_id.clone(), h.score)).collect();
         ce.rerank(query, &mut hits).expect("rerank");
 
         // (a) order flipped: the relevant doc is now first
@@ -276,10 +279,17 @@ mod tests {
             hits[0].score >= hits[1].score,
             "hits must be sorted by descending rerank score"
         );
-        // (b) scores overwritten with rerank scores, not the synthetic fusion inputs
-        assert!(
-            hits.iter().all(|h| h.score != 0.99 && h.score != 0.10),
-            "hit.score must be overwritten by the cross-encoder score"
-        );
+        // (b) every hit's score is replaced by the cross-encoder score —
+        // assert a per-chunk_id delta from the captured pre-rerank value
+        // (tests the overwrite contract, not the seed constants).
+        for h in &hits {
+            let prev = before[&h.chunk_id];
+            assert!(
+                (h.score - prev).abs() > 1e-4,
+                "hit {} score must be overwritten by the cross-encoder (was {prev}, now {})",
+                h.chunk_id,
+                h.score
+            );
+        }
     }
 }
