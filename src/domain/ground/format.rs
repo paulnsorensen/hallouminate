@@ -111,14 +111,21 @@ fn write_doc_block(buf: &mut String, path: &str, doc: &DocFile, strip_prefix: Op
         _ => path.to_string(),
     };
     writeln!(buf, "{display_path}  ({score:.3})", score = doc.score,).expect("doc header");
+    if let Some(z) = doc.z_score {
+        writeln!(buf, "  z={z:.3}").expect("doc z_score");
+    }
     if let Some(summary) = &doc.summary {
         writeln!(buf, "  {summary}").expect("summary");
     }
     for chunk in &doc.chunks {
         let heading = chunk.heading_path.join(" > ");
+        let z_suffix = match chunk.z_score {
+            Some(z) => format!("  z={z:.3}"),
+            None => String::new(),
+        };
         writeln!(
             buf,
-            "  L{start}-{end}  {heading}  ({score:.3})",
+            "  L{start}-{end}  {heading}  ({score:.3}){z_suffix}",
             start = chunk.line_range[0],
             end = chunk.line_range[1],
             score = chunk.score,
@@ -388,5 +395,34 @@ mod tests {
         let t = truncate(s, 5);
         assert_eq!(t.chars().count(), 5);
         assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn outline_renders_z_score_when_some() {
+        // WHY: the PR contract (spec ground-zscore-normalization) states z_score
+        // must appear in human-readable output alongside score.  A None z_score
+        // must not produce any output (cross-encoder absent / small-n / sigma~0).
+        let mut response = fixture();
+        for doc in response.docs.values_mut() {
+            doc.z_score = Some(1.234);
+            for chunk in &mut doc.chunks {
+                chunk.z_score = Some(-0.567);
+            }
+        }
+        let out = render(&response, Format::Outline, &RenderOpts::default());
+        assert!(
+            out.contains("  z=1.234"),
+            "doc-level z_score must appear in outline: {out}"
+        );
+        assert!(
+            out.contains("  z=-0.567"),
+            "chunk-level z_score must appear in outline: {out}"
+        );
+        // None path: the default fixture has z_score: None everywhere.
+        let out_none = render(&fixture(), Format::Outline, &RenderOpts::default());
+        assert!(
+            !out_none.contains("z="),
+            "None z_score must not render in outline: {out_none}"
+        );
     }
 }
