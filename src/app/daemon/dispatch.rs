@@ -530,11 +530,17 @@ async fn read_existing_text(
     let rel_disp = rel.display().to_string();
     let raw = match tokio::task::spawn_blocking(move || read_no_follow(&root, &rel)).await {
         Ok(Ok(b)) => b,
-        Ok(Err(WriteError { kind, .. })) => {
+        Ok(Err(WriteError { kind, source })) => {
             return Err(match kind {
-                WriteErrorKind::Io => DaemonResponse::invalid_params(format!(
-                    "{mode_label} requires an existing file; {rel_disp} not found"
-                )),
+                WriteErrorKind::Io => {
+                    if source.kind() == std::io::ErrorKind::NotFound {
+                        DaemonResponse::invalid_params(format!(
+                            "{mode_label} requires an existing file; {rel_disp} not found"
+                        ))
+                    } else {
+                        DaemonResponse::internal(format!("failed to read {rel_disp}: {source}"))
+                    }
+                }
                 WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => {
                     DaemonResponse::invalid_params(format!("refusing unsafe path {rel_disp}"))
                 }

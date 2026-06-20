@@ -2365,21 +2365,10 @@ async fn t26_replace_lines_write_reindexes_file() {
     );
 
     let on_disk = std::fs::read_to_string(corpus_root.join("page.md")).unwrap();
-    assert!(
-        on_disk.contains("REPLACED"),
-        "replacement must be on disk: {on_disk:?}"
-    );
-    assert!(
-        !on_disk.contains("beta"),
-        "replaced line must be gone: {on_disk:?}"
-    );
-    assert!(
-        on_disk.contains("alpha"),
-        "prefix must be preserved: {on_disk:?}"
-    );
-    assert!(
-        on_disk.contains("gamma"),
-        "suffix must be preserved: {on_disk:?}"
+    // normalize_block wraps the replacement: prefix + \n{body}\n\n + suffix.
+    assert_eq!(
+        on_disk, "alpha\n\nREPLACED\n\ngamma\n",
+        "replace_lines must produce exact composed output: {on_disk:?}"
     );
 }
 
