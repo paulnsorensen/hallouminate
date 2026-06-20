@@ -329,7 +329,7 @@ fn worktree_main_root(git_file: &Path) -> Option<PathBuf> {
 }
 
 /// Walk upward from `start` looking for `.hallouminate/config.toml`, treating
-/// `.git` directories as the hard repo-root boundary. Used after a worktree
+/// any `.git` marker (file or directory) as the hard repo-root boundary. Used after a worktree
 /// hop so that the original `cwd` still appears in any error message.
 fn discover_repo_config_from(cwd: &Path, start: &Path) -> Result<Option<PathBuf>> {
     let mut current: Option<&Path> = Some(start);
