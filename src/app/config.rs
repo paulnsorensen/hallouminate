@@ -239,9 +239,24 @@ pub fn discover_repo_config(cwd: &Path) -> Result<Option<PathBuf>> {
             return Ok(Some(candidate));
         }
         let git_marker = level.join(".git");
-        // `exists` matches both `.git` directories (normal clone) and `.git`
-        // files (git worktrees and submodules).
-        if git_marker.exists() {
+        if git_marker.is_dir() {
+            // Normal clone: `.git` directory is the hard repo-root boundary.
+            return Err(HallouminateError::Config(format!(
+                "no .hallouminate/config.toml found walking up from {} \
+                 (stopped at repo root {})",
+                cwd.display(),
+                level.display(),
+            )));
+        }
+        if git_marker.is_file() {
+            // `.git` file: either a linked worktree or a submodule.
+            // Only linked worktrees have a gitdir pointer containing `/worktrees/`;
+            // for those, hop to the main checkout and continue searching there.
+            // Submodule pointers (containing `/modules/`) fall through to the
+            // hard-error below so they never inherit the superproject's config.
+            if let Some(main_root) = worktree_main_root(&git_marker) {
+                return discover_repo_config_from(cwd, &main_root);
+            }
             return Err(HallouminateError::Config(format!(
                 "no .hallouminate/config.toml found walking up from {} \
                  (stopped at repo root {})",
@@ -268,6 +283,54 @@ fn absolutize_cwd(cwd: &Path, base: &Path) -> PathBuf {
     base.join(cwd)
 }
 
+/// If `git_file` is a linked-worktree `.git` file (i.e. its `gitdir:` pointer
+/// contains a `/worktrees/` component), return the main checkout root.
+///
+/// The pointer looks like `<common-gitdir>/worktrees/<name>`; stripping
+/// `worktrees/<name>` gives `<common-gitdir>` (e.g. `/repo/.git`), and the
+/// main checkout root is its parent (`/repo`).
+///
+/// Returns `None` for submodule pointers (`/modules/` but no `/worktrees/`)
+/// or any file that can't be parsed, so callers treat those as a hard stop.
+fn worktree_main_root(git_file: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(git_file).ok()?;
+    let gitdir_line = content.lines().find(|l| l.starts_with("gitdir:"))?;
+    let ptr = gitdir_line.trim_start_matches("gitdir:").trim();
+    let ptr_path = Path::new(ptr);
+    // Only hop for worktree pointers; submodule pointers must not inherit the
+    // superproject config (issue #132 guard).
+    let components: Vec<_> = ptr_path.components().collect();
+    let worktrees_pos = components
+        .iter()
+        .position(|c| c.as_os_str() == "worktrees")?;
+    // Strip `worktrees/<name>` to get the common gitdir, then take its parent.
+    let common_gitdir = components[..worktrees_pos].iter().collect::<PathBuf>();
+    common_gitdir.parent().map(|p| p.to_path_buf())
+}
+
+/// Walk upward from `start` looking for `.hallouminate/config.toml`, treating
+/// `.git` directories as the hard repo-root boundary. Used after a worktree
+/// hop so that the original `cwd` still appears in any error message.
+fn discover_repo_config_from(cwd: &Path, start: &Path) -> Result<Option<PathBuf>> {
+    let mut current: Option<&Path> = Some(start);
+    while let Some(level) = current {
+        let candidate = level.join(".hallouminate").join("config.toml");
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+        let git_marker = level.join(".git");
+        if git_marker.exists() {
+            return Err(HallouminateError::Config(format!(
+                "no .hallouminate/config.toml found walking up from {} \
+                 (stopped at repo root {})",
+                cwd.display(),
+                level.display(),
+            )));
+        }
+        current = level.parent();
+    }
+    Ok(None)
+}
 /// Parse a repo-layer TOML file, resolving relative paths against the
 /// **repo root** (the parent of `.hallouminate/`, i.e. the directory the
 /// user would `cd` into when working on the repo).
@@ -1257,12 +1320,72 @@ rrf_k                   = 60
 
     #[test]
     fn discover_repo_config_treats_git_file_as_repo_boundary() {
-        // git worktrees and submodules use a `.git` *file* (containing
-        // `gitdir: ...`) rather than a directory; the walk must still stop.
+        // A `.git` *file* whose gitdir pointer does NOT contain `/worktrees/`
+        // (i.e. not a linked worktree — could be an old-style external gitdir or
+        // a bare repo) must still stop the walk with a hard error.
         let dir = tempfile::tempdir().expect("tempdir");
         let root = canon(dir.path());
         std::fs::write(root.join(".git"), "gitdir: /elsewhere\n").expect("write .git file");
-        let err = discover_repo_config(&root).expect_err("git file stops walk");
+        let err = discover_repo_config(&root).expect_err("non-worktree git file stops walk");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_repo_config_worktree_resolves_to_main_checkout() {
+        // A linked worktree's `.git` file contains `gitdir: <main>/.git/worktrees/<name>`.
+        // Discovery must hop to the main checkout root and find the config there
+        // rather than hard-erroring at the worktree boundary.
+        //
+        // Layout:
+        //   <tmpdir>/main-repo/.hallouminate/config.toml  ← the config
+        //   <tmpdir>/main-repo/.git/                      ← main gitdir (directory)
+        //   <tmpdir>/main-repo/.git/worktrees/wt1/        ← per-worktree dir
+        //   <tmpdir>/wt1/                                 ← linked worktree
+        //   <tmpdir>/wt1/.git                             ← file: "gitdir: .../worktrees/wt1"
+        let outer = tempfile::tempdir().expect("tempdir");
+        let outer = canon(outer.path());
+
+        // Main checkout
+        let main_repo = outer.join("main-repo");
+        let main_gitdir = main_repo.join(".git");
+        let worktrees_dir = main_gitdir.join("worktrees").join("wt1");
+        std::fs::create_dir_all(&worktrees_dir).expect("mkdir worktrees/wt1");
+        write_repo_config(&main_repo, "");
+
+        // Linked worktree root
+        let wt = outer.join("wt1");
+        std::fs::create_dir_all(&wt).expect("mkdir wt1");
+        let gitdir_ptr = format!("gitdir: {}\n", worktrees_dir.display());
+        std::fs::write(wt.join(".git"), &gitdir_ptr).expect("write worktree .git file");
+
+        let found = discover_repo_config(&wt)
+            .expect("worktree discovery must not error")
+            .expect("config must be found in main checkout");
+        let expected = main_repo.join(".hallouminate").join("config.toml");
+        assert_eq!(canon(&found), canon(&expected), "resolved to wrong path");
+    }
+
+    #[test]
+    fn discover_repo_config_submodule_git_file_does_not_hop() {
+        // A submodule's `.git` file contains `gitdir: <super>/.git/modules/<name>` —
+        // no `/worktrees/` segment. Discovery must NOT hop; it must hard-error at
+        // the submodule boundary (no .hallouminate/config.toml present).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        // Super-repo gitdir lives separately; the submodule's `.git` file points there.
+        let super_modules = outer.join("super-git").join("modules").join("sub");
+        std::fs::create_dir_all(&super_modules).expect("mkdir modules/sub");
+        // The submodule root has a `.git` file (not a directory) pointing at modules/sub.
+        let sub_root = outer.join("sub-root");
+        std::fs::create_dir_all(&sub_root).expect("mkdir sub-root");
+        let gitdir_ptr = format!("gitdir: {}\n", super_modules.display());
+        std::fs::write(sub_root.join(".git"), &gitdir_ptr).expect("write submodule .git file");
+        let err = discover_repo_config(&sub_root).expect_err("submodule git file must stop walk");
         match err {
             HallouminateError::Config(msg) => {
                 assert!(msg.contains("stopped at repo root"), "got: {msg}");
