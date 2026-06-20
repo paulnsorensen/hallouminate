@@ -179,47 +179,71 @@ impl DaemonState {
                     "ground store schema v{found} < expected v{expected}; rebuilding from source",
                 );
                 move_stale_store(&ground_dir, found).await?;
-                let fresh = LanceStore::open_or_create(
-                    &ground_dir,
-                    &cfg.embeddings.model,
-                    cfg.embeddings.quantized,
-                    cfg.embeddings.enabled,
-                )
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "rebuild: open fresh ground dir {}: {e}",
-                        ground_dir.display()
+                // If anything in the rebuild fails, clean up the partially-created
+                // fresh dir so the next boot re-enters the "no ground dir" path
+                // and retries the rebuild, rather than opening an empty-but-valid store.
+                let rebuild_result: anyhow::Result<LanceStore> = async {
+                    let fresh = LanceStore::open_or_create(
+                        &ground_dir,
+                        &cfg.embeddings.model,
+                        cfg.embeddings.quantized,
+                        cfg.embeddings.enabled,
                     )
-                })?;
-                let chunker = MarkdownChunker::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
-                for corpus in cfg
-                    .effective_corpora()
-                    .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
-                {
-                    let missing = missing_roots(&corpus);
-                    if !missing.is_empty() {
-                        tracing::warn!(
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "rebuild: open fresh ground dir {}: {e}",
+                            ground_dir.display()
+                        )
+                    })?;
+                    let chunker = MarkdownChunker::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+                    for corpus in cfg
+                        .effective_corpora()
+                        .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
+                    {
+                        let missing = missing_roots(&corpus);
+                        if !missing.is_empty() {
+                            tracing::warn!(
+                                target: "hallouminate::daemon",
+                                corpus = %corpus.name,
+                                "rebuild: corpus root missing; skipped",
+                            );
+                            continue;
+                        }
+                        let emb: Option<&mut dyn EmbedBatch> =
+                            embedder.as_mut().map(|e| e as &mut dyn EmbedBatch);
+                        let stats = index_corpus(&corpus, &fresh, emb, &chunker)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
+                        tracing::info!(
                             target: "hallouminate::daemon",
                             corpus = %corpus.name,
-                            "rebuild: corpus root missing; skipped",
+                            files = stats.files_upserted,
+                            chunks = stats.chunks_inserted,
+                            "rebuild: reindexed",
                         );
-                        continue;
                     }
-                    let emb: Option<&mut dyn EmbedBatch> =
-                        embedder.as_mut().map(|e| e as &mut dyn EmbedBatch);
-                    let stats = index_corpus(&corpus, &fresh, emb, &chunker)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
-                    tracing::info!(
-                        target: "hallouminate::daemon",
-                        corpus = %corpus.name,
-                        files = stats.files_upserted,
-                        chunks = stats.chunks_inserted,
-                        "rebuild: reindexed",
-                    );
+                    Ok(fresh)
                 }
-                fresh
+                .await;
+                match rebuild_result {
+                    Ok(fresh) => fresh,
+                    Err(e) => {
+                        // Remove the fresh (empty/partial) ground dir so the next boot
+                        // sees "no store" and retries the rebuild rather than booting
+                        // with an empty index.
+                        if ground_dir.exists() {
+                            let _ = tokio::fs::remove_dir_all(&ground_dir).await;
+                            tracing::warn!(
+                                target: "hallouminate::daemon",
+                                "rebuild failed; removed partial ground dir so next boot retries. \
+                                 Backup preserved at {}.bak-v{found}",
+                                ground_dir.display(),
+                            );
+                        }
+                        return Err(e);
+                    }
+                }
             }
             Err(e) => {
                 return Err(anyhow::anyhow!(

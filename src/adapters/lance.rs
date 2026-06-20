@@ -135,6 +135,7 @@ fn default_schema_version() -> u32 {
     3
 }
 
+#[doc(hidden)]
 /// Public accessor for the current schema version; exposed for integration
 /// tests that need to write a stale meta.toml without hard-coding the value.
 pub fn default_schema_version_pub() -> u32 {

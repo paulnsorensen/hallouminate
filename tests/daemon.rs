@@ -1974,13 +1974,13 @@ fn cfg_with_corpus(ground_dir: &Path, corpus_root: &Path) -> Config {
 
 /// Read the schema_version from a ground dir's meta.toml.
 fn read_schema_version(ground_dir: &Path) -> u32 {
-    let text = std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read meta.toml");
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("schema_version = ") {
-            return rest.trim().parse().expect("parse schema_version");
-        }
+    #[derive(serde::Deserialize)]
+    struct MetaVersion {
+        schema_version: u32,
     }
-    panic!("schema_version not found in meta.toml")
+    let text = std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read meta.toml");
+    let m: MetaVersion = toml::from_str(&text).expect("parse meta.toml");
+    m.schema_version
 }
 
 // T1: stale store auto-rebuilds
@@ -2210,5 +2210,11 @@ async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
     assert!(
         bak.exists(),
         "stale store backup must be preserved after failed rebuild"
+    );
+    // Fresh ground dir must be removed so next boot retries rebuild instead
+    // of booting with an empty-but-schema-valid store.
+    assert!(
+        !ground.exists(),
+        "partial fresh ground dir must be removed on rebuild failure"
     );
 }
