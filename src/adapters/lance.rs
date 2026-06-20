@@ -87,6 +87,10 @@ pub struct SearchHit {
     /// Claim marks decoded from the chunk's `claim_marks` JSON column. Empty
     /// when the chunk carried no marks (a null column value).
     pub claim_marks: Vec<ClaimMark>,
+    /// Per-query z-score of `score`, stamped by the orchestrator after rerank.
+    /// TRANSIENT: not decoded from or persisted to a Lance column; defaults to
+    /// `None` at decode and only the cross-encoder path populates it.
+    pub z_score: Option<f64>,
 }
 
 /// Stable, deterministic chunk identifier derived from (file_ref, ord).
@@ -490,6 +494,7 @@ fn decode_hits(rb: &RecordBatch, out: &mut Vec<SearchHit>) -> Result<()> {
             score: s,
             mtime_ms: mtime_ms.value(i),
             claim_marks: decode_claim_marks(claim_marks, i),
+            z_score: None,
         });
     }
     Ok(())
