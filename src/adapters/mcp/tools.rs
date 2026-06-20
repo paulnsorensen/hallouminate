@@ -22,8 +22,8 @@ use crate::app::config::discover_repo_config;
 use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
     DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
-    GroundResult, IndexRequest, ListCorporaResult, ListFilesRequest, ListFilesResult,
-    ListTreeRequest, ListTreeResult, ReadMarkdownRequest, ReadMarkdownResult, client_for,
+    GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest, ListFilesResult,
+    ListTreeRequest, ListTreeResult, Position, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 use crate::domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};
@@ -386,14 +386,38 @@ pub struct AddMarkdownParams {
     /// markdown shape — convention: `<slug>.md` or `<category>/<slug>.md`,
     /// first line `# Title`.
     pub path: String,
-    /// Markdown bytes to write as UTF-8 text. Stored verbatim — hallouminate
-    /// does not template or validate the markdown format.
+    /// Markdown bytes. Interpretation depends on the edit mode:
+    /// - default (no edit-mode field): the WHOLE file.
+    /// - `under_heading`: the FRAGMENT spliced into the section.
+    /// - `replace_lines`: the replacement body for the line range.
+    /// - `replace_match`: the replacement text for the matched substring.
     pub content: String,
-    /// Replace an existing file. Defaults to false to avoid accidental
-    /// clobber; use `read_markdown` first to inspect, then re-call with
-    /// overwrite=true.
+    /// Replace an existing file. Applies to the WHOLE-FILE mode only; the
+    /// three edit modes are inherently modify-in-place and ignore it.
     #[serde(default)]
     pub overwrite: bool,
+
+    /// Section-splice: splice `content` under this heading's section instead of
+    /// writing the whole file. Matched by rendered heading text (trimmed), at
+    /// any level. Requires the file to already exist. Mutually exclusive with
+    /// `replace_lines` and `replace_match`.
+    #[serde(default)]
+    pub under_heading: Option<String>,
+    /// Where to splice within the section when `under_heading` is set. Default
+    /// `append`. Ignored by the other modes.
+    #[serde(default)]
+    pub position: Position,
+    /// Line-range replace: replace lines `{start, end}` (1-based, inclusive)
+    /// with `content`. Requires the file to already exist. Mutually exclusive
+    /// with `under_heading` and `replace_match`.
+    #[serde(default)]
+    pub replace_lines: Option<LineRange>,
+    /// Text-match replace: replace the UNIQUE literal occurrence of this
+    /// substring with `content`. 0 matches → not found; >1 → ambiguous; both
+    /// rejected with InvalidParams. Requires the file to already exist.
+    /// Mutually exclusive with `under_heading` and `replace_lines`.
+    #[serde(default)]
+    pub replace_match: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -596,7 +620,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`."
+        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams."
     )]
     pub async fn add_markdown(
         &self,
@@ -611,6 +635,10 @@ impl HallouminateTools {
                 path: params.path,
                 content: params.content,
                 overwrite: params.overwrite,
+                under_heading: params.under_heading,
+                position: params.position,
+                replace_lines: params.replace_lines,
+                replace_match: params.replace_match,
             }),
         };
         let response: AddMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
