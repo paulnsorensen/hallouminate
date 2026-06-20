@@ -365,6 +365,9 @@ async fn handle_ground(
     drop(crossencoder);
     drop(embedder);
 
+    // #135: stale-index detection.
+    mark_stale(&mut response).await;
+
     // Surface the cross-repo resolution advisories (name-collision shadowing)
     // on the union response so the merge is auditable rather than silent.
     if union {
@@ -818,6 +821,77 @@ async fn handle_delete_markdown(
 fn mtime_ms_from_duration(dur: std::time::Duration, file: &Path) -> anyhow::Result<i64> {
     i64::try_from(dur.as_millis())
         .map_err(|_| anyhow::anyhow!("mtime overflows i64 on {}", file.display()))
+}
+
+/// Parse an RFC 3339 timestamp string (as stored in [`DocFile::mtime`]) back
+/// to milliseconds since the Unix epoch. Returns `i64::MIN` on parse failure
+/// so any real disk mtime compares as "newer" (i.e. safe-to-mark-stale) rather
+/// than hiding drift behind a silent equal.
+fn mtime_ms_from_rfc3339(rfc: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(rfc)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(i64::MIN)
+}
+
+/// Stat each doc in `response` off-thread and mark it stale when the on-disk
+/// mtime is newer than the indexed mtime, or the file is missing.
+///
+/// Detection only — no re-index (that would force the read handler onto the
+/// write lane and break lane separation).
+async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
+    let paths: Vec<String> = response.docs.keys().cloned().collect();
+    // Clone for the join-error fallback, which needs to mark every doc stale.
+    let paths_for_join_err = paths.clone();
+    let indexed_mtimes: Vec<i64> = response
+        .docs
+        .values()
+        .map(|doc| mtime_ms_from_rfc3339(&doc.mtime))
+        .collect();
+    let stale_flags: Vec<(String, bool)> = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .zip(indexed_mtimes)
+            .map(|(path, indexed_ms)| {
+                let canonical = canonicalize_or_passthrough(std::path::Path::new(&path));
+                let stale = match std::fs::metadata(canonical.as_path()) {
+                    Err(_) => true, // missing file counts as stale
+                    Ok(meta) => {
+                        let disk_s = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            // mtime unreadable (unsupported platform or FS error):
+                            // fail toward stale so drift is never silently hidden.
+                            .unwrap_or(i64::MAX);
+                        // indexed_ms is parsed from RFC3339 with second
+                        // precision; compare at the same granularity to
+                        // avoid false positives from sub-second truncation.
+                        disk_s > indexed_ms / 1000
+                    }
+                };
+                (path, stale)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        // spawn_blocking task panicked or was cancelled: fail toward stale
+        // so every doc in this response is marked stale rather than silently
+        // hiding drift behind a false-not-stale.
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            error = %e,
+            "mark_stale: spawn_blocking task failed; marking all docs stale",
+        );
+        paths_for_join_err.into_iter().map(|p| (p, true)).collect()
+    });
+    for (path, stale) in stale_flags {
+        if let Some(doc) = response.docs.get_mut(&path) {
+            doc.stale = stale;
+        }
+    }
 }
 
 pub(super) async fn index_single_file(
@@ -1563,6 +1637,133 @@ mod tests {
         assert!(
             !message.contains("(XDG baseline)"),
             "must not fall back to the unsourced placeholder: {message}",
+        );
+    }
+
+    // --- #135: mtime_ms_from_rfc3339 ---
+
+    #[test]
+    fn mtime_ms_from_rfc3339_parses_known_timestamp() {
+        // 2026-04-30T10:11:23Z in ms since epoch.
+        let ms = mtime_ms_from_rfc3339("2026-04-30T10:11:23Z");
+        assert_eq!(ms, 1_777_543_883_000_i64);
+    }
+
+    #[test]
+    fn mtime_ms_from_rfc3339_returns_i64_min_for_invalid_input() {
+        // Invalid timestamps must produce i64::MIN so any real disk mtime
+        // compares as newer — safe-to-mark-stale rather than hiding drift.
+        let ms = mtime_ms_from_rfc3339("not-a-date");
+        assert_eq!(ms, i64::MIN);
+    }
+
+    // --- #135: stale-detection ---
+    // These tests call `mark_stale` directly so they exercise the real
+    // production function; deleting the `mark_stale` call from
+    // `handle_ground` would leave this wiring untested and require
+    // the integration test in tests/daemon.rs to catch it.
+
+    #[tokio::test]
+    async fn stale_false_when_file_unchanged_since_index() {
+        // Build a GroundResponse whose indexed mtime matches the file's real
+        // disk mtime — stale must be false.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("doc.md");
+        std::fs::write(&file, "# Title\n\nBody text.\n").expect("write");
+
+        let meta = std::fs::metadata(&file).expect("stat");
+        let disk_ms = meta
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let indexed_mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(disk_ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let abs = canonicalize_or_passthrough(&file);
+        let abs_str = abs.as_path().to_str().unwrap().to_string();
+        let mut docs = std::collections::BTreeMap::new();
+        docs.insert(
+            abs_str.clone(),
+            crate::domain::ground::DocFile {
+                summary: None,
+                keywords: vec![],
+                score: 0.5,
+                mtime: indexed_mtime,
+                corpus: "test".into(),
+                path: None,
+                stale: false,
+                chunks: vec![],
+            },
+        );
+        let mut response = crate::domain::ground::GroundResponse {
+            query: "test".into(),
+            took_ms: 0,
+            stats: crate::domain::ground::Stats { hits: 1 },
+            docs,
+            code: std::collections::BTreeMap::new(),
+            warnings: vec![],
+        };
+
+        mark_stale(&mut response).await;
+
+        assert!(
+            !response.docs[&abs_str].stale,
+            "file unchanged since index must not be stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_true_when_file_modified_after_index() {
+        // Simulate an indexed mtime one second in the past — stale must be true.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("doc.md");
+        std::fs::write(&file, "# Title\n\nOriginal.\n").expect("write");
+
+        let meta = std::fs::metadata(&file).expect("stat");
+        let disk_ms = meta
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let past_ms = disk_ms - 1_000; // indexed one second earlier
+        let indexed_mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(past_ms)
+            .unwrap()
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+        let abs = canonicalize_or_passthrough(&file);
+        let abs_str = abs.as_path().to_str().unwrap().to_string();
+        let mut docs = std::collections::BTreeMap::new();
+        docs.insert(
+            abs_str.clone(),
+            crate::domain::ground::DocFile {
+                summary: None,
+                keywords: vec![],
+                score: 0.5,
+                mtime: indexed_mtime,
+                corpus: "test".into(),
+                path: None,
+                stale: false,
+                chunks: vec![],
+            },
+        );
+        let mut response = crate::domain::ground::GroundResponse {
+            query: "test".into(),
+            took_ms: 0,
+            stats: crate::domain::ground::Stats { hits: 1 },
+            docs,
+            code: std::collections::BTreeMap::new(),
+            warnings: vec![],
+        };
+
+        mark_stale(&mut response).await;
+
+        assert!(
+            response.docs[&abs_str].stale,
+            "file modified after index must be stale"
         );
     }
 }

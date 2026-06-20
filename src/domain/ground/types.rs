@@ -50,6 +50,19 @@ pub struct DocFile {
     pub mtime: String,
     /// Name of the corpus this file belongs to.
     pub corpus: String,
+    /// Corpus-relative path: the file's path with the corpus root prefix
+    /// stripped. Accepted directly by `read_markdown` and `add_markdown`
+    /// (which reject absolute paths). `None` when no corpus root is a
+    /// prefix of the absolute path (e.g. a global corpus or symlinked root).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Whether the file has been modified on disk since it was last indexed.
+    /// `true` means the on-disk mtime is newer than the indexed mtime (or the
+    /// file is missing); the index may not reflect current content. Always
+    /// `false` until the stale-check runs; `#[serde(default)]` lets older
+    /// serialized responses that are missing this field deserialize without error.
+    #[serde(default)]
+    pub stale: bool,
     /// Matching chunks within the file, ranked by `score` descending.
     pub chunks: Vec<DocChunk>,
 }
@@ -124,12 +137,14 @@ mod tests {
                 score: 0.873,
                 mtime: "2026-04-30T10:11:23Z".into(),
                 corpus: "tern-docs".into(),
+                path: Some("path/to/file.md".into()),
+                stale: false,
                 chunks: vec![DocChunk {
                     chunk_id: "abc123".into(),
                     heading_path: vec!["Indexing pipeline".into(), "Phase B".into()],
                     line_range: [134, 198],
                     score: 0.91,
-                    snippet: "first ~200 chars of chunk text…".into(),
+                    snippet: "first ~200 chars of chunk text\u{2026}".into(),
                     provenance: ChunkProvenance {
                         corpus: "tern-docs".into(),
                         claim_marks: vec![ClaimMark {
@@ -166,12 +181,14 @@ mod tests {
                     "score": 0.873,
                     "mtime": "2026-04-30T10:11:23Z",
                     "corpus": "tern-docs",
+                    "path": "path/to/file.md",
+                    "stale": false,
                     "chunks": [{
                         "chunk_id": "abc123",
                         "heading_path": ["Indexing pipeline", "Phase B"],
                         "line_range": [134, 198],
                         "score": 0.91,
-                        "snippet": "first ~200 chars of chunk text…",
+                        "snippet": "first ~200 chars of chunk text\u{2026}",
                         "provenance": {
                             "corpus": "tern-docs",
                             "claim_marks": [{
@@ -198,6 +215,8 @@ mod tests {
             score: 0.0,
             mtime: "2026-04-30T10:11:23Z".into(),
             corpus: "docs".into(),
+            path: None,
+            stale: false,
             chunks: vec![],
         };
         let actual = serde_json::to_value(&file).expect("serialize");
@@ -252,5 +271,59 @@ mod tests {
             chunk.provenance.corpus, "",
             "absent provenance must default to an empty corpus, not error"
         );
+    }
+
+    // --- #137: corpus-relative path ---
+
+    #[test]
+    fn path_field_absent_in_legacy_payload_deserializes_as_none() {
+        // Wire-contract backward-compat: a client reading a payload that
+        // predates the `path` field must not hard-error — `#[serde(default)]`
+        // fills `None` so the contract stays additive.
+        let legacy = json!({
+            "summary": null,
+            "keywords": [],
+            "score": 0.5,
+            "mtime": "2026-01-01T00:00:00Z",
+            "corpus": "docs",
+            "chunks": []
+        });
+        let doc: DocFile = serde_json::from_value(legacy).expect("must deserialize");
+        assert!(
+            doc.path.is_none(),
+            "absent path field must default to None, not error"
+        );
+    }
+
+    #[test]
+    fn path_none_serializes_as_null() {
+        let file = DocFile {
+            summary: None,
+            keywords: vec![],
+            score: 0.0,
+            mtime: "2026-01-01T00:00:00Z".into(),
+            corpus: "docs".into(),
+            path: None,
+            stale: false,
+            chunks: vec![],
+        };
+        let actual = serde_json::to_value(&file).expect("serialize");
+        assert_eq!(actual["path"], json!(null));
+    }
+
+    #[test]
+    fn path_some_serializes_as_string() {
+        let file = DocFile {
+            summary: None,
+            keywords: vec![],
+            score: 0.0,
+            mtime: "2026-01-01T00:00:00Z".into(),
+            corpus: "docs".into(),
+            path: Some("wiki/concepts.md".into()),
+            stale: false,
+            chunks: vec![],
+        };
+        let actual = serde_json::to_value(&file).expect("serialize");
+        assert_eq!(actual["path"], json!("wiki/concepts.md"));
     }
 }

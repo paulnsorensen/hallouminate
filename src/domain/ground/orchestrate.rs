@@ -9,6 +9,29 @@ use crate::domain::search::{Crossencoder, fts_with_ripgrep, hybrid_with_ripgrep}
 use super::bucket::build_docs;
 use super::types::{DocFile, GroundResponse, Stats};
 
+/// Strip the first matching corpus root prefix from `abs_path`, returning
+/// a corpus-relative path string accepted by `safe_relative_path`.
+/// Returns `None` when no root is a prefix (e.g. symlinked or global corpora).
+fn relative_path_for(abs_path: &str, corpus_roots: &[String]) -> Option<String> {
+    for root in corpus_roots {
+        let root = root.trim_end_matches('/');
+        if let Some(rel) = abs_path.strip_prefix(root) {
+            // Only accept if the remainder starts with '/' — i.e. the prefix
+            // ended at a real path-component boundary.  Without this check,
+            // root "/corpus/root" would match "/corpus/rootext/f.md" and
+            // return the nonsense path "ext/f.md".
+            if !rel.starts_with('/') {
+                continue;
+            }
+            let rel = rel.trim_start_matches('/');
+            if !rel.is_empty() {
+                return Some(rel.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GroundOpts {
     pub top_files: usize,
@@ -46,8 +69,9 @@ pub async fn ground(
     }
     let stats = Stats { hits: hits.len() };
     let mut docs = build_docs(&hits, opts.top_files, opts.chunks_per_file)?;
-    for doc in docs.values_mut() {
+    for (abs_path, doc) in docs.iter_mut() {
         doc.corpus = corpus.to_string();
+        doc.path = relative_path_for(abs_path, corpus_paths);
         for chunk in &mut doc.chunks {
             chunk.provenance.corpus = corpus.to_string();
         }
@@ -165,11 +189,22 @@ pub async fn ground_union(
         by_corpus.entry(corpus).or_default().push(hit);
     }
 
+    // Build a name→roots lookup for relative-path stamping below.
+    let corpus_roots_by_name: std::collections::HashMap<&str, &[String]> = corpora
+        .iter()
+        .map(|(n, paths)| (n.as_str(), paths.as_slice()))
+        .collect();
+
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
     for (corpus, corpus_hits) in by_corpus {
+        let corpus_roots = corpus_roots_by_name
+            .get(corpus.as_str())
+            .copied()
+            .unwrap_or(&[]);
         let mut built = build_docs(&corpus_hits, usize::MAX, opts.chunks_per_file)?;
-        for doc in built.values_mut() {
+        for (abs_path, doc) in built.iter_mut() {
             doc.corpus = corpus.clone();
+            doc.path = relative_path_for(abs_path, corpus_roots);
             for chunk in &mut doc.chunks {
                 chunk.provenance.corpus = corpus.clone();
             }
@@ -334,6 +369,60 @@ mod tests {
             embedder.roles,
             vec![EmbedRole::Query],
             "ground must embed the query exactly once, with the Query role"
+        );
+    }
+
+    // --- #137: relative_path_for ---
+
+    #[test]
+    fn relative_path_for_strips_matching_root() {
+        let roots = vec!["/corpus/root".to_string()];
+        let rel = relative_path_for("/corpus/root/wiki/index.md", &roots);
+        assert_eq!(rel.as_deref(), Some("wiki/index.md"));
+    }
+
+    #[test]
+    fn relative_path_for_accepts_result_in_safe_relative_path() {
+        // Regression for #137: the emitted relative path must be accepted by
+        // `safe_relative_path`, which is the gate on read_markdown/add_markdown.
+        // If this fails the field is useless as a handoff from ground.
+        use crate::domain::corpus::sandbox::safe_relative_path;
+        let roots = vec!["/var/hallouminate/wiki".to_string()];
+        let rel = relative_path_for("/var/hallouminate/wiki/concepts/design.md", &roots)
+            .expect("must produce a relative path");
+        safe_relative_path(&rel).expect("relative path must be accepted by safe_relative_path");
+    }
+
+    #[test]
+    fn relative_path_for_multi_root_uses_first_matching() {
+        // #137: multi-root corpora — try each root, use first match.
+        let roots = vec!["/other/root".to_string(), "/corpus/root".to_string()];
+        let rel = relative_path_for("/corpus/root/sub/file.md", &roots);
+        assert_eq!(rel.as_deref(), Some("sub/file.md"));
+    }
+
+    #[test]
+    fn relative_path_for_returns_none_when_no_root_matches() {
+        let roots = vec!["/other/root".to_string()];
+        let rel = relative_path_for("/corpus/root/file.md", &roots);
+        assert!(rel.is_none(), "no matching root must yield None");
+    }
+
+    #[test]
+    fn relative_path_for_returns_none_for_empty_roots() {
+        let rel = relative_path_for("/any/path/file.md", &[]);
+        assert!(rel.is_none());
+    }
+
+    #[test]
+    fn relative_path_for_returns_none_for_sibling_prefix() {
+        // Regression for review finding: "/corpus/root" must NOT match
+        // "/corpus/rootext/f.md" just because it's a string prefix.
+        let roots = vec!["/corpus/root".to_string()];
+        let rel = relative_path_for("/corpus/rootext/f.md", &roots);
+        assert!(
+            rel.is_none(),
+            "/corpus/root must not match /corpus/rootext/f.md: got {rel:?}"
         );
     }
 }

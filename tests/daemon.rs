@@ -18,8 +18,8 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    DeleteMarkdownRequest, ErrorKind, ReadMarkdownRequest, connect_at, serve,
-    spawn_signal_handlers,
+    DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest,
+    ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -1817,4 +1817,128 @@ async fn index_strict_aborts_on_missing_corpus_root() {
         }
         other => panic!("strict mode must reject a missing root, got: {other:?}"),
     }
+}
+
+// ─── Curd 5: stale-detection wiring ─────────────────────────────────────────
+
+/// Build a single-corpus daemon config with embeddings disabled.
+fn cfg_stale_corpus(ground: &Path, corpus_root: &Path) -> Config {
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    toml::from_str(&toml).expect("stale corpus toml parses")
+}
+
+#[tokio::test]
+async fn ground_marks_stale_true_when_file_modified_after_index() {
+    // Quality gate for #135 wiring: index a file through the daemon, bump
+    // its on-disk mtime out-of-band, issue a `ground` request through the
+    // real daemon path, and assert the returned DocFile.stale == true for
+    // the modified file and stale == false for an unchanged file.
+    //
+    // This test specifically guards the `mark_stale` call inside
+    // `handle_ground`: if that call is removed, `ground` still returns
+    // results but stale is always false — this test turns red.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+
+    // Write two files before indexing.
+    let stale_file = corpus_root.join("will-change.md");
+    let fresh_file = corpus_root.join("unchanged.md");
+    // Use unique tokens so `ground` can find them regardless of other content.
+    std::fs::write(&stale_file, "# Stale\n\nstaletoken9182 content here\n").expect("write stale");
+    std::fs::write(&fresh_file, "# Fresh\n\nfreshtoken7364 content here\n").expect("write fresh");
+
+    let cfg = cfg_stale_corpus(&ground, &corpus_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    // Index both files through the daemon.
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("docs".into()),
+                paths_from: None,
+                strict: false,
+            }),
+        })
+        .await
+        .expect("index transport ok");
+    match resp {
+        DaemonResponse::Ok { .. } => {}
+        DaemonResponse::Err { kind, message } => {
+            panic!("index failed ({kind:?}): {message}");
+        }
+    }
+
+    // Bump the mtime of stale_file out-of-band by rewriting it with a
+    // timestamp guaranteed to be at least one second newer than the indexed
+    // mtime. We sleep briefly to ensure the OS mtime ticks past the indexed
+    // second boundary.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    std::fs::write(&stale_file, "# Stale\n\nstaletoken9182 modified\n").expect("rewrite stale");
+
+    // Issue a ground query for the stale file through the real daemon.
+    let client = connect_at(harness.socket()).await.expect("reconnect");
+    let result: GroundResult = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Ground(GroundRequest {
+                query: "staletoken9182".into(),
+                corpus: Some("docs".into()),
+                top_files: None,
+                chunks_per_file: None,
+                limit: None,
+                snippet_chars: None,
+            }),
+        })
+        .await
+        .expect("ground ok");
+
+    // The stale file must appear in results and be marked stale.
+    let abs_stale = std::fs::canonicalize(&stale_file).unwrap_or_else(|_| stale_file.clone());
+    let abs_stale_str = abs_stale.to_str().unwrap();
+    let stale_doc = result
+        .response
+        .docs
+        .get(abs_stale_str)
+        .expect("stale file must appear in ground results");
+    assert!(
+        stale_doc.stale,
+        "file modified after index must be marked stale by handle_ground"
+    );
+
+    // Query for the unchanged file and verify it is NOT stale.
+    let client = connect_at(harness.socket()).await.expect("reconnect2");
+    let result2: GroundResult = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Ground(GroundRequest {
+                query: "freshtoken7364".into(),
+                corpus: Some("docs".into()),
+                top_files: None,
+                chunks_per_file: None,
+                limit: None,
+                snippet_chars: None,
+            }),
+        })
+        .await
+        .expect("ground ok 2");
+
+    let abs_fresh = std::fs::canonicalize(&fresh_file).unwrap_or_else(|_| fresh_file.clone());
+    let abs_fresh_str = abs_fresh.to_str().unwrap();
+    let fresh_doc = result2
+        .response
+        .docs
+        .get(abs_fresh_str)
+        .expect("fresh file must appear in ground results");
+    assert!(
+        !fresh_doc.stale,
+        "file unchanged since index must NOT be marked stale"
+    );
 }

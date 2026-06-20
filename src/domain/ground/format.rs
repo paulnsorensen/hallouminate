@@ -146,6 +146,8 @@ mod tests {
                 score: 0.873,
                 mtime: "2026-04-30T10:11:23Z".into(),
                 corpus: "cheese".into(),
+                path: None,
+                stale: false,
                 chunks: vec![
                     DocChunk {
                         chunk_id: "abc123".into(),
