@@ -365,51 +365,8 @@ async fn handle_ground(
     drop(crossencoder);
     drop(embedder);
 
-    // #135: stale-index detection. Stat each returned file off-thread and
-    // mark it stale when the on-disk mtime is newer than the indexed mtime
-    // (or the file is missing). Detection only — no re-index here (that
-    // would force the read handler onto the write lane and break lane
-    // separation per .hallouminate/wiki/daemon-and-cli.md#80-86).
-    let stale_flags: Vec<(String, bool)> = {
-        let paths: Vec<String> = response.docs.keys().cloned().collect();
-        let indexed_mtimes: Vec<i64> = response
-            .docs
-            .values()
-            .map(|doc| mtime_ms_from_rfc3339(&doc.mtime))
-            .collect();
-        tokio::task::spawn_blocking(move || {
-            paths
-                .into_iter()
-                .zip(indexed_mtimes)
-                .map(|(path, indexed_ms)| {
-                    let canonical = canonicalize_or_passthrough(std::path::Path::new(&path));
-                    let stale = match std::fs::metadata(canonical.as_path()) {
-                        Err(_) => true, // missing file counts as stale
-                        Ok(meta) => {
-                            let disk_s = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(indexed_ms / 1000);
-                            // indexed_ms is parsed from RFC3339 with second
-                            // precision; compare at the same granularity to
-                            // avoid false positives from sub-second truncation.
-                            disk_s > indexed_ms / 1000
-                        }
-                    };
-                    (path, stale)
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .unwrap_or_default()
-    };
-    for (path, stale) in stale_flags {
-        if let Some(doc) = response.docs.get_mut(&path) {
-            doc.stale = stale;
-        }
-    }
+    // #135: stale-index detection.
+    mark_stale(&mut response).await;
 
     // Surface the cross-repo resolution advisories (name-collision shadowing)
     // on the union response so the merge is auditable rather than silent.
@@ -875,6 +832,52 @@ fn mtime_ms_from_rfc3339(rfc: &str) -> i64 {
         .ok()
         .map(|dt| dt.timestamp_millis())
         .unwrap_or(i64::MIN)
+}
+
+/// Stat each doc in `response` off-thread and mark it stale when the on-disk
+/// mtime is newer than the indexed mtime, or the file is missing.
+///
+/// Detection only — no re-index (that would force the read handler onto the
+/// write lane and break lane separation).
+async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
+    let paths: Vec<String> = response.docs.keys().cloned().collect();
+    let indexed_mtimes: Vec<i64> = response
+        .docs
+        .values()
+        .map(|doc| mtime_ms_from_rfc3339(&doc.mtime))
+        .collect();
+    let stale_flags: Vec<(String, bool)> = tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .zip(indexed_mtimes)
+            .map(|(path, indexed_ms)| {
+                let canonical = canonicalize_or_passthrough(std::path::Path::new(&path));
+                let stale = match std::fs::metadata(canonical.as_path()) {
+                    Err(_) => true, // missing file counts as stale
+                    Ok(meta) => {
+                        let disk_s = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(indexed_ms / 1000);
+                        // indexed_ms is parsed from RFC3339 with second
+                        // precision; compare at the same granularity to
+                        // avoid false positives from sub-second truncation.
+                        disk_s > indexed_ms / 1000
+                    }
+                };
+                (path, stale)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (path, stale) in stale_flags {
+        if let Some(doc) = response.docs.get_mut(&path) {
+            doc.stale = stale;
+        }
+    }
 }
 
 pub(super) async fn index_single_file(
@@ -1640,18 +1643,20 @@ mod tests {
         assert_eq!(ms, i64::MIN);
     }
 
-    // --- #135: stale-detection integration ---
+    // --- #135: stale-detection ---
+    // These tests call `mark_stale` directly so they exercise the real
+    // production function; deleting the `mark_stale` call from
+    // `handle_ground` would leave this wiring untested and require
+    // the integration test in tests/daemon.rs to catch it.
 
     #[tokio::test]
     async fn stale_false_when_file_unchanged_since_index() {
-        // Simulate the stale check: build a GroundResponse whose indexed mtime
-        // matches the file's real disk mtime — stale must be false.
+        // Build a GroundResponse whose indexed mtime matches the file's real
+        // disk mtime — stale must be false.
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("doc.md");
         std::fs::write(&file, "# Title\n\nBody text.\n").expect("write");
 
-        // Stamp indexed mtime = current file mtime (simulated via DocFile.mtime
-        // set to the current real mtime so the comparison is equal, not stale).
         let meta = std::fs::metadata(&file).expect("stat");
         let disk_ms = meta
             .modified()
@@ -1663,10 +1668,9 @@ mod tests {
             .unwrap()
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
-        // Build a GroundResponse manually with mtime matching disk.
-        let mut docs = std::collections::BTreeMap::new();
         let abs = canonicalize_or_passthrough(&file);
         let abs_str = abs.as_path().to_str().unwrap().to_string();
+        let mut docs = std::collections::BTreeMap::new();
         docs.insert(
             abs_str.clone(),
             crate::domain::ground::DocFile {
@@ -1689,42 +1693,8 @@ mod tests {
             warnings: vec![],
         };
 
-        // Run the stale check inline (mirrors handle_ground logic).
-        let paths: Vec<String> = response.docs.keys().cloned().collect();
-        let indexed_mtimes: Vec<i64> = response
-            .docs
-            .values()
-            .map(|d| mtime_ms_from_rfc3339(&d.mtime))
-            .collect();
-        let stale_flags: Vec<(String, bool)> = tokio::task::spawn_blocking(move || {
-            paths
-                .into_iter()
-                .zip(indexed_mtimes)
-                .map(|(path, indexed_ms)| {
-                    let canonical = canonicalize_or_passthrough(std::path::Path::new(&path));
-                    let stale = match std::fs::metadata(canonical.as_path()) {
-                        Err(_) => true,
-                        Ok(meta) => {
-                            let disk_s = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(indexed_ms / 1000);
-                            disk_s > indexed_ms / 1000
-                        }
-                    };
-                    (path, stale)
-                })
-                .collect()
-        })
-        .await
-        .unwrap();
-        for (path, stale) in stale_flags {
-            if let Some(doc) = response.docs.get_mut(&path) {
-                doc.stale = stale;
-            }
-        }
+        mark_stale(&mut response).await;
+
         assert!(
             !response.docs[&abs_str].stale,
             "file unchanged since index must not be stale"
@@ -1733,12 +1703,11 @@ mod tests {
 
     #[tokio::test]
     async fn stale_true_when_file_modified_after_index() {
-        // Index a file, bump its mtime out-of-band, run stale check — must be true.
+        // Simulate an indexed mtime one second in the past — stale must be true.
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("doc.md");
         std::fs::write(&file, "# Title\n\nOriginal.\n").expect("write");
 
-        // Simulate an indexed mtime one second in the past.
         let meta = std::fs::metadata(&file).expect("stat");
         let disk_ms = meta
             .modified()
@@ -1776,41 +1745,8 @@ mod tests {
             warnings: vec![],
         };
 
-        let paths: Vec<String> = response.docs.keys().cloned().collect();
-        let indexed_mtimes: Vec<i64> = response
-            .docs
-            .values()
-            .map(|d| mtime_ms_from_rfc3339(&d.mtime))
-            .collect();
-        let stale_flags: Vec<(String, bool)> = tokio::task::spawn_blocking(move || {
-            paths
-                .into_iter()
-                .zip(indexed_mtimes)
-                .map(|(path, indexed_ms)| {
-                    let canonical = canonicalize_or_passthrough(std::path::Path::new(&path));
-                    let stale = match std::fs::metadata(canonical.as_path()) {
-                        Err(_) => true,
-                        Ok(meta) => {
-                            let disk_s = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(indexed_ms / 1000);
-                            disk_s > indexed_ms / 1000
-                        }
-                    };
-                    (path, stale)
-                })
-                .collect()
-        })
-        .await
-        .unwrap();
-        for (path, stale) in stale_flags {
-            if let Some(doc) = response.docs.get_mut(&path) {
-                doc.stale = stale;
-            }
-        }
+        mark_stale(&mut response).await;
+
         assert!(
             response.docs[&abs_str].stale,
             "file modified after index must be stale"

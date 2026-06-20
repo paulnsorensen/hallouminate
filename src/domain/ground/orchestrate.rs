@@ -16,6 +16,13 @@ fn relative_path_for(abs_path: &str, corpus_roots: &[String]) -> Option<String> 
     for root in corpus_roots {
         let root = root.trim_end_matches('/');
         if let Some(rel) = abs_path.strip_prefix(root) {
+            // Only accept if the remainder starts with '/' — i.e. the prefix
+            // ended at a real path-component boundary.  Without this check,
+            // root "/corpus/root" would match "/corpus/rootext/f.md" and
+            // return the nonsense path "ext/f.md".
+            if !rel.starts_with('/') {
+                continue;
+            }
             let rel = rel.trim_start_matches('/');
             if !rel.is_empty() {
                 return Some(rel.to_string());
@@ -405,5 +412,17 @@ mod tests {
     fn relative_path_for_returns_none_for_empty_roots() {
         let rel = relative_path_for("/any/path/file.md", &[]);
         assert!(rel.is_none());
+    }
+
+    #[test]
+    fn relative_path_for_returns_none_for_sibling_prefix() {
+        // Regression for review finding: "/corpus/root" must NOT match
+        // "/corpus/rootext/f.md" just because it's a string prefix.
+        let roots = vec!["/corpus/root".to_string()];
+        let rel = relative_path_for("/corpus/rootext/f.md", &roots);
+        assert!(
+            rel.is_none(),
+            "/corpus/root must not match /corpus/rootext/f.md: got {rel:?}"
+        );
     }
 }
