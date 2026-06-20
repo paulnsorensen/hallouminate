@@ -21,7 +21,7 @@ use super::client::connect_at;
 use super::daemon_socket_path;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
 
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(10);
+const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Upper bound on the version probe's `Ping` round-trip. `call_raw` has no
 /// built-in timeout, so a daemon that accepts the connection but never replies

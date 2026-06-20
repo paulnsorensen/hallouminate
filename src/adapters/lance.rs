@@ -135,6 +135,13 @@ fn default_schema_version() -> u32 {
     3
 }
 
+#[doc(hidden)]
+/// Public accessor for the current schema version; exposed for integration
+/// tests that need to write a stale meta.toml without hard-coding the value.
+pub fn default_schema_version_pub() -> u32 {
+    default_schema_version()
+}
+
 fn default_quantized() -> bool {
     false
 }
@@ -160,9 +167,18 @@ fn meta_check_or_init(
         // query, and return the same "delete + reindex" remedy rather than
         // letting LanceDB surface a raw Arrow schema-mismatch crash later.
         if meta.schema_version != default_schema_version() {
+            if meta.schema_version < default_schema_version() {
+                return Err(HallouminateError::StoreSchemaStale {
+                    found: meta.schema_version,
+                    expected: default_schema_version(),
+                    ground_dir: meta_path.parent().unwrap_or(meta_path).to_path_buf(),
+                });
+            }
+            // store > expected: downgrade. Keep loud + fatal — never silently drop newer data.
             return Err(HallouminateError::Config(format!(
-                "store schema version mismatch: store has schema_version {}, this build \
-                 expects {}; delete {} and re-run `hallouminate index` to rebuild",
+                "store schema version {} is NEWER than this build expects ({}); this binary is \
+                 older than the one that wrote {}. Upgrade hallouminate, or delete the store to \
+                 rebuild.",
                 meta.schema_version,
                 default_schema_version(),
                 meta_path.parent().unwrap_or(meta_path).display(),
@@ -1123,10 +1139,10 @@ schema_version = 3
     }
 
     #[test]
-    fn meta_check_or_init_errors_on_schema_version_mismatch() {
+    fn meta_check_or_init_stale_on_schema_version_below_expected() {
         // A v1 store predates the frontmatter column. Opening it with this (v3)
-        // build must return the graceful delete+reindex remedy, not crash later
-        // on an Arrow schema mismatch.
+        // build must return StoreSchemaStale (recoverable), not a fatal Config
+        // error, so the daemon-open path can auto-rebuild instead of crashing.
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
@@ -1141,18 +1157,27 @@ schema_version = 1
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
             .expect_err("a v1 store must be rejected by the v3 binary");
+        assert!(
+            matches!(
+                err,
+                HallouminateError::StoreSchemaStale {
+                    found: 1,
+                    expected: 3,
+                    ..
+                }
+            ),
+            "expected StoreSchemaStale, got: {err}"
+        );
         let msg = err.to_string();
-        assert!(msg.contains("schema version"), "{msg}");
-        assert!(msg.contains("delete"), "{msg}");
-        assert!(msg.contains("hallouminate index"), "{msg}");
+        assert!(msg.contains("stale"), "{msg}");
+        assert!(msg.contains('1'), "must name found version: {msg}");
+        assert!(msg.contains('3'), "must name expected version: {msg}");
     }
 
     #[test]
-    fn meta_check_or_init_errors_on_v2_store_so_it_reindexes_cleanly() {
-        // A v2 store predates the per-chunk `claim_marks` column. Opening it with
-        // this (v3) build must trip the same graceful delete+reindex remedy as
-        // the v1 case, so the operator rebuilds through the documented path
-        // rather than hitting a raw Arrow schema-mismatch crash on first query.
+    fn meta_check_or_init_stale_on_v2_store() {
+        // A v2 store predates the per-chunk `claim_marks` column. Must return
+        // StoreSchemaStale so the daemon-open path rebuilds rather than crashing.
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
@@ -1167,12 +1192,20 @@ schema_version = 2
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
             .expect_err("a v2 store must be rejected by the v3 binary");
+        assert!(
+            matches!(
+                err,
+                HallouminateError::StoreSchemaStale {
+                    found: 2,
+                    expected: 3,
+                    ..
+                }
+            ),
+            "expected StoreSchemaStale, got: {err}"
+        );
         let msg = err.to_string();
-        assert!(msg.contains("schema version"), "{msg}");
         assert!(msg.contains('2'), "must name the stored version: {msg}");
         assert!(msg.contains('3'), "must name the expected version: {msg}");
-        assert!(msg.contains("delete"), "{msg}");
-        assert!(msg.contains("hallouminate index"), "{msg}");
     }
 
     #[test]
@@ -1618,6 +1651,91 @@ schema_version = 1
             hybrid.is_empty(),
             "a zero-row corpus must yield no hybrid hits, got {}",
             hybrid.len()
+        );
+    }
+
+    // ─── T7: unit guard classifies schema-version direction ──────────────────
+
+    #[test]
+    fn guard_stale_when_stored_version_below_expected() {
+        // A store written at schema_version < default_schema_version() must
+        // return StoreSchemaStale so the daemon-open path can auto-rebuild.
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        let stale_version = default_schema_version() - 1;
+        std::fs::write(
+            &meta_path,
+            format!(
+                "# auto-managed by hallouminate; do not edit\n\
+                 embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
+                 quantized = false\n\
+                 embeddings_enabled = false\n\
+                 schema_version = {stale_version}\n"
+            ),
+        )
+        .unwrap();
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect_err("stale store must be rejected");
+        assert!(
+            matches!(
+                err,
+                HallouminateError::StoreSchemaStale { found, expected, .. }
+                    if found == stale_version && expected == default_schema_version()
+            ),
+            "expected StoreSchemaStale, got: {err}"
+        );
+    }
+
+    #[test]
+    fn guard_ok_when_stored_version_equals_expected() {
+        // Exact version match: guard must pass (== branch falls through).
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            format!(
+                "# auto-managed by hallouminate; do not edit\n\
+                 embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
+                 quantized = false\n\
+                 embeddings_enabled = false\n\
+                 schema_version = {}\n",
+                default_schema_version()
+            ),
+        )
+        .unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect("matching version must succeed");
+    }
+
+    #[test]
+    fn guard_fatal_config_when_stored_version_above_expected() {
+        // A store from a NEWER binary (downgrade scenario) must fail loud + fatal
+        // with a Config error. The original store dir must be untouched (no .bak).
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        let newer_version = default_schema_version() + 1;
+        std::fs::write(
+            &meta_path,
+            format!(
+                "# auto-managed by hallouminate; do not edit\n\
+                 embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
+                 quantized = false\n\
+                 embeddings_enabled = false\n\
+                 schema_version = {newer_version}\n"
+            ),
+        )
+        .unwrap();
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect_err("newer store must be rejected with a fatal error");
+        assert!(
+            matches!(err, HallouminateError::Config(_)),
+            "expected Config (downgrade fatal), got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("NEWER"), "must say NEWER: {msg}");
+        assert!(
+            msg.to_lowercase().contains("upgrade"),
+            "must advise upgrade: {msg}"
         );
     }
 }
