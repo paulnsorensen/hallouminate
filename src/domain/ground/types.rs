@@ -46,6 +46,12 @@ pub struct DocFile {
     pub keywords: Vec<String>,
     /// File-level relevance score (the best of its chunk scores after rollup).
     pub score: f64,
+    /// Per-query z-score of `score`: std-devs above this query's candidate
+    /// mean. `None` unless the cross-encoder ran (RRF scores are rank-derived
+    /// and don't normalize), or for degenerate pools (n < 5, all-equal).
+    /// A per-query RELATIVE score, not a calibrated 0-1 probability.
+    #[serde(default)]
+    pub z_score: Option<f64>,
     /// File modification time as an RFC 3339 timestamp.
     pub mtime: String,
     /// Name of the corpus this file belongs to.
@@ -79,6 +85,9 @@ pub struct DocChunk {
     pub line_range: [u32; 2],
     /// Chunk-level relevance score.
     pub score: f64,
+    /// Same semantics as DocFile.z_score, computed per chunk.
+    #[serde(default)]
+    pub z_score: Option<f64>,
     /// Chunk text, trimmed to the request's `snippet_chars` when set.
     pub snippet: String,
     /// Per-chunk provenance: which corpus this chunk came from (#106), and the
@@ -135,6 +144,7 @@ mod tests {
                 summary: Some("First H1 plus first paragraph (or AI-generated later).".into()),
                 keywords: vec!["fts5".into(), "rrf".into(), "vector".into()],
                 score: 0.873,
+                z_score: None,
                 mtime: "2026-04-30T10:11:23Z".into(),
                 corpus: "tern-docs".into(),
                 path: Some("path/to/file.md".into()),
@@ -144,6 +154,7 @@ mod tests {
                     heading_path: vec!["Indexing pipeline".into(), "Phase B".into()],
                     line_range: [134, 198],
                     score: 0.91,
+                    z_score: None,
                     snippet: "first ~200 chars of chunk text\u{2026}".into(),
                     provenance: ChunkProvenance {
                         corpus: "tern-docs".into(),
@@ -179,6 +190,7 @@ mod tests {
                     "summary": "First H1 plus first paragraph (or AI-generated later).",
                     "keywords": ["fts5", "rrf", "vector"],
                     "score": 0.873,
+                    "z_score": null,
                     "mtime": "2026-04-30T10:11:23Z",
                     "corpus": "tern-docs",
                     "path": "path/to/file.md",
@@ -188,6 +200,7 @@ mod tests {
                         "heading_path": ["Indexing pipeline", "Phase B"],
                         "line_range": [134, 198],
                         "score": 0.91,
+                        "z_score": null,
                         "snippet": "first ~200 chars of chunk text\u{2026}",
                         "provenance": {
                             "corpus": "tern-docs",
@@ -213,6 +226,7 @@ mod tests {
             summary: None,
             keywords: vec![],
             score: 0.0,
+            z_score: None,
             mtime: "2026-04-30T10:11:23Z".into(),
             corpus: "docs".into(),
             path: None,
@@ -301,6 +315,7 @@ mod tests {
             summary: None,
             keywords: vec![],
             score: 0.0,
+            z_score: None,
             mtime: "2026-01-01T00:00:00Z".into(),
             corpus: "docs".into(),
             path: None,
@@ -317,6 +332,7 @@ mod tests {
             summary: None,
             keywords: vec![],
             score: 0.0,
+            z_score: None,
             mtime: "2026-01-01T00:00:00Z".into(),
             corpus: "docs".into(),
             path: Some("wiki/concepts.md".into()),

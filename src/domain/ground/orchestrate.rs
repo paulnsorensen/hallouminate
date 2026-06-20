@@ -6,7 +6,7 @@ use crate::domain::common::{HallouminateError, Result};
 use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 use crate::domain::search::{Crossencoder, fts_with_ripgrep, hybrid_with_ripgrep};
 
-use super::bucket::build_docs;
+use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats};
 
 /// Strip the first matching corpus root prefix from `abs_path`, returning
@@ -65,6 +65,12 @@ pub async fn ground(
         // hit lists so a no-match query doesn't pay the model latency.
         if !hits.is_empty() {
             rerank.rerank(query, &mut hits)?;
+            // RRF-mode guard (decision 4): z only when the cross-encoder ran.
+            // Full-pool scope (decision 2): computed before build_docs truncates.
+            let zs = normalize_scores(&hits);
+            for (hit, z) in hits.iter_mut().zip(zs) {
+                hit.z_score = z;
+            }
         }
     }
     let stats = Stats { hits: hits.len() };
@@ -174,6 +180,10 @@ pub async fn ground_union(
         && !hits.is_empty()
     {
         rerank.rerank(query, &mut hits)?;
+        let zs = normalize_scores(&hits);
+        for (hit, z) in hits.iter_mut().zip(zs) {
+            hit.z_score = z;
+        }
     }
 
     // Build docs per corpus partition so each doc + chunk carries its source
@@ -325,7 +335,12 @@ mod tests {
 
     /// OFF mode: with no embedder, `ground` must take the lexical-only path
     /// and return a well-formed (empty, for an empty store) response instead
-    /// of erroring on a missing query vector.
+    /// of erroring on a missing query vector. Decision-4 note: `crossencoder`
+    /// is also `None` here, so the `if let Some(rerank)` stamp loop in `ground`
+    /// never fires — this is the orchestrator-level RRF/OFF path. Docs are
+    /// empty on an empty store, so the z_score assertion is vacuous; the
+    /// structural enforcement (stamp lexically inside the block) is verified
+    /// by `rrf_mode_docs_have_no_z_score` in bucket.rs.
     #[tokio::test]
     async fn ground_off_mode_returns_lexical_response_without_an_embedder() {
         let dir = tempfile::tempdir().expect("tempdir");

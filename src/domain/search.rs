@@ -149,6 +149,7 @@ mod tests {
             score,
             mtime_ms: 0,
             claim_marks: vec![],
+            z_score: None,
         }
     }
 

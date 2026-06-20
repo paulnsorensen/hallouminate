@@ -144,6 +144,7 @@ mod tests {
                 summary: Some("Planner Cognition Research".into()),
                 keywords: vec!["planner".into(), "plan".into()],
                 score: 0.873,
+                z_score: None,
                 mtime: "2026-04-30T10:11:23Z".into(),
                 corpus: "cheese".into(),
                 path: None,
@@ -154,6 +155,7 @@ mod tests {
                         heading_path: vec!["Planner Cognition Research".into()],
                         line_range: [26, 28],
                         score: 0.91,
+                        z_score: None,
                         snippet: "Three research rounds on planning LLMs handling code.".into(),
                         provenance: ChunkProvenance {
                             corpus: "cheese".into(),
@@ -165,6 +167,7 @@ mod tests {
                         heading_path: vec!["Planner Cognition Research".into(), "Open Gaps".into()],
                         line_range: [44, 52],
                         score: 0.84,
+                        z_score: None,
                         snippet: "Signature-graph planning is unexplored in detail.".into(),
                         provenance: ChunkProvenance {
                             corpus: "cheese".into(),
