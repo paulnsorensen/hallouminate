@@ -288,8 +288,7 @@ mod tests {
         // Byte-exact: heading + blank + fragment + blank + original body (normalize_block
         // prepends \n and appends \n\n; existing blank after heading survives).
         assert_eq!(
-            result,
-            "## Section A\n\nFirst!\n\n\nExisting body.\n",
+            result, "## Section A\n\nFirst!\n\n\nExisting body.\n",
             "prepend must produce exact heading\\n\\nfragment\\n\\n shape: {result:?}"
         );
     }
@@ -375,8 +374,7 @@ mod tests {
         // Byte-exact: underline + blank + fragment + blank + original body (insert
         // point is after underline line; normalize_block prepends \n, appends \n\n).
         assert_eq!(
-            result,
-            "Section A\n---------\n\nBefore body!\n\n\nExisting body.\n",
+            result, "Section A\n---------\n\nBefore body!\n\n\nExisting body.\n",
             "prepend after setext underline must produce exact shape: {result:?}"
         );
     }

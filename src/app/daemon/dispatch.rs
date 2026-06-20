@@ -44,8 +44,8 @@ use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
     DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
-    IndexRequest, LineRange, ListFilesRequest, ListTreeRequest, ListTreeResult, Position,
-    PongResult, ReadMarkdownRequest, ReadMarkdownResult,
+    IndexRequest, LineRange, ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult,
+    Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -543,9 +543,8 @@ async fn read_existing_text(
         }
         Err(e) => return Err(DaemonResponse::internal(format!("read task panicked: {e}"))),
     };
-    String::from_utf8(raw).map_err(|_| {
-        DaemonResponse::invalid_params("existing file is not valid UTF-8".to_string())
-    })
+    String::from_utf8(raw)
+        .map_err(|_| DaemonResponse::invalid_params("existing file is not valid UTF-8".to_string()))
 }
 
 async fn handle_add_markdown(
@@ -566,6 +565,16 @@ async fn handle_add_markdown(
     let mode = match classify_edit_mode(&req) {
         Ok(m) => m,
         Err(resp) => return resp,
+    };
+
+    // Acquire the per-corpus mutation guard before any read-modify-write so the
+    // entire read → compose → write sequence is atomic. Without this ordering
+    // two concurrent edit-mode calls (or an edit racing a whole-file overwrite)
+    // would both read the same pre-edit snapshot and the second write would
+    // clobber the first silently — the classic lost-update bug.
+    let guard = match state.acquire_mutation_guard(&corpus.name).await {
+        Ok(g) => g,
+        Err(msg) => return DaemonResponse::internal(msg),
     };
 
     let force_overwrite: bool;
@@ -591,13 +600,13 @@ async fn handle_add_markdown(
                     return DaemonResponse::invalid_params(format!(
                         "heading '{heading}' not found in {}",
                         relative.display()
-                    ))
+                    ));
                 }
                 Err(crate::domain::corpus::SectionError::Duplicate) => {
                     return DaemonResponse::invalid_params(format!(
                         "heading '{heading}' is ambiguous in {}",
                         relative.display()
-                    ))
+                    ));
                 }
             };
             force_overwrite = true;
@@ -608,21 +617,18 @@ async fn handle_add_markdown(
                     Ok(s) => s,
                     Err(resp) => return resp,
                 };
-            req.content = match crate::domain::corpus::replace_line_range(
-                &existing,
-                range,
-                &req.content,
-            ) {
-                Ok(s) => s,
-                Err(crate::domain::corpus::RangeError::OutOfRange) => {
-                    return DaemonResponse::invalid_params(
-                        "line range out of range".to_string(),
-                    )
-                }
-                Err(crate::domain::corpus::RangeError::Inverted) => {
-                    return DaemonResponse::invalid_params("start > end".to_string())
-                }
-            };
+            req.content =
+                match crate::domain::corpus::replace_line_range(&existing, range, &req.content) {
+                    Ok(s) => s,
+                    Err(crate::domain::corpus::RangeError::OutOfRange) => {
+                        return DaemonResponse::invalid_params(
+                            "line range out of range".to_string(),
+                        );
+                    }
+                    Err(crate::domain::corpus::RangeError::Inverted) => {
+                        return DaemonResponse::invalid_params("start > end".to_string());
+                    }
+                };
             force_overwrite = true;
         }
         EditMode::ReplaceMatch(needle) => {
@@ -631,21 +637,19 @@ async fn handle_add_markdown(
                     Ok(s) => s,
                     Err(resp) => return resp,
                 };
-            req.content = match crate::domain::corpus::replace_unique_match(
-                &existing,
-                &needle,
-                &req.content,
-            ) {
-                Ok(s) => s,
-                Err(crate::domain::corpus::MatchError::NotFound) => {
-                    return DaemonResponse::invalid_params("match not found".to_string())
-                }
-                Err(crate::domain::corpus::MatchError::Ambiguous(n)) => {
-                    return DaemonResponse::invalid_params(format!(
-                        "match ambiguous \u{2014} {n} occurrences"
-                    ));
-                }
-            };
+            req.content =
+                match crate::domain::corpus::replace_unique_match(&existing, &needle, &req.content)
+                {
+                    Ok(s) => s,
+                    Err(crate::domain::corpus::MatchError::NotFound) => {
+                        return DaemonResponse::invalid_params("match not found".to_string());
+                    }
+                    Err(crate::domain::corpus::MatchError::Ambiguous(n)) => {
+                        return DaemonResponse::invalid_params(format!(
+                            "match ambiguous \u{2014} {n} occurrences"
+                        ));
+                    }
+                };
             force_overwrite = true;
         }
     }
@@ -657,11 +661,6 @@ async fn handle_add_markdown(
     let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
     warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
-
-    let guard = match state.acquire_mutation_guard(&corpus.name).await {
-        Ok(g) => g,
-        Err(msg) => return DaemonResponse::internal(msg),
-    };
 
     // Symlink-safe atomic write via the shared sandbox helper. Walks every
     // path component with `O_NOFOLLOW | O_DIRECTORY`, so a symlinked
