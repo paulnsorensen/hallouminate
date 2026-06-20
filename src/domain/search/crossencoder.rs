@@ -240,4 +240,46 @@ mod tests {
             );
         }
     }
+    #[test]
+    #[ignore = "downloads the ~147MB jina-reranker-v1-turbo-en model on first run; opt-in via --ignored"]
+    fn fastembed_crossencoder_reranks_and_overwrites_scores() {
+        let cache = tempfile::tempdir().expect("tempdir");
+        let mut ce = FastembedCrossencoder::try_new(DEFAULT_CROSSENCODER_MODEL, cache.path())
+            .expect("load reranker model");
+
+        // Input order favours the IRRELEVANT doc (high fusion score) over the
+        // truly relevant one; the cross-encoder must disagree and flip them.
+        let query = "how do you grill halloumi cheese";
+        let mut hits = vec![
+            hit(
+                "/paris.md",
+                0,
+                0.99,
+                "The capital of France is Paris, a city on the river Seine.",
+            ),
+            hit(
+                "/halloumi.md",
+                0,
+                0.10,
+                "Halloumi is a brined cheese with a high melting point, so it grills and fries without falling apart.",
+            ),
+        ];
+
+        ce.rerank(query, &mut hits).expect("rerank");
+
+        // (a) order flipped: the relevant doc is now first
+        assert_eq!(
+            hits[0].file_ref, "/halloumi.md",
+            "cross-encoder must rank the relevant doc first"
+        );
+        assert!(
+            hits[0].score >= hits[1].score,
+            "hits must be sorted by descending rerank score"
+        );
+        // (b) scores overwritten with rerank scores, not the synthetic fusion inputs
+        assert!(
+            hits.iter().all(|h| h.score != 0.99 && h.score != 0.10),
+            "hit.score must be overwritten by the cross-encoder score"
+        );
+    }
 }
