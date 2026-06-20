@@ -607,7 +607,7 @@ mod tests {
         low.z_score = Some(-1.0); // z for the lower-score chunk
         let mut high = hit("/a.md", 1, 0.9);
         high.z_score = Some(1.5); // z for the higher-score chunk
-                                  // Push low first, then high — FileBucket.push should adopt high's z.
+        // Push low first, then high — FileBucket.push should adopt high's z.
         let docs = build_docs(&[low, high], 5, 5).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert!(
