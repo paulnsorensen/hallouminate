@@ -7,6 +7,7 @@ use crate::app::config::{self, Config, ResolvedLayers, xdg_config_path};
 use crate::domain::common::{canonicalize_or_passthrough, expand_tilde};
 use crate::domain::corpus::load_tokenizer;
 use crate::domain::embeddings::Embedder;
+use crate::domain::search::FastembedCrossencoder;
 
 const DEFAULT_TEMPLATE: &str = include_str!("config-default.toml");
 
@@ -114,6 +115,11 @@ pub fn cmd_config_download(args: ConfigDownloadArgs) -> anyhow::Result<()> {
              (set embeddings.enabled = true to fetch the model)",
             cfg.embeddings.model
         );
+    }
+    if let Some(model) = cfg.search.crossencoder.as_deref() {
+        let _crossencoder = FastembedCrossencoder::try_new(model, &cache_dir)
+            .with_context(|| format!("download crossencoder model {model}"))?;
+        println!("downloaded crossencoder model {model}");
     }
     Ok(())
 }

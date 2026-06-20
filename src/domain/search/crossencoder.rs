@@ -3,7 +3,7 @@
 //! Bi-encoder retrieval (the FTS+vector+rg fusion in this module's
 //! parent) gives a cheap top-K cut. A crossencoder model scores each
 //! (query, chunk_text) pair jointly, which is much more accurate but
-//! ~100ms per batch, so we only run it on the post-fusion candidates.
+//! ~1.25 s for the default N=50 candidate pool on a fast desktop CPU
 //!
 //! Models are loaded via `fastembed::TextRerank` (ONNX Runtime) and
 //! cached under the same `cache_dir` as the bi-encoder so a single
@@ -26,10 +26,12 @@ pub trait Crossencoder: Send {
     fn rerank(&mut self, query: &str, hits: &mut [SearchHit]) -> Result<()>;
 }
 
-/// Default crossencoder model. JinaRerankerV1TurboEn is ~33 MB and
-/// runs in tens of ms on commodity CPUs — the right zone for an
-/// optional rerank that has to stay under the daemon's perceived
-/// snappiness budget for `ground`.
+/// Default crossencoder model. JinaRerankerV1TurboEn is ~147 MB on disk
+/// (145 MB full-precision ONNX, no quantized variant) and reranks the
+/// default N=50 pool in ~1.25 s on a fast desktop CPU (~463 ms at N=20).
+/// That latency is precisely why it is opt-in / off by default
+/// (`crossencoder: None`): callers that need re-ranking accuracy accept
+/// the cost explicitly.
 pub const DEFAULT_CROSSENCODER_MODEL: &str = "jina-reranker-v1-turbo-en";
 
 /// Recognised model identifiers. Matches `fastembed::RerankerModel`
@@ -81,7 +83,7 @@ impl FastembedCrossencoder {
         let model = resolve_model(canonical);
         let opts = RerankInitOptions::new(model)
             .with_cache_dir(PathBuf::from(cache_dir))
-            .with_show_download_progress(false);
+            .with_show_download_progress(true);
         let inner = TextRerank::try_new(opts).map_err(|e| {
             HallouminateError::Embed(format!(
                 "init crossencoder {canonical}: {e}\n  \
