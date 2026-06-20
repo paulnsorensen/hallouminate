@@ -59,8 +59,8 @@ pub struct DocFile {
     /// Whether the file has been modified on disk since it was last indexed.
     /// `true` means the on-disk mtime is newer than the indexed mtime (or the
     /// file is missing); the index may not reflect current content. Always
-    /// `false` until the stale-check runs; `#[serde(default)]` keeps strict-
-    /// schema clients that predate this field from hard-breaking.
+    /// `false` until the stale-check runs; `#[serde(default)]` lets older
+    /// serialized responses that are missing this field deserialize without error.
     #[serde(default)]
     pub stale: bool,
     /// Matching chunks within the file, ranked by `score` descending.

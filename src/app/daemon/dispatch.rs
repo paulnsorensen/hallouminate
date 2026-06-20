@@ -841,6 +841,8 @@ fn mtime_ms_from_rfc3339(rfc: &str) -> i64 {
 /// write lane and break lane separation).
 async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
     let paths: Vec<String> = response.docs.keys().cloned().collect();
+    // Clone for the join-error fallback, which needs to mark every doc stale.
+    let paths_for_join_err = paths.clone();
     let indexed_mtimes: Vec<i64> = response
         .docs
         .values()
@@ -860,7 +862,9 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
                             .ok()
                             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                             .map(|d| d.as_secs() as i64)
-                            .unwrap_or(indexed_ms / 1000);
+                            // mtime unreadable (unsupported platform or FS error):
+                            // fail toward stale so drift is never silently hidden.
+                            .unwrap_or(i64::MAX);
                         // indexed_ms is parsed from RFC3339 with second
                         // precision; compare at the same granularity to
                         // avoid false positives from sub-second truncation.
@@ -872,7 +876,17 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
             .collect::<Vec<_>>()
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or_else(|e| {
+        // spawn_blocking task panicked or was cancelled: fail toward stale
+        // so every doc in this response is marked stale rather than silently
+        // hiding drift behind a false-not-stale.
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            error = %e,
+            "mark_stale: spawn_blocking task failed; marking all docs stale",
+        );
+        paths_for_join_err.into_iter().map(|p| (p, true)).collect()
+    });
     for (path, stale) in stale_flags {
         if let Some(doc) = response.docs.get_mut(&path) {
             doc.stale = stale;
