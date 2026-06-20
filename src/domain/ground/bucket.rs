@@ -114,6 +114,7 @@ impl FileBucket {
                 score: self.score,
                 mtime,
                 corpus: String::new(),
+                path: None,
                 chunks,
             },
         )
