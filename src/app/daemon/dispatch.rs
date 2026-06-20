@@ -44,8 +44,8 @@ use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
     DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
-    IndexRequest, ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult,
-    ReadMarkdownRequest, ReadMarkdownResult,
+    IndexRequest, LineRange, ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult,
+    Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -486,10 +486,97 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
     DaemonResponse::ok(&report)
 }
 
+/// Classify the edit mode from the request. Returns an error response if more
+/// than one mode selector is set.
+enum EditMode {
+    WholeFile,
+    UnderHeading(String, Position),
+    ReplaceLines(LineRange),
+    ReplaceMatch(String),
+}
+
+fn classify_edit_mode(req: &AddMarkdownRequest) -> Result<EditMode, DaemonResponse> {
+    let count = req.under_heading.is_some() as u8
+        + req.replace_lines.is_some() as u8
+        + req.replace_match.is_some() as u8;
+    if count > 1 {
+        return Err(DaemonResponse::invalid_params(
+            "set at most one of under_heading / replace_lines / replace_match",
+        ));
+    }
+    if let Some(h) = &req.under_heading {
+        return Ok(EditMode::UnderHeading(h.clone(), req.position));
+    }
+    if let Some(r) = req.replace_lines {
+        return Ok(EditMode::ReplaceLines(r));
+    }
+    if let Some(n) = &req.replace_match {
+        return Ok(EditMode::ReplaceMatch(n.clone()));
+    }
+    Ok(EditMode::WholeFile)
+}
+
+/// Read an existing file for edit-mode operations, mapping [`WriteErrorKind`]
+/// to the appropriate response so each edit-mode arm reduces to a single
+/// `read_existing_text(...).await` call with an early-return on error.
+///
+/// `mode_label` appears in the "requires an existing file" message (e.g.
+/// `"under_heading"`) so the caller knows which field triggered the read.
+async fn read_existing_text(
+    root: std::path::PathBuf,
+    rel: std::path::PathBuf,
+    mode_label: &str,
+) -> Result<String, DaemonResponse> {
+    let rel_disp = rel.display().to_string();
+    let raw = match tokio::task::spawn_blocking(move || read_no_follow(&root, &rel)).await {
+        Ok(Ok(b)) => b,
+        Ok(Err(WriteError { kind, source })) => {
+            return Err(match kind {
+                WriteErrorKind::Io => {
+                    if source.kind() == std::io::ErrorKind::NotFound {
+                        DaemonResponse::invalid_params(format!(
+                            "{mode_label} requires an existing file; {rel_disp} not found"
+                        ))
+                    } else {
+                        tracing::error!(
+                            target: "hallouminate::daemon",
+                            error = %source,
+                            path = %rel_disp,
+                            "read_existing_text io error",
+                        );
+                        DaemonResponse::internal(format!("failed to read {rel_disp}: {source}"))
+                    }
+                }
+                WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => {
+                    DaemonResponse::invalid_params(format!("refusing unsafe path {rel_disp}"))
+                }
+                WriteErrorKind::Exists => {
+                    tracing::error!(
+                        target: "hallouminate::daemon",
+                        path = %rel_disp,
+                        "read_existing_text: unexpected Exists variant on read path",
+                    );
+                    DaemonResponse::internal("unexpected Exists on read")
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "read_existing_text read task panicked",
+            );
+            return Err(DaemonResponse::internal(format!("read task panicked: {e}")));
+        }
+    };
+    String::from_utf8(raw)
+        .map_err(|_| DaemonResponse::invalid_params("existing file is not valid UTF-8".to_string()))
+}
+
 async fn handle_add_markdown(
     state: &DaemonState,
     cfg: &Config,
-    req: AddMarkdownRequest,
+    mut req: AddMarkdownRequest,
 ) -> DaemonResponse {
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
@@ -500,17 +587,106 @@ async fn handle_add_markdown(
         Err(resp) => return resp,
     };
 
+    // ── mode dispatch ────────────────────────────────────────────────────────
+    let mode = match classify_edit_mode(&req) {
+        Ok(m) => m,
+        Err(resp) => return resp,
+    };
+
+    // Acquire the per-corpus mutation guard before any read-modify-write so the
+    // entire read → compose → write sequence is atomic. Without this ordering
+    // two concurrent edit-mode calls (or an edit racing a whole-file overwrite)
+    // would both read the same pre-edit snapshot and the second write would
+    // clobber the first silently — the classic lost-update bug.
+    let guard = match state.acquire_mutation_guard(&corpus.name).await {
+        Ok(g) => g,
+        Err(msg) => return DaemonResponse::internal(msg),
+    };
+
+    let force_overwrite: bool;
+    match mode {
+        EditMode::WholeFile => {
+            // Unchanged whole-file path; `overwrite` governs as before.
+            force_overwrite = req.overwrite;
+        }
+        EditMode::UnderHeading(heading, position) => {
+            let existing =
+                match read_existing_text(root.clone(), relative.clone(), "under_heading").await {
+                    Ok(s) => s,
+                    Err(resp) => return resp,
+                };
+            req.content = match crate::domain::corpus::splice_under_heading(
+                &existing,
+                &heading,
+                position,
+                &req.content,
+            ) {
+                Ok(s) => s,
+                Err(crate::domain::corpus::SectionError::NotFound) => {
+                    return DaemonResponse::invalid_params(format!(
+                        "heading '{heading}' not found in {}",
+                        relative.display()
+                    ));
+                }
+                Err(crate::domain::corpus::SectionError::Duplicate) => {
+                    return DaemonResponse::invalid_params(format!(
+                        "heading '{heading}' is ambiguous in {}",
+                        relative.display()
+                    ));
+                }
+            };
+            force_overwrite = true;
+        }
+        EditMode::ReplaceLines(range) => {
+            let existing =
+                match read_existing_text(root.clone(), relative.clone(), "replace_lines").await {
+                    Ok(s) => s,
+                    Err(resp) => return resp,
+                };
+            req.content =
+                match crate::domain::corpus::replace_line_range(&existing, range, &req.content) {
+                    Ok(s) => s,
+                    Err(crate::domain::corpus::RangeError::OutOfRange) => {
+                        return DaemonResponse::invalid_params(
+                            "line range out of range".to_string(),
+                        );
+                    }
+                    Err(crate::domain::corpus::RangeError::Inverted) => {
+                        return DaemonResponse::invalid_params("start > end".to_string());
+                    }
+                };
+            force_overwrite = true;
+        }
+        EditMode::ReplaceMatch(needle) => {
+            let existing =
+                match read_existing_text(root.clone(), relative.clone(), "replace_match").await {
+                    Ok(s) => s,
+                    Err(resp) => return resp,
+                };
+            req.content =
+                match crate::domain::corpus::replace_unique_match(&existing, &needle, &req.content)
+                {
+                    Ok(s) => s,
+                    Err(crate::domain::corpus::MatchError::NotFound) => {
+                        return DaemonResponse::invalid_params("match not found".to_string());
+                    }
+                    Err(crate::domain::corpus::MatchError::Ambiguous(n)) => {
+                        return DaemonResponse::invalid_params(format!(
+                            "match ambiguous \u{2014} {n} occurrences"
+                        ));
+                    }
+                };
+            force_overwrite = true;
+        }
+    }
+
+    // ── shared tail (lint runs on the COMPOSED file) ──────────────────────────
     // Advisory-only lint of the verbatim content. Never blocks or rewrites the
     // write — the messages ride back in the response so the author can fix in
     // a follow-up instead of discovering breakage on a later read.
     let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
     warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
-
-    let guard = match state.acquire_mutation_guard(&corpus.name).await {
-        Ok(g) => g,
-        Err(msg) => return DaemonResponse::internal(msg),
-    };
 
     // Symlink-safe atomic write via the shared sandbox helper. Walks every
     // path component with `O_NOFOLLOW | O_DIRECTORY`, so a symlinked
@@ -521,7 +697,7 @@ async fn handle_add_markdown(
     let error_relative = relative.clone();
     // Read scalars and the empty-content flag before consuming `req.content`,
     // so the move into `into_bytes()` avoids cloning a potentially large body.
-    let overwrite = req.overwrite;
+    let overwrite = force_overwrite;
     let content_is_empty = req.content.trim().is_empty();
     let content_bytes = req.content.into_bytes();
     let written = tokio::task::spawn_blocking(move || {

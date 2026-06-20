@@ -1,4 +1,5 @@
-use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Parser, Tag, TagEnd};
+use super::collect_heading_text;
+use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Parser, Tag};
 use text_splitter::{ChunkConfig, MarkdownSplitter};
 
 use crate::domain::common::{HallouminateError, Result};
@@ -156,18 +157,6 @@ fn heading_level_idx(event: &Event<'_>) -> Option<usize> {
         HeadingLevel::H3 => Some(2),
         _ => None,
     }
-}
-
-fn collect_heading_text(iter: &mut OffsetIter<'_>) -> String {
-    let mut buf = String::new();
-    for (event, _) in iter.by_ref() {
-        match event {
-            Event::End(TagEnd::Heading(_)) => break,
-            Event::Text(t) | Event::Code(t) => buf.push_str(&t),
-            _ => {}
-        }
-    }
-    buf.trim().to_string()
 }
 
 fn heading_path_at(byte_offset: usize, breadcrumbs: &[Breadcrumb]) -> Vec<String> {

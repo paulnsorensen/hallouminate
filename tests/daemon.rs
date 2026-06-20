@@ -18,8 +18,9 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest, ListFilesRequest,
-    ListFilesResult, ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
+    DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
+    ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest, connect_at, serve,
+    spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -198,6 +199,7 @@ ground_dir = "{}"
             path: "race.md".into(),
             content: "".into(),
             overwrite: false,
+            ..Default::default()
         }),
     };
 
@@ -292,6 +294,7 @@ ground_dir = "{g}"
             path: "alpha.md".into(),
             content: "".into(),
             overwrite: false,
+            ..Default::default()
         }),
     };
     let req_b = DaemonRequest {
@@ -301,6 +304,7 @@ ground_dir = "{g}"
             path: "beta.md".into(),
             content: "".into(),
             overwrite: false,
+            ..Default::default()
         }),
     };
 
@@ -380,6 +384,7 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
             path: "cheese.md".into(),
             content: body.into(),
             overwrite: false,
+            ..Default::default()
         }),
     };
     let value: serde_json::Value = timeout(Duration::from_secs(60), client.call(req))
@@ -472,6 +477,7 @@ enabled = false
                 path: "notes.md".into(),
                 content: body.into(),
                 overwrite: false,
+                ..Default::default()
             }),
         })
         .await
@@ -505,6 +511,7 @@ enabled = false
                 path: "clean.md".into(),
                 content: "# Clean\n\nNothing to flag here.\n".into(),
                 overwrite: false,
+                ..Default::default()
             }),
         })
         .await
@@ -560,6 +567,7 @@ enabled = false
                 path: "bad-fm.md".into(),
                 content: malformed.into(),
                 overwrite: false,
+                ..Default::default()
             }),
         })
         .await
@@ -594,6 +602,7 @@ enabled = false
                 path: "good-fm.md".into(),
                 content: "---\nstatus: reviewed\nowner: cheese-lord\n---\n# Notes\n\nbody\n".into(),
                 overwrite: false,
+                ..Default::default()
             }),
         })
         .await
@@ -657,6 +666,7 @@ enabled = false
                 path: "claims.md".into(),
                 content: body.into(),
                 overwrite: false,
+                ..Default::default()
             }),
         })
         .await
@@ -702,6 +712,7 @@ enabled = false
                 path: "clean-claims.md".into(),
                 content: "# Notes\n\nGood.<!--claim:superseded ref=old.md-->\n".into(),
                 overwrite: false,
+                ..Default::default()
             }),
         })
         .await
@@ -1607,6 +1618,7 @@ async fn daemon_add_markdown_to_multi_root_corpus_is_rejected() {
                 path: "new.md".into(),
                 content: "# nope\n".into(),
                 overwrite: false,
+                ..Default::default()
             }),
         })
         .await
@@ -1940,6 +1952,550 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
     assert!(
         !fresh_doc.stale,
         "file unchanged since index must NOT be marked stale"
+    );
+}
+
+// ─── Issue #134: add_markdown section / range / match-scoped writes ──────────
+
+/// T20 — mode exclusivity: under_heading + replace_lines both set → InvalidParams
+#[tokio::test]
+async fn t20_mode_exclusivity_under_heading_plus_replace_lines_rejected() {
+    // WHY: setting two edit-mode selectors is a caller error that must fail
+    // loudly without touching the file.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Write a file first so it exists.
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "## Section\n\nBody.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("initial write");
+
+    let original = std::fs::read_to_string(corpus_root.join("page.md")).unwrap();
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "x".into(),
+                overwrite: false,
+                under_heading: Some("Section".into()),
+                replace_lines: Some(LineRange { start: 1, end: 1 }),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err {
+            kind: ErrorKind::InvalidParams,
+            message,
+        } => {
+            assert!(
+                message.contains("at most one"),
+                "error must mention exclusivity: {message}"
+            );
+        }
+        other => panic!("expected InvalidParams, got: {other:?}"),
+    }
+    // File must be untouched
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("page.md")).unwrap(),
+        original,
+        "file must be untouched after rejected multi-mode request"
+    );
+}
+
+/// T21 — mode exclusivity: replace_lines + replace_match both set → InvalidParams
+#[tokio::test]
+async fn t21_mode_exclusivity_replace_lines_plus_replace_match_rejected() {
+    // WHY: the second conflicting pair must also be caught by the exclusivity gate.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "Line one.\nLine two.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("initial write");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "new".into(),
+                overwrite: false,
+                replace_lines: Some(LineRange { start: 1, end: 1 }),
+                replace_match: Some("Line one".into()),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err {
+            kind: ErrorKind::InvalidParams,
+            message,
+        } => {
+            assert!(
+                message.contains("at most one"),
+                "error must mention exclusivity: {message}"
+            );
+        }
+        other => panic!("expected InvalidParams, got: {other:?}"),
+    }
+    // File must be untouched
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("page.md")).unwrap(),
+        "Line one.\nLine two.\n",
+        "file must be untouched after rejected multi-mode request"
+    );
+}
+
+/// T22 — file-must-exist: under_heading on missing file → InvalidParams
+#[tokio::test]
+async fn t22_under_heading_on_missing_file_returns_invalid_params() {
+    // WHY: edit modes require an existing file; silent creation would corrupt
+    // the expected structure.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "nonexistent.md".into(),
+                content: "stuff".into(),
+                overwrite: false,
+                under_heading: Some("Section".into()),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("transport ok");
+    assert!(
+        matches!(
+            resp,
+            DaemonResponse::Err {
+                kind: ErrorKind::InvalidParams,
+                ..
+            }
+        ),
+        "expected InvalidParams for missing file, got: {resp:?}"
+    );
+    // File must not have been created
+    assert!(
+        !corpus_root.join("nonexistent.md").exists(),
+        "file must not be created by under_heading on a missing file"
+    );
+}
+
+/// T23 — file-must-exist: replace_lines on missing file → InvalidParams
+#[tokio::test]
+async fn t23_replace_lines_on_missing_file_returns_invalid_params() {
+    // WHY: replace_lines is read-modify-write; missing file must fail loudly.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "nonexistent.md".into(),
+                content: "replacement".into(),
+                overwrite: false,
+                replace_lines: Some(LineRange { start: 1, end: 1 }),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("transport ok");
+    assert!(
+        matches!(
+            resp,
+            DaemonResponse::Err {
+                kind: ErrorKind::InvalidParams,
+                ..
+            }
+        ),
+        "expected InvalidParams for missing file, got: {resp:?}"
+    );
+    // File must not have been created
+    assert!(
+        !corpus_root.join("nonexistent.md").exists(),
+        "file must not be created by replace_lines on a missing file"
+    );
+}
+
+/// T24 — file-must-exist: replace_match on missing file → InvalidParams
+#[tokio::test]
+async fn t24_replace_match_on_missing_file_returns_invalid_params() {
+    // WHY: replace_match is read-modify-write; missing file must fail loudly.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "nonexistent.md".into(),
+                content: "replacement".into(),
+                overwrite: false,
+                replace_match: Some("needle".into()),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("transport ok");
+    assert!(
+        matches!(
+            resp,
+            DaemonResponse::Err {
+                kind: ErrorKind::InvalidParams,
+                ..
+            }
+        ),
+        "expected InvalidParams for missing file, got: {resp:?}"
+    );
+    // File must not have been created
+    assert!(
+        !corpus_root.join("nonexistent.md").exists(),
+        "file must not be created by replace_match on a missing file"
+    );
+}
+
+/// T25 — reindex: section write → IndexReport files_upserted >= 1
+#[tokio::test]
+async fn t25_section_write_reindexes_file() {
+    // WHY: after a section splice, the daemon must reindex the file so the
+    // updated content is searchable.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Write initial file.
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "wiki.md".into(),
+                content: "## Notes\n\nOriginal content.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("initial write");
+
+    // Section splice.
+    let resp: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "wiki.md".into(),
+                content: "Added bullet.".into(),
+                overwrite: false,
+                under_heading: Some("Notes".into()),
+                position: Position::Append,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("section write ok");
+
+    let upserted = resp["indexed"]["corpora"][0]["files_upserted"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        upserted >= 1,
+        "section write must report files_upserted >= 1: {resp}"
+    );
+
+    // Verify the composed content is on disk.
+    let on_disk = std::fs::read_to_string(corpus_root.join("wiki.md")).unwrap();
+    assert!(
+        on_disk.contains("Added bullet."),
+        "spliced content must be on disk: {on_disk:?}"
+    );
+    assert!(
+        on_disk.contains("Original content."),
+        "original content must be preserved: {on_disk:?}"
+    );
+}
+
+/// T26 — reindex: replace_lines write → files_upserted >= 1
+#[tokio::test]
+async fn t26_replace_lines_write_reindexes_file() {
+    // WHY: after a line-range replace, the daemon must reindex the modified
+    // file so the updated content is searchable.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Write a 3-line file.
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "alpha\nbeta\ngamma\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("initial write");
+
+    // Replace line 2.
+    let resp: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "REPLACED".into(),
+                overwrite: false,
+                replace_lines: Some(LineRange { start: 2, end: 2 }),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("replace_lines ok");
+
+    let upserted = resp["indexed"]["corpora"][0]["files_upserted"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        upserted >= 1,
+        "replace_lines must report files_upserted >= 1: {resp}"
+    );
+
+    let on_disk = std::fs::read_to_string(corpus_root.join("page.md")).unwrap();
+    // Terminator hygiene: single trailing newline after replacement, no surrounding blank lines.
+    assert_eq!(
+        on_disk, "alpha\nREPLACED\ngamma\n",
+        "replace_lines must produce exact composed output: {on_disk:?}"
+    );
+}
+
+/// T27 — back-compat: whole-file write with all new fields omitted is unchanged
+#[tokio::test]
+async fn t27_whole_file_write_with_new_fields_omitted_is_unchanged() {
+    // WHY: the default (no edit-mode field) must behave identically to the
+    // pre-#134 whole-file path so existing callers are unaffected.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let body = "# Whole File\n\nContent unchanged.\n";
+    let resp: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "whole.md".into(),
+                content: body.into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("whole-file write ok");
+
+    // File on disk is verbatim — no splicing, no normalization.
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("whole.md")).unwrap(),
+        body,
+        "whole-file write must be stored verbatim"
+    );
+    // Index report looks the same as pre-#134.
+    assert!(
+        resp["indexed"]["corpora"][0]["files_upserted"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "whole-file write must report files_upserted >= 1: {resp}"
+    );
+}
+
+/// T28 — lint ride-back: edit-mode write on a composed file that trips a lint
+/// returns warnings in AddMarkdownResult
+#[tokio::test]
+async fn t28_edit_mode_lint_warnings_ride_back_on_composed_file() {
+    // WHY: advisory lint must run on the COMPOSED file after an edit-mode
+    // write so broken links / empty mermaid in the spliced fragment surface
+    // the same way they would in a whole-file write.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir");
+    let cfg: Config = toml::from_str(&format!(
+        "[[corpus]]\nname=\"docs\"\npaths=[\"{c}\"]\nglobs=[\"**/*.md\"]\n[storage]\nground_dir=\"{g}\"\n[embeddings]\nenabled=false",
+        c = corpus_root.display(),
+        g = ground.display()
+    ))
+    .expect("cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Write a clean initial page.
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "## Section\n\nClean content.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("initial write");
+
+    // Splice a fragment with an empty-destination link (triggers lint).
+    let resp: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "page.md".into(),
+                content: "See [broken link]() for details.".into(),
+                overwrite: false,
+                under_heading: Some("Section".into()),
+                position: Position::Append,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("edit-mode write ok despite lint");
+
+    // The write must succeed (advisory lint never blocks).
+    let on_disk = std::fs::read_to_string(corpus_root.join("page.md")).unwrap();
+    assert!(
+        on_disk.contains("broken link"),
+        "content must be on disk despite lint warning: {on_disk:?}"
+    );
+
+    // Lint warnings must ride back in the response.
+    let warnings = resp["warnings"].as_array();
+    assert!(
+        warnings.is_some_and(|w| !w.is_empty()),
+        "lint warnings must ride back on edit-mode write: {resp}"
+    );
+    let joined = warnings
+        .unwrap()
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("empty destination"),
+        "empty-destination lint must be present: {joined}"
     );
 }
 

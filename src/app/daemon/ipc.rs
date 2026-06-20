@@ -28,6 +28,8 @@ use crate::app::cli::IndexReport;
 use crate::domain::corpus::sandbox::{FileEntry, TreeNode};
 use crate::domain::ground::GroundResponse;
 
+pub use crate::domain::corpus::{LineRange, Position};
+
 /// Top-level request envelope. Carries a `cwd: PathBuf` plus a
 /// [`DaemonRequestPayload`] discriminating one of the request variants.
 ///
@@ -104,13 +106,28 @@ pub struct ListTreeRequest {
     pub corpus: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AddMarkdownRequest {
     pub corpus: String,
     pub path: String,
     pub content: String,
     #[serde(default)]
     pub overwrite: bool,
+
+    // ── edit-mode selectors (at most one may be Some/set; see decision D1) ──
+    /// Section-splice mode: splice `content` under this heading's section.
+    #[serde(default)]
+    pub under_heading: Option<String>,
+    /// Splice position within the section. Only meaningful with `under_heading`.
+    #[serde(default)]
+    pub position: Position,
+    /// Line-range-replace mode: replace lines `[start, end]` (1-based, inclusive).
+    #[serde(default)]
+    pub replace_lines: Option<LineRange>,
+    /// Text-match-replace mode: replace the unique literal occurrence of this
+    /// substring.
+    #[serde(default)]
+    pub replace_match: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
