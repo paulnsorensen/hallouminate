@@ -18,8 +18,8 @@ use std::time::Duration;
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest,
-    ListFilesRequest, ListFilesResult, ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
+    DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest, ListFilesRequest,
+    ListFilesResult, ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -1974,8 +1974,7 @@ fn cfg_with_corpus(ground_dir: &Path, corpus_root: &Path) -> Config {
 
 /// Read the schema_version from a ground dir's meta.toml.
 fn read_schema_version(ground_dir: &Path) -> u32 {
-    let text = std::fs::read_to_string(ground_dir.join("meta.toml"))
-        .expect("read meta.toml");
+    let text = std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read meta.toml");
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("schema_version = ") {
             return rest.trim().parse().expect("parse schema_version");
@@ -2009,7 +2008,10 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
 
     // The stale store was moved aside.
     let bak = ground.with_file_name(format!("ground.bak-v{stale}"));
-    assert!(bak.exists(), "backup ground.bak-v{stale} must exist after rebuild");
+    assert!(
+        bak.exists(),
+        "backup ground.bak-v{stale} must exist after rebuild"
+    );
     // The backup must contain the original stale meta.toml so the store is
     // recoverable (spec criterion 4: stale store is recoverable at .bak-v{N}).
     let bak_version = read_schema_version(&bak);
@@ -2055,7 +2057,10 @@ async fn downgrade_store_is_fatal_and_original_untouched() {
     );
     // Original ground dir is untouched: no .bak directory created.
     let bak = ground.with_file_name(format!("ground.bak-v{newer}"));
-    assert!(!bak.exists(), "no .bak must exist after downgrade rejection");
+    assert!(
+        !bak.exists(),
+        "no .bak must exist after downgrade rejection"
+    );
     // The original meta.toml is still at the newer version.
     let stored = read_schema_version(&ground);
     assert_eq!(stored, newer, "original meta.toml must be untouched");
@@ -2081,10 +2086,7 @@ async fn matching_version_store_is_untouched() {
 
     // No backup was created.
     let bak = ground.with_file_name(format!("ground.bak-v{current}"));
-    assert!(
-        !bak.exists(),
-        "no .bak must exist when versions match"
-    );
+    assert!(!bak.exists(), "no .bak must exist when versions match");
     // The on-disk meta.toml must still record the current version — the
     // match-branch must not have silently mutated or re-written it.
     let still_current = read_schema_version(&ground);

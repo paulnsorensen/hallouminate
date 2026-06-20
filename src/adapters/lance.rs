@@ -1157,7 +1157,14 @@ schema_version = 1
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
             .expect_err("a v1 store must be rejected by the v3 binary");
         assert!(
-            matches!(err, HallouminateError::StoreSchemaStale { found: 1, expected: 3, .. }),
+            matches!(
+                err,
+                HallouminateError::StoreSchemaStale {
+                    found: 1,
+                    expected: 3,
+                    ..
+                }
+            ),
             "expected StoreSchemaStale, got: {err}"
         );
         let msg = err.to_string();
@@ -1185,7 +1192,14 @@ schema_version = 2
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
             .expect_err("a v2 store must be rejected by the v3 binary");
         assert!(
-            matches!(err, HallouminateError::StoreSchemaStale { found: 2, expected: 3, .. }),
+            matches!(
+                err,
+                HallouminateError::StoreSchemaStale {
+                    found: 2,
+                    expected: 3,
+                    ..
+                }
+            ),
             "expected StoreSchemaStale, got: {err}"
         );
         let msg = err.to_string();
@@ -1718,7 +1732,10 @@ schema_version = 1
         );
         let msg = err.to_string();
         assert!(msg.contains("NEWER"), "must say NEWER: {msg}");
-        assert!(msg.to_lowercase().contains("upgrade"), "must advise upgrade: {msg}");
+        assert!(
+            msg.to_lowercase().contains("upgrade"),
+            "must advise upgrade: {msg}"
+        );
     }
 }
 

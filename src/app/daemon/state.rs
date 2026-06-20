@@ -169,7 +169,9 @@ impl DaemonState {
         .await
         {
             Ok(s) => s,
-            Err(HallouminateError::StoreSchemaStale { found, expected, .. }) => {
+            Err(HallouminateError::StoreSchemaStale {
+                found, expected, ..
+            }) => {
                 tracing::warn!(
                     target: "hallouminate::daemon",
                     %found,
@@ -185,10 +187,12 @@ impl DaemonState {
                 )
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("rebuild: open fresh ground dir {}: {e}", ground_dir.display())
+                    anyhow::anyhow!(
+                        "rebuild: open fresh ground dir {}: {e}",
+                        ground_dir.display()
+                    )
                 })?;
-                let chunker =
-                    MarkdownChunker::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+                let chunker = MarkdownChunker::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
                 for corpus in cfg
                     .effective_corpora()
                     .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
@@ -206,9 +210,7 @@ impl DaemonState {
                         embedder.as_mut().map(|e| e as &mut dyn EmbedBatch);
                     let stats = index_corpus(&corpus, &fresh, emb, &chunker)
                         .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("rebuild: index {}: {e}", corpus.name)
-                        })?;
+                        .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
                     tracing::info!(
                         target: "hallouminate::daemon",
                         corpus = %corpus.name,
