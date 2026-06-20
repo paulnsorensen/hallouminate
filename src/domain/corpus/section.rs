@@ -5,7 +5,7 @@
 //! regions, so a splice/replace is indistinguishable from a whole-file
 //! rewrite at the indexer layer.
 
-use pulldown_cmark::{Event, OffsetIter, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, OffsetIter, Parser, Tag};
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -175,19 +175,7 @@ pub fn splice_under_heading(
     ))
 }
 
-/// Collect rendered text for the current heading by consuming events through
-/// the matching `End(Heading)`. Mirrors `chunker.rs:161`.
-fn collect_heading_text(iter: &mut OffsetIter<'_>) -> String {
-    let mut buf = String::new();
-    for (event, _) in iter.by_ref() {
-        match event {
-            Event::End(TagEnd::Heading(_)) => break,
-            Event::Text(t) | Event::Code(t) => buf.push_str(&t),
-            _ => {}
-        }
-    }
-    buf.trim().to_string()
-}
+use super::collect_heading_text;
 
 /// Map pulldown-cmark's `HeadingLevel` to a `u8` where lower == higher level
 /// in the document hierarchy (H1 == 1).
@@ -206,7 +194,9 @@ fn heading_level_u8(level: pulldown_cmark::HeadingLevel) -> u8 {
 // ── Mode 3: line-range replace ───────────────────────────────────────────────
 
 /// Replace lines `[range.start, range.end]` (1-based, inclusive) with `body`.
-/// Line terminators are preserved via `split_inclusive`.
+/// `body` is spliced with a single trailing newline (terminator hygiene): no
+/// surrounding blank lines are injected, so table rows and list items edit
+/// surgically without breaking CommonMark structure.
 ///
 /// Errors:
 /// - [`RangeError::OutOfRange`] when `start == 0`, `end == 0`, or
@@ -229,7 +219,7 @@ pub fn replace_line_range(doc: &str, range: LineRange, body: &str) -> Result<Str
     // 1-based inclusive [start, end] → 0-based [start-1, end)
     let prefix: String = lines[..start - 1].concat();
     let suffix: String = lines[end..].concat();
-    Ok(format!("{prefix}{}{suffix}", normalize_block(body)))
+    Ok(format!("{prefix}{}\n{suffix}", body.trim_matches('\n')))
 }
 
 // ── Mode 4: unique-literal-match replace ─────────────────────────────────────
@@ -382,39 +372,27 @@ mod tests {
     // ── T9: replace a middle range [3, 5] ─────────────────────────────────────
     #[test]
     fn t9_replace_middle_range() {
-        // WHY: core replace_lines path; lines outside the range must be byte-identical.
+        // WHY: core replace_lines path; terminator hygiene means exactly one \n
+        // after the replacement body, no surrounding blank lines — table rows
+        // and list items must not have their structure broken.
         let doc = "line1\nline2\nline3\nline4\nline5\nline6\n";
         let result = replace_line_range(doc, LineRange { start: 3, end: 5 }, "replaced").unwrap();
-        assert!(
-            result.starts_with("line1\nline2\n"),
-            "prefix byte-identical: {result:?}"
+        assert_eq!(
+            result, "line1\nline2\nreplaced\nline6\n",
+            "replace_lines [3,5] must produce exact composed output: {result:?}"
         );
-        assert!(
-            result.ends_with("line6\n"),
-            "suffix byte-identical: {result:?}"
-        );
-        assert!(
-            result.contains("replaced"),
-            "replacement present: {result:?}"
-        );
-        // Original lines 3-5 must be gone
-        assert!(!result.contains("line3"), "line3 must be gone: {result:?}");
-        assert!(!result.contains("line4"), "line4 must be gone: {result:?}");
-        assert!(!result.contains("line5"), "line5 must be gone: {result:?}");
     }
 
     // ── T10: single-line replace (start == end) ────────────────────────────────
     #[test]
     fn t10_single_line_replace() {
-        // WHY: start == end must replace exactly one line.
+        // WHY: start == end must replace exactly one line with terminator hygiene —
+        // single trailing newline, no surrounding blank lines.
         let doc = "alpha\nbeta\ngamma\n";
         let result = replace_line_range(doc, LineRange { start: 2, end: 2 }, "replaced").unwrap();
-        assert!(result.contains("alpha\n"), "line1 intact: {result:?}");
-        assert!(result.contains("gamma\n"), "line3 intact: {result:?}");
-        assert!(!result.contains("beta"), "original line2 gone: {result:?}");
-        assert!(
-            result.contains("replaced"),
-            "replacement present: {result:?}"
+        assert_eq!(
+            result, "alpha\nreplaced\ngamma\n",
+            "single-line replace must produce exact composed output: {result:?}"
         );
     }
 

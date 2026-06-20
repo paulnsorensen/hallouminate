@@ -2366,9 +2366,9 @@ async fn t26_replace_lines_write_reindexes_file() {
     );
 
     let on_disk = std::fs::read_to_string(corpus_root.join("page.md")).unwrap();
-    // normalize_block wraps the replacement: prefix + \n{body}\n\n + suffix.
+    // Terminator hygiene: single trailing newline after replacement, no surrounding blank lines.
     assert_eq!(
-        on_disk, "alpha\n\nREPLACED\n\ngamma\n",
+        on_disk, "alpha\nREPLACED\ngamma\n",
         "replace_lines must produce exact composed output: {on_disk:?}"
     );
 }

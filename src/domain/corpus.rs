@@ -11,6 +11,22 @@ mod summary;
 mod validate;
 mod walker;
 
+use pulldown_cmark::{Event, OffsetIter, TagEnd};
+
+/// Collect rendered text for the current heading by consuming events through
+/// the matching `End(Heading)`. Used by both `section.rs` and `chunker.rs`.
+pub(crate) fn collect_heading_text(iter: &mut OffsetIter<'_>) -> String {
+    let mut buf = String::new();
+    for (event, _) in iter.by_ref() {
+        match event {
+            Event::End(TagEnd::Heading(_)) => break,
+            Event::Text(t) | Event::Code(t) => buf.push_str(&t),
+            _ => {}
+        }
+    }
+    buf.trim().to_string()
+}
+
 pub use chunker::{
     Chunk, ChunkSizer, CorpusChunker, MarkdownChunker, chunk_markdown, load_tokenizer,
 };

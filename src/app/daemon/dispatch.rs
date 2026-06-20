@@ -538,16 +538,36 @@ async fn read_existing_text(
                             "{mode_label} requires an existing file; {rel_disp} not found"
                         ))
                     } else {
+                        tracing::error!(
+                            target: "hallouminate::daemon",
+                            error = %source,
+                            path = %rel_disp,
+                            "read_existing_text io error",
+                        );
                         DaemonResponse::internal(format!("failed to read {rel_disp}: {source}"))
                     }
                 }
                 WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => {
                     DaemonResponse::invalid_params(format!("refusing unsafe path {rel_disp}"))
                 }
-                WriteErrorKind::Exists => DaemonResponse::internal("unexpected Exists on read"),
+                WriteErrorKind::Exists => {
+                    tracing::error!(
+                        target: "hallouminate::daemon",
+                        path = %rel_disp,
+                        "read_existing_text: unexpected Exists variant on read path",
+                    );
+                    DaemonResponse::internal("unexpected Exists on read")
+                }
             });
         }
-        Err(e) => return Err(DaemonResponse::internal(format!("read task panicked: {e}"))),
+        Err(e) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "read_existing_text read task panicked",
+            );
+            return Err(DaemonResponse::internal(format!("read task panicked: {e}")));
+        }
     };
     String::from_utf8(raw)
         .map_err(|_| DaemonResponse::invalid_params("existing file is not valid UTF-8".to_string()))
