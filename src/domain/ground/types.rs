@@ -56,6 +56,13 @@ pub struct DocFile {
     /// prefix of the absolute path (e.g. a global corpus or symlinked root).
     #[serde(default)]
     pub path: Option<String>,
+    /// Whether the file has been modified on disk since it was last indexed.
+    /// `true` means the on-disk mtime is newer than the indexed mtime (or the
+    /// file is missing); the index may not reflect current content. Always
+    /// `false` until the stale-check runs; `#[serde(default)]` keeps strict-
+    /// schema clients that predate this field from hard-breaking.
+    #[serde(default)]
+    pub stale: bool,
     /// Matching chunks within the file, ranked by `score` descending.
     pub chunks: Vec<DocChunk>,
 }
@@ -131,6 +138,7 @@ mod tests {
                 mtime: "2026-04-30T10:11:23Z".into(),
                 corpus: "tern-docs".into(),
                 path: Some("path/to/file.md".into()),
+                stale: false,
                 chunks: vec![DocChunk {
                     chunk_id: "abc123".into(),
                     heading_path: vec!["Indexing pipeline".into(), "Phase B".into()],
@@ -174,6 +182,7 @@ mod tests {
                     "mtime": "2026-04-30T10:11:23Z",
                     "corpus": "tern-docs",
                     "path": "path/to/file.md",
+                    "stale": false,
                     "chunks": [{
                         "chunk_id": "abc123",
                         "heading_path": ["Indexing pipeline", "Phase B"],
@@ -207,6 +216,7 @@ mod tests {
             mtime: "2026-04-30T10:11:23Z".into(),
             corpus: "docs".into(),
             path: None,
+            stale: false,
             chunks: vec![],
         };
         let actual = serde_json::to_value(&file).expect("serialize");
@@ -294,6 +304,7 @@ mod tests {
             mtime: "2026-01-01T00:00:00Z".into(),
             corpus: "docs".into(),
             path: None,
+            stale: false,
             chunks: vec![],
         };
         let actual = serde_json::to_value(&file).expect("serialize");
@@ -309,6 +320,7 @@ mod tests {
             mtime: "2026-01-01T00:00:00Z".into(),
             corpus: "docs".into(),
             path: Some("wiki/concepts.md".into()),
+            stale: false,
             chunks: vec![],
         };
         let actual = serde_json::to_value(&file).expect("serialize");

@@ -115,6 +115,7 @@ impl FileBucket {
                 mtime,
                 corpus: String::new(),
                 path: None,
+                stale: false,
                 chunks,
             },
         )
