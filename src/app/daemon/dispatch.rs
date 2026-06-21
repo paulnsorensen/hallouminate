@@ -2056,6 +2056,78 @@ mod tests {
         assert_eq!(stats.corpus, "test");
     }
 
+    /// WHY: files excluded by the corpus `exclude` globs are out of scope and
+    /// must not inflate `unindexed_files`. Without this, an excluded file that
+    /// happens to match the `globs` include pattern would be counted as missing
+    /// from the index, even though the corpus is intentionally ignoring it.
+    #[tokio::test]
+    async fn corpus_stats_excludes_glob_excluded_files_from_unindexed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        let ground = tmp.path().join("ground");
+
+        // Corpus includes *.md but explicitly excludes "excluded.md".
+        let repo_config = format!(
+            concat!(
+                "[[corpus]]\nname = \"test\"\n",
+                "paths = [\"{}\"]",
+                "\nglobs = [\"**/*.md\"]\nexclude = [\"**/excluded.md\"]\n"
+            ),
+            corpus_dir.display()
+        );
+        write_repo_layer(tmp.path(), &repo_config);
+        let state = state_with_ground(&ground, "").await;
+
+        // Write and index one normal file.
+        std::fs::write(corpus_dir.join("indexed.md"), "# Indexed\n\nContent.\n")
+            .expect("write indexed");
+        let index_resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("test".to_string()),
+                    paths_from: None,
+                    strict: false,
+                }),
+            },
+        )
+        .await;
+        assert!(
+            matches!(index_resp, DaemonResponse::Ok { .. }),
+            "index must succeed: {index_resp:?}"
+        );
+
+        // Write the excluded file to disk WITHOUT indexing it.
+        // It matches the include glob (*.md) but is excluded by name.
+        std::fs::write(
+            corpus_dir.join("excluded.md"),
+            "# Excluded\n\nShould not be counted as unindexed.\n",
+        )
+        .expect("write excluded");
+
+        let resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::CorpusStats { corpus: None },
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { result } = resp else {
+            panic!("corpus_stats must succeed: {resp:?}");
+        };
+        let stats: CorpusStatsResult =
+            serde_json::from_value(result).expect("parse CorpusStatsResult");
+        assert_eq!(stats.indexed_files, 1, "one file was indexed");
+        // excluded.md is out of scope — it must not appear in unindexed_files.
+        assert_eq!(
+            stats.unindexed_files, 0,
+            "excluded file must not count toward unindexed_files"
+        );
+    }
+
     /// WHY: a freshly-configured wiki corpus whose directory has never been
     /// created must return zeroed stats (indexed_files=0, unindexed_files=0),
     /// not an internal error. Without `ensure_paths_exist`, `list_corpus_files`
