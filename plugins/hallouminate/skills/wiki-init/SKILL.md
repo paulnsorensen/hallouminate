@@ -80,8 +80,17 @@ your working notes), separating *what was said* from *how it'll be written*.
 - Write a **`wiki-conventions.md`** first (the wiki's constitution): slug rules, the
   H1 rule, one-topic-per-file, the voice, and a provenance-footer convention
   (`_Source: <how we know this> · Updated: <date> · Supersedes: <if any>_`). Declare
-  the `Supersedes:` field here so `wiki-ingest` writes and reads one key. Later skills
-  (`wiki-ingest`) read it to stay consistent.
+  the `Supersedes:` field here so `wiki-ingest` writes and reads one key. Also declare
+  the two ingest-ledger conventions so `wiki-ingest` reads and writes one shape:
+  - **`log.md`** — an append-only ingest journal at the corpus root under a stable
+    `## Log` heading. `wiki-ingest` appends one row per decision via
+    an `add_markdown` append (`corpus`, `path: "log.md"`, `under_heading: "Log"`, `position: "append"`, `content: <row>`); it is **never**
+    rewritten and **never** a routing/merge target.
+  - **`sha256sum` source-hash ledger** — `wiki-ingest`'s Layer-1 dedup hashes each
+    normalized source (`sha256sum`, first 16 hex chars) and records the id in `log.md`;
+    a ledger hit skips the whole source. Note the hash convention here so the id format
+    is stable across ingests.
+  Later skills (`wiki-ingest`) read all of this to stay consistent.
 - Pick the corpus: `repo:{name}:wiki` for the repo, or ask if ambiguous
   (`list_corpora`). Confirm the page list with the user before fanning out.
 
@@ -113,6 +122,9 @@ automatically on write.
 - `list_tree` to confirm the shape; write or refine the top-level `index.md` prose
   (outside the `<!-- HALLOUMINATE:INDEX-START -->` / `<!-- HALLOUMINATE:INDEX-END -->`
   markers — the daemon owns the link list between them).
+- **Scaffold an empty `log.md`** at the corpus root so `wiki-ingest` has a ledger to
+  append to from its first run: `add_markdown { corpus, path: "log.md",
+  content: "# Ingest Log\n\n## Log\n", overwrite: false }`. It stays append-only thereafter.
 - Report the page list to the user and name the gaps the interview didn't reach
   (hand-off candidates for a later `wiki-init` continuation or `wiki-ingest`).
 
