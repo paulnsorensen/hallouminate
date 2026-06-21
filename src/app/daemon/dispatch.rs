@@ -286,6 +286,9 @@ async fn handle_corpus_stats(
         Ok(s) => s,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
+    // Ensure wiki dir exists so an unindexed wiki corpus doesn't error
+    // out on a missing root — mirrors handle_list_files.
+    ensure_paths_exist(&corpus_cfg);
     let disk_files = match list_corpus_files(&corpus_cfg) {
         Ok(f) => f,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -2051,5 +2054,51 @@ mod tests {
             "indexed corpus must carry a timestamp"
         );
         assert_eq!(stats.corpus, "test");
+    }
+
+    /// WHY: a freshly-configured wiki corpus whose directory has never been
+    /// created must return zeroed stats (indexed_files=0, unindexed_files=0),
+    /// not an internal error. Without `ensure_paths_exist`, `list_corpus_files`
+    /// → `scan()` fails fatally on the missing root.
+    #[tokio::test]
+    async fn corpus_stats_returns_zeroed_result_for_never_created_wiki_corpus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path();
+        // The wiki dir (.hallouminate/wiki) is intentionally NOT created.
+        let ground = tmp.path().join("ground");
+
+        let repo_config = format!(
+            "[[repository]]\nname = \"myrepo\"\npath = \"{}\"\n",
+            repo_root.display()
+        );
+        write_repo_layer(repo_root, &repo_config);
+        let state = state_with_ground(&ground, "").await;
+
+        let resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo_root.to_path_buf(),
+                payload: DaemonRequestPayload::CorpusStats {
+                    corpus: Some("repo:myrepo:wiki".to_string()),
+                },
+            },
+        )
+        .await;
+
+        let DaemonResponse::Ok { result } = resp else {
+            panic!(
+                "corpus_stats on a never-created wiki corpus must return Ok, not an error: {resp:?}"
+            );
+        };
+        let stats: CorpusStatsResult =
+            serde_json::from_value(result).expect("parse CorpusStatsResult");
+        assert_eq!(stats.indexed_files, 0, "no files indexed yet");
+        assert_eq!(stats.total_chunks, 0, "no chunks yet");
+        assert_eq!(stats.unindexed_files, 0, "empty dir has no unindexed files");
+        assert!(
+            stats.last_indexed_ms.is_none(),
+            "never-indexed corpus must have null timestamp"
+        );
+        assert_eq!(stats.corpus, "repo:myrepo:wiki");
     }
 }
