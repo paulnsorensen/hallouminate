@@ -42,10 +42,10 @@ use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
-    IndexRequest, LineRange, ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult,
-    Position, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
+    ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -100,6 +100,9 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         }
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
+        }
+        DaemonRequestPayload::CorpusStats { corpus } => {
+            handle_corpus_stats(state, &effective, &req_cwd, corpus).await
         }
         DaemonRequestPayload::Shutdown => {
             // Handled before `resolve_for_cwd` above; unreachable here.
@@ -260,6 +263,54 @@ fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonRes
     DaemonResponse::ok(&ListTreeResult {
         corpus: corpus.name,
         root,
+    })
+}
+
+async fn handle_corpus_stats(
+    state: &DaemonState,
+    cfg: &Config,
+    cwd: &Path,
+    corpus: Option<String>,
+) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let corpus_cfg =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, corpus.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
+    let store = state.store();
+    let chunk_stats = match store.corpus_chunk_stats(&corpus_cfg.name).await {
+        Ok(s) => s,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    // Ensure wiki dir exists so an unindexed wiki corpus doesn't error
+    // out on a missing root — mirrors handle_list_files.
+    ensure_paths_exist(&corpus_cfg);
+    let disk_files = match list_corpus_files(&corpus_cfg) {
+        Ok(f) => f,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let indexed_map = match store.list_files(&corpus_cfg.name).await {
+        Ok(m) => m,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let indexed_paths: std::collections::HashSet<String> = indexed_map
+        .keys()
+        .map(|r| r.as_path().to_string_lossy().into_owned())
+        .collect();
+    let unindexed_files = disk_files
+        .iter()
+        .filter(|e| !indexed_paths.contains(&e.absolute_path))
+        .count() as u64;
+    DaemonResponse::ok(&CorpusStatsResult {
+        corpus: corpus_cfg.name,
+        indexed_files: chunk_stats.indexed_files,
+        total_chunks: chunk_stats.total_chunks,
+        last_indexed_ms: chunk_stats.last_indexed_ms,
+        unindexed_files,
     })
 }
 
@@ -1943,5 +1994,183 @@ mod tests {
             response.docs[&abs_str].stale,
             "file modified after index must be stale"
         );
+    }
+
+    #[tokio::test]
+    async fn corpus_stats_counts_indexed_and_unindexed_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        let ground = tmp.path().join("ground");
+
+        let repo_config = format!(
+            "[[corpus]]\nname = \"test\"\npaths = [\"{}\"]\n",
+            corpus_dir.display()
+        );
+        write_repo_layer(tmp.path(), &repo_config);
+        let state = state_with_ground(&ground, "").await;
+
+        // Write 2 files and index them.
+        std::fs::write(corpus_dir.join("a.md"), "# Doc A\n\nContent A.\n").expect("write a");
+        std::fs::write(corpus_dir.join("b.md"), "# Doc B\n\nContent B.\n").expect("write b");
+
+        let index_resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("test".to_string()),
+                    paths_from: None,
+                    strict: false,
+                }),
+            },
+        )
+        .await;
+        assert!(
+            matches!(index_resp, DaemonResponse::Ok { .. }),
+            "index must succeed: {index_resp:?}"
+        );
+
+        // Add a third file without re-indexing — this becomes the unindexed count.
+        std::fs::write(corpus_dir.join("c.md"), "# Doc C\n\nUnindexed.\n").expect("write c");
+
+        let resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::CorpusStats { corpus: None },
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { result } = resp else {
+            panic!("corpus_stats must succeed: {resp:?}");
+        };
+        let stats: CorpusStatsResult =
+            serde_json::from_value(result).expect("parse CorpusStatsResult");
+        assert_eq!(stats.indexed_files, 2, "two files were indexed");
+        assert_eq!(stats.unindexed_files, 1, "one file added without re-index");
+        assert!(
+            stats.last_indexed_ms.is_some(),
+            "indexed corpus must carry a timestamp"
+        );
+        assert_eq!(stats.corpus, "test");
+    }
+
+    /// WHY: files excluded by the corpus `exclude` globs are out of scope and
+    /// must not inflate `unindexed_files`. Without this, an excluded file that
+    /// happens to match the `globs` include pattern would be counted as missing
+    /// from the index, even though the corpus is intentionally ignoring it.
+    #[tokio::test]
+    async fn corpus_stats_excludes_glob_excluded_files_from_unindexed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        let ground = tmp.path().join("ground");
+
+        // Corpus includes *.md but explicitly excludes "excluded.md".
+        let repo_config = format!(
+            concat!(
+                "[[corpus]]\nname = \"test\"\n",
+                "paths = [\"{}\"]",
+                "\nglobs = [\"**/*.md\"]\nexclude = [\"**/excluded.md\"]\n"
+            ),
+            corpus_dir.display()
+        );
+        write_repo_layer(tmp.path(), &repo_config);
+        let state = state_with_ground(&ground, "").await;
+
+        // Write and index one normal file.
+        std::fs::write(corpus_dir.join("indexed.md"), "# Indexed\n\nContent.\n")
+            .expect("write indexed");
+        let index_resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("test".to_string()),
+                    paths_from: None,
+                    strict: false,
+                }),
+            },
+        )
+        .await;
+        assert!(
+            matches!(index_resp, DaemonResponse::Ok { .. }),
+            "index must succeed: {index_resp:?}"
+        );
+
+        // Write the excluded file to disk WITHOUT indexing it.
+        // It matches the include glob (*.md) but is excluded by name.
+        std::fs::write(
+            corpus_dir.join("excluded.md"),
+            "# Excluded\n\nShould not be counted as unindexed.\n",
+        )
+        .expect("write excluded");
+
+        let resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::CorpusStats { corpus: None },
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { result } = resp else {
+            panic!("corpus_stats must succeed: {resp:?}");
+        };
+        let stats: CorpusStatsResult =
+            serde_json::from_value(result).expect("parse CorpusStatsResult");
+        assert_eq!(stats.indexed_files, 1, "one file was indexed");
+        // excluded.md is out of scope — it must not appear in unindexed_files.
+        assert_eq!(
+            stats.unindexed_files, 0,
+            "excluded file must not count toward unindexed_files"
+        );
+    }
+
+    /// WHY: a freshly-configured wiki corpus whose directory has never been
+    /// created must return zeroed stats (indexed_files=0, unindexed_files=0),
+    /// not an internal error. Without `ensure_paths_exist`, `list_corpus_files`
+    /// → `scan()` fails fatally on the missing root.
+    #[tokio::test]
+    async fn corpus_stats_returns_zeroed_result_for_never_created_wiki_corpus() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path();
+        // The wiki dir (.hallouminate/wiki) is intentionally NOT created.
+        let ground = tmp.path().join("ground");
+
+        let repo_config = format!(
+            "[[repository]]\nname = \"myrepo\"\npath = \"{}\"\n",
+            repo_root.display()
+        );
+        write_repo_layer(repo_root, &repo_config);
+        let state = state_with_ground(&ground, "").await;
+
+        let resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo_root.to_path_buf(),
+                payload: DaemonRequestPayload::CorpusStats {
+                    corpus: Some("repo:myrepo:wiki".to_string()),
+                },
+            },
+        )
+        .await;
+
+        let DaemonResponse::Ok { result } = resp else {
+            panic!(
+                "corpus_stats on a never-created wiki corpus must return Ok, not an error: {resp:?}"
+            );
+        };
+        let stats: CorpusStatsResult =
+            serde_json::from_value(result).expect("parse CorpusStatsResult");
+        assert_eq!(stats.indexed_files, 0, "no files indexed yet");
+        assert_eq!(stats.total_chunks, 0, "no chunks yet");
+        assert_eq!(stats.unindexed_files, 0, "empty dir has no unindexed files");
+        assert!(
+            stats.last_indexed_ms.is_none(),
+            "never-indexed corpus must have null timestamp"
+        );
+        assert_eq!(stats.corpus, "repo:myrepo:wiki");
     }
 }

@@ -20,10 +20,11 @@ use std::time::Duration;
 
 use crate::app::config::discover_repo_config;
 use crate::app::daemon::{
-    AddMarkdownRequest, AddMarkdownResult, DaemonClient, DaemonRequest, DaemonRequestPayload,
-    DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind, GroundRequest,
-    GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest, ListFilesResult,
-    ListTreeRequest, ListTreeResult, Position, ReadMarkdownRequest, ReadMarkdownResult, client_for,
+    AddMarkdownRequest, AddMarkdownResult, CorpusStatsResult, DaemonClient, DaemonRequest,
+    DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest,
+    ListFilesResult, ListTreeRequest, ListTreeResult, Position, ReadMarkdownRequest,
+    ReadMarkdownResult, client_for,
 };
 
 use crate::domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};
@@ -351,6 +352,15 @@ pub struct GroundParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IndexParams {
     /// Optional corpus name; omit to index every configured corpus.
+    #[serde(default)]
+    pub corpus: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct CorpusStatsParams {
+    /// Corpus name; defaults to the wiki for the repo containing the MCP
+    /// workspace root. Required only when no default applies and multiple
+    /// corpora are configured.
     #[serde(default)]
     pub corpus: Option<String>,
 }
@@ -702,6 +712,43 @@ impl HallouminateTools {
         let response: DeleteMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
         let text = format!("deleted {} from corpus {}", response.path, response.corpus);
         let structured = to_structured(&response)?;
+        Ok(tool_ok(text, structured))
+    }
+
+    #[tool(
+        description = "Return index health statistics for one corpus: how many files are indexed, \
+                      total chunk row count, the newest index timestamp (ms since epoch, null when \
+                      the corpus has never been indexed), and how many on-disk files matching the \
+                      corpus globs have not yet been indexed. Corpus selection follows the same \
+                      default resolution as `list_files`. `structuredContent` is \
+                      { corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }."
+    )]
+    pub async fn corpus_stats(
+        &self,
+        Parameters(params): Parameters<CorpusStatsParams>,
+        peer: Peer<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (client, cwd) = self.tool_setup(&peer).await?;
+        let result: CorpusStatsResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::CorpusStats {
+                    corpus: params.corpus,
+                },
+            })
+            .await
+            .map_err(map_daemon_err)?;
+        let text = format!(
+            "corpus: {}\nindexed_files: {}\ntotal_chunks: {}\nlast_indexed_ms: {}\nunindexed_files: {}",
+            result.corpus,
+            result.indexed_files,
+            result.total_chunks,
+            result
+                .last_indexed_ms
+                .map_or("null".to_string(), |ms| ms.to_string()),
+            result.unindexed_files,
+        );
+        let structured = to_structured(&result)?;
         Ok(tool_ok(text, structured))
     }
 

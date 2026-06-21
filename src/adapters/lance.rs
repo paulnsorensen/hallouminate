@@ -93,6 +93,14 @@ pub struct SearchHit {
     pub z_score: Option<f64>,
 }
 
+/// Aggregate statistics for one corpus, returned by [`LanceStore::corpus_chunk_stats`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorpusChunkStats {
+    pub indexed_files: u64,
+    pub total_chunks: u64,
+    pub last_indexed_ms: Option<i64>,
+}
+
 /// Stable, deterministic chunk identifier derived from (file_ref, ord).
 ///
 /// Same (file_ref, ord) → same chunk_id; lets `merge_insert(chunk_id)` cleanly
@@ -597,6 +605,45 @@ impl LanceStore {
             .map(|n| n as u64)
     }
 
+    pub async fn corpus_chunk_stats(&self, corpus: &str) -> Result<CorpusChunkStats> {
+        let esc = escape_sql_str(corpus);
+        let total_chunks = self
+            .table
+            .count_rows(Some(format!("corpus = '{esc}'")))
+            .await
+            .map_err(map_lance_err)? as u64;
+        let predicate = format!("corpus = '{esc}' AND ord = 0");
+        let stream = self
+            .table
+            .query()
+            .only_if(predicate)
+            .select(lancedb::query::Select::columns(&["indexed_at_ms"]))
+            .execute()
+            .await
+            .map_err(map_lance_err)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let mut indexed_files: u64 = 0;
+        let mut last_indexed_ms: Option<i64> = None;
+        for rb in &batches {
+            indexed_files += rb.num_rows() as u64;
+            if rb.num_rows() > 0 {
+                let col = int64_col(rb, "indexed_at_ms")?;
+                for i in 0..rb.num_rows() {
+                    let v = col.value(i);
+                    last_indexed_ms = Some(match last_indexed_ms {
+                        None => v,
+                        Some(cur) => cur.max(v),
+                    });
+                }
+            }
+        }
+        Ok(CorpusChunkStats {
+            indexed_files,
+            total_chunks,
+            last_indexed_ms,
+        })
+    }
+
     /// Upsert a batch of prepared files. All files in a single call MUST
     /// belong to the same corpus — the orphan-drop predicate is scoped to
     /// that corpus, so mixing corpora here would risk deleting unrelated
@@ -990,6 +1037,61 @@ async fn open_or_create_table(connection: &lancedb::Connection) -> Result<lanced
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn corpus_chunk_stats_scoped_to_requested_corpus() {
+        // Seed a two-corpus table and verify that corpus_chunk_stats returns
+        // counts for only the requested corpus with no cross-corpus bleed.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
+            .await
+            .expect("open store");
+
+        let mut alpha_a = synthetic_prepared("/alpha/a.md", 3);
+        alpha_a.corpus = "alpha".into();
+        alpha_a.indexed_at_ms = 1000;
+        let mut alpha_b = synthetic_prepared("/alpha/b.md", 2);
+        alpha_b.corpus = "alpha".into();
+        alpha_b.indexed_at_ms = 2000;
+        let mut beta_c = synthetic_prepared("/beta/c.md", 5);
+        beta_c.corpus = "beta".into();
+        beta_c.indexed_at_ms = 500;
+
+        store
+            .apply_batch(vec![alpha_a, alpha_b])
+            .await
+            .expect("apply alpha");
+        store.apply_batch(vec![beta_c]).await.expect("apply beta");
+
+        let alpha = store
+            .corpus_chunk_stats("alpha")
+            .await
+            .expect("alpha stats");
+        assert_eq!(alpha.indexed_files, 2, "alpha: two files");
+        assert_eq!(alpha.total_chunks, 5, "alpha: 3 + 2 chunks");
+        assert_eq!(
+            alpha.last_indexed_ms,
+            Some(2000),
+            "alpha: max indexed_at_ms"
+        );
+
+        let beta = store.corpus_chunk_stats("beta").await.expect("beta stats");
+        assert_eq!(beta.indexed_files, 1, "beta: one file");
+        assert_eq!(beta.total_chunks, 5, "beta: five chunks");
+        assert_eq!(
+            beta.last_indexed_ms,
+            Some(500),
+            "beta: single indexed_at_ms"
+        );
+
+        let empty = store
+            .corpus_chunk_stats("nonexistent")
+            .await
+            .expect("empty stats");
+        assert_eq!(empty.indexed_files, 0);
+        assert_eq!(empty.total_chunks, 0);
+        assert_eq!(empty.last_indexed_ms, None);
+    }
 
     #[test]
     fn chunk_id_is_deterministic_for_same_file_ref_and_ord() {
