@@ -77,7 +77,7 @@ Catches identical re-ingestion of a whole source before any embedding work.
   in-process); keep the first 16 hex chars as the source id.
 - **Ledger:** `log.md` is the ledger (Phase 4). Scan it for the hash. If `log.md` is absent, treat
   as no ledger hit and continue (Phase 4 scaffolds it on first write). **Hit → skip the entire
-  source**, append a `skipped-duplicate-hash` row, report it. No `ground`, no read, no write.
+  source**, append a `skipped-duplicate-hash` row, report it. No `ground`, no page read/merge — the only write is the `skipped-duplicate-hash` log row.
 - Hash identity is **whole-source**, not per-claim — the cheap exact-dup guard. Per-claim dedup
   is Layers 2–3.
 
@@ -151,7 +151,7 @@ where `<row>` is one log row `<date> · <source-hash> · <action> · <target pat
 and `action ∈ {skipped-duplicate-hash, skipped-near-duplicate, merged, new-page, conflict-flagged}`.
 Log **every** decision — including Layer-1 hash skips (the row *is* the ledger Layer 1 scans) and
 **every** flagged contradiction. If `log.md` is absent, scaffold it once with
-`add_markdown { path: "log.md", content: "# Ingest Log\n\n## Log\n", overwrite: false }`, then append.
+`add_markdown { corpus, path: "log.md", content: "# Ingest Log\n\n## Log\n", overwrite: false }`, then append.
 Whole-file rewrites of `log.md` are forbidden — the only writes are `under_heading: append` splices.
 
 The daemon reindexes each written file and refreshes ancestor `index.md` link lists

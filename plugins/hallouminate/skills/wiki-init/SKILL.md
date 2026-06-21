@@ -84,7 +84,7 @@ your working notes), separating *what was said* from *how it'll be written*.
   the two ingest-ledger conventions so `wiki-ingest` reads and writes one shape:
   - **`log.md`** — an append-only ingest journal at the corpus root under a stable
     `## Log` heading. `wiki-ingest` appends one row per decision via
-    `add_markdown { under_heading: "Log", position: "append" }`; it is **never**
+    an `add_markdown` append (`corpus`, `path: "log.md"`, `under_heading: "Log"`, `position: "append"`, `content: <row>`); it is **never**
     rewritten and **never** a routing/merge target.
   - **`sha256sum` source-hash ledger** — `wiki-ingest`'s Layer-1 dedup hashes each
     normalized source (`sha256sum`, first 16 hex chars) and records the id in `log.md`;
