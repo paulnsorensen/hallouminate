@@ -42,10 +42,10 @@ use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, GroundRequest, GroundResult,
-    IndexRequest, LineRange, ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult,
-    Position, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
+    ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -100,6 +100,9 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         }
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
+        }
+        DaemonRequestPayload::CorpusStats { corpus } => {
+            handle_corpus_stats(state, &effective, &req_cwd, corpus).await
         }
         DaemonRequestPayload::Shutdown => {
             // Handled before `resolve_for_cwd` above; unreachable here.
@@ -260,6 +263,51 @@ fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonRes
     DaemonResponse::ok(&ListTreeResult {
         corpus: corpus.name,
         root,
+    })
+}
+
+async fn handle_corpus_stats(
+    state: &DaemonState,
+    cfg: &Config,
+    cwd: &Path,
+    corpus: Option<String>,
+) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let corpus_cfg =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, corpus.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
+    let store = state.store();
+    let chunk_stats = match store.corpus_chunk_stats(&corpus_cfg.name).await {
+        Ok(s) => s,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let disk_files = match list_corpus_files(&corpus_cfg) {
+        Ok(f) => f,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let indexed_map = match store.list_files(&corpus_cfg.name).await {
+        Ok(m) => m,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let indexed_paths: std::collections::HashSet<String> = indexed_map
+        .keys()
+        .map(|r| r.as_path().to_string_lossy().into_owned())
+        .collect();
+    let unindexed_files = disk_files
+        .iter()
+        .filter(|e| !indexed_paths.contains(&e.absolute_path))
+        .count() as u64;
+    DaemonResponse::ok(&CorpusStatsResult {
+        corpus: corpus_cfg.name,
+        indexed_files: chunk_stats.indexed_files,
+        total_chunks: chunk_stats.total_chunks,
+        last_indexed_ms: chunk_stats.last_indexed_ms,
+        unindexed_files,
     })
 }
 
@@ -1943,5 +1991,65 @@ mod tests {
             response.docs[&abs_str].stale,
             "file modified after index must be stale"
         );
+    }
+
+    #[tokio::test]
+    async fn corpus_stats_counts_indexed_and_unindexed_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        let ground = tmp.path().join("ground");
+
+        let repo_config = format!(
+            "[[corpus]]\nname = \"test\"\npaths = [\"{}\"]\n",
+            corpus_dir.display()
+        );
+        write_repo_layer(tmp.path(), &repo_config);
+        let state = state_with_ground(&ground, "").await;
+
+        // Write 2 files and index them.
+        std::fs::write(corpus_dir.join("a.md"), "# Doc A\n\nContent A.\n").expect("write a");
+        std::fs::write(corpus_dir.join("b.md"), "# Doc B\n\nContent B.\n").expect("write b");
+
+        let index_resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("test".to_string()),
+                    paths_from: None,
+                    strict: false,
+                }),
+            },
+        )
+        .await;
+        assert!(
+            matches!(index_resp, DaemonResponse::Ok { .. }),
+            "index must succeed: {index_resp:?}"
+        );
+
+        // Add a third file without re-indexing — this becomes the unindexed count.
+        std::fs::write(corpus_dir.join("c.md"), "# Doc C\n\nUnindexed.\n").expect("write c");
+
+        let resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::CorpusStats { corpus: None },
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { result } = resp else {
+            panic!("corpus_stats must succeed: {resp:?}");
+        };
+        let stats: CorpusStatsResult =
+            serde_json::from_value(result).expect("parse CorpusStatsResult");
+        assert_eq!(stats.indexed_files, 2, "two files were indexed");
+        assert_eq!(stats.unindexed_files, 1, "one file added without re-index");
+        assert!(
+            stats.last_indexed_ms.is_some(),
+            "indexed corpus must carry a timestamp"
+        );
+        assert_eq!(stats.corpus, "test");
     }
 }

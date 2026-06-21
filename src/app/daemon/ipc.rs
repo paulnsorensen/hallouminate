@@ -69,6 +69,9 @@ pub enum DaemonRequestPayload {
     ReadMarkdown(ReadMarkdownRequest),
     /// Unlink a markdown file from a corpus root and prune its index rows.
     DeleteMarkdown(DeleteMarkdownRequest),
+    /// Read-only index health summary for a corpus: file counts, chunk count,
+    /// newest index timestamp, and unindexed-file count.
+    CorpusStats { corpus: Option<String> },
     /// Ask the daemon to shut down gracefully: cancel the accept loop, drop
     /// the flock guard, and remove the socket file. The server acks with
     /// `"stopping"` before tearing down.
@@ -244,6 +247,16 @@ pub struct DeleteMarkdownResult {
     pub path: String,
     pub absolute_path: String,
     pub file_ref: String,
+}
+
+/// `CorpusStats` payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CorpusStatsResult {
+    pub corpus: String,
+    pub indexed_files: u64,
+    pub total_chunks: u64,
+    pub last_indexed_ms: Option<i64>,
+    pub unindexed_files: u64,
 }
 
 /// `Ping` reply payload (Curd C — cross-version daemon skew). Carries the
