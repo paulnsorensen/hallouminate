@@ -41,11 +41,13 @@ These facts were read from source and constrain the design. They are the reason 
 diverges from the issue's literal prescription in one place.
 
 - **`ground` does not expose raw cosine similarity.** `DocFile` returns
-  `score: f64` — *"a per-query RELATIVE score, not a calibrated 0-1 probability"*
-  (`src/domain/ground/types.rs:47–52`) — and `z_score: Option<f64>` — std-devs above the
-  query's candidate mean, *"`None` unless the cross-encoder ran (RRF scores are
-  rank-derived and don't normalize), or for degenerate pools (n < 5, all-equal)"*
-  (`src/domain/ground/types.rs:49–54`). **There is no MCP tool that returns a 0–1 cosine
+  `score: f64` — the file-level relevance score (best of its chunk scores after
+  rollup), computed as an RRF rank-fusion value (`src/domain/ground/types.rs:47–48`)
+  — and `z_score: Option<f64>` — *"A per-query RELATIVE score, not a calibrated
+  0-1 probability"* (`src/domain/ground/types.rs:52`). `z_score` is std-devs above the
+  query's candidate mean, `None` unless the cross-encoder ran (RRF scores are
+  rank-derived and don't normalize), or for degenerate pools (n < 5, all-equal)
+  (`src/domain/ground/types.rs:49–52`). **There is no MCP tool that returns a 0–1 cosine
   between two texts.** `<certain>`
 - **Consequence for the issue's "cosine ≥ 0.95 skip / 0.80–0.95 merge".** Those literal
   thresholds are **not implementable in a skill** — the underlying signal is absent. The
@@ -87,7 +89,7 @@ Catches identical re-ingestion of a whole source before any embedding work.
 - **Hash:** `sha256sum` of the normalized bytes; keep the first 16 hex chars as the
   source id.
 - **Ledger:** `log.md` is the ledger (Gap 2). Before ingesting, scan `log.md` for the
-  hash. **Hit → skip the entire source**, append a `skipped (duplicate-hash)` log row,
+  hash. **Hit → skip the entire source**, append a `skipped-duplicate-hash` log row,
   report it. No `ground`, no read, no write.
 - Hash identity is **whole-source** (not per-claim) — it is the cheap exact-dup guard.
   Per-claim dedup is Layers 2–3.
@@ -95,8 +97,9 @@ Catches identical re-ingestion of a whole source before any embedding work.
 ### Layer 2 — Near-duplicate (numeric, primary signal `z_score`)
 
 For each atomic claim that survived Layer 1, the haiku locate step (existing Phase 2)
-runs `ground` and returns the top file's `score`, `z_score`, `heading_path`,
-`line_range`, `snippet`, plus the read-back section. The opus root decides:
+runs `ground` and returns the top `DocFile`'s `score` and `z_score` (file-level,
+`DocFile.z_score` — this drives the Layer 2 banding), plus from the top `DocChunk`
+of that file: `heading_path`, `line_range`, `snippet`, plus the read-back section. The opus root decides:
 
 | Condition | Band | Decision |
 |---|---|---|
