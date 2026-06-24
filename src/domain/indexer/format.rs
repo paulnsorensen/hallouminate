@@ -6,8 +6,9 @@
 //! threaded where the single markdown chunker used to be (`DaemonState::open`).
 //!
 //! Detection is extension-primary: the file extension picks the format, and
-//! `file-format`'s magic-byte sniff is the fallback only for extensionless or
-//! unrecognized inputs. Unsupported types and per-handler extraction failures
+//! `file-format`'s magic-byte sniff is the fallback only for extensionless
+//! inputs (a known-but-unsupported extension is decisive, never sniffed).
+//! Unsupported types and per-handler extraction failures
 //! are graceful per-file skips at the call site, never run-aborting errors.
 
 use std::io::Cursor;
@@ -20,8 +21,9 @@ use text_splitter::{ChunkConfig, ChunkSizer, TextSplitter};
 use crate::adapters::lance::{PreparedChunk, PreparedFile};
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::{
-    ClaimMark, CorpusChunker, Frontmatter, extract_claim_marks, extract_keywords, extract_summary,
-    marks_to_canonical_json, split_frontmatter, strip_claim_marks,
+    ClaimMark, CorpusChunker, Frontmatter, build_line_starts, byte_to_line, extract_claim_marks,
+    extract_keywords, extract_summary, marks_to_canonical_json, split_frontmatter,
+    strip_claim_marks,
 };
 
 use super::writer::file_ref_string;
@@ -36,7 +38,8 @@ pub enum Format {
 }
 
 /// Resolve a file's [`Format`] from its extension first, falling back to a
-/// magic-byte sniff for extensionless or unrecognized names.
+/// magic-byte sniff for extensionless names only (a known-but-unsupported
+/// extension returns `None`, never a sniff).
 ///
 /// Returns `None` for any type Phase 1 does not handle — the caller logs a
 /// warning and skips the file.
@@ -110,13 +113,13 @@ impl MarkdownHandler {
 impl FormatHandler for MarkdownHandler {
     fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
         let path = ctx.file.as_path();
-        let body = String::from_utf8(ctx.bytes.to_vec()).map_err(|e| {
+        let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
             HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
         })?;
         // Strip an optional leading frontmatter block before every text pass so
         // it never pollutes chunks, summary, or keywords. `fm_lines` is added
         // back to each chunk's line numbers so citations point at on-disk lines.
-        let (frontmatter, content, fm_lines) = split_frontmatter(&body);
+        let (frontmatter, content, fm_lines) = split_frontmatter(body);
         let chunks_raw = self.chunker.chunk_text(content);
         // Claim marks are parsed once on the (frontmatter-stripped) body; their
         // lines are body-relative, matching the chunker's body-relative chunk
@@ -213,12 +216,12 @@ impl<S: ChunkSizer> TextHandler<S> {
 impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
     fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
         let path = ctx.file.as_path();
-        let body = String::from_utf8(ctx.bytes.to_vec()).map_err(|e| {
+        let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
             HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
         })?;
-        let line_starts = build_line_starts(&body);
+        let line_starts = build_line_starts(body);
         let mut chunks: Vec<PreparedChunk> = Vec::new();
-        for (byte_off, slice) in self.splitter.chunk_indices(&body) {
+        for (byte_off, slice) in self.splitter.chunk_indices(body) {
             if slice.is_empty() {
                 continue;
             }
@@ -247,8 +250,8 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
             corpus: ctx.corpus.name.clone(),
             mtime_ms: ctx.mtime.0,
             content_hash: ctx.content_hash.clone(),
-            summary: extract_summary(&body, &fallback),
-            keywords: extract_keywords(&body),
+            summary: extract_summary(body, &fallback),
+            keywords: extract_keywords(body),
             frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
@@ -312,11 +315,12 @@ fn csv_chunks(bytes: &[u8], path: &Path) -> Result<Vec<PreparedChunk>> {
         .from_reader(bytes);
     // `headers()` borrows `&mut self`; clone so the `records()` loop can reborrow.
     let headers = rdr.headers().map_err(|e| extract_err(path, &e))?.clone();
+    let header_vec = header_strs(&headers);
     let mut chunks: Vec<PreparedChunk> = Vec::new();
     for (row_idx, record) in rdr.records().enumerate() {
         let record = record.map_err(|e| extract_err(path, &e))?;
         let cells: Vec<String> = record.iter().map(|s| s.to_string()).collect();
-        let text = row_text(&header_strs(&headers), &cells);
+        let text = row_text(&header_vec, &cells);
         if text.is_empty() {
             continue;
         }
@@ -329,7 +333,7 @@ fn csv_chunks(bytes: &[u8], path: &Path) -> Result<Vec<PreparedChunk>> {
 /// first row of each sheet is the header; each later row becomes one `col: val`
 /// chunk under breadcrumb `{sheet}:row-N`.
 fn workbook_chunks(bytes: &[u8], path: &Path) -> Result<Vec<PreparedChunk>> {
-    let cursor = Cursor::new(bytes.to_vec());
+    let cursor = Cursor::new(bytes);
     let mut workbook = open_workbook_auto_from_rs(cursor).map_err(|e| extract_err(path, &e))?;
     let sheet_names = workbook.sheet_names().to_vec();
     let mut chunks: Vec<PreparedChunk> = Vec::new();
@@ -404,8 +408,9 @@ fn extract_err(path: &Path, e: &dyn std::fmt::Display) -> HallouminateError {
 
 // ── Registry ──────────────────────────────────────────────────────────────
 
-/// Holds one [`FormatHandler`] per [`Format`]. Built once (in
-/// `DaemonState::open`) and threaded through the indexer where the single
+/// Holds one [`FormatHandler`] per [`Format`]. Constructed fresh per indexing
+/// operation via the daemon's `make_registry` (cheap: a cloned tokenizer and
+/// thin handler wrappers), then threaded through the indexer where the single
 /// markdown chunker used to be. Handlers are boxed behind `dyn FormatHandler`
 /// so the registry is not generic over the sizer (which would ripple `<S>` into
 /// every indexer signature).
@@ -441,28 +446,5 @@ impl HandlerRegistry {
             Format::PlainText => self.text.as_ref(),
             Format::Spreadsheet => self.spreadsheet.as_ref(),
         }
-    }
-}
-
-// ── Line tracking (shared with the markdown chunker's logic) ───────────────
-
-fn build_line_starts(text: &str) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(64);
-    starts.push(0);
-    for (i, b) in text.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    if !text.ends_with('\n') {
-        starts.push(text.len());
-    }
-    starts
-}
-
-fn byte_to_line(byte: usize, line_starts: &[usize]) -> usize {
-    match line_starts.binary_search(&byte) {
-        Ok(idx) => idx + 1,
-        Err(idx) => idx,
     }
 }
