@@ -1,11 +1,10 @@
 use std::fs;
 
-use crate::adapters::lance::{PreparedChunk, PreparedFile};
+use crate::adapters::lance::PreparedFile;
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
-use crate::domain::corpus::{
-    ClaimMark, CorpusChunker, Frontmatter, blake3_bytes, extract_claim_marks, extract_keywords,
-    extract_summary, marks_to_canonical_json, split_frontmatter, strip_claim_marks,
-};
+use crate::domain::corpus::blake3_bytes;
+
+use super::format::{HandlerRegistry, PrepareCtx, detect_format};
 
 pub(super) struct WriteRequest<'a> {
     pub corpus: &'a CorpusConfig,
@@ -13,91 +12,58 @@ pub(super) struct WriteRequest<'a> {
     pub mtime: Mtime,
 }
 
+/// Dispatch one file to its format handler.
+///
+/// Reads the file once (a real IO failure here is a hard error — the caller
+/// must not silently drop a file from the index), hashes the full bytes so any
+/// edit re-indexes, then detects the [`Format`](super::format::Format) and runs
+/// the matching handler.
+///
+/// Returns `Ok(None)` — a graceful per-file skip, logged here — when the type
+/// is unsupported or the handler fails to extract content. One bad file never
+/// aborts the run. `Ok(Some(_))` is a prepared file ready to embed and store.
 pub(super) fn prepare_file(
     req: WriteRequest<'_>,
-    chunker: &dyn CorpusChunker,
+    registry: &HandlerRegistry,
     indexed_at_ms: i64,
-) -> Result<PreparedFile> {
+) -> Result<Option<PreparedFile>> {
     let path = req.file.as_path();
     let bytes = fs::read(path)?;
     // Hash the full file (frontmatter included) so any edit to the block still
     // changes the content hash and triggers a re-index.
-    let hash = blake3_bytes(&bytes);
-    let body = String::from_utf8(bytes).map_err(|e| {
-        HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
-    })?;
-    // Strip an optional leading frontmatter block before every text pass so it
-    // never pollutes chunks, summary, or keywords. `fm_lines` is added back to
-    // each chunk's line numbers so citations point at the real on-disk lines.
-    let (frontmatter, content, fm_lines) = split_frontmatter(&body);
-    let chunks_raw = chunker.chunk_text(content);
-    // Claim marks are parsed once on the (frontmatter-stripped) body; their lines
-    // are body-relative, matching the chunker's body-relative chunk line ranges.
-    // Each mark is bucketed into exactly one chunk below.
-    let marks = extract_claim_marks(content);
-    // Assign each mark to exactly ONE chunk. The naive inclusive range test
-    // (`line_start <= m.line <= line_end`) double-buckets when a single
-    // over-budget line is split across chunks: every sub-chunk then carries
-    // `line_start == line_end == N`, so a mark on line N matches all of them and
-    // surfaces N times in `ground`. Pick the LAST matching chunk — a mark's
-    // `<!--claim:...-->` text sits at the end of its line, so it belongs to the
-    // final sub-chunk of a split line. For an unsplit line exactly one chunk
-    // matches, so this is identical to the old behaviour there.
-    let mark_chunk_idx: Vec<Option<usize>> = marks
-        .iter()
-        .map(|m| {
-            chunks_raw
-                .iter()
-                .rposition(|c| m.line >= c.line_start && m.line <= c.line_end)
-        })
-        .collect();
-    let fallback = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let summary = extract_summary(content, &fallback);
-    let keywords = extract_keywords(content);
-    let file_ref_str = file_ref_string(req.file)?;
-    let mut chunks: Vec<PreparedChunk> = Vec::with_capacity(chunks_raw.len());
-    for c in chunks_raw {
-        // Take only the marks assigned to this chunk (each mark lands in exactly
-        // one chunk via `mark_chunk_idx`), then shift their lines by `fm_lines`
-        // for the on-disk citation (same offset the chunk's line numbers get
-        // below).
-        let chunk_marks: Vec<ClaimMark> = marks
-            .iter()
-            .enumerate()
-            .filter(|(mi, _)| mark_chunk_idx[*mi] == Some(c.ord))
-            .map(|(_, m)| ClaimMark {
-                line: m.line + fm_lines,
-                ..m.clone()
-            })
-            .collect();
-        chunks.push(PreparedChunk {
-            ord: c.ord,
-            heading_path: c.heading_path,
-            line_start: c.line_start + fm_lines,
-            line_end: c.line_end + fm_lines,
-            // Strip claim comments from the retrieval text. This single edit
-            // cleans both the embedding input and the stored snippet (they share
-            // `PreparedChunk.text`); strip preserves line count so the chunk's
-            // line numbers and the per-chunk mark filter above stay aligned.
-            text: strip_claim_marks(&c.text),
-            claim_marks: marks_to_canonical_json(&chunk_marks),
-        });
-    }
-    Ok(PreparedFile {
-        file_ref: file_ref_str,
-        corpus: req.corpus.name.clone(),
-        mtime_ms: req.mtime.0,
-        content_hash: hash,
-        summary,
-        keywords,
-        frontmatter: frontmatter.as_ref().map(Frontmatter::to_canonical_json),
+    let content_hash = blake3_bytes(&bytes);
+
+    let Some(format) = detect_format(path, &bytes) else {
+        tracing::warn!(
+            target: "hallouminate::indexer",
+            file = %path.display(),
+            "skipping file: unsupported format (no handler for its type)"
+        );
+        return Ok(None);
+    };
+
+    let ctx = PrepareCtx {
+        corpus: req.corpus,
+        file: req.file,
+        mtime: req.mtime,
+        bytes: &bytes,
+        content_hash,
         indexed_at_ms,
-        chunks,
-        embeddings: None,
-    })
+    };
+    match registry.handler(format).prepare(&ctx) {
+        Ok(pf) => Ok(Some(pf)),
+        Err(e) => {
+            // Extraction failure (corrupt workbook, non-UTF8 text, …) is a
+            // per-file skip, not a run abort: log and continue the reindex.
+            tracing::warn!(
+                target: "hallouminate::indexer",
+                file = %path.display(),
+                error = %e,
+                "skipping file: extraction failed"
+            );
+            Ok(None)
+        }
+    }
 }
 
 pub(super) fn file_ref_string(file: &FileRef) -> Result<String> {
@@ -115,12 +81,13 @@ pub(super) fn file_ref_string(file: &FileRef) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use text_splitter::Characters;
 
     use super::*;
-    use crate::domain::corpus::MarkdownChunker;
+    use crate::adapters::lance::PreparedFile;
+    use crate::domain::indexer::HandlerRegistry;
 
     fn corpus() -> CorpusConfig {
         CorpusConfig {
@@ -129,23 +96,33 @@ mod tests {
         }
     }
 
+    fn registry(budget: usize) -> HandlerRegistry {
+        HandlerRegistry::new(Characters, budget)
+    }
+
+    /// Run the markdown path the way the indexer does, asserting the file was
+    /// prepared (not skipped). Returns the [`PreparedFile`].
+    fn prep(path: &Path, registry: &HandlerRegistry, mtime: i64, indexed_at: i64) -> PreparedFile {
+        let file = FileRef::new(PathBuf::from(path));
+        prepare_file(
+            WriteRequest {
+                corpus: &corpus(),
+                file: &file,
+                mtime: Mtime(mtime),
+            },
+            registry,
+            indexed_at,
+        )
+        .expect("prepare_file must not hard-error")
+        .expect("file must be prepared, not skipped")
+    }
+
     #[test]
     fn prepare_file_reads_chunks_summary_keywords_from_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("hello.md");
         fs::write(&path, "# Hello\n\nspice melange harvested on Arrakis\n").unwrap();
-        let chunker = MarkdownChunker::new(Characters, 2000);
-        let file = FileRef::new(PathBuf::from(&path));
-        let pf = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &file,
-                mtime: Mtime(42),
-            },
-            &chunker,
-            1234,
-        )
-        .expect("prepare_file");
+        let pf = prep(&path, &registry(2000), 42, 1234);
         assert_eq!(pf.corpus, "docs");
         assert_eq!(pf.mtime_ms, 42);
         assert_eq!(pf.indexed_at_ms, 1234);
@@ -165,56 +142,40 @@ mod tests {
     }
 
     #[test]
-    fn prepare_file_errors_on_non_utf8_file() {
+    fn prepare_file_skips_non_utf8_markdown_with_no_hard_error() {
+        // A non-UTF8 `.md` file routes to the markdown handler, which fails to
+        // decode. Under per-file-skip semantics that is a graceful `Ok(None)`
+        // (logged), NOT a run-aborting error — one bad file must not crash the
+        // reindex of the rest of the corpus.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("binary.md");
         fs::write(&path, &[0xff_u8, 0xfe, 0x00, 0x80][..]).unwrap();
-        let chunker = MarkdownChunker::new(Characters, 2000);
         let file = FileRef::new(PathBuf::from(&path));
-        let err = prepare_file(
+        let out = prepare_file(
             WriteRequest {
                 corpus: &corpus(),
                 file: &file,
                 mtime: Mtime(0),
             },
-            &chunker,
+            &registry(2000),
             0,
         )
-        .expect_err("must reject non-utf8");
-        let msg = err.to_string();
-        assert!(msg.contains("non-utf8"), "{msg}");
+        .expect("non-utf8 must be a skip, not a hard error");
+        assert!(out.is_none(), "non-utf8 file must be skipped (Ok(None))");
     }
 
     #[test]
     fn prepare_file_extracts_content_hash_that_changes_with_content() {
         let dir = tempfile::tempdir().unwrap();
-        let chunker = MarkdownChunker::new(Characters, 2000);
+        let reg = registry(2000);
 
         let p1 = dir.path().join("v1.md");
         fs::write(&p1, "first content").unwrap();
-        let pf1 = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &FileRef::new(PathBuf::from(&p1)),
-                mtime: Mtime(1),
-            },
-            &chunker,
-            0,
-        )
-        .unwrap();
+        let pf1 = prep(&p1, &reg, 1, 0);
 
         let p2 = dir.path().join("v2.md");
         fs::write(&p2, "second content").unwrap();
-        let pf2 = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &FileRef::new(PathBuf::from(&p2)),
-                mtime: Mtime(1),
-            },
-            &chunker,
-            0,
-        )
-        .unwrap();
+        let pf2 = prep(&p2, &reg, 1, 0);
 
         assert_ne!(pf1.content_hash, pf2.content_hash);
     }
@@ -229,18 +190,7 @@ mod tests {
             "---\nstatus: reviewed\nowner: cheese-lord\n---\n# Heading\n\nspice melange harvested on Arrakis\n",
         )
         .unwrap();
-        let chunker = MarkdownChunker::new(Characters, 2000);
-        let file = FileRef::new(PathBuf::from(&path));
-        let pf = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &file,
-                mtime: Mtime(0),
-            },
-            &chunker,
-            0,
-        )
-        .unwrap();
+        let pf = prep(&path, &registry(2000), 0, 0);
 
         // Frontmatter text never leaks into chunk text, summary, or heading paths.
         for c in &pf.chunks {
@@ -290,34 +240,16 @@ mod tests {
         // over the stripped body instead, these would collide and a
         // frontmatter-only edit would silently leave a stale JSON column.
         let dir = tempfile::tempdir().unwrap();
-        let chunker = MarkdownChunker::new(Characters, 2000);
+        let reg = registry(2000);
 
         let body = "# Heading\n\nidentical body text\n";
         let p1 = dir.path().join("draft.md");
         fs::write(&p1, format!("---\nstatus: draft\n---\n{body}")).unwrap();
-        let pf1 = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &FileRef::new(PathBuf::from(&p1)),
-                mtime: Mtime(0),
-            },
-            &chunker,
-            0,
-        )
-        .unwrap();
+        let pf1 = prep(&p1, &reg, 0, 0);
 
         let p2 = dir.path().join("trusted.md");
         fs::write(&p2, format!("---\nstatus: trusted\n---\n{body}")).unwrap();
-        let pf2 = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &FileRef::new(PathBuf::from(&p2)),
-                mtime: Mtime(0),
-            },
-            &chunker,
-            0,
-        )
-        .unwrap();
+        let pf2 = prep(&p2, &reg, 0, 0);
 
         assert_ne!(
             pf1.content_hash, pf2.content_hash,
@@ -330,18 +262,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plain.md");
         fs::write(&path, "# Heading\n\nspice melange\n").unwrap();
-        let chunker = MarkdownChunker::new(Characters, 2000);
-        let file = FileRef::new(PathBuf::from(&path));
-        let pf = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &file,
-                mtime: Mtime(0),
-            },
-            &chunker,
-            0,
-        )
-        .unwrap();
+        let pf = prep(&path, &registry(2000), 0, 0);
         assert!(pf.frontmatter.is_none(), "no block → null column");
         // No frontmatter → zero offset; the heading stays on line 1.
         assert_eq!(pf.chunks.first().unwrap().line_start, 1);
@@ -354,18 +275,7 @@ mod tests {
         // A delimited block whose body is not a YAML mapping: fail-soft, so the
         // whole file (fence included) is indexed and no frontmatter is stored.
         fs::write(&path, "---\n: : : not valid : :\n---\n# Heading\n\nbody\n").unwrap();
-        let chunker = MarkdownChunker::new(Characters, 2000);
-        let file = FileRef::new(PathBuf::from(&path));
-        let pf = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &file,
-                mtime: Mtime(0),
-            },
-            &chunker,
-            0,
-        )
-        .expect("malformed frontmatter must not error the index run");
+        let pf = prep(&path, &registry(2000), 0, 0);
         assert!(pf.frontmatter.is_none(), "malformed → null column");
         assert!(!pf.chunks.is_empty(), "content still indexes");
     }
@@ -384,18 +294,7 @@ mod tests {
         // a claim mark at its end (so the mark anchors to line 1).
         let long_line = "word ".repeat(40);
         fs::write(&path, format!("{long_line}<!--claim:confirmed-->\n")).unwrap();
-        let chunker = MarkdownChunker::new(Characters, 8);
-        let file = FileRef::new(PathBuf::from(&path));
-        let pf = prepare_file(
-            WriteRequest {
-                corpus: &corpus(),
-                file: &file,
-                mtime: Mtime(0),
-            },
-            &chunker,
-            0,
-        )
-        .expect("prepare_file");
+        let pf = prep(&path, &registry(8), 0, 0);
 
         // The tiny budget must actually split the line into multiple chunks; the
         // mark on line 1 must then be bucketed into exactly one of them.

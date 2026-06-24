@@ -157,6 +157,8 @@ pub struct CorpusReport {
     pub files_touched: usize,
     pub files_deleted: usize,
     pub files_skipped_empty: usize,
+    #[serde(default)]
+    pub files_skipped_unreadable: usize,
     pub chunks_inserted: usize,
     pub embeddings_inserted: usize,
 }

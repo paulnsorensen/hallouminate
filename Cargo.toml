@@ -63,6 +63,17 @@ text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
 # internally, so the lock carries both — benign, since those types never cross.
 tokenizers = { version = "0.23", features = ["http"] }
 
+# Multi-format ingestion (Phase 1): plain-text uses the existing text-splitter
+# `TextSplitter`; spreadsheets use calamine (xlsx/xls/ods) + csv; file-format is
+# the magic-byte fallback when an extension is missing or ambiguous. The
+# `reader-*` features gate the discriminators we actually rely on: reader-zip
+# (OOXML xlsx + ODF ods, both ZIP containers), reader-cfb (OLE2 xls), and
+# reader-txt (plain-text detection). Without cfb/txt those formats fall through
+# to ArbitraryBinaryData and the magic-byte fallback silently fails.
+calamine = "0.34"
+csv = "1.4"
+file-format = { version = "0.29", features = ["reader-zip", "reader-cfb", "reader-txt"] }
+
 # Serialization + config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -95,6 +106,14 @@ schemars = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# Spreadsheet ingestion tests generate fixtures in-process (no committed binaries):
+# rust_xlsxwriter writes a real .xlsx calamine can read; .ods is a hand-built ZIP
+# (mimetype + content.xml + META-INF/manifest.xml — calamine requires the manifest)
+# via `zip`, pinned to the 7.x already in the tree (transitive via file-format) so
+# no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
+# is covered by a detection/routing unit test, not a generated binary fixture.
+rust_xlsxwriter = "0.95"
+zip = "7"
 
 # The profile that 'dist' will build with
 [profile.dist]

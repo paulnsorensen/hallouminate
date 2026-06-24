@@ -11,7 +11,7 @@ use hallouminate::adapters::lance::LanceStore;
 use hallouminate::domain::common::CorpusConfig;
 use hallouminate::domain::corpus::MarkdownChunker;
 use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
-use hallouminate::domain::indexer::index_corpus;
+use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
 use hallouminate::domain::search::hybrid_search;
 use text_splitter::Characters;
 
@@ -119,10 +119,10 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
         .await
         .expect("open store");
 
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
         .await
         .expect("index_corpus");
 
@@ -193,15 +193,15 @@ async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    let stats1 = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+    let stats1 = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
         .await
         .expect("first index");
     let rows1 = store.count_rows().await.unwrap();
 
-    let stats2 = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+    let stats2 = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
         .await
         .expect("second index");
     let rows2 = store.count_rows().await.unwrap();
@@ -232,17 +232,17 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+    index_corpus(&corpus, &store, Some(&mut embedder), &registry)
         .await
         .expect("first index");
     let initial = store.count_rows().await.unwrap();
 
     fs::remove_file(corpus_dir.path().join("grail.md")).expect("remove grail.md");
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
         .await
         .expect("second index after delete");
 
@@ -290,10 +290,10 @@ async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut emb = StubEmbedder;
 
-    let stats1 = index_corpus(&corpus, &store, Some(&mut emb), &chunker)
+    let stats1 = index_corpus(&corpus, &store, Some(&mut emb), &registry)
         .await
         .expect("first index");
     assert_eq!(stats1.files_upserted, 1, "only real.md upserted");
@@ -328,7 +328,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut emb = StubEmbedder;
 
     let disk = hallouminate::domain::corpus::scan(&corpus).expect("scan");
@@ -340,7 +340,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
         p,
         &store,
         Some(&mut emb),
-        &chunker,
+        &registry,
         &corpus,
         DEFAULT_BATCH_SIZE,
     )
@@ -377,10 +377,10 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, false)
         .await
         .expect("open OFF-mode store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
 
     // No embedder: OFF-mode indexing.
-    let stats = index_corpus(&corpus, &store, None, &chunker)
+    let stats = index_corpus(&corpus, &store, None, &registry)
         .await
         .expect("OFF-mode index_corpus");
     assert_eq!(
@@ -447,10 +447,10 @@ async fn index_corpus_embeds_passages_with_passage_role() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut recorder = RoleRecordingEmbedder::default();
 
-    index_corpus(&corpus, &store, Some(&mut recorder), &chunker)
+    index_corpus(&corpus, &store, Some(&mut recorder), &registry)
         .await
         .expect("index_corpus");
 
@@ -515,10 +515,10 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
         .await
         .expect("index_corpus");
     assert_eq!(stats.files_upserted, 2, "both pages indexed");
@@ -628,10 +628,10 @@ A note about epsilonmelange with an ordinary comment.<!-- ordinary note -->\n";
     // Budget large enough to keep the whole short page in one chunk so every
     // mark lands in one bucket; the assertions below collect across chunks
     // anyway, so a split would not break them.
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut embedder = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
         .await
         .expect("index_corpus");
     assert_eq!(stats.files_upserted, 1, "the claims page indexed");

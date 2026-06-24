@@ -1,8 +1,9 @@
 use crate::adapters::lance::{EMBEDDING_DIM, LanceStore, PreparedFile};
 use crate::domain::common::{CorpusConfig, HallouminateError, Result};
-use crate::domain::corpus::{CorpusChunker, blake3_file};
+use crate::domain::corpus::blake3_file;
 use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 
+use super::format::HandlerRegistry;
 use super::plan::{IndexPlan, MtimeCandidate};
 use super::writer::{WriteRequest, prepare_file};
 
@@ -16,10 +17,19 @@ pub struct ApplyStats {
     pub files_touched: usize,
     /// Files removed from the index because they vanished from disk.
     pub files_deleted: usize,
-    /// Files that produced zero chunks (typically empty markdown). They are
-    /// not represented in the chunks table and so cannot be made
-    /// idempotent; the caller may want to filter these from the corpus.
+    /// Files that produced zero chunks (typically truncate-to-empty markdown).
+    /// They are not represented in the chunks table and so cannot be made
+    /// idempotent; the caller may want to filter these from the corpus. The
+    /// single-file path treats this as the only eviction trigger (see
+    /// [`index_single_file`](../../app/daemon/dispatch.rs)).
     pub files_skipped_empty: usize,
+    /// Files gracefully skipped because their type is unsupported or extraction
+    /// failed (corrupt workbook, non-UTF-8 text, …). Distinct from
+    /// `files_skipped_empty`: a present-but-unreadable file must NOT evict its
+    /// last-good rows, so the single-file path keys eviction on
+    /// `files_skipped_empty` alone and never on this counter — matching bulk
+    /// `index_corpus`, which retains rows for any still-on-disk file.
+    pub files_skipped_unreadable: usize,
     /// Total chunks written across all upserted files (both embedding modes).
     pub chunks_inserted: usize,
     /// Total embedding vectors written; zero when the embedder is `None`.
@@ -34,7 +44,7 @@ pub async fn apply(
     plan: IndexPlan,
     store: &LanceStore,
     mut embedder: Option<&mut dyn EmbedBatch>,
-    chunker: &dyn CorpusChunker,
+    registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     batch_size: usize,
 ) -> Result<ApplyStats> {
@@ -58,7 +68,7 @@ pub async fn apply(
         batch_size,
         store,
         embedder.as_deref_mut(),
-        chunker,
+        registry,
         indexed_at_ms,
         &mut stats,
     )
@@ -91,7 +101,7 @@ pub async fn apply(
         batch_size,
         store,
         embedder,
-        chunker,
+        registry,
         indexed_at_ms,
         &mut stats,
     )
@@ -120,7 +130,7 @@ async fn run_in_batches(
     // `as_deref_mut()` without the first borrow being pinned for the whole
     // function body.
     mut embedder: Option<&mut (dyn EmbedBatch + '_)>,
-    chunker: &dyn CorpusChunker,
+    registry: &HandlerRegistry,
     indexed_at_ms: i64,
     stats: &mut ApplyStats,
 ) -> Result<()> {
@@ -130,17 +140,27 @@ async fn run_in_batches(
     for chunk_of_reqs in reqs.chunks(batch_size) {
         let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
         for req in chunk_of_reqs {
-            // prepare_file failures (IO, non-UTF8) are real errors — fail
-            // fast rather than silently dropping files from the index.
+            // A real IO failure (file read) is a hard error — fail fast rather
+            // than silently dropping a file. An unsupported type or a handler
+            // extraction failure returns `Ok(None)`: prepare_file already logged
+            // the skip, so just account it and move on.
             let pf = prepare_file(
                 WriteRequest {
                     corpus: req.corpus,
                     file: req.file,
                     mtime: req.mtime,
                 },
-                chunker,
+                registry,
                 indexed_at_ms,
             )?;
+            let Some(pf) = pf else {
+                // Unsupported type or extraction failure — already logged by
+                // prepare_file. Counted distinctly from truncate-to-empty so a
+                // present-but-unreadable file does not evict its last-good rows
+                // on the single-file path.
+                stats.files_skipped_unreadable += 1;
+                continue;
+            };
             if pf.chunks.is_empty() {
                 // Empty file → no rows would land in the chunks table, which
                 // makes list_files unable to track this file and the next
