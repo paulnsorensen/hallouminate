@@ -22,6 +22,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -35,6 +37,17 @@ use crate::domain::indexer::index::index_corpus;
 use crate::domain::search::{FastembedCrossencoder, canonical_crossencoder_model};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
+
+fn unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn is_idle(last_use_secs: u64, now_secs: u64, idle_secs: u64) -> bool {
+    now_secs.saturating_sub(last_use_secs) >= idle_secs
+}
 
 /// Map of corpus name → per-corpus async mutex. Each corpus gets its own
 /// `Mutex<()>` so unrelated corpora never collide *at the per-corpus lock
@@ -98,6 +111,7 @@ struct DaemonStateInner {
     /// shared one. Empty until the first `ground` request that resolves a
     /// configured model; the baseline model (if any) is pre-warmed at boot.
     crossencoders: Arc<Mutex<HashMap<String, FastembedCrossencoder>>>,
+    last_embed_use_secs: Arc<AtomicU64>,
     tokenizer: tokenizers::Tokenizer,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
@@ -279,6 +293,51 @@ impl DaemonState {
                 }
             }
         }
+        let idle_evict_secs = cfg.embeddings.idle_evict_secs;
+        let shutdown = CancellationToken::new();
+        let embedder_arc = Arc::new(Mutex::new(embedder));
+        let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
+        let last_embed_use = Arc::new(AtomicU64::new(unix_secs()));
+
+        if idle_evict_secs > 0 {
+            let embedder_ref = Arc::clone(&embedder_arc);
+            let crossencoders_ref = Arc::clone(&crossencoders_arc);
+            let last_use_ref = Arc::clone(&last_embed_use);
+            let cancel = shutdown.clone();
+            tracing::debug!(
+                target: "hallouminate::daemon",
+                idle_evict_secs,
+                "idle evict task spawned",
+            );
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(idle_evict_secs)) => {
+                            if is_idle(last_use_ref.load(Ordering::Relaxed), unix_secs(), idle_evict_secs) {
+                                let mut emb = embedder_ref.lock().await;
+                                let mut xenc = crossencoders_ref.lock().await;
+                                if is_idle(last_use_ref.load(Ordering::Relaxed), unix_secs(), idle_evict_secs) {
+                                    let was_live = emb.is_some();
+                                    *emb = None;
+                                    let had_xenc = !xenc.is_empty();
+                                    xenc.clear();
+                                    if was_live || had_xenc {
+                                        tracing::info!(
+                                            target: "hallouminate::daemon",
+                                            idle_secs = idle_evict_secs,
+                                            "embedder evicted after idle; ORT BFCArena memory released",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(DaemonState {
             inner: Arc::new(DaemonStateInner {
                 embeddings_enabled: cfg.embeddings.enabled,
@@ -288,10 +347,11 @@ impl DaemonState {
                 ground_dir,
                 corpus_locks: CorpusLockMap::default(),
                 write_lane: Arc::new(Semaphore::new(1)),
-                embedder: Arc::new(Mutex::new(embedder)),
-                crossencoders: Arc::new(Mutex::new(crossencoders)),
+                embedder: embedder_arc,
+                crossencoders: crossencoders_arc,
+                last_embed_use_secs: last_embed_use,
                 tokenizer,
-                shutdown: CancellationToken::new(),
+                shutdown,
             }),
         })
     }
@@ -365,7 +425,13 @@ impl DaemonState {
             })?;
             *guard = Some(embedder);
         }
-        Ok(EmbedderGuard { guard })
+        self.inner
+            .last_embed_use_secs
+            .store(unix_secs(), Ordering::Relaxed);
+        Ok(EmbedderGuard {
+            guard,
+            last_use_secs: Arc::clone(&self.inner.last_embed_use_secs),
+        })
     }
 
     /// Borrow the crossencoder for the model named by the per-request
@@ -393,10 +459,59 @@ impl DaemonState {
                 .map_err(|e| anyhow::anyhow!("init crossencoder ({canonical}): {e}"))?;
             guard.insert(canonical.to_string(), model);
         }
+        self.inner
+            .last_embed_use_secs
+            .store(unix_secs(), Ordering::Relaxed);
         Ok(Some(CrossencoderGuard {
             guard,
             key: canonical.to_string(),
+            last_use_secs: Arc::clone(&self.inner.last_embed_use_secs),
         }))
+    }
+
+    /// Evict the embedder and crossencoders if idle for at least `idle_secs`
+    /// seconds (comparing `now_secs` to the last-recorded embed use). Returns
+    /// `true` when eviction conditions are met (whether or not anything was
+    /// live), `false` when `idle_secs == 0` (disabled) or the last use is too
+    /// recent. Exposed `pub(crate)` so tests can inject a synthetic `now_secs`
+    /// without sleeping.
+    #[cfg(test)]
+    pub(crate) async fn evict_if_idle_at(&self, idle_secs: u64, now_secs: u64) -> bool {
+        if idle_secs == 0 {
+            return false;
+        }
+        let last = self.inner.last_embed_use_secs.load(Ordering::Relaxed);
+        if !is_idle(last, now_secs, idle_secs) {
+            return false;
+        }
+        let mut emb = self.inner.embedder.lock().await;
+        let mut xenc = self.inner.crossencoders.lock().await;
+        if !is_idle(
+            self.inner.last_embed_use_secs.load(Ordering::Relaxed),
+            now_secs,
+            idle_secs,
+        ) {
+            return false;
+        }
+        let was_live = emb.is_some();
+        *emb = None;
+        let had_xenc = !xenc.is_empty();
+        xenc.clear();
+        if was_live || had_xenc {
+            tracing::info!(
+                target: "hallouminate::daemon",
+                idle_secs,
+                "embedder evicted after idle; ORT BFCArena memory released",
+            );
+        }
+        true
+    }
+
+    /// Unix-second timestamp of the most recent `embedder()` or
+    /// `crossencoder()` call. Exposed `pub(crate)` for tests.
+    #[cfg(test)]
+    pub(crate) fn last_embed_use_secs(&self) -> u64 {
+        self.inner.last_embed_use_secs.load(Ordering::Relaxed)
     }
 
     /// A freshly-constructed `MarkdownChunker` over the daemon's loaded
@@ -472,6 +587,7 @@ async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Resu
 /// (Result instead of infallible) differs.
 pub struct EmbedderGuard<'a> {
     guard: MutexGuard<'a, Option<Embedder>>,
+    last_use_secs: Arc<AtomicU64>,
 }
 
 impl std::ops::Deref for EmbedderGuard<'_> {
@@ -490,6 +606,12 @@ impl std::ops::DerefMut for EmbedderGuard<'_> {
     }
 }
 
+impl Drop for EmbedderGuard<'_> {
+    fn drop(&mut self) {
+        self.last_use_secs.store(unix_secs(), Ordering::Relaxed);
+    }
+}
+
 /// Owned guard around the lazily-loaded crossencoder, mirroring
 /// `EmbedderGuard`. Derefs to `FastembedCrossencoder` so callers can
 /// pass `&mut *guard` directly into anything that wants
@@ -499,6 +621,7 @@ pub struct CrossencoderGuard<'a> {
     /// Canonical model name; the key into `guard` that `crossencoder()`
     /// inserted before handing the guard out.
     key: String,
+    last_use_secs: Arc<AtomicU64>,
 }
 
 impl std::ops::Deref for CrossencoderGuard<'_> {
@@ -513,6 +636,12 @@ impl std::ops::Deref for CrossencoderGuard<'_> {
 impl std::ops::DerefMut for CrossencoderGuard<'_> {
     fn deref_mut(&mut self) -> &mut FastembedCrossencoder {
         self.guard.get_mut(&self.key).expect("crossencoder loaded")
+    }
+}
+
+impl Drop for CrossencoderGuard<'_> {
+    fn drop(&mut self) {
+        self.last_use_secs.store(unix_secs(), Ordering::Relaxed);
     }
 }
 
@@ -545,5 +674,141 @@ mod tests {
             .expect("open daemon state");
 
         assert_eq!(state.baseline().embeddings.model, expected_model);
+    }
+
+    #[tokio::test]
+    async fn evict_if_idle_at_returns_false_when_disabled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        assert!(
+            !state.evict_if_idle_at(0, u64::MAX).await,
+            "idle_secs=0 means disabled; must not evict",
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_if_idle_at_returns_false_when_recently_used() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let last = state.last_embed_use_secs();
+        // now_secs is only 1 s ahead — not enough for a 300 s idle threshold.
+        assert!(
+            !state.evict_if_idle_at(300, last + 1).await,
+            "1 s elapsed < 300 s idle; must not evict",
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_if_idle_at_returns_true_when_idle_threshold_exceeded() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let last = state.last_embed_use_secs();
+        // now_secs is 301 s ahead — exceeds the 300 s idle threshold.
+        assert!(
+            state.evict_if_idle_at(300, last + 301).await,
+            "301 s elapsed >= 300 s idle; must evict",
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_if_idle_at_exact_boundary_evicts() {
+        // The condition is `elapsed >= idle_secs` (inclusive). Verifies `>`
+        // was not accidentally used instead.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let last = state.last_embed_use_secs();
+        assert!(
+            state.evict_if_idle_at(300, last + 300).await,
+            "elapsed == idle_secs (>= threshold); must evict",
+        );
+    }
+
+    #[tokio::test]
+    async fn evict_if_idle_at_one_second_below_threshold_does_not_evict() {
+        // Symmetric boundary: elapsed = idle_secs - 1 is strictly less.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let last = state.last_embed_use_secs();
+        assert!(
+            !state.evict_if_idle_at(300, last + 299).await,
+            "elapsed = idle_secs - 1 (< threshold); must not evict",
+        );
+    }
+    #[tokio::test]
+    async fn evict_if_idle_at_rechecks_after_waiting_for_embedder_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        state.inner.last_embed_use_secs.store(1, Ordering::Relaxed);
+
+        let held = state.inner.embedder.lock().await;
+        let task_state = state.clone();
+        let eviction = tokio::spawn(async move { task_state.evict_if_idle_at(300, 1000).await });
+        state
+            .inner
+            .last_embed_use_secs
+            .store(999, Ordering::Relaxed);
+        drop(held);
+
+        assert!(
+            !eviction.await.expect("eviction task joins"),
+            "eviction must re-check idleness after waiting for an active guard",
+        );
+    }
+
+    #[tokio::test]
+    async fn embedder_guard_updates_last_use_on_drop() {
+        let last_use_secs = Arc::new(AtomicU64::new(1));
+        let guard = Mutex::new(None);
+        let guard = guard.lock().await;
+        let before_drop = unix_secs();
+
+        drop(EmbedderGuard {
+            guard,
+            last_use_secs: Arc::clone(&last_use_secs),
+        });
+
+        let observed = last_use_secs.load(Ordering::Relaxed);
+        assert!(
+            observed >= before_drop,
+            "drop should stamp embedder use at or after guard lifetime start: observed {observed}, before {before_drop}",
+        );
+    }
+
+    #[tokio::test]
+    async fn crossencoder_guard_updates_last_use_on_drop() {
+        let last_use_secs = Arc::new(AtomicU64::new(1));
+        let guard = Mutex::new(HashMap::new());
+        let guard = guard.lock().await;
+        let before_drop = unix_secs();
+
+        drop(CrossencoderGuard {
+            guard,
+            key: String::new(),
+            last_use_secs: Arc::clone(&last_use_secs),
+        });
+
+        let observed = last_use_secs.load(Ordering::Relaxed);
+        assert!(
+            observed >= before_drop,
+            "drop should stamp crossencoder use at or after guard lifetime start: observed {observed}, before {before_drop}",
+        );
     }
 }
