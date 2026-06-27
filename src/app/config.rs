@@ -937,8 +937,8 @@ ground_dir = "~/.local/share/hallouminate/ground"
 
     #[test]
     fn parse_idle_evict_secs_can_be_disabled_with_zero() {
-        let cfg = parse("[embeddings]\nidle_evict_secs = 0\n", None)
-            .expect("idle_evict_secs = 0 parses");
+        let cfg =
+            parse("[embeddings]\nidle_evict_secs = 0\n", None).expect("idle_evict_secs = 0 parses");
         assert_eq!(cfg.embeddings.idle_evict_secs, 0);
     }
 

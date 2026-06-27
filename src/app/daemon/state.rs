@@ -424,7 +424,9 @@ impl DaemonState {
             })?;
             *guard = Some(embedder);
         }
-        self.inner.last_embed_use_secs.store(unix_secs(), Ordering::Relaxed);
+        self.inner
+            .last_embed_use_secs
+            .store(unix_secs(), Ordering::Relaxed);
         Ok(EmbedderGuard { guard })
     }
 
@@ -453,7 +455,9 @@ impl DaemonState {
                 .map_err(|e| anyhow::anyhow!("init crossencoder ({canonical}): {e}"))?;
             guard.insert(canonical.to_string(), model);
         }
-        self.inner.last_embed_use_secs.store(unix_secs(), Ordering::Relaxed);
+        self.inner
+            .last_embed_use_secs
+            .store(unix_secs(), Ordering::Relaxed);
         Ok(Some(CrossencoderGuard {
             guard,
             key: canonical.to_string(),
