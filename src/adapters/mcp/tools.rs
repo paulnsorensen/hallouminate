@@ -12,7 +12,7 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo};
-use rmcp::{ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -282,6 +282,34 @@ fn map_daemon_err(err: anyhow::Error) -> ErrorData {
     internal_error(format!("{err:#}"))
 }
 
+/// Resolve the effective cwd for a daemon request.
+///
+/// When the client advertised `roots` capability, sends `roots/list` and uses
+/// the first `file://` root path as cwd. Falls back to the process-startup cwd
+/// when the client has no roots capability or returns an empty list.
+async fn cwd_from_peer(peer: &Peer<RoleServer>, fallback: &Path) -> PathBuf {
+    let has_roots = peer
+        .peer_info()
+        .and_then(|info| info.capabilities.roots.as_ref())
+        .is_some();
+
+    if !has_roots {
+        return fallback.to_path_buf();
+    }
+
+    if let Ok(result) = peer.list_roots().await {
+        if let Some(root) = result.roots.first() {
+            if let Some(path_str) = root.uri.strip_prefix("file://") {
+                if !path_str.is_empty() {
+                    return PathBuf::from(path_str);
+                }
+            }
+        }
+    }
+
+    fallback.to_path_buf()
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GroundParams {
     /// Free-text query to embed and search against the index.
@@ -462,9 +490,12 @@ impl HallouminateTools {
 
     /// Shared per-call preamble: dial the daemon and resolve the effective cwd.
     /// Every tool method opens with this before building its `DaemonRequest`.
-    async fn tool_setup(&self) -> Result<(DaemonClient, PathBuf), ErrorData> {
+    async fn tool_setup(
+        &self,
+        peer: &Peer<RoleServer>,
+    ) -> Result<(DaemonClient, PathBuf), ErrorData> {
         let client = daemon_for_tool().await?;
-        let cwd = self.cwd.clone();
+        let cwd = cwd_from_peer(peer, &self.cwd).await;
         Ok((client, cwd))
     }
 
@@ -473,9 +504,10 @@ impl HallouminateTools {
     )]
     pub async fn ground(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<GroundParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::Ground(GroundRequest {
@@ -505,9 +537,10 @@ impl HallouminateTools {
     )]
     pub async fn index(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::Index(IndexRequest {
@@ -538,9 +571,10 @@ impl HallouminateTools {
     )]
     pub async fn list_tree(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ListTreeParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ListTree(ListTreeRequest {
@@ -559,9 +593,10 @@ impl HallouminateTools {
     )]
     pub async fn list_files(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
@@ -585,9 +620,10 @@ impl HallouminateTools {
     )]
     pub async fn add_markdown(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<AddMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
@@ -621,9 +657,10 @@ impl HallouminateTools {
     )]
     pub async fn read_markdown(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ReadMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
@@ -647,9 +684,10 @@ impl HallouminateTools {
     )]
     pub async fn delete_markdown(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<DeleteMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
@@ -673,9 +711,10 @@ impl HallouminateTools {
     )]
     pub async fn corpus_stats(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<CorpusStatsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let result: CorpusStatsResult = client
             .call(DaemonRequest {
                 cwd,
@@ -704,9 +743,10 @@ impl HallouminateTools {
     )]
     pub async fn list_corpora(
         &self,
+        peer: Peer<RoleServer>,
         _params: Parameters<ListCorporaParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let entries: ListCorporaResult = client
             .call(DaemonRequest {
                 cwd,
@@ -729,9 +769,10 @@ impl HallouminateTools {
     )]
     pub async fn get_footnote(
         &self,
+        peer: Peer<RoleServer>,
         Parameters(params): Parameters<GetFootnoteParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup().await?;
+        let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
