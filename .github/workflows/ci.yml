@@ -51,6 +51,18 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust toolchain
         run: rustup show
+      - name: Expose Xcode compiler runtime
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          clang_bin="$(xcrun --toolchain XcodeDefault --find clang)"
+          clang_usr="$(dirname "$(dirname "$clang_bin")")"
+          runtime_dir="$(find "$clang_usr/lib/clang" -type d -path '*/lib/darwin' | sort | tail -n 1)"
+          if [ -z "$runtime_dir" ]; then
+            echo "::error::could not find Xcode compiler runtime under $clang_usr/lib/clang"
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$runtime_dir${LIBRARY_PATH:+:$LIBRARY_PATH}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Cache Hugging Face tokenizer downloads
         # DaemonState::open hard-loads the HF tokenizer (chunking needs it
