@@ -20,7 +20,7 @@ The entries are written for an LLM working in the repo — they carry
 `file:line` and commit citations these human-facing docs summarize:
 
 - **architecture** — the sliced-bread layout and dependency direction.
-- **mcp-surface** — the nine MCP tools, params, and error mapping.
+- **mcp-surface** — the ten MCP tools, params, and error mapping.
 - **daemon-and-cli** — why there's a daemon, the JSON-line socket protocol,
   the CLI surface, and the lock order.
 - **corpus-walker** — gitignore-aware corpus walking and the explicit-root

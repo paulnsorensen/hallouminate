@@ -85,6 +85,21 @@ Bulk (re)build the LanceDB index for one or all corpora. Params:
 when files were touched outside hallouminate — `add_markdown`'s
 auto-reindex only covers writes that went through the MCP.
 
+### `corpus_stats`
+
+Index health for one corpus: indexed file count, total chunk rows, the newest
+index timestamp (`last_indexed_ms`, null when never indexed), and how many
+on-disk files matching the corpus globs are not yet indexed. Param: `corpus`
+(defaults to wiki-for-cwd, same resolution as `list_files`). `structuredContent`
+is `{ corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }`.
+
+### `get_footnote`
+
+Resolve a single citation: the footnote target for a page's `#footnote_number`.
+Params: `corpus` (defaults to wiki-for-cwd, same as `ground`), `page` (the wiki
+page's relative path), `footnote_number` (the label after `^` — `"1"` for `[^1]`,
+`"note"` for `[^note]`). Expands one footnote without reading the whole page.
+
 ## Error mapping
 
 The MCP transport maps daemon `ErrorKind` variants to JSON-RPC codes:

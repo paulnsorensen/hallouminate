@@ -24,7 +24,7 @@ races. See [Architecture](./architecture.md) for the full picture.
 - **[Installation](./install.md)** — install the binary and register the MCP
   server with your agent.
 - **[CLI reference](./cli.md)** — every subcommand and its flags.
-- **[MCP surface](./mcp.md)** — the nine tools an LLM calls to author and
+- **[MCP surface](./mcp.md)** — the ten tools an LLM calls to author and
   search wikis.
 - **[Configuration](./config.md)** — the XDG baseline, repo-layer merge, and
   embedding-model options.
