@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::app::config::discover_repo_config;
 use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, CorpusStatsResult, DaemonClient, DaemonRequest,
     DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
@@ -45,10 +44,9 @@ Two audiences use this server:
 
 Default corpus: tool calls that omit `corpus` default to the wiki for the \
 repository containing the client's MCP workspace root when the client exposes \
-roots, falling back to the MCP server process cwd. Pass `corpus` explicitly \
-to target another wiki, the repo's source corpus \
-(`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry. \
-`list_corpora` enumerates everything available.
+roots, falling back to the MCP server process cwd. Pass `corpus` explicitly to \
+target another wiki, the repo's source corpus (`repo:{name}:corpus`), or a \
+user-declared `[[corpus]]` entry; `list_corpora` enumerates everything available.
 
 Tools:
 - `list_corpora` — every configured corpus name.
@@ -271,42 +269,6 @@ async fn daemon_for_tool() -> Result<DaemonClient, ErrorData> {
         .map_err(|e| internal_error(format!("{e:#}")))
 }
 
-const ROOTS_LIST_TIMEOUT: Duration = Duration::from_secs(2);
-
-async fn cwd_for_tool(fallback: &Path, peer: &Peer<RoleServer>) -> PathBuf {
-    let Some(info) = peer.peer_info() else {
-        return fallback.to_path_buf();
-    };
-    if info.capabilities.roots.is_none() {
-        return fallback.to_path_buf();
-    }
-    let Ok(Ok(result)) = tokio::time::timeout(ROOTS_LIST_TIMEOUT, peer.list_roots()).await else {
-        return fallback.to_path_buf();
-    };
-    result
-        .roots
-        .iter()
-        .filter_map(|root| root_uri_to_path(&root.uri))
-        .find(|path| has_repo_config_ancestor(path))
-        .unwrap_or_else(|| fallback.to_path_buf())
-}
-
-fn has_repo_config_ancestor(path: &Path) -> bool {
-    // `Ok(None)` means the walk reached the filesystem root with no `.git`
-    // boundary — no repo config — so only `Ok(Some(_))` counts as a hit.
-    matches!(discover_repo_config(path), Ok(Some(_)))
-}
-
-fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
-    if let Ok(url) = url::Url::parse(uri)
-        && url.scheme() == "file"
-    {
-        return url.to_file_path().ok();
-    }
-    let path = PathBuf::from(uri);
-    path.is_absolute().then_some(path)
-}
-
 /// Translate a daemon RPC error into the MCP transport's `ErrorData` shape.
 /// Daemon `InvalidParams` becomes `-32602`, `Internal` becomes `-32603`, and
 /// transport / decode failures (already `anyhow::Error` by the time we get
@@ -320,6 +282,47 @@ fn map_daemon_err(err: anyhow::Error) -> ErrorData {
         };
     }
     internal_error(format!("{err:#}"))
+}
+
+const ROOTS_LIST_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Resolve the effective cwd for a daemon request.
+///
+/// When the client advertised `roots` capability, sends `roots/list` and uses
+/// the first root's path as cwd. Falls back to the process-startup cwd when the
+/// client has no roots capability, the request times out, or the first root has
+/// no usable path.
+async fn cwd_from_peer(peer: &Peer<RoleServer>, fallback: &Path) -> PathBuf {
+    let has_roots = peer
+        .peer_info()
+        .and_then(|info| info.capabilities.roots.as_ref())
+        .is_some();
+
+    if !has_roots {
+        return fallback.to_path_buf();
+    }
+
+    if let Ok(Ok(result)) = tokio::time::timeout(ROOTS_LIST_TIMEOUT, peer.list_roots()).await
+        && let Some(root) = result.roots.first()
+        && let Some(path) = root_uri_to_path(&root.uri)
+    {
+        return path;
+    }
+
+    fallback.to_path_buf()
+}
+
+/// Parse a roots-list `uri` into a filesystem path. Prefers proper `file://`
+/// URL decoding (percent-escapes, host handling); falls back to treating an
+/// absolute non-URL string as a path.
+fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
+    if let Ok(url) = url::Url::parse(uri)
+        && url.scheme() == "file"
+    {
+        return url.to_file_path().ok();
+    }
+    let path = PathBuf::from(uri);
+    path.is_absolute().then_some(path)
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -486,9 +489,10 @@ pub struct HallouminateTools {
     // macro expansion, so silence the warning here.
     #[allow(dead_code)]
     tool_router: ToolRouter<HallouminateTools>,
-    /// Fallback CWD captured once at MCP server startup. Tool calls prefer
-    /// MCP client roots when available so user-global IDE configs still
-    /// resolve against the open workspace.
+    /// Fallback CWD captured once at MCP server startup. Tool calls prefer the
+    /// client's MCP roots when advertised, so user-global IDE configs still
+    /// resolve against the open workspace; this is used only when the client
+    /// exposes no usable root.
     cwd: PathBuf,
 }
 
@@ -501,15 +505,14 @@ impl HallouminateTools {
         }
     }
 
-    /// Shared per-call preamble: dial the daemon and resolve the effective cwd
-    /// (preferring MCP client roots over the startup fallback). Every tool
-    /// method opens with this before building its `DaemonRequest`.
+    /// Shared per-call preamble: dial the daemon and resolve the effective cwd.
+    /// Every tool method opens with this before building its `DaemonRequest`.
     async fn tool_setup(
         &self,
         peer: &Peer<RoleServer>,
     ) -> Result<(DaemonClient, PathBuf), ErrorData> {
         let client = daemon_for_tool().await?;
-        let cwd = cwd_for_tool(&self.cwd, peer).await;
+        let cwd = cwd_from_peer(peer, &self.cwd).await;
         Ok((client, cwd))
     }
 
@@ -518,8 +521,8 @@ impl HallouminateTools {
     )]
     pub async fn ground(
         &self,
-        Parameters(params): Parameters<GroundParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<GroundParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -551,8 +554,8 @@ impl HallouminateTools {
     )]
     pub async fn index(
         &self,
-        Parameters(params): Parameters<IndexParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -585,8 +588,8 @@ impl HallouminateTools {
     )]
     pub async fn list_tree(
         &self,
-        Parameters(params): Parameters<ListTreeParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ListTreeParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -607,8 +610,8 @@ impl HallouminateTools {
     )]
     pub async fn list_files(
         &self,
-        Parameters(params): Parameters<ListFilesParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -634,8 +637,8 @@ impl HallouminateTools {
     )]
     pub async fn add_markdown(
         &self,
-        Parameters(params): Parameters<AddMarkdownParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<AddMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -671,8 +674,8 @@ impl HallouminateTools {
     )]
     pub async fn read_markdown(
         &self,
-        Parameters(params): Parameters<ReadMarkdownParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<ReadMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -698,8 +701,8 @@ impl HallouminateTools {
     )]
     pub async fn delete_markdown(
         &self,
-        Parameters(params): Parameters<DeleteMarkdownParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<DeleteMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -725,8 +728,8 @@ impl HallouminateTools {
     )]
     pub async fn corpus_stats(
         &self,
-        Parameters(params): Parameters<CorpusStatsParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<CorpusStatsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let result: CorpusStatsResult = client
@@ -757,8 +760,8 @@ impl HallouminateTools {
     )]
     pub async fn list_corpora(
         &self,
-        _params: Parameters<ListCorporaParams>,
         peer: Peer<RoleServer>,
+        _params: Parameters<ListCorporaParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let entries: ListCorporaResult = client
@@ -783,8 +786,8 @@ impl HallouminateTools {
     )]
     pub async fn get_footnote(
         &self,
-        Parameters(params): Parameters<GetFootnoteParams>,
         peer: Peer<RoleServer>,
+        Parameters(params): Parameters<GetFootnoteParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&peer).await?;
         let req = DaemonRequest {
@@ -917,5 +920,33 @@ mod tests {
     #[test]
     fn number_lines_empty_input_produces_empty_output() {
         assert_eq!(number_lines(""), "");
+    }
+
+    #[test]
+    fn root_uri_to_path_decodes_file_url() {
+        // A `file://` root from an MCP client must map to its absolute path,
+        // with percent-escapes decoded — otherwise a workspace path with a
+        // space resolves the wrong (or no) corpus.
+        assert_eq!(
+            root_uri_to_path("file:///Users/me/my%20repo"),
+            Some(PathBuf::from("/Users/me/my repo"))
+        );
+    }
+
+    #[test]
+    fn root_uri_to_path_accepts_bare_absolute_path() {
+        // Clients that send a bare absolute path instead of a URL still resolve.
+        assert_eq!(
+            root_uri_to_path("/Users/me/repo"),
+            Some(PathBuf::from("/Users/me/repo"))
+        );
+    }
+
+    #[test]
+    fn root_uri_to_path_rejects_non_file_and_relative() {
+        // A non-`file` scheme or a relative string is not a usable cwd, so the
+        // caller falls back to the startup cwd rather than guessing.
+        assert_eq!(root_uri_to_path("https://example.com/repo"), None);
+        assert_eq!(root_uri_to_path("relative/path"), None);
     }
 }

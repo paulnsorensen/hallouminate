@@ -139,6 +139,18 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      - name: Expose Xcode compiler runtime
+        if: ${{ startsWith(matrix.runner, 'macos-') }}
+        run: |
+          set -euo pipefail
+          clang_bin="$(xcrun --toolchain XcodeDefault --find clang)"
+          clang_usr="$(dirname "$(dirname "$clang_bin")")"
+          runtime_dir="$(find "$clang_usr/lib/clang" -type d -path '*/lib/darwin' | sort | tail -n 1)"
+          if [ -z "$runtime_dir" ]; then
+            echo "::error::could not find Xcode compiler runtime under $clang_usr/lib/clang"
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$runtime_dir${LIBRARY_PATH:+:$LIBRARY_PATH}" >> "$GITHUB_ENV"
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

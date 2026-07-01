@@ -51,13 +51,25 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust toolchain
         run: rustup show
+      - name: Expose Xcode compiler runtime
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          clang_bin="$(xcrun --toolchain XcodeDefault --find clang)"
+          clang_usr="$(dirname "$(dirname "$clang_bin")")"
+          runtime_dir="$(find "$clang_usr/lib/clang" -type d -path '*/lib/darwin' | sort | tail -n 1)"
+          if [ -z "$runtime_dir" ]; then
+            echo "::error::could not find Xcode compiler runtime under $clang_usr/lib/clang"
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$runtime_dir${LIBRARY_PATH:+:$LIBRARY_PATH}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Cache Hugging Face tokenizer downloads
         # DaemonState::open hard-loads the HF tokenizer (chunking needs it
         # regardless of embedding mode), so non-ignored tests fetch it from
         # huggingface.co on a cold cache. Persist the hub cache across runs so
         # the tokenizer is downloaded at most once per key.
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: ~/.cache/huggingface
           key: hf-hub-${{ runner.os }}-arctic-embed-s

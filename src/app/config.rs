@@ -68,6 +68,15 @@ pub struct EmbeddingsConfig {
     /// (default `~/.cache/hallouminate/fastembed`).
     #[serde(default = "default_embed_cache")]
     pub cache_dir: String,
+    /// Seconds of embed-call inactivity before the ORT session (and its
+    /// `BFCArena` memory) is dropped. The session is lazy-reloaded on the
+    /// next embed request, paying the model-load cost again (~4 s cold).
+    /// `0` disables eviction — the arena is never released while the daemon
+    /// lives. Due to sleep-then-check timing the actual eviction lag is
+    /// `[idle_evict_secs, 2×idle_evict_secs]` from the last embed call.
+    /// Default: `300` (5 minutes).
+    #[serde(default = "default_idle_evict_secs")]
+    pub idle_evict_secs: u64,
 }
 
 impl Default for EmbeddingsConfig {
@@ -77,6 +86,7 @@ impl Default for EmbeddingsConfig {
             model: DEFAULT_EMBED_MODEL.into(),
             quantized: false,
             cache_dir: DEFAULT_EMBED_CACHE.into(),
+            idle_evict_secs: default_idle_evict_secs(),
         }
     }
 }
@@ -484,6 +494,14 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        idle_evict_secs: merge_scalar(
+            "embeddings.idle_evict_secs",
+            baseline.embeddings.idle_evict_secs,
+            repo.embeddings.idle_evict_secs,
+            defaults.embeddings.idle_evict_secs,
+            baseline_path,
+            repo_path,
+        )?,
     };
     let watch = WatchConfig {
         debounce_ms: merge_scalar(
@@ -746,6 +764,9 @@ fn default_model() -> String {
 fn default_embed_cache() -> String {
     DEFAULT_EMBED_CACHE.into()
 }
+fn default_idle_evict_secs() -> u64 {
+    300
+}
 fn default_ground_dir() -> String {
     DEFAULT_GROUND_DIR.into()
 }
@@ -907,6 +928,25 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert!(cfg.enabled, "embeddings must default to enabled");
         assert!(!cfg.quantized, "quantization must default to off");
         assert_eq!(cfg.model, "snowflake/snowflake-arctic-embed-s");
+    }
+
+    #[test]
+    fn idle_evict_secs_defaults_to_300() {
+        assert_eq!(EmbeddingsConfig::default().idle_evict_secs, 300);
+    }
+
+    #[test]
+    fn parse_idle_evict_secs_can_be_disabled_with_zero() {
+        let cfg =
+            parse("[embeddings]\nidle_evict_secs = 0\n", None).expect("idle_evict_secs = 0 parses");
+        assert_eq!(cfg.embeddings.idle_evict_secs, 0);
+    }
+
+    #[test]
+    fn parse_idle_evict_secs_custom_timeout() {
+        let cfg = parse("[embeddings]\nidle_evict_secs = 600\n", None)
+            .expect("idle_evict_secs = 600 parses");
+        assert_eq!(cfg.embeddings.idle_evict_secs, 600);
     }
 
     #[test]
@@ -1758,6 +1798,16 @@ path = "/b"
         let repo = parse("", None).expect("repo default");
         let merged = merge_layers(&baseline, &repo).expect("merge");
         assert_eq!(merged.search.top_files_default, 20);
+    }
+
+    #[test]
+    fn merge_layers_idle_evict_secs_propagates_baseline_value_over_repo_default() {
+        // Regression trap: if the merge_scalar call for idle_evict_secs is
+        // removed and the field is hardcoded to its default, this fails.
+        let baseline = parse("[embeddings]\nidle_evict_secs = 600\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo default");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.embeddings.idle_evict_secs, 600);
     }
 
     #[test]
