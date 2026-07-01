@@ -148,6 +148,13 @@ async fn csv_indexes_one_self_describing_chunk_per_row() {
         vec!["csv:row-1".to_string()],
         "first data row breadcrumb"
     );
+    // line_range points at the true on-disk line: header is line 1, so the
+    // first data row is line 2.
+    assert_eq!(
+        (hit.line_start, hit.line_end),
+        (2, 2),
+        "csv line_range is the on-disk line, not the row ordinal"
+    );
 }
 
 // ── XLSX ──────────────────────────────────────────────────────────────────

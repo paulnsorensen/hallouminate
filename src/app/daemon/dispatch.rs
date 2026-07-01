@@ -2229,14 +2229,18 @@ mod tests {
         let corpus = spreadsheet_corpus_at(corpus_dir.path());
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
+
+        // 1. Index a valid CSV: rows land in the index. Compute `file_ref`
+        //    after the write so it canonicalizes the same way `index_single_file`
+        //    does (on macOS, tempdirs symlink /var → /private/var, so a
+        //    canonicalize of a not-yet-existing path would passthrough uncanonicalized
+        //    and mismatch the stored row).
+        std::fs::write(&file, "name,note\nbolt,sturdy fastener\n").unwrap();
         let file_ref = canonicalize_or_passthrough(&file)
             .as_path()
             .to_str()
             .unwrap()
             .to_string();
-
-        // 1. Index a valid CSV: rows land in the index.
-        std::fs::write(&file, "name,note\nbolt,sturdy fastener\n").unwrap();
         let s1 = index_single_file(&store, None, &registry, &corpus, &file)
             .await
             .expect("first index of a valid file must succeed");

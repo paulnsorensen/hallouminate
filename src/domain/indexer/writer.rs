@@ -4,7 +4,7 @@ use crate::adapters::lance::PreparedFile;
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::blake3_bytes;
 
-use super::format::{HandlerRegistry, PrepareCtx, detect_format};
+use super::format::{HandlerRegistry, PrepareCtx, detect_format, format_from_extension};
 
 pub(super) struct WriteRequest<'a> {
     pub corpus: &'a CorpusConfig,
@@ -14,10 +14,12 @@ pub(super) struct WriteRequest<'a> {
 
 /// Dispatch one file to its format handler.
 ///
-/// Reads the file once (a real IO failure here is a hard error — the caller
-/// must not silently drop a file from the index), hashes the full bytes so any
-/// edit re-indexes, then detects the [`Format`](super::format::Format) and runs
-/// the matching handler.
+/// Decides the format from the extension first: a known-but-unsupported
+/// extension is skipped without reading or hashing the file. Only a supported
+/// or extensionless name is read (extensionless names still need the bytes for
+/// the magic-byte sniff in [`detect_format`]). A real IO failure on a file we
+/// do read is a hard error — the caller must not silently drop it from the
+/// index — and the full bytes are hashed so any edit re-indexes.
 ///
 /// Returns `Ok(None)` — a graceful per-file skip, logged here — when the type
 /// is unsupported or the handler fails to extract content. One bad file never
@@ -28,13 +30,24 @@ pub(super) fn prepare_file(
     indexed_at_ms: i64,
 ) -> Result<Option<PreparedFile>> {
     let path = req.file.as_path();
+    // Skip a known-unsupported extension before any IO — no read, no hash.
+    if let Some(None) = format_from_extension(path) {
+        tracing::debug!(
+            target: "hallouminate::indexer",
+            file = %path.display(),
+            "skipping file: unsupported format (no handler for its type)"
+        );
+        return Ok(None);
+    }
+
     let bytes = fs::read(path)?;
     // Hash the full file (frontmatter included) so any edit to the block still
     // changes the content hash and triggers a re-index.
     let content_hash = blake3_bytes(&bytes);
 
     let Some(format) = detect_format(path, &bytes) else {
-        tracing::warn!(
+        // Reached only for extensionless names that sniff to an unsupported type.
+        tracing::debug!(
             target: "hallouminate::indexer",
             file = %path.display(),
             "skipping file: unsupported format (no handler for its type)"

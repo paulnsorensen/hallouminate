@@ -44,18 +44,32 @@ pub enum Format {
 /// Returns `None` for any type Phase 1 does not handle — the caller logs a
 /// warning and skips the file.
 pub fn detect_format(path: &Path, bytes: &[u8]) -> Option<Format> {
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        match ext.to_ascii_lowercase().as_str() {
-            "md" | "markdown" => return Some(Format::Markdown),
-            "txt" | "text" => return Some(Format::PlainText),
-            "csv" | "xlsx" | "xls" | "ods" => return Some(Format::Spreadsheet),
-            // A known-but-unsupported extension is decisive: do NOT fall through
-            // to a magic-byte sniff that might mislabel it (e.g. a `.docx` is a
-            // ZIP and could be mistaken for a spreadsheet container).
-            _ => return None,
-        }
+    match format_from_extension(path) {
+        // Extension is decisive: `Some(fmt)` when supported, `None` when a
+        // known-but-unsupported extension (never sniffed).
+        Some(ext_format) => ext_format,
+        // No usable extension: fall back to a magic-byte sniff.
+        None => detect_by_magic(bytes),
     }
-    detect_by_magic(bytes)
+}
+
+/// Classify a path's extension *without reading its bytes*, so the caller can
+/// skip a known-unsupported file before any IO.
+///
+/// - `Some(Some(fmt))` — extension maps to a supported format.
+/// - `Some(None)` — extension is present but unsupported: skip, no read needed.
+/// - `None` — no usable extension; bytes are required for a magic-byte sniff.
+pub fn format_from_extension(path: &Path) -> Option<Option<Format>> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    Some(match ext.to_ascii_lowercase().as_str() {
+        "md" | "markdown" => Some(Format::Markdown),
+        "txt" | "text" => Some(Format::PlainText),
+        "csv" | "xlsx" | "xls" | "ods" => Some(Format::Spreadsheet),
+        // A known-but-unsupported extension is decisive: do NOT fall through
+        // to a magic-byte sniff that might mislabel it (e.g. a `.docx` is a
+        // ZIP and could be mistaken for a spreadsheet container).
+        _ => None,
+    })
 }
 
 /// Magic-byte fallback for inputs with no usable extension. Maps `file-format`'s
@@ -324,7 +338,8 @@ fn csv_chunks(bytes: &[u8], path: &Path) -> Result<Vec<PreparedChunk>> {
         if text.is_empty() {
             continue;
         }
-        push_row_chunk(&mut chunks, "csv", row_idx + 1, text);
+        // On-disk line: header is line 1, data rows are 1-based below it.
+        push_row_chunk(&mut chunks, "csv", row_idx + 1, row_idx + 2, text);
     }
     Ok(chunks)
 }
@@ -352,7 +367,8 @@ fn workbook_chunks(bytes: &[u8], path: &Path) -> Result<Vec<PreparedChunk>> {
             if text.is_empty() {
                 continue;
             }
-            push_row_chunk(&mut chunks, name, row_idx + 1, text);
+            // No on-disk line for binary formats: `line` is the per-sheet row ordinal.
+            push_row_chunk(&mut chunks, name, row_idx + 1, row_idx + 1, text);
         }
     }
     Ok(chunks)
@@ -381,13 +397,25 @@ fn row_text(headers: &[String], cells: &[String]) -> String {
     lines.join("\n")
 }
 
-fn push_row_chunk(chunks: &mut Vec<PreparedChunk>, sheet: &str, row: usize, text: String) {
+/// Push one row as a chunk. `row` is the 1-based per-sheet data-row ordinal
+/// used in the breadcrumb; `line` is the value surfaced as `line_range`.
+///
+/// For CSV `line` is the true on-disk line (header row + 1-based data lines).
+/// For binary xlsx/ods there is no on-disk line concept, so `line_range` is the
+/// per-sheet row ordinal rather than a file line.
+fn push_row_chunk(
+    chunks: &mut Vec<PreparedChunk>,
+    sheet: &str,
+    row: usize,
+    line: usize,
+    text: String,
+) {
     let ord = chunks.len();
     chunks.push(PreparedChunk {
         ord,
         heading_path: vec![format!("{sheet}:row-{row}")],
-        line_start: row,
-        line_end: row,
+        line_start: line,
+        line_end: line,
         text,
         claim_marks: None,
     });
