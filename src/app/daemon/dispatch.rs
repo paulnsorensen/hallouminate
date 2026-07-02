@@ -25,6 +25,7 @@ use crate::adapters::lance::LanceStore;
 use crate::app::cli::{CorpusReport, IndexReport};
 use crate::app::config::{Config, ResolvedLayers, resolve_for_cwd};
 use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
+use crate::domain::corpus::blake3_file;
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::corpus::sandbox::{
@@ -32,10 +33,10 @@ use crate::domain::corpus::sandbox::{
     ensure_corpus_allows_file, first_corpus_root, list_corpus_files, pick_corpus, read_no_follow,
     resolve_read_root, safe_relative_path,
 };
-use crate::domain::corpus::{MarkdownChunker, blake3_file};
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
+use crate::domain::indexer::HandlerRegistry;
 use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
 #[cfg(test)]
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
@@ -479,7 +480,7 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
     };
 
     let store = state.store();
-    let chunker = state.make_chunker();
+    let registry = state.make_registry();
 
     let mut report = IndexReport::default();
     for corpus in selected {
@@ -518,7 +519,7 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = match index_corpus(&corpus, &store, embedder_dyn, &chunker).await {
+        let stats = match index_corpus(&corpus, &store, embedder_dyn, &registry).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
         };
@@ -530,6 +531,7 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             files_touched: stats.files_touched,
             files_deleted: stats.files_deleted,
             files_skipped_empty: stats.files_skipped_empty,
+            files_skipped_unreadable: stats.files_skipped_unreadable,
             chunks_inserted: stats.chunks_inserted,
             embeddings_inserted: stats.embeddings_inserted,
         });
@@ -815,7 +817,7 @@ async fn handle_add_markdown(
         stats
     } else {
         let store = state.store();
-        let chunker = state.make_chunker();
+        let registry = state.make_registry();
         let mut embedder = if state.embeddings_enabled() {
             match state.embedder().await {
                 Ok(g) => Some(g),
@@ -827,7 +829,7 @@ async fn handle_add_markdown(
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(&store, embedder_dyn, &chunker, &corpus, &dest).await {
+        match index_single_file(&store, embedder_dyn, &registry, &corpus, &dest).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
         }
@@ -855,6 +857,7 @@ async fn handle_add_markdown(
             files_touched: stats.files_touched,
             files_deleted: stats.files_deleted,
             files_skipped_empty: stats.files_skipped_empty,
+            files_skipped_unreadable: stats.files_skipped_unreadable,
             chunks_inserted: stats.chunks_inserted,
             embeddings_inserted: stats.embeddings_inserted,
         }],
@@ -1124,7 +1127,7 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
 pub(super) async fn index_single_file(
     store: &LanceStore,
     embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
-    chunker: &MarkdownChunker<tokenizers::Tokenizer>,
+    registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     file: &Path,
 ) -> anyhow::Result<crate::domain::indexer::ApplyStats> {
@@ -1154,8 +1157,20 @@ pub(super) async fn index_single_file(
         }
     }
     let p = plan(vec![(file_ref, Mtime(mtime_ms))], db);
-    let mut stats = apply(p, store, embedder, chunker, corpus, DEFAULT_BATCH_SIZE).await?;
+    let mut stats = apply(p, store, embedder, registry, corpus, DEFAULT_BATCH_SIZE).await?;
+    // Evict only on the genuine truncate-to-empty case. A present-but-unreadable
+    // file (unsupported type / extraction failure) is counted under
+    // `files_skipped_unreadable` and retains its last-good rows — matching bulk
+    // `index_corpus`, which never deletes a file still on disk. This prevents a
+    // transient parse failure (atomic-save race, partial write, momentary
+    // corruption) from silently dropping a file from search.
     if stats.files_skipped_empty > 0 && had_snapshot {
+        tracing::info!(
+            target: "hallouminate::daemon",
+            corpus = %corpus.name,
+            file = %file_ref_str,
+            "evicting indexed file from search: re-index produced an empty file",
+        );
         store.delete_file(&corpus.name, &file_ref_str).await?;
         stats.files_deleted += 1;
     }
@@ -1190,6 +1205,7 @@ fn fold_apply_stats(
     into.files_touched += extra.files_touched;
     into.files_deleted += extra.files_deleted;
     into.files_skipped_empty += extra.files_skipped_empty;
+    into.files_skipped_unreadable += extra.files_skipped_unreadable;
     into.chunks_inserted += extra.chunks_inserted;
     into.embeddings_inserted += extra.embeddings_inserted;
 }
@@ -1215,7 +1231,7 @@ async fn rebuild_wiki_indexes(
     let mut totals = crate::domain::indexer::ApplyStats::default();
     let dirs = ancestor_dirs(root, file_relative);
     let store = state.store();
-    let chunker = state.make_chunker();
+    let registry = state.make_registry();
 
     for dir in &dirs {
         let index_path = dir.join(INDEX_FILENAME);
@@ -1298,7 +1314,7 @@ async fn rebuild_wiki_indexes(
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = index_single_file(&store, embedder_dyn, &chunker, corpus, &dest)
+        let stats = index_single_file(&store, embedder_dyn, &registry, corpus, &dest)
             .await
             .map_err(|e| format!("reindex {}: {e}", dest.display()))?;
         drop(embedder);
@@ -2172,5 +2188,169 @@ mod tests {
             "never-indexed corpus must have null timestamp"
         );
         assert_eq!(stats.corpus, "repo:myrepo:wiki");
+    }
+
+    // ── index_single_file eviction policy ────────────────────────────────
+    //
+    // Regression for the multi-format-ingestion finding: on the single-file
+    // (watch / add_markdown) path, a present-but-unreadable re-extraction
+    // (corrupt workbook, non-UTF-8 text, unsupported type) must RETAIN the
+    // file's last-good rows — matching bulk `index_corpus`, which never
+    // deletes a file still on disk. Only a genuine truncate-to-empty re-index
+    // evicts. Before the fix both skip kinds routed through
+    // `files_skipped_empty`, so a transient parse failure silently dropped the
+    // file from search.
+
+    fn spreadsheet_corpus_at(root: &Path) -> CorpusConfig {
+        CorpusConfig {
+            name: "docs".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.csv".into()],
+            exclude: vec![],
+            global: false,
+        }
+    }
+
+    /// Open an embeddings-OFF store. The eviction policy is independent of
+    /// embeddings, so `None` keeps the test free of the embedding model.
+    async fn open_off_store(dir: &Path) -> LanceStore {
+        LanceStore::open_or_create(dir, "BAAI/bge-small-en-v1.5", false, false)
+            .await
+            .expect("open store")
+    }
+
+    #[tokio::test]
+    async fn index_single_file_retains_last_good_rows_when_reindex_is_unreadable() {
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let file = corpus_dir.path().join("data.csv");
+        let corpus = spreadsheet_corpus_at(corpus_dir.path());
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+
+        // 1. Index a valid CSV: rows land in the index. Compute `file_ref`
+        //    after the write so it canonicalizes the same way `index_single_file`
+        //    does (on macOS, tempdirs symlink /var → /private/var, so a
+        //    canonicalize of a not-yet-existing path would passthrough uncanonicalized
+        //    and mismatch the stored row).
+        std::fs::write(&file, "name,note\nbolt,sturdy fastener\n").unwrap();
+        let file_ref = canonicalize_or_passthrough(&file)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let s1 = index_single_file(&store, None, &registry, &corpus, &file)
+            .await
+            .expect("first index of a valid file must succeed");
+        assert_eq!(s1.files_upserted, 1, "valid CSV indexes");
+        let after_good = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        assert!(
+            after_good.total_chunks > 0,
+            "the valid CSV must produce indexed rows"
+        );
+
+        // 2. Corrupt the file in place, then re-index. The extraction fails →
+        //    counted as unreadable, NOT empty; the last-good rows must survive.
+        std::fs::write(&file, b"\xff\xfe\x00 not,a valid\x00 spreadsheet").unwrap();
+        let s2 = index_single_file(&store, None, &registry, &corpus, &file)
+            .await
+            .expect("a corrupt re-extraction must not hard-error");
+        assert_eq!(
+            s2.files_skipped_unreadable, 1,
+            "a corrupt re-extraction is an unreadable skip"
+        );
+        assert_eq!(
+            s2.files_skipped_empty, 0,
+            "an extraction failure must NOT be counted as truncate-to-empty"
+        );
+        assert_eq!(
+            s2.files_deleted, 0,
+            "a present-but-unreadable file must NOT be evicted from the index"
+        );
+        let after_corrupt = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        assert_eq!(
+            after_corrupt.total_chunks, after_good.total_chunks,
+            "last-good rows must survive a transient parse failure"
+        );
+        assert!(
+            store
+                .get_file_snapshot(&corpus.name, &file_ref)
+                .await
+                .unwrap()
+                .is_some(),
+            "the file's snapshot row must still be present after an unreadable re-index"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_single_file_evicts_when_reindex_truncates_to_empty() {
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        // A markdown corpus so a truncate-to-empty re-index produces zero
+        // chunks (the genuine empty case the eviction branch was written for).
+        let file = corpus_dir.path().join("note.md");
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        };
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+        let file_ref = canonicalize_or_passthrough(&file)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        std::fs::write(&file, "# Note\n\nspice melange harvested on Arrakis\n").unwrap();
+        index_single_file(&store, None, &registry, &corpus, &file)
+            .await
+            .expect("first index must succeed");
+        assert!(
+            store
+                .corpus_chunk_stats(&corpus.name)
+                .await
+                .unwrap()
+                .total_chunks
+                > 0,
+            "the valid markdown must index rows"
+        );
+
+        // Truncate to empty: zero chunks → genuine empty → eviction fires.
+        std::fs::write(&file, "").unwrap();
+        let s = index_single_file(&store, None, &registry, &corpus, &file)
+            .await
+            .expect("re-index of a now-empty file must not hard-error");
+        assert_eq!(
+            s.files_skipped_empty, 1,
+            "a truncate-to-empty re-index is the genuine empty case"
+        );
+        assert_eq!(
+            s.files_deleted, 1,
+            "the genuine empty case must still evict the prior rows"
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&corpus.name)
+                .await
+                .unwrap()
+                .total_chunks,
+            0,
+            "the truncated file's rows must be removed from the index"
+        );
+        assert!(
+            store
+                .get_file_snapshot(&corpus.name, &file_ref)
+                .await
+                .unwrap()
+                .is_none(),
+            "the truncated file's snapshot row must be gone after eviction"
+        );
     }
 }

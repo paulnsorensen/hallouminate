@@ -10,9 +10,8 @@ use std::path::PathBuf;
 
 use hallouminate::adapters::lance::{EMBEDDING_DIM, LanceStore};
 use hallouminate::domain::common::{CorpusConfig, FileRef, Result};
-use hallouminate::domain::corpus::MarkdownChunker;
 use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
-use hallouminate::domain::indexer::index_corpus;
+use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
 use text_splitter::Characters;
 
 mod common;
@@ -66,9 +65,9 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
         let store = LanceStore::open_or_create(&store_path, MODEL, false, true)
             .await
             .expect("reopen for crash");
-        let chunker = MarkdownChunker::new(Characters, 1500);
+        let registry = HandlerRegistry::new(Characters, 1500);
         let mut emb = PanickingEmbedder;
-        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &chunker).await;
+        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &registry).await;
     })
     .await;
     assert!(
@@ -121,9 +120,9 @@ async fn re_run_after_crash_converges_to_correct_state() {
         let store = LanceStore::open_or_create(&store_path, MODEL, false, true)
             .await
             .expect("reopen");
-        let chunker = MarkdownChunker::new(Characters, 1500);
+        let registry = HandlerRegistry::new(Characters, 1500);
         let mut emb = PanickingEmbedder;
-        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &chunker).await;
+        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &registry).await;
     })
     .await;
     assert!(crashed.is_err());
@@ -132,9 +131,9 @@ async fn re_run_after_crash_converges_to_correct_state() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("recover");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut emb = StubEmbedder;
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &chunker)
+    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
         .await
         .expect("recovered index_corpus");
 

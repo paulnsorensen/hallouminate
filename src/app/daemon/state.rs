@@ -31,8 +31,9 @@ use tokio_util::sync::CancellationToken;
 use crate::adapters::lance::LanceStore;
 use crate::app::config::Config;
 use crate::domain::common::{HallouminateError, expand_tilde};
-use crate::domain::corpus::{MarkdownChunker, load_tokenizer, missing_roots};
+use crate::domain::corpus::{load_tokenizer, missing_roots};
 use crate::domain::embeddings::{EmbedBatch, Embedder};
+use crate::domain::indexer::HandlerRegistry;
 use crate::domain::indexer::index::index_corpus;
 use crate::domain::search::{FastembedCrossencoder, canonical_crossencoder_model};
 
@@ -210,7 +211,7 @@ impl DaemonState {
                             ground_dir.display()
                         )
                     })?;
-                    let chunker = MarkdownChunker::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+                    let registry = HandlerRegistry::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
                     for corpus in cfg
                         .effective_corpora()
                         .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
@@ -226,7 +227,7 @@ impl DaemonState {
                         }
                         let emb: Option<&mut dyn EmbedBatch> =
                             embedder.as_mut().map(|e| e as &mut dyn EmbedBatch);
-                        let stats = index_corpus(&corpus, &fresh, emb, &chunker)
+                        let stats = index_corpus(&corpus, &fresh, emb, &registry)
                             .await
                             .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
                         tracing::info!(
@@ -514,12 +515,12 @@ impl DaemonState {
         self.inner.last_embed_use_secs.load(Ordering::Relaxed)
     }
 
-    /// A freshly-constructed `MarkdownChunker` over the daemon's loaded
-    /// tokenizer. Construction is cheap (the tokenizer is `Clone` and the
-    /// chunker is a thin wrapper), so handlers build one per call instead of
-    /// reaching into shared state for it.
-    pub fn make_chunker(&self) -> MarkdownChunker<tokenizers::Tokenizer> {
-        MarkdownChunker::new(self.inner.tokenizer.clone(), CHUNK_BUDGET_TOKENS)
+    /// A freshly-constructed format-handler [`HandlerRegistry`] over the
+    /// daemon's loaded tokenizer. Construction is cheap (the tokenizer is
+    /// `Clone` and each handler is a thin wrapper), so handlers build one per
+    /// call instead of reaching into shared state for it.
+    pub fn make_registry(&self) -> HandlerRegistry {
+        HandlerRegistry::new(self.inner.tokenizer.clone(), CHUNK_BUDGET_TOKENS)
     }
 
     /// Acquire the per-corpus async mutex. Call before any operation that

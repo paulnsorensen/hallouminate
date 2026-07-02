@@ -249,7 +249,7 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
     let exists = path.is_file();
     let store = state.store();
     if exists {
-        let chunker = state.make_chunker();
+        let registry = state.make_registry();
         let mut embedder = if state.embeddings_enabled() {
             match state.embedder().await {
                 Ok(g) => Some(g),
@@ -264,7 +264,7 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(&store, embedder_dyn, &chunker, corpus, path).await {
+        match index_single_file(&store, embedder_dyn, &registry, corpus, path).await {
             Ok(stats) => tracing::debug!(
                 target: "hallouminate::daemon",
                 corpus = %corpus.name,

@@ -174,7 +174,7 @@ fn heading_path_at(byte_offset: usize, breadcrumbs: &[Breadcrumb]) -> Vec<String
 
 // ── Line tracking ────────────────────────────────────────────────────────
 
-fn build_line_starts(text: &str) -> Vec<usize> {
+pub(crate) fn build_line_starts(text: &str) -> Vec<usize> {
     let mut starts = Vec::with_capacity(64);
     starts.push(0);
     for (i, b) in text.bytes().enumerate() {
@@ -188,7 +188,7 @@ fn build_line_starts(text: &str) -> Vec<usize> {
     starts
 }
 
-fn byte_to_line(byte: usize, line_starts: &[usize]) -> usize {
+pub(crate) fn byte_to_line(byte: usize, line_starts: &[usize]) -> usize {
     match line_starts.binary_search(&byte) {
         Ok(idx) => idx + 1,
         Err(idx) => idx,

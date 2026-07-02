@@ -30,6 +30,7 @@ pub(crate) fn collect_heading_text(iter: &mut OffsetIter<'_>) -> String {
 pub use chunker::{
     Chunk, ChunkSizer, CorpusChunker, MarkdownChunker, chunk_markdown, load_tokenizer,
 };
+pub(crate) use chunker::{build_line_starts, byte_to_line};
 pub use claim_marks::{
     ClaimMark, ClaimStatus, extract_claim_marks, lint_claim_marks, marks_to_canonical_json,
     strip_claim_marks,

@@ -17,10 +17,9 @@ use std::fs;
 use std::path::Path;
 
 use hallouminate::domain::common::CorpusConfig;
-use hallouminate::domain::corpus::MarkdownChunker;
 use hallouminate::domain::discovery::{DEFAULT_MAX_DEPTH, IgnoreRules, discover_wiki_roots};
 use hallouminate::domain::ground::{GroundOpts, ground_union};
-use hallouminate::domain::indexer::index_corpus;
+use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
 use hallouminate::domain::repository::{
     RepositoryConfig, repository_for_discovered_wiki, repository_wiki_corpus,
     union_discovered_repositories, wiki_directory,
@@ -78,12 +77,12 @@ async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
     )
     .await
     .expect("open store");
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut corpora: Vec<CorpusConfig> = Vec::new();
     for repo in &repos {
         let corpus = repository_wiki_corpus(repo).expect("derive wiki corpus");
         let mut embedder = StubEmbedder;
-        index_corpus(&corpus, &store, Some(&mut embedder), &chunker)
+        index_corpus(&corpus, &store, Some(&mut embedder), &registry)
             .await
             .unwrap_or_else(|e| panic!("index {}: {e}", corpus.name));
         corpora.push(corpus);
@@ -222,12 +221,12 @@ async fn index_wikis(
         .filter_map(|r| repository_for_discovered_wiki(r))
         .collect();
     let (repos, _warnings) = union_discovered_repositories(&[], discovered);
-    let chunker = MarkdownChunker::new(Characters, 1500);
+    let registry = HandlerRegistry::new(Characters, 1500);
     let mut targets = Vec::new();
     for repo in &repos {
         let corpus = repository_wiki_corpus(repo).expect("derive wiki corpus");
         let mut embedder = StubEmbedder;
-        index_corpus(&corpus, store, Some(&mut embedder), &chunker)
+        index_corpus(&corpus, store, Some(&mut embedder), &registry)
             .await
             .unwrap_or_else(|e| panic!("index {}: {e}", corpus.name));
         targets.push((corpus.name.clone(), corpus.paths.clone()));
@@ -518,8 +517,8 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
         .await
         .expect("open store");
-    let chunker =
-        hallouminate::domain::corpus::MarkdownChunker::new(text_splitter::Characters, 1500);
+    let registry =
+        hallouminate::domain::indexer::HandlerRegistry::new(text_splitter::Characters, 1500);
 
     // Index the same directory under two distinct corpus names.
     let corpus_a = hallouminate::domain::common::CorpusConfig {
@@ -537,11 +536,11 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
         global: false,
     };
     let mut embedder = StubEmbedder;
-    index_corpus(&corpus_a, &store, Some(&mut embedder), &chunker)
+    index_corpus(&corpus_a, &store, Some(&mut embedder), &registry)
         .await
         .expect("index alpha");
     let mut embedder = StubEmbedder;
-    index_corpus(&corpus_b, &store, Some(&mut embedder), &chunker)
+    index_corpus(&corpus_b, &store, Some(&mut embedder), &registry)
         .await
         .expect("index beta");
 
