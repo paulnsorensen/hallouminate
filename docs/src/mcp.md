@@ -17,7 +17,7 @@ The mutating tools (`add_markdown`, `delete_markdown`) and `read_markdown`
 **always** require an explicit `corpus`, to avoid accidental writes to the
 wrong wiki or ambiguous reads.
 
-## The nine tools
+## The ten tools
 
 ### `list_corpora`
 
@@ -76,6 +76,15 @@ Irreversible. For `repo:*:wiki` corpora it also re-walks the ancestor
 Bulk (re)build the LanceDB index for one or all corpora. Param: `corpus`
 (optional; omit to rebuild every configured corpus). Use this when files were
 touched outside hallouminate.
+
+### `corpus_stats`
+
+Index health statistics for one corpus: number of indexed files, total chunk
+row count, newest index timestamp (`last_indexed_ms`, null when the corpus has
+never been indexed), and how many on-disk files matching the corpus globs are
+not yet indexed. Param: `corpus` (defaults to wiki-for-cwd, same resolution as
+`list_files`). `structuredContent` is `{ corpus, indexed_files, total_chunks,
+last_indexed_ms, unindexed_files }`.
 
 ### `get_footnote`
 

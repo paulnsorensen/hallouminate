@@ -112,6 +112,8 @@ cargo run -- config show                 # print the effective merged config
 
 - `ground` — semantic search.
 - `index` — bulk (re)build a corpus index.
+- `corpus_stats` — index health for one corpus: indexed file count, total
+  chunk rows, newest index timestamp, and unindexed-file count.
 - `list_corpora` — list every configured corpus.
 - `list_files` — flat list of relative paths in a corpus.
 - `list_tree` — the same files grouped into a directory tree, for

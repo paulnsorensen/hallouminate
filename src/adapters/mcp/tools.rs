@@ -62,6 +62,8 @@ Tools:
 - `ground` — semantic search; returns ranked chunks with snippet, \
   heading_path, line_range, score.
 - `index` — bulk (re)index a corpus or all corpora.
+- `corpus_stats` — index health for one corpus: indexed file count, total \
+  chunk rows, newest index timestamp, and count of not-yet-indexed files.
 - `get_footnote` — resolve a single citation: footnote target for page#footnote_number.
 
 Filesystem is the source of truth; LanceDB rows are derived and refreshed \

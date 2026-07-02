@@ -9,7 +9,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 ## Topics
 
 - [architecture](architecture.md) — sliced-bread layout: `app/`, `domain/`, `adapters/`, dependency direction, entry points.
-- [mcp-surface](mcp-surface.md) — the nine MCP tools the LLM uses to author and search wikis.
+- [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis.
 - [daemon-and-cli](daemon-and-cli.md) — why there's a daemon, the JSON-line socket protocol, the CLI subcommand surface.
 - [corpus-walker](corpus-walker.md) — gitignore-aware corpus walking and the explicit-root opt-in escape hatch.
 - [multi-format-ingestion](multi-format-ingestion.md) — why hallouminate is markdown-only today, the per-format dispatch pattern (text/code/PDF), reachable tooling, and the open design questions before extending the indexer.
