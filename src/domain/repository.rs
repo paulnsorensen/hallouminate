@@ -537,6 +537,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wiki_directory_honors_absolute_wiki_override() {
+        // PathBuf::join replaces (rather than appends to) the base when the
+        // joined component is absolute — pin that semantics so an absolute
+        // `wiki` override can't regress into being appended under `repo.path`.
+        let mut r = repo("tern", "/repos/tern");
+        r.wiki = Some("/elsewhere/wiki".into());
+        assert_eq!(wiki_directory(&r), PathBuf::from("/elsewhere/wiki"));
+        assert_eq!(
+            repository_wiki_corpus(&r).unwrap().paths,
+            vec!["/elsewhere/wiki".to_string()],
+            "repo:{{name}}:wiki corpus must resolve through the absolute override too"
+        );
+    }
+
     // ── default_wiki_for_cwd ──────────────────────────────────────────────
 
     #[test]

@@ -332,6 +332,7 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
                     }
                 }
                 collect_nested_warnings(&table, "repository", KNOWN_REPOSITORY_KEYS, &mut out);
+                collect_nested_warnings(&table, "code_repo", KNOWN_REPOSITORY_KEYS, &mut out);
                 collect_nested_warnings(&table, "corpus", KNOWN_CORPUS_KEYS, &mut out);
             }
             Ok(_) => out.push("config is not a TOML table".to_string()),
@@ -923,6 +924,23 @@ model = "clip-vit-b32"
         assert!(
             !warnings.iter().any(|w| w.contains("[[repository]]")),
             "known repository keys (incl. wiki) must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_unknown_key_inside_code_repo_alias_entry() {
+        // `[[code_repo]]` is the legacy alias for `[[repository]]`
+        // (`#[serde(rename = "repository", alias = "code_repo")]` on
+        // `Config`); a stray key inside it must be individually flagged too,
+        // not just silently accepted because the array itself is recognized.
+        let raw = "[[code_repo]]\nname = \"tern\"\npath = \"/r\"\nbogus = \"x\"\n";
+        let cfg = toml::from_str::<Config>(raw).expect("parse despite stray key");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("bogus") && w.contains("[[code_repo]]")),
+            "missing nested code_repo key warning: {warnings:?}"
         );
     }
 
