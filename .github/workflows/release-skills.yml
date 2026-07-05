@@ -165,6 +165,7 @@ jobs:
               --target "$GITHUB_SHA" \
               --title "Skills $tag" \
               --notes "$notes" \
+              --latest=false \
               "${{ steps.pack.outputs.zip }}" \
               "${{ steps.pack.outputs.tar }}" \
               "${{ steps.pack.outputs.sha }}"
