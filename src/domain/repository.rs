@@ -33,6 +33,10 @@ pub struct RepositoryConfig {
     pub corpus_globs: Vec<String>,
     #[serde(default)]
     pub corpus_exclude: Vec<String>,
+    /// Overrides the wiki root, relative to `path` (or absolute), instead of
+    /// the default `.hallouminate/wiki`.
+    #[serde(default)]
+    pub wiki: Option<String>,
 }
 
 /// Kind of repository-derived corpus.
@@ -146,9 +150,13 @@ pub fn effective_corpora(
     Ok(out)
 }
 
-/// Wiki directory for a repository: `<repo.path>/.hallouminate/wiki`.
+/// Wiki directory for a repository: `<repo.path>/.hallouminate/wiki`, or
+/// `<repo.path>/<repo.wiki>` when the repository overrides it.
 pub fn wiki_directory(repo: &RepositoryConfig) -> PathBuf {
-    PathBuf::from(&repo.path).join(WIKI_RELATIVE_PATH)
+    match &repo.wiki {
+        Some(rel) => PathBuf::from(&repo.path).join(rel),
+        None => PathBuf::from(&repo.path).join(WIKI_RELATIVE_PATH),
+    }
 }
 
 /// Pick the default wiki corpus name for `cwd`.
@@ -204,9 +212,9 @@ pub fn repository_for_discovered_wiki(repo_root: &Path) -> Option<RepositoryConf
         corpus_paths: Vec::new(),
         corpus_globs: Vec::new(),
         corpus_exclude: Vec::new(),
+        wiki: None,
     })
 }
-
 /// Union baseline `[[repository]]` declarations with walk-discovered ones,
 /// deduped by resolved wiki path (#106).
 ///
@@ -390,6 +398,7 @@ mod tests {
             corpus_paths: Vec::new(),
             corpus_globs: Vec::new(),
             corpus_exclude: Vec::new(),
+            wiki: None,
         }
     }
 
@@ -510,6 +519,21 @@ mod tests {
         assert_eq!(
             wiki_directory(&r),
             PathBuf::from("/repos/tern/.hallouminate/wiki"),
+        );
+    }
+
+    #[test]
+    fn wiki_directory_honors_wiki_override() {
+        let mut r = repo("tern", "/repos/tern");
+        r.wiki = Some(".hallouminate/artifacts".into());
+        assert_eq!(
+            wiki_directory(&r),
+            PathBuf::from("/repos/tern/.hallouminate/artifacts"),
+        );
+        assert_eq!(
+            repository_wiki_corpus(&r).unwrap().paths,
+            vec!["/repos/tern/.hallouminate/artifacts".to_string()],
+            "repo:{{name}}:wiki corpus must resolve through the override too"
         );
     }
 

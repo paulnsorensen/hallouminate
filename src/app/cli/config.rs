@@ -52,6 +52,22 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "storage",
 ];
 
+/// Keys recognized inside a `[[repository]]` entry. Used by
+/// `collect_warnings` to flag a stray/typo key nested in the array-of-tables
+/// that the top-level-only check never descends into.
+const KNOWN_REPOSITORY_KEYS: &[&str] = &[
+    "name",
+    "path",
+    "corpus_paths",
+    "corpus_globs",
+    "corpus_exclude",
+    "wiki",
+];
+
+/// Keys recognized inside a `[[corpus]]` entry, mirroring `CorpusConfig`'s
+/// serde field names (`src/domain/common.rs`).
+const KNOWN_CORPUS_KEYS: &[&str] = &["name", "paths", "globs", "exclude", "global"];
+
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     let target = args.path.unwrap_or_else(xdg_config_path);
     if target.exists() && !args.force {
@@ -315,6 +331,8 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
                         out.push(format!("unknown top-level key `{key}`{hint}"));
                     }
                 }
+                collect_nested_warnings(&table, "repository", KNOWN_REPOSITORY_KEYS, &mut out);
+                collect_nested_warnings(&table, "corpus", KNOWN_CORPUS_KEYS, &mut out);
             }
             Ok(_) => out.push("config is not a TOML table".to_string()),
             Err(e) => out.push(format!("re-parse for key check failed: {e}")),
@@ -335,6 +353,31 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
         );
     }
     out
+}
+
+/// Flag unknown keys nested inside every `[[<array_key>]]` entry (e.g.
+/// `[[repository]]`, `[[corpus]]`) against `known`. The top-level key check
+/// only walks `table.keys()` one level deep, so a typo'd/stray key inside an
+/// array-of-tables entry parses cleanly and is silently dropped without this.
+fn collect_nested_warnings(
+    table: &toml::value::Table,
+    array_key: &str,
+    known: &[&str],
+    out: &mut Vec<String>,
+) {
+    let Some(toml::Value::Array(entries)) = table.get(array_key) else {
+        return;
+    };
+    for entry in entries {
+        let toml::Value::Table(entry) = entry else {
+            continue;
+        };
+        for key in entry.keys() {
+            if !known.contains(&key.as_str()) {
+                out.push(format!("unknown key `{key}` in [[{array_key}]]"));
+            }
+        }
+    }
 }
 
 /// Non-fatal advisory for issue #32: a `.hallouminate/wiki/` directory sits
@@ -852,6 +895,58 @@ model = "clip-vit-b32"
         assert!(
             warnings.iter().any(|w| w.contains("no corpora configured")),
             "empty corpora advisory missing: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_unknown_key_inside_repository_entry() {
+        // A stray key inside `[[repository]]` parses cleanly (extra TOML
+        // keys are ignored by serde-derived structs without `deny_unknown_fields`)
+        // and was silently dropped before this fix.
+        let raw = "[[repository]]\nname = \"tern\"\npath = \"/r\"\nbogus = \"x\"\n";
+        let cfg = toml::from_str::<Config>(raw).expect("parse despite stray key");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("bogus") && w.contains("[[repository]]")),
+            "missing nested repository key warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_silent_for_repository_entry_with_only_known_keys_including_wiki() {
+        let raw =
+            "[[repository]]\nname = \"tern\"\npath = \"/r\"\nwiki = \".hallouminate/artifacts\"\n";
+        let cfg = toml::from_str::<Config>(raw).expect("parse valid");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            !warnings.iter().any(|w| w.contains("[[repository]]")),
+            "known repository keys (incl. wiki) must not warn: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_flags_unknown_key_inside_corpus_entry() {
+        let raw = "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\nbogus = \"y\"\n";
+        let cfg = toml::from_str::<Config>(raw).expect("parse despite stray key");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("bogus") && w.contains("[[corpus]]")),
+            "missing nested corpus key warning: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn collect_warnings_silent_for_corpus_entry_with_only_known_keys() {
+        let raw = "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\nglobs = [\"**/*.md\"]\nexclude = []\nglobal = false\n";
+        let cfg = toml::from_str::<Config>(raw).expect("parse valid");
+        let warnings = collect_warnings(Some(raw), &cfg);
+        assert!(
+            !warnings.iter().any(|w| w.contains("[[corpus]]")),
+            "known corpus keys must not warn: {warnings:?}"
         );
     }
 
