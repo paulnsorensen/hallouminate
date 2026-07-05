@@ -150,8 +150,10 @@ pub fn effective_corpora(
     Ok(out)
 }
 
-/// Wiki directory for a repository: `<repo.path>/.hallouminate/wiki`, or
-/// `<repo.path>/<repo.wiki>` when the repository overrides it.
+/// Wiki directory for a repository: `<repo.path>/.hallouminate/wiki` by
+/// default. A `wiki` override is joined under `path` when relative, or used
+/// verbatim when absolute (`PathBuf::join` replaces the base for an absolute
+/// component).
 pub fn wiki_directory(repo: &RepositoryConfig) -> PathBuf {
     match &repo.wiki {
         Some(rel) => PathBuf::from(&repo.path).join(rel),
