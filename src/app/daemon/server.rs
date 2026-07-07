@@ -8,6 +8,7 @@
 //! framing/IO errors.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -23,6 +24,13 @@ use super::state::DaemonState;
 pub struct DaemonArgs {
     pub config: Option<PathBuf>,
 }
+
+/// How long `handle_connection` waits for a client to send its request
+/// line before giving up and closing the connection. Guards against a
+/// client that opens a connection and never writes (or writes a partial
+/// line with no trailing newline), which would otherwise pin a
+/// `BufReader::read_line` await forever and leak the per-connection task.
+pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Boot the daemon and serve until SIGINT/SIGTERM (or stdin close on the
 /// rare debug invocations). Returns `Err` if another daemon is already
@@ -55,7 +63,7 @@ async fn serve_with_config(
     remove_stale_socket(socket_path).await;
     let watcher = super::watch::spawn_corpus_watcher(&state);
     spawn_signal_handlers(&state);
-    let result = serve_on_listener(&state, socket_path).await;
+    let result = serve_on_listener(&state, socket_path, IDLE_READ_TIMEOUT).await;
     drop(watcher);
     cleanup(lock, socket_path).await;
     result
@@ -155,6 +163,18 @@ async fn remove_stale_socket(socket_path: &Path) {
 /// on an unrecoverable bind error). After the loop breaks, the caller runs
 /// cleanup: dropping the single-instance flock and removing the socket.
 pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
+    serve_with_idle_timeout(state, socket_path, IDLE_READ_TIMEOUT).await
+}
+
+/// Same as [`serve`], but with an explicit per-connection idle-read
+/// timeout instead of the production [`IDLE_READ_TIMEOUT`] default. Public
+/// so integration tests can exercise the timeout behavior without waiting
+/// out the real 30s default.
+pub async fn serve_with_idle_timeout(
+    state: &DaemonState,
+    socket_path: &Path,
+    idle_timeout: Duration,
+) -> anyhow::Result<()> {
     prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
     let lock = acquire_single_instance(&lock_path)?;
@@ -164,13 +184,17 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
     // socket here is safe.
     remove_stale_socket(socket_path).await;
     let watcher = super::watch::spawn_corpus_watcher(state);
-    let result = serve_on_listener(state, socket_path).await;
+    let result = serve_on_listener(state, socket_path, idle_timeout).await;
     drop(watcher);
     cleanup(lock, socket_path).await;
     result
 }
 
-async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
+async fn serve_on_listener(
+    state: &DaemonState,
+    socket_path: &Path,
+    idle_timeout: Duration,
+) -> anyhow::Result<()> {
     let listener = UnixListener::bind(socket_path).map_err(|e| {
         tracing::error!(
             target: "hallouminate::daemon",
@@ -221,7 +245,7 @@ async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::R
         };
         let state = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(state, stream).await {
+            if let Err(e) = handle_connection(state, stream, idle_timeout).await {
                 tracing::warn!(
                     target: "hallouminate::daemon",
                     error = %e,
@@ -233,11 +257,25 @@ async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::R
     Ok(())
 }
 
-async fn handle_connection(state: DaemonState, stream: UnixStream) -> anyhow::Result<()> {
+async fn handle_connection(
+    state: DaemonState,
+    stream: UnixStream,
+    idle_timeout: Duration,
+) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
+    let n = match tokio::time::timeout(idle_timeout, reader.read_line(&mut line)).await {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                timeout_secs = idle_timeout.as_secs_f64(),
+                "connection idle timeout waiting for request line; closing",
+            );
+            return Ok(());
+        }
+    };
     if n == 0 {
         return Ok(());
     }

@@ -361,7 +361,7 @@ async fn daemon_resolves_repository_derived_corpora_in_list_corpora() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "downloads ~33MB embedding model on first run; opt-in via --ignored"]
 async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wiki() {
     // End-to-end gate: writing into `repo:{name}:wiki` must land at
@@ -436,7 +436,7 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
     assert_eq!(read_value["content"].as_str(), Some(body));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_add_markdown_returns_lint_warnings_without_blocking_the_write() {
     // add_markdown stores content verbatim AND returns advisory lint warnings
     // in the same response. Embeddings are disabled so the index path stays
@@ -523,7 +523,7 @@ enabled = false
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_add_markdown_warns_on_malformed_frontmatter_block_and_stores_verbatim() {
     // Locks the `handle_add_markdown` wiring of `lint_frontmatter`: a page that
     // opens with a *delimited* `---…---` block whose contents are not valid YAML
@@ -623,7 +623,7 @@ enabled = false
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_add_markdown_warns_on_claim_marks_and_stores_verbatim() {
     // Locks the `handle_add_markdown` wiring of `lint_claim_marks`: a page with
     // a `contradicted` mark missing `ref=` and a malformed (unknown-status)
@@ -886,6 +886,47 @@ ground_dir = "{g}"
         }
         other => panic!("expected InvalidParams for garbage input, got: {other:?}"),
     }
+}
+#[tokio::test]
+async fn daemon_closes_idle_connection_after_read_timeout() {
+    // A client that connects but never sends its request line must not pin
+    // the per-connection task forever — the idle-read timeout closes the
+    // connection so it can't leak. Use a harness-scoped short timeout so
+    // this test doesn't wait out the real 30s production default.
+    use tokio::io::AsyncReadExt;
+    use tokio::net::UnixStream;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn_with_idle_timeout(cfg, Duration::from_millis(200)).await;
+
+    let mut stream = UnixStream::connect(harness.socket())
+        .await
+        .expect("connect");
+    // Never write anything — the server must give up waiting for the
+    // request line and close its half, which surfaces to us as EOF.
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("server must close the idle connection well before the test timeout")
+        .expect("read must not error");
+    assert_eq!(n, 0, "idle connection must be closed (EOF), not left open");
 }
 
 #[tokio::test]
@@ -1385,7 +1426,7 @@ impl Drop for EnvGuard {
 
 // ─── Curd 3: corpus watcher ──────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     // Quality gate (Curd 3): editing a file in a baseline corpus root triggers
     // a reindex within ~debounce_ms; deleting prunes its rows. Both legs are
@@ -1958,7 +1999,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
 // ─── Issue #134: add_markdown section / range / match-scoped writes ──────────
 
 /// T20 — mode exclusivity: under_heading + replace_lines both set → InvalidParams
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t20_mode_exclusivity_under_heading_plus_replace_lines_rejected() {
     // WHY: setting two edit-mode selectors is a caller error that must fail
     // loudly without touching the file.
@@ -2028,7 +2069,7 @@ async fn t20_mode_exclusivity_under_heading_plus_replace_lines_rejected() {
 }
 
 /// T21 — mode exclusivity: replace_lines + replace_match both set → InvalidParams
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t21_mode_exclusivity_replace_lines_plus_replace_match_rejected() {
     // WHY: the second conflicting pair must also be caught by the exclusivity gate.
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -2239,7 +2280,7 @@ async fn t24_replace_match_on_missing_file_returns_invalid_params() {
 }
 
 /// T25 — reindex: section write → IndexReport files_upserted >= 1
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t25_section_write_reindexes_file() {
     // WHY: after a section splice, the daemon must reindex the file so the
     // updated content is searchable.
@@ -2309,7 +2350,7 @@ async fn t25_section_write_reindexes_file() {
 }
 
 /// T26 — reindex: replace_lines write → files_upserted >= 1
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t26_replace_lines_write_reindexes_file() {
     // WHY: after a line-range replace, the daemon must reindex the modified
     // file so the updated content is searchable.
@@ -2374,7 +2415,7 @@ async fn t26_replace_lines_write_reindexes_file() {
 }
 
 /// T27 — back-compat: whole-file write with all new fields omitted is unchanged
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t27_whole_file_write_with_new_fields_omitted_is_unchanged() {
     // WHY: the default (no edit-mode field) must behave identically to the
     // pre-#134 whole-file path so existing callers are unaffected.
@@ -2424,7 +2465,7 @@ async fn t27_whole_file_write_with_new_fields_omitted_is_unchanged() {
 
 /// T28 — lint ride-back: edit-mode write on a composed file that trips a lint
 /// returns warnings in AddMarkdownResult
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t28_edit_mode_lint_warnings_ride_back_on_composed_file() {
     // WHY: advisory lint must run on the COMPOSED file after an edit-mode
     // write so broken links / empty mermaid in the spliced fragment surface

@@ -39,6 +39,11 @@ use crate::domain::search::{FastembedCrossencoder, canonical_crossencoder_model}
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
+/// Backup ground-store directories (`<ground>.bak-v{N}`, left behind by
+/// `move_stale_store` on a schema-version rebuild) older than this are
+/// pruned at daemon boot; they're recoverable-until-pruned, not permanent.
+pub(crate) const STALE_BACKUP_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
 fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -267,6 +272,19 @@ impl DaemonState {
                 ));
             }
         };
+        // Recoverable-until-pruned backups from a prior schema rebuild
+        // (see `move_stale_store` above) accumulate on disk forever
+        // otherwise. Tolerate failure — a stuck backup dir must never
+        // block startup; the next boot's prune retries.
+        if let Err(e) =
+            prune_stale_backups(&ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE).await
+        {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "failed to prune stale ground store backups",
+            );
+        }
         // Pre-warm the baseline crossencoder iff configured; tolerate
         // failure so a misconfigured model name (or offline first run)
         // doesn't brick the daemon. The cache stays empty for that model
@@ -413,11 +431,13 @@ impl DaemonState {
         let mut guard = self.inner.embedder.lock().await;
         if guard.is_none() {
             let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
-            let embedder = Embedder::try_new(
-                &self.inner.baseline.embeddings.model,
-                self.inner.baseline.embeddings.quantized,
-                &cache_dir,
-            )
+            let embedder = tokio::task::block_in_place(|| {
+                Embedder::try_new(
+                    &self.inner.baseline.embeddings.model,
+                    self.inner.baseline.embeddings.quantized,
+                    &cache_dir,
+                )
+            })
             .map_err(|e| {
                 anyhow::anyhow!(
                     "init embedder ({}): {e}",
@@ -579,6 +599,94 @@ async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Resu
         backup = %bak.display(),
         "moved stale ground store aside; recoverable until pruned",
     );
+    Ok(())
+}
+
+/// Prune backup ground-store directories (`<ground>.bak-v{N}`) older than
+/// `max_age`, as measured from `now`. `now` is threaded in (rather than
+/// read internally) so tests can make ages deterministic without a
+/// filetime crate. Called once at daemon boot; failures are tolerated by
+/// the caller (a stuck backup dir must never block startup).
+async fn prune_stale_backups(
+    ground_dir: &Path,
+    now: SystemTime,
+    max_age: Duration,
+) -> anyhow::Result<()> {
+    let parent = ground_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = format!(
+        "{}.bak-v",
+        ground_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("ground"),
+    );
+    let mut entries = match tokio::fs::read_dir(parent).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let metadata = match entry.metadata().await {
+            Ok(metadata) => metadata,
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    entry = %name,
+                    error = %e,
+                    "skipping stale-backup entry: failed to read metadata",
+                );
+                continue;
+            }
+        };
+        if !metadata.is_dir() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(modified) => modified,
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    entry = %name,
+                    error = %e,
+                    "skipping stale-backup entry: failed to read modified time",
+                );
+                continue;
+            }
+        };
+        let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+        if age < max_age {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                entry = %name,
+                error = %e,
+                "failed to remove stale ground store backup",
+            );
+            continue;
+        }
+        tracing::info!(
+            target: "hallouminate::daemon",
+            backup = %path.display(),
+            age_days = age.as_secs() / 86_400,
+            "pruned stale ground store backup",
+        );
+    }
     Ok(())
 }
 
@@ -810,6 +918,82 @@ mod tests {
         assert!(
             observed >= before_drop,
             "drop should stamp crossencoder use at or after guard lifetime start: observed {observed}, before {before_drop}",
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_stale_backups_removes_dirs_at_or_past_max_age() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ground_dir = tmp.path().join("ground");
+        tokio::fs::create_dir_all(&ground_dir)
+            .await
+            .expect("create ground dir");
+        let stale = tmp.path().join("ground.bak-v1");
+        let unrelated = tmp.path().join("other-dir");
+        tokio::fs::create_dir_all(&stale)
+            .await
+            .expect("create stale backup");
+        tokio::fs::create_dir_all(&unrelated)
+            .await
+            .expect("create unrelated dir");
+
+        let max_age = Duration::from_secs(1);
+        let now = SystemTime::now() + Duration::from_secs(10);
+
+        prune_stale_backups(&ground_dir, now, max_age)
+            .await
+            .expect("prune");
+
+        assert!(!stale.exists(), "backup past max_age must be pruned");
+        assert!(
+            unrelated.exists(),
+            "dirs that don't match the backup prefix must be left alone",
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_stale_backups_keeps_dirs_within_max_age() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ground_dir = tmp.path().join("ground");
+        tokio::fs::create_dir_all(&ground_dir)
+            .await
+            .expect("create ground dir");
+        let fresh = tmp.path().join("ground.bak-v2");
+        tokio::fs::create_dir_all(&fresh)
+            .await
+            .expect("create fresh backup");
+
+        prune_stale_backups(&ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE)
+            .await
+            .expect("prune");
+
+        assert!(fresh.exists(), "backup younger than max_age must survive");
+    }
+
+    #[tokio::test]
+    async fn prune_stale_backups_keeps_non_numeric_suffix_even_if_stale() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ground_dir = tmp.path().join("ground");
+        tokio::fs::create_dir_all(&ground_dir)
+            .await
+            .expect("create ground dir");
+        // Shares the `<base>.bak-v` prefix but the suffix isn't all digits;
+        // must never be treated as a pruneable version backup.
+        let lookalike = tmp.path().join("ground.bak-vault");
+        tokio::fs::create_dir_all(&lookalike)
+            .await
+            .expect("create lookalike dir");
+
+        let max_age = Duration::from_secs(1);
+        let now = SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60);
+
+        prune_stale_backups(&ground_dir, now, max_age)
+            .await
+            .expect("prune");
+
+        assert!(
+            lookalike.exists(),
+            "non-numeric-suffix dir must survive even when older than max_age",
         );
     }
 }

@@ -40,6 +40,9 @@ pub use ipc::{
     ReadMarkdownResult,
 };
 pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
-pub use server::{DaemonArgs, run_daemon, serve, spawn_signal_handlers};
+pub use server::{
+    DaemonArgs, IDLE_READ_TIMEOUT, run_daemon, serve, serve_with_idle_timeout,
+    spawn_signal_handlers,
+};
 pub use socket::daemon_socket_path;
 pub use state::DaemonState;
