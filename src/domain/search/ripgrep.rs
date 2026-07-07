@@ -32,9 +32,11 @@ pub struct RipgrepHit {
 ///
 /// Failure modes:
 /// - `rg` missing on PATH → `HallouminateError::Io` (`io::ErrorKind::NotFound`)
-/// - `rg` exits non-zero AND nothing was emitted on stdout → error;
-///   non-zero with matches (e.g. exit 1 because a path was missing
-///   while another path matched) is tolerated.
+/// - `rg` exits 1 with no matches → `Ok(vec![])`; this is rg's normal
+///   "nothing found" signal, not an error.
+/// - `rg` exits >=2 (a real error) AND nothing was emitted on stdout →
+///   `HallouminateError::Search`; non-zero with matches already collected
+///   (e.g. one path vanished while another matched) is tolerated.
 pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<RipgrepHit>> {
     if paths.is_empty() || query.is_empty() || limit == 0 {
         return Ok(Vec::new());
@@ -84,19 +86,21 @@ pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<Ripg
     // worst case, but a clean wait is cheaper) AND so we can inspect its
     // exit status instead of masking real failures.
     let status = child.wait().await.map_err(HallouminateError::Io)?;
-    // rg exit codes: 0 = matches found, 1 = no matches, 2 = real error
-    // (bad pattern, IO failure, …). A non-zero exit with hits already
-    // collected is tolerated — e.g. exit 1/2 because one path vanished
-    // while another matched. A non-zero exit with NO hits is a genuine
-    // failure: surface it (with stderr) rather than returning an empty
-    // success that hides the error.
-    if !status.success() && hits.is_empty() {
+    // rg exit codes: 0 = matches found, 1 = no matches, >=2 = real error
+    // (bad pattern, IO failure, …). Exit 1 with no hits is rg's normal
+    // "nothing found" signal, not a failure — return an empty result. A
+    // non-zero exit with hits already collected is also tolerated — e.g.
+    // one path vanished while another matched. Only a real error (exit
+    // >=2) with NO hits is a genuine failure: surface it (with stderr)
+    // rather than returning an empty success that hides the error.
+    let exit_code = status.code();
+    if !status.success() && hits.is_empty() && exit_code != Some(1) {
         let mut stderr_buf = String::new();
         if let Some(mut err) = child.stderr.take() {
             let _ = err.read_to_string(&mut stderr_buf).await;
         }
-        return Err(HallouminateError::Embed(format!(
-            "rg failed ({status}) with no matches: {}",
+        return Err(HallouminateError::Search(format!(
+            "rg failed ({status}): {}",
             stderr_buf.trim()
         )));
     }
@@ -208,6 +212,46 @@ mod tests {
             hits[0].file_ref
         );
         assert_eq!(hits[0].line, 3);
+    }
+
+    #[tokio::test]
+    async fn no_lexical_match_returns_empty_ok_not_error() {
+        // rg exit 1 (no matches) must be a normal empty result, not an
+        // error — exit 1 is rg's documented "nothing found" signal.
+        if which("rg").is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "# Notes\n\nnothing relevant here.\n").unwrap();
+        let hits = run(
+            &[dir.path().to_string_lossy().into_owned()],
+            "caerbannog",
+            5,
+        )
+        .await
+        .expect("exit 1 with no hits must be Ok, not Err");
+        assert!(hits.is_empty(), "expected no hits, got {hits:?}");
+    }
+
+    #[tokio::test]
+    async fn real_rg_failure_errors_with_stderr() {
+        // A nonexistent search path makes rg exit 2 (real error), not 1.
+        if which("rg").is_err() {
+            return;
+        }
+        let err = run(&["/no/such/path/hallouminate-test".into()], "q", 5)
+            .await
+            .expect_err("exit >= 2 must surface as an error");
+        assert!(
+            matches!(err, HallouminateError::Search(_)),
+            "expected Search variant, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("no such file"),
+            "expected stderr detail in error message, got: {msg}"
+        );
     }
 
     fn which(bin: &str) -> std::io::Result<std::path::PathBuf> {

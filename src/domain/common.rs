@@ -104,6 +104,12 @@ pub enum HallouminateError {
     #[error("indexer: {0}")]
     Indexer(String),
 
+    /// A lexical search backend (ripgrep) failed with a real error —
+    /// not "no matches" (rg exit 1), but a spawn failure, bad invocation,
+    /// or IO error surfaced through rg's exit status >= 2.
+    #[error("search: {0}")]
+    Search(String),
+
     /// The on-disk store was written at an OLDER schema version than this build
     /// expects; the daemon-open path rebuilds it from source.
     #[error("store schema stale: found v{found}, expected v{expected} at {}", ground_dir.display())]
