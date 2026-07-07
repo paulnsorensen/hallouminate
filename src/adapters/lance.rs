@@ -554,6 +554,12 @@ pub struct LanceStore {
     /// `list_indices()` round-trip. The table is created once per instance,
     /// so a fresh `LanceStore` always starts unlatched.
     indexes_ensured: AtomicBool,
+    /// Latches true once `has_text_index` has observed the `text` FTS index
+    /// present, letting later `hybrid_search`/`fts_search` calls skip the
+    /// `list_indices()` round-trip on every query. Set unconditionally by
+    /// `ensure_search_indexes` too, since that call guarantees the FTS index
+    /// exists (unlike the row-gated ANN index) once it returns `Ok`.
+    text_index_present: AtomicBool,
 }
 
 impl LanceStore {
@@ -589,6 +595,7 @@ impl LanceStore {
             meta_path,
             embeddings_enabled,
             indexes_ensured: AtomicBool::new(false),
+            text_index_present: AtomicBool::new(false),
         })
     }
 
@@ -603,6 +610,52 @@ impl LanceStore {
             .await
             .map_err(map_lance_err)
             .map(|n| n as u64)
+    }
+
+    /// Compacts small fragments into larger ones and prunes superseded
+    /// dataset versions, keeping on-disk growth bounded across the
+    /// long-running daemon's lifetime. Every `merge_insert` (`apply_batch`),
+    /// `update` (`touch_mtime`), and `delete` (`delete_file`) call retains a
+    /// fragment + a version, so an unmaintained store accumulates both
+    /// without limit.
+    ///
+    /// `prune_older_than` bounds how far back pruning reaches rather than
+    /// always reclaiming every superseded version: this `LanceStore` is
+    /// always the single writer for its table (see the daemon's write-lane
+    /// invariant), so no concurrent *process* can have an older version
+    /// checked out for time travel -- but an in-process query stream that
+    /// snapshotted a version just before this call runs does not hold the
+    /// write lane, so a zero-duration prune could delete files out from
+    /// under it mid-scan. Passing a grace window (e.g. the daemon's
+    /// `MAINTENANCE_PRUNE_GRACE_SECS`) leaves recently-superseded versions
+    /// in place long enough for such in-flight queries to drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB compaction or version-cleanup fails.
+    pub async fn maintain(
+        &self,
+        prune_older_than: lancedb::table::Duration,
+    ) -> Result<lancedb::table::OptimizeStats> {
+        let mut stats = self
+            .table
+            .optimize(lancedb::table::OptimizeAction::Compact {
+                options: lancedb::table::CompactionOptions::default(),
+                remap_options: None,
+            })
+            .await
+            .map_err(map_lance_err)?;
+        let prune = self
+            .table
+            .optimize(lancedb::table::OptimizeAction::Prune {
+                older_than: Some(prune_older_than),
+                delete_unverified: Some(true),
+                error_if_tagged_old_versions: None,
+            })
+            .await
+            .map_err(map_lance_err)?;
+        stats.prune = prune.prune;
+        Ok(stats)
     }
 
     pub async fn corpus_chunk_stats(&self, corpus: &str) -> Result<CorpusChunkStats> {
@@ -726,6 +779,10 @@ impl LanceStore {
                 .await
                 .map_err(map_lance_err)?;
         }
+        // FTS is unconditionally ensured above (unlike the row-gated ANN
+        // index below), so it is guaranteed present at this point — latch it
+        // so `has_text_index` callers skip the `list_indices()` round-trip.
+        self.text_index_present.store(true, Ordering::Release);
         // Embeddings-OFF: the `embedding` column is all nulls, so there is
         // nothing to ANN-index. Skip entirely (spec: OFF mode builds no
         // vector index). The FTS index above is still built — it is the only
@@ -779,10 +836,17 @@ impl LanceStore {
     /// not built yet" as "no results" (a transient state during indexing)
     /// rather than surfacing the error.
     async fn has_text_index(&self) -> Result<bool> {
+        if self.text_index_present.load(Ordering::Acquire) {
+            return Ok(true);
+        }
         let existing = self.table.list_indices().await.map_err(map_lance_err)?;
-        Ok(existing
+        let present = existing
             .iter()
-            .any(|i| i.columns.iter().any(|c| c == "text")))
+            .any(|i| i.columns.iter().any(|c| c == "text"));
+        if present {
+            self.text_index_present.store(true, Ordering::Release);
+        }
+        Ok(present)
     }
 
     /// Updates the stored `mtime_ms` for every row of `(corpus, file_ref)`.
@@ -938,9 +1002,6 @@ impl LanceStore {
                 EMBEDDING_DIM
             )));
         }
-        if self.count_rows().await? == 0 {
-            return Ok(Vec::new());
-        }
         if !self.has_text_index().await? {
             return Ok(Vec::new());
         }
@@ -983,9 +1044,6 @@ impl LanceStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        if self.count_rows().await? == 0 {
-            return Ok(Vec::new());
-        }
         if !self.has_text_index().await? {
             return Ok(Vec::new());
         }
@@ -1091,6 +1149,113 @@ mod tests {
         assert_eq!(empty.indexed_files, 0);
         assert_eq!(empty.total_chunks, 0);
         assert_eq!(empty.last_indexed_ms, None);
+    }
+
+    #[tokio::test]
+    async fn maintain_prunes_versions_and_preserves_query_correctness() {
+        // Every apply_batch (merge_insert) and delete_file (delete) commits a
+        // new dataset version, so many small upserts + deletes build up a
+        // version history that maintain() (compact + prune) should shrink.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
+            .await
+            .expect("open store");
+
+        for i in 0..20 {
+            let pf = synthetic_prepared(&format!("/tmp/f{i}.md"), 1);
+            store.apply_batch(vec![pf]).await.expect("apply");
+        }
+        for i in 0..10 {
+            store
+                .delete_file("docs", &format!("/tmp/f{i}.md"))
+                .await
+                .expect("delete");
+        }
+
+        let versions_before = store
+            .table
+            .list_versions()
+            .await
+            .expect("list_versions")
+            .len();
+        assert!(
+            versions_before > 10,
+            "expected many retained versions before maintain: {versions_before}"
+        );
+
+        // Zero retention is safe here: the test has no concurrent queries,
+        // so there is no in-process read window for a zero-duration prune
+        // to race (see `maintain`'s doc comment).
+        store
+            .maintain(lancedb::table::Duration::zero())
+            .await
+            .expect("maintain");
+
+        let versions_after = store
+            .table
+            .list_versions()
+            .await
+            .expect("list_versions")
+            .len();
+        assert!(
+            versions_after < versions_before,
+            "maintain must prune old versions: before {versions_before}, after {versions_after}"
+        );
+
+        // Queries must still return correct rows after compaction + prune.
+        assert_eq!(
+            store.count_rows().await.unwrap(),
+            10,
+            "10 of 20 files remain after deleting the first 10"
+        );
+        let snaps = store.list_files("docs").await.expect("list_files");
+        assert!(
+            snaps.contains_key(&FileRef::new(PathBuf::from("/tmp/f10.md"))),
+            "surviving file must still be queryable after maintain"
+        );
+        assert!(
+            !snaps.contains_key(&FileRef::new(PathBuf::from("/tmp/f0.md"))),
+            "deleted file must stay gone after maintain"
+        );
+    }
+
+    #[tokio::test]
+    async fn has_text_index_latches_and_skips_list_indices_after_first_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
+            .await
+            .expect("open store");
+        assert!(
+            !store.text_index_present.load(Ordering::Relaxed),
+            "fresh store starts unlatched"
+        );
+
+        let pf = synthetic_prepared("/tmp/a.md", 1);
+        store.apply_batch(vec![pf]).await.expect("apply");
+        assert!(
+            store.text_index_present.load(Ordering::Relaxed),
+            "latch must be set once the FTS index is confirmed present"
+        );
+
+        // Drop the FTS index out-of-band so a genuine `list_indices()`
+        // round-trip would now observe it absent. Without the latch,
+        // `has_text_index` would re-query and return `false`; with the
+        // latch it must keep returning `true` without re-querying.
+        let indices = store.table.list_indices().await.expect("list_indices");
+        let text_index = indices
+            .iter()
+            .find(|i| i.columns.iter().any(|c| c == "text"))
+            .expect("FTS index present before drop");
+        store
+            .table
+            .drop_index(&text_index.name)
+            .await
+            .expect("drop FTS index");
+
+        assert!(
+            store.has_text_index().await.expect("has_text_index"),
+            "latched has_text_index must not re-query list_indices after the index was dropped"
+        );
     }
 
     #[test]
