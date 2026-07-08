@@ -25,7 +25,7 @@ use crate::adapters::lance::LanceStore;
 use crate::app::cli::{CorpusReport, IndexReport};
 use crate::app::config::{Config, ResolvedLayers, resolve_for_cwd};
 use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
-use crate::domain::corpus::blake3_file;
+use crate::domain::corpus::{blake3_file, find_wikilinks, normalize_slug, slug_identifiers};
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::corpus::sandbox::{
@@ -48,10 +48,10 @@ use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
-    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult,
-    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
-    ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusEntry,
+    CorpusStatsResult, DaemonRequest, DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest,
+    DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest,
+    ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -106,6 +106,9 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         }
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
+        }
+        DaemonRequestPayload::Backlinks(req) => {
+            handle_backlinks(&effective, &req_cwd, req).await
         }
         DaemonRequestPayload::CorpusStats { corpus } => {
             handle_corpus_stats(state, &effective, &req_cwd, corpus).await
@@ -940,6 +943,59 @@ async fn handle_read_markdown(
         absolute_path: dest.to_string_lossy().into_owned(),
         bytes: content.len() as u64,
         content,
+    })
+}
+
+async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let corpus =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
+    let entries = match list_corpus_files(&corpus) {
+        Ok(e) => e,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let target_slugs: std::collections::HashSet<String> =
+        slug_identifiers(&req.path).into_iter().collect();
+    let req_path = req.path.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let mut backlinks: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| entry.path != req_path)
+            .filter(|entry| {
+                let Ok(content) = std::fs::read_to_string(&entry.absolute_path) else {
+                    return false;
+                };
+                find_wikilinks(&content)
+                    .iter()
+                    .any(|link| target_slugs.contains(&normalize_slug(link)))
+            })
+            .map(|entry| entry.path)
+            .collect();
+        backlinks.sort();
+        backlinks
+    })
+    .await;
+    let backlinks = match found {
+        Ok(b) => b,
+        Err(join_err) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %join_err,
+                "backlinks scan task panicked",
+            );
+            return DaemonResponse::internal(format!("backlinks task panicked: {join_err}"));
+        }
+    };
+    DaemonResponse::ok(&BacklinksResult {
+        corpus: corpus.name,
+        path: req.path,
+        backlinks,
     })
 }
 
