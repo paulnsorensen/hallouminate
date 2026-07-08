@@ -205,7 +205,7 @@ mod tests {
             async { anyhow::Ok(()) }
         })
         .await;
-        assert!(result.is_err(), "connect to a missing socket must fail");
+        result.expect_err("connect to a missing socket must fail");
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
