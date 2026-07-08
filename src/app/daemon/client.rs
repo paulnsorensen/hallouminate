@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use super::bootstrap::ensure_daemon_running;
 use super::ipc::{DaemonRequest, DaemonResponse, ErrorKind};
 use super::socket::daemon_socket_path;
 
@@ -35,9 +36,34 @@ pub async fn daemon_client() -> anyhow::Result<DaemonClient> {
 /// One canonical entry point for CLI / MCP callers so the `--socket` flag
 /// path and the env-var / default path go through the same client builder.
 pub async fn client_for(socket: Option<&Path>) -> anyhow::Result<DaemonClient> {
+    client_for_with(socket, ensure_daemon_running).await
+}
+
+/// `client_for` with an injectable respawn step — the test seam behind it,
+/// mirroring [`super::lifecycle::restart_with`]. Production passes
+/// `ensure_daemon_running` (which no-ops under `HALLOUMINATE_SOCKET`). Only the
+/// default-socket path (`None`) self-heals: on connect failure it runs
+/// `respawn` once and retries the connect; a second failure returns the loud
+/// "daemon unavailable" error. Explicit-socket callers (`Some(path)`) —
+/// `lifecycle::status`/`stop` and test harnesses — never spawn: `stop` must not
+/// resurrect what it stopped (ADR-002).
+pub async fn client_for_with<F, Fut>(
+    socket: Option<&Path>,
+    respawn: F,
+) -> anyhow::Result<DaemonClient>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     match socket {
         Some(path) => connect_at(path).await,
-        None => daemon_client().await,
+        None => match daemon_client().await {
+            Ok(c) => Ok(c),
+            Err(_) => {
+                respawn().await?;
+                daemon_client().await
+            }
+        },
     }
 }
 
@@ -158,3 +184,32 @@ impl std::fmt::Display for DaemonRpcError {
 }
 
 impl std::error::Error for DaemonRpcError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn client_for_with_explicit_socket_never_respawns() {
+        // AC #4: an explicit-socket caller (Some(path)) must never spawn a
+        // daemon, even on connect failure — `stop`/`status` and test harnesses
+        // rely on this so `stop` cannot resurrect what it stopped (ADR-002).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("never.sock");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let result = client_for_with(Some(&missing), || {
+            calls_ref.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::Ok(()) }
+        })
+        .await;
+        result.expect_err("connect to a missing socket must fail");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "explicit-socket path must never invoke the respawn step",
+        );
+    }
+}

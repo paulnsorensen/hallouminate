@@ -30,7 +30,8 @@ mod watch;
 
 pub use bootstrap::ensure_daemon_running;
 pub use client::{
-    DaemonClient, DaemonRpcError, client_for, connect_at, daemon_client, daemon_client_unavailable,
+    DaemonClient, DaemonRpcError, client_for, client_for_with, connect_at, daemon_client,
+    daemon_client_unavailable,
 };
 pub use ipc::{
     AddMarkdownRequest, AddMarkdownResult, CorpusEntry, CorpusStatsResult, DaemonRequest,

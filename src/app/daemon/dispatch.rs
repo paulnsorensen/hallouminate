@@ -33,11 +33,16 @@ use crate::domain::corpus::sandbox::{
     ensure_corpus_allows_file, first_corpus_root, list_corpus_files, pick_corpus, read_no_follow,
     resolve_read_root, safe_relative_path,
 };
+use crate::domain::corpus::scan;
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
 use crate::domain::indexer::HandlerRegistry;
-use crate::domain::indexer::{DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan};
+#[cfg(test)]
+use crate::domain::indexer::Upsert;
+use crate::domain::indexer::{
+    DEFAULT_BATCH_SIZE, FileSnapshot, IndexPlan, apply, index_corpus, plan,
+};
 #[cfg(test)]
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
@@ -1188,6 +1193,84 @@ pub(super) async fn index_single_file(
     Ok(stats)
 }
 
+/// Non-blocking, incremental catch-up index over the daemon's watched
+/// (baseline) corpora, run once at boot to pick up edits made while the daemon
+/// was down (ADR-001 down-window). Per corpus it plans the disk-vs-index diff —
+/// stat + snapshot compare, no model — and acquires the embedder only when the
+/// plan has content to (re)embed, so an unchanged corpus never triggers an
+/// embedding-model load.
+pub(super) async fn catch_up_index(state: DaemonState) {
+    // Boot reconciliation is in-flight work: hold a connection guard for the
+    // whole sweep so idle-exit defers until it finishes instead of tearing a
+    // reindex mid-scan under a small `idle_exit_secs` (ADR-003).
+    let _conn = state.enter_connection();
+    let corpora = match state.baseline().effective_corpora() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: "hallouminate::daemon", error = %e,
+                "boot catch-up: could not enumerate baseline corpora; skipped");
+            return;
+        }
+    };
+    let store = state.store();
+    let registry = state.make_registry();
+    for corpus in corpora {
+        if !crate::domain::corpus::missing_roots(&corpus).is_empty() {
+            continue; // absent root; watcher skips it too, later boot picks it up
+        }
+        let _guard = match state.acquire_mutation_guard(&corpus.name).await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
+                    error = %e, "boot catch-up: could not lock corpus; skipped");
+                continue;
+            }
+        };
+        match catch_up_corpus(&state, &store, &registry, &corpus).await {
+            Ok(Some(stats)) => tracing::info!(target: "hallouminate::daemon",
+                corpus = %corpus.name, files_upserted = stats.files_upserted,
+                files_touched = stats.files_touched, files_deleted = stats.files_deleted,
+                "boot catch-up: reindexed corpus changed during down-window"),
+            Ok(None) => {}
+            Err(e) => tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
+                error = %e, "boot catch-up: reindex failed; skipped"),
+        }
+    }
+}
+
+/// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed
+/// (no work, no model load); `Ok(Some(stats))` = reindexed.
+async fn catch_up_corpus(
+    state: &DaemonState,
+    store: &LanceStore,
+    registry: &HandlerRegistry,
+    corpus: &CorpusConfig,
+) -> anyhow::Result<Option<crate::domain::indexer::ApplyStats>> {
+    let disk = scan(corpus)?;
+    let db = store.list_files(&corpus.name).await?;
+    let p = plan(disk, db);
+    if p.upserts.is_empty() && p.mtime_touches.is_empty() && p.deletes.is_empty() {
+        return Ok(None);
+    }
+    let mut embedder = if plan_needs_embedder(&p, state.embeddings_enabled()) {
+        Some(state.embedder().await?)
+    } else {
+        None
+    };
+    let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
+        .as_mut()
+        .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
+    let stats = apply(p, store, embedder_dyn, registry, corpus, DEFAULT_BATCH_SIZE).await?;
+    Ok(Some(stats))
+}
+
+/// Whether applying `plan` needs the embedder — embeddings on AND content to
+/// (re)embed. Deletes need none; an all-empty plan needs none, which is what
+/// keeps an unchanged corpus from loading the model.
+fn plan_needs_embedder(plan: &IndexPlan, embeddings_enabled: bool) -> bool {
+    embeddings_enabled && (!plan.upserts.is_empty() || !plan.mtime_touches.is_empty())
+}
+
 /// Best-effort `mkdir -p` on daemon-managed corpus roots so a fresh
 /// repository wiki (which only exists logically until the first write)
 /// doesn't blow up the first `list_files` / `index` call. Restricted to
@@ -1709,6 +1792,78 @@ mod tests {
         let cfg_dir = repo_root.join(".hallouminate");
         std::fs::create_dir_all(&cfg_dir).expect("mkdir .hallouminate");
         std::fs::write(cfg_dir.join("config.toml"), body).expect("write repo config");
+    }
+
+    #[test]
+    fn plan_needs_embedder_is_false_for_empty_plan() {
+        assert!(!plan_needs_embedder(&IndexPlan::default(), true));
+    }
+
+    #[test]
+    fn plan_needs_embedder_is_false_when_embeddings_disabled() {
+        let mut plan = IndexPlan::default();
+        plan.upserts.push(Upsert {
+            file: FileRef::from(std::path::PathBuf::from("/x.md")),
+            mtime: Mtime(1),
+        });
+        assert!(!plan_needs_embedder(&plan, false));
+    }
+
+    #[test]
+    fn plan_needs_embedder_is_true_for_upserts_when_enabled() {
+        let mut plan = IndexPlan::default();
+        plan.upserts.push(Upsert {
+            file: FileRef::from(std::path::PathBuf::from("/x.md")),
+            mtime: Mtime(1),
+        });
+        assert!(plan_needs_embedder(&plan, true));
+    }
+
+    #[test]
+    fn plan_needs_embedder_is_false_for_deletes_only() {
+        let mut plan = IndexPlan::default();
+        plan.deletes.push(FileSnapshot::default());
+        assert!(!plan_needs_embedder(&plan, true));
+    }
+
+    #[tokio::test]
+    async fn catch_up_reindexes_changed_corpus_and_skips_unchanged() {
+        // AC #6: a corpus edited during the daemon's down-window is picked up
+        // by the boot catch-up sweep; a second pass over an unchanged corpus
+        // does no work (Ok(None)) and loads no model. Embeddings OFF keeps it
+        // hermetic.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs_src");
+        std::fs::create_dir_all(&root).expect("mkdir docs_src");
+        let ground = tmp.path().join("ground");
+        let baseline = format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n[embeddings]\nenabled = false\n",
+            root.display(),
+        );
+        let state = state_with_ground(&ground, &baseline).await;
+        std::fs::write(root.join("a.md"), "# Title\n\nbody\n").expect("write a.md");
+
+        catch_up_index(state.clone()).await;
+        assert_eq!(
+            state.store().list_files("docs").await.expect("list").len(),
+            1,
+            "boot catch-up must index the file created during the down-window",
+        );
+
+        let corpus = state
+            .baseline()
+            .effective_corpora()
+            .expect("corpora")
+            .into_iter()
+            .find(|c| c.name == "docs")
+            .expect("docs corpus present");
+        assert!(
+            catch_up_corpus(&state, &state.store(), &state.make_registry(), &corpus)
+                .await
+                .expect("catch_up_corpus")
+                .is_none(),
+            "an unchanged corpus must produce no work (Ok(None)) and load no model",
+        );
     }
 
     #[tokio::test]

@@ -1141,6 +1141,249 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
     );
 }
 
+#[tokio::test]
+async fn idle_exit_removes_socket_and_lockfile_and_refuses_new_connections() {
+    // Quality gate (AC1): after `idle_exit_secs` of no activity with zero
+    // active connections the daemon exits cleanly on its own — the accept
+    // loop drains, the socket is removed, and a subsequent connect fails — so
+    // the OS reclaims all memory (ADR-001). This is the *self-driven* twin of
+    // the IPC/`SIGTERM` cleanup tests above: no shutdown is ever sent and no
+    // connection is ever held, so the idle clock stays quiet from boot and
+    // the watcher cancels the shutdown token after ~`idle_exit_secs`.
+    // Embeddings are disabled to keep the test hermetic (no model download).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let socket = tmp.path().join("daemon.sock");
+    let lockfile = tmp.path().join("daemon.sock.lock");
+    let mut cfg = docs_cfg(&ground, &corpus_root);
+    cfg.daemon.idle_exit_secs = 1;
+    cfg.embeddings.enabled = false;
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let socket_clone = socket.clone();
+    let handle = tokio::spawn(async move { serve(&state, &socket_clone).await });
+
+    // Wait for the socket to appear; hold NO connection afterwards.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(lockfile.exists(), "lockfile must exist while daemon runs");
+
+    // The idle-exit watcher fires within ~idle_exit_secs and drives the same
+    // graceful cleanup as an IPC `Shutdown`; the serve future returns Ok.
+    let served = timeout(Duration::from_secs(10), handle)
+        .await
+        .expect("serve must return after idle-exit")
+        .expect("join ok");
+    served.expect("serve returns Ok on idle-exit shutdown");
+
+    assert!(
+        !socket.exists(),
+        "socket must be removed on idle-exit shutdown"
+    );
+    let err = connect_at(&socket)
+        .await
+        .expect_err("connect must fail after idle-exit");
+    assert!(
+        format!("{err:#}").contains("daemon unavailable"),
+        "post-idle-exit connect must report daemon unavailable: {err:#}"
+    );
+
+    // AC1 "flock released": cleanup drops the single-instance lock but leaves
+    // the lockfile on disk, so the file persists while its advisory lock is
+    // free. A fresh non-blocking exclusive flock on that same lockfile must
+    // succeed — if idle-exit had leaked the lock, this returns EWOULDBLOCK and
+    // the next daemon could never rebind (the whole respawn premise, ADR-002).
+    // This is the assertion that makes the "and_lockfile" in the name real;
+    // the connect-failure above only proves the socket is gone.
+    assert!(
+        lockfile.exists(),
+        "lockfile persists after idle-exit; only its advisory lock is released"
+    );
+    let relock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lockfile)
+        .expect("reopen lockfile after idle-exit");
+    rustix::fs::flock(
+        &relock,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .expect("idle-exit must release the single-instance flock so a fresh daemon can rebind");
+    drop(relock);
+}
+
+#[tokio::test]
+async fn client_for_default_socket_respawns_exactly_once_then_fails_loudly() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // AC3: the default-socket respawn seam (`client_for(None)`) self-heals at
+    // most once — on connect failure it runs the respawn step a single time,
+    // retries the connect, and, if the daemon still is not up, returns the
+    // loud "daemon unavailable" error rather than looping. Point the socket at
+    // a path that is never bound and give a respawn closure that counts its
+    // calls but deliberately does NOT bring up a daemon. Serialized against
+    // other `HALLOUMINATE_SOCKET` mutators via `EnvGuard`'s static mutex.
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing_sock = tmp.path().join("never-bound.sock");
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &missing_sock) };
+
+    let respawns = Arc::new(AtomicUsize::new(0));
+    let respawns_ref = Arc::clone(&respawns);
+    let result = hallouminate::app::daemon::client_for_with(None, || {
+        respawns_ref.fetch_add(1, Ordering::SeqCst);
+        async { anyhow::Ok(()) }
+    })
+    .await;
+
+    assert_eq!(
+        respawns.load(Ordering::SeqCst),
+        1,
+        "default-socket path must invoke the respawn step exactly once"
+    );
+    let err = result.expect_err("connect must fail when respawn brings up no daemon");
+    assert!(
+        format!("{err:#}").contains("daemon unavailable"),
+        "failed respawn must report daemon unavailable: {err:#}"
+    );
+}
+
+#[tokio::test]
+async fn client_for_default_socket_respawns_then_returns_the_reconnected_client() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    // AC3 retry + AC5 transparent respawn: when the first connect on the
+    // default socket fails, client_for(None) runs the respawn step once and
+    // then RETRIES the connect — the retry succeeding is exactly what makes a
+    // mid-session idle-exit invisible to MCP/CLI callers. The respawn closure
+    // stands in for `ensure_daemon_running` by binding a listener at the socket
+    // path (connect_at is a bare connect, so a bound listener is a reachable
+    // "daemon"); the returned client must be Ok and target that socket. A
+    // regression that dropped the retry-after-respawn would surface the first
+    // connect error instead — this test fails, the exactly-once test does not.
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let sock = tmp.path().join("respawned.sock");
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &sock) };
+
+    let respawns = Arc::new(AtomicUsize::new(0));
+    // Keep the stub listener alive past the retry connect; a listener dropped
+    // inside the closure would leave the retry dialing a dead socket.
+    let listener_holder: Arc<Mutex<Option<tokio::net::UnixListener>>> = Arc::new(Mutex::new(None));
+    let respawns_ref = Arc::clone(&respawns);
+    let holder_ref = Arc::clone(&listener_holder);
+    let sock_ref = sock.clone();
+
+    let result = hallouminate::app::daemon::client_for_with(None, move || async move {
+        respawns_ref.fetch_add(1, Ordering::SeqCst);
+        let listener = tokio::net::UnixListener::bind(&sock_ref)?;
+        *holder_ref.lock().unwrap() = Some(listener);
+        anyhow::Ok(())
+    })
+    .await;
+
+    assert_eq!(
+        respawns.load(Ordering::SeqCst),
+        1,
+        "respawn must run exactly once before the successful retry"
+    );
+    let client = result.expect("retry connect after a successful respawn must return Ok");
+    assert_eq!(
+        client.socket_path(),
+        sock.as_path(),
+        "the reconnected client must target the respawned socket"
+    );
+}
+
+#[tokio::test]
+async fn open_warns_and_names_replacement_when_idle_evict_secs_is_set() {
+    // AC7: a non-default legacy `embeddings.idle_evict_secs` must still parse,
+    // take no eviction action (the eviction task is deleted), and emit a
+    // deprecation warning that NAMES the replacement `[daemon].idle_exit_secs`
+    // so operators know where to migrate. Capturing the tracing output proves
+    // the warning actually fires with the migration guidance — a value-only
+    // parse assertion would pass even if the warn were dropped.
+    let logs = capture_daemon_warnings(|| async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        cfg.embeddings.idle_evict_secs += 1; // any non-default value trips the warning
+        DaemonState::open(cfg, None).await.expect("open state");
+    })
+    .await;
+    assert!(
+        logs.contains("deprecated"),
+        "a non-default idle_evict_secs must log a deprecation warning; captured: {logs:?}"
+    );
+    assert!(
+        logs.contains("[daemon].idle_exit_secs"),
+        "the deprecation warning must name the replacement config key; captured: {logs:?}"
+    );
+}
+
+#[tokio::test]
+async fn open_does_not_warn_when_idle_evict_secs_is_default() {
+    // The deprecation warning must be conditional on a non-default value, not
+    // fired unconditionally — otherwise every default config nags on boot.
+    // Guards against dropping the `!= default` guard around the warn.
+    let logs = capture_daemon_warnings(|| async {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        DaemonState::open(cfg, None).await.expect("open state");
+    })
+    .await;
+    assert!(
+        !logs.contains("deprecated"),
+        "a default idle_evict_secs must not log a deprecation warning; captured: {logs:?}"
+    );
+}
+
+/// Run `f` with a thread-local tracing subscriber that captures WARN-level
+/// output into a string, so a test can assert which warnings a code path emits.
+/// `#[tokio::test]` uses a current-thread runtime, so the thread-local default
+/// holds across the awaits inside `f`.
+async fn capture_daemon_warnings<F, Fut>(f: F) -> String
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer_buf = std::sync::Arc::clone(&buf);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || CaptureWriter(std::sync::Arc::clone(&writer_buf)))
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    f().await;
+    drop(guard);
+    let bytes = buf.lock().unwrap().clone();
+    String::from_utf8(bytes).expect("captured logs are utf8")
+}
+
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 // ─── Curd 2: lifecycle status / restart ──────────────────────────────────
 
 #[tokio::test]
