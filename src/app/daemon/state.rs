@@ -508,6 +508,23 @@ impl DaemonState {
         )
     }
 
+    /// Seconds remaining until the idle-exit deadline (last activity +
+    /// `idle_exit_secs`): the full window right after activity, saturating to
+    /// zero once the window has elapsed. The idle-exit watcher sleeps this
+    /// long instead of polling on a fixed period, so exit lands within one
+    /// short interval of the true deadline rather than overshooting by up to a
+    /// whole period.
+    pub(crate) fn secs_until_idle(&self, idle_exit_secs: u64) -> u64 {
+        self.secs_until_idle_at(idle_exit_secs, unix_secs())
+    }
+
+    /// Injectable-clock variant so tests drive a synthetic `now_secs`.
+    fn secs_until_idle_at(&self, idle_exit_secs: u64, now_secs: u64) -> u64 {
+        let elapsed =
+            now_secs.saturating_sub(self.inner.last_activity_secs.load(Ordering::Relaxed));
+        idle_exit_secs.saturating_sub(elapsed)
+    }
+
     /// Unix-second timestamp of the most recent activity. Test accessor.
     #[cfg(test)]
     pub(crate) fn last_activity_secs(&self) -> u64 {
@@ -733,6 +750,40 @@ mod tests {
         assert!(
             !state.should_idle_exit_at(300, last + 299),
             "elapsed = idle_secs - 1 (< threshold); must not exit",
+        );
+    }
+
+    #[tokio::test]
+    async fn secs_until_idle_counts_down_to_the_deadline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let last = state.last_activity_secs();
+        // Full window remains the instant activity lands.
+        assert_eq!(
+            state.secs_until_idle_at(300, last),
+            300,
+            "no time elapsed since activity; the full window remains",
+        );
+        // Partway through the window, only the remainder is left.
+        assert_eq!(
+            state.secs_until_idle_at(300, last + 100),
+            200,
+            "100 s elapsed of a 300 s window; 200 s remain",
+        );
+        // Saturates to zero once the window has fully elapsed, and stays there
+        // well past it (no underflow).
+        assert_eq!(
+            state.secs_until_idle_at(300, last + 300),
+            0,
+            "window exactly elapsed; deadline reached",
+        );
+        assert_eq!(
+            state.secs_until_idle_at(300, last + 10_000),
+            0,
+            "well past the window; saturates to zero, never underflows",
         );
     }
 

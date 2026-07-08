@@ -110,10 +110,16 @@ fn spawn_idle_exit(state: &DaemonState, idle_exit_secs: u64) {
     let cancel = state.shutdown_token().clone();
     tokio::spawn(async move {
         loop {
+            // Sleep to the deadline, not a fixed period: recomputing the
+            // remaining window each iteration bounds idle-exit overshoot to
+            // ~one short sleep regardless of `idle_exit_secs`. The `.max(1)`
+            // floor avoids a busy-loop when the deadline has already passed
+            // but a connection is still active (`should_idle_exit` false).
+            let secs = state.secs_until_idle(idle_exit_secs).max(1);
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(idle_exit_secs)) => {
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
                     if state.should_idle_exit(idle_exit_secs) {
                         tracing::info!(
                             target: "hallouminate::daemon",
