@@ -867,7 +867,7 @@ fn cleanup_temp(parent: &Dir, name: &OsStr) {
 //
 // The #48 Windows spike disproved that premise: `Errno::NOTDIR` and
 // `Errno::ISDIR` are gated `#[cfg(not(windows))]` upstream and do not exist on
-// windows-msvc. So the rustix path is unix-only here and a `#[cfg(not(unix))]`
+// windows-msvc. So the rustix path is unix-only here and a `#[cfg(windows)]`
 // arm supplies the MSVC CRT errno values directly. cap-std on Windows surfaces
 // Win32 error codes rather than MSVC-CRT errno, so these matches may not fire
 // at runtime and `WriteErrorKind::{Symlink,InvalidPath}` may degrade to `::Io`
@@ -882,13 +882,13 @@ const ENOTDIR: i32 = rustix::io::Errno::NOTDIR.raw_os_error();
 const EISDIR: i32 = rustix::io::Errno::ISDIR.raw_os_error();
 #[cfg(unix)]
 const EINVAL: i32 = rustix::io::Errno::INVAL.raw_os_error();
-#[cfg(not(unix))]
+#[cfg(windows)]
 const ELOOP: i32 = 114;
-#[cfg(not(unix))]
+#[cfg(windows)]
 const ENOTDIR: i32 = 20;
-#[cfg(not(unix))]
+#[cfg(windows)]
 const EISDIR: i32 = 21;
-#[cfg(not(unix))]
+#[cfg(windows)]
 const EINVAL: i32 = 22;
 
 /// Classify an error from a non-create path operation (open_dir, open,
@@ -1159,6 +1159,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&written).unwrap(), "# leaf\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_rejects_intermediate_symlink_without_creating_outside_dirs() {
         // The whole reason this helper exists: a symlinked intermediate dir
@@ -1182,6 +1183,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_rejects_final_component_symlink() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1208,6 +1210,7 @@ mod tests {
         assert!(matches!(err.kind, WriteErrorKind::Exists), "{err:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_classifies_nul_byte_filename_as_invalid_path() {
         // Defense-in-depth: even if a caller bypasses `safe_relative_path`
@@ -1269,6 +1272,7 @@ mod tests {
         assert_eq!(got, b"# hardened\n");
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_no_follow_rejects_symlinked_leaf_with_symlink_kind() {
         // Mirrors `atomic_write_no_follow_rejects_final_component_symlink`
@@ -1288,6 +1292,7 @@ mod tests {
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_no_follow_rejects_symlinked_intermediate_dir() {
         // The pre-fix daemon path missed this exact case (leaf-only
@@ -1402,6 +1407,7 @@ mod tests {
         assert_eq!(err.source.kind(), std::io::ErrorKind::NotFound, "{err:?}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn resolve_read_root_symlinked_leaf_bounces_without_falling_through() {
         // A symlinked leaf under the first root is a security stop: it must
@@ -1464,6 +1470,7 @@ mod tests {
         assert!(!target.exists(), "file must be gone");
     }
 
+    #[cfg(unix)]
     #[test]
     fn delete_no_follow_rejects_symlinked_leaf_without_unlinking_target() {
         // Lock the security contract: a symlinked leaf must surface as
@@ -1486,6 +1493,7 @@ mod tests {
         assert!(root.join("link.md").exists(), "symlink must survive too");
     }
 
+    #[cfg(unix)]
     #[test]
     fn delete_no_follow_rejects_symlinked_intermediate_dir() {
         // Same shape as the read test — covers the unlink path. The
