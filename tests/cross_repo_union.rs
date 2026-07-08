@@ -569,3 +569,118 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
         "both corpora must appear in attribution even when chunk_ids collide; saw: {corpora_seen:?}"
     );
 }
+
+// ── Package C: ground_union efficiency (single embed, no clones) ─────────
+
+use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
+
+/// Wraps `StubEmbedder`, counting `embed_batch` invocations. Regression guard
+/// for the union query-embed hoist: a multi-corpus union must embed the query
+/// exactly ONCE and share the vector, not re-embed per corpus (each embed is
+/// a forward pass serialized on the embedder mutex).
+struct CountingEmbedder {
+    calls: usize,
+}
+
+impl EmbedBatch for CountingEmbedder {
+    fn embed_batch(
+        &mut self,
+        texts: &[String],
+        role: EmbedRole,
+    ) -> hallouminate::domain::common::Result<
+        Vec<[f32; hallouminate::adapters::lance::EMBEDDING_DIM]>,
+    > {
+        self.calls += 1;
+        StubEmbedder.embed_batch(texts, role)
+    }
+}
+
+/// AC: `ground_union` must embed the query exactly once and reuse the vector
+/// across every corpus in the union set, regardless of corpus count.
+#[tokio::test]
+async fn ground_union_embeds_query_exactly_once_across_three_corpora() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let alpha = seed_repo_wiki(parent.path(), "alpha", "zphyxnort");
+    let beta = seed_repo_wiki(parent.path(), "beta", "qwobblefrotz");
+    let gamma = seed_repo_wiki(parent.path(), "gamma", "vummelthwap");
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let targets = index_wikis(&store, &[alpha, beta, gamma]).await;
+    assert_eq!(targets.len(), 3, "three corpora in the union set");
+
+    let mut embedder = CountingEmbedder { calls: 0 };
+    ground_union(
+        "distinctive token wiki",
+        &targets,
+        &store,
+        Some(&mut embedder),
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("union ground");
+
+    assert_eq!(
+        embedder.calls, 1,
+        "query must be embedded exactly once and shared across all corpora, not re-embedded per corpus"
+    );
+}
+
+/// Regression guard for the corpus-queue refactor (finding 2): the queue keyed
+/// by chunk_id must be built from borrowed `chunk_id`/corpus-name, then the
+/// hits themselves MOVED (not cloned) into the final docs. Every chunk's exact
+/// snippet text must still equal its true source file's body — a broken move
+/// (e.g. building docs from a stale or duplicated hit) would corrupt or lose
+/// this text even though attribution-only checks elsewhere might still pass.
+#[tokio::test]
+async fn union_ground_preserves_exact_hit_text_after_queue_refactor() {
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let alpha = seed_repo_wiki(parent.path(), "alpha", "zphyxnort");
+    let beta = seed_repo_wiki(parent.path(), "beta", "qwobblefrotz");
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let targets = index_wikis(&store, &[alpha, beta]).await;
+
+    let mut embedder = StubEmbedder;
+    let resp = ground_union(
+        "distinctive token wiki",
+        &targets,
+        &store,
+        Some(&mut embedder),
+        None,
+        GroundOpts::default(),
+    )
+    .await
+    .expect("union ground");
+
+    let expected_snippet = |repo: &str, token: &str| {
+        format!("The distinctive token {token} lives only in {repo}'s wiki.")
+    };
+
+    let mut checked = 0usize;
+    for doc in resp.docs.values() {
+        for chunk in &doc.chunks {
+            let (repo, token) = match doc.corpus.as_str() {
+                "repo:alpha:wiki" => ("alpha", "zphyxnort"),
+                "repo:beta:wiki" => ("beta", "qwobblefrotz"),
+                other => panic!("unexpected corpus: {other}"),
+            };
+            assert!(
+                chunk.snippet.contains(&expected_snippet(repo, token)),
+                "chunk snippet must carry {repo}'s exact source text unmodified, got: {:?}",
+                chunk.snippet
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 2,
+        "expected chunks from both corpora, checked {checked}"
+    );
+}

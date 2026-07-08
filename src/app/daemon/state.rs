@@ -44,6 +44,16 @@ const CHUNK_BUDGET_TOKENS: usize = 384;
 /// pruned at daemon boot; they're recoverable-until-pruned, not permanent.
 pub(crate) const STALE_BACKUP_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
+/// Interval between LanceDB maintenance ticks (compaction + version prune).
+const MAINTENANCE_INTERVAL_SECS: u64 = 1800;
+
+/// Grace window for `maintain`'s prune cutoff: versions younger than this
+/// are retained, letting in-flight queries drain before their snapshotted
+/// version's files can be deleted. Queries don't hold the write lane, so
+/// this is the only thing protecting them from a maintenance tick's version
+/// prune.
+const MAINTENANCE_PRUNE_GRACE_SECS: u64 = 300;
+
 fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -317,6 +327,8 @@ impl DaemonState {
         let embedder_arc = Arc::new(Mutex::new(embedder));
         let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
         let last_embed_use = Arc::new(AtomicU64::new(unix_secs()));
+        let store = Arc::new(store);
+        let write_lane = Arc::new(Semaphore::new(1));
 
         if idle_evict_secs > 0 {
             let embedder_ref = Arc::clone(&embedder_arc);
@@ -357,15 +369,62 @@ impl DaemonState {
             });
         }
 
+        // Low-frequency LanceDB maintenance tick (compaction + version
+        // prune, see `LanceStore::maintain`). Runs under the write-lane
+        // permit alone -- maintenance spans the whole table, not one
+        // corpus, so there is no corpus lock to acquire first; taking only
+        // the write lane still preserves the documented `corpus ->
+        // write_lane` order (a lock that is never acquired can't be
+        // acquired out of order).
+        {
+            let store_ref = Arc::clone(&store);
+            let write_lane_ref = Arc::clone(&write_lane);
+            let cancel = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(MAINTENANCE_INTERVAL_SECS)) => {
+                            let Ok(_permit) = write_lane_ref.acquire().await else { break };
+                            match store_ref
+                                .maintain(lancedb::table::Duration::seconds(
+                                    MAINTENANCE_PRUNE_GRACE_SECS as i64,
+                                ))
+                                .await
+                            {
+                                Ok(stats) => {
+                                    tracing::info!(
+                                        target: "hallouminate::lance",
+                                        fragments_removed = stats.compaction.as_ref().map(|c| c.fragments_removed),
+                                        fragments_added = stats.compaction.as_ref().map(|c| c.fragments_added),
+                                        old_versions_pruned = stats.prune.as_ref().map(|p| p.old_versions),
+                                        "periodic LanceDB maintenance completed",
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "hallouminate::lance",
+                                        error = %e,
+                                        "periodic LanceDB maintenance failed",
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         Ok(DaemonState {
             inner: Arc::new(DaemonStateInner {
                 embeddings_enabled: cfg.embeddings.enabled,
                 baseline: cfg,
                 baseline_xdg_path: xdg_path,
-                store: Arc::new(store),
+                store,
                 ground_dir,
                 corpus_locks: CorpusLockMap::default(),
-                write_lane: Arc::new(Semaphore::new(1)),
+                write_lane,
                 embedder: embedder_arc,
                 crossencoders: crossencoders_arc,
                 last_embed_use_secs: last_embed_use,
