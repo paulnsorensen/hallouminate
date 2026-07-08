@@ -69,6 +69,9 @@ pub enum DaemonRequestPayload {
     ReadMarkdown(ReadMarkdownRequest),
     /// Unlink a markdown file from a corpus root and prune its index rows.
     DeleteMarkdown(DeleteMarkdownRequest),
+    /// Find every page in a corpus that links to a given page via a
+    /// `[[wikilink]]`.
+    Backlinks(BacklinksRequest),
     /// Read-only index health summary for a corpus: file counts, chunk count,
     /// newest index timestamp, and unindexed-file count.
     CorpusStats { corpus: Option<String> },
@@ -142,6 +145,12 @@ pub struct ReadMarkdownRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteMarkdownRequest {
     pub corpus: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklinksRequest {
+    pub corpus: Option<String>,
     pub path: String,
 }
 
@@ -247,6 +256,16 @@ pub struct DeleteMarkdownResult {
     pub path: String,
     pub absolute_path: String,
     pub file_ref: String,
+}
+
+/// `Backlinks` payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacklinksResult {
+    pub corpus: String,
+    pub path: String,
+    /// Corpus-relative paths of every page whose content links to `path` via
+    /// a `[[wikilink]]`.
+    pub backlinks: Vec<String>,
 }
 
 /// `CorpusStats` payload.

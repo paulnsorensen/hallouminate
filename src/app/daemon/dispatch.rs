@@ -745,6 +745,11 @@ async fn handle_add_markdown(
     let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
     warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
+    if let Ok(entries) = crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
+        let known_slugs =
+            crate::domain::corpus::corpus_slugs(entries.iter().map(|e| e.path.as_str()));
+        warnings.extend(crate::domain::corpus::lint_wikilinks(&req.content, &known_slugs));
+    }
 
     // Symlink-safe atomic write via the shared sandbox helper. Walks every
     // path component with `O_NOFOLLOW | O_DIRECTORY`, so a symlinked
