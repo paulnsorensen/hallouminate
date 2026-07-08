@@ -117,12 +117,10 @@ fn ranked_paths(docs: &BTreeMap<String, DocFile>) -> Vec<(String, DocFile)> {
 /// 1-indexed rank of the first doc whose absolute path ends with one of
 /// `expected`'s relative paths, or `None` if absent from the ranked list.
 fn rank_of_expected(ranked: &[(String, DocFile)], expected: &[String]) -> Option<usize> {
-    ranked.iter().position(|(path, _)| {
-        expected
-            .iter()
-            .any(|rel| path.ends_with(rel.as_str()))
-    })
-    .map(|idx| idx + 1)
+    ranked
+        .iter()
+        .position(|(path, _)| expected.iter().any(|rel| path.ends_with(rel.as_str())))
+        .map(|idx| idx + 1)
 }
 
 struct QueryResult {
@@ -197,7 +195,10 @@ fn mrr(results: &[QueryResult]) -> f64 {
 fn z_threshold_sweep(results: &[QueryResult]) {
     let thresholds = [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0];
     println!("\n  z-score threshold sweep (fusion+rerank top-1 gate):");
-    println!("  {:>9} | {:>14} | {:>16}", "threshold", "gate would keep", "top1-correct kept");
+    println!(
+        "  {:>9} | {:>14} | {:>16}",
+        "threshold", "gate would keep", "top1-correct kept"
+    );
     for t in thresholds {
         let kept = results
             .iter()
@@ -207,9 +208,7 @@ fn z_threshold_sweep(results: &[QueryResult]) {
             .iter()
             .filter(|r| r.rank == Some(1) && r.top1_z.is_none_or(|z| z >= t))
             .count();
-        println!(
-            "  {t:>9.1} | {kept:>14} | {correct_kept:>16}",
-        );
+        println!("  {t:>9.1} | {kept:>14} | {correct_kept:>16}",);
     }
 }
 
@@ -223,11 +222,11 @@ async fn ground_recall_and_mrr_across_variants() {
         queries.len()
     );
 
-    println!("\n=== ground retrieval eval — {} queries ===", queries.len());
     println!(
-        "{:<45} | {:>10} | {:>10}",
-        "variant", "recall@5", "mrr"
+        "\n=== ground retrieval eval — {} queries ===",
+        queries.len()
     );
+    println!("{:<45} | {:>10} | {:>10}", "variant", "recall@5", "mrr");
 
     let mut rerank_results: Option<Vec<QueryResult>> = None;
     for variant in VARIANTS {
