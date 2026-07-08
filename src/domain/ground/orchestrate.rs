@@ -28,6 +28,11 @@ const RERANK_TIMEOUT: Duration = Duration::from_secs(2);
 /// to fusion order. Returns `(hits, applied)`; `applied` is `false` on
 /// timeout so callers gate z-score normalization on it, preserving the
 /// "z-score only when the cross-encoder ran" invariant on the fallback path.
+/// The abandoned thread still owns the boxed crossencoder (on the daemon
+/// path, a `CrossencoderGuard` holding the shared crossencoder mutex), so
+/// that mutex stays locked until the stalled call drains — concurrent rerank
+/// requests serialize behind it, exactly as they did before the timeout
+/// existed (#139 accepted tradeoff).
 async fn rerank_with_timeout(
     mut crossencoder: Box<dyn Crossencoder>,
     query: String,
@@ -35,6 +40,7 @@ async fn rerank_with_timeout(
     timeout: Duration,
 ) -> Result<(Vec<SearchHit>, bool)> {
     let fallback = hits.clone();
+    let query_log = query.clone();
     let handle = tokio::task::spawn_blocking(move || {
         let mut hits = hits;
         crossencoder.rerank(&query, &mut hits)?;
@@ -46,7 +52,14 @@ async fn rerank_with_timeout(
         Ok(Err(join_err)) => Err(HallouminateError::Embed(format!(
             "crossencoder task panicked: {join_err}"
         ))),
-        Err(_elapsed) => Ok((fallback, false)),
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                query = %query_log,
+                "crossencoder rerank timed out; falling back to fusion order"
+            );
+            Ok((fallback, false))
+        }
     }
 }
 /// Strip the first matching corpus root prefix from `abs_path`, returning
