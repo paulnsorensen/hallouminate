@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hallouminate::app::config::Config;
-use hallouminate::app::daemon::{DaemonState, serve};
+use hallouminate::app::daemon::{DaemonState, IDLE_READ_TIMEOUT, serve_with_idle_timeout};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -24,10 +24,16 @@ pub struct DaemonHarness {
 }
 
 impl DaemonHarness {
-    /// Boot a daemon against the given config, bound to a tempdir socket.
-    /// The returned harness owns the tempdir, daemon task, and shutdown
-    /// channel; drop tears them all down.
+    /// Boot a daemon against the given config, bound to a tempdir socket,
+    /// using the production idle-read timeout.
     pub async fn spawn(cfg: Config) -> Self {
+        Self::spawn_with_idle_timeout(cfg, IDLE_READ_TIMEOUT).await
+    }
+
+    /// Same as [`Self::spawn`], but with an explicit per-connection
+    /// idle-read timeout — lets tests exercise the idle-timeout behavior
+    /// without waiting out the real production default.
+    pub async fn spawn_with_idle_timeout(cfg: Config, idle_timeout: Duration) -> Self {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("daemon.sock");
 
@@ -46,7 +52,7 @@ impl DaemonHarness {
         let socket_clone = socket.clone();
         let handle = tokio::spawn(async move {
             tokio::select! {
-                res = serve(&state, &socket_clone) => res,
+                res = serve_with_idle_timeout(&state, &socket_clone, idle_timeout) => res,
                 _ = rx => Ok(()),
             }
         });

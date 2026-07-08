@@ -98,8 +98,8 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         }
         DaemonRequestPayload::Index(req) => handle_index(state, &effective, req).await,
         DaemonRequestPayload::ListCorpora => handle_list_corpora(&effective),
-        DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, &req_cwd, req),
-        DaemonRequestPayload::ListTree(req) => handle_list_tree(&effective, &req_cwd, req),
+        DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, &req_cwd, req).await,
+        DaemonRequestPayload::ListTree(req) => handle_list_tree(&effective, &req_cwd, req).await,
         DaemonRequestPayload::AddMarkdown(req) => handle_add_markdown(state, &effective, req).await,
         DaemonRequestPayload::ReadMarkdown(req) => {
             handle_read_markdown(&effective, &req_cwd, req).await
@@ -232,7 +232,7 @@ fn handle_list_corpora(cfg: &Config) -> DaemonResponse {
     DaemonResponse::ok(&entries)
 }
 
-fn handle_list_files(cfg: &Config, cwd: &Path, req: ListFilesRequest) -> DaemonResponse {
+async fn handle_list_files(cfg: &Config, cwd: &Path, req: ListFilesRequest) -> DaemonResponse {
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -244,14 +244,14 @@ fn handle_list_files(cfg: &Config, cwd: &Path, req: ListFilesRequest) -> DaemonR
         };
     // Ensure wiki dir exists so an unindexed repository wiki doesn't error
     // out the first list call.
-    ensure_paths_exist(&corpus);
+    ensure_paths_exist(&corpus).await;
     match list_corpus_files(&corpus) {
         Ok(entries) => DaemonResponse::ok(&entries),
         Err(e) => DaemonResponse::internal(e.to_string()),
     }
 }
 
-fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonResponse {
+async fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonResponse {
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -261,7 +261,7 @@ fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> DaemonRes
             Ok(c) => c,
             Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
         };
-    ensure_paths_exist(&corpus);
+    ensure_paths_exist(&corpus).await;
     let root = match crate::domain::corpus::sandbox::build_corpus_tree(&corpus) {
         Ok(node) => node,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -294,7 +294,7 @@ async fn handle_corpus_stats(
     };
     // Ensure wiki dir exists so an unindexed wiki corpus doesn't error
     // out on a missing root — mirrors handle_list_files.
-    ensure_paths_exist(&corpus_cfg);
+    ensure_paths_exist(&corpus_cfg).await;
     let disk_files = match list_corpus_files(&corpus_cfg) {
         Ok(f) => f,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -493,7 +493,7 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             Ok(g) => g,
             Err(msg) => return DaemonResponse::internal(msg),
         };
-        ensure_paths_exist(&corpus);
+        ensure_paths_exist(&corpus).await;
         let missing = crate::domain::corpus::missing_roots(&corpus);
         if !missing.is_empty() {
             let roots = missing
@@ -1129,6 +1129,9 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
     }
 }
 
+/// Uses `block_in_place` internally, which panics on a current-thread
+/// runtime — callers (and their tests) must run under the `multi_thread`
+/// flavor.
 pub(super) async fn index_single_file(
     store: &LanceStore,
     embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
@@ -1153,7 +1156,9 @@ pub(super) async fn index_single_file(
     let mut db: HashMap<FileRef, FileSnapshot> = HashMap::new();
     if let Some(snap) = existing {
         let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
-            blake3_file(file)? != snap.content_hash.as_str()
+            let owned_file = file.to_path_buf();
+            let hash = tokio::task::spawn_blocking(move || blake3_file(&owned_file)).await??;
+            hash != snap.content_hash.as_str()
         } else {
             false
         };
@@ -1162,7 +1167,16 @@ pub(super) async fn index_single_file(
         }
     }
     let p = plan(vec![(file_ref, Mtime(mtime_ms))], db);
-    let mut stats = apply(p, store, embedder, registry, corpus, DEFAULT_BATCH_SIZE).await?;
+    let mut stats = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(apply(
+            p,
+            store,
+            embedder,
+            registry,
+            corpus,
+            DEFAULT_BATCH_SIZE,
+        ))
+    })?;
     // Evict only on the genuine truncate-to-empty case. A present-but-unreadable
     // file (unsupported type / extraction failure) is counted under
     // `files_skipped_unreadable` and retains its last-good rows — matching bulk
@@ -1266,14 +1280,21 @@ fn plan_needs_embedder(plan: &IndexPlan, embeddings_enabled: bool) -> bool {
 /// `repo:*:wiki` corpora so a typo'd `[[corpus]] paths = ...` surfaces as a
 /// clear scan error instead of silently creating an empty directory and
 /// reporting success.
-fn ensure_paths_exist(corpus: &CorpusConfig) {
+async fn ensure_paths_exist(corpus: &CorpusConfig) {
     if !is_wiki_corpus(corpus) {
         return;
     }
-    for raw in &corpus.paths {
-        let path = crate::domain::common::expand_tilde(raw);
-        let _ = std::fs::create_dir_all(&path);
-    }
+    let paths: Vec<std::path::PathBuf> = corpus
+        .paths
+        .iter()
+        .map(|raw| crate::domain::common::expand_tilde(raw))
+        .collect();
+    let _ = tokio::task::spawn_blocking(move || {
+        for path in paths {
+            let _ = std::fs::create_dir_all(&path);
+        }
+    })
+    .await;
 }
 
 /// Sum `extra` into `into` so the daemon's IndexReport reflects both the
@@ -1329,10 +1350,16 @@ async fn rebuild_wiki_indexes(
             continue;
         }
 
-        let existing = match std::fs::read_to_string(&index_path) {
-            Ok(s) => Some(s),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => return Err(format!("read {}: {e}", index_path.display())),
+        let existing = {
+            let owned_path = index_path.clone();
+            match tokio::task::spawn_blocking(move || std::fs::read_to_string(&owned_path)).await {
+                Ok(Ok(s)) => Some(s),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Ok(Err(e)) => return Err(format!("read {}: {e}", index_path.display())),
+                Err(e) => {
+                    return Err(format!("read {} join failed: {e}", index_path.display()));
+                }
+            }
         };
 
         let is_root = dir == root;
@@ -2167,7 +2194,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corpus_stats_counts_indexed_and_unindexed_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let corpus_dir = tmp.path().join("wiki");
@@ -2179,7 +2206,7 @@ mod tests {
             corpus_dir.display()
         );
         write_repo_layer(tmp.path(), &repo_config);
-        let state = state_with_ground(&ground, "").await;
+        let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
 
         // Write 2 files and index them.
         std::fs::write(corpus_dir.join("a.md"), "# Doc A\n\nContent A.\n").expect("write a");
@@ -2231,7 +2258,7 @@ mod tests {
     /// must not inflate `unindexed_files`. Without this, an excluded file that
     /// happens to match the `globs` include pattern would be counted as missing
     /// from the index, even though the corpus is intentionally ignoring it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corpus_stats_excludes_glob_excluded_files_from_unindexed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let corpus_dir = tmp.path().join("wiki");
@@ -2248,7 +2275,7 @@ mod tests {
             corpus_dir.display()
         );
         write_repo_layer(tmp.path(), &repo_config);
-        let state = state_with_ground(&ground, "").await;
+        let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
 
         // Write and index one normal file.
         std::fs::write(corpus_dir.join("indexed.md"), "# Indexed\n\nContent.\n")
@@ -2374,7 +2401,7 @@ mod tests {
             .expect("open store")
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn index_single_file_retains_last_good_rows_when_reindex_is_unreadable() {
         use text_splitter::Characters;
 
@@ -2439,7 +2466,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn index_single_file_evicts_when_reindex_truncates_to_empty() {
         use text_splitter::Characters;
 
