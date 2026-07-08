@@ -13,7 +13,7 @@ jobs:
     name: fmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install Rust toolchain
         # installs the channel pinned in rust-toolchain.toml (the crate's MSRV)
         run: rustup show && rustup component add rustfmt
@@ -23,7 +23,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install protoc
         # lance-encoding (via lancedb) runs a build script that needs protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
@@ -43,7 +43,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Free disk space
         if: runner.os == 'Linux'
         # The hosted ubuntu image leaves only ~14 GB free on /; the dependency
