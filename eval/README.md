@@ -50,7 +50,8 @@ several minutes (four full daemon-index-query cycles).
 
 For each of 4 configs (lexical-only, fusion-only, lexical+rerank,
 fusion+rerank) and each query: rank of the first result whose path matches
-`expected` (1-indexed, `None` if absent from the top-50 candidate pool).
+`expected` (1-indexed, `None` if absent after the top-10 file cap, drawn
+from a 50-chunk candidate pool).
 
 - **Recall@5** — fraction of queries where that rank is `<= 5`.
 - **MRR** — mean of `1/rank` (`0` when absent).

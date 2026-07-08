@@ -9,7 +9,7 @@
 //!
 //! `#[ignore]`d like `cli_ground.rs`'s model-dependent test: first run
 //! downloads the crossencoder model (~147MB) and needs network + several
-//! seconds per config. Run with:
+//! minutes total (~40s per config). Run with:
 //!   cargo test --test eval_ground_recall -- --ignored --nocapture
 
 use std::collections::BTreeMap;
