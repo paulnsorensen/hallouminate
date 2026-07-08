@@ -653,6 +653,15 @@ async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Resu
         tokio::fs::remove_dir_all(&bak).await?;
     }
     tokio::fs::rename(ground_dir, &bak).await?;
+    // `rename(2)` preserves the source dir's mtime, so without this the
+    // freshly-moved backup can already look >30d old and get pruned on the
+    // same boot that created it. Stamp it to "now" so age is measured from
+    // when it was set aside, not from the original store's last write.
+    let stamp_target = bak.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&stamp_target)?.set_modified(SystemTime::now())
+    })
+    .await??;
     tracing::info!(
         target: "hallouminate::daemon",
         backup = %bak.display(),
@@ -1053,6 +1062,40 @@ mod tests {
         assert!(
             lookalike.exists(),
             "non-numeric-suffix dir must survive even when older than max_age",
+        );
+    }
+
+    #[tokio::test]
+    async fn move_stale_store_stamps_backup_mtime_to_now() {
+        // `rename(2)` preserves the source dir's mtime, so a store idle >30d
+        // would already look prunable the instant it's moved aside — the
+        // whole point of the recovery window collapses. Give the source an
+        // artificially old mtime, move it, and confirm `prune_stale_backups`
+        // does NOT delete the fresh backup.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ground_dir = tmp.path().join("ground");
+        tokio::fs::create_dir_all(&ground_dir)
+            .await
+            .expect("create ground dir");
+
+        let old_mtime = SystemTime::now() - Duration::from_secs(60 * 24 * 60 * 60);
+        let dir = ground_dir.clone();
+        tokio::task::spawn_blocking(move || std::fs::File::open(&dir)?.set_modified(old_mtime))
+            .await
+            .expect("join")
+            .expect("backdate ground dir mtime");
+
+        move_stale_store(&ground_dir, 1).await.expect("move");
+
+        let bak = tmp.path().join("ground.bak-v1");
+        prune_stale_backups(&ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE)
+            .await
+            .expect("prune");
+
+        assert!(
+            bak.exists(),
+            "backup just moved aside must survive its own boot's prune, \
+             even though the source dir's mtime was 60d old",
         );
     }
 }

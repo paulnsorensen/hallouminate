@@ -268,7 +268,7 @@ async fn handle_connection(
     let n = match tokio::time::timeout(idle_timeout, reader.read_line(&mut line)).await {
         Ok(res) => res?,
         Err(_) => {
-            tracing::warn!(
+            tracing::debug!(
                 target: "hallouminate::daemon",
                 timeout_secs = idle_timeout.as_secs_f64(),
                 "connection idle timeout waiting for request line; closing",
@@ -285,8 +285,21 @@ async fn handle_connection(
     };
     let mut text = serde_json::to_string(&response)?;
     text.push('\n');
-    write_half.write_all(text.as_bytes()).await?;
-    write_half.flush().await?;
+    let write_result = tokio::time::timeout(idle_timeout, async {
+        write_half.write_all(text.as_bytes()).await?;
+        write_half.flush().await
+    })
+    .await;
+    match write_result {
+        Ok(res) => res?,
+        Err(_) => {
+            tracing::debug!(
+                target: "hallouminate::daemon",
+                timeout_secs = idle_timeout.as_secs_f64(),
+                "connection idle timeout writing response; closing",
+            );
+        }
+    }
     Ok(())
 }
 
