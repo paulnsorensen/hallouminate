@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crate::adapters::lance::{LanceStore, SearchHit};
 use crate::domain::common::{HallouminateError, Result};
-use crate::domain::embeddings::{EmbedBatch, EmbedRole};
+use crate::domain::embeddings::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use crate::domain::search::{Crossencoder, fts_with_ripgrep, hybrid_with_ripgrep};
 
 use super::bucket::{build_docs, normalize_scores};
@@ -59,7 +59,16 @@ pub async fn ground(
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-    let mut hits = search_corpus(query, corpus, corpus_paths, store, embedder, opts.limit).await?;
+    let query_vec = embed_query(query, embedder)?;
+    let mut hits = search_corpus(
+        query,
+        corpus,
+        corpus_paths,
+        store,
+        query_vec.as_ref(),
+        opts.limit,
+    )
+    .await?;
     if let Some(rerank) = crossencoder {
         // The crossencoder is the most expensive step; skip it on empty
         // hit lists so a no-match query doesn't pay the model latency.
@@ -92,10 +101,29 @@ pub async fn ground(
     })
 }
 
+/// Embed `query` once under `EmbedRole::Query`, or return `None` in OFF mode
+/// (no embedder). Shared by `ground` and `ground_union` so the query is
+/// embedded exactly once regardless of how many corpora are searched.
+fn embed_query(
+    query: &str,
+    embedder: Option<&mut dyn EmbedBatch>,
+) -> Result<Option<[f32; EMBEDDING_DIM]>> {
+    match embedder {
+        Some(embedder) => {
+            let embeddings = embedder.embed_batch(&[query.to_string()], EmbedRole::Query)?;
+            let query_vec = embeddings.into_iter().next().ok_or_else(|| {
+                HallouminateError::Embed("embed_batch returned no vector for query".into())
+            })?;
+            Ok(Some(query_vec))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Search one corpus, returning its un-reranked hits.
 ///
-/// ON mode (embedder present): embed the query and fuse FTS + vector + rg.
-/// OFF mode (None): lexical-only FTS + rg. The crossencoder rerank is the
+/// ON mode (`query_vec` present): fuse FTS + vector + rg.
+/// OFF mode (`None`): lexical-only FTS + rg. The crossencoder rerank is the
 /// caller's concern — `ground` reranks per corpus, `ground_union` hoists the
 /// single rerank past the cross-corpus merge (#106).
 async fn search_corpus(
@@ -103,16 +131,12 @@ async fn search_corpus(
     corpus: &str,
     corpus_paths: &[String],
     store: &LanceStore,
-    embedder: Option<&mut dyn EmbedBatch>,
+    query_vec: Option<&[f32; EMBEDDING_DIM]>,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    match embedder {
-        Some(embedder) => {
-            let embeddings = embedder.embed_batch(&[query.to_string()], EmbedRole::Query)?;
-            let query_vec = embeddings.into_iter().next().ok_or_else(|| {
-                HallouminateError::Embed("embed_batch returned no vector for query".into())
-            })?;
-            hybrid_with_ripgrep(store, corpus, corpus_paths, query, &query_vec, limit).await
+    match query_vec {
+        Some(query_vec) => {
+            hybrid_with_ripgrep(store, corpus, corpus_paths, query, query_vec, limit).await
         }
         None => fts_with_ripgrep(store, corpus, corpus_paths, query, limit).await,
     }
@@ -144,16 +168,13 @@ pub async fn ground_union(
 
     // Search each corpus independently, tagging every hit with its source so
     // the per-corpus partition survives the shared rerank's reshuffle. The
-    // `&mut dyn` is reborrowed per iteration so the shared embedder is used
-    // across all corpora without the borrow outliving the loop.
-    let mut embedder = embedder;
+    // query is embedded ONCE up front and shared across every corpus — each
+    // embed is a forward pass serialized on the embedder mutex, so hoisting
+    // it out of the loop turns N passes into 1.
+    let query_vec = embed_query(query, embedder)?;
     let mut tagged: Vec<(SearchHit, String)> = Vec::new();
     for (name, paths) in corpora {
-        let reborrow: Option<&mut dyn EmbedBatch> = match &mut embedder {
-            Some(e) => Some(&mut **e),
-            None => None,
-        };
-        let hits = search_corpus(query, name, paths, store, reborrow, opts.limit).await?;
+        let hits = search_corpus(query, name, paths, store, query_vec.as_ref(), opts.limit).await?;
         for hit in hits {
             tagged.push((hit, name.clone()));
         }
@@ -167,15 +188,18 @@ pub async fn ground_union(
     // Use a FIFO queue per chunk_id so cross-corpus chunk_id collisions survive
     // — two corpora indexing the same file path produce the same chunk_id, but
     // both attributions must be preserved (same content, different corpus).
-    let mut hits: Vec<SearchHit> = tagged.iter().map(|(h, _)| h.clone()).collect();
+    // Build the queue from borrowed chunk_id/corpus-name first, then MOVE (not
+    // clone) each hit into `hits` — cloning duplicates the full text and
+    // summary just to key a lookup that only needs two strings.
     let mut corpus_queues: std::collections::HashMap<String, std::collections::VecDeque<String>> =
         std::collections::HashMap::new();
-    for (h, name) in tagged.iter() {
+    for (h, name) in &tagged {
         corpus_queues
             .entry(h.chunk_id.clone())
             .or_default()
             .push_back(name.clone());
     }
+    let mut hits: Vec<SearchHit> = tagged.into_iter().map(|(h, _)| h).collect();
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
