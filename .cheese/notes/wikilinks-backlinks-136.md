@@ -1,6 +1,38 @@
 status: blocked: out of context
 next: cook
 artifact: .cheese/notes/wikilinks-backlinks-136.md
+Issue #136: wikilink validation + backlinks. validate.rs, ipc.rs, dispatch.rs lint wiring, mod.rs re-exports, and handle_backlinks + dispatch arm are ALL DONE and cargo-check-verified (compiles clean). Still need: MCP backlinks tool, tests/daemon.rs integration tests, fmt/clippy/test gates, final commit.
+
+## Done (verified via `cargo check --all-targets` — compiles clean, committed at b4ef098)
+
+- `src/domain/corpus/validate.rs`: `find_wikilinks`, `normalize_slug`, `slug_identifiers`, `corpus_slugs`, `lint_wikilinks` + 3 unit tests (NOT yet run through `cargo test` — do that on resume).
+- `src/domain/corpus.rs`: re-exports.
+- `src/app/daemon/dispatch.rs` `handle_add_markdown`: lint_wikilinks wired into warnings.
+- `src/app/daemon/ipc.rs`: `BacklinksRequest`, `BacklinksResult`, `DaemonRequestPayload::Backlinks` variant.
+- `src/app/daemon/mod.rs`: re-exports `BacklinksRequest, BacklinksResult` added to the `pub use ipc::{...}` list.
+- `src/app/daemon/dispatch.rs`: added `handle_backlinks(cfg, cwd, req) -> DaemonResponse` (~line 949-1000, right after `handle_read_markdown`, before `handle_delete_markdown`). Pattern: `pick_corpus_or_default` for corpus resolution, `list_corpus_files` for entries, `slug_identifiers(&req.path)` into a `HashSet<String>` target set, `tokio::task::spawn_blocking` reads each OTHER entry's file via `std::fs::read_to_string(&entry.absolute_path)`, runs `find_wikilinks`, normalizes each link with `normalize_slug`, and collects+sorts matching entry paths. Added dispatch arm `DaemonRequestPayload::Backlinks(req) => handle_backlinks(&effective, &req_cwd, req).await,` right after the `DeleteMarkdown` arm (~line 110-112). Added imports: `normalize_slug, find_wikilinks, slug_identifiers` to the `crate::domain::corpus::{...}` import (line 28), and `BacklinksRequest, BacklinksResult` to the `super::ipc::{...}` import (line 50-55).
+
+## Left / next steps (in order)
+
+1. **`src/adapters/mcp/tools.rs`**: add `BacklinksParams { corpus: Option<String> (#[serde(default)]), path: String }` struct (model on `ReadMarkdownParams`/`GetFootnoteParams`, ~line 464), then a `backlinks` tool method (model on `read_markdown`/`get_footnote`, insert after `get_footnote` before closing `}` of the `impl HallouminateTools` block ~line 818-820). Needs `BacklinksRequest, BacklinksResult` added to the `use crate::app::daemon::{...}` import list (~line 21-27). Tool description: returns corpus-relative paths of pages that `[[wikilink]]` to the given page. `structuredContent` = `{ corpus, path, backlinks }`; `content` = newline-joined backlink paths (or a "no backlinks" message when empty).
+2. **`tests/daemon.rs`**: two new tests, modeled on `daemon_add_markdown_returns_lint_warnings_without_blocking_the_write` (~line 439-524):
+   - `daemon_add_markdown_flags_dangling_wikilink`: write a page with `[[missing-page]]` (no matching file) — assert `warnings` mentions the broken target. Also write `real-page.md` first, then a page linking `[[real-page]]` — assert no wikilink warning.
+   - `daemon_backlinks_returns_pages_linking_to_target`: write 2-3 pages via `AddMarkdown`, one containing `[[other-page]]`, call `DaemonRequestPayload::Backlinks(BacklinksRequest { corpus: Some("docs".into()), path: "other-page.md".into() })`, assert the linking page's path is in `backlinks` and a non-linking page is not.
+   - Add `BacklinksRequest` to the `use hallouminate::app::daemon::{...}` import list at top of `tests/daemon.rs` (~line 19-24).
+3. Run gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`. Fix fallout.
+4. Commit via `/commit` skill with conventional commit referencing #136 once gates are green. Do NOT push.
+
+## Design notes carried from the locked spec
+
+- Standalone MCP tool `backlinks(corpus, path)`, NOT a field bolted onto `read_markdown`.
+- Wikilink target resolution answers to both full path-without-extension slug and bare filename stem (`slug_identifiers`).
+- Lint is advisory-only, never blocks the write.
+
+---
+
+status: blocked: out of context
+next: cook
+artifact: .cheese/notes/wikilinks-backlinks-136.md
 Issue #136: wikilink validation + backlinks. validate.rs domain logic DONE and unit-tested; ipc.rs types DONE; dispatch.rs wiring for add_markdown lint DONE; still need handle_backlinks + dispatch arm, mod.rs re-export, MCP tool, and integration tests.
 
 ## Done (verified)
