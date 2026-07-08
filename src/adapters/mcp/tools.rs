@@ -22,8 +22,8 @@ use crate::app::daemon::{
     AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusStatsResult,
     DaemonClient, DaemonRequest, DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest,
     DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
-    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult, Position,
-    ReadMarkdownRequest, ReadMarkdownResult, client_for,
+    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
+    Position, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 use crate::domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};

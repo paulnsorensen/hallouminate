@@ -25,7 +25,6 @@ use crate::adapters::lance::LanceStore;
 use crate::app::cli::{CorpusReport, IndexReport};
 use crate::app::config::{Config, ResolvedLayers, resolve_for_cwd};
 use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
-use crate::domain::corpus::{blake3_file, find_wikilinks, normalize_slug, slug_identifiers};
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::corpus::sandbox::{
@@ -34,6 +33,7 @@ use crate::domain::corpus::sandbox::{
     resolve_read_root, safe_relative_path,
 };
 use crate::domain::corpus::scan;
+use crate::domain::corpus::{blake3_file, find_wikilinks, normalize_slug, slug_identifiers};
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
@@ -107,9 +107,7 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
         }
-        DaemonRequestPayload::Backlinks(req) => {
-            handle_backlinks(&effective, &req_cwd, req).await
-        }
+        DaemonRequestPayload::Backlinks(req) => handle_backlinks(&effective, &req_cwd, req).await,
         DaemonRequestPayload::CorpusStats { corpus } => {
             handle_corpus_stats(state, &effective, &req_cwd, corpus).await
         }
@@ -751,7 +749,10 @@ async fn handle_add_markdown(
     if let Ok(entries) = crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
         let known_slugs =
             crate::domain::corpus::corpus_slugs(entries.iter().map(|e| e.path.as_str()));
-        warnings.extend(crate::domain::corpus::lint_wikilinks(&req.content, &known_slugs));
+        warnings.extend(crate::domain::corpus::lint_wikilinks(
+            &req.content,
+            &known_slugs,
+        ));
     }
 
     // Symlink-safe atomic write via the shared sandbox helper. Walks every

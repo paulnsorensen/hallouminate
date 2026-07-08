@@ -126,7 +126,10 @@ fn extract_wikilinks(text: &str, out: &mut Vec<String>) {
 /// slug: lowercase, forward slashes, no `.md` extension.
 pub fn normalize_slug(raw: &str) -> String {
     let lower = raw.trim().replace('\\', "/").to_lowercase();
-    lower.strip_suffix(".md").map(str::to_string).unwrap_or(lower)
+    lower
+        .strip_suffix(".md")
+        .map(str::to_string)
+        .unwrap_or(lower)
 }
 
 /// The slugs a corpus-relative markdown `path` should answer to for wikilink

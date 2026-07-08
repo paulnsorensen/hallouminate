@@ -583,7 +583,7 @@ enabled = false
 
     // real-page.md already exists, so a wikilink to it is not flagged.
     client
-        .call(DaemonRequest {
+        .call::<serde_json::Value>(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
@@ -646,7 +646,7 @@ enabled = false
     let client = connect_at(harness.socket()).await.expect("connect");
 
     client
-        .call(DaemonRequest {
+        .call::<serde_json::Value>(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
@@ -659,7 +659,7 @@ enabled = false
         .await
         .expect("add_markdown other-page ok");
     client
-        .call(DaemonRequest {
+        .call::<serde_json::Value>(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
@@ -672,7 +672,7 @@ enabled = false
         .await
         .expect("add_markdown linker ok");
     client
-        .call(DaemonRequest {
+        .call::<serde_json::Value>(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
