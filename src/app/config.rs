@@ -68,13 +68,10 @@ pub struct EmbeddingsConfig {
     /// (default `~/.cache/hallouminate/fastembed`).
     #[serde(default = "default_embed_cache")]
     pub cache_dir: String,
-    /// Seconds of embed-call inactivity before the ORT session (and its
-    /// `BFCArena` memory) is dropped. The session is lazy-reloaded on the
-    /// next embed request, paying the model-load cost again (~4 s cold).
-    /// `0` disables eviction — the arena is never released while the daemon
-    /// lives. Due to sleep-then-check timing the actual eviction lag is
-    /// `[idle_evict_secs, 2×idle_evict_secs]` from the last embed call.
-    /// Default: `300` (5 minutes).
+    /// Deprecated — does nothing. Session eviction was removed (ADR-001):
+    /// dropping the ORT session never released its `BFCArena` memory. Setting
+    /// this only emits a deprecation warning at daemon start. Use
+    /// `[daemon].idle_exit_secs` instead.
     #[serde(default = "default_idle_evict_secs")]
     pub idle_evict_secs: u64,
 }
