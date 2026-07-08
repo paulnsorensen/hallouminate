@@ -835,6 +835,9 @@ impl LanceStore {
     /// observe that in-between version. Callers guard on this and treat "index
     /// not built yet" as "no results" (a transient state during indexing)
     /// rather than surfacing the error.
+    /// Latched: once `true`, stays `true` for the life of this `LanceStore`
+    /// -- the FTS index is never dropped, so a cached hit skips the
+    /// `list_indices` round-trip on every later query.
     async fn has_text_index(&self) -> Result<bool> {
         if self.text_index_present.load(Ordering::Acquire) {
             return Ok(true);

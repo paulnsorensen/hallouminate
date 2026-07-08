@@ -42,10 +42,11 @@ const CHUNK_BUDGET_TOKENS: usize = 384;
 /// Interval between LanceDB maintenance ticks (compaction + version prune).
 const MAINTENANCE_INTERVAL_SECS: u64 = 1800;
 
-/// Grace window subtracted from `maintain`'s prune cutoff: lets in-flight
-/// queries drain before their snapshotted version's files can be deleted.
-/// Queries don't hold the write lane, so this is the only thing protecting
-/// them from a maintenance tick's version prune.
+/// Grace window for `maintain`'s prune cutoff: versions younger than this
+/// are retained, letting in-flight queries drain before their snapshotted
+/// version's files can be deleted. Queries don't hold the write lane, so
+/// this is the only thing protecting them from a maintenance tick's version
+/// prune.
 const MAINTENANCE_PRUNE_GRACE_SECS: u64 = 300;
 
 fn unix_secs() -> u64 {
@@ -368,17 +369,28 @@ impl DaemonState {
                         _ = cancel.cancelled() => break,
                         _ = tokio::time::sleep(Duration::from_secs(MAINTENANCE_INTERVAL_SECS)) => {
                             let Ok(_permit) = write_lane_ref.acquire().await else { break };
-                            if let Err(e) = store_ref
+                            match store_ref
                                 .maintain(lancedb::table::Duration::seconds(
                                     MAINTENANCE_PRUNE_GRACE_SECS as i64,
                                 ))
                                 .await
                             {
-                                tracing::warn!(
-                                    target: "hallouminate::lance",
-                                    error = %e,
-                                    "periodic LanceDB maintenance failed",
-                                );
+                                Ok(stats) => {
+                                    tracing::info!(
+                                        target: "hallouminate::lance",
+                                        fragments_removed = stats.compaction.as_ref().map(|c| c.fragments_removed),
+                                        fragments_added = stats.compaction.as_ref().map(|c| c.fragments_added),
+                                        old_versions_pruned = stats.prune.as_ref().map(|p| p.old_versions),
+                                        "periodic LanceDB maintenance completed",
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "hallouminate::lance",
+                                        error = %e,
+                                        "periodic LanceDB maintenance failed",
+                                    );
+                                }
                             }
                         }
                     }
