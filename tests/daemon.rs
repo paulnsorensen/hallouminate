@@ -709,6 +709,138 @@ enabled = false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_backlinks_on_uninitialized_wiki_returns_empty_result() {
+    // handle_backlinks must ensure the wiki root exists before scanning — a
+    // corpus whose directory was never created (no page ever written) must
+    // yield an empty result, not an internal error.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    // Deliberately no `.hallouminate/wiki` under repo_root — this repository's
+    // wiki has never been written to.
+    let toml = format!(
+        r#"
+[[repository]]
+name = "repo1"
+path = "{r}"
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        r = repo_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: Some("repo:repo1:wiki".into()),
+                path: "missing-page.md".into(),
+            }),
+        })
+        .await
+        .expect("backlinks on a fresh wiki must succeed, not error");
+    let backlinks = value["backlinks"]
+        .as_array()
+        .expect("backlinks array present")
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backlinks,
+        Vec::<&str>::new(),
+        "fresh wiki with no created root must yield empty backlinks: {backlinks:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_backlinks_disambiguates_basename_collision() {
+    // Two pages share the bare stem "index" (a/index.md, b/index.md). A bare
+    // [[index]] link is ambiguous and must not be attributed to either page;
+    // only a full-path [[a/index]] link counts as a backlink to a/index.md.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for (path, content) in [
+        ("a/index.md", "# A Index\n\nNothing here.\n"),
+        ("b/index.md", "# B Index\n\nNothing here.\n"),
+        (
+            "ambiguous.md",
+            "# Ambiguous\n\nSee [[index]] for details.\n",
+        ),
+        (
+            "full-path-linker.md",
+            "# Full path linker\n\nSee [[a/index]] for details.\n",
+        ),
+    ] {
+        client
+            .call::<serde_json::Value>(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                    corpus: "docs".into(),
+                    path: path.into(),
+                    content: content.into(),
+                    overwrite: false,
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("add_markdown {path} ok: {e}"));
+    }
+
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: Some("docs".into()),
+                path: "a/index.md".into(),
+            }),
+        })
+        .await
+        .expect("backlinks ok");
+    let backlinks = value["backlinks"]
+        .as_array()
+        .expect("backlinks array present")
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backlinks,
+        vec!["full-path-linker.md"],
+        "bare [[index]] must not be attributed to a/index.md when the stem is ambiguous: {backlinks:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_add_markdown_warns_on_malformed_frontmatter_block_and_stores_verbatim() {
     // Locks the `handle_add_markdown` wiring of `lint_frontmatter`: a page that
     // opens with a *delimited* `---…---` block whose contents are not valid YAML

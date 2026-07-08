@@ -746,13 +746,23 @@ async fn handle_add_markdown(
     let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
     warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
-    if let Ok(entries) = crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
-        let known_slugs =
-            crate::domain::corpus::corpus_slugs(entries.iter().map(|e| e.path.as_str()));
-        warnings.extend(crate::domain::corpus::lint_wikilinks(
-            &req.content,
-            &known_slugs,
-        ));
+    match crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
+        Ok(entries) => {
+            let mut known_slugs =
+                crate::domain::corpus::corpus_slugs(entries.iter().map(|e| e.path.as_str()));
+            known_slugs.extend(slug_identifiers(&req.path));
+            warnings.extend(crate::domain::corpus::lint_wikilinks(
+                &req.content,
+                &known_slugs,
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "skipping wikilink lint: failed to list corpus files",
+            );
+        }
     }
 
     // Symlink-safe atomic write via the shared sandbox helper. Walks every
@@ -957,12 +967,37 @@ async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> Da
             Ok(c) => c,
             Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
         };
+    ensure_paths_exist(&corpus).await;
     let entries = match list_corpus_files(&corpus) {
         Ok(e) => e,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    let target_slugs: std::collections::HashSet<String> =
-        slug_identifiers(&req.path).into_iter().collect();
+    let full_slug = normalize_slug(&req.path);
+    let bare_stem = Path::new(&req.path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .filter(|stem| *stem != full_slug);
+    let target_slugs: std::collections::HashSet<String> = match &bare_stem {
+        Some(stem) => {
+            let stem_is_unique = entries
+                .iter()
+                .filter(|entry| {
+                    Path::new(&entry.path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_lowercase())
+                        .as_deref()
+                        == Some(stem.as_str())
+                })
+                .count()
+                <= 1;
+            if stem_is_unique {
+                [full_slug.clone(), stem.clone()].into_iter().collect()
+            } else {
+                std::iter::once(full_slug.clone()).collect()
+            }
+        }
+        None => std::iter::once(full_slug.clone()).collect(),
+    };
     let req_path = req.path.clone();
     let found = tokio::task::spawn_blocking(move || {
         let mut backlinks: Vec<String> = entries

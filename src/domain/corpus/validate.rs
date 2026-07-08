@@ -101,7 +101,13 @@ pub fn find_wikilinks(content: &str) -> Vec<String> {
     let mut buf = String::new();
     for event in Parser::new(content) {
         match event {
-            Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
+            Event::Start(Tag::CodeBlock(_)) => {
+                if !buf.is_empty() {
+                    extract_wikilinks(&buf, &mut links);
+                    buf.clear();
+                }
+                in_code_block = true;
+            }
             Event::End(TagEnd::CodeBlock) => in_code_block = false,
             Event::Text(text) if !in_code_block => buf.push_str(&text),
             _ if !buf.is_empty() => {
