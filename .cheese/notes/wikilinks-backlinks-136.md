@@ -1,6 +1,33 @@
 status: blocked: out of context
 next: cook
 artifact: .cheese/notes/wikilinks-backlinks-136.md
+Issue #136: wikilink validation + backlinks. ALL CODE IS WRITTEN AND COMMITTED (2 commits: 87d54b0 MCP tool, ce8580b integration tests). Only remaining work is running the gates and fixing any fallout, then a final commit.
+
+## Done (this session, committed)
+
+- `src/adapters/mcp/tools.rs` (commit 87d54b0): added `BacklinksParams` struct and standalone `backlinks(corpus, path)` MCP tool method, modeled on `read_markdown`/`get_footnote`. Added `BacklinksRequest, BacklinksResult` to the `use crate::app::daemon::{...}` import list. Also added a `backlinks` line to `SERVER_INSTRUCTIONS`'s tool list for consistency. Verified via `cargo check --all-targets` — compiled clean.
+- `tests/daemon.rs` (commit ce8580b): added `BacklinksRequest` to the `use hallouminate::app::daemon::{...}` import list. Added two integration tests after `daemon_add_markdown_returns_lint_warnings_without_blocking_the_write` (~line 524):
+  - `daemon_add_markdown_flags_dangling_wikilink`: writes a page with `[[missing-page]]` (no matching file) — asserts warnings mention `missing-page` and `no matching page`. Also writes `real-page.md`, then a page linking `[[real-page]]` — asserts no wikilink warning.
+  - `daemon_backlinks_returns_pages_linking_to_target`: writes `other-page.md`, `linker.md` (contains `[[other-page]]`), and `unrelated.md` (no link), then calls `DaemonRequestPayload::Backlinks(BacklinksRequest { corpus: Some("docs".into()), path: "other-page.md".into() })` and asserts `backlinks == ["linker.md"]`.
+  - **NOT YET RUN** — `cargo test --test daemon <name>` was still compiling (>4 min, likely first full rebuild of the test binary in this worktree) when this session hit its context budget. The compile itself was clean per the prior `cargo check --all-targets` pass with the same tools.rs changes; the test binary just needed its own build.
+
+## Left / next steps (in order)
+
+1. Run `cargo test --test daemon daemon_add_markdown_flags_dangling_wikilink` and `cargo test --test daemon daemon_backlinks_returns_pages_linking_to_target` (run separately — `cargo test --test daemon <name1> <name2>` is NOT valid syntax, cargo test only takes one filter substring positional arg). Use a long foreground timeout (5-10 min) since this looks like a cold test-binary build. Fix any assertion/wiring mismatches.
+2. Run the full gate sequence: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (whole suite). Fix fallout.
+3. Once green, commit via `/commit` skill with a final conventional commit referencing #136 (only needed if gates required fixes beyond the two commits already made — if everything is already green, the two existing commits ARE the final state, no further commit needed beyond confirming gates pass). Do NOT push.
+
+## Design notes carried from the locked spec (unchanged)
+
+- Standalone MCP tool `backlinks(corpus, path)`, NOT a field bolted onto `read_markdown`. DONE.
+- Wikilink target resolution answers to both full path-without-extension slug and bare filename stem (`slug_identifiers`). DONE (domain layer, prior session).
+- Lint is advisory-only, never blocks the write. DONE (prior session).
+
+---
+
+status: blocked: out of context
+next: cook
+artifact: .cheese/notes/wikilinks-backlinks-136.md
 Issue #136: wikilink validation + backlinks. validate.rs, ipc.rs, dispatch.rs lint wiring, mod.rs re-exports, and handle_backlinks + dispatch arm are ALL DONE and cargo-check-verified (compiles clean). Still need: MCP backlinks tool, tests/daemon.rs integration tests, fmt/clippy/test gates, final commit.
 
 ## Done (verified via `cargo check --all-targets` — compiles clean, committed at b4ef098)
