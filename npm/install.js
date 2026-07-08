@@ -9,11 +9,12 @@ const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 // cargo-dist artifact target triples. Hallouminate's dist-workspace.toml
-// builds gnu (not musl) for Linux and does not target Windows.
+// builds gnu (not musl) Linux and Apple Silicon macOS only — no Windows,
+// no Intel macOS. Keep this map in lockstep with dist-workspace.toml's
+// `targets`; the nightly-release-check workflow verifies the pairing.
 const PLATFORM_MAP = {
   "linux-x64": "x86_64-unknown-linux-gnu",
   "linux-arm64": "aarch64-unknown-linux-gnu",
-  "darwin-x64": "x86_64-apple-darwin",
   "darwin-arm64": "aarch64-apple-darwin",
 };
 
