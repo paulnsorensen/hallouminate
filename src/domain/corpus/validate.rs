@@ -91,17 +91,28 @@ fn collect_code_block(iter: &mut Parser<'_>) -> String {
 /// skipping fenced code blocks — a wikilink written inside an example is not
 /// a real link. `[[wikilinks]]` are plain text to `pulldown-cmark` (only
 /// `[text](url)` links parse as `Tag::Link`), so this scans `Event::Text`
-/// directly rather than matching on link tags.
+/// directly rather than matching on link tags. `pulldown-cmark` can split a
+/// single run of text into several adjacent `Text` events (e.g. `[[` and the
+/// rest), so consecutive text is buffered and flushed on any non-text
+/// boundary event rather than scanned event-by-event.
 pub fn find_wikilinks(content: &str) -> Vec<String> {
     let mut links = Vec::new();
     let mut in_code_block = false;
+    let mut buf = String::new();
     for event in Parser::new(content) {
         match event {
             Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
             Event::End(TagEnd::CodeBlock) => in_code_block = false,
-            Event::Text(text) if !in_code_block => extract_wikilinks(&text, &mut links),
+            Event::Text(text) if !in_code_block => buf.push_str(&text),
+            _ if !buf.is_empty() => {
+                extract_wikilinks(&buf, &mut links);
+                buf.clear();
+            }
             _ => {}
         }
+    }
+    if !buf.is_empty() {
+        extract_wikilinks(&buf, &mut links);
     }
     links
 }
