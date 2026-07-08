@@ -19,11 +19,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::app::daemon::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusStatsResult, DaemonClient, DaemonRequest,
-    DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
-    GroundRequest, GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest,
-    ListFilesResult, ListTreeRequest, ListTreeResult, Position, ReadMarkdownRequest,
-    ReadMarkdownResult, client_for,
+    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusStatsResult,
+    DaemonClient, DaemonRequest, DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest,
+    DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
+    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult, Position,
+    ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 use crate::domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};
@@ -65,6 +65,7 @@ Tools:
 - `corpus_stats` — index health for one corpus: indexed file count, total \
   chunk rows, newest index timestamp, and count of not-yet-indexed files.
 - `get_footnote` — resolve a single citation: footnote target for page#footnote_number.
+- `backlinks` — corpus-relative paths of pages that `[[wikilink]]` to a given page.
 
 Filesystem is the source of truth; LanceDB rows are derived and refreshed \
 after `add_markdown` / `delete_markdown`. `index` is the only way to pick \
@@ -472,6 +473,17 @@ pub struct DeleteMarkdownParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct BacklinksParams {
+    /// Corpus that owns the page. Defaults to the wiki for the repo
+    /// containing the client's MCP workspace root, same as `ground`.
+    #[serde(default)]
+    pub corpus: Option<String>,
+    /// Relative path of the wiki page within the corpus whose backlinks are
+    /// being resolved.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetFootnoteParams {
     /// Corpus that owns the page. Defaults to the wiki for the repo
     /// containing the client's MCP workspace root, same as `ground`.
@@ -816,6 +828,32 @@ impl HallouminateTools {
             "target": target,
         });
         Ok(tool_ok(target, structured))
+    }
+
+    #[tool(
+        description = "Return corpus-relative paths of every page that links to the given page via a `[[wikilink]]`. `structuredContent` is { corpus, path, backlinks }; `content` is a newline-joined list of backlink paths, or a message noting there are none."
+    )]
+    pub async fn backlinks(
+        &self,
+        peer: Peer<RoleServer>,
+        Parameters(params): Parameters<BacklinksParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let (client, cwd) = self.tool_setup(&peer).await?;
+        let req = DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: params.corpus,
+                path: params.path,
+            }),
+        };
+        let response: BacklinksResult = client.call(req).await.map_err(map_daemon_err)?;
+        let structured = to_structured(&response)?;
+        let text = if response.backlinks.is_empty() {
+            format!("no backlinks found for {}", response.path)
+        } else {
+            response.backlinks.join("\n")
+        };
+        Ok(tool_ok(text, structured))
     }
 }
 
