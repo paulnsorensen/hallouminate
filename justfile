@@ -81,6 +81,7 @@ prepare-release version:
     for manifest in [
         Path("plugins/hallouminate/.claude-plugin/plugin.json"),
         Path("plugins/hallouminate/.codex-plugin/plugin.json"),
+        Path("npm/package.json"),
     ]:
         data = json.loads(manifest.read_text())
         data["version"] = version
@@ -90,7 +91,7 @@ prepare-release version:
     cargo update -p hallouminate --precise "$version"
     just ci
 
-    git add Cargo.toml Cargo.lock plugins/hallouminate/.claude-plugin/plugin.json plugins/hallouminate/.codex-plugin/plugin.json
+    git add Cargo.toml Cargo.lock plugins/hallouminate/.claude-plugin/plugin.json plugins/hallouminate/.codex-plugin/plugin.json npm/package.json
     git commit -m "chore(release): bump version to $version"
     git push -u origin "$branch"
     gh pr create --base main --head "$branch" --title "chore(release): bump version to $version" --body "Release bump for v$version."

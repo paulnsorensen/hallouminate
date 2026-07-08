@@ -5,6 +5,7 @@
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { spawn } = require("child_process");
 
 // cargo-dist artifact target triples. Hallouminate's dist-workspace.toml
@@ -44,7 +45,10 @@ fs.mkdirSync(binDir, { recursive: true });
 
 console.log(`hallouminate: downloading ${target} binary...`);
 
-function follow(url, cb) {
+const MAX_REDIRECTS = 5;
+const REQUEST_TIMEOUT_MS = 30_000;
+
+function follow(url, redirectsLeft, cb) {
   // postinstall download: refuse anything but HTTPS, including redirect
   // targets, so a hijacked Location header can't downgrade or jump host.
   if (!url.startsWith("https:")) {
@@ -52,7 +56,7 @@ function follow(url, cb) {
     console.error("Install manually: cargo install hallouminate");
     process.exit(1);
   }
-  https
+  const req = https
     .get(url, { headers: { "User-Agent": "hallouminate-npm" } }, (res) => {
       if (
         res.statusCode >= 300 &&
@@ -60,7 +64,12 @@ function follow(url, cb) {
         res.headers.location
       ) {
         res.resume(); // drain the redirect body so the socket is freed
-        follow(res.headers.location, cb);
+        if (redirectsLeft <= 0) {
+          console.error(`hallouminate: too many redirects fetching ${url}`);
+          console.error("Install manually: cargo install hallouminate");
+          process.exit(1);
+        }
+        follow(res.headers.location, redirectsLeft - 1, cb);
       } else if (res.statusCode !== 200) {
         console.error(`hallouminate: download failed (HTTP ${res.statusCode})`);
         console.error(`URL: ${url}`);
@@ -75,38 +84,74 @@ function follow(url, cb) {
       console.error("Install manually: cargo install hallouminate");
       process.exit(1);
     });
+  req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+    req.destroy(new Error(`timed out after ${REQUEST_TIMEOUT_MS}ms`));
+  });
 }
 
-follow(url, (res) => {
-  // tar -xJ understands xz on both macOS (BSD tar) and Linux (GNU tar).
-  // --strip-components=1 flattens the top-level <app>-<target>/ wrapper so
-  // the binary lands directly in npm/bin/.
-  const tar = spawn(
-    "tar",
-    ["-xJ", "--strip-components=1", "-C", binDir],
-    { stdio: ["pipe", "inherit", "inherit"] },
-  );
-  tar.on("error", (err) => {
-    console.error(`hallouminate: failed to run tar: ${err.message}`);
+function downloadToBuffer(url, cb) {
+  follow(url, MAX_REDIRECTS, (res) => {
+    const chunks = [];
+    res.on("data", (chunk) => chunks.push(chunk));
+    res.on("end", () => cb(Buffer.concat(chunks)));
+    res.on("error", (err) => {
+      console.error(`hallouminate: download failed: ${err.message}`);
+      console.error("Install manually: cargo install hallouminate");
+      process.exit(1);
+    });
+  });
+}
+
+const shaUrl = `${url}.sha256`;
+
+downloadToBuffer(shaUrl, (shaBuf) => {
+  const expected = shaBuf.toString("utf8").trim().split(/\s+/)[0].toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(expected)) {
+    console.error(`hallouminate: malformed checksum file at ${shaUrl}`);
     console.error("Install manually: cargo install hallouminate");
     process.exit(1);
-  });
-  res.pipe(tar.stdin);
-  tar.on("close", (code) => {
-    if (code !== 0) {
-      console.error(
-        "hallouminate: failed to extract. Install manually: cargo install hallouminate",
-      );
-      process.exit(1);
-    }
-    if (!fs.existsSync(binPath)) {
-      console.error(
-        `hallouminate: binary missing after extract (expected ${binPath}).`,
-      );
+  }
+
+  downloadToBuffer(url, (tarBuf) => {
+    const actual = crypto.createHash("sha256").update(tarBuf).digest("hex");
+    if (actual !== expected) {
+      console.error(`hallouminate: checksum mismatch for ${archive}`);
+      console.error(`expected: ${expected}`);
+      console.error(`actual:   ${actual}`);
       console.error("Install manually: cargo install hallouminate");
       process.exit(1);
     }
-    fs.chmodSync(binPath, 0o755);
-    console.log("hallouminate: installed successfully");
+
+    // tar -xJ understands xz on both macOS (BSD tar) and Linux (GNU tar).
+    // --strip-components=1 flattens the top-level <app>-<target>/ wrapper so
+    // the binary lands directly in npm/bin/.
+    const tar = spawn(
+      "tar",
+      ["-xJ", "--strip-components=1", "-C", binDir],
+      { stdio: ["pipe", "inherit", "inherit"] },
+    );
+    tar.on("error", (err) => {
+      console.error(`hallouminate: failed to run tar: ${err.message}`);
+      console.error("Install manually: cargo install hallouminate");
+      process.exit(1);
+    });
+    tar.stdin.end(tarBuf);
+    tar.on("close", (code) => {
+      if (code !== 0) {
+        console.error(
+          "hallouminate: failed to extract. Install manually: cargo install hallouminate",
+        );
+        process.exit(1);
+      }
+      if (!fs.existsSync(binPath)) {
+        console.error(
+          `hallouminate: binary missing after extract (expected ${binPath}).`,
+        );
+        console.error("Install manually: cargo install hallouminate");
+        process.exit(1);
+      }
+      fs.chmodSync(binPath, 0o755);
+      console.log("hallouminate: installed successfully");
+    });
   });
 });

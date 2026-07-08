@@ -1,6 +1,6 @@
 {
   "name": "hallouminate",
-  "version": "0.1.0",
+  "version": "0.2.4",
   "description": "A markdown corpus indexer for LLMs to build and query their own per-repo wikis.",
   "bin": {
     "hallouminate": "run.js"
