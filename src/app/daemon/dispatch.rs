@@ -1271,7 +1271,7 @@ async fn rebuild_wiki_indexes(
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Ok(Err(e)) => return Err(format!("read {}: {e}", index_path.display())),
                 Err(e) => {
-                    return Err(format!("read {} task panicked: {e}", index_path.display()));
+                    return Err(format!("read {} join failed: {e}", index_path.display()));
                 }
             }
         };
@@ -2036,7 +2036,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corpus_stats_counts_indexed_and_unindexed_files() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let corpus_dir = tmp.path().join("wiki");
@@ -2100,7 +2100,7 @@ mod tests {
     /// must not inflate `unindexed_files`. Without this, an excluded file that
     /// happens to match the `globs` include pattern would be counted as missing
     /// from the index, even though the corpus is intentionally ignoring it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn corpus_stats_excludes_glob_excluded_files_from_unindexed() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let corpus_dir = tmp.path().join("wiki");
