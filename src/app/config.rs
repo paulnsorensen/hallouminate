@@ -108,6 +108,26 @@ impl Default for WatchConfig {
     }
 }
 
+/// Daemon-wide runtime settings, orthogonal to any single concern (search,
+/// embeddings, storage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Seconds of no completed activity (and zero active connections) before
+    /// the daemon exits cleanly so the OS reclaims all memory. The next CLI or
+    /// MCP use transparently respawns it (~4 s cold start). `0` disables
+    /// idle-exit — the daemon lives until stopped. Default: `900` (15 min).
+    #[serde(default = "default_idle_exit_secs")]
+    pub idle_exit_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_exit_secs: default_idle_exit_secs(),
+        }
+    }
+}
+
 /// On-disk storage locations for hallouminate's persistent state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -154,6 +174,9 @@ pub struct Config {
     /// On-disk storage locations.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Daemon-wide runtime settings.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 impl Config {
@@ -523,6 +546,16 @@ fn merge_layers_with_sources(
             repo_path,
         )?,
     };
+    let daemon = DaemonConfig {
+        idle_exit_secs: merge_scalar(
+            "daemon.idle_exit_secs",
+            baseline.daemon.idle_exit_secs,
+            repo.daemon.idle_exit_secs,
+            defaults.daemon.idle_exit_secs,
+            baseline_path,
+            repo_path,
+        )?,
+    };
 
     let merged = Config {
         corpora,
@@ -531,6 +564,7 @@ fn merge_layers_with_sources(
         embeddings,
         watch,
         storage,
+        daemon,
     };
     // Re-run cross-layer validation on the combined lists; the inner
     // `effective_corpora` call covers duplicate-name detection across
@@ -770,6 +804,9 @@ fn default_idle_evict_secs() -> u64 {
 fn default_ground_dir() -> String {
     DEFAULT_GROUND_DIR.into()
 }
+fn default_idle_exit_secs() -> u64 {
+    900
+}
 
 #[cfg(test)]
 mod tests {
@@ -947,6 +984,26 @@ ground_dir = "~/.local/share/hallouminate/ground"
         let cfg = parse("[embeddings]\nidle_evict_secs = 600\n", None)
             .expect("idle_evict_secs = 600 parses");
         assert_eq!(cfg.embeddings.idle_evict_secs, 600);
+    }
+
+    #[test]
+    fn daemon_idle_exit_secs_defaults_to_900() {
+        assert_eq!(DaemonConfig::default().idle_exit_secs, 900);
+        let cfg = parse("", None).expect("empty config parses");
+        assert_eq!(cfg.daemon.idle_exit_secs, 900);
+    }
+
+    #[test]
+    fn parse_daemon_idle_exit_secs_can_be_disabled_with_zero() {
+        let cfg = parse("[daemon]\nidle_exit_secs = 0\n", None).expect("idle_exit_secs = 0 parses");
+        assert_eq!(cfg.daemon.idle_exit_secs, 0);
+    }
+
+    #[test]
+    fn parse_daemon_idle_exit_secs_custom_value() {
+        let cfg =
+            parse("[daemon]\nidle_exit_secs = 1800\n", None).expect("idle_exit_secs = 1800 parses");
+        assert_eq!(cfg.daemon.idle_exit_secs, 1800);
     }
 
     #[test]
@@ -1808,6 +1865,16 @@ path = "/b"
         let repo = parse("", None).expect("repo default");
         let merged = merge_layers(&baseline, &repo).expect("merge");
         assert_eq!(merged.embeddings.idle_evict_secs, 600);
+    }
+
+    #[test]
+    fn merge_layers_daemon_idle_exit_secs_propagates_baseline_over_repo_default() {
+        // Regression trap: if the merge_scalar call for daemon.idle_exit_secs
+        // is removed and the field is hardcoded to its default, this fails.
+        let baseline = parse("[daemon]\nidle_exit_secs = 1800\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo default");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.daemon.idle_exit_secs, 1800);
     }
 
     #[test]
