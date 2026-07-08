@@ -40,7 +40,7 @@ async fn rerank_with_timeout(
     timeout: Duration,
 ) -> Result<(Vec<SearchHit>, bool)> {
     let fallback = hits.clone();
-    let query_log = query.clone();
+    let query_len = query.len();
     let handle = tokio::task::spawn_blocking(move || {
         let mut hits = hits;
         crossencoder.rerank(&query, &mut hits)?;
@@ -49,13 +49,21 @@ async fn rerank_with_timeout(
     match tokio::time::timeout(timeout, handle).await {
         Ok(Ok(Ok(reranked))) => Ok((reranked, true)),
         Ok(Ok(Err(e))) => Err(e),
-        Ok(Err(join_err)) => Err(HallouminateError::Embed(format!(
-            "crossencoder task panicked: {join_err}"
-        ))),
+        Ok(Err(join_err)) => {
+            let cause = if join_err.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            tracing::error!(error = %join_err, cause, "crossencoder task failed");
+            Err(HallouminateError::Embed(format!(
+                "crossencoder task {cause}: {join_err}"
+            )))
+        }
         Err(_elapsed) => {
             tracing::warn!(
                 timeout_ms = timeout.as_millis() as u64,
-                query = %query_log,
+                query_len,
                 "crossencoder rerank timed out; falling back to fusion order"
             );
             Ok((fallback, false))
