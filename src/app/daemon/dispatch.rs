@@ -371,7 +371,7 @@ async fn handle_ground(
     // load (e.g. model file vanished), log and ground without it
     // rather than refusing the request. Unconfigured paths return
     // Ok(None) and the rerank step is skipped entirely.
-    let mut crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()).await {
+    let crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(
@@ -382,9 +382,10 @@ async fn handle_ground(
             None
         }
     };
-    let crossencoder_dyn: Option<&mut dyn crate::domain::search::Crossencoder> = crossencoder
-        .as_mut()
-        .map(|g| &mut **g as &mut dyn crate::domain::search::Crossencoder);
+    // #139: moved (not borrowed) into a `Box<dyn Crossencoder>` so `ground`/
+    // `ground_union` can hand it to `spawn_blocking` for the rerank timeout.
+    let crossencoder_box: Option<Box<dyn crate::domain::search::Crossencoder>> =
+        crossencoder.map(|g| Box::new(g) as Box<dyn crate::domain::search::Crossencoder>);
     let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
         .as_mut()
         .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
@@ -396,7 +397,7 @@ async fn handle_ground(
             &corpus.paths,
             &store,
             embedder_dyn,
-            crossencoder_dyn,
+            crossencoder_box,
             opts,
         )
         .await
@@ -410,7 +411,7 @@ async fn handle_ground(
             &targets,
             &store,
             embedder_dyn,
-            crossencoder_dyn,
+            crossencoder_box,
             opts,
         )
         .await
@@ -419,7 +420,6 @@ async fn handle_ground(
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    drop(crossencoder);
     drop(embedder);
 
     // #135: stale-index detection.

@@ -257,13 +257,12 @@ async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuf
     let targets = index_wikis(&store, &[alpha, beta, gamma]).await;
 
     let mut embedder = StubEmbedder;
-    let mut crossencoder = ReversingCrossencoder;
     let resp = ground_union(
         "distinctive token wiki",
         &targets,
         &store,
         Some(&mut embedder),
-        Some(&mut crossencoder),
+        Some(Box::new(ReversingCrossencoder)),
         GroundOpts::default(),
     )
     .await
@@ -431,13 +430,12 @@ async fn union_ground_over_all_empty_corpora_returns_empty_response_without_pani
     // No corpora at all is the degenerate floor; a crossencoder is supplied so
     // the empty-hit skip is exercised rather than handed an empty slice.
     let mut embedder = StubEmbedder;
-    let mut crossencoder = ReversingCrossencoder;
     let resp = ground_union(
         "distinctive token wiki",
         &[],
         &store,
         Some(&mut embedder),
-        Some(&mut crossencoder),
+        Some(Box::new(ReversingCrossencoder)),
         GroundOpts::default(),
     )
     .await
