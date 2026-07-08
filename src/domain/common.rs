@@ -105,8 +105,8 @@ pub enum HallouminateError {
     Indexer(String),
 
     /// A lexical search backend (ripgrep) failed with a real error —
-    /// not "no matches" (rg exit 1), but a spawn failure, bad invocation,
-    /// or IO error surfaced through rg's exit status >= 2.
+    /// not "no matches" (rg exit 1), but rg exiting with status >= 2 or
+    /// terminating abnormally (e.g. by signal).
     #[error("search: {0}")]
     Search(String),
 

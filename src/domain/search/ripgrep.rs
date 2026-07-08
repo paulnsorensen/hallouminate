@@ -34,9 +34,10 @@ pub struct RipgrepHit {
 /// - `rg` missing on PATH → `HallouminateError::Io` (`io::ErrorKind::NotFound`)
 /// - `rg` exits 1 with no matches → `Ok(vec![])`; this is rg's normal
 ///   "nothing found" signal, not an error.
-/// - `rg` exits >=2 (a real error) AND nothing was emitted on stdout →
-///   `HallouminateError::Search`; non-zero with matches already collected
-///   (e.g. one path vanished while another matched) is tolerated.
+/// - `rg` exits >=2 (a real error), or terminates abnormally/by signal,
+///   AND nothing was emitted on stdout → `HallouminateError::Search`;
+///   non-zero with matches already collected (e.g. one path vanished
+///   while another matched) is tolerated.
 pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<RipgrepHit>> {
     if paths.is_empty() || query.is_empty() || limit == 0 {
         return Ok(Vec::new());
@@ -249,8 +250,8 @@ mod tests {
         );
         let msg = err.to_string();
         assert!(
-            msg.to_lowercase().contains("no such file"),
-            "expected stderr detail in error message, got: {msg}"
+            msg.contains("/no/such/path/hallouminate-test"),
+            "expected stderr to include the failing path, got: {msg}"
         );
     }
 
