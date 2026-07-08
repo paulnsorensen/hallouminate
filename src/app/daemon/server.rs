@@ -8,6 +8,7 @@
 //! framing/IO errors.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -55,6 +56,8 @@ async fn serve_with_config(
     remove_stale_socket(socket_path).await;
     let watcher = super::watch::spawn_corpus_watcher(&state);
     spawn_signal_handlers(&state);
+    spawn_idle_exit(&state, state.baseline().daemon.idle_exit_secs);
+    tokio::spawn(super::dispatch::catch_up_index(state.clone()));
     let result = serve_on_listener(&state, socket_path).await;
     drop(watcher);
     cleanup(lock, socket_path).await;
@@ -91,6 +94,44 @@ pub fn spawn_signal_handlers(state: &DaemonState) {
             }
         }
         token.cancel();
+    });
+}
+
+/// Spawn the process-level idle-exit watcher (ADR-001/003). When the activity
+/// clock is quiet for `idle_exit_secs` and no connection is active, cancel the
+/// shutdown token — the same clean exit SIGTERM drives — so the OS reclaims all
+/// memory (the ONNX BFCArena included); the next CLI/MCP use respawns the
+/// daemon. `idle_exit_secs == 0` disables it.
+fn spawn_idle_exit(state: &DaemonState, idle_exit_secs: u64) {
+    if idle_exit_secs == 0 {
+        return;
+    }
+    let state = state.clone();
+    let cancel = state.shutdown_token().clone();
+    tokio::spawn(async move {
+        loop {
+            // Sleep to the deadline, not a fixed period: recomputing the
+            // remaining window each iteration bounds idle-exit overshoot to
+            // ~one short sleep regardless of `idle_exit_secs`. The `.max(1)`
+            // floor avoids a busy-loop when the deadline has already passed
+            // but a connection is still active (`should_idle_exit` false).
+            let secs = state.secs_until_idle(idle_exit_secs).max(1);
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                    if state.should_idle_exit(idle_exit_secs) {
+                        tracing::info!(
+                            target: "hallouminate::daemon",
+                            idle_secs = idle_exit_secs,
+                            "daemon idle-exit; exiting so the OS reclaims all memory",
+                        );
+                        state.shutdown_token().cancel();
+                        break;
+                    }
+                }
+            }
+        }
     });
 }
 
@@ -164,6 +205,7 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
     // socket here is safe.
     remove_stale_socket(socket_path).await;
     let watcher = super::watch::spawn_corpus_watcher(state);
+    spawn_idle_exit(state, state.baseline().daemon.idle_exit_secs);
     let result = serve_on_listener(state, socket_path).await;
     drop(watcher);
     cleanup(lock, socket_path).await;
@@ -220,7 +262,11 @@ async fn serve_on_listener(state: &DaemonState, socket_path: &Path) -> anyhow::R
             },
         };
         let state = state.clone();
+        let conn = state.enter_connection();
         tokio::spawn(async move {
+            // Held for the handler's lifetime; decrements the active-connection
+            // count on drop so idle-exit never fires mid-request (ADR-003).
+            let _conn = conn;
             if let Err(e) = handle_connection(state, stream).await {
                 tracing::warn!(
                     target: "hallouminate::daemon",
@@ -245,6 +291,9 @@ async fn handle_connection(state: DaemonState, stream: UnixStream) -> anyhow::Re
         Ok(req) => dispatch(&state, req).await,
         Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
     };
+    // Request completed; stamp the activity clock so idle-exit keys on real
+    // request throughput, not just embed use (ADR-003).
+    state.touch_activity();
     let mut text = serde_json::to_string(&response)?;
     text.push('\n');
     write_half.write_all(text.as_bytes()).await?;

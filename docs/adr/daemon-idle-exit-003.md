@@ -1,0 +1,8 @@
+# ADR — daemon-idle-exit-003
+
+### ADR-003: Idleness = last completed activity + zero active connections  [status: accepted]
+
+- **Context:** The eviction-era clock (`last_embed_use_secs`, `state.rs:115`) tracked only embedder/crossencoder use (`state.rs:429-465`, guard drops `:610-647`). A process-level exit keyed on that clock would fire during wiki-write- or list-heavy sessions that never embed. Separately, daemon shutdown does not drain in-flight handlers — connection tasks are spawned detached (`server.rs:204-208`, `:223-231`) — so an automatic, frequent exit raises the exposure of dying mid-LanceDB-write beyond today's manual SIGTERM.
+- **Decision:** Rename `last_embed_use_secs` → `last_activity_secs` and touch it at request completion in `handle_connection` (embed/crossencoder acquire+drop keep touching it). Gate idle-exit on `active_connections == 0` via an atomic counter incremented in the accept loop before the handler spawns and decremented by a Drop guard when the handler ends. If the deadline passes while a connection is active, defer and re-check.
+- **Alternatives:** Keep the embed-only clock and cancel the token bare (rejected: exits under active non-embed use and can kill mid-write); full graceful drain of in-flight requests (rejected as scope: a pre-existing gap shared with SIGTERM/`stop`, worth its own change if ever).
+- **Consequences:** No idle-exit under any active use; the residual mid-write exposure is exactly today's SIGTERM exposure, not worse. A tiny accept-backlog race remains (connected-but-not-accepted client sees EOF; the next `client_for(None)` heals it).

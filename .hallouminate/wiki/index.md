@@ -15,6 +15,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [multi-format-ingestion](multi-format-ingestion.md) — why hallouminate is markdown-only today, the per-format dispatch pattern (text/code/PDF), reachable tooling, and the open design questions before extending the indexer.
 - [claim-provenance-marks](claim-provenance-marks.md) — inline `<!--claim:STATUS-->` marks parsed at index time, stored per chunk in Lance and surfaced in `ground`; how they differ from page-level frontmatter.
 - [config-layering](config-layering.md) — XDG baseline plus repo-layer merge; how a single daemon serves many repos.
+- [ort-arena-retention](ort-arena-retention.md) — why session eviction never reclaimed embedder memory: upstream ONNX Runtime BFCArena retention; superseded by daemon idle-exit.
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
 

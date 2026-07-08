@@ -265,7 +265,10 @@ fn invalid_params(msg: impl Into<String>) -> ErrorData {
 /// `daemon_socket_path()` (which respects `HALLOUMINATE_SOCKET`); the env
 /// is the only override hook the MCP transport needs.
 async fn daemon_for_tool() -> Result<DaemonClient, ErrorData> {
-    // Per the spec's Non-goals: do NOT auto-start the daemon from MCP.
+    // ADR-002 reverses the old "do NOT auto-start the daemon from MCP" non-goal:
+    // with idle-exit (ADR-001) a mid-session exit would strand every later tool
+    // call, so client_for(None) self-heals by respawning the daemon once on
+    // connect failure.
     client_for(None)
         .await
         .map_err(|e| internal_error(format!("{e:#}")))

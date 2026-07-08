@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -122,7 +122,14 @@ struct DaemonStateInner {
     /// shared one. Empty until the first `ground` request that resolves a
     /// configured model; the baseline model (if any) is pre-warmed at boot.
     crossencoders: Arc<Mutex<HashMap<String, FastembedCrossencoder>>>,
-    last_embed_use_secs: Arc<AtomicU64>,
+    /// Unix-second timestamp of the most recent completed activity: request
+    /// completion (handle_connection) plus embedder/crossencoder acquire and
+    /// guard drop. Idle-exit (server.rs) fires when this is quiet for
+    /// `[daemon].idle_exit_secs` and no connection is active (ADR-003).
+    last_activity_secs: Arc<AtomicU64>,
+    /// Count of connection handlers in flight. Idle-exit defers while non-zero
+    /// so the daemon never exits mid-request (ADR-003).
+    active_connections: Arc<AtomicUsize>,
     tokenizer: tokenizers::Tokenizer,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
@@ -139,6 +146,19 @@ pub struct MutationGuard {
     // make the order an invariant rather than a convention.
     _permit: OwnedSemaphorePermit,
     _corpus: OwnedMutexGuard<()>,
+}
+
+/// Decrements the daemon's active-connection count when dropped. Held by a
+/// connection handler task for its whole lifetime so idle-exit sees a non-zero
+/// count for the duration of every in-flight request (ADR-003).
+pub struct ConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl DaemonState {
@@ -304,51 +324,28 @@ impl DaemonState {
                 }
             }
         }
-        let idle_evict_secs = cfg.embeddings.idle_evict_secs;
         let shutdown = CancellationToken::new();
         let embedder_arc = Arc::new(Mutex::new(embedder));
         let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
-        let last_embed_use = Arc::new(AtomicU64::new(unix_secs()));
+        let last_activity = Arc::new(AtomicU64::new(unix_secs()));
         let store = Arc::new(store);
         let write_lane = Arc::new(Semaphore::new(1));
 
-        if idle_evict_secs > 0 {
-            let embedder_ref = Arc::clone(&embedder_arc);
-            let crossencoders_ref = Arc::clone(&crossencoders_arc);
-            let last_use_ref = Arc::clone(&last_embed_use);
-            let cancel = shutdown.clone();
-            tracing::debug!(
+        // #161's idle eviction is deleted (ADR-001): dropping the ONNX session
+        // released nothing (the CPU BFCArena retains its extents), so each
+        // evict->reload cycle stacked a fresh arena. Idle-exit (server.rs)
+        // reclaims memory by exiting the whole process instead. The config
+        // field still parses; warn when it was set to a non-default value so
+        // operators migrate to `[daemon].idle_exit_secs`.
+        if cfg.embeddings.idle_evict_secs
+            != crate::app::config::EmbeddingsConfig::default().idle_evict_secs
+        {
+            tracing::warn!(
                 target: "hallouminate::daemon",
-                idle_evict_secs,
-                "idle evict task spawned",
+                idle_evict_secs = cfg.embeddings.idle_evict_secs,
+                "embeddings.idle_evict_secs is deprecated and does nothing; \
+                 set [daemon].idle_exit_secs to control idle-exit instead",
             );
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(idle_evict_secs)) => {
-                            if is_idle(last_use_ref.load(Ordering::Relaxed), unix_secs(), idle_evict_secs) {
-                                let mut emb = embedder_ref.lock().await;
-                                let mut xenc = crossencoders_ref.lock().await;
-                                if is_idle(last_use_ref.load(Ordering::Relaxed), unix_secs(), idle_evict_secs) {
-                                    let was_live = emb.is_some();
-                                    *emb = None;
-                                    let had_xenc = !xenc.is_empty();
-                                    xenc.clear();
-                                    if was_live || had_xenc {
-                                        tracing::info!(
-                                            target: "hallouminate::daemon",
-                                            idle_secs = idle_evict_secs,
-                                            "embedder evicted after idle; ORT BFCArena memory released",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            });
         }
 
         // Low-frequency LanceDB maintenance tick (compaction + version
@@ -409,7 +406,8 @@ impl DaemonState {
                 write_lane,
                 embedder: embedder_arc,
                 crossencoders: crossencoders_arc,
-                last_embed_use_secs: last_embed_use,
+                last_activity_secs: last_activity,
+                active_connections: Arc::new(AtomicUsize::new(0)),
                 tokenizer,
                 shutdown,
             }),
@@ -486,11 +484,11 @@ impl DaemonState {
             *guard = Some(embedder);
         }
         self.inner
-            .last_embed_use_secs
+            .last_activity_secs
             .store(unix_secs(), Ordering::Relaxed);
         Ok(EmbedderGuard {
             guard,
-            last_use_secs: Arc::clone(&self.inner.last_embed_use_secs),
+            last_use_secs: Arc::clone(&self.inner.last_activity_secs),
         })
     }
 
@@ -520,58 +518,76 @@ impl DaemonState {
             guard.insert(canonical.to_string(), model);
         }
         self.inner
-            .last_embed_use_secs
+            .last_activity_secs
             .store(unix_secs(), Ordering::Relaxed);
         Ok(Some(CrossencoderGuard {
             guard,
             key: canonical.to_string(),
-            last_use_secs: Arc::clone(&self.inner.last_embed_use_secs),
+            last_use_secs: Arc::clone(&self.inner.last_activity_secs),
         }))
     }
 
-    /// Evict the embedder and crossencoders if idle for at least `idle_secs`
-    /// seconds (comparing `now_secs` to the last-recorded embed use). Returns
-    /// `true` when eviction conditions are met (whether or not anything was
-    /// live), `false` when `idle_secs == 0` (disabled) or the last use is too
-    /// recent. Exposed `pub(crate)` so tests can inject a synthetic `now_secs`
-    /// without sleeping.
-    #[cfg(test)]
-    pub(crate) async fn evict_if_idle_at(&self, idle_secs: u64, now_secs: u64) -> bool {
+    /// Bump the activity clock to now — called at request completion so
+    /// idle-exit keys on real request throughput, not just embed use (ADR-003).
+    pub fn touch_activity(&self) {
+        self.inner
+            .last_activity_secs
+            .store(unix_secs(), Ordering::Relaxed);
+    }
+
+    /// Register an active connection; the returned guard decrements the count
+    /// on drop. Held for a connection handler's lifetime so idle-exit never
+    /// fires mid-request (ADR-003).
+    pub fn enter_connection(&self) -> ConnectionGuard {
+        self.inner.active_connections.fetch_add(1, Ordering::SeqCst);
+        ConnectionGuard {
+            active: Arc::clone(&self.inner.active_connections),
+        }
+    }
+
+    /// Idle-exit predicate against the real clock: enabled, zero active
+    /// connections, activity clock quiet for at least `idle_secs`.
+    /// `idle_secs == 0` disables idle-exit.
+    pub(crate) fn should_idle_exit(&self, idle_secs: u64) -> bool {
+        self.should_idle_exit_at(idle_secs, unix_secs())
+    }
+
+    /// Injectable-clock variant so tests drive a synthetic `now_secs`.
+    fn should_idle_exit_at(&self, idle_secs: u64, now_secs: u64) -> bool {
         if idle_secs == 0 {
             return false;
         }
-        let last = self.inner.last_embed_use_secs.load(Ordering::Relaxed);
-        if !is_idle(last, now_secs, idle_secs) {
+        if self.inner.active_connections.load(Ordering::SeqCst) != 0 {
             return false;
         }
-        let mut emb = self.inner.embedder.lock().await;
-        let mut xenc = self.inner.crossencoders.lock().await;
-        if !is_idle(
-            self.inner.last_embed_use_secs.load(Ordering::Relaxed),
+        is_idle(
+            self.inner.last_activity_secs.load(Ordering::Relaxed),
             now_secs,
             idle_secs,
-        ) {
-            return false;
-        }
-        let was_live = emb.is_some();
-        *emb = None;
-        let had_xenc = !xenc.is_empty();
-        xenc.clear();
-        if was_live || had_xenc {
-            tracing::info!(
-                target: "hallouminate::daemon",
-                idle_secs,
-                "embedder evicted after idle; ORT BFCArena memory released",
-            );
-        }
-        true
+        )
     }
 
-    /// Unix-second timestamp of the most recent `embedder()` or
-    /// `crossencoder()` call. Exposed `pub(crate)` for tests.
+    /// Seconds remaining until the idle-exit deadline (last activity +
+    /// `idle_exit_secs`): the full window right after activity, saturating to
+    /// zero once the window has elapsed. The idle-exit watcher sleeps this
+    /// long instead of polling on a fixed period, so exit lands within one
+    /// short interval of the true deadline rather than overshooting by up to a
+    /// whole period.
+    pub(crate) fn secs_until_idle(&self, idle_exit_secs: u64) -> u64 {
+        self.secs_until_idle_at(idle_exit_secs, unix_secs())
+    }
+
+    /// Injectable-clock variant so tests drive a synthetic `now_secs`.
+    fn secs_until_idle_at(&self, idle_exit_secs: u64, now_secs: u64) -> u64 {
+        let elapsed =
+            now_secs.saturating_sub(self.inner.last_activity_secs.load(Ordering::Relaxed));
+        idle_exit_secs.saturating_sub(elapsed)
+    }
+
+    /// Unix-second timestamp of the most recent activity. Test accessor.
     #[cfg(test)]
-    pub(crate) fn last_embed_use_secs(&self) -> u64 {
-        self.inner.last_embed_use_secs.load(Ordering::Relaxed)
+    pub(crate) fn last_activity_secs(&self) -> u64 {
+        self.inner.last_activity_secs.load(Ordering::Relaxed)
     }
 
     /// A freshly-constructed format-handler [`HandlerRegistry`] over the
@@ -737,99 +753,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evict_if_idle_at_returns_false_when_disabled() {
+    async fn should_idle_exit_is_false_when_disabled() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
         assert!(
-            !state.evict_if_idle_at(0, u64::MAX).await,
-            "idle_secs=0 means disabled; must not evict",
+            !state.should_idle_exit_at(0, u64::MAX),
+            "idle_secs=0 disables idle-exit; must never fire",
         );
     }
 
     #[tokio::test]
-    async fn evict_if_idle_at_returns_false_when_recently_used() {
+    async fn should_idle_exit_is_false_when_recently_active() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
-        let last = state.last_embed_use_secs();
-        // now_secs is only 1 s ahead — not enough for a 300 s idle threshold.
+        let last = state.last_activity_secs();
         assert!(
-            !state.evict_if_idle_at(300, last + 1).await,
-            "1 s elapsed < 300 s idle; must not evict",
+            !state.should_idle_exit_at(300, last + 1),
+            "1 s elapsed < 300 s idle; must not exit",
         );
     }
 
     #[tokio::test]
-    async fn evict_if_idle_at_returns_true_when_idle_threshold_exceeded() {
+    async fn should_idle_exit_is_true_when_idle_and_no_connections() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
-        let last = state.last_embed_use_secs();
-        // now_secs is 301 s ahead — exceeds the 300 s idle threshold.
+        let last = state.last_activity_secs();
+        // Inclusive boundary and just past it both fire.
         assert!(
-            state.evict_if_idle_at(300, last + 301).await,
-            "301 s elapsed >= 300 s idle; must evict",
+            state.should_idle_exit_at(300, last + 300),
+            "elapsed == idle_secs (>= threshold); must exit",
+        );
+        assert!(
+            state.should_idle_exit_at(300, last + 301),
+            "elapsed > idle_secs; must exit",
         );
     }
 
     #[tokio::test]
-    async fn evict_if_idle_at_exact_boundary_evicts() {
-        // The condition is `elapsed >= idle_secs` (inclusive). Verifies `>`
-        // was not accidentally used instead.
+    async fn should_idle_exit_is_false_one_second_below_threshold() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
-        let last = state.last_embed_use_secs();
+        let last = state.last_activity_secs();
         assert!(
-            state.evict_if_idle_at(300, last + 300).await,
-            "elapsed == idle_secs (>= threshold); must evict",
+            !state.should_idle_exit_at(300, last + 299),
+            "elapsed = idle_secs - 1 (< threshold); must not exit",
         );
     }
 
     #[tokio::test]
-    async fn evict_if_idle_at_one_second_below_threshold_does_not_evict() {
-        // Symmetric boundary: elapsed = idle_secs - 1 is strictly less.
+    async fn secs_until_idle_counts_down_to_the_deadline() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
-        let last = state.last_embed_use_secs();
-        assert!(
-            !state.evict_if_idle_at(300, last + 299).await,
-            "elapsed = idle_secs - 1 (< threshold); must not evict",
+        let last = state.last_activity_secs();
+        // Full window remains the instant activity lands.
+        assert_eq!(
+            state.secs_until_idle_at(300, last),
+            300,
+            "no time elapsed since activity; the full window remains",
+        );
+        // Partway through the window, only the remainder is left.
+        assert_eq!(
+            state.secs_until_idle_at(300, last + 100),
+            200,
+            "100 s elapsed of a 300 s window; 200 s remain",
+        );
+        // Saturates to zero once the window has fully elapsed, and stays there
+        // well past it (no underflow).
+        assert_eq!(
+            state.secs_until_idle_at(300, last + 300),
+            0,
+            "window exactly elapsed; deadline reached",
+        );
+        assert_eq!(
+            state.secs_until_idle_at(300, last + 10_000),
+            0,
+            "well past the window; saturates to zero, never underflows",
         );
     }
+
     #[tokio::test]
-    async fn evict_if_idle_at_rechecks_after_waiting_for_embedder_lock() {
+    async fn active_connection_defers_idle_exit_even_when_clock_is_idle() {
+        // ADR-003: idle-exit must never fire while a connection is in flight,
+        // no matter how quiet the activity clock is.
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
-        state.inner.last_embed_use_secs.store(1, Ordering::Relaxed);
+        let last = state.last_activity_secs();
 
-        let held = state.inner.embedder.lock().await;
-        let task_state = state.clone();
-        let eviction = tokio::spawn(async move { task_state.evict_if_idle_at(300, 1000).await });
-        state
-            .inner
-            .last_embed_use_secs
-            .store(999, Ordering::Relaxed);
-        drop(held);
-
+        let guard = state.enter_connection();
         assert!(
-            !eviction.await.expect("eviction task joins"),
-            "eviction must re-check idleness after waiting for an active guard",
+            !state.should_idle_exit_at(300, last + 10_000),
+            "an active connection must defer idle-exit even when long idle",
+        );
+        drop(guard);
+        assert!(
+            state.should_idle_exit_at(300, last + 10_000),
+            "once the connection count returns to zero, idle-exit fires",
+        );
+    }
+
+    #[tokio::test]
+    async fn touch_activity_advances_the_idle_clock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        state.inner.last_activity_secs.store(1, Ordering::Relaxed);
+        assert!(
+            state.should_idle_exit_at(300, 1000),
+            "clock stale at 1 s; now=1000 is well past idle",
+        );
+        state.touch_activity();
+        assert!(
+            !state.should_idle_exit_at(300, state.last_activity_secs() + 1),
+            "touch_activity must reset the clock so a fresh now is not idle",
         );
     }
 
