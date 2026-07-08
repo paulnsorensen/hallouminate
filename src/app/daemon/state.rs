@@ -484,6 +484,10 @@ impl DaemonState {
     /// The fastembed runtime is `&mut`-only, so concurrent embed batches
     /// serialize behind this mutex; that matches the underlying constraint
     /// (one model handle per process) rather than introducing a new one.
+    ///
+    /// Uses `block_in_place` internally, which panics on a current-thread
+    /// runtime — callers (and their tests) must run under the `multi_thread`
+    /// flavor.
     pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard<'_>> {
         let mut guard = self.inner.embedder.lock().await;
         if guard.is_none() {

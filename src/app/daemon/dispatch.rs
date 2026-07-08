@@ -1129,6 +1129,9 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
     }
 }
 
+/// Uses `block_in_place` internally, which panics on a current-thread
+/// runtime — callers (and their tests) must run under the `multi_thread`
+/// flavor.
 pub(super) async fn index_single_file(
     store: &LanceStore,
     embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
@@ -2203,7 +2206,7 @@ mod tests {
             corpus_dir.display()
         );
         write_repo_layer(tmp.path(), &repo_config);
-        let state = state_with_ground(&ground, "").await;
+        let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
 
         // Write 2 files and index them.
         std::fs::write(corpus_dir.join("a.md"), "# Doc A\n\nContent A.\n").expect("write a");
@@ -2272,7 +2275,7 @@ mod tests {
             corpus_dir.display()
         );
         write_repo_layer(tmp.path(), &repo_config);
-        let state = state_with_ground(&ground, "").await;
+        let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
 
         // Write and index one normal file.
         std::fs::write(corpus_dir.join("indexed.md"), "# Indexed\n\nContent.\n")
