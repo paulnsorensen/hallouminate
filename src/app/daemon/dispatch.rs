@@ -797,9 +797,9 @@ async fn handle_add_markdown(
     // Short-circuit so tests that exercise just the filesystem-mutation lane
     // don't need the embedding model active. When the request is overwriting
     // a previously-indexed file with empty content, also prune the existing
-    // LanceDB rows so searches stop returning the deleted body — the full
-    // `index_single_file` path does this via `files_skipped_empty > 0 &&
-    // had_snapshot`, but the short-circuit below bypasses that loop.
+    // LanceDB rows so searches stop returning the deleted body — the shared
+    // `apply`/`EmptyFilePolicy::Evict` path (see `apply.rs`) does this for the
+    // full `index_single_file` path, but the short-circuit below bypasses it.
     let mut stats = if content_is_empty {
         let mut stats = crate::domain::indexer::ApplyStats {
             files_skipped_empty: 1,
@@ -1152,13 +1152,24 @@ pub(super) async fn index_single_file(
         .ok_or_else(|| anyhow::anyhow!("non-utf8 path: {}", file_ref.as_path().display()))?
         .to_string();
     let existing = store.get_file_snapshot(&corpus.name, &file_ref_str).await?;
-    let had_snapshot = existing.is_some();
     let mut db: HashMap<FileRef, FileSnapshot> = HashMap::new();
+    // Carries the snapshot when the mtime lied (same-second truncation/edit)
+    // but the content hash moved: `plan()` would otherwise skip this file
+    // entirely (mtime unchanged) or, if omitted from `db`, misroute it as a
+    // brand-new upsert with no prior rows to evict. Neither is right — it
+    // must go through the mtime-fallthrough path so a truncate-to-empty here
+    // still evicts stale rows (`EmptyFilePolicy::Evict`).
+    let mut reindex_despite_same_mtime: Option<(FileSnapshot, String)> = None;
     if let Some(snap) = existing {
         let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
             let owned_file = file.to_path_buf();
             let hash = tokio::task::spawn_blocking(move || blake3_file(&owned_file)).await??;
-            hash != snap.content_hash.as_str()
+            if hash != snap.content_hash.as_str() {
+                reindex_despite_same_mtime = Some((snap.clone(), hash));
+                true
+            } else {
+                false
+            }
         } else {
             false
         };
@@ -1166,8 +1177,24 @@ pub(super) async fn index_single_file(
             db.insert(file_ref.clone(), snap);
         }
     }
-    let p = plan(vec![(file_ref, Mtime(mtime_ms))], db);
-    let mut stats = tokio::task::block_in_place(|| {
+    let mut p = plan(vec![(file_ref.clone(), Mtime(mtime_ms))], db);
+    if let Some((snap, known_hash)) = reindex_despite_same_mtime
+        && let Some(idx) = p.upserts.iter().position(|u| u.file == file_ref)
+    {
+        let upsert = p.upserts.remove(idx);
+        p.mtime_touches
+            .push(crate::domain::indexer::MtimeCandidate {
+                file: upsert.file,
+                snap,
+                new_mtime: upsert.mtime,
+                known_hash: Some(known_hash),
+            });
+    }
+    // Truncate-to-empty eviction (files_skipped_empty > 0 for a file that HAD
+    // a snapshot) is handled inside `apply`'s mtime-fallthrough batch — see
+    // `EmptyFilePolicy::Evict` in `src/domain/indexer/apply.rs` — so both this
+    // single-file path and bulk `index_corpus` share one eviction rule.
+    let stats = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(apply(
             p,
             store,
@@ -1177,22 +1204,6 @@ pub(super) async fn index_single_file(
             DEFAULT_BATCH_SIZE,
         ))
     })?;
-    // Evict only on the genuine truncate-to-empty case. A present-but-unreadable
-    // file (unsupported type / extraction failure) is counted under
-    // `files_skipped_unreadable` and retains its last-good rows — matching bulk
-    // `index_corpus`, which never deletes a file still on disk. This prevents a
-    // transient parse failure (atomic-save race, partial write, momentary
-    // corruption) from silently dropping a file from search.
-    if stats.files_skipped_empty > 0 && had_snapshot {
-        tracing::info!(
-            target: "hallouminate::daemon",
-            corpus = %corpus.name,
-            file = %file_ref_str,
-            "evicting indexed file from search: re-index produced an empty file",
-        );
-        store.delete_file(&corpus.name, &file_ref_str).await?;
-        stats.files_deleted += 1;
-    }
     Ok(stats)
 }
 
@@ -2516,6 +2527,83 @@ mod tests {
         assert_eq!(
             s.files_deleted, 1,
             "the genuine empty case must still evict the prior rows"
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&corpus.name)
+                .await
+                .unwrap()
+                .total_chunks,
+            0,
+            "the truncated file's rows must be removed from the index"
+        );
+        assert!(
+            store
+                .get_file_snapshot(&corpus.name, &file_ref)
+                .await
+                .unwrap()
+                .is_none(),
+            "the truncated file's snapshot row must be gone after eviction"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_single_file_evicts_when_reindex_truncates_to_empty_with_unchanged_mtime() {
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let file = corpus_dir.path().join("note.md");
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        };
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+        let file_ref = canonicalize_or_passthrough(&file)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        std::fs::write(&file, "# Note\n\nspice melange harvested on Arrakis\n").unwrap();
+        index_single_file(&store, None, &registry, &corpus, &file)
+            .await
+            .expect("first index must succeed");
+        assert!(
+            store
+                .corpus_chunk_stats(&corpus.name)
+                .await
+                .unwrap()
+                .total_chunks
+                > 0,
+            "the valid markdown must index rows"
+        );
+
+        // Truncate to empty but pin the mtime back to its pre-truncation value:
+        // the regression case is a same-second truncate-to-empty where the
+        // filesystem mtime does not advance. It must still be evicted, not
+        // silently routed into the upsert path as if it were a brand-new file.
+        let indexed_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::fs::write(&file, "").unwrap();
+        std::fs::File::open(&file)
+            .unwrap()
+            .set_modified(indexed_mtime)
+            .unwrap();
+
+        let s = index_single_file(&store, None, &registry, &corpus, &file)
+            .await
+            .expect("re-index of a now-empty file with unchanged mtime must not hard-error");
+        assert_eq!(
+            s.files_skipped_empty, 1,
+            "a truncate-to-empty re-index is the genuine empty case"
+        );
+        assert_eq!(
+            s.files_deleted, 1,
+            "the genuine empty case must still evict prior rows even when mtime did not change"
         );
         assert_eq!(
             store

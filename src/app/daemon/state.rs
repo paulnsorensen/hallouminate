@@ -54,6 +54,14 @@ const MAINTENANCE_INTERVAL_SECS: u64 = 1800;
 /// prune.
 const MAINTENANCE_PRUNE_GRACE_SECS: u64 = 300;
 
+/// Whether the maintenance loop should keep ticking after a pass. `Stop`
+/// means the write lane is closed — the daemon is shutting down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceTick {
+    Continue,
+    Stop,
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -366,54 +374,7 @@ impl DaemonState {
             );
         }
 
-        // Low-frequency LanceDB maintenance tick (compaction + version
-        // prune, see `LanceStore::maintain`). Runs under the write-lane
-        // permit alone -- maintenance spans the whole table, not one
-        // corpus, so there is no corpus lock to acquire first; taking only
-        // the write lane still preserves the documented `corpus ->
-        // write_lane` order (a lock that is never acquired can't be
-        // acquired out of order).
-        {
-            let store_ref = Arc::clone(&store);
-            let write_lane_ref = Arc::clone(&write_lane);
-            let cancel = shutdown.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(MAINTENANCE_INTERVAL_SECS)) => {
-                            let Ok(_permit) = write_lane_ref.acquire().await else { break };
-                            match store_ref
-                                .maintain(lancedb::table::Duration::seconds(
-                                    MAINTENANCE_PRUNE_GRACE_SECS as i64,
-                                ))
-                                .await
-                            {
-                                Ok(stats) => {
-                                    tracing::info!(
-                                        target: "hallouminate::lance",
-                                        fragments_removed = stats.compaction.as_ref().map(|c| c.fragments_removed),
-                                        fragments_added = stats.compaction.as_ref().map(|c| c.fragments_added),
-                                        old_versions_pruned = stats.prune.as_ref().map(|p| p.old_versions),
-                                        "periodic LanceDB maintenance completed",
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "hallouminate::lance",
-                                        error = %e,
-                                        "periodic LanceDB maintenance failed",
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(DaemonState {
+        let state = DaemonState {
             inner: Arc::new(DaemonStateInner {
                 embeddings_enabled: cfg.embeddings.enabled,
                 baseline: cfg,
@@ -429,7 +390,75 @@ impl DaemonState {
                 tokenizer,
                 shutdown,
             }),
-        })
+        };
+
+        // Low-frequency LanceDB maintenance tick (compaction + version
+        // prune, see `LanceStore::maintain`). Runs under the write-lane
+        // permit alone -- maintenance spans the whole table, not one
+        // corpus, so there is no corpus lock to acquire first; taking only
+        // the write lane still preserves the documented `corpus ->
+        // write_lane` order (a lock that is never acquired can't be
+        // acquired out of order).
+        {
+            let state = state.clone();
+            let cancel = state.shutdown_token().clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(MAINTENANCE_INTERVAL_SECS)) => {
+                            if state.run_maintenance_tick().await == MaintenanceTick::Stop {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(state)
+    }
+
+    /// One LanceDB maintenance pass (compaction + version prune). Holds a
+    /// connection guard for the write's duration and stamps the activity
+    /// clock after, so idle-exit defers instead of tearing the process down
+    /// (and releasing the single-instance flock) under a live LanceDB write
+    /// (ADR-003) — mirroring `catch_up_index` (dispatch.rs) and the
+    /// watcher's `process_change_batch`. Returns [`MaintenanceTick::Stop`]
+    /// when the write lane is closed (daemon shutting down).
+    async fn run_maintenance_tick(&self) -> MaintenanceTick {
+        let _conn = self.enter_connection();
+        let Ok(_permit) = self.inner.write_lane.acquire().await else {
+            return MaintenanceTick::Stop;
+        };
+        match self
+            .inner
+            .store
+            .maintain(lancedb::table::Duration::seconds(
+                MAINTENANCE_PRUNE_GRACE_SECS as i64,
+            ))
+            .await
+        {
+            Ok(stats) => {
+                tracing::info!(
+                    target: "hallouminate::lance",
+                    fragments_removed = stats.compaction.as_ref().map(|c| c.fragments_removed),
+                    fragments_added = stats.compaction.as_ref().map(|c| c.fragments_added),
+                    old_versions_pruned = stats.prune.as_ref().map(|p| p.old_versions),
+                    "periodic LanceDB maintenance completed",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::lance",
+                    error = %e,
+                    "periodic LanceDB maintenance failed",
+                );
+            }
+        }
+        self.touch_activity();
+        MaintenanceTick::Continue
     }
 
     /// The daemon-wide shutdown token. The accept loop selects on
@@ -612,6 +641,14 @@ impl DaemonState {
     #[cfg(test)]
     pub(crate) fn last_activity_secs(&self) -> u64 {
         self.inner.last_activity_secs.load(Ordering::Relaxed)
+    }
+
+    /// Force the activity clock to an arbitrary value. Test-only: lets a
+    /// cross-module test (e.g. watch.rs's batch-processing regression test)
+    /// simulate a long-idle daemon without a real sleep.
+    #[cfg(test)]
+    pub(crate) fn set_last_activity_secs_for_test(&self, secs: u64) {
+        self.inner.last_activity_secs.store(secs, Ordering::Relaxed);
     }
 
     /// A freshly-constructed format-handler [`HandlerRegistry`] over the
@@ -988,6 +1025,50 @@ mod tests {
             state.should_idle_exit_at(300, last + 10_000),
             "once the connection count returns to zero, idle-exit fires",
         );
+    }
+
+    /// ADR-003 regression: the maintenance tick wrote to LanceDB with no
+    /// connection guard and no clock stamp, so idle-exit could tear the
+    /// daemon down (releasing the single-instance flock) mid-maintenance.
+    #[tokio::test]
+    async fn maintenance_tick_stamps_the_idle_clock_and_continues() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        state.set_last_activity_secs_for_test(1);
+        assert!(
+            state.should_idle_exit_at(300, 1000),
+            "sanity: stale clock with no connections is idle-eligible",
+        );
+
+        let tick = state.run_maintenance_tick().await;
+
+        assert_eq!(tick, MaintenanceTick::Continue);
+        assert!(
+            !state.should_idle_exit(300),
+            "a maintenance pass must stamp the activity clock so idle-exit \
+             does not fire immediately after it",
+        );
+    }
+
+    /// `write_lane.acquire()` erring (a closed semaphore) is the other half
+    /// of `run_maintenance_tick`'s match: it must return `Stop` rather than
+    /// panicking or silently continuing, so the caller's maintenance loop
+    /// exits cleanly instead of looping on a permanently-closed lane.
+    #[tokio::test]
+    async fn maintenance_tick_stops_when_the_write_lane_is_closed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        state.write_lane().close();
+
+        let tick = state.run_maintenance_tick().await;
+
+        assert_eq!(tick, MaintenanceTick::Stop);
     }
 
     #[tokio::test]

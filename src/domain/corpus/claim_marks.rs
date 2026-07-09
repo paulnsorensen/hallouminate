@@ -100,8 +100,8 @@ fn classify(inner: &str) -> Comment {
     let Some(rest) = trimmed.strip_prefix("claim:") else {
         return Comment::NotClaim;
     };
-    // `rest` is `STATUS [ref=... note="..."]`. The status token runs up to the
-    // first ASCII whitespace; the remainder is the attribute span.
+    // `rest` is `STATUS [ref=... note="..."]`. The status token runs up to
+    // the first whitespace; the remainder is the attribute span.
     let (status_tok, attr_span) = match rest.find(char::is_whitespace) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, ""),
@@ -124,11 +124,15 @@ fn classify(inner: &str) -> Comment {
 fn parse_attributes(span: &str) -> Attributes {
     let mut reference = None;
     let mut note = None;
-    let bytes = span.as_bytes();
     let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_whitespace() {
-            i += 1;
+    while let Some(first) = span[i..].chars().next() {
+        if first.is_whitespace() {
+            // Skip whitespace by its full UTF-8 width. The token splits below
+            // use `char::is_whitespace`, so the skip must match it: an
+            // ASCII-only skip paired with a 1-byte advance walked into the
+            // middle of multibyte whitespace (e.g. U+00A0) and panicked
+            // slicing mid-codepoint.
+            i += first.len_utf8();
             continue;
         }
         if let Some(after) = span[i..].strip_prefix("note=\"") {
@@ -157,11 +161,13 @@ fn parse_attributes(span: &str) -> Attributes {
             }
             i = value_start + rel_end;
         } else {
-            // Unknown token: skip to the next whitespace.
+            // Unknown token: skip to the next whitespace. `first` is not
+            // whitespace, so the found offset is at least `first`'s width and
+            // always lands on a char boundary.
             let rel_end = span[i..]
                 .find(char::is_whitespace)
                 .unwrap_or(span.len() - i);
-            i += rel_end.max(1);
+            i += rel_end;
         }
     }
     Attributes { reference, note }
@@ -703,5 +709,42 @@ mod tests {
             text.lines().count(),
             "strip must preserve line count"
         );
+    }
+
+    #[test]
+    fn multibyte_unicode_whitespace_before_attribute_does_not_panic() {
+        // U+00A0 (NBSP) is Unicode whitespace but not ASCII whitespace and is
+        // 2 bytes in UTF-8 — a classic copy-paste artifact. Interior NBSP
+        // survives `inner.trim()` and reaches `parse_attributes`, which must
+        // skip it like an ASCII space instead of slicing mid-codepoint and
+        // panicking (`byte index 1 is not a char boundary`).
+        let body = "x<!--claim:superseded\u{a0}ref=old.md-->\n";
+        let marks = extract_claim_marks(body);
+        assert_eq!(marks.len(), 1, "mark must parse despite NBSP: {marks:?}");
+        assert_eq!(marks[0].status, ClaimStatus::Superseded);
+        assert_eq!(
+            marks[0].reference.as_deref(),
+            Some("old.md"),
+            "NBSP must act as an attribute separator"
+        );
+    }
+
+    #[test]
+    fn multibyte_unicode_whitespace_between_attributes_does_not_panic() {
+        // U+2003 (em space, 3 bytes) between `ref=` and `note=` — the `ref=`
+        // branch stops at it, then the skip loop must step over the whole
+        // codepoint. Lint and strip route through the same classify path and
+        // must survive too.
+        let body = "x<!--claim:qualified ref=a\u{2003}note=\"why\"-->\n";
+        let marks = extract_claim_marks(body);
+        assert_eq!(
+            marks.len(),
+            1,
+            "mark must parse despite em space: {marks:?}"
+        );
+        assert_eq!(marks[0].reference.as_deref(), Some("a"));
+        assert_eq!(marks[0].note.as_deref(), Some("why"));
+        lint_claim_marks(body);
+        assert_eq!(strip_claim_marks(body), "x\n");
     }
 }

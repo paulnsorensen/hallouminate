@@ -50,6 +50,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "embeddings",
     "watch",
     "storage",
+    "daemon",
 ];
 
 /// Keys recognized inside a `[[repository]]` entry. Used by
@@ -465,6 +466,27 @@ mod tests {
         let cfg_path = cfg_dir.join("config.toml");
         std::fs::write(&cfg_path, body).expect("write repo config");
         cfg_path
+    }
+
+    #[test]
+    fn collect_warnings_does_not_flag_daemon_section() {
+        let warnings = collect_warnings(Some("[daemon]\nidle_exit_secs = 0\n"), &Config::default());
+        assert!(
+            warnings.iter().all(|w| !w.contains("daemon")),
+            "valid [daemon] section must not be flagged: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn known_top_level_keys_covers_every_config_section() {
+        let value = toml::Value::try_from(Config::default()).expect("serialize default config");
+        let table = value.as_table().expect("config serializes to a table");
+        for key in table.keys() {
+            assert!(
+                KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()),
+                "`{key}` is a Config section missing from KNOWN_TOP_LEVEL_KEYS, so `config validate` falsely warns on it"
+            );
+        }
     }
 
     #[test]
