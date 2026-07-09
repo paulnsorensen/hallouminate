@@ -28,14 +28,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::lance::LanceStore;
+use crate::adapters::lance::{LanceStore, SearchHit};
 use crate::app::config::Config;
 use crate::domain::common::{HallouminateError, expand_tilde};
 use crate::domain::corpus::{load_tokenizer, missing_roots};
 use crate::domain::embeddings::{EmbedBatch, Embedder};
 use crate::domain::indexer::HandlerRegistry;
 use crate::domain::indexer::index::index_corpus;
-use crate::domain::search::{FastembedCrossencoder, canonical_crossencoder_model};
+use crate::domain::search::{Crossencoder, FastembedCrossencoder, canonical_crossencoder_model};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
@@ -556,14 +556,17 @@ impl DaemonState {
     pub async fn crossencoder(
         &self,
         model_name: Option<&str>,
-    ) -> anyhow::Result<Option<CrossencoderGuard<'_>>> {
+    ) -> anyhow::Result<Option<CrossencoderGuard>> {
         let Some(model_name) = model_name else {
             return Ok(None);
         };
         // Canonicalize so config aliases (e.g. the corrected English
         // spelling of a typo'd upstream id) share one cache entry.
         let canonical = canonical_crossencoder_model(model_name)?;
-        let mut guard = self.inner.crossencoders.lock().await;
+        // Owned lock (not a borrowed `MutexGuard<'_, ...>`): #139's per-request
+        // rerank timeout boxes this guard as `dyn Crossencoder` and moves it
+        // into `spawn_blocking`, which requires 'static ownership.
+        let mut guard = Arc::clone(&self.inner.crossencoders).lock_owned().await;
         if !guard.contains_key(canonical) {
             let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
             let model = FastembedCrossencoder::try_new(canonical, &cache_dir)
@@ -849,16 +852,18 @@ impl Drop for EmbedderGuard<'_> {
 /// Owned guard around the lazily-loaded crossencoder, mirroring
 /// `EmbedderGuard`. Derefs to `FastembedCrossencoder` so callers can
 /// pass `&mut *guard` directly into anything that wants
-/// `&mut dyn Crossencoder`.
-pub struct CrossencoderGuard<'a> {
-    guard: MutexGuard<'a, HashMap<String, FastembedCrossencoder>>,
+/// `&mut dyn Crossencoder`. Holds an `OwnedMutexGuard` (not a borrowed
+/// `MutexGuard<'a, ...>`) so it can be boxed as `Box<dyn Crossencoder>` and
+/// moved into `spawn_blocking` for the #139 per-request rerank timeout.
+pub struct CrossencoderGuard {
+    guard: OwnedMutexGuard<HashMap<String, FastembedCrossencoder>>,
     /// Canonical model name; the key into `guard` that `crossencoder()`
     /// inserted before handing the guard out.
     key: String,
     last_use_secs: Arc<AtomicU64>,
 }
 
-impl std::ops::Deref for CrossencoderGuard<'_> {
+impl std::ops::Deref for CrossencoderGuard {
     type Target = FastembedCrossencoder;
     fn deref(&self) -> &FastembedCrossencoder {
         // `crossencoder()` inserts `key` before constructing the guard,
@@ -867,15 +872,24 @@ impl std::ops::Deref for CrossencoderGuard<'_> {
     }
 }
 
-impl std::ops::DerefMut for CrossencoderGuard<'_> {
+impl std::ops::DerefMut for CrossencoderGuard {
     fn deref_mut(&mut self) -> &mut FastembedCrossencoder {
         self.guard.get_mut(&self.key).expect("crossencoder loaded")
     }
 }
 
-impl Drop for CrossencoderGuard<'_> {
+impl Drop for CrossencoderGuard {
     fn drop(&mut self) {
         self.last_use_secs.store(unix_secs(), Ordering::Relaxed);
+    }
+}
+
+/// Lets a `CrossencoderGuard` be boxed as `Box<dyn Crossencoder>` and moved
+/// into `spawn_blocking` for the #139 per-request rerank timeout, instead of
+/// call sites unwrapping it to a borrowed `&mut dyn Crossencoder`.
+impl Crossencoder for CrossencoderGuard {
+    fn rerank(&mut self, query: &str, hits: &mut [SearchHit]) -> crate::domain::common::Result<()> {
+        (**self).rerank(query, hits)
     }
 }
 
@@ -1112,12 +1126,10 @@ mod tests {
     #[tokio::test]
     async fn crossencoder_guard_updates_last_use_on_drop() {
         let last_use_secs = Arc::new(AtomicU64::new(1));
-        let guard = Mutex::new(HashMap::new());
-        let guard = guard.lock().await;
         let before_drop = unix_secs();
 
         drop(CrossencoderGuard {
-            guard,
+            guard: Arc::new(Mutex::new(HashMap::new())).lock_owned().await,
             key: String::new(),
             last_use_secs: Arc::clone(&last_use_secs),
         });

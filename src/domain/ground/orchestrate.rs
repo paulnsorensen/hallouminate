@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::adapters::lance::{LanceStore, SearchHit};
 use crate::domain::common::{HallouminateError, Result};
@@ -9,6 +9,67 @@ use crate::domain::search::{Crossencoder, fts_with_ripgrep, hybrid_with_ripgrep}
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats};
 
+/// Bound on the crossencoder rerank step (#139). The crossencoder is
+/// synchronous CPU-bound code with no `.await` points, so a bare
+/// `tokio::time::timeout` around `rerank()` cannot preempt it — see
+/// `rerank_with_timeout` below. Chosen against the documented ~1.25 s
+/// typical worst case for the default N=50 pool (`crossencoder.rs:6,30-32`):
+/// generous enough to cover a normal run, tight enough to cap a stalled
+/// request at roughly one typical rerank's worth of latency.
+const RERANK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Run `crossencoder.rerank(query, &mut hits)` on a blocking-pool thread and
+/// bound it with `timeout`. `Crossencoder::rerank` is synchronous CPU-bound
+/// work with no `.await`, so wrapping `tokio::time::timeout` directly around
+/// it cannot preempt a stalled call (#139) — only a real OS-thread boundary
+/// can. `spawn_blocking` gives us that boundary; on timeout the spawned
+/// thread is abandoned (left to finish or die on its own, never joined) and
+/// `hits` (cloned up front) is returned unchanged so the caller falls back
+/// to fusion order. Returns `(hits, applied)`; `applied` is `false` on
+/// timeout so callers gate z-score normalization on it, preserving the
+/// "z-score only when the cross-encoder ran" invariant on the fallback path.
+/// The abandoned thread still owns the boxed crossencoder (on the daemon
+/// path, a `CrossencoderGuard` holding the shared crossencoder mutex), so
+/// that mutex stays locked until the stalled call drains — concurrent rerank
+/// requests serialize behind it, exactly as they did before the timeout
+/// existed (#139 accepted tradeoff).
+async fn rerank_with_timeout(
+    mut crossencoder: Box<dyn Crossencoder>,
+    query: String,
+    hits: Vec<SearchHit>,
+    timeout: Duration,
+) -> Result<(Vec<SearchHit>, bool)> {
+    let fallback = hits.clone();
+    let query_len = query.len();
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut hits = hits;
+        crossencoder.rerank(&query, &mut hits)?;
+        Ok::<Vec<SearchHit>, HallouminateError>(hits)
+    });
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(Ok(reranked))) => Ok((reranked, true)),
+        Ok(Ok(Err(e))) => Err(e),
+        Ok(Err(join_err)) => {
+            let cause = if join_err.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            tracing::error!(error = %join_err, cause, "crossencoder task failed");
+            Err(HallouminateError::Embed(format!(
+                "crossencoder task {cause}: {join_err}"
+            )))
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_ms = timeout.as_millis() as u64,
+                query_len,
+                "crossencoder rerank timed out; falling back to fusion order"
+            );
+            Ok((fallback, false))
+        }
+    }
+}
 /// Strip the first matching corpus root prefix from `abs_path`, returning
 /// a corpus-relative path string accepted by `safe_relative_path`.
 /// Returns `None` when no root is a prefix (e.g. symlinked or global corpora).
@@ -55,7 +116,7 @@ pub async fn ground(
     corpus_paths: &[String],
     store: &LanceStore,
     embedder: Option<&mut dyn EmbedBatch>,
-    crossencoder: Option<&mut dyn Crossencoder>,
+    crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
@@ -73,12 +134,16 @@ pub async fn ground(
         // The crossencoder is the most expensive step; skip it on empty
         // hit lists so a no-match query doesn't pay the model latency.
         if !hits.is_empty() {
-            rerank.rerank(query, &mut hits)?;
-            // RRF-mode guard (decision 4): z only when the cross-encoder ran.
-            // Full-pool scope (decision 2): computed before build_docs truncates.
-            let zs = normalize_scores(&hits);
-            for (hit, z) in hits.iter_mut().zip(zs) {
-                hit.z_score = z;
+            let (reranked, applied) =
+                rerank_with_timeout(rerank, query.to_string(), hits, RERANK_TIMEOUT).await?;
+            hits = reranked;
+            if applied {
+                // RRF-mode guard (decision 4): z only when the cross-encoder ran.
+                // Full-pool scope (decision 2): computed before build_docs truncates.
+                let zs = normalize_scores(&hits);
+                for (hit, z) in hits.iter_mut().zip(zs) {
+                    hit.z_score = z;
+                }
             }
         }
     }
@@ -161,7 +226,7 @@ pub async fn ground_union(
     corpora: &[(String, Vec<String>)],
     store: &LanceStore,
     embedder: Option<&mut dyn EmbedBatch>,
-    crossencoder: Option<&mut dyn Crossencoder>,
+    crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
@@ -203,10 +268,14 @@ pub async fn ground_union(
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
-        rerank.rerank(query, &mut hits)?;
-        let zs = normalize_scores(&hits);
-        for (hit, z) in hits.iter_mut().zip(zs) {
-            hit.z_score = z;
+        let (reranked, applied) =
+            rerank_with_timeout(rerank, query.to_string(), hits, RERANK_TIMEOUT).await?;
+        hits = reranked;
+        if applied {
+            let zs = normalize_scores(&hits);
+            for (hit, z) in hits.iter_mut().zip(zs) {
+                hit.z_score = z;
+            }
         }
     }
 
@@ -462,6 +531,95 @@ mod tests {
         assert!(
             rel.is_none(),
             "/corpus/root must not match /corpus/rootext/f.md: got {rel:?}"
+        );
+    }
+
+    // --- #139: rerank_with_timeout ---
+
+    fn hit_for_timeout_test(file_ref: &str, score: f32) -> SearchHit {
+        SearchHit {
+            chunk_id: format!("{file_ref}#0"),
+            file_ref: file_ref.into(),
+            heading_path: vec![],
+            line_start: 1,
+            line_end: 2,
+            text: String::new(),
+            summary: String::new(),
+            keywords: vec![],
+            score,
+            mtime_ms: 0,
+            claim_marks: vec![],
+            z_score: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn rerank_with_timeout_returns_fusion_order_when_crossencoder_stalls() {
+        struct SleepingCrossencoder;
+        impl Crossencoder for SleepingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                hits.reverse();
+                Ok(())
+            }
+        }
+
+        let hits = vec![
+            hit_for_timeout_test("/a.md", 0.1),
+            hit_for_timeout_test("/b.md", 0.9),
+        ];
+        let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+
+        let (result, applied) = rerank_with_timeout(
+            Box::new(SleepingCrossencoder),
+            "q".to_string(),
+            hits,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("timeout path must not error");
+
+        assert!(
+            !applied,
+            "a stalled crossencoder must report applied == false"
+        );
+        let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
+        assert_eq!(
+            observed, fusion_order,
+            "timeout fallback must preserve the original fusion order"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_with_timeout_applies_the_rerank_on_the_fast_path() {
+        struct ReversingCrossencoderStub;
+        impl Crossencoder for ReversingCrossencoderStub {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                hits.reverse();
+                Ok(())
+            }
+        }
+
+        let hits = vec![
+            hit_for_timeout_test("/a.md", 0.1),
+            hit_for_timeout_test("/b.md", 0.9),
+        ];
+
+        let (result, applied) = rerank_with_timeout(
+            Box::new(ReversingCrossencoderStub),
+            "q".to_string(),
+            hits,
+            RERANK_TIMEOUT,
+        )
+        .await
+        .expect("fast path must not error");
+
+        assert!(applied, "a fast crossencoder must report applied == true");
+        let observed: Vec<&str> = result.iter().map(|h| h.file_ref.as_str()).collect();
+        assert_eq!(
+            observed,
+            vec!["/b.md", "/a.md"],
+            "fast path must apply the crossencoder's reordering"
         );
     }
 }
