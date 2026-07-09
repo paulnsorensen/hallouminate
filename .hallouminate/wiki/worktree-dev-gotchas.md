@@ -71,3 +71,28 @@ tree. Full-suite verification of a merge belongs on **CI**, which runs in
 a clean, resourced environment. Use the local build only for the cheap,
 reliable checks — text-level merge-conflict probes and single-target
 compiles.
+
+## Parallel agents in one shared workspace: never `git stash`
+
+Added 2026-07-08. Two coder agents ran concurrently in one shared
+Conductor workspace with uncommitted work from three writers in the
+tree. One agent ran a `git stash` / `stash pop` round-trip to "isolate
+its diff". The stash swept up **every** writer's uncommitted edits; the
+pop conflicted on a file another agent was mid-edit on, and that agent
+watched its files "silently revert", burned its context budget
+re-deriving lost state, and handed off unfinished.
+
+`<certain>` the mechanism: `git stash` operates on the whole worktree,
+never on one agent's edits. The same goes for any tree-wide destructive
+git operation: `checkout -- .`, `restore`, `reset --hard`.
+
+**Rules that follow:**
+- An agent that needs an isolated diff must get a real isolation
+  worktree at dispatch time — never fake isolation with `stash` in a
+  shared tree.
+- Orchestrators dispatching parallel coders into one workspace should
+  state it in the brief: "sibling agents are editing other files; do
+  not run destructive git commands (stash / checkout -- . / restore /
+  reset)".
+- If files appear to revert mid-session, suspect a sibling's tree-wide
+  git operation first, then the tilth parent-checkout leak above.
