@@ -304,6 +304,83 @@ async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
 }
 
 #[tokio::test]
+async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
+    // Same-action divergence regression (daemon single-file path evicts on
+    // truncate-to-empty; bulk index_corpus previously left stale rows behind).
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+    let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+
+    let file = corpus_dir.path().join("vanishing.md");
+    fs::write(&file, "# Vanishing\n\nspice melange harvested on Arrakis\n").unwrap();
+
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+        global: false,
+    };
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        .await
+        .expect("open store");
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let mut emb = StubEmbedder;
+
+    index_corpus(&corpus, &store, Some(&mut emb), &registry)
+        .await
+        .expect("first index");
+    let rows_before = store.count_rows().await.unwrap();
+    assert!(
+        rows_before > 0,
+        "vanishing.md must produce at least one row"
+    );
+
+    let qv = emb
+        .embed_batch(&["melange".to_string()], EmbedRole::Query)
+        .expect("embed")[0];
+    let hits_before = hybrid_search(&store, "docs", "melange", &qv, 5)
+        .await
+        .expect("search before truncation");
+    assert!(
+        hits_before
+            .iter()
+            .any(|h| h.file_ref.ends_with("vanishing.md")),
+        "vanishing.md must be searchable before truncation"
+    );
+
+    // Truncate to empty and bump mtime forward so the plan sees it as changed.
+    fs::write(&file, "").unwrap();
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+    std::fs::File::open(&file)
+        .unwrap()
+        .set_modified(bumped)
+        .unwrap();
+
+    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+        .await
+        .expect("second index after truncation");
+    assert_eq!(
+        stats.files_skipped_empty, 1,
+        "truncated file must still be counted as skipped-empty"
+    );
+
+    let rows_after = store.count_rows().await.unwrap();
+    assert_eq!(
+        rows_after, 0,
+        "stale rows for the truncated file must be evicted, not left behind"
+    );
+
+    let hits_after = hybrid_search(&store, "docs", "melange", &qv, 5)
+        .await
+        .expect("search after truncation");
+    assert!(
+        hits_after.is_empty(),
+        "truncated file must no longer be searchable: {hits_after:?}"
+    );
+}
+
+#[tokio::test]
 async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     // Pointing a corpus at a path that doesn't exist would fail at scan time,
     // not prepare time. To exercise the prepare_file error propagation we

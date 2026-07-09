@@ -338,8 +338,15 @@ fn csv_chunks(bytes: &[u8], path: &Path) -> Result<Vec<PreparedChunk>> {
         if text.is_empty() {
             continue;
         }
-        // On-disk line: header is line 1, data rows are 1-based below it.
-        push_row_chunk(&mut chunks, "csv", row_idx + 1, row_idx + 2, text);
+        // On-disk line where this record starts, from the reader's own
+        // position tracking. Deriving it as `row_idx + 2` drifts after any
+        // record with a quoted embedded newline (one logical record spanning
+        // several physical lines).
+        let line = record
+            .position()
+            .map(|p| p.line() as usize)
+            .unwrap_or(row_idx + 2);
+        push_row_chunk(&mut chunks, "csv", row_idx + 1, line, text);
     }
     Ok(chunks)
 }
@@ -474,5 +481,32 @@ impl HandlerRegistry {
             Format::PlainText => self.text.as_ref(),
             Format::Spreadsheet => self.spreadsheet.as_ref(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_line_range_tracks_physical_lines_across_quoted_newlines() {
+        // `alice`'s note contains a quoted newline, so her record spans
+        // physical lines 2-3 and `bob` starts on physical line 4. The
+        // `push_row_chunk` contract says CSV `line` is the true on-disk
+        // line — deriving it from the logical record ordinal drifts every
+        // record that follows a multi-line record.
+        let bytes = b"name,note\nalice,\"hello\nworld\"\nbob,ok\n";
+        let chunks = csv_chunks(bytes, Path::new("t.csv")).expect("parse csv");
+        assert_eq!(chunks.len(), 2, "two data rows");
+        assert_eq!(
+            (chunks[0].line_start, chunks[0].line_end),
+            (2, 2),
+            "alice's record starts on line 2"
+        );
+        assert_eq!(
+            (chunks[1].line_start, chunks[1].line_end),
+            (4, 4),
+            "bob is on physical line 4, not logical-record line 3"
+        );
     }
 }

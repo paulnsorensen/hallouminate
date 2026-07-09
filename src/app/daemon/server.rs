@@ -142,10 +142,14 @@ fn spawn_idle_exit(state: &DaemonState, idle_exit_secs: u64) {
     });
 }
 
-/// Release the single-instance flock and remove the socket file so the next
-/// boot binds cleanly. Dropping the `File` releases the advisory lock (POSIX);
-/// we remove the socket after so a client racing a reconnect sees the socket
-/// gone rather than a dead-but-present file.
+/// Remove the socket file, then release the single-instance flock (dropping
+/// the `File` releases the advisory lock, POSIX). This order matters: if the
+/// flock were released first, a respawning daemon could win it, remove the
+/// stale socket, and bind a fresh one — which this process's trailing
+/// `remove_file` would then delete, leaving the new daemon bound but
+/// unreachable. Removing the socket first instead costs only a benign window
+/// where a racing respawn sees the socket gone while the flock is briefly
+/// still held and bounces with a clear "already holds" error.
 async fn cleanup(lock: std::fs::File, socket_path: &Path) {
     let _ = tokio::fs::remove_file(socket_path).await;
     drop(lock);

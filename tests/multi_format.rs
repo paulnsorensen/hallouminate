@@ -371,6 +371,55 @@ async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
     assert!(hits.iter().any(|h| h.file_ref.ends_with("ok.csv")));
 }
 
+#[tokio::test]
+async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
+    // apply.rs's unreadable-skip branch must never evict a previously-indexed
+    // file's rows on re-index (distinct from the truncate-to-empty eviction
+    // path) — exercised here through the bulk `index_corpus` path rather than
+    // the single-file daemon dispatch path.
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let file = corpus_dir.path().join("data.csv");
+    fs::write(&file, "name,note\nbolt,sturdy fastener\n").unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.csv"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let mut emb = StubEmbedder;
+
+    let stats1 = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+        .await
+        .expect("first index of a valid csv must succeed");
+    assert_eq!(stats1.files_upserted, 1, "the valid csv indexes");
+    let rows_before = store.count_rows().await.unwrap();
+    assert!(rows_before > 0, "the valid csv must produce indexed rows");
+
+    // Bump mtime forward so the plan re-visits the file, then corrupt it.
+    let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+    fs::write(&file, b"\xff\xfe\x00 not,a valid\x00 csv").unwrap();
+    std::fs::File::open(&file)
+        .unwrap()
+        .set_modified(bumped)
+        .unwrap();
+
+    let stats2 = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+        .await
+        .expect("a corrupt re-extraction must not hard-error");
+    assert_eq!(
+        stats2.files_skipped_unreadable, 1,
+        "a corrupt re-extraction is an unreadable skip"
+    );
+    assert_eq!(
+        stats2.files_deleted, 0,
+        "a present-but-unreadable file must NOT be evicted from the index"
+    );
+    let rows_after = store.count_rows().await.unwrap();
+    assert_eq!(
+        rows_after, rows_before,
+        "last-good rows must survive a transient parse failure on re-index"
+    );
+}
+
 // ── Detection / routing unit checks ────────────────────────────────────────
 
 #[test]

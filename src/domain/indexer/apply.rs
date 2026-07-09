@@ -5,7 +5,7 @@ use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 
 use super::format::HandlerRegistry;
 use super::plan::{IndexPlan, MtimeCandidate};
-use super::writer::{WriteRequest, prepare_file};
+use super::writer::{WriteRequest, file_ref_string, prepare_file};
 
 /// Tallies of the work an [`apply`] run performed, returned to the caller for
 /// reporting and assertions.
@@ -19,21 +19,43 @@ pub struct ApplyStats {
     pub files_deleted: usize,
     /// Files that produced zero chunks (typically truncate-to-empty markdown).
     /// They are not represented in the chunks table and so cannot be made
-    /// idempotent; the caller may want to filter these from the corpus. The
-    /// single-file path treats this as the only eviction trigger (see
-    /// [`index_single_file`](../../app/daemon/dispatch.rs)).
+    /// idempotent; the caller may want to filter these from the corpus. When
+    /// the file previously had rows (the mtime-fallthrough batch), those rows
+    /// are evicted and counted under `files_deleted` too — see
+    /// [`EmptyFilePolicy::Evict`].
     pub files_skipped_empty: usize,
     /// Files gracefully skipped because their type is unsupported or extraction
     /// failed (corrupt workbook, non-UTF-8 text, …). Distinct from
-    /// `files_skipped_empty`: a present-but-unreadable file must NOT evict its
-    /// last-good rows, so the single-file path keys eviction on
-    /// `files_skipped_empty` alone and never on this counter — matching bulk
-    /// `index_corpus`, which retains rows for any still-on-disk file.
+    /// `files_skipped_empty`: a present-but-unreadable file must NEVER evict its
+    /// last-good rows, on either the bulk or single-file path — a transient
+    /// parse failure (atomic-save race, partial write, momentary corruption)
+    /// must not silently drop a file from search.
     pub files_skipped_unreadable: usize,
     /// Total chunks written across all upserted files (both embedding modes).
     pub chunks_inserted: usize,
     /// Total embedding vectors written; zero when the embedder is `None`.
     pub embeddings_inserted: usize,
+}
+
+/// Whether `run_in_batches` should evict a truncated-to-empty file's stale
+/// rows. `plan.upserts` covers files with no snapshot in the store (no rows
+/// can exist yet, so `Retain` is a no-op); the mtime-fallthrough batch covers
+/// files that HAD a snapshot (rows may exist), so it passes `Evict`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmptyFilePolicy {
+    Retain,
+    Evict,
+}
+
+/// Invariants shared by every batch of one `apply` run: the store and
+/// registry to write through, the run-wide `indexed_at_ms` stamp, and the
+/// batch width. Groups what would otherwise be four extra parameters on
+/// `run_in_batches` (mirroring `PrepareCtx` in format.rs).
+struct RunCtx<'a> {
+    store: &'a LanceStore,
+    registry: &'a HandlerRegistry,
+    indexed_at_ms: i64,
+    batch_size: usize,
 }
 
 /// Default number of files prepared and embedded per batch when the caller
@@ -53,6 +75,12 @@ pub async fn apply(
     // Captured once so every file written by this run shares a single
     // `indexed_at_ms`, regardless of how many batches it spans.
     let indexed_at_ms = chrono::Utc::now().timestamp_millis();
+    let run = RunCtx {
+        store,
+        registry,
+        indexed_at_ms,
+        batch_size,
+    };
 
     // Upserts: build write requests and run them in batches.
     let mut upsert_reqs: Vec<WriteRequest<'_>> = Vec::with_capacity(plan.upserts.len());
@@ -65,20 +93,23 @@ pub async fn apply(
     }
     run_in_batches(
         upsert_reqs,
-        batch_size,
-        store,
+        &run,
         embedder.as_deref_mut(),
-        registry,
-        indexed_at_ms,
         &mut stats,
+        EmptyFilePolicy::Retain,
     )
     .await?;
 
     // Mtime touches: hash-check each. If hash unchanged, just bump mtime.
-    // Otherwise re-index (deferred into the upsert path).
+    // Otherwise re-index (deferred into the upsert path). Skip the re-hash
+    // when the caller already computed it (`known_hash` — see the
+    // single-file reroute in `dispatch.rs`).
     let mut fallthrough: Vec<MtimeCandidate> = Vec::new();
     for cand in plan.mtime_touches {
-        let new_hash = blake3_file(cand.file.as_path())?;
+        let new_hash = match &cand.known_hash {
+            Some(h) => h.clone(),
+            None => blake3_file(cand.file.as_path())?,
+        };
         if new_hash == cand.snap.content_hash {
             store
                 .touch_mtime(&cand.snap.corpus, &cand.snap.file_ref, cand.new_mtime.0)
@@ -98,12 +129,10 @@ pub async fn apply(
     }
     run_in_batches(
         fallthrough_reqs,
-        batch_size,
-        store,
+        &run,
         embedder,
-        registry,
-        indexed_at_ms,
         &mut stats,
+        EmptyFilePolicy::Evict,
     )
     .await?;
 
@@ -123,21 +152,19 @@ pub async fn apply(
 
 async fn run_in_batches(
     reqs: Vec<WriteRequest<'_>>,
-    batch_size: usize,
-    store: &LanceStore,
+    run: &RunCtx<'_>,
     // `+ '_` decouples the trait-object lifetime from the reference lifetime
     // so `apply` can hand out two successive short reborrows via
     // `as_deref_mut()` without the first borrow being pinned for the whole
     // function body.
     mut embedder: Option<&mut (dyn EmbedBatch + '_)>,
-    registry: &HandlerRegistry,
-    indexed_at_ms: i64,
     stats: &mut ApplyStats,
+    empty_file_policy: EmptyFilePolicy,
 ) -> Result<()> {
     if reqs.is_empty() {
         return Ok(());
     }
-    for chunk_of_reqs in reqs.chunks(batch_size) {
+    for chunk_of_reqs in reqs.chunks(run.batch_size) {
         let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
         for req in chunk_of_reqs {
             // A real IO failure (file read) is a hard error — fail fast rather
@@ -150,8 +177,8 @@ async fn run_in_batches(
                     file: req.file,
                     mtime: req.mtime,
                 },
-                registry,
-                indexed_at_ms,
+                run.registry,
+                run.indexed_at_ms,
             )?;
             let Some(pf) = pf else {
                 // Unsupported type or extraction failure — already logged by
@@ -171,6 +198,22 @@ async fn run_in_batches(
                     "skipping empty file (no chunks generated)"
                 );
                 stats.files_skipped_empty += 1;
+                if empty_file_policy == EmptyFilePolicy::Evict {
+                    // This batch's files all had a store snapshot (see the
+                    // `Evict` doc comment), so stale rows may exist — evict
+                    // them so the filesystem stays the source of truth.
+                    let file_ref_str = file_ref_string(req.file)?;
+                    tracing::info!(
+                        target: "hallouminate::indexer",
+                        corpus = %req.corpus.name,
+                        file = %file_ref_str,
+                        "evicting indexed file from search: re-index produced an empty file",
+                    );
+                    run.store
+                        .delete_file(&req.corpus.name, &file_ref_str)
+                        .await?;
+                    stats.files_deleted += 1;
+                }
                 continue;
             }
             prepared.push(pf);
@@ -225,7 +268,7 @@ async fn run_in_batches(
             }
         }
         let n = prepared.len();
-        store.apply_batch(prepared).await?;
+        run.store.apply_batch(prepared).await?;
         stats.files_upserted += n;
     }
     Ok(())

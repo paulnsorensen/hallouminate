@@ -53,6 +53,11 @@ pub struct MtimeCandidate {
     pub snap: FileSnapshot,
     /// Current on-disk mtime to record if the fast path is taken.
     pub new_mtime: Mtime,
+    /// Content hash already computed by the caller (e.g. the single-file
+    /// reroute's same-mtime hash check), so `apply` can skip re-hashing the
+    /// file. `None` when no hash has been computed yet (the bulk `plan()`
+    /// path below).
+    pub known_hash: Option<String>,
 }
 
 pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileSnapshot>) -> IndexPlan {
@@ -68,6 +73,7 @@ pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileSnapshot>)
                 file,
                 snap,
                 new_mtime: mtime,
+                known_hash: None,
             }),
         }
     }

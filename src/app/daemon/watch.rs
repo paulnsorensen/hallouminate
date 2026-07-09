@@ -173,15 +173,19 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
             // Collect distinct affected paths so a debounced batch that
             // touches one file many times reindexes it once.
             let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            let mut paths: Vec<PathBuf> = Vec::new();
             for event in events {
                 for path in &event.paths {
                     if path.extension().and_then(|e| e.to_str()) != Some("md") {
                         continue;
                     }
                     if seen.insert(path.clone()) {
-                        handle_changed_path(&state, &roots, path).await;
+                        paths.push(path.clone());
                     }
                 }
+            }
+            if !paths.is_empty() {
+                process_change_batch(&state, &roots, paths).await;
             }
         }
     });
@@ -230,6 +234,22 @@ fn build_watch_root(corpus: &CorpusConfig, raw: &str) -> Option<WatchRoot> {
     } else {
         None
     }
+}
+
+/// Reindex/prune every distinct path in one debounced batch. Holds a
+/// connection guard for the whole batch and stamps the activity clock
+/// afterward, mirroring `catch_up_index` (dispatch.rs) and
+/// `handle_connection` (server.rs): without it, a watcher-triggered write
+/// (in particular the delete/prune branch of `handle_changed_path`, which
+/// touches neither an embedder nor the clock) can run while idle-exit tears
+/// the process down mid-write, releasing the single-instance flock under a
+/// live LanceDB writer (ADR-003).
+async fn process_change_batch(state: &DaemonState, roots: &[WatchRoot], paths: Vec<PathBuf>) {
+    let _conn = state.enter_connection();
+    for path in &paths {
+        handle_changed_path(state, roots, path).await;
+    }
+    state.touch_activity();
 }
 
 /// Reindex (or prune) one changed markdown path against whichever baseline
@@ -587,6 +607,45 @@ mod tests {
             delete_file_ref(&owner, Path::new("/srv/wiki/topics/spice.md")).as_path(),
             Path::new("/srv/wiki/topics/spice.md"),
             "a non-symlinked root must prune the path unchanged"
+        );
+    }
+
+    /// ADR-003 regression: the delete/prune branch of `handle_changed_path`
+    /// acquired no connection guard and never touched the activity clock, so
+    /// idle-exit could tear down the daemon (and release the single-instance
+    /// flock) mid-write. Batch processing must hold a guard for the whole
+    /// batch and stamp the clock afterward, exactly like `catch_up_index`
+    /// (dispatch.rs) and `handle_connection` (server.rs).
+    #[tokio::test]
+    async fn process_change_batch_touches_activity_after_a_stale_clock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = crate::app::config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        state.set_last_activity_secs_for_test(1);
+
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        // Never created on disk: `handle_changed_path` takes the delete/prune
+        // branch — the branch that acquired no guard and stamped no clock
+        // before the fix.
+        let deleted = corpus_dir.join("gone.md");
+
+        assert!(
+            state.should_idle_exit(300),
+            "sanity: stale clock with no connections must be idle-eligible",
+        );
+        process_change_batch(&state, &roots, vec![deleted]).await;
+        assert!(
+            !state.should_idle_exit(300),
+            "batch processing must stamp the activity clock so idle-exit does \
+             not fire immediately after a delete-branch write",
         );
     }
 }
