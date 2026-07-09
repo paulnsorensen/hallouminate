@@ -17,9 +17,9 @@ use std::time::Duration;
 
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
-    AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, DaemonState,
-    DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
-    ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest, connect_at, serve,
+    AddMarkdownRequest, BacklinksRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse,
+    DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest,
+    LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest, connect_at, serve,
     spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
@@ -520,6 +520,323 @@ enabled = false
         clean["warnings"].as_array().is_none_or(|w| w.is_empty()),
         "clean content must carry no warnings: {:?}",
         clean["warnings"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_add_markdown_flags_dangling_wikilink() {
+    // A [[wikilink]] whose target has no matching page in the corpus rides
+    // back as an advisory warning on the same add_markdown response, and the
+    // write still succeeds verbatim — mirrors the lint_markdown wiring above,
+    // now for lint_wikilinks. A wikilink to a page that DOES exist must not
+    // be flagged.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Dangling wikilink: no `missing-page.md` exists in the corpus.
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "notes.md".into(),
+                content: "# Notes\n\nSee [[missing-page]] for details.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown ok");
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present for a dangling wikilink");
+    let joined = warnings
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("missing-page") && joined.contains("no matching page"),
+        "got: {joined}"
+    );
+
+    // real-page.md already exists, so a wikilink to it is not flagged.
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "real-page.md".into(),
+                content: "# Real page\n\nNothing to see here.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown real-page ok");
+    let clean: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "links-to-real.md".into(),
+                content: "# Links to real\n\nSee [[real-page]] for details.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown links-to-real ok");
+    assert!(
+        clean["warnings"].as_array().is_none_or(|w| w.is_empty()),
+        "wikilink to an existing page must not be flagged: {:?}",
+        clean["warnings"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_backlinks_returns_pages_linking_to_target() {
+    // handle_backlinks scans every other page in the corpus for a
+    // [[wikilink]] resolving to the target path, and returns the linking
+    // pages' corpus-relative paths, sorted. A page with no link to the
+    // target must not appear.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "other-page.md".into(),
+                content: "# Other page\n\nNothing links here.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown other-page ok");
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "linker.md".into(),
+                content: "# Linker\n\nSee [[other-page]] for details.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown linker ok");
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "unrelated.md".into(),
+                content: "# Unrelated\n\nNo links at all.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown unrelated ok");
+
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: Some("docs".into()),
+                path: "other-page.md".into(),
+            }),
+        })
+        .await
+        .expect("backlinks ok");
+    let backlinks = value["backlinks"]
+        .as_array()
+        .expect("backlinks array present")
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backlinks,
+        vec!["linker.md"],
+        "only the linking page must appear in backlinks: {backlinks:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_backlinks_on_uninitialized_wiki_returns_empty_result() {
+    // handle_backlinks must ensure the wiki root exists before scanning — a
+    // corpus whose directory was never created (no page ever written) must
+    // yield an empty result, not an internal error.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo_root = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+    // Deliberately no `.hallouminate/wiki` under repo_root — this repository's
+    // wiki has never been written to.
+    let toml = format!(
+        r#"
+[[repository]]
+name = "repo1"
+path = "{r}"
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        r = repo_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: Some("repo:repo1:wiki".into()),
+                path: "missing-page.md".into(),
+            }),
+        })
+        .await
+        .expect("backlinks on a fresh wiki must succeed, not error");
+    let backlinks = value["backlinks"]
+        .as_array()
+        .expect("backlinks array present")
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backlinks,
+        Vec::<&str>::new(),
+        "fresh wiki with no created root must yield empty backlinks: {backlinks:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_backlinks_disambiguates_basename_collision() {
+    // Two pages share the bare stem "index" (a/index.md, b/index.md). A bare
+    // [[index]] link is ambiguous and must not be attributed to either page;
+    // only a full-path [[a/index]] link counts as a backlink to a/index.md.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for (path, content) in [
+        ("a/index.md", "# A Index\n\nNothing here.\n"),
+        ("b/index.md", "# B Index\n\nNothing here.\n"),
+        (
+            "ambiguous.md",
+            "# Ambiguous\n\nSee [[index]] for details.\n",
+        ),
+        (
+            "full-path-linker.md",
+            "# Full path linker\n\nSee [[a/index]] for details.\n",
+        ),
+    ] {
+        client
+            .call::<serde_json::Value>(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                    corpus: "docs".into(),
+                    path: path.into(),
+                    content: content.into(),
+                    overwrite: false,
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("add_markdown {path} ok: {e}"));
+    }
+
+    let value: serde_json::Value = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: Some("docs".into()),
+                path: "a/index.md".into(),
+            }),
+        })
+        .await
+        .expect("backlinks ok");
+    let backlinks = value["backlinks"]
+        .as_array()
+        .expect("backlinks array present")
+        .iter()
+        .filter_map(|p| p.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        backlinks,
+        vec!["full-path-linker.md"],
+        "bare [[index]] must not be attributed to a/index.md when the stem is ambiguous: {backlinks:?}"
     );
 }
 

@@ -34,11 +34,11 @@ pub use client::{
     daemon_client_unavailable,
 };
 pub use ipc::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
-    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
-    GroundRequest, GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest,
-    ListFilesResult, ListTreeRequest, ListTreeResult, Position, ReadMarkdownRequest,
-    ReadMarkdownResult,
+    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusEntry,
+    CorpusStatsResult, DaemonRequest, DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest,
+    DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
+    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
+    Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
 pub use server::{

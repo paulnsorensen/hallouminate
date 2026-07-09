@@ -44,5 +44,7 @@ pub use section::{
 };
 pub use snippet::make_snippet;
 pub use summary::extract_summary;
-pub use validate::lint_markdown;
+pub use validate::{
+    corpus_slugs, find_wikilinks, lint_markdown, lint_wikilinks, normalize_slug, slug_identifiers,
+};
 pub use walker::{missing_roots, scan};

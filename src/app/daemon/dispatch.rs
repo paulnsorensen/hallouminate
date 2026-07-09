@@ -25,7 +25,6 @@ use crate::adapters::lance::LanceStore;
 use crate::app::cli::{CorpusReport, IndexReport};
 use crate::app::config::{Config, ResolvedLayers, resolve_for_cwd};
 use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
-use crate::domain::corpus::blake3_file;
 #[cfg(test)]
 use crate::domain::corpus::sandbox::FileEntry;
 use crate::domain::corpus::sandbox::{
@@ -34,6 +33,7 @@ use crate::domain::corpus::sandbox::{
     resolve_read_root, safe_relative_path,
 };
 use crate::domain::corpus::scan;
+use crate::domain::corpus::{blake3_file, find_wikilinks, normalize_slug, slug_identifiers};
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
@@ -48,10 +48,10 @@ use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
 use crate::domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
-    AddMarkdownRequest, AddMarkdownResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
-    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult,
-    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
-    ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusEntry,
+    CorpusStatsResult, DaemonRequest, DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest,
+    DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest,
+    ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 use super::state::DaemonState;
 
@@ -107,6 +107,7 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::DeleteMarkdown(req) => {
             handle_delete_markdown(state, &effective, req).await
         }
+        DaemonRequestPayload::Backlinks(req) => handle_backlinks(&effective, &req_cwd, req).await,
         DaemonRequestPayload::CorpusStats { corpus } => {
             handle_corpus_stats(state, &effective, &req_cwd, corpus).await
         }
@@ -745,6 +746,24 @@ async fn handle_add_markdown(
     let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
     warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
+    match crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
+        Ok(entries) => {
+            let mut known_slugs =
+                crate::domain::corpus::corpus_slugs(entries.iter().map(|e| e.path.as_str()));
+            known_slugs.extend(slug_identifiers(&req.path));
+            warnings.extend(crate::domain::corpus::lint_wikilinks(
+                &req.content,
+                &known_slugs,
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "skipping wikilink lint: failed to list corpus files",
+            );
+        }
+    }
 
     // Symlink-safe atomic write via the shared sandbox helper. Walks every
     // path component with `O_NOFOLLOW | O_DIRECTORY`, so a symlinked
@@ -935,6 +954,84 @@ async fn handle_read_markdown(
         absolute_path: dest.to_string_lossy().into_owned(),
         bytes: content.len() as u64,
         content,
+    })
+}
+
+async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> DaemonResponse {
+    let corpora = match effective_corpora(cfg) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let corpus =
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => c,
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        };
+    ensure_paths_exist(&corpus).await;
+    let entries = match list_corpus_files(&corpus) {
+        Ok(e) => e,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let full_slug = normalize_slug(&req.path);
+    let bare_stem = Path::new(&req.path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .filter(|stem| *stem != full_slug);
+    let target_slugs: std::collections::HashSet<String> = match &bare_stem {
+        Some(stem) => {
+            let stem_is_unique = entries
+                .iter()
+                .filter(|entry| {
+                    Path::new(&entry.path)
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_lowercase())
+                        .as_deref()
+                        == Some(stem.as_str())
+                })
+                .count()
+                <= 1;
+            if stem_is_unique {
+                [full_slug.clone(), stem.clone()].into_iter().collect()
+            } else {
+                std::iter::once(full_slug.clone()).collect()
+            }
+        }
+        None => std::iter::once(full_slug.clone()).collect(),
+    };
+    let req_path = req.path.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let mut backlinks: Vec<String> = entries
+            .into_iter()
+            .filter(|entry| entry.path != req_path)
+            .filter(|entry| {
+                let Ok(content) = std::fs::read_to_string(&entry.absolute_path) else {
+                    return false;
+                };
+                find_wikilinks(&content)
+                    .iter()
+                    .any(|link| target_slugs.contains(&normalize_slug(link)))
+            })
+            .map(|entry| entry.path)
+            .collect();
+        backlinks.sort();
+        backlinks
+    })
+    .await;
+    let backlinks = match found {
+        Ok(b) => b,
+        Err(join_err) => {
+            tracing::error!(
+                target: "hallouminate::daemon",
+                error = %join_err,
+                "backlinks scan task panicked",
+            );
+            return DaemonResponse::internal(format!("backlinks task panicked: {join_err}"));
+        }
+    };
+    DaemonResponse::ok(&BacklinksResult {
+        corpus: corpus.name,
+        path: req.path,
+        backlinks,
     })
 }
 
