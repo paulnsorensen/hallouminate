@@ -70,7 +70,7 @@ tokenizers = { version = "0.23", features = ["http"] }
 # (OOXML xlsx + ODF ods, both ZIP containers), reader-cfb (OLE2 xls), and
 # reader-txt (plain-text detection). Without cfb/txt those formats fall through
 # to ArbitraryBinaryData and the magic-byte fallback silently fails.
-calamine = "0.34"
+calamine = "0.36"
 csv = "1.4"
 file-format = { version = "0.29", features = ["reader-zip", "reader-cfb", "reader-txt"] }
 
