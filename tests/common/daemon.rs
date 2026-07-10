@@ -1,7 +1,8 @@
 //! Shared `DaemonHarness` for integration tests. Spawns the daemon
-//! in-process against a tempdir socket, waits for the socket to appear
-//! (so the first client connect doesn't race the bind), and tears the
-//! daemon down on drop.
+//! in-process against a tempdir socket, waits for a successful `Ping`
+//! round-trip (not just socket-path existence) so the first real client
+//! connect doesn't race the listener's `accept`, and tears the daemon down
+//! on drop.
 //!
 //! Lives here (rather than copy-pasted across CLI / MCP suites) so the
 //! spawn / shutdown shape stays uniform and the per-test socket lifetime
@@ -11,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use hallouminate::app::config::Config;
-use hallouminate::app::daemon::{DaemonState, IDLE_READ_TIMEOUT, serve_with_idle_timeout};
+use hallouminate::app::daemon::{
+    DaemonRequest, DaemonRequestPayload, DaemonState, IDLE_READ_TIMEOUT, connect_at,
+    serve_with_idle_timeout,
+};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -56,12 +60,26 @@ impl DaemonHarness {
                 _ = rx => Ok(()),
             }
         });
-        // Wait for the socket to appear so the first client connect
-        // doesn't race the bind.
+        // Wait for a successful Ping round-trip, not just socket-path
+        // existence: `bind` creates the path before `accept` is ready to
+        // service connections, so a bare `socket.exists()` check leaves a
+        // window where the very first client connect can race the listener
+        // and see ECONNREFUSED.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !socket.exists() {
+        loop {
             if std::time::Instant::now() > deadline {
-                panic!("daemon socket never appeared: {}", socket.display());
+                panic!("daemon never became ready to serve: {}", socket.display());
+            }
+            if let Ok(client) = connect_at(&socket).await
+                && client
+                    .call_raw(DaemonRequest {
+                        cwd: cwd.clone(),
+                        payload: DaemonRequestPayload::Ping,
+                    })
+                    .await
+                    .is_ok()
+            {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
