@@ -8,3 +8,5 @@ ralphs/
 .claude/settings.json
 .milknado/
 milknado.toml
+npm/bin/
+npm/node_modules/

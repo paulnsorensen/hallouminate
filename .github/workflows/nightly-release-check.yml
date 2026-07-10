@@ -1,0 +1,142 @@
+# Nightly verification that the latest GitHub Release actually shipped end to
+# end: the npx shim installs and runs on every supported platform, and the
+# release, npm, and crates.io versions all agree. On any failure it opens (or
+# comments on) a `nightly-failure` tracking issue.
+name: nightly-release-check
+
+on:
+  schedule:
+    - cron: "37 7 * * *" # daily 07:37 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Single source of truth for "the latest release" — every other job checks
+  # against this tag/version.
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.rel.outputs.tag }}
+      version: ${{ steps.rel.outputs.version }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh release view --json tagName --jq .tagName)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Latest release: $tag"
+
+  # A real user's install path: fresh npx of the published package on each
+  # target the shim advertises, then run it and assert the version equals the
+  # latest release. Catches broken postinstall downloads, missing release
+  # assets, and an npm dist-tag that lags the release.
+  npx:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest # linux-x64
+          - runner: ubuntu-24.04-arm # linux-arm64
+          - runner: macos-latest # darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 20
+      - name: npx install and run
+        run: |
+          set -euo pipefail
+          want="${{ needs.resolve.outputs.version }}"
+          got="$(npx --yes hallouminate@latest --version | tail -n1 | awk '{print $NF}')"
+          echo "release=$want  npx@latest=$got  ($(uname -sm))"
+          if [ "$got" != "$want" ]; then
+            echo "::error::npx hallouminate@latest reported '$got', expected release '$want'"
+            exit 1
+          fi
+
+  # The release ceremony has three publish surfaces — GitHub Release tarballs,
+  # npm, crates.io. Verify all three landed and agree for the latest tag.
+  verify-release:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+      - name: Release has a tarball + checksum for every dist target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.resolve.outputs.tag }}"
+          targets="$(grep '^targets = ' dist-workspace.toml \
+            | grep -oE '[a-z0-9_]+-(apple-darwin|unknown-linux-(gnu|musl)|pc-windows-(msvc|gnu))')"
+          [ -n "$targets" ] || { echo "::error::no targets parsed from dist-workspace.toml"; exit 1; }
+          assets="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+          rc=0
+          for t in $targets; do
+            for name in "hallouminate-$t.tar.xz" "hallouminate-$t.tar.xz.sha256"; do
+              if grep -Fqx "$name" <<<"$assets"; then
+                echo "ok   $name"
+              else
+                echo "::error::release $tag missing asset $name"; rc=1
+              fi
+            done
+          done
+          exit $rc
+      - name: npm dist-tag latest matches the release
+        run: |
+          set -euo pipefail
+          want="${{ needs.resolve.outputs.version }}"
+          got="$(npm view hallouminate version)"
+          echo "release=$want  npm-latest=$got"
+          [ "$got" = "$want" ] || { echo "::error::npm latest '$got' != release '$want'"; exit 1; }
+      - name: crates.io has the release version
+        run: |
+          set -euo pipefail
+          want="${{ needs.resolve.outputs.version }}"
+          if curl -sf --retry 3 --retry-connrefused https://index.crates.io/ha/ll/hallouminate \
+            | jq -r .vers | grep -Fqx "$want"; then
+            echo "ok  crates.io has $want"
+          else
+            echo "::error::crates.io missing version $want"; exit 1
+          fi
+
+  # Nightly runs are easy to miss in the Actions tab — surface any failure as a
+  # tracking issue (one open at a time, appended to on repeat failures).
+  notify:
+    needs: [resolve, npx, verify-release]
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Open or update tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh label create nightly-failure --color B60205 \
+            --description "Automated nightly release/npx check failed" --force \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          body="Nightly release check failed: $run_url"
+          existing="$(gh issue list --state open --label nightly-failure \
+            --json number --jq '.[0].number' --repo "$GITHUB_REPOSITORY")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body" --repo "$GITHUB_REPOSITORY"
+          else
+            gh issue create --title "Nightly release check failed" --body "$body" \
+              --label nightly-failure --repo "$GITHUB_REPOSITORY"
+          fi

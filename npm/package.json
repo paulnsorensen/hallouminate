@@ -1,0 +1,28 @@
+{
+  "name": "hallouminate",
+  "version": "0.3.0",
+  "description": "A markdown corpus indexer for LLMs to build and query their own per-repo wikis.",
+  "bin": {
+    "hallouminate": "run.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "install.js",
+    "run.js",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paulnsorensen/hallouminate.git"
+  },
+  "keywords": [
+    "mcp",
+    "markdown",
+    "wiki",
+    "rag",
+    "ai-agents"
+  ],
+  "license": "MIT"
+}
