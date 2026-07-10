@@ -113,7 +113,7 @@ tempfile = "3"
 # no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
 # is covered by a detection/routing unit test, not a generated binary fixture.
 rust_xlsxwriter = "0.96"
-zip = "7"
+zip = "8"
 
 # The profile that 'dist' will build with
 [profile.dist]
