@@ -101,7 +101,7 @@ url = "2"
 # Time + lazy init
 chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1"
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"
 
 [dev-dependencies]
