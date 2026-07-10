@@ -112,7 +112,7 @@ tempfile = "3"
 # via `zip`, pinned to the 7.x already in the tree (transitive via file-format) so
 # no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
 # is covered by a detection/routing unit test, not a generated binary fixture.
-rust_xlsxwriter = "0.95"
+rust_xlsxwriter = "0.96"
 zip = "7"
 
 # The profile that 'dist' will build with
