@@ -94,7 +94,18 @@ fn render_outline(response: &GroundResponse, strip_prefix: Option<&str>) -> Stri
     }
 
     writeln!(buf).expect("blank");
-    for (path, doc) in &response.docs {
+    // Render in relevance order (score desc, path asc tiebreak) — `docs` is a
+    // `BTreeMap` keyed by path for O(log n) lookup, so its iteration order is
+    // alphabetical and must not be used directly for display.
+    let mut ranked: Vec<(&String, &DocFile)> = response.docs.iter().collect();
+    ranked.sort_by(|(a_path, a_doc), (b_path, b_doc)| {
+        b_doc
+            .score
+            .partial_cmp(&a_doc.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a_path.cmp(b_path))
+    });
+    for (path, doc) in ranked {
         write_doc_block(&mut buf, path, doc, strip_prefix);
     }
 
@@ -423,6 +434,60 @@ mod tests {
         assert!(
             !out_none.contains("z="),
             "None z_score must not render in outline: {out_none}"
+        );
+    }
+
+    #[test]
+    fn outline_orders_docs_by_score_not_path() {
+        // Regression: `docs` is a `BTreeMap` keyed by absolute path, so
+        // iterating it directly yields alphabetical order. A higher-scored
+        // file with a later-alphabetical path must still render before a
+        // lower-scored file with an earlier-alphabetical path.
+        let mut docs = BTreeMap::new();
+        docs.insert(
+            "/a-low-score.md".into(),
+            DocFile {
+                summary: None,
+                keywords: vec![],
+                score: 0.1,
+                z_score: None,
+                mtime: "2026-04-30T10:11:23Z".into(),
+                corpus: "cheese".into(),
+                path: None,
+                stale: false,
+                chunks: vec![],
+            },
+        );
+        docs.insert(
+            "/z-high-score.md".into(),
+            DocFile {
+                summary: None,
+                keywords: vec![],
+                score: 0.9,
+                z_score: None,
+                mtime: "2026-04-30T10:11:23Z".into(),
+                corpus: "cheese".into(),
+                path: None,
+                stale: false,
+                chunks: vec![],
+            },
+        );
+        let response = GroundResponse {
+            query: "ranked".into(),
+            took_ms: 5,
+            stats: Stats { hits: 2 },
+            docs,
+            code: BTreeMap::new(),
+            warnings: vec![],
+        };
+        let out = render(&response, Format::Outline, &RenderOpts::default());
+        let high_pos = out
+            .find("/z-high-score.md")
+            .expect("high-score doc present");
+        let low_pos = out.find("/a-low-score.md").expect("low-score doc present");
+        assert!(
+            high_pos < low_pos,
+            "higher-scored, later-alphabetical doc must render first: {out}"
         );
     }
 }
