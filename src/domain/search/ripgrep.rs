@@ -69,8 +69,10 @@ pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<Ripg
     let mut reader = BufReader::new(stdout).lines();
 
     let mut hits: Vec<RipgrepHit> = Vec::new();
+    let mut limit_reached = false;
     while let Some(line) = reader.next_line().await.map_err(HallouminateError::Io)? {
         if hits.len() >= limit {
+            limit_reached = true;
             break;
         }
         if let Some(mut hit) = parse_match_line(&line) {
@@ -81,6 +83,13 @@ pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<Ripg
             hit.file_ref = canon.as_path().to_string_lossy().into_owned();
             hits.push(hit);
         }
+    }
+
+    if limit_reached {
+        // We stopped draining stdout before rg finished writing. rg may
+        // be blocked on a full stdout pipe, so a plain wait() here can
+        // deadlock — kill it instead of waiting for a graceful exit.
+        let _ = child.kill().await;
     }
 
     // Wait for the child so it exits cleanly (kill_on_drop catches the
@@ -213,6 +222,39 @@ mod tests {
             hits[0].file_ref
         );
         assert_eq!(hits[0].line, 3);
+    }
+
+    #[tokio::test]
+    async fn limit_reached_returns_promptly_without_draining_full_output() {
+        // Regression test: reaching `limit` used to `break` the stdout-draining
+        // loop and then `child.wait()`, which can deadlock if rg is still
+        // blocked writing the rest of its matches into a full pipe. Generate
+        // enough matching lines to overflow the OS pipe buffer (well over the
+        // 64KiB typical max) so the pre-fix code would hang forever here.
+        if which("rg").is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.md");
+        let mut content = String::from("# Big\n\n");
+        for _ in 0..20_000 {
+            content.push_str("caerbannog beast appears again in the text\n");
+        }
+        std::fs::write(&path, content).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run(
+                &[dir.path().to_string_lossy().into_owned()],
+                "caerbannog",
+                1,
+            ),
+        )
+        .await
+        .expect("run() must return promptly instead of deadlocking on a full pipe")
+        .expect("rg run");
+
+        assert_eq!(result.len(), 1, "limit of 1 must cap the returned hits");
     }
 
     #[tokio::test]
