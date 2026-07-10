@@ -840,6 +840,192 @@ enabled = false
     );
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_backlinks_reports_unreadable_file_as_warning() {
+    // A page that becomes unreadable mid-scan (permission change, transient
+    // I/O error) must not fail the whole request — handle_backlinks collects
+    // the (path, error) failure, warns via tracing, and surfaces it on
+    // BacklinksResult.warnings naming both the corpus and the path, so the
+    // caller knows the scan is a partial one instead of trusting an empty
+    // `backlinks` as "no backlinks".
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "locked.md".into(),
+                content: "# Locked\n\nSee [[other-page]] for details.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown locked ok");
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "other-page.md".into(),
+                content: "# Other page\n\nNothing links here.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown other-page ok");
+
+    let is_root = nix_getuid_is_zero();
+    let locked_path = corpus_root.join("locked.md");
+    std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod locked.md");
+
+    let result: Result<serde_json::Value, _> = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: Some("docs".into()),
+                path: "other-page.md".into(),
+            }),
+        })
+        .await;
+    // Restore perms before any potential assertion failure unwinds, so the
+    // tempdir can be cleaned up.
+    let _ = std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o644));
+    if is_root {
+        return; // root reads through 0o000; the negative test is meaningless.
+    }
+    let value = result.expect("backlinks must still succeed despite one unreadable file");
+
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present when a file could not be read");
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    let warning = warnings[0].as_str().expect("warning is a string");
+    assert!(
+        warning.contains("docs"),
+        "warning must name the corpus: {warning}"
+    );
+    assert!(
+        warning.contains("locked.md"),
+        "warning must name the unreadable path: {warning}"
+    );
+}
+
+#[cfg(unix)]
+fn nix_getuid_is_zero() -> bool {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+        && let Some(line) = s.lines().find(|l| l.starts_with("Uid:"))
+    {
+        return line.split_whitespace().nth(1) == Some("0");
+    }
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_add_markdown_reports_ancestor_index_refresh_failure_as_warning() {
+    // The primary write can durably succeed while the auto-rebuild of an
+    // ancestor index.md fails (e.g. a permission change on an intermediate
+    // directory). handle_add_markdown must still report success with the
+    // file on disk, and surface the refresh failure as a warning naming the
+    // repair step — never swallow it, and never bounce an internal error
+    // that would make the caller believe the durable write itself was lost.
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo = tmp.path().join("my-repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    let mut cfg = cfg_with_repository(&ground, "myrepo", &repo);
+    cfg.embeddings.enabled = false;
+
+    let wiki_dir = wiki_directory(&cfg.repositories[0]);
+    let dir_a = wiki_dir.join("a");
+    let dir_b = dir_a.join("b");
+    std::fs::create_dir_all(&dir_b).expect("mkdir nested wiki dirs");
+
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    std::fs::set_permissions(&dir_a, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod a to read-only");
+
+    let is_root = nix_getuid_is_zero();
+    let result: Result<serde_json::Value, _> = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                path: "a/b/page.md".into(),
+                content: "# Page\n\nBody text.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await;
+    // Restore perms before any potential assertion failure unwinds, so the
+    // tempdir can be cleaned up.
+    let _ = std::fs::set_permissions(&dir_a, std::fs::Permissions::from_mode(0o755));
+    if is_root {
+        return; // root writes through 0o555; the negative test is meaningless.
+    }
+    let value = result.expect("add_markdown must still succeed despite index refresh failure");
+
+    let on_disk = std::fs::read_to_string(dir_b.join("page.md")).expect("page.md written to disk");
+    assert_eq!(
+        on_disk, "# Page\n\nBody text.\n",
+        "primary write content must land verbatim despite the downstream index failure"
+    );
+
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present when ancestor index refresh fails");
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    let warning = warnings[0].as_str().expect("warning is a string");
+    assert!(
+        warning.contains("ancestor index refresh failed"),
+        "warning must name the refresh failure: {warning}"
+    );
+    assert!(
+        warning.contains("run `index` to repair"),
+        "warning must point at the repair step: {warning}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_add_markdown_warns_on_malformed_frontmatter_block_and_stores_verbatim() {
     // Locks the `handle_add_markdown` wiring of `lint_frontmatter`: a page that
@@ -3373,5 +3559,128 @@ async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
     assert!(
         !ground.exists(),
         "partial fresh ground dir must be removed on rebuild failure"
+    );
+}
+
+// ─── Curd: bounded request-line cap + drained shutdown ──────────────────
+
+#[tokio::test]
+async fn daemon_closes_connection_when_request_line_exceeds_cap() {
+    // MAX_REQUEST_LINE_BYTES (4 MiB) bounds the newline-delimited request
+    // line's allocation via a `.take()`-wrapped reader. A line that never
+    // hits its newline within the cap must close the connection instead of
+    // growing the buffer without bound or hanging on the idle timeout.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let cfg = docs_cfg(&ground, &corpus_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut stream = UnixStream::connect(harness.socket())
+        .await
+        .expect("connect");
+
+    // Write past the cap with no trailing newline; tolerate a broken pipe
+    // once the server closes its half after the cap is exceeded.
+    let chunk = vec![b'a'; 64 * 1024];
+    let target = 4 * 1024 * 1024 + 64 * 1024;
+    let mut written = 0usize;
+    while written < target {
+        match stream.write_all(&chunk).await {
+            Ok(()) => written += chunk.len(),
+            Err(_) => break,
+        }
+    }
+
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("server must close the oversized-line connection promptly, not hang")
+        .expect("read must not error");
+    assert_eq!(
+        n, 0,
+        "server must close the connection (EOF) once the cap is exceeded, not respond or hang"
+    );
+}
+
+#[tokio::test]
+async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
+    // Quality gate: `drain_handlers` (SHUTDOWN_DRAIN_TIMEOUT) must let an
+    // in-flight connection handler finish before `serve_with_idle_timeout`
+    // releases the socket + single-instance flock. A connection that never
+    // sends its request line stays "in-flight" (blocked on `read_line`)
+    // until the per-connection idle timeout elapses, giving us a real
+    // in-flight handler without any test-only injection seam.
+    use hallouminate::app::daemon::serve_with_idle_timeout;
+    use tokio::net::UnixStream;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let cwd = seed_cwd(tmp.path());
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let socket_clone = socket.clone();
+    let idle_timeout = Duration::from_millis(500);
+    let handle =
+        tokio::spawn(
+            async move { serve_with_idle_timeout(&state, &socket_clone, idle_timeout).await },
+        );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Open a connection and never write to it: its handler stays alive,
+    // blocked on `read_line` under `idle_timeout`, until that timeout fires.
+    let _in_flight = UnixStream::connect(&socket)
+        .await
+        .expect("connect in-flight handler");
+
+    // Trigger shutdown from a second, independent connection.
+    let client = connect_at(&socket).await.expect("connect for shutdown");
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await
+        .expect("shutdown transport ok");
+    match resp {
+        DaemonResponse::Ok { result } => {
+            assert_eq!(result, serde_json::Value::String("stopping".to_string()));
+        }
+        other => panic!("shutdown must ack `stopping`, got {other:?}"),
+    }
+
+    // The accept loop breaks near-instantly on the Shutdown ack, but cleanup
+    // must not run until the in-flight handler above times out — proving
+    // drain runs before socket removal / flock release, not after.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        socket.exists(),
+        "socket must still exist while the in-flight handler is draining"
+    );
+
+    let served = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve must return once the in-flight handler finishes draining")
+        .expect("join ok");
+    served.expect("serve returns Ok after a graceful drain");
+    assert!(
+        !socket.exists(),
+        "socket must be removed once the drain completes"
     );
 }

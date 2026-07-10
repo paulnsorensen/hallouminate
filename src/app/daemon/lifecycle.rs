@@ -17,6 +17,9 @@ use super::socket::daemon_socket_path;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_POLL: Duration = Duration::from_millis(50);
+/// Bound on the `Ping` round trip `status` uses to probe liveness — an
+/// accepted-but-silent socket must report `NotRunning`, not hang the CLI.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Liveness of the daemon for `daemon status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,10 +37,13 @@ pub async fn status() -> anyhow::Result<DaemonStatus> {
         Err(_) => return Ok(DaemonStatus::NotRunning),
     };
     match client
-        .call_raw(DaemonRequest {
-            cwd: std::env::current_dir().unwrap_or_default(),
-            payload: DaemonRequestPayload::Ping,
-        })
+        .call_raw_with_timeout(
+            DaemonRequest {
+                cwd: std::env::current_dir().unwrap_or_default(),
+                payload: DaemonRequestPayload::Ping,
+            },
+            STATUS_TIMEOUT,
+        )
         .await
     {
         Ok(_) => Ok(DaemonStatus::Running),
@@ -53,21 +59,29 @@ pub async fn status() -> anyhow::Result<DaemonStatus> {
 /// resolve a repo config.
 pub async fn stop() -> anyhow::Result<()> {
     let socket = daemon_socket_path();
+    // Start the deadline before sending `Shutdown`, not after `call_raw`
+    // returns — otherwise an accepted-but-silent socket lets the send itself
+    // hang indefinitely and the poll loop below never gets a chance to time
+    // out.
+    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     let client = match connect_at(&socket).await {
         Ok(c) => c,
         Err(_) => return Ok(()),
     };
     // Send Shutdown. A transport error here can mean the daemon raced us and
     // already closed; treat that as "already stopping" and fall through to
-    // the socket-gone poll rather than failing.
+    // the socket-gone poll rather than failing. Bounded by the same deadline
+    // so a wedged daemon can't hang this call past `STOP_TIMEOUT`.
     let _ = client
-        .call_raw(DaemonRequest {
-            cwd: std::env::current_dir().unwrap_or_default(),
-            payload: DaemonRequestPayload::Shutdown,
-        })
+        .call_raw_with_timeout(
+            DaemonRequest {
+                cwd: std::env::current_dir().unwrap_or_default(),
+                payload: DaemonRequestPayload::Shutdown,
+            },
+            STOP_TIMEOUT,
+        )
         .await;
 
-    let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     loop {
         // Socket file removed by the daemon's cleanup, OR present-but-dead
         // (connect refused) — either means it's down.

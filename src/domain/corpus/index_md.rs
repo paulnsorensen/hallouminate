@@ -72,6 +72,14 @@ pub struct ChildEntry {
 /// unreadable or has no leading H1. Used for the trailing gloss on each
 /// link entry, so the list is browsable without opening every child.
 pub fn read_h1(path: &Path) -> Option<String> {
+    // Refuse to follow a symlinked index/child file: a directory symlink
+    // planted inside the corpus (or a symlinked child markdown file) must
+    // not let its target's H1 get copied into a generated ancestor index.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => return None,
+        Ok(_) => {}
+        Err(_) => return None,
+    }
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines().peekable();
 
@@ -366,6 +374,21 @@ mod tests {
     #[test]
     fn read_h1_returns_none_for_missing_file() {
         assert_eq!(read_h1(Path::new("/does/not/exist")), None);
+    }
+
+    #[test]
+    fn read_h1_returns_none_for_symlinked_file() {
+        // The bug this guards: a symlinked index.md (or child markdown file)
+        // must not have its target's H1 copied into a generated ancestor
+        // index -- that would let a directory symlink smuggle content from
+        // outside the corpus into an auto-generated page.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real = outside.path().join("real.md");
+        std::fs::write(&real, "# Outside Title\n").unwrap();
+        let link = tmp.path().join("index.md");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(read_h1(&link), None);
     }
 
     #[test]

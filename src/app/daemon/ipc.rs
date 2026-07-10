@@ -266,6 +266,12 @@ pub struct BacklinksResult {
     /// Corpus-relative paths of every page whose content links to `path` via
     /// a `[[wikilink]]`.
     pub backlinks: Vec<String>,
+    /// Files that could not be read during the scan (permission change,
+    /// deletion, transient I/O error). Non-empty means the scan is
+    /// incomplete — the caller cannot treat an empty `backlinks` as "no
+    /// backlinks" when warnings are present. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `CorpusStats` payload.
