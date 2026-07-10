@@ -3375,3 +3375,126 @@ async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
         "partial fresh ground dir must be removed on rebuild failure"
     );
 }
+
+// ─── Curd: bounded request-line cap + drained shutdown ──────────────────
+
+#[tokio::test]
+async fn daemon_closes_connection_when_request_line_exceeds_cap() {
+    // MAX_REQUEST_LINE_BYTES (4 MiB) bounds the newline-delimited request
+    // line's allocation via a `.take()`-wrapped reader. A line that never
+    // hits its newline within the cap must close the connection instead of
+    // growing the buffer without bound or hanging on the idle timeout.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let cfg = docs_cfg(&ground, &corpus_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut stream = UnixStream::connect(harness.socket())
+        .await
+        .expect("connect");
+
+    // Write past the cap with no trailing newline; tolerate a broken pipe
+    // once the server closes its half after the cap is exceeded.
+    let chunk = vec![b'a'; 64 * 1024];
+    let target = 4 * 1024 * 1024 + 64 * 1024;
+    let mut written = 0usize;
+    while written < target {
+        match stream.write_all(&chunk).await {
+            Ok(()) => written += chunk.len(),
+            Err(_) => break,
+        }
+    }
+
+    let mut buf = [0u8; 1];
+    let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .expect("server must close the oversized-line connection promptly, not hang")
+        .expect("read must not error");
+    assert_eq!(
+        n, 0,
+        "server must close the connection (EOF) once the cap is exceeded, not respond or hang"
+    );
+}
+
+#[tokio::test]
+async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
+    // Quality gate: `drain_handlers` (SHUTDOWN_DRAIN_TIMEOUT) must let an
+    // in-flight connection handler finish before `serve_with_idle_timeout`
+    // releases the socket + single-instance flock. A connection that never
+    // sends its request line stays "in-flight" (blocked on `read_line`)
+    // until the per-connection idle timeout elapses, giving us a real
+    // in-flight handler without any test-only injection seam.
+    use hallouminate::app::daemon::serve_with_idle_timeout;
+    use tokio::net::UnixStream;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let cwd = seed_cwd(tmp.path());
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let socket_clone = socket.clone();
+    let idle_timeout = Duration::from_millis(500);
+    let handle =
+        tokio::spawn(
+            async move { serve_with_idle_timeout(&state, &socket_clone, idle_timeout).await },
+        );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Open a connection and never write to it: its handler stays alive,
+    // blocked on `read_line` under `idle_timeout`, until that timeout fires.
+    let _in_flight = UnixStream::connect(&socket)
+        .await
+        .expect("connect in-flight handler");
+
+    // Trigger shutdown from a second, independent connection.
+    let client = connect_at(&socket).await.expect("connect for shutdown");
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await
+        .expect("shutdown transport ok");
+    match resp {
+        DaemonResponse::Ok { result } => {
+            assert_eq!(result, serde_json::Value::String("stopping".to_string()));
+        }
+        other => panic!("shutdown must ack `stopping`, got {other:?}"),
+    }
+
+    // The accept loop breaks near-instantly on the Shutdown ack, but cleanup
+    // must not run until the in-flight handler above times out — proving
+    // drain runs before socket removal / flock release, not after.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        socket.exists(),
+        "socket must still exist while the in-flight handler is draining"
+    );
+
+    let served = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve must return once the in-flight handler finishes draining")
+        .expect("join ok");
+    served.expect("serve returns Ok after a graceful drain");
+    assert!(
+        !socket.exists(),
+        "socket must be removed once the drain completes"
+    );
+}
