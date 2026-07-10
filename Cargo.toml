@@ -21,7 +21,7 @@ notify = "8"
 notify-debouncer-full = "0.7"
 
 # Storage
-lancedb = "0.30"
+lancedb = "0.31"
 # Only the `arrow` umbrella: its `arrow::array` / `arrow::datatypes` re-exports
 # replace direct arrow-array/arrow-schema deps, so they can never drift apart.
 arrow = "58"
