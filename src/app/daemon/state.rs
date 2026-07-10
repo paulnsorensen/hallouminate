@@ -22,8 +22,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -62,11 +63,14 @@ enum MaintenanceTick {
     Stop,
 }
 
-fn unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+
+/// Monotonic seconds elapsed since process start (`Instant`-based), not
+/// wall-clock Unix time — a clock step (NTP correction, manual clock change)
+/// can't make idle accounting exit early or postpone exit until the clock
+/// catches up.
+fn monotonic_secs() -> u64 {
+    PROCESS_START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
 fn is_idle(last_use_secs: u64, now_secs: u64, idle_secs: u64) -> bool {
@@ -135,7 +139,7 @@ struct DaemonStateInner {
     /// shared one. Empty until the first `ground` request that resolves a
     /// configured model; the baseline model (if any) is pre-warmed at boot.
     crossencoders: Arc<Mutex<HashMap<String, FastembedCrossencoder>>>,
-    /// Unix-second timestamp of the most recent completed activity: request
+    /// Monotonic (`Instant`-based) seconds-since-process-start timestamp of
     /// completion (handle_connection) plus embedder/crossencoder acquire and
     /// guard drop. Idle-exit (server.rs) fires when this is quiet for
     /// `[daemon].idle_exit_secs` and no connection is active (ADR-003).
@@ -353,7 +357,7 @@ impl DaemonState {
         let shutdown = CancellationToken::new();
         let embedder_arc = Arc::new(Mutex::new(embedder));
         let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
-        let last_activity = Arc::new(AtomicU64::new(unix_secs()));
+        let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
         let write_lane = Arc::new(Semaphore::new(1));
 
@@ -538,7 +542,7 @@ impl DaemonState {
         }
         self.inner
             .last_activity_secs
-            .store(unix_secs(), Ordering::Relaxed);
+            .store(monotonic_secs(), Ordering::Relaxed);
         Ok(EmbedderGuard {
             guard,
             last_use_secs: Arc::clone(&self.inner.last_activity_secs),
@@ -575,7 +579,7 @@ impl DaemonState {
         }
         self.inner
             .last_activity_secs
-            .store(unix_secs(), Ordering::Relaxed);
+            .store(monotonic_secs(), Ordering::Relaxed);
         Ok(Some(CrossencoderGuard {
             guard,
             key: canonical.to_string(),
@@ -588,7 +592,7 @@ impl DaemonState {
     pub fn touch_activity(&self) {
         self.inner
             .last_activity_secs
-            .store(unix_secs(), Ordering::Relaxed);
+            .store(monotonic_secs(), Ordering::Relaxed);
     }
 
     /// Register an active connection; the returned guard decrements the count
@@ -605,7 +609,7 @@ impl DaemonState {
     /// connections, activity clock quiet for at least `idle_secs`.
     /// `idle_secs == 0` disables idle-exit.
     pub(crate) fn should_idle_exit(&self, idle_secs: u64) -> bool {
-        self.should_idle_exit_at(idle_secs, unix_secs())
+        self.should_idle_exit_at(idle_secs, monotonic_secs())
     }
 
     /// Injectable-clock variant so tests drive a synthetic `now_secs`.
@@ -630,7 +634,7 @@ impl DaemonState {
     /// short interval of the true deadline rather than overshooting by up to a
     /// whole period.
     pub(crate) fn secs_until_idle(&self, idle_exit_secs: u64) -> u64 {
-        self.secs_until_idle_at(idle_exit_secs, unix_secs())
+        self.secs_until_idle_at(idle_exit_secs, monotonic_secs())
     }
 
     /// Injectable-clock variant so tests drive a synthetic `now_secs`.
@@ -640,7 +644,7 @@ impl DaemonState {
         idle_exit_secs.saturating_sub(elapsed)
     }
 
-    /// Unix-second timestamp of the most recent activity. Test accessor.
+    /// Monotonic seconds-since-process-start of the most recent activity. Test accessor.
     #[cfg(test)]
     pub(crate) fn last_activity_secs(&self) -> u64 {
         self.inner.last_activity_secs.load(Ordering::Relaxed)
@@ -845,7 +849,8 @@ impl std::ops::DerefMut for EmbedderGuard<'_> {
 
 impl Drop for EmbedderGuard<'_> {
     fn drop(&mut self) {
-        self.last_use_secs.store(unix_secs(), Ordering::Relaxed);
+        self.last_use_secs
+            .store(monotonic_secs(), Ordering::Relaxed);
     }
 }
 
@@ -880,7 +885,8 @@ impl std::ops::DerefMut for CrossencoderGuard {
 
 impl Drop for CrossencoderGuard {
     fn drop(&mut self) {
-        self.last_use_secs.store(unix_secs(), Ordering::Relaxed);
+        self.last_use_secs
+            .store(monotonic_secs(), Ordering::Relaxed);
     }
 }
 
@@ -1104,12 +1110,35 @@ mod tests {
         );
     }
 
+    /// Regression for the correctness finding fixed alongside this test:
+    /// idle accounting must key off `Instant`-based monotonic ticks, not
+    /// wall-clock Unix seconds, so an NTP correction or manual clock change
+    /// can't make the daemon exit immediately after activity or postpone
+    /// exit until the clock catches up. A process-relative monotonic clock
+    /// reads small (seconds since this test binary started); a wall-clock
+    /// Unix-seconds reading is always > 1.7 billion (2024+). If this ever
+    /// regresses to `unix_secs()`-style wall time, `monotonic_secs()` jumps
+    /// to the same huge magnitude and this assertion fails.
+    #[test]
+    fn idle_clock_is_monotonic_not_wall_clock() {
+        let wall_clock_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_secs();
+        let monotonic = monotonic_secs();
+        assert!(
+            monotonic < wall_clock_secs / 2,
+            "idle clock must be process-relative (Instant-based), not wall-clock \
+             Unix seconds: monotonic={monotonic}, wall_clock={wall_clock_secs}",
+        );
+    }
+
     #[tokio::test]
     async fn embedder_guard_updates_last_use_on_drop() {
         let last_use_secs = Arc::new(AtomicU64::new(1));
         let guard = Mutex::new(None);
         let guard = guard.lock().await;
-        let before_drop = unix_secs();
+        let before_drop = monotonic_secs();
 
         drop(EmbedderGuard {
             guard,
@@ -1126,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn crossencoder_guard_updates_last_use_on_drop() {
         let last_use_secs = Arc::new(AtomicU64::new(1));
-        let before_drop = unix_secs();
+        let before_drop = monotonic_secs();
 
         drop(CrossencoderGuard {
             guard: Arc::new(Mutex::new(HashMap::new())).lock_owned().await,
