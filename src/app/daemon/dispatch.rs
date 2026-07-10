@@ -33,7 +33,9 @@ use crate::domain::corpus::sandbox::{
     resolve_read_root, safe_relative_path,
 };
 use crate::domain::corpus::scan;
-use crate::domain::corpus::{blake3_file, find_wikilinks, normalize_slug, slug_identifiers};
+use crate::domain::corpus::{
+    SlugResolution, blake3_file, find_wikilinks, normalize_slug, resolve_slug,
+};
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
@@ -748,12 +750,11 @@ async fn handle_add_markdown(
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
     match crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
         Ok(entries) => {
-            let mut known_slugs =
-                crate::domain::corpus::corpus_slugs(entries.iter().map(|e| e.path.as_str()));
-            known_slugs.extend(slug_identifiers(&req.path));
+            let mut known_paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
+            known_paths.push(req.path.clone());
             warnings.extend(crate::domain::corpus::lint_wikilinks(
                 &req.content,
-                &known_slugs,
+                &known_paths,
             ));
         }
         Err(e) => {
@@ -855,20 +856,41 @@ async fn handle_add_markdown(
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
         match index_single_file(&store, embedder_dyn, &registry, &corpus, &dest).await {
             Ok(s) => s,
-            Err(e) => return DaemonResponse::internal(e.to_string()),
+            Err(e) => {
+                // The write above already durably completed; a model/store
+                // failure here must not hide that from the caller behind a
+                // bare internal error. Surface it as a warning on the
+                // otherwise-successful response and leave the file
+                // unindexed for a later `index` call to repair.
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %e,
+                    path = %dest.display(),
+                    "add_markdown: indexing failed after durable write",
+                );
+                warnings.push(format!(
+                    "wrote {} but indexing failed: {e}; run `index` to repair search results",
+                    relative.display()
+                ));
+                crate::domain::indexer::ApplyStats::default()
+            }
         }
     };
 
     // Auto-rebuild wiki indexes from the corpus root down to the parent of
-    // the just-written file. Failures here surface as `Internal` and the
-    // mutation guard is dropped — partial index regen would leave the wiki
-    // in a less-coherent state than aborting outright.
+    // the just-written file. The write already durably completed, so a
+    // refresh failure here is reported as a warning on the successful
+    // response instead of an internal error — the caller can see the
+    // durable write and retry `index` rather than losing visibility into
+    // it entirely.
     if is_wiki_corpus(&corpus) {
         match rebuild_wiki_indexes(state, &corpus, &root, &relative).await {
             Ok(extra) => fold_apply_stats(&mut stats, &extra),
             Err(msg) => {
-                drop(guard);
-                return DaemonResponse::internal(msg);
+                warnings.push(format!(
+                    "wrote {} but ancestor index refresh failed: {msg}; run `index` to repair",
+                    relative.display()
+                ));
             }
         }
     }
@@ -977,48 +999,38 @@ async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> Da
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .filter(|stem| *stem != full_slug);
+    let entry_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
     let target_slugs: std::collections::HashSet<String> = match &bare_stem {
-        Some(stem) => {
-            let stem_is_unique = entries
-                .iter()
-                .filter(|entry| {
-                    Path::new(&entry.path)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_lowercase())
-                        .as_deref()
-                        == Some(stem.as_str())
-                })
-                .count()
-                <= 1;
-            if stem_is_unique {
-                [full_slug.clone(), stem.clone()].into_iter().collect()
-            } else {
-                std::iter::once(full_slug.clone()).collect()
-            }
-        }
+        Some(stem) => match resolve_slug(stem, &entry_paths) {
+            SlugResolution::Ambiguous(_) => std::iter::once(full_slug.clone()).collect(),
+            _ => [full_slug.clone(), stem.clone()].into_iter().collect(),
+        },
         None => std::iter::once(full_slug.clone()).collect(),
     };
+    let corpus_name = corpus.name.clone();
     let req_path = req.path.clone();
-    let found = tokio::task::spawn_blocking(move || {
-        let mut backlinks: Vec<String> = entries
-            .into_iter()
-            .filter(|entry| entry.path != req_path)
-            .filter(|entry| {
-                let Ok(content) = std::fs::read_to_string(&entry.absolute_path) else {
-                    return false;
-                };
-                find_wikilinks(&content)
-                    .iter()
-                    .any(|link| target_slugs.contains(&normalize_slug(link)))
-            })
-            .map(|entry| entry.path)
-            .collect();
+    let scanned = tokio::task::spawn_blocking(move || {
+        let mut backlinks: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for entry in entries.into_iter().filter(|entry| entry.path != req_path) {
+            match std::fs::read_to_string(&entry.absolute_path) {
+                Ok(content) => {
+                    if find_wikilinks(&content)
+                        .iter()
+                        .any(|link| target_slugs.contains(&normalize_slug(link)))
+                    {
+                        backlinks.push(entry.path);
+                    }
+                }
+                Err(e) => failures.push((entry.path, e.to_string())),
+            }
+        }
         backlinks.sort();
-        backlinks
+        (backlinks, failures)
     })
     .await;
-    let backlinks = match found {
-        Ok(b) => b,
+    let (backlinks, failures) = match scanned {
+        Ok(r) => r,
         Err(join_err) => {
             tracing::error!(
                 target: "hallouminate::daemon",
@@ -1028,10 +1040,24 @@ async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> Da
             return DaemonResponse::internal(format!("backlinks task panicked: {join_err}"));
         }
     };
+    let mut warnings = Vec::new();
+    for (path, error) in &failures {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            corpus = %corpus_name,
+            path = %path,
+            error = %error,
+            "backlinks scan: failed to read file; result is a partial scan",
+        );
+        warnings.push(format!(
+            "could not read {path} in corpus {corpus_name}: {error}; backlinks result is incomplete"
+        ));
+    }
     DaemonResponse::ok(&BacklinksResult {
-        corpus: corpus.name,
+        corpus: corpus_name,
         path: req.path,
         backlinks,
+        warnings,
     })
 }
 
@@ -1460,8 +1486,20 @@ async fn rebuild_wiki_indexes(
 
         let existing = {
             let owned_path = index_path.clone();
-            match tokio::task::spawn_blocking(move || std::fs::read_to_string(&owned_path)).await {
-                Ok(Ok(s)) => Some(s),
+            match tokio::task::spawn_blocking(move || {
+                // Treat a symlinked index.md as invalid (as if absent) so a
+                // child directory's index.md symlink can't smuggle content
+                // from outside the corpus into the composed ancestor index.
+                match std::fs::symlink_metadata(&owned_path) {
+                    Ok(meta) if meta.file_type().is_symlink() => Ok(None),
+                    Ok(_) => std::fs::read_to_string(&owned_path).map(Some),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            {
+                Ok(Ok(s)) => s,
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Ok(Err(e)) => return Err(format!("read {}: {e}", index_path.display())),
                 Err(e) => {

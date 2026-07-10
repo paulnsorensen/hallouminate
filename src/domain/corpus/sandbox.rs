@@ -431,7 +431,6 @@ pub fn atomic_write_no_follow(
     content: &[u8],
     overwrite: bool,
 ) -> Result<PathBuf, WriteError> {
-    std::fs::create_dir_all(root).map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
     let names = normal_components(relative)?;
     let file_name = names
         .last()
@@ -657,12 +656,59 @@ fn open_parent_dir(root: &Path, dirs: &[OsString]) -> Result<Dir, WriteError> {
     Ok(current)
 }
 
+fn deepest_existing_ancestor(root: &Path) -> Result<(PathBuf, Vec<OsString>), WriteError> {
+    let mut missing = Vec::new();
+    let mut current = root.to_path_buf();
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()));
+            }
+            Ok(meta) if meta.is_dir() => {
+                missing.reverse();
+                return Ok((current, missing));
+            }
+            Ok(_) => {
+                return Err(invalid_path_error(
+                    "corpus root path component is not a directory",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = current.file_name() else {
+                    return Err(invalid_path_error(
+                        "corpus root has no existing ancestor directory",
+                    ));
+                };
+                missing.push(name.to_os_string());
+                if !current.pop() {
+                    return Err(invalid_path_error(
+                        "corpus root has no existing ancestor directory",
+                    ));
+                }
+            }
+            Err(e) => return Err(WriteError::new(WriteErrorKind::Io, e)),
+        }
+    }
+}
+
 fn open_root_dir(root: &Path) -> Result<Dir, WriteError> {
-    // `open_ambient_dir` is the documented bootstrap for getting a `Dir`
-    // capability from an absolute path. All subsequent component opens go
-    // through that capability and stay confined to `root`.
-    Dir::open_ambient_dir(root, ambient_authority())
-        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
+    // Never bootstrap the write capability by ambient-opening `root` itself:
+    // a symlink swapped into place after the caller's preflight check (e.g.
+    // `ensure_wiki_root_safe`) would be silently followed by
+    // `open_ambient_dir`, redirecting every subsequent no-follow component
+    // open onto whatever the symlink targets. Instead we ambient-open the
+    // deepest already-existing ancestor of `root` and open/create every
+    // remaining component -- including `root`'s own leaf -- through the same
+    // no-follow `open_or_create_child_dir` used for every interior path
+    // segment, so a raced root symlink bounces with `WriteErrorKind::Symlink`
+    // exactly like a raced intermediate directory does.
+    let (anchor, remaining) = deepest_existing_ancestor(root)?;
+    let mut current = Dir::open_ambient_dir(&anchor, ambient_authority())
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    for name in &remaining {
+        current = open_or_create_child_dir(&current, name.as_os_str())?;
+    }
+    Ok(current)
 }
 
 fn open_or_create_child_dir(parent: &Dir, name: &OsStr) -> Result<Dir, WriteError> {
@@ -743,6 +789,12 @@ fn reject_symlink_leaf(parent: &Dir, name: &OsStr) -> Result<(), WriteError> {
     }
 }
 
+/// Default permission bits for a brand-new corpus file -- an explicit mode
+/// instead of trusting the OS default (`0o666` minus umask), mirroring the
+/// same explicit-mode restore `open_or_create_child_dir` applies to
+/// directories (`0o755`).
+const NEW_FILE_MODE: u32 = 0o644;
+
 fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
     // `create_new(true)` maps to `O_CREAT | O_EXCL`. The pre-existing-leaf
     // case (including a pre-existing symlink) surfaces as `AlreadyExists`,
@@ -751,6 +803,11 @@ fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), Writ
     // existing entry.
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        opts.mode(NEW_FILE_MODE);
+    }
     let cap_file = parent
         .open_with(name, &opts)
         .map_err(classify_create_io_error)?;
@@ -761,8 +818,8 @@ fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), Writ
 }
 
 fn atomic_replace(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
-    validate_replace_target(parent, name)?;
-    let (temp_name, mut file) = create_temp_file(parent, name)?;
+    let mode = validate_replace_target(parent, name)?;
+    let (temp_name, mut file) = create_temp_file(parent, name, mode)?;
     if let Err(err) = write_and_sync(&mut file, content) {
         cleanup_temp(parent, &temp_name);
         return Err(err);
@@ -776,24 +833,41 @@ fn atomic_replace(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), Writ
     fsync_dir(parent)
 }
 
-fn validate_replace_target(parent: &Dir, name: &OsStr) -> Result<(), WriteError> {
+/// Confirms `name` is either absent or an existing regular file, and returns
+/// the mode the replacement temp file must be created with: the
+/// destination's own mode when it exists -- so an overwrite can never
+/// broaden permissions -- or [`NEW_FILE_MODE`] when there is nothing to
+/// inherit from.
+fn validate_replace_target(parent: &Dir, name: &OsStr) -> Result<u32, WriteError> {
     match parent.symlink_metadata(name) {
         Ok(meta) => {
             let ft = meta.file_type();
             if ft.is_symlink() {
                 Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()))
             } else if ft.is_file() {
-                Ok(())
+                #[cfg(unix)]
+                {
+                    use cap_std::fs::PermissionsExt;
+                    Ok(meta.permissions().mode() & 0o777)
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(NEW_FILE_MODE)
+                }
             } else {
                 Err(invalid_path_error("target is not a regular file"))
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(NEW_FILE_MODE),
         Err(e) => Err(classify_create_io_error(e)),
     }
 }
 
-fn create_temp_file(parent: &Dir, name: &OsStr) -> Result<(OsString, std::fs::File), WriteError> {
+fn create_temp_file(
+    parent: &Dir,
+    name: &OsStr,
+    mode: u32,
+) -> Result<(OsString, std::fs::File), WriteError> {
     for attempt in 0..100 {
         let mut temp = OsString::from(".");
         temp.push(name);
@@ -803,6 +877,11 @@ fn create_temp_file(parent: &Dir, name: &OsStr) -> Result<(OsString, std::fs::Fi
         ));
         let mut opts = OpenOptions::new();
         opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
         match parent.open_with(temp.as_os_str(), &opts) {
             Ok(cap_file) => return Ok((temp, cap_file.into_std())),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -1191,6 +1270,69 @@ mod tests {
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn atomic_write_no_follow_rejects_root_itself_as_symlink() {
+        // The bug this guards: a symlinked corpus root (swapped in after a
+        // caller's preflight check, e.g. `ensure_wiki_root_safe`) must not
+        // let the capability bootstrap redirect writes outside the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let root = tmp.path().join("root");
+        std::os::unix::fs::symlink(&outside, &root).unwrap();
+
+        let err = atomic_write_no_follow(&root, Path::new("pwned.md"), b"x", false)
+            .expect_err("symlinked corpus root must bounce");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
+        assert!(
+            !outside.join("pwned.md").exists(),
+            "writer must not punch through the root symlink"
+        );
+    }
+
+    #[test]
+    fn atomic_write_no_follow_overwrite_preserves_destination_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        atomic_write_no_follow(root, Path::new("secret.md"), b"first", false).unwrap();
+        std::fs::set_permissions(
+            root.join("secret.md"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        atomic_write_no_follow(root, Path::new("secret.md"), b"second", true).unwrap();
+
+        let mode = std::fs::metadata(root.join("secret.md"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "overwrite must preserve the destination's mode"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("secret.md")).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn atomic_write_no_follow_new_file_gets_configured_safe_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        atomic_write_no_follow(root, Path::new("fresh.md"), b"data", false).unwrap();
+        let mode = std::fs::metadata(root.join("fresh.md"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644, "new file must get the configured safe mode");
     }
 
     #[test]
