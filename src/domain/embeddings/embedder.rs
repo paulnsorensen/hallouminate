@@ -20,6 +20,12 @@ pub const ARCTIC_S_MODEL: &str = "snowflake/snowflake-arctic-embed-s";
 pub const DEFAULT_EMBED_MODEL: &str = ARCTIC_S_MODEL;
 /// Every model name accepted by [`canonical_model_name`], for menus and tests.
 pub const SUPPORTED_MODELS: [&str; 3] = [BGE_SMALL_MODEL, E5_SMALL_MODEL, ARCTIC_S_MODEL];
+/// Bounded fastembed batch size for ONNX runs. Passing `None` selects
+/// fastembed's internal default (256 sequences × 512 tokens), which sets the
+/// ORT CPU arena's high-water mark in the multi-GB range and is never
+/// reclaimed afterwards (see `.hallouminate/wiki/ort-arena-retention.md`).
+/// `Some(32)` is the measured, verified mitigation.
+const EMBED_BATCH_SIZE: usize = 32;
 
 /// Whether a query or a passage is being embedded. Asymmetric retrieval
 /// models (the e5 family) take different instruction prefixes for the two
@@ -116,10 +122,10 @@ impl EmbedBatch for Embedder {
         // symmetric-passage path (bge, arctic) free of needless clones.
         let prefix = instruction_prefix(&self.model_name, role);
         let raw = if prefix.is_empty() {
-            self.inner.embed(texts, None)
+            self.inner.embed(texts, Some(EMBED_BATCH_SIZE))
         } else {
             let prefixed: Vec<String> = texts.iter().map(|t| format!("{prefix}{t}")).collect();
-            self.inner.embed(&prefixed, None)
+            self.inner.embed(&prefixed, Some(EMBED_BATCH_SIZE))
         }
         .map_err(|e| HallouminateError::Embed(format!("embed: {e}")))?;
         raw.into_iter().map(finalize_vector).collect()

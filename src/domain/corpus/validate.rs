@@ -6,7 +6,6 @@
 //! in the same round-trip. Catching a broken link or empty diagram at write
 //! time saves the read-discover-rewrite loop later.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
@@ -148,36 +147,62 @@ pub fn normalize_slug(raw: &str) -> String {
         .map(str::to_string)
         .unwrap_or(lower)
 }
+/// Result of resolving a wikilink target against a corpus's paths — shared
+/// by `add_markdown`'s wikilink lint and `handle_backlinks`' bare-stem
+/// uniqueness check so the two agree on whether a bare stem identifies one
+/// page, no page, or several.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SlugResolution {
+    /// No page's full path or bare stem matches the target.
+    Missing,
+    /// Exactly one page matches; carries its corpus-relative path.
+    Unique(String),
+    /// More than one page shares the bare stem; carries every candidate.
+    Ambiguous(Vec<String>),
+}
 
-/// The slugs a corpus-relative markdown `path` should answer to for wikilink
-/// resolution: the full relative path (extension stripped) and, when it
-/// differs, the bare filename — most wikilinks name only the page, not its
-/// directory.
-pub fn slug_identifiers(path: &str) -> Vec<String> {
-    let full = normalize_slug(path);
-    let stem = Path::new(path)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase());
-    match stem {
-        Some(stem) if stem != full => vec![full, stem],
-        _ => vec![full],
+/// Resolve `target` against every corpus-relative path in `paths`. A page
+/// matches when its normalized full path equals `target`, or when its bare
+/// filename stem does.
+pub fn resolve_slug(target: &str, paths: &[String]) -> SlugResolution {
+    let target_slug = normalize_slug(target);
+    let matches: Vec<String> = paths
+        .iter()
+        .filter(|path| {
+            normalize_slug(path) == target_slug
+                || Path::new(path.as_str())
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_lowercase())
+                    .as_deref()
+                    == Some(target_slug.as_str())
+        })
+        .cloned()
+        .collect();
+    match matches.len() {
+        0 => SlugResolution::Missing,
+        1 => SlugResolution::Unique(matches.into_iter().next().expect("len == 1")),
+        _ => SlugResolution::Ambiguous(matches),
     }
 }
 
-/// Union of [`slug_identifiers`] for every path in a corpus — the known-good
-/// set [`lint_wikilinks`] checks wikilink targets against.
-pub fn corpus_slugs<'a>(paths: impl IntoIterator<Item = &'a str>) -> HashSet<String> {
-    paths.into_iter().flat_map(slug_identifiers).collect()
-}
-
-/// Flag every `[[wikilink]]` in `content` whose target does not resolve to a
-/// page in `known_slugs`. Advisory-only, mirrors `lint_markdown`: never
-/// rewrites or blocks the write.
-pub fn lint_wikilinks(content: &str, known_slugs: &HashSet<String>) -> Vec<String> {
+/// Flag every `[[wikilink]]` in `content` whose target does not uniquely
+/// resolve to a page in `paths`. Advisory-only, mirrors `lint_markdown`:
+/// never rewrites or blocks the write. A bare stem shared by two or more
+/// pages is flagged as ambiguous, listing the candidates, instead of being
+/// silently accepted.
+pub fn lint_wikilinks(content: &str, paths: &[String]) -> Vec<String> {
     find_wikilinks(content)
         .into_iter()
-        .filter(|target| !known_slugs.contains(&normalize_slug(target)))
-        .map(|target| format!("wikilink [[{target}]] has no matching page in the corpus"))
+        .filter_map(|target| match resolve_slug(&target, paths) {
+            SlugResolution::Unique(_) => None,
+            SlugResolution::Missing => Some(format!(
+                "wikilink [[{target}]] has no matching page in the corpus"
+            )),
+            SlugResolution::Ambiguous(candidates) => Some(format!(
+                "wikilink [[{target}]] is ambiguous \u{2014} matches {}",
+                candidates.join(", ")
+            )),
+        })
         .collect()
 }
 
@@ -283,24 +308,63 @@ mod tests {
 
     #[test]
     fn valid_wikilink_is_not_flagged() {
-        let known = corpus_slugs(["guide/setup.md"]);
+        let paths = vec!["guide/setup.md".to_string()];
         let text = "See [[guide/setup]] for details.\n";
-        assert!(lint_wikilinks(text, &known).is_empty());
+        assert!(lint_wikilinks(text, &paths).is_empty());
     }
 
     #[test]
     fn broken_wikilink_is_flagged() {
-        let known = corpus_slugs(["guide/setup.md"]);
+        let paths = vec!["guide/setup.md".to_string()];
         let text = "See [[missing-page]] for details.\n";
-        let warnings = lint_wikilinks(text, &known);
+        let warnings = lint_wikilinks(text, &paths);
         assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
         assert!(warnings[0].contains("missing-page"));
     }
 
     #[test]
     fn wikilink_inside_code_fence_is_ignored() {
-        let known = corpus_slugs(["guide/setup.md"]);
+        let paths = vec!["guide/setup.md".to_string()];
         let text = "```text\n[[missing-page]]\n```\n";
-        assert!(lint_wikilinks(text, &known).is_empty());
+        assert!(lint_wikilinks(text, &paths).is_empty());
+    }
+
+    #[test]
+    fn ambiguous_bare_wikilink_lists_candidate_paths() {
+        // Two pages share the bare stem "setup"; a bare `[[setup]]` wikilink
+        // cannot be resolved to either one, matching `handle_backlinks`'
+        // refusal to treat a colliding stem as identifying a single page.
+        let paths = vec!["guide/setup.md".to_string(), "other/setup.md".to_string()];
+        let text = "See [[setup]] for details.\n";
+        let warnings = lint_wikilinks(text, &paths);
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("ambiguous"));
+        assert!(warnings[0].contains("guide/setup.md"));
+        assert!(warnings[0].contains("other/setup.md"));
+    }
+
+    #[test]
+    fn resolve_slug_agrees_with_backlinks_bare_stem_rule() {
+        // `resolve_slug` is the shared resolver: a bare stem matching two
+        // pages is Ambiguous, matching exactly one is Unique, and matching
+        // none is Missing — the same three outcomes `handle_backlinks`
+        // needs when deciding whether a stem uniquely names the page it is
+        // looking up backlinks for.
+        let paths = vec!["guide/setup.md".to_string(), "other/setup.md".to_string()];
+        assert_eq!(
+            resolve_slug("setup", &paths),
+            SlugResolution::Ambiguous(vec![
+                "guide/setup.md".to_string(),
+                "other/setup.md".to_string()
+            ])
+        );
+
+        let single = vec!["guide/setup.md".to_string()];
+        assert_eq!(
+            resolve_slug("setup", &single),
+            SlugResolution::Unique("guide/setup.md".to_string())
+        );
+
+        assert_eq!(resolve_slug("nowhere", &single), SlugResolution::Missing);
     }
 }

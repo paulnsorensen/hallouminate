@@ -2827,6 +2827,7 @@ dependencies = [
  "globset",
  "ignore",
  "lancedb",
+ "libc",
  "notify",
  "notify-debouncer-full",
  "once_cell",

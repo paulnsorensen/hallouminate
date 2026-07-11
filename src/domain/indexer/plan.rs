@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::domain::common::{FileRef, Mtime};
+use crate::domain::corpus::blake3_file;
 
 /// Storage-agnostic view of a previously-indexed file. Built from the
 /// denormalized columns of the chunks table by `LanceStore::list_files`.
@@ -68,7 +69,29 @@ pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileSnapshot>)
     for (file, mtime) in disk {
         match db.remove(&file) {
             None => out.upserts.push(Upsert { file, mtime }),
-            Some(snap) if snap.mtime_ms == mtime.0 => continue,
+            Some(snap) if snap.mtime_ms == mtime.0 => {
+                // Millisecond mtime resolution can hide a real content change
+                // (same-mtime edit, clock skew): verify with a content hash
+                // before declaring the file unchanged, mirroring the
+                // single-file reroute's hash check in dispatch.rs. A hash
+                // read failure is treated the same as a changed file so
+                // `apply`'s own re-hash surfaces the error.
+                match blake3_file(file.as_path()) {
+                    Ok(hash) if hash == snap.content_hash => continue,
+                    Ok(hash) => out.mtime_touches.push(MtimeCandidate {
+                        file,
+                        snap,
+                        new_mtime: mtime,
+                        known_hash: Some(hash),
+                    }),
+                    Err(_) => out.mtime_touches.push(MtimeCandidate {
+                        file,
+                        snap,
+                        new_mtime: mtime,
+                        known_hash: None,
+                    }),
+                }
+            }
             Some(snap) => out.mtime_touches.push(MtimeCandidate {
                 file,
                 snap,
@@ -102,6 +125,15 @@ mod tests {
         }
     }
 
+    /// Writes `content` to a real file so `plan()`'s hash-verification I/O
+    /// has something to read; returns the path and its blake3 hash.
+    fn write_file(dir: &std::path::Path, name: &str, content: &[u8]) -> (PathBuf, String) {
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("write fixture file");
+        let hash = blake3_file(&path).expect("hash fixture file");
+        (path, hash)
+    }
+
     #[test]
     fn plan_routes_new_file_into_upserts() {
         let disk = vec![(fref("/tmp/new.md"), Mtime(42))];
@@ -115,15 +147,48 @@ mod tests {
     }
 
     #[test]
-    fn plan_skips_files_with_unchanged_mtime() {
-        let file = fref("/tmp/stable.md");
+    fn plan_skips_files_with_unchanged_mtime_and_matching_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, hash) = write_file(dir.path(), "stable.md", b"stable content");
+        let file = FileRef::new(path.clone());
         let disk = vec![(file.clone(), Mtime(100))];
         let mut db = HashMap::new();
-        db.insert(file, snap("/tmp/stable.md", 100, "deadbeef"));
+        db.insert(file, snap(path.to_str().unwrap(), 100, &hash));
         let p = plan(disk, db);
         assert!(p.upserts.is_empty());
         assert!(p.mtime_touches.is_empty());
         assert!(p.deletes.is_empty());
+    }
+
+    #[test]
+    fn plan_reindexes_when_content_hash_differs_despite_unchanged_mtime() {
+        // Regression for the bulk planner trusting mtime alone: a file whose
+        // millisecond mtime happens to be unchanged (clock resolution,
+        // same-mtime overwrite) but whose content hash moved must NOT be
+        // silently skipped — it must be routed for a hash-verified re-index,
+        // matching the single-file reroute's same-mtime hash check.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, real_hash) = write_file(dir.path(), "changed-in-place.md", b"new content");
+        let file = FileRef::new(path.clone());
+        let disk = vec![(file.clone(), Mtime(100))];
+        let mut db = HashMap::new();
+        db.insert(
+            file.clone(),
+            snap(path.to_str().unwrap(), 100, "stale-hash-from-old-content"),
+        );
+        let p = plan(disk, db);
+        assert!(p.upserts.is_empty());
+        assert!(p.deletes.is_empty());
+        assert_eq!(p.mtime_touches.len(), 1);
+        let cand = &p.mtime_touches[0];
+        assert_eq!(cand.file, file);
+        assert_eq!(cand.new_mtime, Mtime(100));
+        assert_eq!(cand.snap.content_hash, "stale-hash-from-old-content");
+        assert_eq!(
+            cand.known_hash,
+            Some(real_hash),
+            "plan() must carry the hash it already computed so apply() doesn't re-read the file"
+        );
     }
 
     #[test]
@@ -141,6 +206,7 @@ mod tests {
         assert_eq!(cand.new_mtime, Mtime(200));
         assert_eq!(cand.snap.mtime_ms, 100);
         assert_eq!(cand.snap.content_hash, "cafebabe");
+        assert_eq!(cand.known_hash, None);
     }
 
     #[test]
@@ -157,8 +223,11 @@ mod tests {
 
     #[test]
     fn plan_handles_full_matrix_simultaneously() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (stable_path, stable_hash) = write_file(dir.path(), "stable.md", b"stable content");
+
         let new = fref("/tmp/new.md");
-        let stable = fref("/tmp/stable.md");
+        let stable = FileRef::new(stable_path.clone());
         let changed = fref("/tmp/changed.md");
         let gone = fref("/tmp/gone.md");
         let disk = vec![
@@ -167,7 +236,7 @@ mod tests {
             (changed.clone(), Mtime(30)),
         ];
         let mut db = HashMap::new();
-        db.insert(stable, snap("/tmp/stable.md", 2, "aa"));
+        db.insert(stable, snap(stable_path.to_str().unwrap(), 2, &stable_hash));
         db.insert(changed, snap("/tmp/changed.md", 20, "bb"));
         db.insert(gone, snap("/tmp/gone.md", 5, "cc"));
 
