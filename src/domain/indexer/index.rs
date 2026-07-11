@@ -23,5 +23,14 @@ pub async fn index_corpus(
     let disk = scan(corpus)?;
     let db = store.list_files(&corpus.name).await?;
     let p = plan(disk, db);
-    apply(p, store, embedder, registry, corpus, DEFAULT_BATCH_SIZE).await
+    apply(
+        p,
+        store,
+        embedder,
+        registry,
+        corpus,
+        DEFAULT_BATCH_SIZE,
+        None,
+    )
+    .await
 }

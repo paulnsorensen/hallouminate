@@ -34,7 +34,7 @@ use crate::domain::corpus::sandbox::{
 };
 use crate::domain::corpus::scan;
 use crate::domain::corpus::{
-    SlugResolution, blake3_file, find_wikilinks, normalize_slug, resolve_slug,
+    SlugResolution, blake3_bytes, find_wikilinks, normalize_slug, resolve_slug,
 };
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
@@ -1276,6 +1276,12 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
 /// Uses `block_in_place` internally, which panics on a current-thread
 /// runtime — callers (and their tests) must run under the `multi_thread`
 /// flavor.
+/// Reindex a single file the daemon controls, reading its content and mtime
+/// from the ambient path. Used by the write/add-markdown handlers, which
+/// reindex a file they just wrote through the sandbox no-follow write path.
+/// The untrusted watcher path must NOT use this — it reads no-follow bytes and
+/// calls `index_single_file_with_content` directly to avoid a symlink-swap
+/// TOCTOU between validation and content read.
 pub(super) async fn index_single_file(
     store: &LanceStore,
     embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
@@ -1283,9 +1289,26 @@ pub(super) async fn index_single_file(
     corpus: &CorpusConfig,
     file: &Path,
 ) -> anyhow::Result<crate::domain::indexer::ApplyStats> {
-    let meta = tokio::fs::metadata(file).await?;
-    let modified = meta.modified()?;
-    let dur = modified
+    let mtime = tokio::fs::metadata(file).await?.modified()?;
+    let bytes = tokio::fs::read(file).await?;
+    index_single_file_with_content(store, embedder, registry, corpus, file, &bytes, mtime).await
+}
+
+/// Reindex a single file from already-read content and mtime, so the caller
+/// controls how the bytes were obtained. The watcher passes bytes from a
+/// no-follow read (`sandbox::read_no_follow_with_mtime`) so a corpus
+/// contributor cannot swap a checked component to a symlink between the
+/// validation and the content read.
+pub(super) async fn index_single_file_with_content(
+    store: &LanceStore,
+    embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
+    registry: &HandlerRegistry,
+    corpus: &CorpusConfig,
+    file: &Path,
+    bytes: &[u8],
+    mtime: std::time::SystemTime,
+) -> anyhow::Result<crate::domain::indexer::ApplyStats> {
+    let dur = mtime
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("pre-epoch mtime on {}", file.display()))?;
     let mtime_ms = mtime_ms_from_duration(dur, file)?;
@@ -1306,8 +1329,7 @@ pub(super) async fn index_single_file(
     let mut reindex_despite_same_mtime: Option<(FileSnapshot, String)> = None;
     if let Some(snap) = existing {
         let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
-            let owned_file = file.to_path_buf();
-            let hash = tokio::task::spawn_blocking(move || blake3_file(&owned_file)).await??;
+            let hash = blake3_bytes(bytes);
             if hash != snap.content_hash.as_str() {
                 reindex_despite_same_mtime = Some((snap.clone(), hash));
                 true
@@ -1346,6 +1368,7 @@ pub(super) async fn index_single_file(
             registry,
             corpus,
             DEFAULT_BATCH_SIZE,
+            Some((&file_ref, bytes)),
         ))
     })?;
     Ok(stats)
@@ -1431,6 +1454,7 @@ async fn catch_up_corpus(
         registry,
         corpus,
         DEFAULT_BATCH_SIZE,
+        None,
     )
     .await?;
     Ok(Some(stats))

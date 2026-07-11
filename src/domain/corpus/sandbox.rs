@@ -35,6 +35,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -474,6 +475,41 @@ pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteErro
     file.read_to_end(&mut buf)
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
     Ok(buf)
+}
+
+/// Read the contents of `<root>/<relative>` and its mtime from one no-follow
+/// resolution, so a caller that must both reject symlinks and read content
+/// cannot be raced by a symlink swapped in between two separate filesystem
+/// calls (check-then-ambient-read). Mirrors [`read_no_follow`]'s
+/// component-walk; the mtime comes from the same no-follow-opened file
+/// handle's `metadata()`, never an ambient `fs::metadata` call on the path.
+///
+/// # Errors
+///
+/// Same as [`read_no_follow`].
+pub fn read_no_follow_with_mtime(
+    root: &Path,
+    relative: &Path,
+) -> Result<(Vec<u8>, SystemTime), WriteError> {
+    let names = normal_components(relative)?;
+    let file_name = names
+        .last()
+        .ok_or_else(|| invalid_path_error("path must name a file"))?;
+    let parent = open_parent_dir(root, &names[..names.len() - 1])?;
+    reject_symlink_leaf(&parent, file_name.as_os_str())?;
+    let cap_file = parent
+        .open(file_name.as_os_str())
+        .map_err(classify_path_io_error)?;
+    let mut file = cap_file.into_std();
+    let mtime = file
+        .metadata()
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?
+        .modified()
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    Ok((buf, mtime))
 }
 
 /// Find which configured root of `corpus` holds `relative`, walking the roots

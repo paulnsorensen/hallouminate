@@ -118,7 +118,7 @@ pub fn read_h1(root: &Path, path: &Path) -> Option<String> {
 /// Read `dir/file_name` through a `cap-std` no-follow open, refusing the read
 /// when the leaf, `dir` itself, or any component between `root` and `dir` is
 /// a symlink. Walks component-by-component from a capability opened at
-/// `root` — mirroring the no-follow walk in `watch.rs::contains_symlink` —
+/// `root` — mirroring `sandbox::read_no_follow`'s no-follow component walk —
 /// rather than trusting `open_ambient_dir(dir, …)` to be no-follow: that call
 /// resolves `dir` through normal OS path resolution and follows symlinks in
 /// every ancestor component, so checking only `dir`'s own `symlink_metadata`

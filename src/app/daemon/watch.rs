@@ -25,7 +25,7 @@ use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use crate::domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
 use crate::domain::corpus::sandbox::ensure_corpus_allows_file;
 
-use super::dispatch::index_single_file;
+use super::dispatch::index_single_file_with_content;
 use super::state::DaemonState;
 
 /// One watched location: the directory handed to `notify`, the corpus that
@@ -326,19 +326,33 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
     let store = state.store();
     if exists {
         // `path.is_file()` above follows symlinks, so a symlinked leaf whose
-        // target is a regular file elsewhere still reaches here. Reject it
-        // before any read: `index_single_file` canonicalizes and reads the
-        // path directly, which would follow the link and index (and later
-        // serve back through Ground) content from outside the corpus root
-        // entirely.
-        if contains_symlink(owner, path) {
+        // target is a regular file elsewhere still reaches here. A single
+        // no-follow read below both rejects the symlink and supplies the
+        // content, closing the TOCTOU gap a separate check-then-read would
+        // leave open to a symlink swapped in between the two calls.
+        let Ok(relative) = path.strip_prefix(&owner.canonical_watched) else {
             tracing::warn!(
                 target: "hallouminate::daemon",
                 path = %path.display(),
                 "watcher: rejected symlinked path; skipping reindex",
             );
             return;
-        }
+        };
+        let (bytes, mtime) = match crate::domain::corpus::sandbox::read_no_follow_with_mtime(
+            &owner.canonical_watched,
+            relative,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    path = %path.display(),
+                    error = ?e,
+                    "watcher: rejected symlinked path; skipping reindex",
+                );
+                return;
+            }
+        };
         let registry = state.make_registry();
         let mut embedder = if state.embeddings_enabled() {
             match state.embedder().await {
@@ -354,7 +368,17 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(&store, embedder_dyn, &registry, corpus, path).await {
+        match index_single_file_with_content(
+            &store,
+            embedder_dyn,
+            &registry,
+            corpus,
+            path,
+            &bytes,
+            mtime,
+        )
+        .await
+        {
             Ok(stats) => tracing::debug!(
                 target: "hallouminate::daemon",
                 corpus = %corpus.name,
@@ -444,56 +468,6 @@ fn delete_file_ref(owner: &WatchRoot, path: &Path) -> crate::domain::common::Fil
         Ok(rel) => crate::domain::common::FileRef::new(owner.canonical_watched.join(rel)),
         Err(_) => canonicalize_or_passthrough(path),
     }
-}
-
-/// Reject `path` when it or any component between it and `owner.canonical_watched`
-/// is a symlink, walking from a `cap-std` capability opened at
-/// `canonical_watched` rather than canonicalizing the raw path.
-/// `canonicalize`/`canonicalize_or_passthrough` *follow* symlinks by design
-/// (that's how `WatchRoot` resolves a symlinked *ancestor* of the watched
-/// root at setup) — but a symlink placed *inside* the watched root by a
-/// corpus contributor (e.g. `corpus/leak.md -> /etc/outside-secret.md`) must
-/// never be followed for indexing: that would read and serve back content
-/// from outside the corpus root. Mirrors the no-follow `cap-std` component
-/// walk in `domain::corpus::sandbox` (`probe_leaf_exists`), applied to an
-/// absolute event path instead of a corpus-relative one.
-///
-/// Returns `true` (reject) in three cases: (1) the leaf or an ancestor
-/// component is a symlink, (2) `path` falls outside `owner.canonical_watched`
-/// (the `strip_prefix` failure below), or (3) a path component is not a
-/// plain (`Normal`) component. Returns `false` for a vanished component or
-/// any other IO failure — not a security decision this check needs to make;
-/// downstream IO (`index_single_file`) will fail on its own if the path is
-/// unusable.
-fn contains_symlink(owner: &WatchRoot, path: &Path) -> bool {
-    let Ok(relative) = path.strip_prefix(&owner.canonical_watched) else {
-        return true;
-    };
-    let Ok(mut dir) =
-        cap_std::fs::Dir::open_ambient_dir(&owner.canonical_watched, cap_std::ambient_authority())
-    else {
-        return false;
-    };
-    let components: Vec<_> = relative.components().collect();
-    for (idx, component) in components.iter().enumerate() {
-        let std::path::Component::Normal(name) = component else {
-            return true;
-        };
-        let Ok(meta) = dir.symlink_metadata(name) else {
-            return false;
-        };
-        if meta.file_type().is_symlink() {
-            return true;
-        }
-        let is_leaf = idx + 1 == components.len();
-        if !is_leaf {
-            let Ok(next) = dir.open_dir(name) else {
-                return false;
-            };
-            dir = next;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -768,47 +742,104 @@ mod tests {
         );
     }
 
-    /// A symlink leaf inside the watched root must be rejected, not followed:
-    /// this is the exact shape of the reported leak (`corpus/leak.md ->
-    /// outside-secret.md`), which previously reindexed (and later served
-    /// back through Ground) content living outside the corpus root.
-    #[test]
-    fn contains_symlink_rejects_symlinked_leaf() {
+    /// Security regression: the watcher must read a changed file's content
+    /// through a **no-follow** filesystem resolution, so a corpus contributor
+    /// cannot make the daemon index — and later serve back through Ground —
+    /// content from **outside** the corpus root by pointing an in-corpus path
+    /// at an external file via a symlink.
+    ///
+    /// The fix collapses validation and content-read into one atomic no-follow
+    /// read (`sandbox::read_no_follow_with_mtime`) instead of a symlink *check*
+    /// followed by a separate ambient re-read of the same path — the gap a
+    /// symlink swapped in between the two could race (TOCTOU). This test guards
+    /// the resulting property: a symlinked leaf whose target lives outside the
+    /// watched root is rejected, and the outside content never reaches the
+    /// store. A regression to an ambient read (which follows symlinks) would
+    /// index the secret and fail the final assertion.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_never_indexes_content_through_a_symlink_out_of_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize root");
-        let outside = tempfile::tempdir().expect("outside tempdir");
-        let outside_secret = outside.path().join("outside-secret.md");
-        std::fs::write(&outside_secret, "# secret\n").expect("write outside file");
-        let leak = root.join("leak.md");
-        std::os::unix::fs::symlink(&outside_secret, &leak).expect("symlink leak");
+        let mut cfg = crate::app::config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
 
-        let owner = watch_root(
-            root.to_str().unwrap(),
-            corpus("wiki", root.to_str().unwrap(), &["**/*.md"]),
+        // A real in-root corpus with one genuine markdown file. Canonicalize
+        // the root so the event path matches `canonical_watched` (tempdirs can
+        // symlink an ancestor, e.g. macOS /var → /private/var).
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let note = corpus_dir.join("note.md");
+        std::fs::write(&note, "# In-corpus\n\nbenign in-corpus content\n").expect("write note");
+
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
             None,
-        );
-        assert!(
-            contains_symlink(&owner, &leak),
-            "a symlinked leaf inside the watched root must be rejected"
-        );
-    }
+        )];
+        let file_ref = canonicalize_or_passthrough(&note)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
 
-    /// A plain, non-symlinked file under the watched root is never rejected.
-    #[test]
-    fn contains_symlink_accepts_plain_file() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canonicalize root");
-        let real = root.join("real.md");
-        std::fs::write(&real, "# real\n").expect("write real file");
+        // Baseline: the real file indexes and lands a snapshot row.
+        handle_changed_path(&state, &roots, &note).await;
+        let good = state
+            .store()
+            .get_file_snapshot("wiki", &file_ref)
+            .await
+            .expect("snapshot query")
+            .expect("a real in-root file must be indexed");
 
-        let owner = watch_root(
-            root.to_str().unwrap(),
-            corpus("wiki", root.to_str().unwrap(), &["**/*.md"]),
-            None,
-        );
+        // Attack: replace the leaf with a symlink to a secret file OUTSIDE the
+        // watched root, then trigger a reindex of the same in-corpus path.
+        let secret_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&secret_dir).expect("mkdir outside");
+        let secret = secret_dir.join("secret.md");
+        std::fs::write(&secret, "# Secret\n\nSECRET_OUTSIDE_CONTENT\n").expect("write secret");
+        std::fs::remove_file(&note).expect("rm note");
+        std::os::unix::fs::symlink(&secret, &note).expect("symlink note -> secret");
+
+        handle_changed_path(&state, &roots, &note).await;
+
+        // The reindex through the symlink must have been rejected. Vulnerable
+        // code would `canonicalize` the in-corpus path (following the symlink)
+        // and index the outside content under the *resolved* key — so assert
+        // the secret's own canonical path has no snapshot row anywhere in the
+        // corpus. (Checking only the note's key would miss this: the follow
+        // indexes under the target's key, not the link's.)
+        let secret_ref = canonicalize_or_passthrough(&secret)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
         assert!(
-            !contains_symlink(&owner, &real),
-            "a plain file under the watched root must not be rejected"
+            state
+                .store()
+                .get_file_snapshot("wiki", &secret_ref)
+                .await
+                .expect("snapshot query")
+                .is_none(),
+            "the outside secret file's content must never be indexed — the \
+             watcher must not follow an in-corpus symlink to a target outside \
+             the watched root",
+        );
+
+        // And the in-corpus key must still hold the real file's content,
+        // untouched by the rejected reindex.
+        let after = state
+            .store()
+            .get_file_snapshot("wiki", &file_ref)
+            .await
+            .expect("snapshot query")
+            .expect("the snapshot must survive a rejected symlink reindex");
+        assert_eq!(
+            after.content_hash, good.content_hash,
+            "the store must still hold the real in-corpus file's content, never \
+             the outside secret's",
         );
     }
 
