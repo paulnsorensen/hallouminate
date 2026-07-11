@@ -20,6 +20,7 @@
 //! one. Tokenizers are cheap to clone (`Arc` internally) and need no lock.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -77,22 +78,33 @@ fn is_idle(last_use_secs: u64, now_secs: u64, idle_secs: u64) -> bool {
     now_secs.saturating_sub(last_use_secs) >= idle_secs
 }
 
-/// Map of corpus name → per-corpus async mutex. Each corpus gets its own
-/// `Mutex<()>` so unrelated corpora never collide *at the per-corpus lock
-/// layer* — but every mutating handler also takes the single-permit global
-/// `write_lane` (see `DaemonStateInner.write_lane`), so cross-corpus writes
-/// still serialize at the lane while reads through different corpora run
-/// freely.
-#[derive(Default)]
-struct CorpusLockMap {
-    inner: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+/// Map of key → per-key async mutex, created on first use. Two callers
+/// holding the same key serialize on its mutex; distinct keys never collide.
+/// Backs both the per-corpus write lock (keyed by corpus name) and the
+/// per-`ResourceKey` build lock in `resources_for`. For corpus writes, every
+/// mutating handler also takes the single-permit global `write_lane` (see
+/// `DaemonStateInner.write_lane`), so cross-corpus writes still serialize at
+/// the lane while reads through different corpora run freely.
+struct KeyedLockMap<K> {
+    inner: Mutex<HashMap<K, Arc<Mutex<()>>>>,
 }
 
-impl CorpusLockMap {
-    async fn lock(&self, corpus: &str) -> OwnedMutexGuard<()> {
+impl<K> Default for KeyedLockMap<K> {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<K: Eq + Hash> KeyedLockMap<K> {
+    async fn lock<Q>(&self, key: &Q) -> OwnedMutexGuard<()>
+    where
+        Q: ToOwned<Owned = K> + ?Sized,
+    {
         let mutex = {
             let mut map = self.inner.lock().await;
-            map.entry(corpus.to_string())
+            map.entry(key.to_owned())
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
@@ -196,7 +208,12 @@ struct DaemonStateInner {
     /// embedder/tokenizer set, never opening two store handles on the same
     /// directory.
     resources: Mutex<HashMap<ResourceKey, Arc<RequestResources>>>,
-    corpus_locks: CorpusLockMap,
+    /// Per-`ResourceKey` build lock. `resources_for` holds the matching key
+    /// lock while opening a store so two requests never open the same ground
+    /// dir concurrently (the single-open-per-ground-dir invariant), without
+    /// holding the `resources` map lock across that async open.
+    resource_build_locks: KeyedLockMap<ResourceKey>,
+    corpus_locks: KeyedLockMap<String>,
     write_lane: Arc<Semaphore>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
     /// A per-model cache (rather than a single slot) so that repos
@@ -469,7 +486,8 @@ impl DaemonState {
                 baseline_xdg_path: xdg_path,
                 baseline_resources,
                 resources: Mutex::new(resources_map),
-                corpus_locks: CorpusLockMap::default(),
+                resource_build_locks: KeyedLockMap::default(),
+                corpus_locks: KeyedLockMap::default(),
                 write_lane,
                 crossencoders: crossencoders_arc,
                 last_activity_secs: last_activity,
@@ -622,8 +640,22 @@ impl DaemonState {
     /// different ground_dir at all".
     pub async fn resources_for(&self, cfg: &Config) -> anyhow::Result<Arc<RequestResources>> {
         let key = ResourceKey::from_config(cfg);
-        let mut map = self.inner.resources.lock().await;
-        if let Some(existing) = map.get(&key) {
+        // Fast path: a cache hit takes the `resources` map lock only long
+        // enough to clone the entry — never across the async build below.
+        if let Some(existing) = self.inner.resources.lock().await.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        // Cache miss: serialize the build on the per-key lock so two requests
+        // sharing a key never open the same ground dir concurrently (the
+        // single-open-per-ground-dir invariant), while distinct keys build in
+        // parallel. The `resources` map lock is deliberately NOT held across
+        // the `create_dir_all` / `open_or_create` awaits — holding it there
+        // would stall unrelated requests (including cache hits on other keys)
+        // behind slow filesystem/LanceDB work.
+        let _build = self.inner.resource_build_locks.lock(&key).await;
+        // Re-check under the map lock: another task may have built this key
+        // while we waited on the build lock.
+        if let Some(existing) = self.inner.resources.lock().await.get(&key) {
             return Ok(Arc::clone(existing));
         }
         let ground_dir = key.ground_dir.clone();
@@ -635,14 +667,10 @@ impl DaemonState {
                 .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
         }
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        // Embedder construction is a cold ONNX model load (seconds). Do NOT
-        // eager-build it here: this whole function runs under the shared
-        // `resources` map mutex, and every request handler takes this same
-        // lock via `resources_for`. Building the embedder here would stall
-        // every other request — including cache hits on other keys — behind
-        // one first-touch model load. Leave it `None`; the lazy per-entry
-        // `RequestResources::embedder()` loads it on first use under its OWN
-        // lock, outside the map mutex.
+        // Embedder construction is a cold ONNX model load (seconds). Leave it
+        // `None` here; the lazy per-entry `RequestResources::embedder()` loads
+        // it on first use under its OWN lock, so a first-touch model load
+        // never blocks the build lock held for this key.
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
         let store = LanceStore::open_or_create(
@@ -664,7 +692,11 @@ impl DaemonState {
             cache_dir,
             last_activity_secs: Arc::clone(&self.inner.last_activity_secs),
         });
-        map.insert(key, Arc::clone(&resources));
+        self.inner
+            .resources
+            .lock()
+            .await
+            .insert(key, Arc::clone(&resources));
         Ok(resources)
     }
 
@@ -1461,5 +1493,51 @@ mod tests {
             "resources_for must open (and initialize) a store at the new \
              ground_dir on first use",
         );
+    }
+
+    /// C0 regression: concurrent `resources_for` calls sharing one key must
+    /// build the entry exactly once. The per-key build lock serializes the
+    /// racing tasks so only the first opens the store; the rest re-check the
+    /// cache and reuse it. A naive "drop the map lock, then insert" fix would
+    /// let two tasks open a second `LanceStore` on the same ground dir,
+    /// breaking the single-open-per-ground-dir invariant — this asserts every
+    /// racer resolves to the identical `Arc`.
+    #[tokio::test]
+    async fn resources_for_builds_once_under_concurrent_same_key_calls() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+
+        let state = DaemonState::open(cfg.clone(), None)
+            .await
+            .expect("open daemon state");
+
+        // Evict the boot-built baseline entry so the racing calls actually
+        // contend on the build path rather than all hitting the warm cache.
+        state.inner.resources.lock().await.clear();
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let state = state.clone();
+            let cfg = cfg.clone();
+            handles.push(tokio::spawn(async move {
+                state.resources_for(&cfg).await.expect("resources_for")
+            }));
+        }
+
+        let mut resolved = Vec::new();
+        for h in handles {
+            resolved.push(h.await.expect("join resources_for task"));
+        }
+
+        let first = &resolved[0];
+        for (i, res) in resolved.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(first, res),
+                "racer {i} resolved a different RequestResources Arc — the \
+                 store was opened more than once for one ground dir",
+            );
+        }
     }
 }
