@@ -1591,8 +1591,8 @@ async fn rebuild_wiki_indexes(
         // are opt-in: when enabled, the embedder must load (a cold-cache or
         // network failure fails the mutation, same shape as the primary
         // add_markdown path); when disabled, reindex lexical-only.
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
+        let mut embedder = if res.embeddings_enabled {
+            match res.embedder().await {
                 Ok(g) => Some(g),
                 Err(e) => return Err(format!("embedder: {e}")),
             }

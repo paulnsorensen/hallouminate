@@ -3892,3 +3892,94 @@ async fn resources_for_observes_repo_layer_embeddings_model_override_without_res
         ),
     }
 }
+
+// ─── rebuild_wiki_indexes must resolve its embedder from the per-request
+// `RequestResources`, not the boot-frozen baseline (age High finding). ───
+//
+// Combines a repo-layer override of `[storage].ground_dir` with a distinct
+// `[embeddings].model` so the two resource keys (baseline vs override) get
+// genuinely different embedder instances. Against the pre-fix code — which
+// read `state.embeddings_enabled()` / `state.embedder()` (the baseline's)
+// inside `rebuild_wiki_indexes` instead of `res.*` — the ancestor index.md
+// gets embedded with the baseline's model into the override's store,
+// producing a dimension mismatch that `index_single_file` reports as an
+// `Err`. That `Err` is folded into a response `warning` rather than a hard
+// failure (see `handle_add_markdown`), so the regression is silent: the
+// request still returns Ok while the ancestor index drifts out of sync.
+//
+// This requires embeddings genuinely ENABLED end-to-end (two distinct real
+// models must load), so it stays `#[ignore]`-gated like the other
+// model-download tests in this suite — no hermetic assertion can catch this
+// specific bug because the store selection was already correct pre-fix
+// (only the embedder accessor was wrong); the divergence is only observable
+// once an embedder actually runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "downloads two distinct embedding models on first run; opt-in via --ignored"]
+async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("my-repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    let ground_baseline = tmp.path().join("ground-baseline");
+    let cfg = cfg_with_repository(&ground_baseline, "myrepo", &repo);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Baseline request establishes the wiki root index.md, embedded with the
+    // baseline's default model (snowflake-arctic-embed-s) into ground_baseline.
+    let body = "# Cheese\n\nHalloumi grills better than most.\n";
+    let _: serde_json::Value = timeout(
+        Duration::from_secs(120),
+        client.call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                path: "cheese.md".into(),
+                content: body.into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect("timeout")
+    .expect("baseline add_markdown ok");
+
+    // Repo-layer override: distinct ground_dir + distinct embeddings model —
+    // the exact trigger combination named in the bug report.
+    let ground_override = tmp.path().join("ground-override");
+    let override_cwd = repo_override_cwd(
+        &tmp.path().join("override"),
+        &format!(
+            "[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+            g = ground_override.display(),
+        ),
+    );
+
+    let value: serde_json::Value = timeout(
+        Duration::from_secs(120),
+        client.call(DaemonRequest {
+            cwd: override_cwd,
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                path: "brie.md".into(),
+                content: "# Brie\n\nSofter, but still cheese.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect("timeout")
+    .expect("override add_markdown ok");
+
+    let warnings = value["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings
+            .iter()
+            .all(|w| !w.as_str().unwrap_or("").contains("ancestor index refresh failed")),
+        "rebuild_wiki_indexes must embed the ancestor index.md with the \
+         per-request (bge-small) embedder, not the baseline (snowflake) one; \
+         a dimension-mismatch warning here means the bug (state.embedder() \
+         instead of res.embedder()) regressed: {warnings:?}"
+    );
+}
