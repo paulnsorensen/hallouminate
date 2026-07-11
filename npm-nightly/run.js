@@ -41,6 +41,7 @@ for (const sig of SIGNALS) {
 child.on("exit", (code, signal) => {
   if (signal) {
     // Re-raise so our parent observes signal-death, not a synthetic exit code.
+    process.removeAllListeners(signal);
     process.kill(process.pid, signal);
   } else {
     process.exit(code === null ? 1 : code);
