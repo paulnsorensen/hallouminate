@@ -50,7 +50,9 @@ const REQUEST_TIMEOUT_MS = 30_000;
 
 function follow(url, redirectsLeft, cb) {
   // postinstall download: refuse anything but HTTPS, including redirect
-  // targets, so a hijacked Location header can't downgrade or jump host.
+  // targets, so a hijacked Location header can't downgrade the transport to
+  // plaintext. Cross-host HTTPS redirects are allowed and expected — GitHub
+  // release downloads redirect to objects.githubusercontent.com.
   if (!url.startsWith("https:")) {
     console.error(`hallouminate-nightly: refusing non-HTTPS download URL: ${url}`);
     console.error("Install manually: cargo install hallouminate");
