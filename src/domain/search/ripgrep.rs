@@ -71,10 +71,6 @@ pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<Ripg
     let mut hits: Vec<RipgrepHit> = Vec::new();
     let mut limit_reached = false;
     while let Some(line) = reader.next_line().await.map_err(HallouminateError::Io)? {
-        if hits.len() >= limit {
-            limit_reached = true;
-            break;
-        }
         if let Some(mut hit) = parse_match_line(&line) {
             // Indexer stores file_ref as `canonicalize_or_passthrough`'d
             // path; mirror that here so the fusion key (file_ref string
@@ -82,6 +78,14 @@ pub async fn run(paths: &[String], query: &str, limit: usize) -> Result<Vec<Ripg
             let canon = canonicalize_or_passthrough(Path::new(&hit.file_ref));
             hit.file_ref = canon.as_path().to_string_lossy().into_owned();
             hits.push(hit);
+        }
+        // Break the instant the cap is satisfied — checking after the push
+        // (rather than at the top of the next iteration) means we don't
+        // await one more `next_line()`, which could block until rg emits a
+        // later match. `limit >= 1` here (limit == 0 short-circuits above).
+        if hits.len() >= limit {
+            limit_reached = true;
+            break;
         }
     }
 
