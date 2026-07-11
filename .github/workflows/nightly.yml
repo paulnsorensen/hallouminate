@@ -1,0 +1,198 @@
+name: Nightly (main)
+
+# Rolling experimental channel: every push to main native-builds the three
+# supported targets, refreshes the `nightly` GitHub prerelease, and publishes
+# the npm wrapper `@paulnsorensen/hallouminate-nightly` so
+# `npx @paulnsorensen/hallouminate-nightly` runs the latest main. The
+# tag-triggered official release (release.yml + publish-npm.yml) is untouched.
+#
+# npm auth is trusted publishing (OIDC) — no NPM_TOKEN. Configure once at
+# npmjs.com -> @paulnsorensen/hallouminate-nightly -> Settings ->
+# Trusted Publisher: GitHub Actions, repo paulnsorensen/hallouminate,
+# workflow nightly.yml.
+#
+# Builds are NATIVE on pinned runners (never cross-compiled) to satisfy the
+# ort/onnxruntime prebuilt link constraints — identical to dist-workspace.toml:
+#   x86_64 linux  -> ubuntu-24.04      (glibc 2.39 resolves the prebuilt's C23 symbols)
+#   aarch64 linux -> ubuntu-24.04-arm  (native; cross-linking onnxruntime's C++ rt fails)
+#   aarch64 macos -> macos-latest
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One nightly run at a time; a newer push cancels an in-flight build.
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NIGHTLY_TAG: nightly
+
+jobs:
+  # Recreate the rolling prerelease first so the matrix jobs only upload assets
+  # (race-free: the release exists before any build finishes).
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Refresh nightly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release delete "$NIGHTLY_TAG" --yes --cleanup-tag || true
+          gh release create "$NIGHTLY_TAG" \
+            --target "$GITHUB_SHA" \
+            --title "nightly (main)" \
+            --notes "Rolling build of main @ ${GITHUB_SHA}. Prerelease — not a stable version." \
+            --prerelease
+
+  build:
+    needs: prepare-release
+    permissions:
+      contents: write # gh release upload
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        # The dependency graph (lancedb/arrow/ort) plus the target cache
+        # overflow the hosted image's ~14 GB free space. Drop unused toolchains.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install protoc
+        # cross-platform protoc; lance-encoding (via lancedb) needs it at build.
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        # Installs the channel pinned in rust-toolchain.toml (the crate's MSRV).
+        run: rustup show
+
+      - name: Expose Xcode compiler runtime
+        if: runner.os == 'macOS'
+        # ort/onnxruntime links the Xcode clang runtime; add it to LIBRARY_PATH.
+        run: |
+          set -euo pipefail
+          clang_bin="$(xcrun --toolchain XcodeDefault --find clang)"
+          clang_usr="$(dirname "$(dirname "$clang_bin")")"
+          runtime_dir="$(find "$clang_usr/lib/clang" -type d -path '*/lib/darwin' | sort | tail -n 1)"
+          if [ -z "$runtime_dir" ]; then
+            echo "::error::could not find Xcode compiler runtime under $clang_usr/lib/clang"
+            exit 1
+          fi
+          echo "LIBRARY_PATH=$runtime_dir${LIBRARY_PATH:+:$LIBRARY_PATH}" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: nightly-${{ matrix.target }}
+
+      - name: Build
+        # Native build (host target == matrix.target on each pinned runner).
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: bash
+        # Match the cargo-dist artifact shape the install shim expects:
+        # hallouminate-<target>.tar.xz with a top-level hallouminate-<target>/
+        # wrapper dir (install.js extracts with --strip-components=1).
+        run: |
+          set -euo pipefail
+          stage="hallouminate-${{ matrix.target }}"
+          mkdir "$stage"
+          cp "target/release/hallouminate" "$stage/"
+          tar -cJf "${stage}.tar.xz" "$stage"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${stage}.tar.xz" > "${stage}.tar.xz.sha256"
+          else
+            shasum -a 256 "${stage}.tar.xz" > "${stage}.tar.xz.sha256"
+          fi
+
+      - name: Upload asset to nightly release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stage="hallouminate-${{ matrix.target }}"
+          gh release upload "$NIGHTLY_TAG" \
+            "${stage}.tar.xz" "${stage}.tar.xz.sha256" --clobber
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing — no NPM_TOKEN secret needed
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24 # bundled npm (>= 11.5.1) satisfies OIDC trusted publishing
+      # Stamp a unique experimental prerelease version per run (run_number is
+      # monotonic). Decoupled from Cargo.toml. OIDC injects auth automatically;
+      # provenance is attached on publish. This package IS the nightly channel,
+      # so its newest build is `latest`.
+      - name: Stamp version and publish
+        working-directory: ./npm-nightly
+        run: |
+          npm pkg set version="0.0.0-experimental.${{ github.run_number }}.${{ github.run_attempt }}"
+          npm publish --tag latest --access public
+
+  smoke-test:
+    needs: publish-npm
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+      - name: Smoke test nightly npx package
+        shell: bash
+        # Stream postinstall output to the foreground so an install failure is
+        # visible in the log instead of npm's hidden debug file.
+        env:
+          npm_config_foreground_scripts: "true"
+        run: |
+          set +e
+          output=$(npx --yes @paulnsorensen/hallouminate-nightly@latest --version 2>stderr.txt)
+          code=$?
+          set -e
+          echo "npx exit code: $code"
+          echo "--- stdout ---"; echo "$output"
+          echo "--- stderr ---"; cat stderr.txt || true
+          if [ "$code" -ne 0 ] || [ -z "$output" ]; then
+            echo "smoke test FAILED (exit=$code, stdout empty=$([ -z "$output" ] && echo yes || echo no))"
+            exit 1
+          fi
