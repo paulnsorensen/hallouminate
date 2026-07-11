@@ -17,10 +17,10 @@ use std::time::Duration;
 
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
-    AddMarkdownRequest, BacklinksRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse,
-    DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest,
-    LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest, connect_at, serve,
-    spawn_signal_handlers,
+    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest, DaemonRequestPayload,
+    DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult,
+    IndexRequest, LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest,
+    connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -837,6 +837,192 @@ enabled = false
         backlinks,
         vec!["full-path-linker.md"],
         "bare [[index]] must not be attributed to a/index.md when the stem is ambiguous: {backlinks:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_backlinks_reports_unreadable_file_as_warning() {
+    // A page that becomes unreadable mid-scan (permission change, transient
+    // I/O error) must not fail the whole request — handle_backlinks collects
+    // the (path, error) failure, warns via tracing, and surfaces it on
+    // BacklinksResult.warnings naming both the corpus and the path, so the
+    // caller knows the scan is a partial one instead of trusting an empty
+    // `backlinks` as "no backlinks".
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{c}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "locked.md".into(),
+                content: "# Locked\n\nSee [[other-page]] for details.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown locked ok");
+    client
+        .call::<serde_json::Value>(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "other-page.md".into(),
+                content: "# Other page\n\nNothing links here.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("add_markdown other-page ok");
+
+    let is_root = nix_getuid_is_zero();
+    let locked_path = corpus_root.join("locked.md");
+    std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod locked.md");
+
+    let result: Result<serde_json::Value, _> = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: Some("docs".into()),
+                path: "other-page.md".into(),
+            }),
+        })
+        .await;
+    // Restore perms before any potential assertion failure unwinds, so the
+    // tempdir can be cleaned up.
+    let _ = std::fs::set_permissions(&locked_path, std::fs::Permissions::from_mode(0o644));
+    if is_root {
+        return; // root reads through 0o000; the negative test is meaningless.
+    }
+    let value = result.expect("backlinks must still succeed despite one unreadable file");
+
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present when a file could not be read");
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    let warning = warnings[0].as_str().expect("warning is a string");
+    assert!(
+        warning.contains("docs"),
+        "warning must name the corpus: {warning}"
+    );
+    assert!(
+        warning.contains("locked.md"),
+        "warning must name the unreadable path: {warning}"
+    );
+}
+
+#[cfg(unix)]
+fn nix_getuid_is_zero() -> bool {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+        && let Some(line) = s.lines().find(|l| l.starts_with("Uid:"))
+    {
+        return line.split_whitespace().nth(1) == Some("0");
+    }
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_add_markdown_reports_ancestor_index_refresh_failure_as_warning() {
+    // The primary write can durably succeed while the auto-rebuild of an
+    // ancestor index.md fails (e.g. a permission change on an intermediate
+    // directory). handle_add_markdown must still report success with the
+    // file on disk, and surface the refresh failure as a warning naming the
+    // repair step — never swallow it, and never bounce an internal error
+    // that would make the caller believe the durable write itself was lost.
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo = tmp.path().join("my-repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    let mut cfg = cfg_with_repository(&ground, "myrepo", &repo);
+    cfg.embeddings.enabled = false;
+
+    let wiki_dir = wiki_directory(&cfg.repositories[0]);
+    let dir_a = wiki_dir.join("a");
+    let dir_b = dir_a.join("b");
+    std::fs::create_dir_all(&dir_b).expect("mkdir nested wiki dirs");
+
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    std::fs::set_permissions(&dir_a, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod a to read-only");
+
+    let is_root = nix_getuid_is_zero();
+    let result: Result<serde_json::Value, _> = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                path: "a/b/page.md".into(),
+                content: "# Page\n\nBody text.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        })
+        .await;
+    // Restore perms before any potential assertion failure unwinds, so the
+    // tempdir can be cleaned up.
+    let _ = std::fs::set_permissions(&dir_a, std::fs::Permissions::from_mode(0o755));
+    if is_root {
+        return; // root writes through 0o555; the negative test is meaningless.
+    }
+    let value = result.expect("add_markdown must still succeed despite index refresh failure");
+
+    let on_disk = std::fs::read_to_string(dir_b.join("page.md")).expect("page.md written to disk");
+    assert_eq!(
+        on_disk, "# Page\n\nBody text.\n",
+        "primary write content must land verbatim despite the downstream index failure"
+    );
+
+    let warnings = value["warnings"]
+        .as_array()
+        .expect("warnings array present when ancestor index refresh fails");
+    assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+    let warning = warnings[0].as_str().expect("warning is a string");
+    assert!(
+        warning.contains("ancestor index refresh failed"),
+        "warning must name the refresh failure: {warning}"
+    );
+    assert!(
+        warning.contains("run `index` to repair"),
+        "warning must point at the repair step: {warning}"
     );
 }
 
@@ -3373,5 +3559,438 @@ async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
     assert!(
         !ground.exists(),
         "partial fresh ground dir must be removed on rebuild failure"
+    );
+}
+
+// ─── Curd: bounded request-line cap + structured over-cap error (R1) ────
+
+#[tokio::test]
+async fn daemon_returns_structured_error_when_request_line_exceeds_cap() {
+    // MAX_REQUEST_LINE_BYTES (4 MiB) bounds the newline-delimited request
+    // line's allocation via a `.take()`-wrapped reader. A line that never
+    // hits its newline within the cap must yield a structured
+    // `DaemonResponse::Err { kind: InvalidParams }` naming the cap, not a
+    // bare transport EOF with no error payload (a legitimate oversized
+    // `add_markdown.content` write would otherwise look identical to a
+    // crashed connection).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::net::UnixStream;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let cfg = docs_cfg(&ground, &corpus_root);
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut stream = UnixStream::connect(harness.socket())
+        .await
+        .expect("connect");
+
+    // Write past the cap with no trailing newline; tolerate a broken pipe
+    // once the server's read side hits the cap.
+    let chunk = vec![b'a'; 64 * 1024];
+    let target = 4 * 1024 * 1024 + 64 * 1024;
+    let mut written = 0usize;
+    while written < target {
+        match stream.write_all(&chunk).await {
+            Ok(()) => written += chunk.len(),
+            Err(_) => break,
+        }
+    }
+
+    let mut reader = TokioBufReader::new(&mut stream);
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+    )
+    .await
+    .expect("server must respond promptly once the cap is exceeded, not hang")
+    .expect("read must not error");
+
+    let response: DaemonResponse =
+        serde_json::from_str(line.trim_end()).expect("over-cap response must be valid JSON");
+    match response {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(
+                message.contains("4194304") || message.contains("cap"),
+                "error message must name the byte cap: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => {
+            panic!("over-cap request must error, not succeed; got Ok({result:?})")
+        }
+    }
+
+    // Connection closes after the structured response. On Linux, the
+    // server closing the socket with unread client data (the request line
+    // is still streaming past the cap) can trigger an RST instead of an
+    // orderly FIN, so the client's read surfaces `ConnectionReset` rather
+    // than `Ok(0)`; macOS delivers a clean EOF for the same sequence.
+    // Both outcomes mean the server closed as required.
+    let mut buf = [0u8; 1];
+    match timeout(Duration::from_secs(5), reader.read(&mut buf))
+        .await
+        .expect("server must close after responding")
+    {
+        Ok(n) => assert_eq!(
+            n, 0,
+            "server must close the connection after the error response"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("expected graceful EOF or ConnectionReset, got: {e:?}"),
+    }
+}
+
+#[tokio::test]
+async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
+    // Quality gate: `drain_handlers` (SHUTDOWN_DRAIN_TIMEOUT) must let an
+    // in-flight connection handler finish before `serve_with_idle_timeout`
+    // releases the socket + single-instance flock. A connection that never
+    // sends its request line stays "in-flight" (blocked on `read_line`)
+    // until the per-connection idle timeout elapses, giving us a real
+    // in-flight handler without any test-only injection seam.
+    use hallouminate::app::daemon::serve_with_idle_timeout;
+    use tokio::net::UnixStream;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let cwd = seed_cwd(tmp.path());
+    let socket = tmp.path().join("daemon.sock");
+    let cfg = docs_cfg(&ground, &corpus_root);
+
+    let state = DaemonState::open(cfg, None).await.expect("open state");
+    let socket_clone = socket.clone();
+    let idle_timeout = Duration::from_millis(500);
+    let handle =
+        tokio::spawn(
+            async move { serve_with_idle_timeout(&state, &socket_clone, idle_timeout).await },
+        );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !socket.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Open a connection and never write to it: its handler stays alive,
+    // blocked on `read_line` under `idle_timeout`, until that timeout fires.
+    let _in_flight = UnixStream::connect(&socket)
+        .await
+        .expect("connect in-flight handler");
+
+    // Trigger shutdown from a second, independent connection.
+    let client = connect_at(&socket).await.expect("connect for shutdown");
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await
+        .expect("shutdown transport ok");
+    match resp {
+        DaemonResponse::Ok { result } => {
+            assert_eq!(result, serde_json::Value::String("stopping".to_string()));
+        }
+        other => panic!("shutdown must ack `stopping`, got {other:?}"),
+    }
+
+    // The accept loop breaks near-instantly on the Shutdown ack, but cleanup
+    // must not run until the in-flight handler above times out — proving
+    // drain runs before socket removal / flock release, not after.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        socket.exists(),
+        "socket must still exist while the in-flight handler is draining"
+    );
+
+    let served = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("serve must return once the in-flight handler finishes draining")
+        .expect("join ok");
+    served.expect("serve returns Ok after a graceful drain");
+    assert!(
+        !socket.exists(),
+        "socket must be removed once the drain completes"
+    );
+}
+
+// ─── C0: per-request resource seam (B2+B3) ──────────────────────────────
+//
+// `DaemonState::resources_for` resolves `[storage].ground_dir` /
+// `[embeddings].enabled` / `[embeddings].model` from the *effective*
+// (baseline + repo-layer) config on every request, instead of the
+// boot-frozen baseline the daemon opened with. Each test below sends a
+// baseline request first (no restart), then a second request whose `cwd`
+// carries a repo-layer override, and asserts the override is observed on
+// that very next request. Against the pre-seam code — which read
+// `state.store()` / `state.embeddings_enabled()` / `state.embedder()`
+// directly, ignoring the resolved per-request config — every override
+// below would be silently ignored and the assertions would fail.
+
+/// Seed `dir` with a `.hallouminate/config.toml` carrying `toml`, so a
+/// `DaemonRequest` using it as `cwd` resolves a repo layer with that content.
+fn repo_override_cwd(dir: &Path, toml: &str) -> PathBuf {
+    let hallou = dir.join(".hallouminate");
+    std::fs::create_dir_all(&hallou).expect("mkdir .hallouminate");
+    std::fs::write(hallou.join("config.toml"), toml).expect("write repo override config");
+    dir.to_path_buf()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resources_for_observes_repo_layer_embeddings_enabled_override_without_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let ground = tmp.path().join("ground");
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    // Baseline config leaves `[embeddings]` unset, so `enabled` defaults to
+    // `true` — `DaemonState::open` establishes the ground store's
+    // `meta.toml` with `embeddings_enabled = true`.
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let baseline_resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("baseline request transport ok");
+    match baseline_resp {
+        DaemonResponse::Ok { result } => {
+            let stats: CorpusStatsResult =
+                serde_json::from_value(result).expect("parse CorpusStatsResult");
+            assert_eq!(stats.corpus, "docs");
+        }
+        other => panic!("baseline corpus_stats must succeed, got {other:?}"),
+    }
+
+    // Second request, same `ground_dir` (inherited — the override cwd does
+    // not set `[storage]`), but a repo layer that flips embeddings off.
+    let override_cwd = repo_override_cwd(
+        &tmp.path().join("override-enabled"),
+        "[embeddings]\nenabled = false\n",
+    );
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: override_cwd,
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("override request transport ok");
+    match resp {
+        // The overridden request resolves a *different* resource key
+        // (`embeddings_enabled = false`) than the baseline's, so
+        // `resources_for` reopens the same `ground_dir` under the new
+        // value and the store's meta-mismatch guard refuses — proof the
+        // override was actually applied on this request, not silently
+        // reused from the baseline's `enabled = true` store.
+        DaemonResponse::Err { message, .. } => {
+            assert!(
+                message.contains("embedding store mismatch"),
+                "got: {message}"
+            );
+            assert!(
+                message.contains("embeddings_enabled true"),
+                "error must name the baseline's enabled=true store: {message}"
+            );
+            assert!(
+                message.contains("embeddings_enabled false"),
+                "error must name the overridden request's enabled=false: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => panic!(
+            "repo-layer `embeddings.enabled = false` must be observed on the next \
+             request without a daemon restart; boot-frozen resources would silently \
+             reuse the baseline (enabled=true) store instead of reopening under the \
+             override, got Ok: {result:?}"
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resources_for_observes_repo_layer_embeddings_model_override_without_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let ground = tmp.path().join("ground");
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    // Baseline leaves `embeddings.model` unset (default: snowflake-arctic-embed-s),
+    // with embeddings disabled so no embedder ever loads — this test is about
+    // the model *name* recorded in the store, not actual embedding compute.
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let baseline_resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("baseline request transport ok");
+    match baseline_resp {
+        DaemonResponse::Ok { result } => {
+            let stats: CorpusStatsResult =
+                serde_json::from_value(result).expect("parse CorpusStatsResult");
+            assert_eq!(stats.corpus, "docs");
+        }
+        other => panic!("baseline corpus_stats must succeed, got {other:?}"),
+    }
+
+    // Second request: repo layer overrides `embeddings.model`; `enabled`
+    // stays inherited (false) so no embedder load is attempted either way.
+    let override_cwd = repo_override_cwd(
+        &tmp.path().join("override-model"),
+        "[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+    );
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: override_cwd,
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("override request transport ok");
+    match resp {
+        // Different model in the resource key reopens the same `ground_dir`
+        // under the new model name; the meta-mismatch guard names both,
+        // proving the override reached the store rather than being ignored.
+        DaemonResponse::Err { message, .. } => {
+            assert!(
+                message.contains("embedding store mismatch"),
+                "got: {message}"
+            );
+            assert!(
+                message.contains("snowflake/snowflake-arctic-embed-s"),
+                "error must name the baseline's default model: {message}"
+            );
+            assert!(
+                message.contains("BAAI/bge-small-en-v1.5"),
+                "error must name the overridden request's model: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => panic!(
+            "repo-layer `embeddings.model` override must be observed on the next \
+             request without a daemon restart; boot-frozen resources would silently \
+             reuse the baseline model's store instead of reopening under the \
+             override, got Ok: {result:?}"
+        ),
+    }
+}
+
+// ─── rebuild_wiki_indexes must resolve its embedder from the per-request
+// `RequestResources`, not the boot-frozen baseline (age High finding). ───
+//
+// Combines a repo-layer override of `[storage].ground_dir` with a distinct
+// `[embeddings].model` so the two resource keys (baseline vs override) get
+// genuinely different embedder instances. Against the pre-fix code — which
+// read `state.embeddings_enabled()` / `state.embedder()` (the baseline's)
+// inside `rebuild_wiki_indexes` instead of `res.*` — the ancestor index.md
+// gets embedded with the baseline's model into the override's store,
+// producing a dimension mismatch that `index_single_file` reports as an
+// `Err`. That `Err` is folded into a response `warning` rather than a hard
+// failure (see `handle_add_markdown`), so the regression is silent: the
+// request still returns Ok while the ancestor index drifts out of sync.
+//
+// This requires embeddings genuinely ENABLED end-to-end (two distinct real
+// models must load), so it stays `#[ignore]`-gated like the other
+// model-download tests in this suite — no hermetic assertion can catch this
+// specific bug because the store selection was already correct pre-fix
+// (only the embedder accessor was wrong); the divergence is only observable
+// once an embedder actually runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "downloads two distinct embedding models on first run; opt-in via --ignored"]
+async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo = tmp.path().join("my-repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    let ground_baseline = tmp.path().join("ground-baseline");
+    let cfg = cfg_with_repository(&ground_baseline, "myrepo", &repo);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    // Baseline request establishes the wiki root index.md, embedded with the
+    // baseline's default model (snowflake-arctic-embed-s) into ground_baseline.
+    let body = "# Cheese\n\nHalloumi grills better than most.\n";
+    let _: serde_json::Value = timeout(
+        Duration::from_secs(120),
+        client.call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                path: "cheese.md".into(),
+                content: body.into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect("timeout")
+    .expect("baseline add_markdown ok");
+
+    // Repo-layer override: distinct ground_dir + distinct embeddings model —
+    // the exact trigger combination named in the bug report.
+    let ground_override = tmp.path().join("ground-override");
+    let override_cwd = repo_override_cwd(
+        &tmp.path().join("override"),
+        &format!(
+            "[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+            g = ground_override.display(),
+        ),
+    );
+
+    let value: serde_json::Value = timeout(
+        Duration::from_secs(120),
+        client.call(DaemonRequest {
+            cwd: override_cwd,
+            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
+                path: "brie.md".into(),
+                content: "# Brie\n\nSofter, but still cheese.\n".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .expect("timeout")
+    .expect("override add_markdown ok");
+
+    let warnings = value["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().all(|w| !w
+            .as_str()
+            .unwrap_or("")
+            .contains("ancestor index refresh failed")),
+        "rebuild_wiki_indexes must embed the ancestor index.md with the \
+         per-request (bge-small) embedder, not the baseline (snowflake) one; \
+         a dimension-mismatch warning here means the bug (state.embedder() \
+         instead of res.embedder()) regressed: {warnings:?}"
     );
 }

@@ -29,6 +29,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// elapsed probe is treated as unverifiable (→ restart), the same fate as a
 /// transport error or a legacy bare-`"pong"` reply.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Size cap for `daemon-bootstrap.log`. The file is append-only across every
+/// auto-spawn and failed start, so with no cap repeated restarts (or a daemon
+/// that fails to come up in a crash loop) grow it forever. It is a startup
+/// diagnostic, not an audit trail, so a simple truncate-at-startup is enough.
+const MAX_BOOTSTRAP_LOG_BYTES: u64 = 1024 * 1024;
 
 /// Ensure a daemon is reachable, spawning a detached one if not.
 ///
@@ -74,6 +79,7 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    truncate_log_if_oversized(&log_path, MAX_BOOTSTRAP_LOG_BYTES)?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -107,6 +113,20 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
 /// mutating process env (unsafe on edition 2024).
 fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
     env_value.is_some_and(|v| !v.is_empty())
+}
+
+/// Caps `daemon-bootstrap.log` at `max_bytes` before the next append. Called
+/// once per `ensure_daemon_running` invocation, right before the log is
+/// (re)opened in append mode, so a log that grew past the cap on a prior
+/// spawn (or crash loop) is reset to empty instead of appended to forever.
+/// A missing file (first run) is not an error.
+fn truncate_log_if_oversized(path: &Path, max_bytes: u64) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > max_bytes => std::fs::File::create(path).map(|_| ()),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Probe the already-running daemon's version via `Ping`. Returns `true` only
@@ -241,5 +261,36 @@ mod tests {
             !pong_reports_our_version(&resp),
             "an error response is unverifiable → mismatch"
         );
+    }
+
+    // ── bootstrap log size cap ──
+
+    #[test]
+    fn undersized_log_is_left_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon-bootstrap.log");
+        std::fs::write(&path, b"small").expect("write");
+        truncate_log_if_oversized(&path, 1024).expect("truncate check");
+        assert_eq!(std::fs::read(&path).expect("read"), b"small");
+    }
+
+    #[test]
+    fn oversized_log_is_truncated_to_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon-bootstrap.log");
+        std::fs::write(&path, vec![b'x'; 2048]).expect("write");
+        truncate_log_if_oversized(&path, 1024).expect("truncate");
+        assert_eq!(
+            std::fs::read(&path).expect("read").len(),
+            0,
+            "log past the cap must be reset to empty, not left to grow further"
+        );
+    }
+
+    #[test]
+    fn missing_log_file_is_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.log");
+        assert!(truncate_log_if_oversized(&path, 1024).is_ok());
     }
 }

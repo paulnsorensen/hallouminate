@@ -11,7 +11,7 @@
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, ErrorData, ServerCapabilities, ServerInfo};
+use rmcp::model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
 use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -192,7 +192,7 @@ citation without pulling the whole document.
 /// `#[non_exhaustive]` in `rmcp`, so we must construct via the provided
 /// `success(...)` constructor then mutate public fields.
 fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.structured_content = Some(structured);
     result
 }
@@ -298,11 +298,14 @@ const ROOTS_LIST_TIMEOUT: Duration = Duration::from_secs(2);
 /// the first root's path as cwd. Falls back to the process-startup cwd when the
 /// client has no roots capability, the request times out, or the first root has
 /// no usable path.
+// MCP roots is deprecated upstream by SEP-2577, but it remains how clients like
+// Claude Code advertise the workspace directory today; keep using it until a
+// replacement lands (https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577).
+#[allow(deprecated)]
 async fn cwd_from_peer(peer: &Peer<RoleServer>, fallback: &Path) -> PathBuf {
     let has_roots = peer
         .peer_info()
-        .and_then(|info| info.capabilities.roots.as_ref())
-        .is_some();
+        .is_some_and(|info| info.capabilities.roots.is_some());
 
     if !has_roots {
         return fallback.to_path_buf();
