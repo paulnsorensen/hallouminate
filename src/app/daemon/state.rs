@@ -26,7 +26,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::lance::{LanceStore, SearchHit};
@@ -100,6 +100,66 @@ impl CorpusLockMap {
     }
 }
 
+/// Key identifying one distinct resource set: a `[storage].ground_dir` +
+/// `[embeddings]` combination. Repo-layer config resolved per request
+/// selects (or lazily builds) the `RequestResources` entry for its key, so
+/// overriding any of these fields takes effect on the very next request
+/// with no daemon restart.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ResourceKey {
+    ground_dir: PathBuf,
+    model: String,
+    quantized: bool,
+    enabled: bool,
+}
+
+impl ResourceKey {
+    fn from_config(cfg: &Config) -> Self {
+        Self {
+            ground_dir: expand_tilde(&cfg.storage.ground_dir),
+            model: cfg.embeddings.model.clone(),
+            quantized: cfg.embeddings.quantized,
+            enabled: cfg.embeddings.enabled,
+        }
+    }
+}
+
+/// Resources effective for one repo-layer config. Keyed cache entry —
+/// mirrors the `crossencoders: Arc<Mutex<HashMap<..>>>` cache precedent.
+pub struct RequestResources {
+    pub store: Arc<LanceStore>,
+    pub tokenizer: tokenizers::Tokenizer,
+    pub embeddings_enabled: bool,
+    pub ground_dir: PathBuf,
+    embedder: Arc<Mutex<Option<Embedder>>>,
+    model: String,
+    quantized: bool,
+    cache_dir: PathBuf,
+    last_activity_secs: Arc<AtomicU64>,
+}
+
+impl RequestResources {
+    /// Lazy-load mirror of the old `DaemonState::embedder()`, scoped to this
+    /// resource set's model instead of the daemon-wide one.
+    pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard> {
+        let mut guard = Arc::clone(&self.embedder).lock_owned().await;
+        if guard.is_none() {
+            let (model, quantized, cache_dir) =
+                (self.model.clone(), self.quantized, self.cache_dir.clone());
+            let embedder =
+                tokio::task::block_in_place(|| Embedder::try_new(&model, quantized, &cache_dir))
+                    .map_err(|e| anyhow::anyhow!("init embedder ({model}): {e}"))?;
+            *guard = Some(embedder);
+        }
+        self.last_activity_secs
+            .store(monotonic_secs(), Ordering::Relaxed);
+        Ok(EmbedderGuard {
+            guard,
+            last_use_secs: Arc::clone(&self.last_activity_secs),
+        })
+    }
+}
+
 /// Owned daemon state. Cheap to clone (`Arc` inside); one instance lives for
 /// the lifetime of the daemon process.
 #[derive(Clone)]
@@ -123,15 +183,21 @@ struct DaemonStateInner {
     /// daemon was booted without a known source (e.g. tests that construct
     /// a `Config` programmatically).
     baseline_xdg_path: Option<PathBuf>,
-    store: Arc<LanceStore>,
-    ground_dir: PathBuf,
-    /// Whether dense embeddings are enabled for this daemon (mirrors
-    /// `baseline.embeddings.enabled`). When false, the embedder is `None`
-    /// permanently and every retrieval/index path runs lexical-only.
-    embeddings_enabled: bool,
+    /// Resources (store/tokenizer/embedder) for the boot baseline's
+    /// `ResourceKey`. `watch.rs` and boot-time sweeps key off this instead
+    /// of the per-request map since they have no per-request effective
+    /// config to resolve.
+    baseline_resources: Arc<RequestResources>,
+    /// Per-request resource cache, keyed by `(ground_dir, model, quantized,
+    /// enabled)`. A repo-layer config that overrides any of these fields
+    /// gets its own entry lazily built by `resources_for` on first use, so
+    /// the override takes effect on the very next request with no daemon
+    /// restart — while requests sharing a key share one `LanceStore`/
+    /// embedder/tokenizer set, never opening two store handles on the same
+    /// directory.
+    resources: Mutex<HashMap<ResourceKey, Arc<RequestResources>>>,
     corpus_locks: CorpusLockMap,
     write_lane: Arc<Semaphore>,
-    embedder: Arc<Mutex<Option<Embedder>>>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
     /// A per-model cache (rather than a single slot) so that repos
     /// selecting different `[search].crossencoder` models via repo-layer
@@ -147,7 +213,6 @@ struct DaemonStateInner {
     /// Count of connection handlers in flight. Idle-exit defers while non-zero
     /// so the daemon never exits mid-request (ADR-003).
     active_connections: Arc<AtomicUsize>,
-    tokenizer: tokenizers::Tokenizer,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
@@ -378,20 +443,37 @@ impl DaemonState {
             );
         }
 
+        let baseline_key = ResourceKey {
+            ground_dir: ground_dir.clone(),
+            model: cfg.embeddings.model.clone(),
+            quantized: cfg.embeddings.quantized,
+            enabled: cfg.embeddings.enabled,
+        };
+        let baseline_resources = Arc::new(RequestResources {
+            store,
+            tokenizer,
+            embeddings_enabled: cfg.embeddings.enabled,
+            ground_dir,
+            embedder: embedder_arc,
+            model: cfg.embeddings.model.clone(),
+            quantized: cfg.embeddings.quantized,
+            cache_dir,
+            last_activity_secs: Arc::clone(&last_activity),
+        });
+        let mut resources_map = HashMap::new();
+        resources_map.insert(baseline_key, Arc::clone(&baseline_resources));
+
         let state = DaemonState {
             inner: Arc::new(DaemonStateInner {
-                embeddings_enabled: cfg.embeddings.enabled,
                 baseline: cfg,
                 baseline_xdg_path: xdg_path,
-                store,
-                ground_dir,
+                baseline_resources,
+                resources: Mutex::new(resources_map),
                 corpus_locks: CorpusLockMap::default(),
                 write_lane,
-                embedder: embedder_arc,
                 crossencoders: crossencoders_arc,
                 last_activity_secs: last_activity,
                 active_connections: Arc::new(AtomicUsize::new(0)),
-                tokenizer,
                 shutdown,
             }),
         };
@@ -438,6 +520,7 @@ impl DaemonState {
         };
         match self
             .inner
+            .baseline_resources
             .store
             .maintain(lancedb::table::Duration::seconds(
                 MAINTENANCE_PRUNE_GRACE_SECS as i64,
@@ -493,18 +576,18 @@ impl DaemonState {
     }
 
     pub fn store(&self) -> Arc<LanceStore> {
-        self.inner.store.clone()
+        self.inner.baseline_resources.store.clone()
     }
 
     pub fn ground_dir(&self) -> &std::path::Path {
-        &self.inner.ground_dir
+        &self.inner.baseline_resources.ground_dir
     }
 
     /// Whether dense embeddings are enabled. Dispatchers branch on this to
     /// pass `Some(embedder)` (hybrid) or `None` (lexical-only) into `ground`
     /// and `index_corpus`. False means the embedder is permanently `None`.
     pub fn embeddings_enabled(&self) -> bool {
-        self.inner.embeddings_enabled
+        self.inner.baseline_resources.embeddings_enabled
     }
 
     /// Borrow the shared embedder for one call, loading it lazily on first
@@ -521,32 +604,78 @@ impl DaemonState {
     /// Uses `block_in_place` internally, which panics on a current-thread
     /// runtime — callers (and their tests) must run under the `multi_thread`
     /// flavor.
-    pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard<'_>> {
-        let mut guard = self.inner.embedder.lock().await;
-        if guard.is_none() {
-            let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
-            let embedder = tokio::task::block_in_place(|| {
-                Embedder::try_new(
-                    &self.inner.baseline.embeddings.model,
-                    self.inner.baseline.embeddings.quantized,
-                    &cache_dir,
-                )
-            })
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "init embedder ({}): {e}",
-                    self.inner.baseline.embeddings.model
-                )
-            })?;
-            *guard = Some(embedder);
+    pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard> {
+        self.inner.baseline_resources.embedder().await
+    }
+
+    /// Per-request resource seam (B2+B3): resolve (or lazily build) the
+    /// `RequestResources` for the effective config's `(ground_dir, model,
+    /// quantized, enabled)` key. A repo-layer override of any of those
+    /// fields (`[storage].ground_dir`, `[embeddings].model`,
+    /// `[embeddings].enabled`) takes effect on the very next request — no
+    /// daemon restart — while requests sharing a key share one
+    /// `LanceStore`/embedder/tokenizer set so two `Arc<LanceStore>` handles
+    /// never open on the same ground dir. Deliberately no stale-schema-
+    /// rebuild handling here (that is boot-only, see `move_stale_store`); a
+    /// per-request `ground_dir` hitting `HallouminateError::StoreSchemaStale`
+    /// just surfaces as an `Err`, no worse than today's "can't point at a
+    /// different ground_dir at all".
+    pub async fn resources_for(&self, cfg: &Config) -> anyhow::Result<Arc<RequestResources>> {
+        let key = ResourceKey::from_config(cfg);
+        let mut map = self.inner.resources.lock().await;
+        if let Some(existing) = map.get(&key) {
+            return Ok(Arc::clone(existing));
         }
-        self.inner
-            .last_activity_secs
-            .store(monotonic_secs(), Ordering::Relaxed);
-        Ok(EmbedderGuard {
-            guard,
-            last_use_secs: Arc::clone(&self.inner.last_activity_secs),
-        })
+        let ground_dir = key.ground_dir.clone();
+        if let Some(parent) = ground_dir.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
+        }
+        let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
+        let embedder: Option<Embedder> = if cfg.embeddings.enabled {
+            match tokio::task::block_in_place(|| {
+                Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir)
+            }) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        model = %cfg.embeddings.model,
+                        error = %e,
+                        "embedder unavailable for repo-layer resource config; will retry on first embedding request",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tokenizer = load_tokenizer(&cfg.embeddings.model)
+            .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
+        let store = LanceStore::open_or_create(
+            &ground_dir,
+            &cfg.embeddings.model,
+            cfg.embeddings.quantized,
+            cfg.embeddings.enabled,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
+        let resources = Arc::new(RequestResources {
+            store: Arc::new(store),
+            tokenizer,
+            embeddings_enabled: cfg.embeddings.enabled,
+            ground_dir: ground_dir.clone(),
+            embedder: Arc::new(Mutex::new(embedder)),
+            model: cfg.embeddings.model.clone(),
+            quantized: cfg.embeddings.quantized,
+            cache_dir,
+            last_activity_secs: Arc::clone(&self.inner.last_activity_secs),
+        });
+        map.insert(key, Arc::clone(&resources));
+        Ok(resources)
     }
 
     /// Borrow the crossencoder for the model named by the per-request
@@ -663,7 +792,10 @@ impl DaemonState {
     /// `Clone` and each handler is a thin wrapper), so handlers build one per
     /// call instead of reaching into shared state for it.
     pub fn make_registry(&self) -> HandlerRegistry {
-        HandlerRegistry::new(self.inner.tokenizer.clone(), CHUNK_BUDGET_TOKENS)
+        HandlerRegistry::new(
+            self.inner.baseline_resources.tokenizer.clone(),
+            CHUNK_BUDGET_TOKENS,
+        )
     }
 
     /// Acquire the per-corpus async mutex. Call before any operation that
@@ -826,12 +958,12 @@ async fn prune_stale_backups(
 /// existing call sites (`ground`, `index_corpus`, `apply`) keep their
 /// `&mut Embedder` signatures unchanged — only the *acquisition* shape
 /// (Result instead of infallible) differs.
-pub struct EmbedderGuard<'a> {
-    guard: MutexGuard<'a, Option<Embedder>>,
+pub struct EmbedderGuard {
+    guard: OwnedMutexGuard<Option<Embedder>>,
     last_use_secs: Arc<AtomicU64>,
 }
 
-impl std::ops::Deref for EmbedderGuard<'_> {
+impl std::ops::Deref for EmbedderGuard {
     type Target = Embedder;
     fn deref(&self) -> &Embedder {
         // SAFETY-of-correctness: `embedder()` populates `Some(...)` before
@@ -841,13 +973,13 @@ impl std::ops::Deref for EmbedderGuard<'_> {
     }
 }
 
-impl std::ops::DerefMut for EmbedderGuard<'_> {
+impl std::ops::DerefMut for EmbedderGuard {
     fn deref_mut(&mut self) -> &mut Embedder {
         self.guard.as_mut().expect("embedder loaded")
     }
 }
 
-impl Drop for EmbedderGuard<'_> {
+impl Drop for EmbedderGuard {
     fn drop(&mut self) {
         self.last_use_secs
             .store(monotonic_secs(), Ordering::Relaxed);
@@ -902,7 +1034,7 @@ impl Crossencoder for CrossencoderGuard {
 impl std::fmt::Debug for DaemonState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaemonState")
-            .field("ground_dir", &self.inner.ground_dir)
+            .field("ground_dir", &self.inner.baseline_resources.ground_dir)
             .field("model", &self.inner.baseline.embeddings.model)
             .finish()
     }
@@ -1136,8 +1268,7 @@ mod tests {
     #[tokio::test]
     async fn embedder_guard_updates_last_use_on_drop() {
         let last_use_secs = Arc::new(AtomicU64::new(1));
-        let guard = Mutex::new(None);
-        let guard = guard.lock().await;
+        let guard = Arc::new(Mutex::new(None)).lock_owned().await;
         let before_drop = monotonic_secs();
 
         drop(EmbedderGuard {
