@@ -458,10 +458,13 @@ fn delete_file_ref(owner: &WatchRoot, path: &Path) -> crate::domain::common::Fil
 /// walk in `domain::corpus::sandbox` (`probe_leaf_exists`), applied to an
 /// absolute event path instead of a corpus-relative one.
 ///
-/// Returns `true` (reject) only when a symlink is actually found. A vanished
-/// component, a non-normal path component, or any other IO failure returns
-/// `false` — not a security decision this check needs to make; downstream
-/// IO (`index_single_file`) will fail on its own if the path is unusable.
+/// Returns `true` (reject) in three cases: (1) the leaf or an ancestor
+/// component is a symlink, (2) `path` falls outside `owner.canonical_watched`
+/// (the `strip_prefix` failure below), or (3) a path component is not a
+/// plain (`Normal`) component. Returns `false` for a vanished component or
+/// any other IO failure — not a security decision this check needs to make;
+/// downstream IO (`index_single_file`) will fail on its own if the path is
+/// unusable.
 fn contains_symlink(owner: &WatchRoot, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(&owner.canonical_watched) else {
         return true;

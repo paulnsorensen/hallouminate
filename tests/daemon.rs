@@ -17,11 +17,10 @@ use std::time::Duration;
 
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
-    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest,
-    DaemonRequestPayload, DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind,
-    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListFilesResult,
-    Position, ReadMarkdownRequest, connect_at, serve,
-    spawn_signal_handlers,
+    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest, DaemonRequestPayload,
+    DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult,
+    IndexRequest, LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest,
+    connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
@@ -3625,13 +3624,24 @@ async fn daemon_returns_structured_error_when_request_line_exceeds_cap() {
         }
     }
 
-    // Connection closes after the structured response.
+    // Connection closes after the structured response. On Linux, the
+    // server closing the socket with unread client data (the request line
+    // is still streaming past the cap) can trigger an RST instead of an
+    // orderly FIN, so the client's read surfaces `ConnectionReset` rather
+    // than `Ok(0)`; macOS delivers a clean EOF for the same sequence.
+    // Both outcomes mean the server closed as required.
     let mut buf = [0u8; 1];
-    let n = timeout(Duration::from_secs(5), reader.read(&mut buf))
+    match timeout(Duration::from_secs(5), reader.read(&mut buf))
         .await
         .expect("server must close after responding")
-        .expect("read must not error");
-    assert_eq!(n, 0, "server must close the connection after the error response");
+    {
+        Ok(n) => assert_eq!(
+            n, 0,
+            "server must close the connection after the error response"
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        Err(e) => panic!("expected graceful EOF or ConnectionReset, got: {e:?}"),
+    }
 }
 
 #[tokio::test]
@@ -3974,9 +3984,10 @@ async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
 
     let warnings = value["warnings"].as_array().expect("warnings array");
     assert!(
-        warnings
-            .iter()
-            .all(|w| !w.as_str().unwrap_or("").contains("ancestor index refresh failed")),
+        warnings.iter().all(|w| !w
+            .as_str()
+            .unwrap_or("")
+            .contains("ancestor index refresh failed")),
         "rebuild_wiki_indexes must embed the ancestor index.md with the \
          per-request (bge-small) embedder, not the baseline (snowflake) one; \
          a dimension-mismatch warning here means the bug (state.embedder() \

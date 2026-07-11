@@ -313,20 +313,29 @@ async fn serve_on_listener(
                 }
             },
         };
+        // Gate concurrently active handlers so unlimited clients can't spend
+        // unbounded memory/CPU at once. The permit is acquired here, before
+        // spawning, so an accepted-but-unhandled `UnixStream` and its task
+        // never accumulate unbounded while waiting for a permit; it is
+        // acquired against `shutdown.cancelled()` so waiting for a permit
+        // never blocks drain/shutdown.
+        let permit = tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!(target: "hallouminate::daemon", "shutdown requested; stopping accept loop");
+                break;
+            }
+            acquired = Arc::clone(&semaphore).acquire_owned() => match acquired {
+                Ok(permit) => permit,
+                Err(_closed) => break,
+            },
+        };
         let state = state.clone();
         let conn = state.enter_connection();
-        let semaphore = Arc::clone(&semaphore);
         handlers.spawn(async move {
             // Held for the handler's lifetime; decrements the active-connection
             // count on drop so idle-exit never fires mid-request (ADR-003).
             let _conn = conn;
-            // Gate concurrently active handlers so unlimited clients can't
-            // spend unbounded memory/CPU at once; the permit is acquired
-            // inside the spawned task so it never blocks the accept loop.
-            let _permit = match semaphore.acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_closed) => return,
-            };
+            let _permit = permit;
             if let Err(e) = handle_connection(state, stream, idle_timeout).await {
                 tracing::warn!(
                     target: "hallouminate::daemon",
@@ -633,8 +642,15 @@ mod tests {
             .expect("different-uid peer must be rejected for a mutating request");
         match response {
             DaemonResponse::Err { kind, message } => {
-                assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams, "{message}");
-                assert!(message.contains("999") && message.contains("501"), "{message}");
+                assert_eq!(
+                    kind,
+                    super::super::ipc::ErrorKind::InvalidParams,
+                    "{message}"
+                );
+                assert!(
+                    message.contains("999") && message.contains("501"),
+                    "{message}"
+                );
             }
             DaemonResponse::Ok { result } => {
                 panic!("unauthorized mutating request must error; got Ok({result:?})")

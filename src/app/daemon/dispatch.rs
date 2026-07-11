@@ -1424,7 +1424,15 @@ async fn catch_up_corpus(
     let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
         .as_mut()
         .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-    let stats = apply(p, &res.store, embedder_dyn, registry, corpus, DEFAULT_BATCH_SIZE).await?;
+    let stats = apply(
+        p,
+        &res.store,
+        embedder_dyn,
+        registry,
+        corpus,
+        DEFAULT_BATCH_SIZE,
+    )
+    .await?;
     Ok(Some(stats))
 }
 
@@ -1496,10 +1504,7 @@ async fn rebuild_wiki_indexes(
     let written_is_index = is_index_md(file_relative);
     let mut totals = crate::domain::indexer::ApplyStats::default();
     let dirs = ancestor_dirs(root, file_relative);
-    let res = state
-        .resources_for(cfg)
-        .await
-        .map_err(|e| e.to_string())?;
+    let res = state.resources_for(cfg).await.map_err(|e| e.to_string())?;
     let store = &res.store;
     let registry = state.make_registry();
 
@@ -1541,7 +1546,7 @@ async fn rebuild_wiki_indexes(
         };
 
         let is_root = dir == root;
-        let (new_content, outcome) = compose_index_md(dir, is_root, existing.as_deref())
+        let (new_content, outcome) = compose_index_md(root, dir, is_root, existing.as_deref())
             .map_err(|e| format!("compose index {}: {e}", dir.display()))?;
         match outcome {
             crate::domain::corpus::index_md::RewriteOutcome::NoMarkers

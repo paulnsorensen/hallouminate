@@ -71,11 +71,15 @@ pub struct ChildEntry {
 
 /// Read the first H1 from `path` (`# Title`). Returns `None` if the file is
 /// unreadable or has no leading H1. Used for the trailing gloss on each
-/// link entry, so the list is browsable without opening every child.
-pub fn read_h1(path: &Path) -> Option<String> {
+/// link entry, so the list is browsable without opening every child. `root`
+/// is the corpus/watched root; every path component between it and `path`'s
+/// parent is walked no-follow (see `read_leaf_no_follow`) so a symlink
+/// swapped in anywhere along that chain is refused, not just at the leaf or
+/// its immediate parent.
+pub fn read_h1(root: &Path, path: &Path) -> Option<String> {
     let dir = path.parent()?;
     let file_name = path.file_name()?;
-    let text = read_leaf_no_follow(dir, file_name)?;
+    let text = read_leaf_no_follow(root, dir, file_name)?;
     let mut lines = text.lines().peekable();
 
     // Skip a leading YAML frontmatter block, but only when the `---` fence
@@ -112,23 +116,34 @@ pub fn read_h1(path: &Path) -> Option<String> {
 }
 
 /// Read `dir/file_name` through a `cap-std` no-follow open, refusing the read
-/// when `dir` itself or the leaf is a symlink. Closes two gaps the earlier
-/// leaf-only `symlink_metadata`-then-`read_to_string` check left open: (1) a
-/// TOCTOU window between the check and the read (an attacker swaps the leaf
-/// for a symlink in between) and (2) the check only ever inspected the leaf,
-/// never the directory it lives in — so a symlinked ANCESTOR directory could
-/// still smuggle an outside file's H1 into a generated index. Mirrors the
-/// no-follow component walk `watch.rs::contains_symlink` and
-/// `sandbox::read_no_follow` use; kept local (rather than reusing
-/// `sandbox::read_no_follow`) because that helper creates missing
-/// intermediate directories on the write path, a side effect wrong for a
-/// read-only gloss lookup over a directory that may legitimately not exist.
-fn read_leaf_no_follow(dir: &Path, file_name: &OsStr) -> Option<String> {
-    let dir_meta = std::fs::symlink_metadata(dir).ok()?;
-    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
-        return None;
+/// when the leaf, `dir` itself, or any component between `root` and `dir` is
+/// a symlink. Walks component-by-component from a capability opened at
+/// `root` — mirroring the no-follow walk in `watch.rs::contains_symlink` —
+/// rather than trusting `open_ambient_dir(dir, …)` to be no-follow: that call
+/// resolves `dir` through normal OS path resolution and follows symlinks in
+/// every ancestor component, so checking only `dir`'s own `symlink_metadata`
+/// left a symlinked grandparent (or higher) free to smuggle an outside
+/// file's H1 into a generated index. The per-component `symlink_metadata`
+/// check plus `open_dir`/`open` also closes the TOCTOU window a
+/// check-then-open-by-path sequence would leave between the check and the
+/// read. Kept local (rather than reusing `sandbox::read_no_follow`) because
+/// that helper creates missing intermediate directories on the write path, a
+/// side effect wrong for a read-only gloss lookup over a directory that may
+/// legitimately not exist.
+fn read_leaf_no_follow(root: &Path, dir: &Path, file_name: &OsStr) -> Option<String> {
+    let relative = dir.strip_prefix(root).ok()?;
+    let mut cap_dir =
+        cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()).ok()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return None;
+        };
+        let meta = cap_dir.symlink_metadata(name).ok()?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return None;
+        }
+        cap_dir = cap_dir.open_dir(name).ok()?;
     }
-    let cap_dir = cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority()).ok()?;
     let leaf_meta = cap_dir.symlink_metadata(file_name).ok()?;
     if leaf_meta.file_type().is_symlink() {
         return None;
@@ -140,11 +155,13 @@ fn read_leaf_no_follow(dir: &Path, file_name: &OsStr) -> Option<String> {
 }
 
 /// Enumerate the immediate-child entries to render for `dir`'s `index.md`.
-/// Reads one directory; does not recurse. Includes:
+/// Reads one directory; does not recurse. `root` is the corpus/watched root
+/// `dir` lives under — threaded through to `read_h1`'s no-follow ancestor
+/// walk. Includes:
 ///   - `*.md` files except `index.md` itself
 ///   - subdirectories that (anywhere beneath them) contain at least one
 ///     `*.md` so dirs that have nothing-but-junk don't pollute the list
-pub fn enumerate_children(dir: &Path) -> std::io::Result<Vec<ChildEntry>> {
+pub fn enumerate_children(root: &Path, dir: &Path) -> std::io::Result<Vec<ChildEntry>> {
     let mut out: Vec<ChildEntry> = Vec::new();
     let read = match std::fs::read_dir(dir) {
         Ok(r) => r,
@@ -170,7 +187,7 @@ pub fn enumerate_children(dir: &Path) -> std::io::Result<Vec<ChildEntry>> {
                 continue;
             }
             let stem = name.strip_suffix(".md").unwrap_or(name);
-            let gloss = read_h1(&entry.path()).unwrap_or_default();
+            let gloss = read_h1(root, &entry.path()).unwrap_or_default();
             let line = render_file_line(name, stem, &gloss);
             out.push(ChildEntry {
                 line,
@@ -182,7 +199,7 @@ pub fn enumerate_children(dir: &Path) -> std::io::Result<Vec<ChildEntry>> {
             if name.starts_with('.') || !dir_contains_markdown(&entry.path()) {
                 continue;
             }
-            let gloss = read_h1(&entry.path().join(INDEX_FILENAME)).unwrap_or_default();
+            let gloss = read_h1(root, &entry.path().join(INDEX_FILENAME)).unwrap_or_default();
             let line = render_dir_line(name, &gloss);
             out.push(ChildEntry {
                 line,
@@ -285,15 +302,18 @@ pub fn dir_title(dir: &Path, is_root: bool) -> String {
         .unwrap_or_else(|| "wiki".to_string())
 }
 
-/// Compose the index.md content for `dir`. Returns the new file body and the
-/// outcome relative to `existing` (so callers can skip a redundant write
-/// when the rebuilt body matches what was already on disk).
+/// Compose the index.md content for `dir`. `root` is the corpus/watched
+/// root `dir` lives under, threaded through to `enumerate_children`'s
+/// no-follow ancestor walk. Returns the new file body and the outcome
+/// relative to `existing` (so callers can skip a redundant write when the
+/// rebuilt body matches what was already on disk).
 pub fn compose_index_md(
+    root: &Path,
     dir: &Path,
     is_root: bool,
     existing: Option<&str>,
 ) -> std::io::Result<(String, RewriteOutcome)> {
-    let children = enumerate_children(dir)?;
+    let children = enumerate_children(root, dir)?;
     let body = render_block_body(&children);
     match existing {
         None => {
@@ -375,7 +395,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.md");
         std::fs::write(&path, "# Hello world\n\nbody\n").unwrap();
-        assert_eq!(read_h1(&path), Some("Hello world".to_string()));
+        assert_eq!(read_h1(tmp.path(), &path), Some("Hello world".to_string()));
     }
 
     #[test]
@@ -383,7 +403,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.md");
         std::fs::write(&path, "\n\n# Title\n").unwrap();
-        assert_eq!(read_h1(&path), Some("Title".to_string()));
+        assert_eq!(read_h1(tmp.path(), &path), Some("Title".to_string()));
     }
 
     #[test]
@@ -391,12 +411,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.md");
         std::fs::write(&path, "intro text\n# late\n").unwrap();
-        assert_eq!(read_h1(&path), None);
+        assert_eq!(read_h1(tmp.path(), &path), None);
     }
 
     #[test]
     fn read_h1_returns_none_for_missing_file() {
-        assert_eq!(read_h1(Path::new("/does/not/exist")), None);
+        assert_eq!(read_h1(Path::new("/"), Path::new("/does/not/exist")), None);
     }
 
     #[test]
@@ -411,7 +431,7 @@ mod tests {
         std::fs::write(&real, "# Outside Title\n").unwrap();
         let link = tmp.path().join("index.md");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert_eq!(read_h1(&link), None);
+        assert_eq!(read_h1(tmp.path(), &link), None);
     }
 
     #[test]
@@ -432,7 +452,31 @@ mod tests {
         std::os::unix::fs::symlink(&real_dir, &symlinked_dir).unwrap();
 
         let path_through_symlink = symlinked_dir.join("child.md");
-        assert_eq!(read_h1(&path_through_symlink), None);
+        assert_eq!(read_h1(base.path(), &path_through_symlink), None);
+    }
+
+    #[test]
+    fn read_h1_returns_none_when_grandparent_directory_is_symlinked() {
+        // Closes the gap the immediate-parent-only check left open: a
+        // symlink swapped in higher up the chain (not the leaf's direct
+        // parent) is only caught by walking every component from the
+        // corpus root — `open_ambient_dir(dir, ..)` alone would still
+        // follow it via normal OS path resolution.
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real_dir = outside.path().join("real_dir");
+        std::fs::create_dir(&real_dir).unwrap();
+        std::fs::create_dir(real_dir.join("child")).unwrap();
+        let real_file = real_dir.join("child").join("leaf.md");
+        std::fs::write(&real_file, "# Outside Title\n").unwrap();
+
+        let symlinked_dir = base.path().join("linked");
+        std::os::unix::fs::symlink(&real_dir, &symlinked_dir).unwrap();
+
+        // `linked` is the symlink; `linked/child` is a plain directory once
+        // resolved, so a leaf-or-immediate-parent-only check would miss it.
+        let path_through_symlink = symlinked_dir.join("child").join("leaf.md");
+        assert_eq!(read_h1(base.path(), &path_through_symlink), None);
     }
 
     #[test]
@@ -440,7 +484,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.md");
         std::fs::write(&path, "---\nup:\n  - \"[[bar]]\"\n---\n\n# Foo Title\n").unwrap();
-        assert_eq!(read_h1(&path), Some("Foo Title".to_string()));
+        assert_eq!(read_h1(tmp.path(), &path), Some("Foo Title".to_string()));
     }
 
     #[test]
@@ -448,7 +492,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("a.md");
         std::fs::write(&path, "---\nup: bar\n---\n\nintro text\n# late\n").unwrap();
-        assert_eq!(read_h1(&path), None);
+        assert_eq!(read_h1(tmp.path(), &path), None);
     }
 
     #[test]
@@ -457,7 +501,7 @@ mod tests {
         let path = tmp.path().join("a.md");
         // No closing fence — must not over-scan into the body and grab the H1.
         std::fs::write(&path, "---\nup: bar\n# Not a real title\n").unwrap();
-        assert_eq!(read_h1(&path), None);
+        assert_eq!(read_h1(tmp.path(), &path), None);
     }
 
     #[test]
@@ -468,7 +512,7 @@ mod tests {
         // checks match under CRLF. Lock that so a future move off `lines()`
         // can't silently regress Windows-authored frontmatter pages.
         std::fs::write(&path, "---\r\nup: bar\r\n---\r\n\r\n# Foo Title\r\n").unwrap();
-        assert_eq!(read_h1(&path), Some("Foo Title".to_string()));
+        assert_eq!(read_h1(tmp.path(), &path), Some("Foo Title".to_string()));
     }
 
     #[test]
@@ -477,7 +521,7 @@ mod tests {
         let path = tmp.path().join("a.md");
         // `---` not on line 1 is a thematic break; H1 detection is unchanged.
         std::fs::write(&path, "# Real Title\n\n---\n\nbody\n").unwrap();
-        assert_eq!(read_h1(&path), Some("Real Title".to_string()));
+        assert_eq!(read_h1(tmp.path(), &path), Some("Real Title".to_string()));
     }
 
     #[test]
@@ -486,7 +530,7 @@ mod tests {
         std::fs::write(tmp.path().join("index.md"), "# index\n").unwrap();
         std::fs::write(tmp.path().join("alpha.md"), "# Alpha topic\n").unwrap();
         std::fs::write(tmp.path().join("beta.md"), "no h1 here\n").unwrap();
-        let children = enumerate_children(tmp.path()).unwrap();
+        let children = enumerate_children(tmp.path(), tmp.path()).unwrap();
         let lines: Vec<&str> = children.iter().map(|c| c.line.as_str()).collect();
         assert_eq!(
             lines,
@@ -502,7 +546,7 @@ mod tests {
         std::fs::write(sub.join("inner.md"), "# Inner\n").unwrap();
         std::fs::write(sub.join("index.md"), "# Nested index\n").unwrap();
         std::fs::write(tmp.path().join("top.md"), "# Top\n").unwrap();
-        let children = enumerate_children(tmp.path()).unwrap();
+        let children = enumerate_children(tmp.path(), tmp.path()).unwrap();
         let lines: Vec<&str> = children.iter().map(|c| c.line.as_str()).collect();
         assert_eq!(
             lines,
@@ -521,7 +565,7 @@ mod tests {
         std::fs::create_dir(&no_md).unwrap();
         std::fs::write(no_md.join("readme.txt"), "x").unwrap();
         std::fs::write(tmp.path().join("a.md"), "# A\n").unwrap();
-        let children = enumerate_children(tmp.path()).unwrap();
+        let children = enumerate_children(tmp.path(), tmp.path()).unwrap();
         let lines: Vec<&str> = children.iter().map(|c| c.line.as_str()).collect();
         assert_eq!(lines, vec!["- [a](./a.md) — A"]);
     }
@@ -538,7 +582,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("alien.md"), tmp.path().join("alien.md"))
             .unwrap();
         std::fs::write(tmp.path().join("real.md"), "# Real\n").unwrap();
-        let children = enumerate_children(tmp.path()).unwrap();
+        let children = enumerate_children(tmp.path(), tmp.path()).unwrap();
         let lines: Vec<&str> = children.iter().map(|c| c.line.as_str()).collect();
         assert_eq!(lines, vec!["- [real](./real.md) — Real"]);
     }
@@ -547,7 +591,7 @@ mod tests {
     fn compose_index_md_scaffolds_when_existing_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("a.md"), "# Alpha\n").unwrap();
-        let (content, outcome) = compose_index_md(tmp.path(), true, None).unwrap();
+        let (content, outcome) = compose_index_md(tmp.path(), tmp.path(), true, None).unwrap();
         assert_eq!(outcome, RewriteOutcome::Created);
         assert!(content.starts_with("# wiki"), "got: {content}");
         assert!(content.contains(INDEX_START_MARKER));
@@ -564,7 +608,8 @@ mod tests {
              ## Footer\n\nMore prose.\n",
         );
         std::fs::write(tmp.path().join("a.md"), "# Alpha\n").unwrap();
-        let (content, outcome) = compose_index_md(tmp.path(), true, Some(&prose)).unwrap();
+        let (content, outcome) =
+            compose_index_md(tmp.path(), tmp.path(), true, Some(&prose)).unwrap();
         assert_eq!(outcome, RewriteOutcome::Updated);
         assert!(content.starts_with("# Custom title"), "prose H1 preserved");
         assert!(content.contains("This is curated prose"));
@@ -578,7 +623,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let prose = "# Author-only\n\nNo markers here.\n";
         std::fs::write(tmp.path().join("a.md"), "# Alpha\n").unwrap();
-        let (content, outcome) = compose_index_md(tmp.path(), true, Some(prose)).unwrap();
+        let (content, outcome) =
+            compose_index_md(tmp.path(), tmp.path(), true, Some(prose)).unwrap();
         assert_eq!(outcome, RewriteOutcome::NoMarkers);
         assert_eq!(content, prose, "file untouched");
     }
@@ -589,7 +635,8 @@ mod tests {
         std::fs::write(tmp.path().join("a.md"), "# Alpha\n").unwrap();
         let current =
             format!("# wiki\n\n{INDEX_START_MARKER}\n- [a](./a.md) — Alpha\n{INDEX_END_MARKER}\n",);
-        let (content, outcome) = compose_index_md(tmp.path(), true, Some(&current)).unwrap();
+        let (content, outcome) =
+            compose_index_md(tmp.path(), tmp.path(), true, Some(&current)).unwrap();
         assert_eq!(outcome, RewriteOutcome::Unchanged);
         assert_eq!(content, current);
     }
