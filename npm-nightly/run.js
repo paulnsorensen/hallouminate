@@ -49,7 +49,7 @@ child.on("exit", (code, signal) => {
 });
 
 child.on("error", (err) => {
-  console.error(`hallouminate: failed to run binary at ${bin}`);
+  console.error(`hallouminate-nightly: failed to run binary at ${bin}`);
   console.error(err.message);
   process.exit(1);
 });
