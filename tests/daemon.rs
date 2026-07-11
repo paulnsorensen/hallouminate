@@ -1783,18 +1783,34 @@ async fn stop_is_a_noop_against_an_already_stopped_daemon() {
 }
 
 /// Spawn an in-process `serve` on `socket` from a fresh `DaemonState` and wait
-/// until the socket is reachable. Returns the serve task handle so the caller
-/// can join it after a graceful shutdown.
+/// until the daemon answers a Ping round-trip. Returns the serve task handle so
+/// the caller can join it after a graceful shutdown.
 async fn spawn_serve(cfg: Config, socket: &Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
     let state = DaemonState::open(cfg, None).await.expect("open state");
     let socket_clone = socket.to_path_buf();
     let handle = tokio::spawn(async move { serve(&state, &socket_clone).await });
+    // Wait for a successful Ping round-trip, not just socket-path existence:
+    // `bind` creates the path before `accept` is ready to service connections,
+    // so a bare `socket.exists()` check leaves a window where the first client
+    // connect can race the listener and see ECONNREFUSED (a macOS CI flake).
+    // Mirrors the readiness poll in tests/common/daemon.rs (commit 13bb241).
+    let cwd = seed_cwd(socket.parent().expect("socket has a parent dir"));
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !socket.exists() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "socket never appeared"
-        );
+    loop {
+        if std::time::Instant::now() > deadline {
+            panic!("daemon never became ready to serve: {}", socket.display());
+        }
+        if let Ok(client) = connect_at(socket).await
+            && client
+                .call_raw(DaemonRequest {
+                    cwd: cwd.clone(),
+                    payload: DaemonRequestPayload::Ping,
+                })
+                .await
+                .is_ok()
+        {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     handle
