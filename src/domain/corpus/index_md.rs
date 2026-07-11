@@ -17,6 +17,7 @@
 //! summary of what's in the corpus.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Filename of the auto-maintained directory index.
@@ -72,15 +73,9 @@ pub struct ChildEntry {
 /// unreadable or has no leading H1. Used for the trailing gloss on each
 /// link entry, so the list is browsable without opening every child.
 pub fn read_h1(path: &Path) -> Option<String> {
-    // Refuse to follow a symlinked index/child file: a directory symlink
-    // planted inside the corpus (or a symlinked child markdown file) must
-    // not let its target's H1 get copied into a generated ancestor index.
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => return None,
-        Ok(_) => {}
-        Err(_) => return None,
-    }
-    let text = std::fs::read_to_string(path).ok()?;
+    let dir = path.parent()?;
+    let file_name = path.file_name()?;
+    let text = read_leaf_no_follow(dir, file_name)?;
     let mut lines = text.lines().peekable();
 
     // Skip a leading YAML frontmatter block, but only when the `---` fence
@@ -114,6 +109,34 @@ pub fn read_h1(path: &Path) -> Option<String> {
         return None;
     }
     None
+}
+
+/// Read `dir/file_name` through a `cap-std` no-follow open, refusing the read
+/// when `dir` itself or the leaf is a symlink. Closes two gaps the earlier
+/// leaf-only `symlink_metadata`-then-`read_to_string` check left open: (1) a
+/// TOCTOU window between the check and the read (an attacker swaps the leaf
+/// for a symlink in between) and (2) the check only ever inspected the leaf,
+/// never the directory it lives in — so a symlinked ANCESTOR directory could
+/// still smuggle an outside file's H1 into a generated index. Mirrors the
+/// no-follow component walk `watch.rs::contains_symlink` and
+/// `sandbox::read_no_follow` use; kept local (rather than reusing
+/// `sandbox::read_no_follow`) because that helper creates missing
+/// intermediate directories on the write path, a side effect wrong for a
+/// read-only gloss lookup over a directory that may legitimately not exist.
+fn read_leaf_no_follow(dir: &Path, file_name: &OsStr) -> Option<String> {
+    let dir_meta = std::fs::symlink_metadata(dir).ok()?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+        return None;
+    }
+    let cap_dir = cap_std::fs::Dir::open_ambient_dir(dir, cap_std::ambient_authority()).ok()?;
+    let leaf_meta = cap_dir.symlink_metadata(file_name).ok()?;
+    if leaf_meta.file_type().is_symlink() {
+        return None;
+    }
+    let mut file = cap_dir.open(file_name).ok()?.into_std();
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
 }
 
 /// Enumerate the immediate-child entries to render for `dir`'s `index.md`.
@@ -389,6 +412,27 @@ mod tests {
         let link = tmp.path().join("index.md");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert_eq!(read_h1(&link), None);
+    }
+
+    #[test]
+    fn read_h1_returns_none_for_symlinked_ancestor_directory() {
+        // The gap the leaf-only lstat guard left open: the LEAF itself is a
+        // plain regular file, but the directory containing it is reached
+        // through a symlinked ancestor. An attacker who can only swap a
+        // directory (not the leaf) must still be refused -- otherwise an
+        // outside file's H1 gets pulled into a generated ancestor index.
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let real_dir = outside.path().join("real_dir");
+        std::fs::create_dir(&real_dir).unwrap();
+        let real_file = real_dir.join("child.md");
+        std::fs::write(&real_file, "# Outside Title\n").unwrap();
+
+        let symlinked_dir = base.path().join("linked");
+        std::os::unix::fs::symlink(&real_dir, &symlinked_dir).unwrap();
+
+        let path_through_symlink = symlinked_dir.join("child.md");
+        assert_eq!(read_h1(&path_through_symlink), None);
     }
 
     #[test]
