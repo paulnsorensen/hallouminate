@@ -3563,15 +3563,18 @@ async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
     );
 }
 
-// ─── Curd: bounded request-line cap + drained shutdown ──────────────────
+// ─── Curd: bounded request-line cap + structured over-cap error (R1) ────
 
 #[tokio::test]
-async fn daemon_closes_connection_when_request_line_exceeds_cap() {
+async fn daemon_returns_structured_error_when_request_line_exceeds_cap() {
     // MAX_REQUEST_LINE_BYTES (4 MiB) bounds the newline-delimited request
     // line's allocation via a `.take()`-wrapped reader. A line that never
-    // hits its newline within the cap must close the connection instead of
-    // growing the buffer without bound or hanging on the idle timeout.
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // hits its newline within the cap must yield a structured
+    // `DaemonResponse::Err { kind: InvalidParams }` naming the cap, not a
+    // bare transport EOF with no error payload (a legitimate oversized
+    // `add_markdown.content` write would otherwise look identical to a
+    // crashed connection).
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader as TokioBufReader};
     use tokio::net::UnixStream;
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3586,7 +3589,7 @@ async fn daemon_closes_connection_when_request_line_exceeds_cap() {
         .expect("connect");
 
     // Write past the cap with no trailing newline; tolerate a broken pipe
-    // once the server closes its half after the cap is exceeded.
+    // once the server's read side hits the cap.
     let chunk = vec![b'a'; 64 * 1024];
     let target = 4 * 1024 * 1024 + 64 * 1024;
     let mut written = 0usize;
@@ -3597,15 +3600,38 @@ async fn daemon_closes_connection_when_request_line_exceeds_cap() {
         }
     }
 
+    let mut reader = TokioBufReader::new(&mut stream);
+    let mut line = String::new();
+    timeout(
+        Duration::from_secs(5),
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut line),
+    )
+    .await
+    .expect("server must respond promptly once the cap is exceeded, not hang")
+    .expect("read must not error");
+
+    let response: DaemonResponse =
+        serde_json::from_str(line.trim_end()).expect("over-cap response must be valid JSON");
+    match response {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(
+                message.contains("4194304") || message.contains("cap"),
+                "error message must name the byte cap: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => {
+            panic!("over-cap request must error, not succeed; got Ok({result:?})")
+        }
+    }
+
+    // Connection closes after the structured response.
     let mut buf = [0u8; 1];
-    let n = timeout(Duration::from_secs(5), stream.read(&mut buf))
+    let n = timeout(Duration::from_secs(5), reader.read(&mut buf))
         .await
-        .expect("server must close the oversized-line connection promptly, not hang")
+        .expect("server must close after responding")
         .expect("read must not error");
-    assert_eq!(
-        n, 0,
-        "server must close the connection (EOF) once the cap is exceeded, not respond or hang"
-    );
+    assert_eq!(n, 0, "server must close the connection after the error response");
 }
 
 #[tokio::test]

@@ -395,17 +395,20 @@ async fn handle_connection(
     if n == 0 {
         return Ok(());
     }
-    if !line.ends_with('\n') {
+    let response = if !line.ends_with('\n') {
         tracing::warn!(
             target: "hallouminate::daemon",
             cap_bytes = MAX_REQUEST_LINE_BYTES,
-            "request line exceeded the size cap; closing connection",
+            "request line exceeded the size cap; returning structured error",
         );
-        return Ok(());
-    }
-    let response = match serde_json::from_str::<DaemonRequest>(line.trim_end()) {
-        Ok(req) => dispatch(&state, req).await,
-        Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
+        DaemonResponse::invalid_params(format!(
+            "request line exceeds {MAX_REQUEST_LINE_BYTES}-byte cap"
+        ))
+    } else {
+        match serde_json::from_str::<DaemonRequest>(line.trim_end()) {
+            Ok(req) => dispatch(&state, req).await,
+            Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
+        }
     };
     // Request completed; stamp the activity clock so idle-exit keys on real
     // request throughput, not just embed use (ADR-003).
