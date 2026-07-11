@@ -55,7 +55,7 @@ use super::ipc::{
     DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest,
     ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
-use super::state::DaemonState;
+use super::state::{DaemonState, RequestResources};
 
 pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
     // Resolve per-request config layering on every request: discover the
@@ -290,7 +290,11 @@ async fn handle_corpus_stats(
             Ok(c) => c,
             Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
         };
-    let store = state.store();
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let store = &res.store;
     let chunk_stats = match store.corpus_chunk_stats(&corpus_cfg.name).await {
         Ok(s) => s,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -334,7 +338,11 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let store = state.store();
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let store = &res.store;
     let opts = GroundOpts {
         top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
         chunks_per_file: req
@@ -362,8 +370,8 @@ async fn handle_ground(
 
     // Embeddings-OFF: skip the embedder entirely and let the search run the
     // lexical-only path. ON: borrow the shared embedder (lazy-loaded).
-    let mut embedder = if state.embeddings_enabled() {
-        match state.embedder().await {
+    let mut embedder = if res.embeddings_enabled {
+        match res.embedder().await {
             Ok(g) => Some(g),
             Err(e) => return DaemonResponse::internal(e.to_string()),
         }
@@ -398,7 +406,7 @@ async fn handle_ground(
             &req.query,
             &corpus.name,
             &corpus.paths,
-            &store,
+            store,
             embedder_dyn,
             crossencoder_box,
             opts,
@@ -412,7 +420,7 @@ async fn handle_ground(
         ground_union(
             &req.query,
             &targets,
-            &store,
+            store,
             embedder_dyn,
             crossencoder_box,
             opts,
@@ -487,7 +495,11 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
         corpora.clone()
     };
 
-    let store = state.store();
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let store = &res.store;
     let registry = state.make_registry();
 
     let mut report = IndexReport::default();
@@ -516,8 +528,8 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             ));
             continue;
         }
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
+        let mut embedder = if res.embeddings_enabled {
+            match res.embedder().await {
                 Ok(g) => Some(g),
                 Err(e) => return DaemonResponse::internal(e.to_string()),
             }
@@ -527,7 +539,7 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = match index_corpus(&corpus, &store, embedder_dyn, &registry).await {
+        let stats = match index_corpus(&corpus, store, embedder_dyn, &registry).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
         };
@@ -662,6 +674,11 @@ async fn handle_add_markdown(
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
         Err(msg) => return DaemonResponse::internal(msg),
+    };
+
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
     };
 
     let force_overwrite: bool;
@@ -828,7 +845,7 @@ async fn handle_add_markdown(
         if overwrite {
             let file_ref = canonicalize_or_passthrough(&dest);
             if let Some(file_ref_str) = file_ref.as_path().to_str() {
-                let store = state.store();
+                let store = &res.store;
                 match store.get_file_snapshot(&corpus.name, file_ref_str).await {
                     Ok(Some(_)) => match store.delete_file(&corpus.name, file_ref_str).await {
                         Ok(()) => stats.files_deleted = 1,
@@ -841,10 +858,10 @@ async fn handle_add_markdown(
         }
         stats
     } else {
-        let store = state.store();
+        let store = &res.store;
         let registry = state.make_registry();
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
+        let mut embedder = if res.embeddings_enabled {
+            match res.embedder().await {
                 Ok(g) => Some(g),
                 Err(e) => return DaemonResponse::internal(e.to_string()),
             }
@@ -854,7 +871,7 @@ async fn handle_add_markdown(
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(&store, embedder_dyn, &registry, &corpus, &dest).await {
+        match index_single_file(store, embedder_dyn, &registry, &corpus, &dest).await {
             Ok(s) => s,
             Err(e) => {
                 // The write above already durably completed; a model/store
@@ -884,7 +901,7 @@ async fn handle_add_markdown(
     // durable write and retry `index` rather than losing visibility into
     // it entirely.
     if is_wiki_corpus(&corpus) {
-        match rebuild_wiki_indexes(state, &corpus, &root, &relative).await {
+        match rebuild_wiki_indexes(state, cfg, &corpus, &root, &relative).await {
             Ok(extra) => fold_apply_stats(&mut stats, &extra),
             Err(msg) => {
                 warnings.push(format!(
@@ -1148,7 +1165,11 @@ async fn handle_delete_markdown(
             return DaemonResponse::internal(format!("unlink task panicked: {join_err}"));
         }
     }
-    if let Err(e) = state.store().delete_file(&corpus.name, &file_ref_str).await {
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    if let Err(e) = res.store.delete_file(&corpus.name, &file_ref_str).await {
         return DaemonResponse::internal(e.to_string());
     }
 
@@ -1156,7 +1177,7 @@ async fn handle_delete_markdown(
     // longer links to the deleted file. Same internal-error semantics as
     // the add_markdown path — partial regen would desync the wiki tree.
     if is_wiki_corpus(&corpus)
-        && let Err(msg) = rebuild_wiki_indexes(state, &corpus, &root, &relative).await
+        && let Err(msg) = rebuild_wiki_indexes(state, cfg, &corpus, &root, &relative).await
     {
         drop(guard);
         return DaemonResponse::internal(msg);
@@ -1349,7 +1370,14 @@ pub(super) async fn catch_up_index(state: DaemonState) {
             return;
         }
     };
-    let store = state.store();
+    let res = match state.resources_for(state.baseline()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "hallouminate::daemon", error = %e,
+                "boot catch-up: could not resolve baseline resources; skipped");
+            return;
+        }
+    };
     let registry = state.make_registry();
     for corpus in corpora {
         if !crate::domain::corpus::missing_roots(&corpus).is_empty() {
@@ -1363,7 +1391,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
                 continue;
             }
         };
-        match catch_up_corpus(&state, &store, &registry, &corpus).await {
+        match catch_up_corpus(&res, &registry, &corpus).await {
             Ok(Some(stats)) => tracing::info!(target: "hallouminate::daemon",
                 corpus = %corpus.name, files_upserted = stats.files_upserted,
                 files_touched = stats.files_touched, files_deleted = stats.files_deleted,
@@ -1378,26 +1406,25 @@ pub(super) async fn catch_up_index(state: DaemonState) {
 /// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed
 /// (no work, no model load); `Ok(Some(stats))` = reindexed.
 async fn catch_up_corpus(
-    state: &DaemonState,
-    store: &LanceStore,
+    res: &RequestResources,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
 ) -> anyhow::Result<Option<crate::domain::indexer::ApplyStats>> {
     let disk = scan(corpus)?;
-    let db = store.list_files(&corpus.name).await?;
+    let db = res.store.list_files(&corpus.name).await?;
     let p = plan(disk, db);
     if p.upserts.is_empty() && p.mtime_touches.is_empty() && p.deletes.is_empty() {
         return Ok(None);
     }
-    let mut embedder = if plan_needs_embedder(&p, state.embeddings_enabled()) {
-        Some(state.embedder().await?)
+    let mut embedder = if plan_needs_embedder(&p, res.embeddings_enabled) {
+        Some(res.embedder().await?)
     } else {
         None
     };
     let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
         .as_mut()
         .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-    let stats = apply(p, store, embedder_dyn, registry, corpus, DEFAULT_BATCH_SIZE).await?;
+    let stats = apply(p, &res.store, embedder_dyn, registry, corpus, DEFAULT_BATCH_SIZE).await?;
     Ok(Some(stats))
 }
 
@@ -1457,6 +1484,7 @@ fn fold_apply_stats(
 /// regenerating would clobber it.
 async fn rebuild_wiki_indexes(
     state: &DaemonState,
+    cfg: &Config,
     corpus: &CorpusConfig,
     root: &Path,
     file_relative: &Path,
@@ -1468,7 +1496,11 @@ async fn rebuild_wiki_indexes(
     let written_is_index = is_index_md(file_relative);
     let mut totals = crate::domain::indexer::ApplyStats::default();
     let dirs = ancestor_dirs(root, file_relative);
-    let store = state.store();
+    let res = state
+        .resources_for(cfg)
+        .await
+        .map_err(|e| e.to_string())?;
+    let store = &res.store;
     let registry = state.make_registry();
 
     for dir in &dirs {
@@ -1570,7 +1602,7 @@ async fn rebuild_wiki_indexes(
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = index_single_file(&store, embedder_dyn, &registry, corpus, &dest)
+        let stats = index_single_file(store, embedder_dyn, &registry, corpus, &dest)
             .await
             .map_err(|e| format!("reindex {}: {e}", dest.display()))?;
         drop(embedder);
@@ -2006,8 +2038,12 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "docs")
             .expect("docs corpus present");
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources_for");
         assert!(
-            catch_up_corpus(&state, &state.store(), &state.make_registry(), &corpus)
+            catch_up_corpus(&res, &state.make_registry(), &corpus)
                 .await
                 .expect("catch_up_corpus")
                 .is_none(),
