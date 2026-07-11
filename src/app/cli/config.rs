@@ -69,6 +69,26 @@ const KNOWN_REPOSITORY_KEYS: &[&str] = &[
 /// serde field names (`src/domain/common.rs`).
 const KNOWN_CORPUS_KEYS: &[&str] = &["name", "paths", "globs", "exclude", "global"];
 
+/// Keys recognized inside `[embeddings]`, `[search]`, `[storage]`,
+/// `[daemon]`, and `[watch]` — scalar (non-array) sections — mirroring the
+/// field names on `EmbeddingsConfig` / `SearchConfig` / `StorageConfig` /
+/// `DaemonConfig` / `WatchConfig` (`src/app/config.rs`).
+const KNOWN_EMBEDDINGS_KEYS: &[&str] = &[
+    "enabled",
+    "model",
+    "quantized",
+    "cache_dir",
+    "idle_evict_secs",
+];
+const KNOWN_SEARCH_KEYS: &[&str] = &[
+    "top_files_default",
+    "chunks_per_file_default",
+    "crossencoder",
+];
+const KNOWN_STORAGE_KEYS: &[&str] = &["ground_dir"];
+const KNOWN_DAEMON_KEYS: &[&str] = &["idle_exit_secs"];
+const KNOWN_WATCH_KEYS: &[&str] = &["debounce_ms"];
+
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     let target = args.path.unwrap_or_else(xdg_config_path);
     if target.exists() && !args.force {
@@ -177,7 +197,22 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
         .as_deref()
         .and_then(|p| unregistered_wiki_advisory(p, &effective));
     let root_advisories = missing_root_advisories(&effective);
-    let warnings = collect_warnings(raw.as_deref(), &effective);
+
+    // Check unknown keys against every resolved layer's raw text, not just
+    // the baseline — a repo-layer scalar key (e.g. `[embeddings] enable =
+    // false`) parses cleanly into `Config` via serde's unknown-field
+    // tolerance and was previously invisible to `collect_warnings`, which
+    // only ever saw the baseline's raw text. Each layer's warnings are
+    // labeled with their source file so a warning can be traced back.
+    let mut layer_sources: Vec<(&Path, Option<&str>)> = vec![(resolved.as_path(), raw.as_deref())];
+    let repo_raw = match layers.repo_path.as_deref() {
+        Some(p) => Some(fs::read_to_string(p).with_context(|| format!("read {}", p.display()))?),
+        None => None,
+    };
+    if let Some(p) = layers.repo_path.as_deref() {
+        layer_sources.push((p, repo_raw.as_deref()));
+    }
+    let warnings = collect_layered_warnings(&layer_sources, &effective);
 
     let any_advisory = advisory.is_some() || !root_advisories.is_empty();
     if any_advisory || !warnings.is_empty() {
@@ -316,30 +351,52 @@ fn format_no_repo_error(
     out
 }
 
+/// Single-layer wrapper kept for the existing unit tests' call shape.
+#[cfg(test)]
 fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
+    let mut out = raw.map(key_warnings).unwrap_or_default();
+    out.extend(effective_empty_warning(cfg));
+    out
+}
+
+/// Unknown-key checks (top-level + nested array-of-tables) against one
+/// layer's raw TOML text. Shared by `collect_warnings` (single-layer,
+/// back-compat with its existing callers/tests) and
+/// `collect_layered_warnings` (every resolved config layer).
+fn key_warnings(raw: &str) -> Vec<String> {
     let mut out = Vec::new();
-    if let Some(raw) = raw {
-        match toml::from_str::<toml::Value>(raw) {
-            Ok(toml::Value::Table(table)) => {
-                for key in table.keys() {
-                    if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
-                        let hint = match key.as_str() {
-                            "corpora" => " (did you mean `[[corpus]]`?)",
-                            "code_repo" | "code_repos" => " (renamed to `[[repository]]`)",
-                            "repositories" => " (did you mean `[[repository]]`?)",
-                            _ => "",
-                        };
-                        out.push(format!("unknown top-level key `{key}`{hint}"));
-                    }
+    match toml::from_str::<toml::Value>(raw) {
+        Ok(toml::Value::Table(table)) => {
+            for key in table.keys() {
+                if !KNOWN_TOP_LEVEL_KEYS.contains(&key.as_str()) {
+                    let hint = match key.as_str() {
+                        "corpora" => " (did you mean `[[corpus]]`?)",
+                        "code_repo" | "code_repos" => " (renamed to `[[repository]]`)",
+                        "repositories" => " (did you mean `[[repository]]`?)",
+                        _ => "",
+                    };
+                    out.push(format!("unknown top-level key `{key}`{hint}"));
                 }
-                collect_nested_warnings(&table, "repository", KNOWN_REPOSITORY_KEYS, &mut out);
-                collect_nested_warnings(&table, "code_repo", KNOWN_REPOSITORY_KEYS, &mut out);
-                collect_nested_warnings(&table, "corpus", KNOWN_CORPUS_KEYS, &mut out);
             }
-            Ok(_) => out.push("config is not a TOML table".to_string()),
-            Err(e) => out.push(format!("re-parse for key check failed: {e}")),
+            collect_nested_warnings(&table, "repository", KNOWN_REPOSITORY_KEYS, &mut out);
+            collect_nested_warnings(&table, "code_repo", KNOWN_REPOSITORY_KEYS, &mut out);
+            collect_nested_warnings(&table, "corpus", KNOWN_CORPUS_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "embeddings", KNOWN_EMBEDDINGS_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "search", KNOWN_SEARCH_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "storage", KNOWN_STORAGE_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "daemon", KNOWN_DAEMON_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "watch", KNOWN_WATCH_KEYS, &mut out);
         }
+        Ok(_) => out.push("config is not a TOML table".to_string()),
+        Err(e) => out.push(format!("re-parse for key check failed: {e}")),
     }
+    out
+}
+
+/// "no corpora configured" advisory, checked once against the merged
+/// effective config (not per-layer — a repository-only baseline plus an
+/// empty repo layer is still a valid effective config).
+fn effective_empty_warning(cfg: &Config) -> Option<String> {
     // Count effective corpora (explicit `[[corpus]]` + repository-derived
     // `repo:*:wiki` / `repo:*:corpus`) so a repository-only config doesn't
     // get falsely flagged as empty when the daemon would happily serve it.
@@ -347,13 +404,33 @@ fn collect_warnings(raw: Option<&str>, cfg: &Config) -> Vec<String> {
         .effective_corpora()
         .map(|c| c.is_empty())
         .unwrap_or(true);
-    if effective_empty {
-        out.push(
-            "no corpora configured — `ground`, `index`, and `add_markdown` will all error \
-             until you add at least one `[[corpus]]` or `[[repository]]` entry"
-                .to_string(),
-        );
+    effective_empty.then(|| {
+        "no corpora configured — `ground`, `index`, and `add_markdown` will all error \
+         until you add at least one `[[corpus]]` or `[[repository]]` entry"
+            .to_string()
+    })
+}
+
+/// Run the unknown-key checks against every resolved config layer's raw
+/// text (baseline + repo layer, when present), labeling each warning with
+/// its source file. Before this, `config validate` only ever checked the
+/// baseline's raw text, so an unknown scalar key written in the repo-layer
+/// `.hallouminate/config.toml` (e.g. `[embeddings] enable = false`) parsed
+/// cleanly into `Config` via serde's unknown-field tolerance and was
+/// silently dropped without a warning. The "no corpora configured" check
+/// still runs once against the merged effective config.
+fn collect_layered_warnings(layers: &[(&Path, Option<&str>)], cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    for (path, raw) in layers {
+        if let Some(raw) = raw {
+            out.extend(
+                key_warnings(raw)
+                    .into_iter()
+                    .map(|w| format!("{}: {w}", path.display())),
+            );
+        }
     }
+    out.extend(effective_empty_warning(cfg));
     out
 }
 
@@ -378,6 +455,28 @@ fn collect_nested_warnings(
             if !known.contains(&key.as_str()) {
                 out.push(format!("unknown key `{key}` in [[{array_key}]]"));
             }
+        }
+    }
+}
+
+/// Flag unknown keys inside a scalar (non-array) `[section]` table, e.g.
+/// `[embeddings]`, against `known`. Complements `collect_nested_warnings`
+/// (array-of-tables): a scalar section is itself a known top-level key, so
+/// the top-level check never descends into it, and a stray/typo'd field
+/// (e.g. `[embeddings] enable = false` instead of `enabled`) parses cleanly
+/// via serde's unknown-field tolerance and was silently dropped.
+fn collect_scalar_table_warnings(
+    table: &toml::value::Table,
+    section_key: &str,
+    known: &[&str],
+    out: &mut Vec<String>,
+) {
+    let Some(toml::Value::Table(section)) = table.get(section_key) else {
+        return;
+    };
+    for key in section.keys() {
+        if !known.contains(&key.as_str()) {
+            out.push(format!("unknown key `{key}` in [{section_key}]"));
         }
     }
 }
@@ -706,6 +805,49 @@ mod tests {
         .expect("layered validate must succeed");
     }
 
+    #[test]
+    fn validate_flags_unknown_key_in_repo_layer_not_just_baseline() {
+        // Regression for the age finding: `collect_warnings` only ever saw
+        // the baseline's raw text, so an unknown scalar key written in the
+        // *repo* layer (`[embeddings] enable = false` — the real field is
+        // `enabled`) parsed cleanly via serde's unknown-field tolerance,
+        // printed "ok", and exited 0. It must now surface as a warning.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg_path = dir.path().join("xdg.toml");
+        fs::write(&xdg_path, "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n")
+            .expect("write valid XDG baseline");
+        let cwd = canon(dir.path());
+        write_repo_config(&cwd, "[embeddings]\nenable = false\n");
+        let err = cmd_config_validate(ConfigValidateArgs {
+            config: Some(xdg_path),
+            cwd: Some(cwd),
+        })
+        .expect_err("unknown repo-layer key must surface a warning, not exit ok");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("1 warning"),
+            "expected exactly one warning (the unknown `enable` key): {msg}"
+        );
+    }
+
+    #[test]
+    fn collect_layered_warnings_labels_each_warning_with_its_source_file() {
+        let baseline_path = PathBuf::from("/etc/hallouminate/config.toml");
+        let repo_path = PathBuf::from("/repo/.hallouminate/config.toml");
+        let repo_raw = "[embeddings]\nenable = false\n";
+        let layers: Vec<(&Path, Option<&str>)> =
+            vec![(&baseline_path, Some("")), (&repo_path, Some(repo_raw))];
+        let cfg = toml::from_str::<Config>(repo_raw).expect("parse despite stray key");
+        let warnings = collect_layered_warnings(&layers, &cfg);
+        let hit = warnings
+            .iter()
+            .find(|w| w.contains("unknown key `enable` in [embeddings]"))
+            .unwrap_or_else(|| panic!("missing unknown-key warning: {warnings:?}"));
+        assert!(
+            hit.starts_with("/repo/.hallouminate/config.toml: "),
+            "warning must be labeled with its source file: {hit}"
+        );
+    }
     #[test]
     fn show_uses_effective_merged_config() {
         // Both XDG and repo layer declare corpora; render_config(&effective)
