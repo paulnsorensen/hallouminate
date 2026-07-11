@@ -375,6 +375,11 @@ async fn handle_connection(
     stream: UnixStream,
     idle_timeout: Duration,
 ) -> anyhow::Result<()> {
+    // Best-effort peer uid, checked below against the mutating-request
+    // allowlist (B6 defense-in-depth). Captured before `into_split` since the
+    // whole `UnixStream` (not either half) implements `AsRawFd`.
+    let peer_uid = peer_credential_uid(&stream);
+    let effective_uid = rustix::process::geteuid().as_raw();
     let (read_half, mut write_half) = stream.into_split();
     // Cap the newline-delimited request line's allocation — `.take()` bounds
     // how many bytes `read_line` will pull before giving up, so an oversized
@@ -406,7 +411,10 @@ async fn handle_connection(
         ))
     } else {
         match serde_json::from_str::<DaemonRequest>(line.trim_end()) {
-            Ok(req) => dispatch(&state, req).await,
+            Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
+                Some(denied) => denied,
+                None => dispatch(&state, req).await,
+            },
             Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
         }
     };
@@ -467,6 +475,99 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Reject mutating requests (`AddMarkdown`/`DeleteMarkdown`/`Index`/
+/// `Shutdown`) from a peer whose uid doesn't match the daemon's effective
+/// uid (B6 defense-in-depth). The socket + parent dir are already
+/// owner-only (0o600 / 0o700 in [`serve_on_listener`]/[`prepare_socket_dir`]),
+/// so this only matters if those perms are loosened after boot on a shared
+/// machine. Read-only requests (Ping/Ground/List*/Backlinks/ReadMarkdown/
+/// CorpusStats) are unrestricted. `peer_uid: None` (credential lookup
+/// unsupported or failed) fails closed for mutating requests rather than
+/// silently allowing them.
+fn authorize_peer(
+    peer_uid: Option<u32>,
+    effective_uid: u32,
+    payload: &super::ipc::DaemonRequestPayload,
+) -> Option<DaemonResponse> {
+    if !is_mutating_payload(payload) {
+        return None;
+    }
+    match peer_uid {
+        Some(uid) if uid == effective_uid => None,
+        Some(uid) => Some(DaemonResponse::invalid_params(format!(
+            "peer uid {uid} is not authorized for mutating requests (daemon uid {effective_uid})"
+        ))),
+        None => Some(DaemonResponse::invalid_params(
+            "peer credentials unavailable; refusing mutating request",
+        )),
+    }
+}
+
+fn is_mutating_payload(payload: &super::ipc::DaemonRequestPayload) -> bool {
+    use super::ipc::DaemonRequestPayload;
+    matches!(
+        payload,
+        DaemonRequestPayload::AddMarkdown(_)
+            | DaemonRequestPayload::DeleteMarkdown(_)
+            | DaemonRequestPayload::Index(_)
+            | DaemonRequestPayload::Shutdown
+    )
+}
+
+/// Best-effort peer uid of a connected Unix-domain socket: `SO_PEERCRED` on
+/// Linux, `getpeereid` on macOS/BSD (rustix's `net::sockopt::socket_peercred`
+/// is Linux-only, so it can't cover both). `None` on any error or
+/// unsupported platform; [`authorize_peer`] fails closed for mutating
+/// requests in that case.
+fn peer_credential_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    raw_peer_uid(stream.as_raw_fd())
+}
+
+#[cfg(target_os = "linux")]
+fn raw_peer_uid(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 { Some(cred.uid) } else { None }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn raw_peer_uid(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let ret = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+    if ret == 0 { Some(uid) } else { None }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+fn raw_peer_uid(_fd: std::os::fd::RawFd) -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +611,53 @@ mod tests {
         remove_stale_socket(&stale).await;
         assert!(!stale.exists(), "stale socket must be removed before bind");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── B6: peer-credential authorization ──────────────────────────────
+
+    #[test]
+    fn authorize_peer_allows_same_uid_mutating_request() {
+        use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
+        let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
+        assert!(
+            authorize_peer(Some(501), 501, &payload).is_none(),
+            "same-uid peer must be authorized for a mutating request"
+        );
+    }
+
+    #[test]
+    fn authorize_peer_rejects_different_uid_mutating_request() {
+        use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
+        let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
+        let response = authorize_peer(Some(999), 501, &payload)
+            .expect("different-uid peer must be rejected for a mutating request");
+        match response {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams, "{message}");
+                assert!(message.contains("999") && message.contains("501"), "{message}");
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("unauthorized mutating request must error; got Ok({result:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn authorize_peer_allows_different_uid_read_only_request() {
+        use super::super::ipc::DaemonRequestPayload;
+        assert!(
+            authorize_peer(Some(999), 501, &DaemonRequestPayload::Ping).is_none(),
+            "read-only requests must stay unrestricted regardless of peer uid"
+        );
+    }
+
+    #[test]
+    fn authorize_peer_fails_closed_when_peer_uid_unknown() {
+        use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
+        let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
+        assert!(
+            authorize_peer(None, 501, &payload).is_some(),
+            "unresolvable peer credentials must fail closed for a mutating request"
+        );
     }
 }
