@@ -635,24 +635,14 @@ impl DaemonState {
                 .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
         }
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        let embedder: Option<Embedder> = if cfg.embeddings.enabled {
-            match tokio::task::block_in_place(|| {
-                Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir)
-            }) {
-                Ok(e) => Some(e),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        model = %cfg.embeddings.model,
-                        error = %e,
-                        "embedder unavailable for repo-layer resource config; will retry on first embedding request",
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Embedder construction is a cold ONNX model load (seconds). Do NOT
+        // eager-build it here: this whole function runs under the shared
+        // `resources` map mutex, and every request handler takes this same
+        // lock via `resources_for`. Building the embedder here would stall
+        // every other request — including cache hits on other keys — behind
+        // one first-touch model load. Leave it `None`; the lazy per-entry
+        // `RequestResources::embedder()` loads it on first use under its OWN
+        // lock, outside the map mutex.
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
         let store = LanceStore::open_or_create(
@@ -668,7 +658,7 @@ impl DaemonState {
             tokenizer,
             embeddings_enabled: cfg.embeddings.enabled,
             ground_dir: ground_dir.clone(),
-            embedder: Arc::new(Mutex::new(embedder)),
+            embedder: Arc::new(Mutex::new(None)),
             model: cfg.embeddings.model.clone(),
             quantized: cfg.embeddings.quantized,
             cache_dir,
