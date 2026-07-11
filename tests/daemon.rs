@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use hallouminate::app::config::Config;
 use hallouminate::app::daemon::{
-    AddMarkdownRequest, BacklinksRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse,
-    DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult, IndexRequest,
-    LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest, connect_at, serve,
+    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListFilesResult,
+    Position, ReadMarkdownRequest, connect_at, serve,
     spawn_signal_handlers,
 };
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
@@ -3683,4 +3684,185 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
         !socket.exists(),
         "socket must be removed once the drain completes"
     );
+}
+
+// ─── C0: per-request resource seam (B2+B3) ──────────────────────────────
+//
+// `DaemonState::resources_for` resolves `[storage].ground_dir` /
+// `[embeddings].enabled` / `[embeddings].model` from the *effective*
+// (baseline + repo-layer) config on every request, instead of the
+// boot-frozen baseline the daemon opened with. Each test below sends a
+// baseline request first (no restart), then a second request whose `cwd`
+// carries a repo-layer override, and asserts the override is observed on
+// that very next request. Against the pre-seam code — which read
+// `state.store()` / `state.embeddings_enabled()` / `state.embedder()`
+// directly, ignoring the resolved per-request config — every override
+// below would be silently ignored and the assertions would fail.
+
+/// Seed `dir` with a `.hallouminate/config.toml` carrying `toml`, so a
+/// `DaemonRequest` using it as `cwd` resolves a repo layer with that content.
+fn repo_override_cwd(dir: &Path, toml: &str) -> PathBuf {
+    let hallou = dir.join(".hallouminate");
+    std::fs::create_dir_all(&hallou).expect("mkdir .hallouminate");
+    std::fs::write(hallou.join("config.toml"), toml).expect("write repo override config");
+    dir.to_path_buf()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resources_for_observes_repo_layer_embeddings_enabled_override_without_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let ground = tmp.path().join("ground");
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    // Baseline config leaves `[embeddings]` unset, so `enabled` defaults to
+    // `true` — `DaemonState::open` establishes the ground store's
+    // `meta.toml` with `embeddings_enabled = true`.
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let baseline_resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("baseline request transport ok");
+    match baseline_resp {
+        DaemonResponse::Ok { result } => {
+            let stats: CorpusStatsResult =
+                serde_json::from_value(result).expect("parse CorpusStatsResult");
+            assert_eq!(stats.corpus, "docs");
+        }
+        other => panic!("baseline corpus_stats must succeed, got {other:?}"),
+    }
+
+    // Second request, same `ground_dir` (inherited — the override cwd does
+    // not set `[storage]`), but a repo layer that flips embeddings off.
+    let override_cwd = repo_override_cwd(
+        &tmp.path().join("override-enabled"),
+        "[embeddings]\nenabled = false\n",
+    );
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: override_cwd,
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("override request transport ok");
+    match resp {
+        // The overridden request resolves a *different* resource key
+        // (`embeddings_enabled = false`) than the baseline's, so
+        // `resources_for` reopens the same `ground_dir` under the new
+        // value and the store's meta-mismatch guard refuses — proof the
+        // override was actually applied on this request, not silently
+        // reused from the baseline's `enabled = true` store.
+        DaemonResponse::Err { message, .. } => {
+            assert!(
+                message.contains("embedding store mismatch"),
+                "got: {message}"
+            );
+            assert!(
+                message.contains("embeddings_enabled true"),
+                "error must name the baseline's enabled=true store: {message}"
+            );
+            assert!(
+                message.contains("embeddings_enabled false"),
+                "error must name the overridden request's enabled=false: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => panic!(
+            "repo-layer `embeddings.enabled = false` must be observed on the next \
+             request without a daemon restart; boot-frozen resources would silently \
+             reuse the baseline (enabled=true) store instead of reopening under the \
+             override, got Ok: {result:?}"
+        ),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resources_for_observes_repo_layer_embeddings_model_override_without_restart() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let ground = tmp.path().join("ground");
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    // Baseline leaves `embeddings.model` unset (default: snowflake-arctic-embed-s),
+    // with embeddings disabled so no embedder ever loads — this test is about
+    // the model *name* recorded in the store, not actual embedding compute.
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let baseline_resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("baseline request transport ok");
+    match baseline_resp {
+        DaemonResponse::Ok { result } => {
+            let stats: CorpusStatsResult =
+                serde_json::from_value(result).expect("parse CorpusStatsResult");
+            assert_eq!(stats.corpus, "docs");
+        }
+        other => panic!("baseline corpus_stats must succeed, got {other:?}"),
+    }
+
+    // Second request: repo layer overrides `embeddings.model`; `enabled`
+    // stays inherited (false) so no embedder load is attempted either way.
+    let override_cwd = repo_override_cwd(
+        &tmp.path().join("override-model"),
+        "[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+    );
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: override_cwd,
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some("docs".into()),
+            },
+        })
+        .await
+        .expect("override request transport ok");
+    match resp {
+        // Different model in the resource key reopens the same `ground_dir`
+        // under the new model name; the meta-mismatch guard names both,
+        // proving the override reached the store rather than being ignored.
+        DaemonResponse::Err { message, .. } => {
+            assert!(
+                message.contains("embedding store mismatch"),
+                "got: {message}"
+            );
+            assert!(
+                message.contains("snowflake/snowflake-arctic-embed-s"),
+                "error must name the baseline's default model: {message}"
+            );
+            assert!(
+                message.contains("BAAI/bge-small-en-v1.5"),
+                "error must name the overridden request's model: {message}"
+            );
+        }
+        DaemonResponse::Ok { result } => panic!(
+            "repo-layer `embeddings.model` override must be observed on the next \
+             request without a daemon restart; boot-frozen resources would silently \
+             reuse the baseline model's store instead of reopening under the \
+             override, got Ok: {result:?}"
+        ),
+    }
 }

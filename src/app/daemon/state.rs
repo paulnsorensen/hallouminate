@@ -1410,4 +1410,66 @@ mod tests {
              even though the source dir's mtime was 60d old",
         );
     }
+
+    /// C0 regression (state.rs unit half): `resources_for` must key its
+    /// cache on `storage.ground_dir` alone, without going through the
+    /// config-merge layer at all (hermetic — no repo-discovery, no scalar-
+    /// conflict guard). Two effective `Config`s differing only in
+    /// `ground_dir` must resolve to two distinct `RequestResources`, each
+    /// rooted at its own tempdir; the same config queried twice must return
+    /// the identical cached `Arc` rather than opening a second store.
+    #[tokio::test]
+    async fn resources_for_keys_on_ground_dir() {
+        let tmp_a = tempfile::tempdir().expect("tempdir a");
+        let tmp_b = tempfile::tempdir().expect("tempdir b");
+
+        let mut cfg_a = Config::default();
+        cfg_a.embeddings.enabled = false;
+        cfg_a.storage.ground_dir = tmp_a.path().to_string_lossy().into_owned();
+
+        let mut cfg_b = cfg_a.clone();
+        cfg_b.storage.ground_dir = tmp_b.path().to_string_lossy().into_owned();
+
+        let state = DaemonState::open(cfg_a.clone(), None)
+            .await
+            .expect("open daemon state");
+
+        let res_a1 = state
+            .resources_for(&cfg_a)
+            .await
+            .expect("resources_for cfg_a (first call)");
+        let res_a2 = state
+            .resources_for(&cfg_a)
+            .await
+            .expect("resources_for cfg_a (second call)");
+        assert!(
+            Arc::ptr_eq(&res_a1, &res_a2),
+            "same config must resolve the same cached RequestResources Arc, \
+             not rebuild or reopen a second store",
+        );
+
+        let res_b = state
+            .resources_for(&cfg_b)
+            .await
+            .expect("resources_for cfg_b");
+        assert!(
+            !Arc::ptr_eq(&res_a1, &res_b),
+            "a different ground_dir must key a distinct RequestResources entry",
+        );
+        assert_eq!(
+            res_a1.ground_dir,
+            tmp_a.path(),
+            "cfg_a's resources must be rooted at tmp_a's ground_dir",
+        );
+        assert_eq!(
+            res_b.ground_dir,
+            tmp_b.path(),
+            "cfg_b's resources must be rooted at tmp_b's ground_dir, not cfg_a's",
+        );
+        assert!(
+            tmp_b.path().join("meta.toml").exists(),
+            "resources_for must open (and initialize) a store at the new \
+             ground_dir on first use",
+        );
+    }
 }
