@@ -74,8 +74,10 @@ pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileSnapshot>)
                 // (same-mtime edit, clock skew): verify with a content hash
                 // before declaring the file unchanged, mirroring the
                 // single-file reroute's hash check in dispatch.rs. A hash
-                // read failure is treated the same as a changed file so
-                // `apply`'s own re-hash surfaces the error.
+                // read failure means the file is transiently unreadable —
+                // log and keep the existing snapshot (pre-hash-verify
+                // behavior), rather than routing to apply() where its own
+                // re-hash would abort the whole corpus index.
                 match blake3_file(file.as_path()) {
                     Ok(hash) if hash == snap.content_hash => continue,
                     Ok(hash) => out.mtime_touches.push(MtimeCandidate {
@@ -84,12 +86,14 @@ pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileSnapshot>)
                         new_mtime: mtime,
                         known_hash: Some(hash),
                     }),
-                    Err(_) => out.mtime_touches.push(MtimeCandidate {
-                        file,
-                        snap,
-                        new_mtime: mtime,
-                        known_hash: None,
-                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "hallouminate::indexer",
+                            file = %file.as_path().display(),
+                            error = %e,
+                            "skipping hash verification: file unreadable, keeping existing snapshot"
+                        );
+                    }
                 }
             }
             Some(snap) => out.mtime_touches.push(MtimeCandidate {
@@ -187,7 +191,7 @@ mod tests {
         assert_eq!(
             cand.known_hash,
             Some(real_hash),
-            "plan() must carry the hash it already computed so apply() doesn't re-read the file"
+            "plan() must carry the hash it already computed so apply() doesn't re-hash the file for the touch-vs-upsert decision"
         );
     }
 
@@ -219,6 +223,60 @@ mod tests {
         assert!(p.mtime_touches.is_empty());
         assert_eq!(p.deletes.len(), 1);
         assert_eq!(p.deletes[0].file_ref, "/tmp/gone.md");
+    }
+
+    #[cfg(unix)]
+    fn nix_getuid_is_zero() -> bool {
+        // Avoid a libc dep just for this; read /proc/self/status on Linux,
+        // shell out to `id -u` everywhere else (macOS, BSDs). The test
+        // tolerates either path failing — worst case we run the assertion
+        // when we shouldn't, which only false-positives in CI containers
+        // running as root, where the assertion is a no-op anyway.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+            && let Some(line) = s.lines().find(|l| l.starts_with("Uid:"))
+        {
+            return line.split_whitespace().nth(1) == Some("0");
+        }
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_keeps_existing_snapshot_when_same_mtime_file_is_unreadable() {
+        // Regression: a same-mtime, already-indexed file that is
+        // transiently unreadable during the hash-verify check must be
+        // planned as unchanged, not routed to mtime_touches — routing it
+        // would hit apply()'s own re-hash and abort the whole corpus index
+        // (pre-hash-verify behavior was a zero-IO silent skip).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, hash) = write_file(dir.path(), "locked.md", b"stable content");
+        let is_root = nix_getuid_is_zero();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let file = FileRef::new(path.clone());
+        let disk = vec![(file.clone(), Mtime(100))];
+        let mut db = HashMap::new();
+        db.insert(file, snap(path.to_str().unwrap(), 100, &hash));
+        let p = plan(disk, db);
+        // Restore perms before any potential assertion failure unwind, so
+        // the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        if is_root {
+            return; // root reads through 0o000; the negative test is meaningless.
+        }
+        assert!(p.upserts.is_empty());
+        assert!(
+            p.mtime_touches.is_empty(),
+            "unreadable same-mtime file must not route to apply(); got {:?}",
+            p.mtime_touches
+        );
+        assert!(p.deletes.is_empty());
     }
 
     #[test]
