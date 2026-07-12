@@ -1,6 +1,6 @@
 {
   "name": "hallouminate",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Install hallouminate and bootstrap your first LLM-authored per-repo wiki.",
   "author": {
     "name": "Paul Sorensen",
