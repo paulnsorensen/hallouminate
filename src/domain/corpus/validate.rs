@@ -185,15 +185,59 @@ pub fn resolve_slug(target: &str, paths: &[String]) -> SlugResolution {
     }
 }
 
+/// Precomputed lookup from a normalized slug key (full path or bare stem) to
+/// the corpus-relative paths that resolve under it, built once per
+/// `lint_wikilinks` call instead of re-normalizing every path per link
+/// (`resolve_slug` does the latter, which is O(links x pages)). A path whose
+/// stem key coincides with its own full-slug key is inserted once, so a
+/// target matching both ways for the same page isn't double-counted.
+struct SlugIndex<'a> {
+    by_key: std::collections::HashMap<String, Vec<&'a str>>,
+}
+
+impl<'a> SlugIndex<'a> {
+    fn build(paths: &'a [String]) -> Self {
+        let mut by_key: std::collections::HashMap<String, Vec<&str>> =
+            std::collections::HashMap::new();
+        for path in paths {
+            let full_key = normalize_slug(path);
+            let stem_key = Path::new(path.as_str())
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase());
+            by_key
+                .entry(full_key.clone())
+                .or_default()
+                .push(path.as_str());
+            if stem_key.as_deref() != Some(full_key.as_str())
+                && let Some(stem_key) = stem_key
+            {
+                by_key.entry(stem_key).or_default().push(path.as_str());
+            }
+        }
+        Self { by_key }
+    }
+
+    fn resolve(&self, target: &str) -> SlugResolution {
+        match self.by_key.get(&normalize_slug(target)) {
+            None => SlugResolution::Missing,
+            Some(matches) if matches.len() == 1 => SlugResolution::Unique(matches[0].to_string()),
+            Some(matches) => {
+                SlugResolution::Ambiguous(matches.iter().map(|s| s.to_string()).collect())
+            }
+        }
+    }
+}
+
 /// Flag every `[[wikilink]]` in `content` whose target does not uniquely
 /// resolve to a page in `paths`. Advisory-only, mirrors `lint_markdown`:
 /// never rewrites or blocks the write. A bare stem shared by two or more
 /// pages is flagged as ambiguous, listing the candidates, instead of being
 /// silently accepted.
 pub fn lint_wikilinks(content: &str, paths: &[String]) -> Vec<String> {
+    let index = SlugIndex::build(paths);
     find_wikilinks(content)
         .into_iter()
-        .filter_map(|target| match resolve_slug(&target, paths) {
+        .filter_map(|target| match index.resolve(&target) {
             SlugResolution::Unique(_) => None,
             SlugResolution::Missing => Some(format!(
                 "wikilink [[{target}]] has no matching page in the corpus"
@@ -341,6 +385,16 @@ mod tests {
         assert!(warnings[0].contains("ambiguous"));
         assert!(warnings[0].contains("guide/setup.md"));
         assert!(warnings[0].contains("other/setup.md"));
+    }
+
+    #[test]
+    fn top_level_wikilink_matching_both_full_slug_and_stem_is_not_double_counted() {
+        // "foo.md" at the corpus root has an identical full-slug and bare
+        // stem ("foo"), so a target of "foo" must resolve Unique, not
+        // Ambiguous from counting the same page under both lookup keys.
+        let paths = vec!["foo.md".to_string()];
+        let text = "See [[foo]] for details.\n";
+        assert!(lint_wikilinks(text, &paths).is_empty());
     }
 
     #[test]

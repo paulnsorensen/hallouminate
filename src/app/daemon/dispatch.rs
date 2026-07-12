@@ -1550,23 +1550,33 @@ async fn rebuild_wiki_indexes(
         }
 
         let existing = {
-            let owned_path = index_path.clone();
-            match tokio::task::spawn_blocking(move || {
+            let owned_root = root.to_path_buf();
+            let owned_relative = match index_path.strip_prefix(root) {
+                Ok(p) => p.to_path_buf(),
+                Err(_) => {
+                    return Err(format!(
+                        "index path {} not under root",
+                        index_path.display()
+                    ));
+                }
+            };
+            match tokio::task::spawn_blocking(move || read_no_follow(&owned_root, &owned_relative))
+                .await
+            {
                 // Treat a symlinked index.md as invalid (as if absent) so a
                 // child directory's index.md symlink can't smuggle content
                 // from outside the corpus into the composed ancestor index.
-                match std::fs::symlink_metadata(&owned_path) {
-                    Ok(meta) if meta.file_type().is_symlink() => Ok(None),
-                    Ok(_) => std::fs::read_to_string(&owned_path).map(Some),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(e),
+                Ok(Err(e)) if matches!(e.kind, WriteErrorKind::Symlink) => None,
+                Ok(Err(e))
+                    if matches!(e.kind, WriteErrorKind::Io)
+                        && e.source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    None
                 }
-            })
-            .await
-            {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Ok(Err(e)) => return Err(format!("read {}: {e}", index_path.display())),
+                Ok(Err(e)) => {
+                    return Err(format!("read {}: {}", index_path.display(), e.source));
+                }
+                Ok(Ok(bytes)) => Some(String::from_utf8_lossy(&bytes).into_owned()),
                 Err(e) => {
                     return Err(format!("read {} join failed: {e}", index_path.display()));
                 }

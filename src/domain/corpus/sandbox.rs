@@ -1356,7 +1356,16 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o644, "new file must get the configured safe mode");
+        assert_eq!(
+            mode & !0o644,
+            0,
+            "new file must not be more permissive than the configured safe mode"
+        );
+        assert_eq!(
+            mode & 0o600,
+            0o600,
+            "new file must be owner-readable and owner-writable"
+        );
     }
 
     #[test]

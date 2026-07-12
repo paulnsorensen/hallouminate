@@ -419,6 +419,7 @@ mod tests {
         assert_eq!(read_h1(Path::new("/"), Path::new("/does/not/exist")), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_h1_returns_none_for_symlinked_file() {
         // The bug this guards: a symlinked index.md (or child markdown file)
@@ -434,6 +435,7 @@ mod tests {
         assert_eq!(read_h1(tmp.path(), &link), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_h1_returns_none_for_symlinked_ancestor_directory() {
         // The gap the leaf-only lstat guard left open: the LEAF itself is a
@@ -455,6 +457,7 @@ mod tests {
         assert_eq!(read_h1(base.path(), &path_through_symlink), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn read_h1_returns_none_when_grandparent_directory_is_symlinked() {
         // Closes the gap the immediate-parent-only check left open: a
@@ -570,6 +573,7 @@ mod tests {
         assert_eq!(lines, vec!["- [a](./a.md) — A"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn enumerate_children_skips_symlinks_into_corpus() {
         // Defense in depth against a malicious-or-buggy corpus that swaps a
