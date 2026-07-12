@@ -211,10 +211,10 @@ jobs:
             echo "attempt ${attempt}: exit=${code}"
             echo "--- stdout ---"; echo "$output"
             echo "--- stderr ---"; cat stderr.txt || true
-            if [ "$code" -eq 0 ] && printf '%s' "$output" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            if [ "$code" -eq 0 ] && printf '%s' "$output" | grep -Eq '^hallouminate [0-9]+\.[0-9]+\.[0-9]+'; then
               exit 0
             fi
             sleep 30
           done
-          echo "smoke test FAILED after 10 attempts (expected semver on stdout)"
+          echo "smoke test FAILED after 10 attempts (expected 'hallouminate <semver>' on stdout)"
           exit 1
