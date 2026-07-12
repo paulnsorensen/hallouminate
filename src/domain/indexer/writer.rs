@@ -28,6 +28,7 @@ pub(super) fn prepare_file(
     req: WriteRequest<'_>,
     registry: &HandlerRegistry,
     indexed_at_ms: i64,
+    bytes_override: Option<&[u8]>,
 ) -> Result<Option<PreparedFile>> {
     let path = req.file.as_path();
     // Skip a known-unsupported extension before any IO — no read, no hash.
@@ -40,12 +41,19 @@ pub(super) fn prepare_file(
         return Ok(None);
     }
 
-    let bytes = fs::read(path)?;
+    let owned_bytes;
+    let bytes: &[u8] = match bytes_override {
+        Some(b) => b,
+        None => {
+            owned_bytes = fs::read(path)?;
+            &owned_bytes
+        }
+    };
     // Hash the full file (frontmatter included) so any edit to the block still
     // changes the content hash and triggers a re-index.
-    let content_hash = blake3_bytes(&bytes);
+    let content_hash = blake3_bytes(bytes);
 
-    let Some(format) = detect_format(path, &bytes) else {
+    let Some(format) = detect_format(path, bytes) else {
         // Reached only for extensionless names that sniff to an unsupported type.
         tracing::debug!(
             target: "hallouminate::indexer",
@@ -59,7 +67,7 @@ pub(super) fn prepare_file(
         corpus: req.corpus,
         file: req.file,
         mtime: req.mtime,
-        bytes: &bytes,
+        bytes,
         content_hash,
         indexed_at_ms,
     };
@@ -125,6 +133,7 @@ mod tests {
             },
             registry,
             indexed_at,
+            None,
         )
         .expect("prepare_file must not hard-error")
         .expect("file must be prepared, not skipped")
@@ -172,6 +181,7 @@ mod tests {
             },
             &registry(2000),
             0,
+            None,
         )
         .expect("non-utf8 must be a skip, not a hard error");
         assert!(out.is_none(), "non-utf8 file must be skipped (Ok(None))");

@@ -420,6 +420,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
         &registry,
         &corpus,
         DEFAULT_BATCH_SIZE,
+        None,
     )
     .await
     .expect_err("missing file must surface as Err, not silent skip");
