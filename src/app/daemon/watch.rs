@@ -330,14 +330,9 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
         // no-follow read below both rejects the symlink and supplies the
         // content, closing the TOCTOU gap a separate check-then-read would
         // leave open to a symlink swapped in between the two calls.
-        let Ok(relative) = path.strip_prefix(&owner.canonical_watched) else {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                path = %path.display(),
-                "watcher: rejected symlinked path; skipping reindex",
-            );
-            return;
-        };
+        let relative = path
+            .strip_prefix(&owner.canonical_watched)
+            .expect("owning_corpus guarantees path starts_with canonical_watched");
         let (bytes, mtime) = match crate::domain::corpus::sandbox::read_no_follow_with_mtime(
             &owner.canonical_watched,
             relative,
@@ -348,7 +343,7 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
                     target: "hallouminate::daemon",
                     path = %path.display(),
                     error = ?e,
-                    "watcher: rejected symlinked path; skipping reindex",
+                    "watcher: skipping reindex, no-follow read failed",
                 );
                 return;
             }

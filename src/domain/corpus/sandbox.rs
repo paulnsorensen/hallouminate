@@ -461,28 +461,16 @@ pub fn atomic_write_no_follow(
 ///   carries a NUL byte.
 /// - [`WriteErrorKind::Io`] when the file is absent or any other read fails.
 pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteError> {
-    let names = normal_components(relative)?;
-    let file_name = names
-        .last()
-        .ok_or_else(|| invalid_path_error("path must name a file"))?;
-    let parent = open_parent_dir(root, &names[..names.len() - 1])?;
-    reject_symlink_leaf(&parent, file_name.as_os_str())?;
-    let cap_file = parent
-        .open(file_name.as_os_str())
-        .map_err(classify_path_io_error)?;
-    let mut file = cap_file.into_std();
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf)
-        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
-    Ok(buf)
+    read_no_follow_with_mtime(root, relative).map(|(bytes, _)| bytes)
 }
 
 /// Read the contents of `<root>/<relative>` and its mtime from one no-follow
-/// resolution, so a caller that must both reject symlinks and read content
-/// cannot be raced by a symlink swapped in between two separate filesystem
-/// calls (check-then-ambient-read). Mirrors [`read_no_follow`]'s
-/// component-walk; the mtime comes from the same no-follow-opened file
-/// handle's `metadata()`, never an ambient `fs::metadata` call on the path.
+/// resolution, collapsing the watcher's prior check-then-ambient-read into a
+/// single cap-std handle: bytes and mtime come from the same opened file, so
+/// a symlink swapped in after a separate `fs::metadata` call can no longer
+/// desync the two reads. The residual `symlink_metadata` + `open` split
+/// inside the component walk (see [`open_or_create_child_dir`]) is bounded to
+/// the corpus root by cap-std, not atomic at the syscall level.
 ///
 /// # Errors
 ///

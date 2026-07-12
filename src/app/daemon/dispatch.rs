@@ -1320,47 +1320,51 @@ pub(super) async fn index_single_file_with_content(
         .to_string();
     let existing = store.get_file_snapshot(&corpus.name, &file_ref_str).await?;
     let mut db: HashMap<FileRef, FileSnapshot> = HashMap::new();
-    // Carries the snapshot when the mtime lied (same-second truncation/edit)
-    // but the content hash moved: `plan()` would otherwise skip this file
-    // entirely (mtime unchanged) or, if omitted from `db`, misroute it as a
-    // brand-new upsert with no prior rows to evict. Neither is right — it
-    // must go through the mtime-fallthrough path so a truncate-to-empty here
-    // still evicts stale rows (`EmptyFilePolicy::Evict`).
-    let mut reindex_despite_same_mtime: Option<(FileSnapshot, String)> = None;
-    if let Some(snap) = existing {
-        let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
-            let hash = blake3_bytes(bytes);
-            if hash != snap.content_hash.as_str() {
-                reindex_despite_same_mtime = Some((snap.clone(), hash));
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !hash_changed_without_mtime {
-            db.insert(file_ref.clone(), snap);
-        }
-    }
-    let mut p = plan(vec![(file_ref.clone(), Mtime(mtime_ms))], db);
-    if let Some((snap, known_hash)) = reindex_despite_same_mtime
-        && let Some(idx) = p.upserts.iter().position(|u| u.file == file_ref)
-    {
-        let upsert = p.upserts.remove(idx);
-        p.mtime_touches
-            .push(crate::domain::indexer::MtimeCandidate {
-                file: upsert.file,
-                snap,
-                new_mtime: upsert.mtime,
-                known_hash: Some(known_hash),
-            });
-    }
     // Truncate-to-empty eviction (files_skipped_empty > 0 for a file that HAD
     // a snapshot) is handled inside `apply`'s mtime-fallthrough batch — see
     // `EmptyFilePolicy::Evict` in `src/domain/indexer/apply.rs` — so both this
     // single-file path and bulk `index_corpus` share one eviction rule.
     let stats = tokio::task::block_in_place(|| {
+        // Carries the snapshot when the mtime lied (same-second truncation/edit)
+        // but the content hash moved: `plan()` would otherwise skip this file
+        // entirely (mtime unchanged) or, if omitted from `db`, misroute it as a
+        // brand-new upsert with no prior rows to evict. Neither is right — it
+        // must go through the mtime-fallthrough path so a truncate-to-empty here
+        // still evicts stale rows (`EmptyFilePolicy::Evict`).
+        //
+        // The hash (when needed) is computed here, inside block_in_place,
+        // since blake3-hashing file bytes is blocking CPU work same as the
+        // rest of this closure.
+        let mut reindex_despite_same_mtime: Option<(FileSnapshot, String)> = None;
+        if let Some(snap) = existing {
+            let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
+                let hash = blake3_bytes(bytes);
+                if hash != snap.content_hash.as_str() {
+                    reindex_despite_same_mtime = Some((snap.clone(), hash));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !hash_changed_without_mtime {
+                db.insert(file_ref.clone(), snap);
+            }
+        }
+        let mut p = plan(vec![(file_ref.clone(), Mtime(mtime_ms))], db);
+        if let Some((snap, known_hash)) = reindex_despite_same_mtime
+            && let Some(idx) = p.upserts.iter().position(|u| u.file == file_ref)
+        {
+            let upsert = p.upserts.remove(idx);
+            p.mtime_touches
+                .push(crate::domain::indexer::MtimeCandidate {
+                    file: upsert.file,
+                    snap,
+                    new_mtime: upsert.mtime,
+                    known_hash: Some(known_hash),
+                });
+        }
         tokio::runtime::Handle::current().block_on(apply(
             p,
             store,
