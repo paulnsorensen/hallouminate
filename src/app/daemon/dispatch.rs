@@ -34,7 +34,8 @@ use crate::domain::corpus::sandbox::{
 };
 use crate::domain::corpus::scan;
 use crate::domain::corpus::{
-    SlugResolution, find_wikilinks, normalize_slug, resolve_slug, blake3_bytes, };
+    SlugResolution, blake3_bytes, find_wikilinks, normalize_slug, resolve_slug,
+};
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
