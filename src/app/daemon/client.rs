@@ -7,6 +7,7 @@
 //! explicitly; the client never auto-starts a daemon.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::de::DeserializeOwned;
@@ -139,6 +140,26 @@ impl DaemonClient {
         Ok(response)
     }
 
+    /// [`call_raw`] with a bounded round-trip deadline. `call_raw` itself
+    /// has no timeout — a daemon that accepts the connection but never
+    /// writes/reads would otherwise hang the caller forever. Lifecycle
+    /// commands (`stop`, `status`) that must never wait indefinitely for an
+    /// accepted-but-silent socket use this instead of bare `call_raw`.
+    pub async fn call_raw_with_timeout(
+        &self,
+        req: DaemonRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<DaemonResponse> {
+        match tokio::time::timeout(timeout, self.call_raw(req)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(daemon_client_unavailable(format!(
+                "no response from {} within {}s",
+                self.socket.display(),
+                timeout.as_secs(),
+            ))),
+        }
+    }
+
     /// Convenience wrapper: send a request and decode the `Ok` payload as
     /// `T`. Daemon-side `Err` variants surface as `anyhow::Error` with the
     /// daemon's message preserved.
@@ -187,6 +208,7 @@ impl std::error::Error for DaemonRpcError {}
 
 #[cfg(test)]
 mod tests {
+    use super::super::ipc::DaemonRequestPayload;
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -210,6 +232,40 @@ mod tests {
             calls.load(Ordering::SeqCst),
             0,
             "explicit-socket path must never invoke the respawn step",
+        );
+    }
+
+    #[tokio::test]
+    async fn call_raw_with_timeout_returns_err_when_server_never_replies() {
+        // The blocker this guards: `call_raw` has no built-in timeout, so a
+        // daemon that accepts the connection but never writes a response
+        // would hang the caller forever. `call_raw_with_timeout` must bound
+        // the whole round trip and return promptly instead of hanging.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock_path = tmp.path().join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        tokio::spawn(async move {
+            // Accept and hold the connection open without ever reading or
+            // writing — simulates a wedged daemon.
+            let (_stream, _addr) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let client = connect_at(&sock_path).await.expect("connect");
+        let started = std::time::Instant::now();
+        let result = client
+            .call_raw_with_timeout(
+                DaemonRequest {
+                    cwd: PathBuf::from("."),
+                    payload: DaemonRequestPayload::Ping,
+                },
+                Duration::from_millis(100),
+            )
+            .await;
+        result.expect_err("a silent server must time out, not hang");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "call_raw_with_timeout must not block past its deadline",
         );
     }
 }

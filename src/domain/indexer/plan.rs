@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::domain::common::{FileRef, Mtime};
+use crate::domain::corpus::blake3_file;
 
 /// Storage-agnostic view of a previously-indexed file. Built from the
 /// denormalized columns of the chunks table by `LanceStore::list_files`.
@@ -68,7 +69,33 @@ pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileSnapshot>)
     for (file, mtime) in disk {
         match db.remove(&file) {
             None => out.upserts.push(Upsert { file, mtime }),
-            Some(snap) if snap.mtime_ms == mtime.0 => continue,
+            Some(snap) if snap.mtime_ms == mtime.0 => {
+                // Millisecond mtime resolution can hide a real content change
+                // (same-mtime edit, clock skew): verify with a content hash
+                // before declaring the file unchanged, mirroring the
+                // single-file reroute's hash check in dispatch.rs. A hash
+                // read failure means the file is transiently unreadable —
+                // log and keep the existing snapshot (pre-hash-verify
+                // behavior), rather than routing to apply() where its own
+                // re-hash would abort the whole corpus index.
+                match blake3_file(file.as_path()) {
+                    Ok(hash) if hash == snap.content_hash => continue,
+                    Ok(hash) => out.mtime_touches.push(MtimeCandidate {
+                        file,
+                        snap,
+                        new_mtime: mtime,
+                        known_hash: Some(hash),
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "hallouminate::indexer",
+                            file = %file.as_path().display(),
+                            error = %e,
+                            "skipping hash verification: file unreadable, keeping existing snapshot"
+                        );
+                    }
+                }
+            }
             Some(snap) => out.mtime_touches.push(MtimeCandidate {
                 file,
                 snap,
@@ -102,6 +129,15 @@ mod tests {
         }
     }
 
+    /// Writes `content` to a real file so `plan()`'s hash-verification I/O
+    /// has something to read; returns the path and its blake3 hash.
+    fn write_file(dir: &std::path::Path, name: &str, content: &[u8]) -> (PathBuf, String) {
+        let path = dir.join(name);
+        std::fs::write(&path, content).expect("write fixture file");
+        let hash = blake3_file(&path).expect("hash fixture file");
+        (path, hash)
+    }
+
     #[test]
     fn plan_routes_new_file_into_upserts() {
         let disk = vec![(fref("/tmp/new.md"), Mtime(42))];
@@ -115,15 +151,48 @@ mod tests {
     }
 
     #[test]
-    fn plan_skips_files_with_unchanged_mtime() {
-        let file = fref("/tmp/stable.md");
+    fn plan_skips_files_with_unchanged_mtime_and_matching_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, hash) = write_file(dir.path(), "stable.md", b"stable content");
+        let file = FileRef::new(path.clone());
         let disk = vec![(file.clone(), Mtime(100))];
         let mut db = HashMap::new();
-        db.insert(file, snap("/tmp/stable.md", 100, "deadbeef"));
+        db.insert(file, snap(path.to_str().unwrap(), 100, &hash));
         let p = plan(disk, db);
         assert!(p.upserts.is_empty());
         assert!(p.mtime_touches.is_empty());
         assert!(p.deletes.is_empty());
+    }
+
+    #[test]
+    fn plan_reindexes_when_content_hash_differs_despite_unchanged_mtime() {
+        // Regression for the bulk planner trusting mtime alone: a file whose
+        // millisecond mtime happens to be unchanged (clock resolution,
+        // same-mtime overwrite) but whose content hash moved must NOT be
+        // silently skipped — it must be routed for a hash-verified re-index,
+        // matching the single-file reroute's same-mtime hash check.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, real_hash) = write_file(dir.path(), "changed-in-place.md", b"new content");
+        let file = FileRef::new(path.clone());
+        let disk = vec![(file.clone(), Mtime(100))];
+        let mut db = HashMap::new();
+        db.insert(
+            file.clone(),
+            snap(path.to_str().unwrap(), 100, "stale-hash-from-old-content"),
+        );
+        let p = plan(disk, db);
+        assert!(p.upserts.is_empty());
+        assert!(p.deletes.is_empty());
+        assert_eq!(p.mtime_touches.len(), 1);
+        let cand = &p.mtime_touches[0];
+        assert_eq!(cand.file, file);
+        assert_eq!(cand.new_mtime, Mtime(100));
+        assert_eq!(cand.snap.content_hash, "stale-hash-from-old-content");
+        assert_eq!(
+            cand.known_hash,
+            Some(real_hash),
+            "plan() must carry the hash it already computed so apply() doesn't re-hash the file for the touch-vs-upsert decision"
+        );
     }
 
     #[test]
@@ -141,6 +210,7 @@ mod tests {
         assert_eq!(cand.new_mtime, Mtime(200));
         assert_eq!(cand.snap.mtime_ms, 100);
         assert_eq!(cand.snap.content_hash, "cafebabe");
+        assert_eq!(cand.known_hash, None);
     }
 
     #[test]
@@ -155,10 +225,67 @@ mod tests {
         assert_eq!(p.deletes[0].file_ref, "/tmp/gone.md");
     }
 
+    #[cfg(unix)]
+    fn nix_getuid_is_zero() -> bool {
+        // Avoid a libc dep just for this; read /proc/self/status on Linux,
+        // shell out to `id -u` everywhere else (macOS, BSDs). The test
+        // tolerates either path failing — worst case we run the assertion
+        // when we shouldn't, which only false-positives in CI containers
+        // running as root, where the assertion is a no-op anyway.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+            && let Some(line) = s.lines().find(|l| l.starts_with("Uid:"))
+        {
+            return line.split_whitespace().nth(1) == Some("0");
+        }
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plan_keeps_existing_snapshot_when_same_mtime_file_is_unreadable() {
+        // Regression: a same-mtime, already-indexed file that is
+        // transiently unreadable during the hash-verify check must be
+        // planned as unchanged, not routed to mtime_touches — routing it
+        // would hit apply()'s own re-hash and abort the whole corpus index
+        // (pre-hash-verify behavior was a zero-IO silent skip).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, hash) = write_file(dir.path(), "locked.md", b"stable content");
+        let is_root = nix_getuid_is_zero();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let file = FileRef::new(path.clone());
+        let disk = vec![(file.clone(), Mtime(100))];
+        let mut db = HashMap::new();
+        db.insert(file, snap(path.to_str().unwrap(), 100, &hash));
+        let p = plan(disk, db);
+        // Restore perms before any potential assertion failure unwind, so
+        // the tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
+        if is_root {
+            return; // root reads through 0o000; the negative test is meaningless.
+        }
+        assert!(p.upserts.is_empty());
+        assert!(
+            p.mtime_touches.is_empty(),
+            "unreadable same-mtime file must not route to apply(); got {:?}",
+            p.mtime_touches
+        );
+        assert!(p.deletes.is_empty());
+    }
+
     #[test]
     fn plan_handles_full_matrix_simultaneously() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (stable_path, stable_hash) = write_file(dir.path(), "stable.md", b"stable content");
+
         let new = fref("/tmp/new.md");
-        let stable = fref("/tmp/stable.md");
+        let stable = FileRef::new(stable_path.clone());
         let changed = fref("/tmp/changed.md");
         let gone = fref("/tmp/gone.md");
         let disk = vec![
@@ -167,7 +294,7 @@ mod tests {
             (changed.clone(), Mtime(30)),
         ];
         let mut db = HashMap::new();
-        db.insert(stable, snap("/tmp/stable.md", 2, "aa"));
+        db.insert(stable, snap(stable_path.to_str().unwrap(), 2, &stable_hash));
         db.insert(changed, snap("/tmp/changed.md", 20, "bb"));
         db.insert(gone, snap("/tmp/gone.md", 5, "cc"));
 

@@ -25,7 +25,7 @@ use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use crate::domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
 use crate::domain::corpus::sandbox::ensure_corpus_allows_file;
 
-use super::dispatch::index_single_file;
+use super::dispatch::index_single_file_with_content;
 use super::state::DaemonState;
 
 /// One watched location: the directory handed to `notify`, the corpus that
@@ -106,12 +106,44 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         return None;
     }
 
-    let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
-    let mut debouncer = match new_debouncer(debounce, None, move |res| {
+    // Affected paths pending reindex, coalesced across debounced batches (not
+    // just within one) rather than forwarded whole-batch through an
+    // unbounded channel: a write burst that outpaces the serial async
+    // consumer used to retain every debounced batch in daemon memory
+    // indefinitely. `pending` accumulates distinct paths; `wake` only signals
+    // "something is pending" and is bounded to capacity 1 — the consumer
+    // always drains the *whole* `pending` set on wake, so a second wake
+    // queued while one is outstanding would be redundant. `try_send`
+    // returning `Full` is that explicit overflow behavior: a no-op, never a
+    // block or a panic, because the paths it would have carried are already
+    // sitting in `pending`.
+    let pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+    let pending_for_debouncer = pending.clone();
+    let mut debouncer = match new_debouncer(debounce, None, move |res: DebounceEventResult| {
         // The debouncer worker thread calls this on each debounced batch.
-        // Forward to the async side; a closed receiver (daemon shutting down)
-        // is benign.
-        let _ = tx.send(res);
+        match res {
+            Ok(events) => {
+                record_pending(&pending_for_debouncer, &events);
+                // Non-blocking: `Full` means a wake is already queued (this
+                // batch's paths are already recorded in `pending` above, so
+                // the outstanding wake will pick them up); `Disconnected`
+                // means the daemon is shutting down. Either way there is
+                // nothing more to do here.
+                let _ = wake_tx.try_send(());
+            }
+            Err(errors) => {
+                for err in errors {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        error = %err,
+                        "watcher: notify backend error",
+                    );
+                }
+            }
+        }
     }) {
         Ok(d) => d,
         Err(e) => {
@@ -140,50 +172,46 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     let task = tokio::spawn(async move {
         // Bridge the std mpsc receiver into the async runtime via
         // spawn_blocking-style recv with cancellation. We poll the channel on
-        // a blocking thread per batch; simplest correct shape that respects
+        // a blocking thread per wake; simplest correct shape that respects
         // the shutdown token.
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let wake_rx = std::sync::Arc::new(std::sync::Mutex::new(wake_rx));
         loop {
-            let rx_recv = rx.clone();
+            let wake_rx_recv = wake_rx.clone();
             let next = tokio::select! {
                 _ = shutdown.cancelled() => break,
                 got = tokio::task::spawn_blocking(move || {
-                    rx_recv.lock().expect("watch rx mutex").recv()
+                    wake_rx_recv.lock().expect("watch wake-rx mutex").recv()
                 }) => got,
             };
-            let batch = match next {
-                Ok(Ok(res)) => res,
-                // Channel disconnected (debouncer dropped) or join error:
-                // nothing more will arrive, so end the pump.
-                _ => break,
-            };
-            let events = match batch {
-                Ok(events) => events,
-                Err(errors) => {
-                    for err in errors {
-                        tracing::warn!(
-                            target: "hallouminate::daemon",
-                            error = %err,
-                            "watcher: notify backend error",
-                        );
-                    }
-                    continue;
+            match next {
+                Ok(Ok(())) => {}
+                // Channel disconnected: the debouncer (and its `wake_tx`) was
+                // dropped, so nothing more will ever arrive. Distinct from the
+                // `shutdown.cancelled()` branch above, which is an expected,
+                // silent exit: an unexpected disconnect while the daemon is
+                // still meant to be serving is worth structured error context
+                // so it shows up in telemetry instead of auto-reindex just
+                // going quiet.
+                Ok(Err(_recv_err)) => {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        "watcher: event channel disconnected unexpectedly; auto-reindex pump stopping",
+                    );
+                    break;
                 }
-            };
-            // Collect distinct affected paths so a debounced batch that
-            // touches one file many times reindexes it once.
-            let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-            let mut paths: Vec<PathBuf> = Vec::new();
-            for event in events {
-                for path in &event.paths {
-                    if path.extension().and_then(|e| e.to_str()) != Some("md") {
-                        continue;
-                    }
-                    if seen.insert(path.clone()) {
-                        paths.push(path.clone());
-                    }
+                Err(join_err) => {
+                    tracing::error!(
+                        target: "hallouminate::daemon",
+                        error = %join_err,
+                        "watcher: blocking recv task failed; auto-reindex pump stopping",
+                    );
+                    break;
                 }
             }
+            let paths: Vec<PathBuf> = {
+                let mut set = pending.lock().expect("watch pending-paths mutex");
+                set.drain().collect()
+            };
             if !paths.is_empty() {
                 process_change_batch(&state, &roots, paths).await;
             }
@@ -194,6 +222,34 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         _task: task,
         _debouncer: Box::new(debouncer),
     })
+}
+
+/// Insert every markdown path from one debounced batch into the shared
+/// pending set, coalescing duplicates within *and across* batches — a burst
+/// that touches one file many times (or arrives in several batches before the
+/// consumer next drains) still reindexes it once per drain.
+fn record_pending(
+    pending: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    events: &[notify_debouncer_full::DebouncedEvent],
+) {
+    let mut set = pending.lock().expect("watch pending-paths mutex");
+    for event in events {
+        for path in &event.paths {
+            // Extension-only, matching `format_from_extension`'s classification
+            // without reading bytes: a deleted path no longer exists to sniff, and
+            // reading an existing one just to decide admission would duplicate the
+            // indexer's own read. Extensionless files fall through to `None` here
+            // (never admitted) rather than risking a second, diverging extension
+            // rule from the one `domain::indexer::format` owns.
+            if !matches!(
+                crate::domain::indexer::format_from_extension(path),
+                Some(Some(_))
+            ) {
+                continue;
+            }
+            set.insert(path.clone());
+        }
+    }
 }
 
 /// Build a `WatchRoot` for one declared corpus path, probing the filesystem to
@@ -269,6 +325,29 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
     let exists = path.is_file();
     let store = state.store();
     if exists {
+        // `path.is_file()` above follows symlinks, so a symlinked leaf whose
+        // target is a regular file elsewhere still reaches here. A single
+        // no-follow read below both rejects the symlink and supplies the
+        // content, closing the TOCTOU gap a separate check-then-read would
+        // leave open to a symlink swapped in between the two calls.
+        let relative = path
+            .strip_prefix(&owner.canonical_watched)
+            .expect("owning_corpus guarantees path starts_with canonical_watched");
+        let (bytes, mtime) = match crate::domain::corpus::sandbox::read_no_follow_with_mtime(
+            &owner.canonical_watched,
+            relative,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    path = %path.display(),
+                    error = ?e,
+                    "watcher: skipping reindex, no-follow read failed",
+                );
+                return;
+            }
+        };
         let registry = state.make_registry();
         let mut embedder = if state.embeddings_enabled() {
             match state.embedder().await {
@@ -284,7 +363,17 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(&store, embedder_dyn, &registry, corpus, path).await {
+        match index_single_file_with_content(
+            &store,
+            embedder_dyn,
+            &registry,
+            corpus,
+            path,
+            &bytes,
+            mtime,
+        )
+        .await
+        {
             Ok(stats) => tracing::debug!(
                 target: "hallouminate::daemon",
                 corpus = %corpus.name,
@@ -623,7 +712,9 @@ mod tests {
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
-        state.set_last_activity_secs_for_test(1);
+        // Sentinel no stamp can produce: the activity clock stores monotonic
+        // seconds since process start, so a fresh stamp is always small.
+        state.set_last_activity_secs_for_test(u64::MAX);
 
         let corpus_dir = tmp.path().join("wiki");
         std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
@@ -637,15 +728,198 @@ mod tests {
         // before the fix.
         let deleted = corpus_dir.join("gone.md");
 
-        assert!(
-            state.should_idle_exit(300),
-            "sanity: stale clock with no connections must be idle-eligible",
-        );
         process_change_batch(&state, &roots, vec![deleted]).await;
-        assert!(
-            !state.should_idle_exit(300),
+        assert_ne!(
+            state.last_activity_secs(),
+            u64::MAX,
             "batch processing must stamp the activity clock so idle-exit does \
              not fire immediately after a delete-branch write",
+        );
+    }
+
+    /// Security regression: the watcher must read a changed file's content
+    /// through a **no-follow** filesystem resolution, so a corpus contributor
+    /// cannot make the daemon index — and later serve back through Ground —
+    /// content from **outside** the corpus root by pointing an in-corpus path
+    /// at an external file via a symlink.
+    ///
+    /// The fix collapses validation and content-read into one atomic no-follow
+    /// read (`sandbox::read_no_follow_with_mtime`) instead of a symlink *check*
+    /// followed by a separate ambient re-read of the same path — the gap a
+    /// symlink swapped in between the two could race (TOCTOU). This test guards
+    /// the resulting property: a symlinked leaf whose target lives outside the
+    /// watched root is rejected, and the outside content never reaches the
+    /// store. A regression to an ambient read (which follows symlinks) would
+    /// index the secret and fail the final assertion.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_never_indexes_content_through_a_symlink_out_of_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = crate::app::config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        // A real in-root corpus with one genuine markdown file. Canonicalize
+        // the root so the event path matches `canonical_watched` (tempdirs can
+        // symlink an ancestor, e.g. macOS /var → /private/var).
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let note = corpus_dir.join("note.md");
+        std::fs::write(&note, "# In-corpus\n\nbenign in-corpus content\n").expect("write note");
+
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        let file_ref = canonicalize_or_passthrough(&note)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Baseline: the real file indexes and lands a snapshot row.
+        handle_changed_path(&state, &roots, &note).await;
+        let good = state
+            .store()
+            .get_file_snapshot("wiki", &file_ref)
+            .await
+            .expect("snapshot query")
+            .expect("a real in-root file must be indexed");
+
+        // Attack: replace the leaf with a symlink to a secret file OUTSIDE the
+        // watched root, then trigger a reindex of the same in-corpus path.
+        let secret_dir = tmp.path().join("outside");
+        std::fs::create_dir_all(&secret_dir).expect("mkdir outside");
+        let secret = secret_dir.join("secret.md");
+        std::fs::write(&secret, "# Secret\n\nSECRET_OUTSIDE_CONTENT\n").expect("write secret");
+        std::fs::remove_file(&note).expect("rm note");
+        std::os::unix::fs::symlink(&secret, &note).expect("symlink note -> secret");
+
+        handle_changed_path(&state, &roots, &note).await;
+
+        // The reindex through the symlink must have been rejected. Vulnerable
+        // code would `canonicalize` the in-corpus path (following the symlink)
+        // and index the outside content under the *resolved* key — so assert
+        // the secret's own canonical path has no snapshot row anywhere in the
+        // corpus. (Checking only the note's key would miss this: the follow
+        // indexes under the target's key, not the link's.)
+        let secret_ref = canonicalize_or_passthrough(&secret)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            state
+                .store()
+                .get_file_snapshot("wiki", &secret_ref)
+                .await
+                .expect("snapshot query")
+                .is_none(),
+            "the outside secret file's content must never be indexed — the \
+             watcher must not follow an in-corpus symlink to a target outside \
+             the watched root",
+        );
+
+        // And the in-corpus key must still hold the real file's content,
+        // untouched by the rejected reindex.
+        let after = state
+            .store()
+            .get_file_snapshot("wiki", &file_ref)
+            .await
+            .expect("snapshot query")
+            .expect("the snapshot must survive a rejected symlink reindex");
+        assert_eq!(
+            after.content_hash, good.content_hash,
+            "the store must still hold the real in-corpus file's content, never \
+             the outside secret's",
+        );
+    }
+
+    /// `record_pending` coalesces duplicate paths within one batch and across
+    /// multiple batches recorded before a drain — the fix for the unbounded
+    /// channel: paths accumulate in a bounded shared set instead of every
+    /// debounced batch queuing separately.
+    #[test]
+    fn record_pending_coalesces_across_batches() {
+        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
+            std::sync::Mutex::new(std::collections::HashSet::new());
+        let a = PathBuf::from("/srv/wiki/a.md");
+        let b = PathBuf::from("/srv/wiki/b.md");
+        let ignored = PathBuf::from("/srv/wiki/notes.docx");
+
+        let batch1 = vec![
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Any).add_path(a.clone()),
+                std::time::Instant::now(),
+            ),
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Any).add_path(a.clone()),
+                std::time::Instant::now(),
+            ),
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Any).add_path(ignored.clone()),
+                std::time::Instant::now(),
+            ),
+        ];
+        let batch2 = vec![notify_debouncer_full::DebouncedEvent::new(
+            notify::Event::new(notify::EventKind::Any).add_path(b.clone()),
+            std::time::Instant::now(),
+        )];
+
+        record_pending(&pending, &batch1);
+        record_pending(&pending, &batch2);
+
+        let drained: std::collections::HashSet<PathBuf> =
+            pending.lock().expect("pending mutex").drain().collect();
+        assert_eq!(
+            drained,
+            std::collections::HashSet::from([a, b]),
+            "pending must coalesce the duplicate .md path within a batch and \
+             across batches, while dropping the known-but-unsupported .docx path"
+        );
+    }
+
+    /// `record_pending` must admit every extension `format_from_extension`
+    /// (the indexer's own admission rule) accepts, case-insensitively — not a
+    /// second, narrower `.md`-only rule the watcher used to maintain
+    /// separately from `domain::indexer::format`. An uppercase `.MD` and a
+    /// `.csv` (spreadsheet) must both be admitted; a known-unsupported `.docx`
+    /// must still be dropped.
+    #[test]
+    fn record_pending_admits_every_indexer_supported_extension() {
+        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
+            std::sync::Mutex::new(std::collections::HashSet::new());
+        let uppercase_md = PathBuf::from("/srv/wiki/README.MD");
+        let csv = PathBuf::from("/srv/wiki/data.csv");
+        let unsupported = PathBuf::from("/srv/wiki/notes.docx");
+
+        let batch = vec![
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Any).add_path(uppercase_md.clone()),
+                std::time::Instant::now(),
+            ),
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Any).add_path(csv.clone()),
+                std::time::Instant::now(),
+            ),
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Any).add_path(unsupported.clone()),
+                std::time::Instant::now(),
+            ),
+        ];
+
+        record_pending(&pending, &batch);
+
+        let drained: std::collections::HashSet<PathBuf> =
+            pending.lock().expect("pending mutex").drain().collect();
+        assert_eq!(
+            drained,
+            std::collections::HashSet::from([uppercase_md, csv]),
+            "an uppercase .MD and a .csv must be admitted (matching \
+             format_from_extension), while a known-unsupported .docx is dropped"
         );
     }
 }

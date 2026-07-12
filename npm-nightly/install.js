@@ -1,0 +1,159 @@
+#!/usr/bin/env node
+
+"use strict";
+
+const https = require("https");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const { spawn } = require("child_process");
+
+// cargo-dist artifact target triples. Hallouminate's dist-workspace.toml
+// builds gnu (not musl) Linux and Apple Silicon macOS only — no Windows,
+// no Intel macOS. Keep this map in lockstep with dist-workspace.toml's
+// `targets` and the nightly.yml build matrix.
+const PLATFORM_MAP = {
+  "linux-x64": "x86_64-unknown-linux-gnu",
+  "linux-arm64": "aarch64-unknown-linux-gnu",
+  "darwin-arm64": "aarch64-apple-darwin",
+};
+
+const key = `${process.platform}-${process.arch}`;
+const target = PLATFORM_MAP[key];
+
+if (!target) {
+  console.error(`hallouminate-nightly: unsupported platform ${key}`);
+  console.error(`Supported: ${Object.keys(PLATFORM_MAP).join(", ")}`);
+  console.error("Install manually: cargo install hallouminate");
+  process.exit(1);
+}
+
+const binName = "hallouminate";
+// cargo-dist default unix archive format is .tar.xz; nightly.yml packages the
+// binary under a top-level <app>-<target>/ directory to match.
+const archive = `hallouminate-${target}.tar.xz`;
+// Rolling build: assets live on the fixed `nightly` prerelease, not a
+// per-version tag, so this URL is version-independent.
+const url = `https://github.com/paulnsorensen/hallouminate/releases/download/nightly/${archive}`;
+
+const binDir = path.join(__dirname, "bin");
+const binPath = path.join(binDir, binName);
+
+// Always refresh: each npm version maps to a fresh nightly build, so never
+// short-circuit on an existing (stale) binary.
+fs.mkdirSync(binDir, { recursive: true });
+
+console.log(`hallouminate-nightly: downloading ${target} nightly binary...`);
+
+const MAX_REDIRECTS = 5;
+const REQUEST_TIMEOUT_MS = 30_000;
+
+function follow(url, redirectsLeft, cb) {
+  // postinstall download: refuse anything but HTTPS, including redirect
+  // targets, so a hijacked Location header can't downgrade the transport to
+  // plaintext. Cross-host HTTPS redirects are allowed and expected — GitHub
+  // release downloads redirect to objects.githubusercontent.com.
+  if (!url.startsWith("https:")) {
+    console.error(`hallouminate-nightly: refusing non-HTTPS download URL: ${url}`);
+    console.error("Install manually: cargo install hallouminate");
+    process.exit(1);
+  }
+  const req = https
+    .get(url, { headers: { "User-Agent": "hallouminate-npm" } }, (res) => {
+      if (
+        res.statusCode >= 300 &&
+        res.statusCode < 400 &&
+        res.headers.location
+      ) {
+        res.resume(); // drain the redirect body so the socket is freed
+        if (redirectsLeft <= 0) {
+          console.error(`hallouminate-nightly: too many redirects fetching ${url}`);
+          console.error("Install manually: cargo install hallouminate");
+          process.exit(1);
+        }
+        follow(res.headers.location, redirectsLeft - 1, cb);
+      } else if (res.statusCode !== 200) {
+        console.error(`hallouminate-nightly: download failed (HTTP ${res.statusCode})`);
+        console.error(`URL: ${url}`);
+        console.error("Install manually: cargo install hallouminate");
+        process.exit(1);
+      } else {
+        cb(res);
+      }
+    })
+    .on("error", (err) => {
+      console.error(`hallouminate-nightly: download failed: ${err.message}`);
+      console.error("Install manually: cargo install hallouminate");
+      process.exit(1);
+    });
+  req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+    req.destroy(new Error(`timed out after ${REQUEST_TIMEOUT_MS}ms`));
+  });
+}
+
+function downloadToBuffer(url, cb) {
+  follow(url, MAX_REDIRECTS, (res) => {
+    const chunks = [];
+    res.on("data", (chunk) => chunks.push(chunk));
+    res.on("end", () => cb(Buffer.concat(chunks)));
+    res.on("error", (err) => {
+      console.error(`hallouminate-nightly: download failed: ${err.message}`);
+      console.error("Install manually: cargo install hallouminate");
+      process.exit(1);
+    });
+  });
+}
+
+const shaUrl = `${url}.sha256`;
+
+downloadToBuffer(shaUrl, (shaBuf) => {
+  const expected = shaBuf.toString("utf8").trim().split(/\s+/)[0].toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(expected)) {
+    console.error(`hallouminate-nightly: malformed checksum file at ${shaUrl}`);
+    console.error("Install manually: cargo install hallouminate");
+    process.exit(1);
+  }
+
+  downloadToBuffer(url, (tarBuf) => {
+    const actual = crypto.createHash("sha256").update(tarBuf).digest("hex");
+    if (actual !== expected) {
+      console.error(`hallouminate-nightly: checksum mismatch for ${archive}`);
+      console.error(`expected: ${expected}`);
+      console.error(`actual:   ${actual}`);
+      console.error("Install manually: cargo install hallouminate");
+      process.exit(1);
+    }
+
+    // tar -xJ understands xz on both macOS (BSD tar) and Linux (GNU tar).
+    // --strip-components=1 flattens the top-level <app>-<target>/ wrapper so
+    // the binary lands directly in bin/.
+    const tar = spawn(
+      "tar",
+      ["-xJ", "--strip-components=1", "-C", binDir],
+      { stdio: ["pipe", "inherit", "inherit"] },
+    );
+    tar.on("error", (err) => {
+      console.error(`hallouminate-nightly: failed to run tar: ${err.message}`);
+      console.error("Install manually: cargo install hallouminate");
+      process.exit(1);
+    });
+    tar.stdin.end(tarBuf);
+    tar.on("close", (code) => {
+      if (code !== 0) {
+        console.error(
+          "hallouminate-nightly: failed to extract. Install manually: cargo install hallouminate",
+        );
+        process.exit(1);
+      }
+      if (!fs.existsSync(binPath)) {
+        console.error(
+          `hallouminate-nightly: binary missing after extract (expected ${binPath}).`,
+        );
+        console.error("Install manually: cargo install hallouminate");
+        process.exit(1);
+      }
+      fs.chmodSync(binPath, 0o755);
+      console.log("hallouminate-nightly: installed successfully");
+    });
+  });
+});

@@ -35,6 +35,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::time::SystemTime;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -460,6 +461,24 @@ pub fn atomic_write_no_follow(
 ///   carries a NUL byte.
 /// - [`WriteErrorKind::Io`] when the file is absent or any other read fails.
 pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteError> {
+    read_no_follow_with_mtime(root, relative).map(|(bytes, _)| bytes)
+}
+
+/// Read the contents of `<root>/<relative>` and its mtime from one no-follow
+/// resolution, collapsing the watcher's prior check-then-ambient-read into a
+/// single cap-std handle: bytes and mtime come from the same opened file, so
+/// a symlink swapped in after a separate `fs::metadata` call can no longer
+/// desync the two reads. The residual `symlink_metadata` + `open` split
+/// inside the component walk (see [`open_or_create_child_dir`]) is bounded to
+/// the corpus root by cap-std, not atomic at the syscall level.
+///
+/// # Errors
+///
+/// Same as [`read_no_follow`].
+pub fn read_no_follow_with_mtime(
+    root: &Path,
+    relative: &Path,
+) -> Result<(Vec<u8>, SystemTime), WriteError> {
     let names = normal_components(relative)?;
     let file_name = names
         .last()
@@ -470,10 +489,15 @@ pub fn read_no_follow(root: &Path, relative: &Path) -> Result<Vec<u8>, WriteErro
         .open(file_name.as_os_str())
         .map_err(classify_path_io_error)?;
     let mut file = cap_file.into_std();
+    let mtime = file
+        .metadata()
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?
+        .modified()
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
-    Ok(buf)
+    Ok((buf, mtime))
 }
 
 /// Find which configured root of `corpus` holds `relative`, walking the roots
