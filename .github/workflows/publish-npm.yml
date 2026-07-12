@@ -1,17 +1,23 @@
 name: Publish to npm
 
-# Fires AFTER cargo-dist's release.yml has finished and the GitHub Release
-# (with platform-specific tarballs) is live. The npm postinstall script
-# downloads those tarballs by URL, so this workflow must run last.
+# Runs as a cargo-dist custom publish job (see publish-jobs in
+# dist-workspace.toml), invoked by release.yml via `uses: ./.github/workflows/publish-npm.yml`
+# AFTER the host phase has uploaded release assets and created the GitHub
+# Release — so the npm postinstall script's tarball download URLs are live.
 #
 # Auth: npm trusted publishing (OIDC). No NPM_TOKEN secret — the job requests
 # an id-token and npm mints a short-lived credential, attaching provenance
 # automatically. Configure the trusted publisher once at
 # npmjs.com -> package `hallouminate` -> Settings -> Trusted Publisher:
-# GitHub Actions, repo paulnsorensen/hallouminate, workflow publish-npm.yml.
+# GitHub Actions, repo paulnsorensen/hallouminate, workflow release.yml (the
+# CALLING workflow's filename — npm validates that, not this file's name;
+# see docs.npmjs.com/trusted-publishers).
 on:
-  release:
-    types: [published]
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -26,7 +32,7 @@ jobs:
       - name: Verify versions match release tag
         run: |
           set -euo pipefail
-          TAG="${{ github.event.release.tag_name }}"
+          TAG="${{ github.ref_name }}"
           # Strip optional leading "v" — cargo-dist accepts both forms.
           TAG_VER="${TAG#v}"
           CARGO_VER=$(awk '/^\[package\]/{f=1} f&&/^\[/&&!/^\[package\]/{f=0} f&&/^version[[:space:]]*=/{print; exit}' Cargo.toml | sed 's/.*"\(.*\)"/\1/')

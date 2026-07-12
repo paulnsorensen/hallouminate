@@ -11,6 +11,10 @@ ci = "github"
 # (OpenSSF Scorecard Pinned-Dependencies). allow-dirty stops `dist plan` from
 # failing on that divergence; Dependabot keeps the pinned SHAs current.
 allow-dirty = ["ci"]
+# Wires .github/workflows/publish-npm.yml as a custom publish job (resolves
+# "./publish-npm" -> publish-npm.yml). The release.yml call site is hand-
+# maintained since allow-dirty = ["ci"] above stops dist from regenerating it.
+publish-jobs = ["./publish-npm"]
 # The installers to generate for each app
 installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)

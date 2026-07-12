@@ -290,14 +290,31 @@ jobs:
 
           gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
+  # Hand-maintained (allow-dirty = ["ci"] stops dist from regenerating this
+  # call site). Mirrors dist 0.32.0's generated shape for a publish-jobs
+  # entry (see j178/prek's release.yml custom-publish-npm job), except
+  # `secrets: inherit` is deliberately omitted: publish-npm.yml authenticates
+  # via OIDC only and reads no secrets (least privilege).
+  custom-publish-npm:
+    needs:
+      - plan
+      - host
+    if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
+    uses: ./.github/workflows/publish-npm.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    permissions:
+      id-token: write
+
   announce:
     needs:
       - plan
       - host
+      - custom-publish-npm
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
+    if: ${{ always() && needs.host.result == 'success' && (needs.custom-publish-npm.result == 'skipped' || needs.custom-publish-npm.result == 'success') }}
     runs-on: "ubuntu-24.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
