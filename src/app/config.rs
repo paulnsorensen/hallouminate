@@ -1897,6 +1897,17 @@ path = "/b"
     }
 
     #[test]
+    fn merge_layers_rerank_timeout_ms_propagates_repo_value_over_baseline_default() {
+        // Regression trap (#139): if the merge_scalar call for
+        // rerank_timeout_ms is removed and the field is hardcoded to its
+        // default, this fails.
+        let baseline = parse("", None).expect("baseline default");
+        let repo = parse("[search]\nrerank_timeout_ms = 500\n", None).expect("repo");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.search.rerank_timeout_ms, 500);
+    }
+
+    #[test]
     fn merge_layers_daemon_idle_exit_secs_propagates_baseline_over_repo_default() {
         // Regression trap: if the merge_scalar call for daemon.idle_exit_secs
         // is removed and the field is hardcoded to its default, this fails.

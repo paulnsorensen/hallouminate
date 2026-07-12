@@ -705,4 +705,94 @@ mod tests {
              configured timeout was ignored"
         );
     }
+
+    #[tokio::test]
+    async fn ground_honors_opts_rerank_timeout() {
+        // Mirrors ground_union_honors_opts_rerank_timeout for the single-
+        // corpus `ground()` entry point (#139): a regression that rewires
+        // only ground_union to read opts.rerank_timeout while ground() keeps
+        // (or reverts to) a hardcoded duration would pass every other test
+        // in this file but must fail here.
+        struct SleepingCrossencoder;
+        impl Crossencoder for SleepingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                hits.reverse();
+                Ok(())
+            }
+        }
+
+        let content_dir = tempfile::tempdir().expect("tempdir content");
+        let store_dir = tempfile::tempdir().expect("tempdir store");
+        let store = open_test_store(store_dir.path()).await;
+        let paths = seed_and_index_fixture_corpus(content_dir.path(), &store).await;
+
+        let opts = GroundOpts {
+            rerank_timeout: Duration::from_millis(20),
+            ..GroundOpts::default()
+        };
+        let resp = ground(
+            "spice",
+            "fixtures",
+            &paths,
+            &store,
+            None,
+            Some(Box::new(SleepingCrossencoder)),
+            opts,
+        )
+        .await
+        .expect("tiny rerank_timeout must not error, only fall back to fusion order");
+
+        assert!(
+            resp.stats.hits >= 2,
+            "fixture corpus must yield real hits so the crossencoder branch actually runs, got {}",
+            resp.stats.hits
+        );
+        assert!(
+            resp.docs.values().all(|d| d.z_score.is_none()),
+            "a 20ms opts.rerank_timeout must time out the 200ms-sleeping crossencoder in ground(), \
+             leaving z_score unset (applied == false); a non-None z_score means the \
+             configured timeout was ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_with_timeout_zero_duration_falls_back_without_panic() {
+        // Boundary (#139): rerank_timeout_ms = 0 must degrade gracefully to
+        // fusion order rather than panicking or erroring — a 0ms deadline is
+        // already expired the instant the task is spawned.
+        struct SleepingCrossencoder;
+        impl Crossencoder for SleepingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                hits.reverse();
+                Ok(())
+            }
+        }
+
+        let hits = vec![
+            hit_for_timeout_test("/a.md", 0.1),
+            hit_for_timeout_test("/b.md", 0.9),
+        ];
+        let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+
+        let (result, applied) = rerank_with_timeout(
+            Box::new(SleepingCrossencoder),
+            "q".to_string(),
+            hits,
+            Duration::from_millis(0),
+        )
+        .await
+        .expect("zero timeout must not error, only fall back to fusion order");
+
+        assert!(
+            !applied,
+            "a zero-duration timeout must report applied == false"
+        );
+        let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
+        assert_eq!(
+            observed, fusion_order,
+            "zero-duration timeout fallback must preserve the original fusion order"
+        );
+    }
 }
