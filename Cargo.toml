@@ -48,6 +48,11 @@ cap-std = "4"
 # for `process::kill_process` (daemon shutdown tests) and `fs::flock`
 # (single-instance daemon lock in `server.rs`).
 rustix = { version = "1", features = ["fs", "process"] }
+# Direct dep for peer-credential auth on the daemon's Unix socket
+# (`SO_PEERCRED` on Linux via raw `getsockopt`, `getpeereid` on macOS/BSD;
+# rustix's `net::sockopt::socket_peercred` is Linux-only, so it can't cover
+# both platforms). Already pulled in transitively.
+libc = "0.2"
 ignore = "0.4"
 globset = "0.4"
 
@@ -101,7 +106,7 @@ url = "2"
 # Time + lazy init
 chrono = { version = "0.4", features = ["serde"] }
 once_cell = "1"
-rmcp = { version = "1.7", features = ["server", "macros", "transport-io", "schemars"] }
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
 schemars = "1"
 
 [dev-dependencies]

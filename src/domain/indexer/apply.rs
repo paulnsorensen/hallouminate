@@ -1,5 +1,5 @@
 use crate::adapters::lance::{EMBEDDING_DIM, LanceStore, PreparedFile};
-use crate::domain::common::{CorpusConfig, HallouminateError, Result};
+use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Result};
 use crate::domain::corpus::blake3_file;
 use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 
@@ -69,6 +69,7 @@ pub async fn apply(
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     batch_size: usize,
+    precomputed: Option<(&FileRef, &[u8])>,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
     let batch_size = batch_size.max(1);
@@ -97,6 +98,7 @@ pub async fn apply(
         embedder.as_deref_mut(),
         &mut stats,
         EmptyFilePolicy::Retain,
+        precomputed,
     )
     .await?;
 
@@ -133,6 +135,7 @@ pub async fn apply(
         embedder,
         &mut stats,
         EmptyFilePolicy::Evict,
+        precomputed,
     )
     .await?;
 
@@ -160,6 +163,7 @@ async fn run_in_batches(
     mut embedder: Option<&mut (dyn EmbedBatch + '_)>,
     stats: &mut ApplyStats,
     empty_file_policy: EmptyFilePolicy,
+    precomputed: Option<(&FileRef, &[u8])>,
 ) -> Result<()> {
     if reqs.is_empty() {
         return Ok(());
@@ -171,6 +175,7 @@ async fn run_in_batches(
             // than silently dropping a file. An unsupported type or a handler
             // extraction failure returns `Ok(None)`: prepare_file already logged
             // the skip, so just account it and move on.
+            let bytes_override = precomputed.and_then(|(f, b)| (req.file == f).then_some(b));
             let pf = prepare_file(
                 WriteRequest {
                     corpus: req.corpus,
@@ -179,6 +184,7 @@ async fn run_in_batches(
                 },
                 run.registry,
                 run.indexed_at_ms,
+                bytes_override,
             )?;
             let Some(pf) = pf else {
                 // Unsupported type or extraction failure — already logged by

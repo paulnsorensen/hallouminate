@@ -8,10 +8,13 @@
 //! framing/IO errors.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::app::config::{self, Config};
 
@@ -31,6 +34,24 @@ pub struct DaemonArgs {
 /// line with no trailing newline), which would otherwise pin a
 /// `BufReader::read_line` await forever and leak the per-connection task.
 pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on the newline-delimited request line's `String` allocation. Without
+/// this, a client can stream an arbitrarily large line before
+/// `IDLE_READ_TIMEOUT` would otherwise catch it, growing the allocation
+/// without bound.
+const MAX_REQUEST_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Cap on concurrently active connection handlers. Bounds memory/CPU from a
+/// client (or many clients) opening unlimited connections; excess
+/// connections wait for a permit inside their spawned task rather than
+/// blocking the accept loop.
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+
+/// Upper bound on how long shutdown waits for in-flight connection handlers
+/// to finish before releasing the socket and single-instance flock. A
+/// handler that ignores this deadline is aborted rather than allowed to
+/// block shutdown forever.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Boot the daemon and serve until SIGINT/SIGTERM (or stdin close on the
 /// rare debug invocations). Returns `Err` if another daemon is already
@@ -162,20 +183,21 @@ async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| anyhow::anyhow!("create socket parent dir {}: {e}", parent.display()))?;
-        // 0o700: owner-only access. Without this, another local user on a
-        // shared machine could traverse the parent dir, connect to the
-        // socket, and issue mutating requests — the daemon has no
-        // peer-credential auth on the wire.
+        // 0o700: owner-only access. The daemon has no peer-credential auth
+        // on the wire, so a socket directory that isn't owner-only would let
+        // another local user on a shared machine traverse it, connect to the
+        // socket, and issue mutating requests — refuse to start rather than
+        // silently degrade.
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
-        if let Err(e) = tokio::fs::set_permissions(parent, perms).await {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                parent = %parent.display(),
-                error = %e,
-                "failed to set socket parent permissions; continuing with default",
-            );
-        }
+        tokio::fs::set_permissions(parent, perms)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to set owner-only permissions (0o700) on socket parent dir {}: {e}",
+                    parent.display(),
+                )
+            })?;
     }
     Ok(())
 }
@@ -250,18 +272,19 @@ async fn serve_on_listener(
         anyhow::anyhow!("bind {}: {e}", socket_path.display())
     })?;
     // Tighten the socket itself to owner-only access — belt to the parent
-    // dir's 0o700 suspenders. Logged-but-ignored on failure so a tempfs
-    // backend that refuses chmod doesn't crash the daemon.
+    // dir's 0o700 suspenders. The daemon has no peer-credential auth on the
+    // wire, so refuse to start rather than serve on a socket another local
+    // user could connect to.
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o600);
-    if let Err(e) = tokio::fs::set_permissions(socket_path, perms).await {
-        tracing::warn!(
-            target: "hallouminate::daemon",
-            socket = %socket_path.display(),
-            error = %e,
-            "failed to set socket permissions; continuing with default",
-        );
-    }
+    tokio::fs::set_permissions(socket_path, perms)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "failed to set owner-only permissions (0o600) on socket {}: {e}",
+                socket_path.display(),
+            )
+        })?;
     tracing::info!(
         target: "hallouminate::daemon",
         socket = %socket_path.display(),
@@ -269,12 +292,14 @@ async fn serve_on_listener(
     );
 
     let shutdown = state.shutdown_token().clone();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let mut handlers: JoinSet<()> = JoinSet::new();
     loop {
         // Drain semantics (spec Curd 1 open question): cancelling the token
-        // stops accepting *new* connections but does not abort in-flight
-        // `handle_connection` tasks — they were spawned detached and finish
-        // their one-shot request/response on their own. The cancel only
-        // breaks this accept loop, after which the caller runs cleanup.
+        // stops accepting *new* connections. Handlers are retained in
+        // `handlers` (a `JoinSet`) so shutdown can drain or abort them under
+        // a bounded deadline before the caller releases the socket and
+        // single-instance flock — see the drain below.
         let (stream, _addr) = tokio::select! {
             _ = shutdown.cancelled() => {
                 tracing::info!(target: "hallouminate::daemon", "shutdown requested; stopping accept loop");
@@ -288,12 +313,29 @@ async fn serve_on_listener(
                 }
             },
         };
+        // Gate concurrently active handlers so unlimited clients can't spend
+        // unbounded memory/CPU at once. The permit is acquired here, before
+        // spawning, so an accepted-but-unhandled `UnixStream` and its task
+        // never accumulate unbounded while waiting for a permit; it is
+        // acquired against `shutdown.cancelled()` so waiting for a permit
+        // never blocks drain/shutdown.
+        let permit = tokio::select! {
+            _ = shutdown.cancelled() => {
+                tracing::info!(target: "hallouminate::daemon", "shutdown requested; stopping accept loop");
+                break;
+            }
+            acquired = Arc::clone(&semaphore).acquire_owned() => match acquired {
+                Ok(permit) => permit,
+                Err(_closed) => break,
+            },
+        };
         let state = state.clone();
         let conn = state.enter_connection();
-        tokio::spawn(async move {
+        handlers.spawn(async move {
             // Held for the handler's lifetime; decrements the active-connection
             // count on drop so idle-exit never fires mid-request (ADR-003).
             let _conn = conn;
+            let _permit = permit;
             if let Err(e) = handle_connection(state, stream, idle_timeout).await {
                 tracing::warn!(
                     target: "hallouminate::daemon",
@@ -303,7 +345,38 @@ async fn serve_on_listener(
             }
         });
     }
+    drain_handlers(&mut handlers, SHUTDOWN_DRAIN_TIMEOUT).await;
     Ok(())
+}
+
+/// Wait for in-flight connection handlers to finish before the caller
+/// releases the socket and single-instance flock — without this, a
+/// replacement daemon could open the same LanceDB while an old mutation is
+/// still running. Bounded by `deadline`: handlers that don't finish in time
+/// are aborted so shutdown can never hang forever on a wedged handler.
+async fn drain_handlers(handlers: &mut JoinSet<()>, deadline: Duration) {
+    if handlers.is_empty() {
+        return;
+    }
+    let pending = handlers.len();
+    tracing::info!(
+        target: "hallouminate::daemon",
+        pending,
+        "draining in-flight connection handlers before releasing daemon resources",
+    );
+    let drained = tokio::time::timeout(deadline, async {
+        while handlers.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            timeout_secs = deadline.as_secs(),
+            "shutdown drain timed out; aborting remaining in-flight handlers",
+        );
+        handlers.abort_all();
+        while handlers.join_next().await.is_some() {}
+    }
 }
 
 async fn handle_connection(
@@ -311,8 +384,16 @@ async fn handle_connection(
     stream: UnixStream,
     idle_timeout: Duration,
 ) -> anyhow::Result<()> {
+    // Best-effort peer uid, checked below against the mutating-request
+    // allowlist (B6 defense-in-depth). Captured before `into_split` since the
+    // whole `UnixStream` (not either half) implements `AsRawFd`.
+    let peer_uid = peer_credential_uid(&stream);
+    let effective_uid = rustix::process::geteuid().as_raw();
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    // Cap the newline-delimited request line's allocation — `.take()` bounds
+    // how many bytes `read_line` will pull before giving up, so an oversized
+    // line is rejected instead of growing the `String` without bound.
+    let mut reader = BufReader::new(read_half).take(MAX_REQUEST_LINE_BYTES);
     let mut line = String::new();
     let n = match tokio::time::timeout(idle_timeout, reader.read_line(&mut line)).await {
         Ok(res) => res?,
@@ -328,9 +409,23 @@ async fn handle_connection(
     if n == 0 {
         return Ok(());
     }
-    let response = match serde_json::from_str::<DaemonRequest>(line.trim_end()) {
-        Ok(req) => dispatch(&state, req).await,
-        Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
+    let response = if !line.ends_with('\n') {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            cap_bytes = MAX_REQUEST_LINE_BYTES,
+            "request line exceeded the size cap; returning structured error",
+        );
+        DaemonResponse::invalid_params(format!(
+            "request line exceeds {MAX_REQUEST_LINE_BYTES}-byte cap"
+        ))
+    } else {
+        match serde_json::from_str::<DaemonRequest>(line.trim_end()) {
+            Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
+                Some(denied) => denied,
+                None => dispatch(&state, req).await,
+            },
+            Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
+        }
     };
     // Request completed; stamp the activity clock so idle-exit keys on real
     // request throughput, not just embed use (ADR-003).
@@ -389,6 +484,99 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Reject mutating requests (`AddMarkdown`/`DeleteMarkdown`/`Index`/
+/// `Shutdown`) from a peer whose uid doesn't match the daemon's effective
+/// uid (B6 defense-in-depth). The socket + parent dir are already
+/// owner-only (0o600 / 0o700 in [`serve_on_listener`]/[`prepare_socket_dir`]),
+/// so this only matters if those perms are loosened after boot on a shared
+/// machine. Read-only requests (Ping/Ground/List*/Backlinks/ReadMarkdown/
+/// CorpusStats) are unrestricted. `peer_uid: None` (credential lookup
+/// unsupported or failed) fails closed for mutating requests rather than
+/// silently allowing them.
+fn authorize_peer(
+    peer_uid: Option<u32>,
+    effective_uid: u32,
+    payload: &super::ipc::DaemonRequestPayload,
+) -> Option<DaemonResponse> {
+    if !is_mutating_payload(payload) {
+        return None;
+    }
+    match peer_uid {
+        Some(uid) if uid == effective_uid => None,
+        Some(uid) => Some(DaemonResponse::invalid_params(format!(
+            "peer uid {uid} is not authorized for mutating requests (daemon uid {effective_uid})"
+        ))),
+        None => Some(DaemonResponse::invalid_params(
+            "peer credentials unavailable; refusing mutating request",
+        )),
+    }
+}
+
+fn is_mutating_payload(payload: &super::ipc::DaemonRequestPayload) -> bool {
+    use super::ipc::DaemonRequestPayload;
+    matches!(
+        payload,
+        DaemonRequestPayload::AddMarkdown(_)
+            | DaemonRequestPayload::DeleteMarkdown(_)
+            | DaemonRequestPayload::Index(_)
+            | DaemonRequestPayload::Shutdown
+    )
+}
+
+/// Best-effort peer uid of a connected Unix-domain socket: `SO_PEERCRED` on
+/// Linux, `getpeereid` on macOS/BSD (rustix's `net::sockopt::socket_peercred`
+/// is Linux-only, so it can't cover both). `None` on any error or
+/// unsupported platform; [`authorize_peer`] fails closed for mutating
+/// requests in that case.
+fn peer_credential_uid(stream: &UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    raw_peer_uid(stream.as_raw_fd())
+}
+
+#[cfg(target_os = "linux")]
+fn raw_peer_uid(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let ret = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut libc::ucred as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if ret == 0 { Some(cred.uid) } else { None }
+}
+
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+fn raw_peer_uid(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let ret = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+    if ret == 0 { Some(uid) } else { None }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+)))]
+fn raw_peer_uid(_fd: std::os::fd::RawFd) -> Option<u32> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +620,60 @@ mod tests {
         remove_stale_socket(&stale).await;
         assert!(!stale.exists(), "stale socket must be removed before bind");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── B6: peer-credential authorization ──────────────────────────────
+
+    #[test]
+    fn authorize_peer_allows_same_uid_mutating_request() {
+        use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
+        let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
+        assert!(
+            authorize_peer(Some(501), 501, &payload).is_none(),
+            "same-uid peer must be authorized for a mutating request"
+        );
+    }
+
+    #[test]
+    fn authorize_peer_rejects_different_uid_mutating_request() {
+        use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
+        let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
+        let response = authorize_peer(Some(999), 501, &payload)
+            .expect("different-uid peer must be rejected for a mutating request");
+        match response {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(
+                    kind,
+                    super::super::ipc::ErrorKind::InvalidParams,
+                    "{message}"
+                );
+                assert!(
+                    message.contains("999") && message.contains("501"),
+                    "{message}"
+                );
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("unauthorized mutating request must error; got Ok({result:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn authorize_peer_allows_different_uid_read_only_request() {
+        use super::super::ipc::DaemonRequestPayload;
+        assert!(
+            authorize_peer(Some(999), 501, &DaemonRequestPayload::Ping).is_none(),
+            "read-only requests must stay unrestricted regardless of peer uid"
+        );
+    }
+
+    #[test]
+    fn authorize_peer_fails_closed_when_peer_uid_unknown() {
+        use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
+        let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
+        assert!(
+            authorize_peer(None, 501, &payload).is_some(),
+            "unresolvable peer credentials must fail closed for a mutating request"
+        );
     }
 }

@@ -33,7 +33,9 @@ use crate::domain::corpus::sandbox::{
     resolve_read_root, safe_relative_path,
 };
 use crate::domain::corpus::scan;
-use crate::domain::corpus::{blake3_file, find_wikilinks, normalize_slug, slug_identifiers};
+use crate::domain::corpus::{
+    SlugResolution, blake3_bytes, find_wikilinks, normalize_slug, resolve_slug,
+};
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
@@ -53,7 +55,7 @@ use super::ipc::{
     DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest,
     ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
-use super::state::DaemonState;
+use super::state::{DaemonState, RequestResources};
 
 pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
     // Resolve per-request config layering on every request: discover the
@@ -288,7 +290,11 @@ async fn handle_corpus_stats(
             Ok(c) => c,
             Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
         };
-    let store = state.store();
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let store = &res.store;
     let chunk_stats = match store.corpus_chunk_stats(&corpus_cfg.name).await {
         Ok(s) => s,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -332,7 +338,11 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let store = state.store();
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let store = &res.store;
     let opts = GroundOpts {
         top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
         chunks_per_file: req
@@ -360,8 +370,8 @@ async fn handle_ground(
 
     // Embeddings-OFF: skip the embedder entirely and let the search run the
     // lexical-only path. ON: borrow the shared embedder (lazy-loaded).
-    let mut embedder = if state.embeddings_enabled() {
-        match state.embedder().await {
+    let mut embedder = if res.embeddings_enabled {
+        match res.embedder().await {
             Ok(g) => Some(g),
             Err(e) => return DaemonResponse::internal(e.to_string()),
         }
@@ -396,7 +406,7 @@ async fn handle_ground(
             &req.query,
             &corpus.name,
             &corpus.paths,
-            &store,
+            store,
             embedder_dyn,
             crossencoder_box,
             opts,
@@ -410,7 +420,7 @@ async fn handle_ground(
         ground_union(
             &req.query,
             &targets,
-            &store,
+            store,
             embedder_dyn,
             crossencoder_box,
             opts,
@@ -485,7 +495,11 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
         corpora.clone()
     };
 
-    let store = state.store();
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    let store = &res.store;
     let registry = state.make_registry();
 
     let mut report = IndexReport::default();
@@ -514,8 +528,8 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             ));
             continue;
         }
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
+        let mut embedder = if res.embeddings_enabled {
+            match res.embedder().await {
                 Ok(g) => Some(g),
                 Err(e) => return DaemonResponse::internal(e.to_string()),
             }
@@ -525,7 +539,7 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = match index_corpus(&corpus, &store, embedder_dyn, &registry).await {
+        let stats = match index_corpus(&corpus, store, embedder_dyn, &registry).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
         };
@@ -662,6 +676,11 @@ async fn handle_add_markdown(
         Err(msg) => return DaemonResponse::internal(msg),
     };
 
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+
     let force_overwrite: bool;
     match mode {
         EditMode::WholeFile => {
@@ -748,12 +767,11 @@ async fn handle_add_markdown(
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
     match crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
         Ok(entries) => {
-            let mut known_slugs =
-                crate::domain::corpus::corpus_slugs(entries.iter().map(|e| e.path.as_str()));
-            known_slugs.extend(slug_identifiers(&req.path));
+            let mut known_paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
+            known_paths.push(req.path.clone());
             warnings.extend(crate::domain::corpus::lint_wikilinks(
                 &req.content,
-                &known_slugs,
+                &known_paths,
             ));
         }
         Err(e) => {
@@ -827,7 +845,7 @@ async fn handle_add_markdown(
         if overwrite {
             let file_ref = canonicalize_or_passthrough(&dest);
             if let Some(file_ref_str) = file_ref.as_path().to_str() {
-                let store = state.store();
+                let store = &res.store;
                 match store.get_file_snapshot(&corpus.name, file_ref_str).await {
                     Ok(Some(_)) => match store.delete_file(&corpus.name, file_ref_str).await {
                         Ok(()) => stats.files_deleted = 1,
@@ -840,10 +858,10 @@ async fn handle_add_markdown(
         }
         stats
     } else {
-        let store = state.store();
+        let store = &res.store;
         let registry = state.make_registry();
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
+        let mut embedder = if res.embeddings_enabled {
+            match res.embedder().await {
                 Ok(g) => Some(g),
                 Err(e) => return DaemonResponse::internal(e.to_string()),
             }
@@ -853,22 +871,43 @@ async fn handle_add_markdown(
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(&store, embedder_dyn, &registry, &corpus, &dest).await {
+        match index_single_file(store, embedder_dyn, &registry, &corpus, &dest).await {
             Ok(s) => s,
-            Err(e) => return DaemonResponse::internal(e.to_string()),
+            Err(e) => {
+                // The write above already durably completed; a model/store
+                // failure here must not hide that from the caller behind a
+                // bare internal error. Surface it as a warning on the
+                // otherwise-successful response and leave the file
+                // unindexed for a later `index` call to repair.
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %e,
+                    path = %dest.display(),
+                    "add_markdown: indexing failed after durable write",
+                );
+                warnings.push(format!(
+                    "wrote {} but indexing failed: {e}; run `index` to repair search results",
+                    relative.display()
+                ));
+                crate::domain::indexer::ApplyStats::default()
+            }
         }
     };
 
     // Auto-rebuild wiki indexes from the corpus root down to the parent of
-    // the just-written file. Failures here surface as `Internal` and the
-    // mutation guard is dropped — partial index regen would leave the wiki
-    // in a less-coherent state than aborting outright.
+    // the just-written file. The write already durably completed, so a
+    // refresh failure here is reported as a warning on the successful
+    // response instead of an internal error — the caller can see the
+    // durable write and retry `index` rather than losing visibility into
+    // it entirely.
     if is_wiki_corpus(&corpus) {
-        match rebuild_wiki_indexes(state, &corpus, &root, &relative).await {
+        match rebuild_wiki_indexes(state, cfg, &corpus, &root, &relative).await {
             Ok(extra) => fold_apply_stats(&mut stats, &extra),
             Err(msg) => {
-                drop(guard);
-                return DaemonResponse::internal(msg);
+                warnings.push(format!(
+                    "wrote {} but ancestor index refresh failed: {msg}; run `index` to repair",
+                    relative.display()
+                ));
             }
         }
     }
@@ -977,48 +1016,38 @@ async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> Da
         .file_stem()
         .map(|s| s.to_string_lossy().to_lowercase())
         .filter(|stem| *stem != full_slug);
+    let entry_paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
     let target_slugs: std::collections::HashSet<String> = match &bare_stem {
-        Some(stem) => {
-            let stem_is_unique = entries
-                .iter()
-                .filter(|entry| {
-                    Path::new(&entry.path)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().to_lowercase())
-                        .as_deref()
-                        == Some(stem.as_str())
-                })
-                .count()
-                <= 1;
-            if stem_is_unique {
-                [full_slug.clone(), stem.clone()].into_iter().collect()
-            } else {
-                std::iter::once(full_slug.clone()).collect()
-            }
-        }
+        Some(stem) => match resolve_slug(stem, &entry_paths) {
+            SlugResolution::Ambiguous(_) => std::iter::once(full_slug.clone()).collect(),
+            _ => [full_slug.clone(), stem.clone()].into_iter().collect(),
+        },
         None => std::iter::once(full_slug.clone()).collect(),
     };
+    let corpus_name = corpus.name.clone();
     let req_path = req.path.clone();
-    let found = tokio::task::spawn_blocking(move || {
-        let mut backlinks: Vec<String> = entries
-            .into_iter()
-            .filter(|entry| entry.path != req_path)
-            .filter(|entry| {
-                let Ok(content) = std::fs::read_to_string(&entry.absolute_path) else {
-                    return false;
-                };
-                find_wikilinks(&content)
-                    .iter()
-                    .any(|link| target_slugs.contains(&normalize_slug(link)))
-            })
-            .map(|entry| entry.path)
-            .collect();
+    let scanned = tokio::task::spawn_blocking(move || {
+        let mut backlinks: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, String)> = Vec::new();
+        for entry in entries.into_iter().filter(|entry| entry.path != req_path) {
+            match std::fs::read_to_string(&entry.absolute_path) {
+                Ok(content) => {
+                    if find_wikilinks(&content)
+                        .iter()
+                        .any(|link| target_slugs.contains(&normalize_slug(link)))
+                    {
+                        backlinks.push(entry.path);
+                    }
+                }
+                Err(e) => failures.push((entry.path, e.to_string())),
+            }
+        }
         backlinks.sort();
-        backlinks
+        (backlinks, failures)
     })
     .await;
-    let backlinks = match found {
-        Ok(b) => b,
+    let (backlinks, failures) = match scanned {
+        Ok(r) => r,
         Err(join_err) => {
             tracing::error!(
                 target: "hallouminate::daemon",
@@ -1028,10 +1057,24 @@ async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> Da
             return DaemonResponse::internal(format!("backlinks task panicked: {join_err}"));
         }
     };
+    let mut warnings = Vec::new();
+    for (path, error) in &failures {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            corpus = %corpus_name,
+            path = %path,
+            error = %error,
+            "backlinks scan: failed to read file; result is a partial scan",
+        );
+        warnings.push(format!(
+            "could not read {path} in corpus {corpus_name}: {error}; backlinks result is incomplete"
+        ));
+    }
     DaemonResponse::ok(&BacklinksResult {
-        corpus: corpus.name,
+        corpus: corpus_name,
         path: req.path,
         backlinks,
+        warnings,
     })
 }
 
@@ -1122,7 +1165,11 @@ async fn handle_delete_markdown(
             return DaemonResponse::internal(format!("unlink task panicked: {join_err}"));
         }
     }
-    if let Err(e) = state.store().delete_file(&corpus.name, &file_ref_str).await {
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => return DaemonResponse::internal(e.to_string()),
+    };
+    if let Err(e) = res.store.delete_file(&corpus.name, &file_ref_str).await {
         return DaemonResponse::internal(e.to_string());
     }
 
@@ -1130,7 +1177,7 @@ async fn handle_delete_markdown(
     // longer links to the deleted file. Same internal-error semantics as
     // the add_markdown path — partial regen would desync the wiki tree.
     if is_wiki_corpus(&corpus)
-        && let Err(msg) = rebuild_wiki_indexes(state, &corpus, &root, &relative).await
+        && let Err(msg) = rebuild_wiki_indexes(state, cfg, &corpus, &root, &relative).await
     {
         drop(guard);
         return DaemonResponse::internal(msg);
@@ -1229,6 +1276,12 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
 /// Uses `block_in_place` internally, which panics on a current-thread
 /// runtime — callers (and their tests) must run under the `multi_thread`
 /// flavor.
+/// Reindex a single file the daemon controls, reading its content and mtime
+/// from the ambient path. Used by the write/add-markdown handlers, which
+/// reindex a file they just wrote through the sandbox no-follow write path.
+/// The untrusted watcher path must NOT use this — it reads no-follow bytes and
+/// calls `index_single_file_with_content` directly to avoid a symlink-swap
+/// TOCTOU between validation and content read.
 pub(super) async fn index_single_file(
     store: &LanceStore,
     embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
@@ -1236,9 +1289,26 @@ pub(super) async fn index_single_file(
     corpus: &CorpusConfig,
     file: &Path,
 ) -> anyhow::Result<crate::domain::indexer::ApplyStats> {
-    let meta = tokio::fs::metadata(file).await?;
-    let modified = meta.modified()?;
-    let dur = modified
+    let mtime = tokio::fs::metadata(file).await?.modified()?;
+    let bytes = tokio::fs::read(file).await?;
+    index_single_file_with_content(store, embedder, registry, corpus, file, &bytes, mtime).await
+}
+
+/// Reindex a single file from already-read content and mtime, so the caller
+/// controls how the bytes were obtained. The watcher passes bytes from a
+/// no-follow read (`sandbox::read_no_follow_with_mtime`) so a corpus
+/// contributor cannot swap a checked component to a symlink between the
+/// validation and the content read.
+pub(super) async fn index_single_file_with_content(
+    store: &LanceStore,
+    embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
+    registry: &HandlerRegistry,
+    corpus: &CorpusConfig,
+    file: &Path,
+    bytes: &[u8],
+    mtime: std::time::SystemTime,
+) -> anyhow::Result<crate::domain::indexer::ApplyStats> {
+    let dur = mtime
         .duration_since(UNIX_EPOCH)
         .map_err(|_| anyhow::anyhow!("pre-epoch mtime on {}", file.display()))?;
     let mtime_ms = mtime_ms_from_duration(dur, file)?;
@@ -1250,48 +1320,51 @@ pub(super) async fn index_single_file(
         .to_string();
     let existing = store.get_file_snapshot(&corpus.name, &file_ref_str).await?;
     let mut db: HashMap<FileRef, FileSnapshot> = HashMap::new();
-    // Carries the snapshot when the mtime lied (same-second truncation/edit)
-    // but the content hash moved: `plan()` would otherwise skip this file
-    // entirely (mtime unchanged) or, if omitted from `db`, misroute it as a
-    // brand-new upsert with no prior rows to evict. Neither is right — it
-    // must go through the mtime-fallthrough path so a truncate-to-empty here
-    // still evicts stale rows (`EmptyFilePolicy::Evict`).
-    let mut reindex_despite_same_mtime: Option<(FileSnapshot, String)> = None;
-    if let Some(snap) = existing {
-        let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
-            let owned_file = file.to_path_buf();
-            let hash = tokio::task::spawn_blocking(move || blake3_file(&owned_file)).await??;
-            if hash != snap.content_hash.as_str() {
-                reindex_despite_same_mtime = Some((snap.clone(), hash));
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        if !hash_changed_without_mtime {
-            db.insert(file_ref.clone(), snap);
-        }
-    }
-    let mut p = plan(vec![(file_ref.clone(), Mtime(mtime_ms))], db);
-    if let Some((snap, known_hash)) = reindex_despite_same_mtime
-        && let Some(idx) = p.upserts.iter().position(|u| u.file == file_ref)
-    {
-        let upsert = p.upserts.remove(idx);
-        p.mtime_touches
-            .push(crate::domain::indexer::MtimeCandidate {
-                file: upsert.file,
-                snap,
-                new_mtime: upsert.mtime,
-                known_hash: Some(known_hash),
-            });
-    }
     // Truncate-to-empty eviction (files_skipped_empty > 0 for a file that HAD
     // a snapshot) is handled inside `apply`'s mtime-fallthrough batch — see
     // `EmptyFilePolicy::Evict` in `src/domain/indexer/apply.rs` — so both this
     // single-file path and bulk `index_corpus` share one eviction rule.
     let stats = tokio::task::block_in_place(|| {
+        // Carries the snapshot when the mtime lied (same-second truncation/edit)
+        // but the content hash moved: `plan()` would otherwise skip this file
+        // entirely (mtime unchanged) or, if omitted from `db`, misroute it as a
+        // brand-new upsert with no prior rows to evict. Neither is right — it
+        // must go through the mtime-fallthrough path so a truncate-to-empty here
+        // still evicts stale rows (`EmptyFilePolicy::Evict`).
+        //
+        // The hash (when needed) is computed here, inside block_in_place,
+        // since blake3-hashing file bytes is blocking CPU work same as the
+        // rest of this closure.
+        let mut reindex_despite_same_mtime: Option<(FileSnapshot, String)> = None;
+        if let Some(snap) = existing {
+            let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
+                let hash = blake3_bytes(bytes);
+                if hash != snap.content_hash.as_str() {
+                    reindex_despite_same_mtime = Some((snap.clone(), hash));
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !hash_changed_without_mtime {
+                db.insert(file_ref.clone(), snap);
+            }
+        }
+        let mut p = plan(vec![(file_ref.clone(), Mtime(mtime_ms))], db);
+        if let Some((snap, known_hash)) = reindex_despite_same_mtime
+            && let Some(idx) = p.upserts.iter().position(|u| u.file == file_ref)
+        {
+            let upsert = p.upserts.remove(idx);
+            p.mtime_touches
+                .push(crate::domain::indexer::MtimeCandidate {
+                    file: upsert.file,
+                    snap,
+                    new_mtime: upsert.mtime,
+                    known_hash: Some(known_hash),
+                });
+        }
         tokio::runtime::Handle::current().block_on(apply(
             p,
             store,
@@ -1299,6 +1372,7 @@ pub(super) async fn index_single_file(
             registry,
             corpus,
             DEFAULT_BATCH_SIZE,
+            Some((&file_ref, bytes)),
         ))
     })?;
     Ok(stats)
@@ -1323,7 +1397,14 @@ pub(super) async fn catch_up_index(state: DaemonState) {
             return;
         }
     };
-    let store = state.store();
+    let res = match state.resources_for(state.baseline()).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "hallouminate::daemon", error = %e,
+                "boot catch-up: could not resolve baseline resources; skipped");
+            return;
+        }
+    };
     let registry = state.make_registry();
     for corpus in corpora {
         if !crate::domain::corpus::missing_roots(&corpus).is_empty() {
@@ -1337,7 +1418,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
                 continue;
             }
         };
-        match catch_up_corpus(&state, &store, &registry, &corpus).await {
+        match catch_up_corpus(&res, &registry, &corpus).await {
             Ok(Some(stats)) => tracing::info!(target: "hallouminate::daemon",
                 corpus = %corpus.name, files_upserted = stats.files_upserted,
                 files_touched = stats.files_touched, files_deleted = stats.files_deleted,
@@ -1352,26 +1433,34 @@ pub(super) async fn catch_up_index(state: DaemonState) {
 /// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed
 /// (no work, no model load); `Ok(Some(stats))` = reindexed.
 async fn catch_up_corpus(
-    state: &DaemonState,
-    store: &LanceStore,
+    res: &RequestResources,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
 ) -> anyhow::Result<Option<crate::domain::indexer::ApplyStats>> {
     let disk = scan(corpus)?;
-    let db = store.list_files(&corpus.name).await?;
+    let db = res.store.list_files(&corpus.name).await?;
     let p = plan(disk, db);
     if p.upserts.is_empty() && p.mtime_touches.is_empty() && p.deletes.is_empty() {
         return Ok(None);
     }
-    let mut embedder = if plan_needs_embedder(&p, state.embeddings_enabled()) {
-        Some(state.embedder().await?)
+    let mut embedder = if plan_needs_embedder(&p, res.embeddings_enabled) {
+        Some(res.embedder().await?)
     } else {
         None
     };
     let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
         .as_mut()
         .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-    let stats = apply(p, store, embedder_dyn, registry, corpus, DEFAULT_BATCH_SIZE).await?;
+    let stats = apply(
+        p,
+        &res.store,
+        embedder_dyn,
+        registry,
+        corpus,
+        DEFAULT_BATCH_SIZE,
+        None,
+    )
+    .await?;
     Ok(Some(stats))
 }
 
@@ -1431,6 +1520,7 @@ fn fold_apply_stats(
 /// regenerating would clobber it.
 async fn rebuild_wiki_indexes(
     state: &DaemonState,
+    cfg: &Config,
     corpus: &CorpusConfig,
     root: &Path,
     file_relative: &Path,
@@ -1442,7 +1532,8 @@ async fn rebuild_wiki_indexes(
     let written_is_index = is_index_md(file_relative);
     let mut totals = crate::domain::indexer::ApplyStats::default();
     let dirs = ancestor_dirs(root, file_relative);
-    let store = state.store();
+    let res = state.resources_for(cfg).await.map_err(|e| e.to_string())?;
+    let store = &res.store;
     let registry = state.make_registry();
 
     for dir in &dirs {
@@ -1460,8 +1551,20 @@ async fn rebuild_wiki_indexes(
 
         let existing = {
             let owned_path = index_path.clone();
-            match tokio::task::spawn_blocking(move || std::fs::read_to_string(&owned_path)).await {
-                Ok(Ok(s)) => Some(s),
+            match tokio::task::spawn_blocking(move || {
+                // Treat a symlinked index.md as invalid (as if absent) so a
+                // child directory's index.md symlink can't smuggle content
+                // from outside the corpus into the composed ancestor index.
+                match std::fs::symlink_metadata(&owned_path) {
+                    Ok(meta) if meta.file_type().is_symlink() => Ok(None),
+                    Ok(_) => std::fs::read_to_string(&owned_path).map(Some),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            {
+                Ok(Ok(s)) => s,
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
                 Ok(Err(e)) => return Err(format!("read {}: {e}", index_path.display())),
                 Err(e) => {
@@ -1471,7 +1574,7 @@ async fn rebuild_wiki_indexes(
         };
 
         let is_root = dir == root;
-        let (new_content, outcome) = compose_index_md(dir, is_root, existing.as_deref())
+        let (new_content, outcome) = compose_index_md(root, dir, is_root, existing.as_deref())
             .map_err(|e| format!("compose index {}: {e}", dir.display()))?;
         match outcome {
             crate::domain::corpus::index_md::RewriteOutcome::NoMarkers
@@ -1521,8 +1624,8 @@ async fn rebuild_wiki_indexes(
         // are opt-in: when enabled, the embedder must load (a cold-cache or
         // network failure fails the mutation, same shape as the primary
         // add_markdown path); when disabled, reindex lexical-only.
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
+        let mut embedder = if res.embeddings_enabled {
+            match res.embedder().await {
                 Ok(g) => Some(g),
                 Err(e) => return Err(format!("embedder: {e}")),
             }
@@ -1532,7 +1635,7 @@ async fn rebuild_wiki_indexes(
         let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
             .as_mut()
             .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = index_single_file(&store, embedder_dyn, &registry, corpus, &dest)
+        let stats = index_single_file(store, embedder_dyn, &registry, corpus, &dest)
             .await
             .map_err(|e| format!("reindex {}: {e}", dest.display()))?;
         drop(embedder);
@@ -1968,8 +2071,12 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "docs")
             .expect("docs corpus present");
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources_for");
         assert!(
-            catch_up_corpus(&state, &state.store(), &state.make_registry(), &corpus)
+            catch_up_corpus(&res, &state.make_registry(), &corpus)
                 .await
                 .expect("catch_up_corpus")
                 .is_none(),

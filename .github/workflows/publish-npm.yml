@@ -3,6 +3,12 @@ name: Publish to npm
 # Fires AFTER cargo-dist's release.yml has finished and the GitHub Release
 # (with platform-specific tarballs) is live. The npm postinstall script
 # downloads those tarballs by URL, so this workflow must run last.
+#
+# Auth: npm trusted publishing (OIDC). No NPM_TOKEN secret — the job requests
+# an id-token and npm mints a short-lived credential, attaching provenance
+# automatically. Configure the trusted publisher once at
+# npmjs.com -> package `hallouminate` -> Settings -> Trusted Publisher:
+# GitHub Actions, repo paulnsorensen/hallouminate, workflow publish-npm.yml.
 on:
   release:
     types: [published]
@@ -38,14 +44,15 @@ jobs:
   publish-npm:
     needs: version-check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC trusted publishing — no NPM_TOKEN secret needed
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 20
-          registry-url: https://registry.npmjs.org
+          node-version: 24 # bundled npm (>= 11.5.1) satisfies OIDC trusted publishing
+      # No registry-url / NODE_AUTH_TOKEN: a set token blocks the OIDC exchange.
       - run: npm publish ./npm --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
