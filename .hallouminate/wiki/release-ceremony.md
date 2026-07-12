@@ -17,8 +17,16 @@ Current design: `publish-jobs = ["./publish-npm"]` in dist-workspace.toml; publi
 
 Full cited research: `.cheese/research/npm-publish-tagged-release/`.
 
-## macOS CI flake on the idle-exit daemon test
+## Reusable-workflow call sites zero unlisted permission scopes
 
-`idle_exit_removes_socket_and_lockfile_and_refuses_new_connections` can fail on macOS with `WouldBlock` re-flocking the single-instance lockfile: the test relocks immediately after the serve future returns, racing the async drop of the lock-holding fd. Rerun passes. Tracked in [issue #207](https://github.com/paulnsorensen/hallouminate/issues/207) with a bounded-retry fix direction. Don't burn time bisecting a red macOS leg on this test — check the panic line (tests/daemon.rs ~1780) first.
+A `permissions:` block on a job that `uses:` a reusable workflow REPLACES the workflow-level grant — every unlisted scope becomes `none`, and GitHub validates the callee's requested scopes against that at graph setup. `custom-publish-npm` originally granted only `id-token: write`; publish-npm.yml's jobs request `contents: read`, so every release.yml run died with `startup_failure` ("The nested job 'publish-npm' is requesting 'contents: read', but is only allowed 'contents: none'") — including tag pushes, which would have silently killed the release. Fixed 2026-07-12 by listing `contents: read` alongside `id-token: write` at the call site. Startup failures produce NO failing check on the PR — they only show in the Actions tab — so a green PR does not prove release.yml still parses; check `gh run list --workflow Release` after touching it.
+
+## Nightly smoke test matches the binary's version line
+
+`hallouminate --version` prints `hallouminate X.Y.Z` (clap's `name version` shape), and the wrapper package version (`0.0.0-experimental.N.M`) never appears in binary output. The smoke assertion greps for `^hallouminate <semver>` — the first cut anchored on bare `^<semver>` and failed all 10 attempts despite exit 0 (fixed 2026-07-12).
+
+## macOS CI flake on the idle-exit daemon test (fixed)
+
+`idle_exit_removes_socket_and_lockfile_and_refuses_new_connections` could fail on macOS with `WouldBlock` re-flocking the single-instance lockfile: the test relocked immediately after the serve future returned, racing the async drop of the lock-holding fd. Fixed in [PR #210](https://github.com/paulnsorensen/hallouminate/pull/210) ([issue #207](https://github.com/paulnsorensen/hallouminate/issues/207)) with a bounded 2s retry that only retries `EWOULDBLOCK`. If it reappears, the panic line is tests/daemon.rs ~1790.
 
 Related: [[daemon-and-cli]], [[worktree-dev-gotchas]]

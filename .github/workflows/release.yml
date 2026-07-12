@@ -304,6 +304,7 @@ jobs:
     with:
       plan: ${{ needs.plan.outputs.val }}
     permissions:
+      contents: read # callee jobs request it; a job-level grant zeroes unlisted scopes
       id-token: write
 
   announce:
