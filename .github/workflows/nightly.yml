@@ -144,12 +144,27 @@ jobs:
           gh release upload "$NIGHTLY_TAG" \
             "${stage}.tar.xz" "${stage}.tar.xz.sha256" --clobber
 
-  publish-npm:
+  # Publish + smoke in ONE job definition (no cross-job handoff to race).
+  # Every matrix leg derives the same version string from run_number +
+  # run_attempt, so the smoke test pins the EXACT version instead of
+  # resolving the `latest` dist-tag (which raced npm's read-after-write
+  # replication and failed with ETARGET). Only the ubuntu leg publishes.
+  # Re-runs never conflict because VERSION embeds run_attempt — each re-run
+  # mints a fresh version; the publish guard below is cheap defense only.
+  # Both legs then retry the pinned npx install until the registry serves it.
+  publish-and-smoke:
     needs: build
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: read
       id-token: write # OIDC trusted publishing — no NPM_TOKEN secret needed
+    env:
+      PKG: "@paulnsorensen/hallouminate-nightly"
+      VERSION: 0.0.0-experimental.${{ github.run_number }}.${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -157,42 +172,49 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
           node-version: 24 # bundled npm (>= 11.5.1) satisfies OIDC trusted publishing
-      # Stamp a unique experimental prerelease version per run (run_number is
-      # monotonic). Decoupled from Cargo.toml. OIDC injects auth automatically;
-      # provenance is attached on publish. This package IS the nightly channel,
-      # so its newest build is `latest`.
-      - name: Stamp version and publish
+      # This package IS the nightly channel, so its newest build is `latest`.
+      - name: Publish (idempotent)
+        if: matrix.os == 'ubuntu-latest'
         working-directory: ./npm-nightly
         run: |
-          npm pkg set version="0.0.0-experimental.${{ github.run_number }}.${{ github.run_attempt }}"
-          npm publish --tag latest --access public
-
-  smoke-test:
-    needs: publish-npm
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: 24
-      - name: Smoke test nightly npx package
-        shell: bash
-        # Stream postinstall output to the foreground so an install failure is
-        # visible in the log instead of npm's hidden debug file.
-        env:
-          npm_config_foreground_scripts: "true"
-        run: |
-          set +e
-          output=$(npx --yes @paulnsorensen/hallouminate-nightly@latest --version 2>stderr.txt)
-          code=$?
-          set -e
-          echo "npx exit code: $code"
-          echo "--- stdout ---"; echo "$output"
-          echo "--- stderr ---"; cat stderr.txt || true
-          if [ "$code" -ne 0 ] || [ -z "$output" ]; then
-            echo "smoke test FAILED (exit=$code, stdout empty=$([ -z "$output" ] && echo yes || echo no))"
+          set -euo pipefail
+          # Skip only on a confirmed prior publish; any other npm view error
+          # (network, auth) fails loudly instead of falling through to publish.
+          if npm view "${PKG}@${VERSION}" version >/dev/null 2>view-err.txt; then
+            echo "${PKG}@${VERSION} already published — skipping"
+            exit 0
+          fi
+          if ! grep -q "E404" view-err.txt; then
+            echo "npm view failed for a non-404 reason:"
+            cat view-err.txt
             exit 1
           fi
+          npm pkg set version="$VERSION"
+          npm publish --tag latest --access public
+      - name: Smoke test pinned nightly version
+        shell: bash
+        # Stream postinstall output to the foreground so an install failure is
+        # visible in the log instead of npm's hidden debug file. prefer-online
+        # keeps retries from replaying a cached registry miss. The macOS leg
+        # has nothing to wait on except the ubuntu publish; the retry loop IS
+        # the synchronization.
+        env:
+          npm_config_foreground_scripts: "true"
+          npm_config_prefer_online: "true"
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 10); do
+            set +e
+            output=$(npx --yes "${PKG}@${VERSION}" --version 2>stderr.txt)
+            code=$?
+            set -e
+            echo "attempt ${attempt}: exit=${code}"
+            echo "--- stdout ---"; echo "$output"
+            echo "--- stderr ---"; cat stderr.txt || true
+            if [ "$code" -eq 0 ] && printf '%s' "$output" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+'; then
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "smoke test FAILED after 10 attempts (expected semver on stdout)"
+          exit 1
