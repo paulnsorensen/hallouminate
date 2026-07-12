@@ -12,7 +12,7 @@ Historical bug (fixed 2026-07-12): `publish-npm.yml` originally triggered on `re
 
 Current design: `publish-jobs = ["./publish-npm"]` in dist-workspace.toml; publish-npm.yml is `on: workflow_call` (dist passes the `plan` manifest; the version check derives the tag from `github.ref_name` — the caller's context). Runs after the `host` phase, so release tarballs are live before npm postinstall needs them. Two things to know:
 
-- **npm Trusted Publisher must name `release.yml` (the CALLER), not publish-npm.yml** — npm validates the calling workflow's filename for reusable workflows (docs.npmjs.com/trusted-publishers), exact and case-sensitive. Repointing it on npmjs.com was a manual one-time step; if npm publish ever fails `ENEEDAUTH`, check this first.
+- **npm Trusted Publisher must name `release.yml` (the CALLER), not publish-npm.yml** — npm validates the calling workflow's filename for reusable workflows (docs.npmjs.com/trusted-publishers), exact and case-sensitive. Repointing it on npmjs.com was a manual one-time step; if npm publish ever fails `ENEEDAUTH`, check this first. Verified live by the v0.3.2 cut (2026-07-12, run 29208478197): tag → dist → GitHub Release → OIDC npm publish, all green — the pipeline's first end-to-end run.
 - **The release.yml call-site job (`custom-publish-npm`) is hand-maintained** — `allow-dirty = ["ci"]` means dist never regenerates release.yml, so the publish-jobs config alone doesn't wire it. The job mirrors dist 0.32.0's generated shape (verified against j178/prek). A future `dist generate` regen would include it natively but clobber the hand-pinned action SHAs.
 
 Full cited research: `.cheese/research/npm-publish-tagged-release/`.
