@@ -239,7 +239,16 @@ fn write_meta(meta_path: &Path, meta: &Meta) -> Result<()> {
     if let Some(parent) = meta_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(meta_path, toml_text)?;
+    // Write-then-rename: readers never see a partial meta.toml (rename is
+    // atomic within the same directory/filesystem), and the pid-unique tmp
+    // name keeps concurrent first-inits from interleaving writes into a
+    // shared tmp file.
+    let tmp_path = meta_path.with_file_name(format!(
+        "{META_FILENAME}.{pid}.tmp",
+        pid = std::process::id()
+    ));
+    std::fs::write(&tmp_path, toml_text)?;
+    std::fs::rename(&tmp_path, meta_path)?;
     Ok(())
 }
 
@@ -594,11 +603,27 @@ fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
         .mode(0o600)
         .open(&lock_path)?;
     if let Err(errno) = flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        if errno == rustix::io::Errno::WOULDBLOCK {
+            // "stop the other daemon" assumes the contender is another
+            // process. True today because the resources cache never evicts
+            // (baseline store stays cached and reused, per ADR-001 dropping
+            // idle-evict), so a same-process re-open can't reach this path.
+            // If cache eviction is ever introduced, distinguish same-process
+            // contention here.
+            return Err(HallouminateError::Config(format!(
+                "ground store {} is locked by another hallouminate process ({}); \
+                 every ground dir has exactly one owner — stop the other daemon \
+                 (`hallouminate daemon stop`) or point [storage].ground_dir \
+                 elsewhere before retrying",
+                ground_dir.display(),
+                std::io::Error::from(errno),
+            )));
+        }
+        // Contention (WOULDBLOCK) is the only errno that implies another
+        // owner; anything else (permissions, I/O, no space, etc.) is a
+        // distinct failure and gets a generic message with path context.
         return Err(HallouminateError::Config(format!(
-            "ground store {} is locked by another hallouminate process ({}); \
-             every ground dir has exactly one owner — stop the other daemon \
-             (`hallouminate daemon stop`) or point [storage].ground_dir \
-             elsewhere before retrying",
+            "failed to lock {}: {}",
             ground_dir.display(),
             std::io::Error::from(errno),
         )));
