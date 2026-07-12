@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use crate::adapters::lance::LanceStore;
 use crate::app::cli::{CorpusReport, IndexReport};
@@ -349,6 +349,7 @@ async fn handle_ground(
             .chunks_per_file
             .unwrap_or(cfg.search.chunks_per_file_default),
         limit: req.limit.unwrap_or(50),
+        rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
     };
 
     // Union ground (#106): a no-corpus request from above all repos fans the

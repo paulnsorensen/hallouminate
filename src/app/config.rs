@@ -15,6 +15,10 @@ const DEFAULT_CHUNKS_PER_FILE: usize = 3;
 const DEFAULT_DEBOUNCE_MS: u64 = 500;
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
+// #139: crossencoder rerank timeout, configurable via `[search].rerank_timeout_ms`.
+// 2s covers the measured ~1.25s median rerank for the default N=50 candidate
+// pool — see `domain::search::crossencoder` for the latency rationale.
+const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
 
 /// Search and ranking defaults applied when a query does not override them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +35,11 @@ pub struct SearchConfig {
     /// `domain::search::crossencoder::canonical_crossencoder_model`.
     #[serde(default)]
     pub crossencoder: Option<String>,
+    /// Milliseconds to wait for the crossencoder rerank before falling back
+    /// to fusion order (default `2000`, i.e. 2s). See #139 and
+    /// `domain::ground::orchestrate::rerank_with_timeout`.
+    #[serde(default = "default_rerank_timeout_ms")]
+    pub rerank_timeout_ms: u64,
 }
 
 impl Default for SearchConfig {
@@ -39,6 +48,7 @@ impl Default for SearchConfig {
             top_files_default: DEFAULT_TOP_FILES,
             chunks_per_file_default: DEFAULT_CHUNKS_PER_FILE,
             crossencoder: None,
+            rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
         }
     }
 }
@@ -480,6 +490,14 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        rerank_timeout_ms: merge_scalar(
+            "search.rerank_timeout_ms",
+            baseline.search.rerank_timeout_ms,
+            repo.search.rerank_timeout_ms,
+            defaults.search.rerank_timeout_ms,
+            baseline_path,
+            repo_path,
+        )?,
     };
     let embeddings = EmbeddingsConfig {
         enabled: merge_scalar(
@@ -783,6 +801,9 @@ fn default_top_files() -> usize {
 fn default_chunks_per_file() -> usize {
     DEFAULT_CHUNKS_PER_FILE
 }
+fn default_rerank_timeout_ms() -> u64 {
+    DEFAULT_RERANK_TIMEOUT_MS
+}
 fn default_debounce_ms() -> u64 {
     DEFAULT_DEBOUNCE_MS
 }
@@ -1068,6 +1089,16 @@ ground_dir = "~/.local/share/hallouminate/ground"
         let cfg = parse("[search]\ntop_files_default = 5\n", None).expect("partial search parses");
         assert_eq!(cfg.search.top_files_default, 5);
         assert_eq!(cfg.search.chunks_per_file_default, DEFAULT_CHUNKS_PER_FILE);
+        assert_eq!(
+            cfg.search.rerank_timeout_ms, DEFAULT_RERANK_TIMEOUT_MS,
+            "omitted rerank_timeout_ms must default to 2000ms (#139)"
+        );
+    }
+
+    #[test]
+    fn parse_rerank_timeout_ms_custom_value() {
+        let cfg = parse("[search]\nrerank_timeout_ms = 500\n", None).expect("parses");
+        assert_eq!(cfg.search.rerank_timeout_ms, 500);
     }
 
     #[test]
@@ -1268,6 +1299,7 @@ rrf_k                   = 60
                 top_files_default: 7,
                 chunks_per_file_default: 2,
                 crossencoder: None,
+                rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
             },
             "SearchConfig must hold only the surviving fields"
         );
