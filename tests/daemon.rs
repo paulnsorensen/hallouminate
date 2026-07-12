@@ -1773,11 +1773,28 @@ async fn idle_exit_removes_socket_and_lockfile_and_refuses_new_connections() {
         .write(true)
         .open(&lockfile)
         .expect("reopen lockfile after idle-exit");
-    rustix::fs::flock(
-        &relock,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )
-    .expect("idle-exit must release the single-instance flock so a fresh daemon can rebind");
+    // The lock-holding handle's drop can still be pending in another tokio
+    // task (flock is per open-file-description), so an immediate relock can
+    // race idle-exit's cleanup. Retry with a short bounded backoff instead of
+    // asserting on the first attempt.
+    let relock_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let result = loop {
+        let attempt = rustix::fs::flock(
+            &relock,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        );
+        if attempt != Err(rustix::io::Errno::WOULDBLOCK)
+            || std::time::Instant::now() >= relock_deadline
+        {
+            break attempt;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    if let Err(err) = result {
+        panic!(
+            "idle-exit must release the single-instance flock so a fresh daemon can rebind: {err}"
+        );
+    }
     drop(relock);
 }
 
