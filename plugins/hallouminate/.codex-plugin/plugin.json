@@ -1,6 +1,6 @@
 {
   "name": "hallouminate",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Install hallouminate and bootstrap your first LLM-authored per-repo wiki.",
   "author": {
     "name": "Paul Sorensen",
@@ -10,7 +10,13 @@
   "homepage": "https://github.com/paulnsorensen/hallouminate",
   "repository": "https://github.com/paulnsorensen/hallouminate",
   "license": "MIT",
-  "keywords": ["hallouminate", "wiki", "rag", "mcp", "documentation"],
+  "keywords": [
+    "hallouminate",
+    "wiki",
+    "rag",
+    "mcp",
+    "documentation"
+  ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
@@ -19,7 +25,11 @@
     "longDescription": "Hallouminate packages skills and an MCP server for creating, querying, ingesting, and maintaining per-repository LLM-authored wikis.",
     "developerName": "Paul Sorensen",
     "category": "Documentation",
-    "capabilities": ["MCP", "Skills", "Documentation"],
+    "capabilities": [
+      "MCP",
+      "Skills",
+      "Documentation"
+    ],
     "websiteURL": "https://github.com/paulnsorensen/hallouminate",
     "defaultPrompt": [
       "Install hallouminate in this repo.",
