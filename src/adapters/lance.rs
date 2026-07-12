@@ -27,6 +27,8 @@ use crate::domain::indexer::plan::FileSnapshot;
 pub const EMBEDDING_DIM: usize = 384;
 const TABLE_NAME: &str = "chunks";
 const META_FILENAME: &str = "meta.toml";
+/// Single-owner lockfile inside the ground dir — see [`acquire_store_lock`].
+const STORE_LOCK_FILENAME: &str = "store.lock";
 
 /// One chunk of a prepared file, ready to be written as a row in the `chunks`
 /// table.
@@ -237,7 +239,16 @@ fn write_meta(meta_path: &Path, meta: &Meta) -> Result<()> {
     if let Some(parent) = meta_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(meta_path, toml_text)?;
+    // Write-then-rename: readers never see a partial meta.toml (rename is
+    // atomic within the same directory/filesystem), and the pid-unique tmp
+    // name keeps concurrent first-inits from interleaving writes into a
+    // shared tmp file.
+    let tmp_path = meta_path.with_file_name(format!(
+        "{META_FILENAME}.{pid}.tmp",
+        pid = std::process::id()
+    ));
+    std::fs::write(&tmp_path, toml_text)?;
+    std::fs::rename(&tmp_path, meta_path)?;
     Ok(())
 }
 
@@ -560,6 +571,64 @@ pub struct LanceStore {
     /// `ensure_search_indexes` too, since that call guarantees the FTS index
     /// exists (unlike the row-gated ANN index) once it returns `Ok`.
     text_index_present: AtomicBool,
+    /// Exclusive advisory lock on `store.lock` inside the ground dir, held
+    /// for this store's whole lifetime (dropping the handle releases it).
+    /// Pins the single-owner invariant to the store itself — see
+    /// [`acquire_store_lock`].
+    _dir_lock: std::fs::File,
+}
+
+/// Take a non-blocking exclusive `flock` on `store.lock` inside the ground
+/// dir, binding single ownership to the store rather than to any daemon
+/// socket path.
+///
+/// The daemon's per-socket lock is not enough (#204): socket resolution is
+/// environment-dependent (`XDG_RUNTIME_DIR` present vs the `~/.cache`
+/// fallback), so two daemons spawned from different environments each held
+/// their own socket lock and co-owned this directory — and their interleaved
+/// maintenance/write commits deleted data files the other's manifest still
+/// referenced. Locking here covers every open path (daemon boot baseline,
+/// per-request `resources_for` builds, and any future direct open).
+fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use rustix::fs::{FlockOperation, flock};
+
+    let lock_path = ground_dir.join(STORE_LOCK_FILENAME);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)?;
+    if let Err(errno) = flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        if errno == rustix::io::Errno::WOULDBLOCK {
+            // "stop the other daemon" assumes the contender is another
+            // process. True today because the resources cache never evicts
+            // (baseline store stays cached and reused, per ADR-001 dropping
+            // idle-evict), so a same-process re-open can't reach this path.
+            // If cache eviction is ever introduced, distinguish same-process
+            // contention here.
+            return Err(HallouminateError::Config(format!(
+                "ground store {} is locked by another hallouminate process ({}); \
+                 every ground dir has exactly one owner — stop the other daemon \
+                 (`hallouminate daemon stop`) or point [storage].ground_dir \
+                 elsewhere before retrying",
+                ground_dir.display(),
+                std::io::Error::from(errno),
+            )));
+        }
+        // Contention (WOULDBLOCK) is the only errno that implies another
+        // owner; anything else (permissions, I/O, no space, etc.) is a
+        // distinct failure and gets a generic message with path context.
+        return Err(HallouminateError::Config(format!(
+            "failed to lock {}: {}",
+            ground_dir.display(),
+            std::io::Error::from(errno),
+        )));
+    }
+    Ok(file)
 }
 
 impl LanceStore {
@@ -580,7 +649,14 @@ impl LanceStore {
     ) -> Result<Self> {
         std::fs::create_dir_all(ground_dir)?;
         let meta_path = ground_dir.join(META_FILENAME);
+        // Meta check first so a same-dir embedding-config mismatch keeps its
+        // actionable "embedding store mismatch" error (the daemon's
+        // repo-layer override flow depends on it) instead of bouncing off
+        // the owner lock. The lock still lands before `lancedb::connect`,
+        // so the dataset itself is never co-owned; error paths after the
+        // acquisition drop the handle and release the lock.
         meta_check_or_init(&meta_path, model_name, quantized, embeddings_enabled)?;
+        let dir_lock = acquire_store_lock(ground_dir)?;
         let uri = ground_dir.to_str().ok_or_else(|| {
             HallouminateError::Config(format!("non-utf8 ground dir: {}", ground_dir.display()))
         })?;
@@ -596,6 +672,7 @@ impl LanceStore {
             embeddings_enabled,
             indexes_ensured: AtomicBool::new(false),
             text_index_present: AtomicBool::new(false),
+            _dir_lock: dir_lock,
         })
     }
 

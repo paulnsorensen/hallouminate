@@ -1460,12 +1460,20 @@ ground_dir = "{g}"
 
     // First daemon: the standard harness takes the lock and binds the
     // socket.
-    let harness = DaemonHarness::spawn(cfg.clone()).await;
+    let harness = DaemonHarness::spawn(cfg).await;
 
-    // Second daemon: same socket path, fresh state. `serve()` must bail out
-    // before returning, with an error that mentions the lockfile so a user
-    // sees what's holding them up.
-    let state2 = DaemonState::open(cfg, None).await.expect("second open ok");
+    // Second daemon: same socket path, fresh state on its OWN ground dir —
+    // the store-level single-owner lock (#204) would otherwise refuse the
+    // open before the per-socket lock under test here ever gets exercised.
+    // `serve()` must bail out before returning, with an error that mentions
+    // the lockfile so a user sees what's holding them up.
+    let ground2 = tmp.path().join("ground2");
+    let toml2 = toml.replace(
+        &ground.display().to_string(),
+        &ground2.display().to_string(),
+    );
+    let cfg2: Config = toml::from_str(&toml2).expect("parse cfg2");
+    let state2 = DaemonState::open(cfg2, None).await.expect("second open ok");
     let socket2 = harness.socket().to_path_buf();
     let result = timeout(Duration::from_secs(5), serve(&state2, &socket2))
         .await
@@ -1509,6 +1517,56 @@ fn docs_cfg(ground_dir: &Path, corpus_root: &Path) -> Config {
         g = ground_dir.display(),
     );
     toml::from_str(&toml).expect("parse cfg")
+}
+
+#[tokio::test]
+async fn second_daemon_on_same_ground_dir_is_refused() {
+    // Regression test for #204: two daemons resolved *different* socket paths
+    // (XDG_RUNTIME_DIR present vs absent -> ~/.cache fallback), so the
+    // per-socket single-instance flock never conflicted and both processes
+    // co-owned the same LanceDB ground dir. Their interleaved maintenance
+    // passes (compact + prune with delete_unverified) then deleted data files
+    // the other daemon's manifest still referenced, corrupting the store.
+    // Ownership must attach to the ground dir itself, not the socket path.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+
+    let first = DaemonState::open(docs_cfg(&ground, &corpus_root), None)
+        .await
+        .expect("first daemon owns the ground dir");
+
+    let err = DaemonState::open(docs_cfg(&ground, &corpus_root), None)
+        .await
+        .expect_err("second daemon on the same ground dir must refuse");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("locked by another hallouminate process"),
+        "error must name the single-owner violation, got: {chain}"
+    );
+    assert!(
+        chain.contains(&ground.display().to_string()),
+        "error must name the contested ground dir, got: {chain}"
+    );
+
+    // Release: the maintenance loop spawned by `open` holds a state clone, so
+    // the store lock outlives our handle until the shutdown token cancels it.
+    first.shutdown_token().cancel();
+    drop(first);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match DaemonState::open(docs_cfg(&ground, &corpus_root), None).await {
+            Ok(_) => break,
+            Err(e) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "store must reopen once the first daemon exits, got: {e:#}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -1972,7 +2030,22 @@ async fn stop_is_a_noop_against_an_already_stopped_daemon() {
 /// until the socket is reachable. Returns the serve task handle so the caller
 /// can join it after a graceful shutdown.
 async fn spawn_serve(cfg: Config, socket: &Path) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    let state = DaemonState::open(cfg, None).await.expect("open state");
+    // A just-stopped in-process daemon's maintenance task can hold its state
+    // clone (and the ground store's single-owner flock, #204) for a beat
+    // after `serve` returns; retry briefly. Production restarts are process
+    // exits, where the kernel releases the flock atomically.
+    let state = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match DaemonState::open(cfg.clone(), None).await {
+                Ok(state) => break state,
+                Err(e) => {
+                    assert!(std::time::Instant::now() < deadline, "open state: {e:#}");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        }
+    };
     let socket_clone = socket.to_path_buf();
     let handle = tokio::spawn(async move { serve(&state, &socket_clone).await });
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

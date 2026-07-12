@@ -1513,9 +1513,13 @@ mod tests {
             .await
             .expect("open daemon state");
 
-        // Evict the boot-built baseline entry so the racing calls actually
-        // contend on the build path rather than all hitting the warm cache.
-        state.inner.resources.lock().await.clear();
+        // Race the builders on a ground_dir the boot-built baseline does NOT
+        // own: the fresh key has no cache entry, so all 16 calls contend on
+        // the build path. (Evicting the baseline entry instead would leave
+        // its live store holding the ground dir's single-owner flock — #204 —
+        // and the rebuild would correctly refuse.)
+        let tmp_race = tempfile::tempdir().expect("tempdir race");
+        cfg.storage.ground_dir = tmp_race.path().to_string_lossy().into_owned();
 
         let mut handles = Vec::new();
         for _ in 0..16 {
