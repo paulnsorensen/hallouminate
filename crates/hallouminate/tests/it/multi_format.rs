@@ -23,6 +23,7 @@ use hallouminate_domain::indexer::{
 use hallouminate_domain::search::search_with_ripgrep;
 use text_splitter::Characters;
 
+use crate::common::LANCE_WRITE_LOCK;
 use crate::common::StubEmbedder;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
@@ -47,6 +48,7 @@ async fn open_store(dir: &Path) -> LanceStore {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_text_corpus_indexes_and_grounds() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -95,6 +97,7 @@ async fn plain_text_corpus_indexes_and_grounds() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn csv_indexes_one_self_describing_chunk_per_row() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     fs::write(
@@ -164,6 +167,7 @@ fn write_xlsx(path: &Path) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xlsx_indexes_each_sheet_row_with_sheet_and_row_metadata() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     write_xlsx(&corpus_dir.path().join("inv.xlsx"));
@@ -228,6 +232,7 @@ fn write_ods(path: &Path) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ods_indexes_rows_with_sheet_and_row_metadata() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     write_ods(&corpus_dir.path().join("cat.ods"));
@@ -262,6 +267,7 @@ async fn ods_indexes_rows_with_sheet_and_row_metadata() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     // One supported file and one unsupported type, both swept by a broad glob.
@@ -301,6 +307,7 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     // A `.xlsx` (in-scope, supported extension) whose bytes are not a valid
@@ -341,6 +348,7 @@ async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     // apply.rs's unreadable-skip branch must never evict a previously-indexed
     // file's rows on re-index (distinct from the truncate-to-empty eviction
     // path) — exercised here through the bulk `index_corpus` path rather than
@@ -507,6 +515,7 @@ fn markdown_handler_golden_snapshot_is_byte_stable() {
 /// rendering path in `cell_to_string` was never exercised; this pins it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xlsx_numeric_cell_renders_as_bare_number_not_float_debug() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     use rust_xlsxwriter::Workbook;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -557,6 +566,7 @@ async fn xlsx_numeric_cell_renders_as_bare_number_not_float_debug() {
 /// running row counter across sheets or only read the first sheet.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     use rust_xlsxwriter::Workbook;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -623,6 +633,7 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
 /// `col: val` rendering, but the populated cells around it still render.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn csv_ragged_row_uses_col_n_fallback_and_omits_blank_cells() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     // Header has 2 columns; the data row has 3 cells (the 3rd has no header) and

@@ -8,6 +8,14 @@
 
 pub mod daemon;
 
+/// Serializes tests that hammer LanceDB with real disk-backed writers.
+/// Each test uses a unique `tempfile::tempdir()` (no flock-path collision),
+/// but the merged single-binary harness runs many such writers concurrently
+/// on different OS threads, which trips LanceDB's commit-visibility /
+/// writer-retry contention (confirmed: `RUST_TEST_THREADS=1` never flakes;
+/// default parallelism does). Acquire and hold this for a test's whole body.
+pub static LANCE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use hallouminate_adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use hallouminate_domain::common::Result;
 use hallouminate_domain::indexer::chunk::{PreparedChunk, PreparedFile};

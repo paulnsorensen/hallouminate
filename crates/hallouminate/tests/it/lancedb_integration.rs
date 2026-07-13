@@ -8,6 +8,7 @@ use hallouminate_adapters::lance::{LanceStore, chunk_id_for};
 use hallouminate_domain::indexer::store::ChunkStore;
 use hallouminate_domain::search::search_with_ripgrep;
 
+use crate::common::LANCE_WRITE_LOCK;
 use crate::common::{placeholder_prepared_file, prepared_file_with_chunks};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
@@ -24,6 +25,7 @@ async fn fresh_store() -> (tempfile::TempDir, LanceStore) {
 
 #[tokio::test]
 async fn re_index_with_fewer_chunks_drops_orphaned_ords() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let five = placeholder_prepared_file("/tmp/a.md", 5);
@@ -46,6 +48,7 @@ async fn re_index_with_fewer_chunks_drops_orphaned_ords() {
 
 #[tokio::test]
 async fn delete_file_removes_all_chunks_for_that_file_only() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let a = placeholder_prepared_file("/tmp/a.md", 3);
@@ -78,6 +81,7 @@ async fn delete_file_removes_all_chunks_for_that_file_only() {
 
 #[tokio::test]
 async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     // Same distinctive token in two corpora; apply_batch requires one corpus
@@ -113,6 +117,7 @@ async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
 
 #[tokio::test]
 async fn fts_search_on_empty_store_returns_no_hits() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let hits = store
         .hybrid_search("docs", "anything", 10)
@@ -125,6 +130,7 @@ async fn fts_search_on_empty_store_returns_no_hits() {
 
 #[tokio::test]
 async fn touch_mtime_updates_only_mtime_column() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let pf = prepared_file_with_chunks(
@@ -163,6 +169,7 @@ async fn touch_mtime_updates_only_mtime_column() {
 
 #[tokio::test]
 async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let pf = prepared_file_with_chunks(
@@ -192,6 +199,7 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
 
 #[tokio::test]
 async fn hybrid_search_on_empty_corpus_returns_empty_vec() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let hits = search_with_ripgrep(&store, "docs", &[], "anything", 5)
         .await
@@ -203,6 +211,7 @@ async fn hybrid_search_on_empty_corpus_returns_empty_vec() {
 
 #[tokio::test]
 async fn single_file_corpus_top_hit_is_that_file() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let pf = prepared_file_with_chunks(
@@ -228,6 +237,7 @@ async fn single_file_corpus_top_hit_is_that_file() {
 
 #[tokio::test]
 async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let weird = "/tmp/o'brien's notes.md";
     let pf = placeholder_prepared_file(weird, 2);
@@ -262,6 +272,7 @@ async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
 
 #[tokio::test]
 async fn list_files_returns_only_the_requested_corpus() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let mut a = placeholder_prepared_file("/tmp/a.md", 2);
@@ -284,6 +295,7 @@ async fn list_files_returns_only_the_requested_corpus() {
 
 #[tokio::test]
 async fn apply_batch_rejects_mixed_corpus_batches() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let mut a = placeholder_prepared_file("/tmp/a.md", 1);
     a.corpus = "alpha".into();
@@ -303,6 +315,7 @@ async fn apply_batch_rejects_mixed_corpus_batches() {
 
 #[tokio::test]
 async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let shared = "/tmp/shared.md";
 
@@ -332,6 +345,7 @@ async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
 
 #[tokio::test]
 async fn hybrid_search_returns_only_hits_from_requested_corpus() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let mut a = prepared_file_with_chunks(
@@ -376,6 +390,7 @@ async fn hybrid_search_returns_only_hits_from_requested_corpus() {
 
 #[tokio::test]
 async fn apply_batch_uses_deterministic_chunk_ids_so_reapply_is_idempotent() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
 
     let pf = placeholder_prepared_file("/tmp/idem.md", 4);
