@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use hallouminate::adapters::lance::{EMBEDDING_DIM, LanceStore};
-use hallouminate::domain::common::{CorpusConfig, FileRef, Result};
+use hallouminate::domain::common::{CorpusConfig, FileRef, Result, canonicalize_or_passthrough};
 use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
 use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
 use text_splitter::Characters;
@@ -99,7 +99,16 @@ async fn re_run_after_crash_converges_to_correct_state() {
     // Pre-crash: index file A — an in-root file_ref that never exists on
     // disk, so the recovery scan plans a delete that survives the #215
     // root-scope filter (an out-of-root ref like /tmp/a.md would be skipped).
-    let a_ref = corpus_dir.path().join("a.md").to_string_lossy().into_owned();
+    // Anchor it under the CANONICALIZED corpus dir so it matches what the
+    // walker stores (walker.rs canonicalizes every file_ref) and what the
+    // #215 filter canonicalizes corpus.paths to. Without this the raw
+    // `/var/...` ref fails `starts_with` against the canonical `/private/var/...`
+    // root on macOS (symlinked temp dirs), and the delete is wrongly skipped.
+    let a_ref = canonicalize_or_passthrough(corpus_dir.path())
+        .into_path_buf()
+        .join("a.md")
+        .to_string_lossy()
+        .into_owned();
     {
         let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
             .await

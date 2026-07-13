@@ -330,9 +330,10 @@ mod tests {
     #[tokio::test]
     async fn apply_skips_deletes_outside_corpus_paths() {
         let store_dir = tempfile::tempdir().expect("tempdir store");
-        let store = LanceStore::open_or_create(store_dir.path(), "BAAI/bge-small-en-v1.5", false, false)
-            .await
-            .expect("open store");
+        let store =
+            LanceStore::open_or_create(store_dir.path(), "BAAI/bge-small-en-v1.5", false, false)
+                .await
+                .expect("open store");
         let registry = HandlerRegistry::new(text_splitter::Characters, 1500);
 
         // Seed two files under two distinct roots, both in the "docs" corpus.
@@ -340,8 +341,11 @@ mod tests {
         let out_of_scope_dir = tempfile::tempdir().expect("tempdir out-of-scope");
         std::fs::write(in_scope_dir.path().join("keep-gone.md"), "in scope")
             .expect("write in-scope fixture");
-        std::fs::write(out_of_scope_dir.path().join("other-gone.md"), "out of scope")
-            .expect("write out-of-scope fixture");
+        std::fs::write(
+            out_of_scope_dir.path().join("other-gone.md"),
+            "out of scope",
+        )
+        .expect("write out-of-scope fixture");
 
         let seed_corpus = CorpusConfig {
             name: "docs".to_string(),
@@ -398,11 +402,15 @@ mod tests {
 
         let remaining = store.list_files("docs").await.expect("list after apply");
         assert!(
-            !remaining.values().any(|s| s.file_ref.contains("keep-gone.md")),
+            !remaining
+                .values()
+                .any(|s| s.file_ref.contains("keep-gone.md")),
             "in-scope delete must actually remove its row from the store"
         );
         assert!(
-            remaining.values().any(|s| s.file_ref.contains("other-gone.md")),
+            remaining
+                .values()
+                .any(|s| s.file_ref.contains("other-gone.md")),
             "out-of-scope row must survive: it is outside this request's corpus.paths"
         );
     }

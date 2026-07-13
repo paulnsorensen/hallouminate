@@ -117,12 +117,18 @@ pub async fn ground(
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-    // `embed_query` calls the blocking ONNX forward pass; run it on this
-    // worker thread's blocking slot so the async runtime is not starved
+    // In ON mode `embed_query` calls the blocking ONNX forward pass; run it on
+    // this worker thread's blocking slot so the async runtime is not starved
     // while it runs (#217, matches #176's discipline). `embedder` is
     // `Option<&mut dyn EmbedBatch>` (non-'static), which rules out
-    // `spawn_blocking`.
-    let query_vec = tokio::task::block_in_place(|| embed_query(query, embedder))?;
+    // `spawn_blocking`. In OFF mode (`embedder: None`) `embed_query` does no
+    // blocking work, so skip `block_in_place` — it panics on a `current_thread`
+    // runtime and there is nothing to offload for lexical-only callers.
+    let query_vec = if embedder.is_some() {
+        tokio::task::block_in_place(|| embed_query(query, embedder))?
+    } else {
+        embed_query(query, embedder)?
+    };
     let mut hits = search_corpus(
         query,
         corpus,
@@ -237,8 +243,14 @@ pub async fn ground_union(
     // the per-corpus partition survives the shared rerank's reshuffle. The
     // query is embedded ONCE up front and shared across every corpus — each
     // embed is a forward pass serialized on the embedder mutex, so hoisting
-    // it out of the loop turns N passes into 1.
-    let query_vec = tokio::task::block_in_place(|| embed_query(query, embedder))?;
+    // it out of the loop turns N passes into 1. In OFF mode (`embedder: None`)
+    // there is no blocking inference to offload, so skip `block_in_place` — it
+    // panics on a `current_thread` runtime (see `ground()`).
+    let query_vec = if embedder.is_some() {
+        tokio::task::block_in_place(|| embed_query(query, embedder))?
+    } else {
+        embed_query(query, embedder)?
+    };
     let mut tagged: Vec<(SearchHit, String)> = Vec::new();
     for (name, paths) in corpora {
         let hits = search_corpus(query, name, paths, store, query_vec.as_ref(), opts.limit).await?;
