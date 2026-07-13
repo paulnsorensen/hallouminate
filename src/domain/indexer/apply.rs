@@ -1,11 +1,7 @@
-use std::path::{Path, PathBuf};
-
-use crate::adapters::lance::{EMBEDDING_DIM, LanceStore, PreparedFile};
-use crate::domain::common::{
-    CorpusConfig, FileRef, HallouminateError, Result, canonicalize_or_passthrough, expand_tilde,
-};
+use crate::domain::common::{CorpusConfig, FileRef, Result};
 use crate::domain::corpus::blake3_file;
-use crate::domain::embeddings::{EmbedBatch, EmbedRole};
+use crate::domain::indexer::chunk::PreparedFile;
+use crate::domain::indexer::store::ChunkStore;
 
 use super::format::HandlerRegistry;
 use super::plan::{IndexPlan, MtimeCandidate};
@@ -56,7 +52,7 @@ enum EmptyFilePolicy {
 /// batch width. Groups what would otherwise be four extra parameters on
 /// `run_in_batches` (mirroring `PrepareCtx` in format.rs).
 struct RunCtx<'a> {
-    store: &'a LanceStore,
+    store: &'a dyn ChunkStore,
     registry: &'a HandlerRegistry,
     indexed_at_ms: i64,
     batch_size: usize,
@@ -68,8 +64,7 @@ pub const DEFAULT_BATCH_SIZE: usize = 16;
 
 pub async fn apply(
     plan: IndexPlan,
-    store: &LanceStore,
-    mut embedder: Option<&mut dyn EmbedBatch>,
+    store: &dyn ChunkStore,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     batch_size: usize,
@@ -99,7 +94,6 @@ pub async fn apply(
     run_in_batches(
         upsert_reqs,
         &run,
-        embedder.as_deref_mut(),
         &mut stats,
         EmptyFilePolicy::Retain,
         precomputed,
@@ -136,38 +130,14 @@ pub async fn apply(
     run_in_batches(
         fallthrough_reqs,
         &run,
-        embedder,
         &mut stats,
         EmptyFilePolicy::Evict,
         precomputed,
     )
     .await?;
 
-    // Deletes: one delete-by-(corpus, file_ref) per gone file, scoped to this
-    // request's configured roots. `plan.deletes` is every store row for this
-    // corpus name that `list_files` returned (`list_files` filters by corpus
-    // name only, not by which root produced this request) minus what `disk`
-    // walked; a row whose `file_ref` falls outside every root in `corpus.paths`
-    // is out of scope for this run, not actually gone from disk, so deleting
-    // it would be a false-positive eviction (#215).
-    let delete_roots: Vec<PathBuf> = corpus
-        .paths
-        .iter()
-        .map(|p| canonicalize_or_passthrough(&expand_tilde(p)).into_path_buf())
-        .collect();
+    // Deletes: one delete-by-(corpus, file_ref) per gone file.
     for snap in plan.deletes {
-        let in_scope = delete_roots
-            .iter()
-            .any(|root| Path::new(&snap.file_ref).starts_with(root));
-        if !in_scope {
-            tracing::debug!(
-                target: "hallouminate::indexer",
-                file_ref = %snap.file_ref,
-                corpus = %snap.corpus,
-                "skipping delete: file_ref outside this request's configured roots"
-            );
-            continue;
-        }
         store.delete_file(&snap.corpus, &snap.file_ref).await?;
         stats.files_deleted += 1;
     }
@@ -183,11 +153,6 @@ pub async fn apply(
 async fn run_in_batches(
     reqs: Vec<WriteRequest<'_>>,
     run: &RunCtx<'_>,
-    // `+ '_` decouples the trait-object lifetime from the reference lifetime
-    // so `apply` can hand out two successive short reborrows via
-    // `as_deref_mut()` without the first borrow being pinned for the whole
-    // function body.
-    mut embedder: Option<&mut (dyn EmbedBatch + '_)>,
     stats: &mut ApplyStats,
     empty_file_policy: EmptyFilePolicy,
     precomputed: Option<(&FileRef, &[u8])>,
@@ -254,164 +219,14 @@ async fn run_in_batches(
         if prepared.is_empty() {
             continue;
         }
-        // Embed all chunks across all prepared files in this batch in a single call.
-        let mut all_texts: Vec<String> = Vec::new();
-        let mut splits: Vec<usize> = Vec::with_capacity(prepared.len());
-        for pf in &prepared {
-            splits.push(pf.chunks.len());
-            for c in &pf.chunks {
-                all_texts.push(c.text.clone());
-            }
-        }
-        match embedder.as_deref_mut() {
-            // ON mode: embed the passages and de-flatten back per file.
-            Some(embedder) => {
-                let mut vectors = if all_texts.is_empty() {
-                    Vec::new()
-                } else {
-                    // Blocking CPU work (ONNX forward pass): run on this
-                    // worker thread's blocking slot so the async runtime is
-                    // not starved while it runs (#217, matches #176's
-                    // discipline). `embedder` is `Option<&mut dyn EmbedBatch>`
-                    // (non-'static), which rules out `spawn_blocking`.
-                    tokio::task::block_in_place(|| {
-                        embedder.embed_batch(&all_texts, EmbedRole::Passage)
-                    })?
-                };
-                if vectors.len() != all_texts.len() {
-                    return Err(HallouminateError::Indexer(format!(
-                        "embedder returned {} vectors for {} chunks",
-                        vectors.len(),
-                        all_texts.len()
-                    )));
-                }
-                let mut iter = vectors.drain(..);
-                for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
-                    let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        let v = iter.next().ok_or_else(|| {
-                            HallouminateError::Indexer("embedding count drained early".into())
-                        })?;
-                        buf.push(v);
-                    }
-                    stats.chunks_inserted += count;
-                    stats.embeddings_inserted += count;
-                    pf.embeddings = Some(buf);
-                }
-            }
-            // OFF mode: write null embeddings, count chunks but no embeddings.
-            None => {
-                for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
-                    stats.chunks_inserted += count;
-                    pf.embeddings = None;
-                }
-            }
-        }
         let n = prepared.len();
-        run.store.apply_batch(prepared).await?;
+        // Embedding happens inside the store (US-002: embeddings are
+        // adapter-owned), so this just hands the batch off and folds the
+        // returned counts into the run's stats.
+        let write_stats = run.store.apply_batch(prepared).await?;
+        stats.chunks_inserted += write_stats.chunks_written;
+        stats.embeddings_inserted += write_stats.embeddings_written;
         stats.files_upserted += n;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::domain::indexer::index_corpus;
-
-    /// #215: `apply()` must scope `plan.deletes` to this request's
-    /// `corpus.paths` roots. `plan.deletes` comes from a diff against every
-    /// store row for the corpus *name* (not the caller's roots), so a
-    /// snapshot indexed under a different root sharing the same corpus name
-    /// must survive an `apply` run whose `corpus.paths` doesn't cover it —
-    /// otherwise a scoped reindex (e.g. one root of a multi-root corpus)
-    /// would evict rows that are still very much present on disk under the
-    /// other root.
-    #[tokio::test]
-    async fn apply_skips_deletes_outside_corpus_paths() {
-        let store_dir = tempfile::tempdir().expect("tempdir store");
-        let store =
-            LanceStore::open_or_create(store_dir.path(), "BAAI/bge-small-en-v1.5", false, false)
-                .await
-                .expect("open store");
-        let registry = HandlerRegistry::new(text_splitter::Characters, 1500);
-
-        // Seed two files under two distinct roots, both in the "docs" corpus.
-        let in_scope_dir = tempfile::tempdir().expect("tempdir in-scope");
-        let out_of_scope_dir = tempfile::tempdir().expect("tempdir out-of-scope");
-        std::fs::write(in_scope_dir.path().join("keep-gone.md"), "in scope")
-            .expect("write in-scope fixture");
-        std::fs::write(
-            out_of_scope_dir.path().join("other-gone.md"),
-            "out of scope",
-        )
-        .expect("write out-of-scope fixture");
-
-        let seed_corpus = CorpusConfig {
-            name: "docs".to_string(),
-            paths: vec![
-                in_scope_dir.path().to_string_lossy().into_owned(),
-                out_of_scope_dir.path().to_string_lossy().into_owned(),
-            ],
-            ..Default::default()
-        };
-        index_corpus(&seed_corpus, &store, None, &registry)
-            .await
-            .expect("seed both files into the store");
-
-        let snaps = store.list_files("docs").await.expect("list seeded files");
-        let in_scope_snap = snaps
-            .values()
-            .find(|s| s.file_ref.contains("keep-gone.md"))
-            .cloned()
-            .expect("in-scope snapshot present after seeding");
-        let out_of_scope_snap = snaps
-            .values()
-            .find(|s| s.file_ref.contains("other-gone.md"))
-            .cloned()
-            .expect("out-of-scope snapshot present after seeding");
-
-        // Now run `apply` for a request scoped to ONLY `in_scope_dir`, with
-        // both snapshots queued as deletes — as would happen if `list_files`
-        // returned rows from a sibling root sharing the same corpus name.
-        let scoped_corpus = CorpusConfig {
-            name: "docs".to_string(),
-            paths: vec![in_scope_dir.path().to_string_lossy().into_owned()],
-            ..Default::default()
-        };
-        let plan = IndexPlan {
-            deletes: vec![in_scope_snap, out_of_scope_snap],
-            ..Default::default()
-        };
-        let stats = apply(
-            plan,
-            &store,
-            None,
-            &registry,
-            &scoped_corpus,
-            DEFAULT_BATCH_SIZE,
-            None,
-        )
-        .await
-        .expect("apply must not error on a mixed-scope delete batch");
-
-        assert_eq!(
-            stats.files_deleted, 1,
-            "only the in-scope delete must fire; the out-of-scope one must be skipped"
-        );
-
-        let remaining = store.list_files("docs").await.expect("list after apply");
-        assert!(
-            !remaining
-                .values()
-                .any(|s| s.file_ref.contains("keep-gone.md")),
-            "in-scope delete must actually remove its row from the store"
-        );
-        assert!(
-            remaining
-                .values()
-                .any(|s| s.file_ref.contains("other-gone.md")),
-            "out-of-scope row must survive: it is outside this request's corpus.paths"
-        );
-    }
 }

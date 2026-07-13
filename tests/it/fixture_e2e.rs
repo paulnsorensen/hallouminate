@@ -7,12 +7,13 @@
 use std::fs;
 use std::path::Path;
 
+use hallouminate::adapters::embedder::{EmbedBatch, EmbedRole};
 use hallouminate::adapters::lance::LanceStore;
 use hallouminate::domain::common::CorpusConfig;
 use hallouminate::domain::corpus::MarkdownChunker;
-use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
+use hallouminate::domain::indexer::store::ChunkStore;
 use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
-use hallouminate::domain::search::hybrid_search;
+use hallouminate::domain::search::search_with_ripgrep;
 use text_splitter::Characters;
 
 use crate::common::StubEmbedder;
@@ -21,9 +22,9 @@ const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 /// Embedder that records every role it was asked to embed, so a test can
 /// assert the indexer embeds passages with `EmbedRole::Passage`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct RoleRecordingEmbedder {
-    roles: Vec<EmbedRole>,
+    roles: std::sync::Arc<std::sync::Mutex<Vec<EmbedRole>>>,
 }
 
 impl EmbedBatch for RoleRecordingEmbedder {
@@ -32,12 +33,12 @@ impl EmbedBatch for RoleRecordingEmbedder {
         texts: &[String],
         role: EmbedRole,
     ) -> hallouminate::domain::common::Result<
-        Vec<[f32; hallouminate::adapters::lance::EMBEDDING_DIM]>,
+        Vec<[f32; hallouminate::adapters::embedder::EMBEDDING_DIM]>,
     > {
-        self.roles.push(role);
+        self.roles.lock().unwrap().push(role);
         Ok(texts
             .iter()
-            .map(|_| [0.1_f32; hallouminate::adapters::lance::EMBEDDING_DIM])
+            .map(|_| [0.1_f32; hallouminate::adapters::embedder::EMBEDDING_DIM])
             .collect())
     }
 }
@@ -114,14 +115,19 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
 
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut embedder = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index_corpus");
 
@@ -151,12 +157,8 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
         ("chrome-bright", "fury-road.md"),
     ];
 
-    let mut emb_for_query = StubEmbedder;
     for (query, expected_file) in oracles {
-        let qv = emb_for_query
-            .embed_batch(&[(*query).to_string()], EmbedRole::Query)
-            .expect("embed query")[0];
-        let hits = hybrid_search(&store, "docs", query, &qv, 5)
+        let hits = search_with_ripgrep(&store, "docs", &corpus.paths, query, 5)
             .await
             .expect("hybrid_search");
         assert!(
@@ -189,18 +191,23 @@ async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut embedder = StubEmbedder;
 
-    let stats1 = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+    let stats1 = index_corpus(&corpus, &store, &registry)
         .await
         .expect("first index");
     let rows1 = store.count_rows().await.unwrap();
 
-    let stats2 = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+    let stats2 = index_corpus(&corpus, &store, &registry)
         .await
         .expect("second index");
     let rows2 = store.count_rows().await.unwrap();
@@ -228,20 +235,25 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut embedder = StubEmbedder;
 
-    index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+    index_corpus(&corpus, &store, &registry)
         .await
         .expect("first index");
     let initial = store.count_rows().await.unwrap();
 
     fs::remove_file(corpus_dir.path().join("grail.md")).expect("remove grail.md");
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("second index after delete");
 
@@ -253,11 +265,7 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
     assert!(stats.files_deleted >= 1, "must report at least 1 deletion");
 
     // Verify the grail oracle no longer hits its source
-    let mut emb = StubEmbedder;
-    let qv = emb
-        .embed_batch(&["caerbannog".to_string()], EmbedRole::Query)
-        .expect("embed")[0];
-    let hits = hybrid_search(&store, "docs", "caerbannog", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "caerbannog", 5)
         .await
         .expect("search after delete");
     assert!(
@@ -286,13 +294,18 @@ async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats1 = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats1 = index_corpus(&corpus, &store, &registry)
         .await
         .expect("first index");
     assert_eq!(stats1.files_upserted, 1, "only real.md upserted");
@@ -320,13 +333,18 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    index_corpus(&corpus, &store, &registry)
         .await
         .expect("first index");
     let rows_before = store.count_rows().await.unwrap();
@@ -335,10 +353,7 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         "vanishing.md must produce at least one row"
     );
 
-    let qv = emb
-        .embed_batch(&["melange".to_string()], EmbedRole::Query)
-        .expect("embed")[0];
-    let hits_before = hybrid_search(&store, "docs", "melange", &qv, 5)
+    let hits_before = search_with_ripgrep(&store, "docs", &corpus.paths, "melange", 5)
         .await
         .expect("search before truncation");
     assert!(
@@ -356,7 +371,7 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         .set_modified(bumped)
         .unwrap();
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("second index after truncation");
     assert_eq!(
@@ -370,7 +385,7 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         "stale rows for the truncated file must be evicted, not left behind"
     );
 
-    let hits_after = hybrid_search(&store, "docs", "melange", &qv, 5)
+    let hits_after = search_with_ripgrep(&store, "docs", &corpus.paths, "melange", 5)
         .await
         .expect("search after truncation");
     assert!(
@@ -401,28 +416,39 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
     let disk = hallouminate::domain::corpus::scan(&corpus).expect("scan");
-    let db = store.list_files("docs").await.expect("list");
+    let db: std::collections::HashMap<
+        hallouminate::domain::common::FileRef,
+        hallouminate::domain::indexer::FileSnapshot,
+    > = store
+        .list_files("docs")
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|s| {
+            (
+                hallouminate::domain::common::FileRef::new(std::path::PathBuf::from(&s.file_ref)),
+                s,
+            )
+        })
+        .collect();
     let p = plan(disk, db);
     fs::remove_file(&real).unwrap();
 
-    let err = apply(
-        p,
-        &store,
-        Some(&mut emb),
-        &registry,
-        &corpus,
-        DEFAULT_BATCH_SIZE,
-        None,
-    )
-    .await
-    .expect_err("missing file must surface as Err, not silent skip");
+    let err = apply(p, &store, &registry, &corpus, DEFAULT_BATCH_SIZE, None)
+        .await
+        .expect_err("missing file must surface as Err, not silent skip");
     let msg = err.to_string();
     assert!(
         msg.contains("vanishes.md") || msg.contains("No such file") || msg.contains("not found"),
@@ -451,13 +477,13 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
     };
 
     // enabled = false → the store's `embedding` column is all nulls.
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, false)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, false, None)
         .await
         .expect("open OFF-mode store");
     let registry = HandlerRegistry::new(Characters, 1500);
 
     // No embedder: OFF-mode indexing.
-    let stats = index_corpus(&corpus, &store, None, &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("OFF-mode index_corpus");
     assert_eq!(
@@ -480,7 +506,6 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
         &corpus.name,
         &corpus.paths,
         &store,
-        None,
         None,
         GroundOpts::default(),
     )
@@ -521,24 +546,32 @@ async fn index_corpus_embeds_passages_with_passage_role() {
         exclude: vec![],
         global: false,
     };
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let recorder = RoleRecordingEmbedder::default();
+    let roles = recorder.roles.clone();
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(recorder)),
+    )
+    .await
+    .expect("open store");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut recorder = RoleRecordingEmbedder::default();
 
-    index_corpus(&corpus, &store, Some(&mut recorder), &registry)
+    index_corpus(&corpus, &store, &registry)
         .await
         .expect("index_corpus");
 
+    let roles = roles.lock().unwrap();
     assert!(
-        !recorder.roles.is_empty(),
+        !roles.is_empty(),
         "indexing must embed at least one passage batch"
     );
     assert!(
-        recorder.roles.iter().all(|r| *r == EmbedRole::Passage),
+        roles.iter().all(|r| *r == EmbedRole::Passage),
         "indexing must embed every batch with the Passage role, got {:?}",
-        recorder.roles
+        roles
     );
 }
 
@@ -589,24 +622,23 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut embedder = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index_corpus");
     assert_eq!(stats.files_upserted, 2, "both pages indexed");
 
-    let mut emb_for_query = StubEmbedder;
-
-    // The frontmatter page grounds on its body token, with no leaked metadata.
-    let qv = emb_for_query
-        .embed_batch(&["zphyxnort".to_string()], EmbedRole::Query)
-        .expect("embed query")[0];
-    let hits = hybrid_search(&store, "docs", "zphyxnort", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "zphyxnort", 5)
         .await
         .expect("hybrid_search fm");
     let hit = hits
@@ -652,10 +684,7 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
     );
 
     // The plain page (no frontmatter) still grounds normally.
-    let qv2 = emb_for_query
-        .embed_batch(&["qwobblefrotz".to_string()], EmbedRole::Query)
-        .expect("embed query")[0];
-    let hits2 = hybrid_search(&store, "docs", "qwobblefrotz", &qv2, 5)
+    let hits2 = search_with_ripgrep(&store, "docs", &corpus.paths, "qwobblefrotz", 5)
         .await
         .expect("hybrid_search plain");
     assert!(
@@ -699,28 +728,31 @@ A note about epsilonmelange with an ordinary comment.<!-- ordinary note -->\n";
         global: false,
     };
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     // Budget large enough to keep the whole short page in one chunk so every
     // mark lands in one bucket; the assertions below collect across chunks
     // anyway, so a split would not break them.
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut embedder = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index_corpus");
     assert_eq!(stats.files_upserted, 1, "the claims page indexed");
 
     // Ground on a distinctive body token so the claims page is the top hit.
-    let mut embedder2 = StubEmbedder;
     let resp = ground(
         "alphamelange",
         &corpus.name,
         &corpus.paths,
         &store,
-        Some(&mut embedder2),
         None,
         GroundOpts::default(),
     )

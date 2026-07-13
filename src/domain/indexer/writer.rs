@@ -1,6 +1,6 @@
 use std::fs;
 
-use crate::adapters::lance::PreparedFile;
+use super::chunk::PreparedFile;
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::blake3_bytes;
 
@@ -107,7 +107,6 @@ mod tests {
     use text_splitter::Characters;
 
     use super::*;
-    use crate::adapters::lance::PreparedFile;
     use crate::domain::indexer::HandlerRegistry;
 
     fn corpus() -> CorpusConfig {
@@ -157,8 +156,6 @@ mod tests {
             "summary should reflect content: {:?}",
             pf.summary
         );
-        // embeddings start as None; apply.rs fills in Some(..) in ON mode.
-        assert!(pf.embeddings.is_none());
         // content_hash is a 64-char blake3 hex
         assert_eq!(pf.content_hash.len(), 64);
     }

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
-use crate::adapters::lance::SearchHit;
 use crate::domain::common::Result;
 use crate::domain::corpus::make_snippet;
+use crate::domain::indexer::chunk::SearchHit;
 
 use super::types::{ChunkProvenance, DocChunk, DocFile};
 

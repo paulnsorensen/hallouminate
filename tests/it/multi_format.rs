@@ -17,11 +17,10 @@ use std::path::{Path, PathBuf};
 
 use hallouminate::adapters::lance::LanceStore;
 use hallouminate::domain::common::{CorpusConfig, FileRef, Mtime};
-use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
 use hallouminate::domain::indexer::{
     Format, HandlerRegistry, PrepareCtx, detect_format, index_corpus,
 };
-use hallouminate::domain::search::hybrid_search;
+use hallouminate::domain::search::search_with_ripgrep;
 use text_splitter::Characters;
 
 use crate::common::StubEmbedder;
@@ -39,7 +38,7 @@ fn corpus(dir: &Path, name: &str, globs: &[&str]) -> CorpusConfig {
 }
 
 async fn open_store(dir: &Path) -> LanceStore {
-    LanceStore::open_or_create(dir, MODEL, false, true)
+    LanceStore::open_or_create(dir, MODEL, false, true, Some(Box::new(StubEmbedder)))
         .await
         .expect("open store")
 }
@@ -65,19 +64,14 @@ async fn plain_text_corpus_indexes_and_grounds() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.txt", "**/*.text"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index plain text");
     assert_eq!(stats.files_upserted, 2, "both text files indexed");
     assert!(stats.chunks_inserted >= 2);
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["xenoblat".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "xenoblat", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "xenoblat", 5)
         .await
         .expect("search");
     assert!(
@@ -112,20 +106,15 @@ async fn csv_indexes_one_self_describing_chunk_per_row() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.csv"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index csv");
     assert_eq!(stats.files_upserted, 1);
     // Two data rows → two chunks (header row is not a chunk).
     assert_eq!(stats.chunks_inserted, 2, "one chunk per data row");
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["wozzlefruit".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "wozzlefruit", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "wozzlefruit", 5)
         .await
         .expect("search csv");
     let hit = hits
@@ -182,19 +171,14 @@ async fn xlsx_indexes_each_sheet_row_with_sheet_and_row_metadata() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.xlsx"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index xlsx");
     assert_eq!(stats.files_upserted, 1);
     assert_eq!(stats.chunks_inserted, 2, "two data rows → two chunks");
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["grobblet".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "grobblet", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "grobblet", 5)
         .await
         .expect("search xlsx");
     let hit = hits
@@ -251,19 +235,14 @@ async fn ods_indexes_rows_with_sheet_and_row_metadata() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.ods"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index ods");
     assert_eq!(stats.files_upserted, 1);
     assert_eq!(stats.chunks_inserted, 1, "one data row → one chunk");
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["snibblet".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "snibblet", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "snibblet", 5)
         .await
         .expect("search ods");
     let hit = hits
@@ -300,9 +279,8 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index must not abort on an unsupported file");
     assert_eq!(stats.files_upserted, 1, "the markdown file still indexes");
@@ -315,11 +293,7 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
         "an unsupported type must not be miscounted as truncate-to-empty"
     );
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["flibberwidget".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "flibberwidget", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "flibberwidget", 5)
         .await
         .unwrap();
     assert!(hits.iter().any(|h| h.file_ref.ends_with("good.md")));
@@ -345,9 +319,8 @@ async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.xlsx", "**/*.csv"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("a corrupt in-scope file must skip, not error the run");
     assert_eq!(stats.files_upserted, 1, "the valid csv still indexes");
@@ -360,11 +333,7 @@ async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
         "an extraction failure must not be miscounted as truncate-to-empty"
     );
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["zonkbolt".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "zonkbolt", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "zonkbolt", 5)
         .await
         .unwrap();
     assert!(hits.iter().any(|h| h.file_ref.ends_with("ok.csv")));
@@ -384,9 +353,8 @@ async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.csv"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats1 = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats1 = index_corpus(&corpus, &store, &registry)
         .await
         .expect("first index of a valid csv must succeed");
     assert_eq!(stats1.files_upserted, 1, "the valid csv indexes");
@@ -401,7 +369,7 @@ async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
         .set_modified(bumped)
         .unwrap();
 
-    let stats2 = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats2 = index_corpus(&corpus, &store, &registry)
         .await
         .expect("a corrupt re-extraction must not hard-error");
     assert_eq!(
@@ -558,18 +526,13 @@ async fn xlsx_numeric_cell_renders_as_bare_number_not_float_debug() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.xlsx"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index numeric xlsx");
     assert_eq!(stats.chunks_inserted, 1);
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["numwidget".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "numwidget", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "numwidget", 5)
         .await
         .expect("search numeric xlsx");
     let hit = hits
@@ -617,21 +580,16 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.xlsx"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index multi-sheet xlsx");
     // Alpha: 1 data row; Beta: 2 data rows → 3 chunks total.
     assert_eq!(stats.chunks_inserted, 3, "every sheet's data rows index");
 
-    let mut q = StubEmbedder;
     // The first data row of the SECOND sheet must carry `Beta:row-1`, proving the
     // row index resets per sheet rather than running 1,2,3 across the workbook.
-    let qv = q
-        .embed_batch(&["betathing".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "first betathing", &qv, 10)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "first betathing", 10)
         .await
         .expect("search beta sheet");
     let beta_hit = hits
@@ -644,10 +602,7 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
         "second sheet's first data row must be row-1 with the Beta breadcrumb"
     );
 
-    let qa = q
-        .embed_batch(&["alphathing".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let ahits = hybrid_search(&store, "docs", "first alphathing", &qa, 10)
+    let ahits = search_with_ripgrep(&store, "docs", &corpus.paths, "first alphathing", 10)
         .await
         .expect("search alpha sheet");
     assert!(
@@ -681,18 +636,13 @@ async fn csv_ragged_row_uses_col_n_fallback_and_omits_blank_cells() {
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.csv"]);
     let store = open_store(store_dir.path()).await;
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
 
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index ragged csv");
     assert_eq!(stats.chunks_inserted, 1, "one data row → one chunk");
 
-    let mut q = StubEmbedder;
-    let qv = q
-        .embed_batch(&["raggedcell".to_string()], EmbedRole::Query)
-        .unwrap()[0];
-    let hits = hybrid_search(&store, "docs", "raggedcell", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "raggedcell", 5)
         .await
         .expect("search ragged csv");
     let hit = hits
