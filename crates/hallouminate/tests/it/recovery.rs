@@ -13,7 +13,7 @@ use hallouminate_domain::common::{CorpusConfig, Result};
 use hallouminate_domain::indexer::{ChunkStore, HandlerRegistry, index_corpus};
 use text_splitter::Characters;
 
-use crate::common::{StubEmbedder, placeholder_prepared_file};
+use crate::common::{LANCE_WRITE_LOCK, StubEmbedder, placeholder_prepared_file};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -33,6 +33,7 @@ impl EmbedBatch for PanickingEmbedder {
 
 #[tokio::test]
 async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
 
@@ -96,6 +97,7 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
 
 #[tokio::test]
 async fn re_run_after_crash_converges_to_correct_state() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
 
@@ -165,6 +167,7 @@ async fn re_run_after_crash_converges_to_correct_state() {
 
 #[tokio::test]
 async fn multiple_independent_apply_batches_are_durable_across_opens() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     // Sanity check: every successful apply_batch must survive a reopen.
     let store_dir = tempfile::tempdir().expect("tempdir store");
 

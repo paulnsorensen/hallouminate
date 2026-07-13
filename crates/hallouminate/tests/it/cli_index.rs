@@ -8,6 +8,7 @@ use hallouminate::daemon::{
 };
 use hallouminate_adapters::lance::LanceStore;
 
+use crate::common::LANCE_WRITE_LOCK;
 use crate::common::daemon::DaemonHarness;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
@@ -55,6 +56,7 @@ fn seed_fixtures(root: &Path) {
 #[tokio::test]
 #[ignore = "downloads ~33MB embedding model on first run; opt-in via --ignored"]
 async fn cmd_index_indexes_fixture_corpus_end_to_end() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let corpus_root = dir.path().join("corpus");
     fs::create_dir_all(&corpus_root).unwrap();

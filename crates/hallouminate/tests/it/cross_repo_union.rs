@@ -26,6 +26,7 @@ use hallouminate_domain::repository::{
 };
 use text_splitter::Characters;
 
+use crate::common::LANCE_WRITE_LOCK;
 use crate::common::StubEmbedder;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
@@ -48,6 +49,7 @@ fn seed_repo_wiki(parent: &Path, repo: &str, token: &str) -> std::path::PathBuf 
 
 #[tokio::test]
 async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
 
@@ -239,6 +241,7 @@ async fn index_wikis(
 /// differs from the per-corpus search order.
 #[tokio::test]
 async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuffle() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
 
@@ -314,6 +317,7 @@ async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuf
 /// search — every hit attributed to that one corpus, no panic, hits present.
 #[tokio::test]
 async fn union_ground_with_single_corpus_attributes_all_hits_to_it() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let solo = seed_repo_wiki(parent.path(), "solo", "zphyxnort");
@@ -366,6 +370,7 @@ async fn union_ground_with_single_corpus_attributes_all_hits_to_it() {
 /// populated, but the corpus filter matches nothing).
 #[tokio::test]
 async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let full = seed_repo_wiki(parent.path(), "full", "zphyxnort");
@@ -431,6 +436,7 @@ async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
 /// otherwise be asked to run.
 #[tokio::test]
 async fn union_ground_over_all_empty_corpora_returns_empty_response_without_panic() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let store = LanceStore::open_or_create(
         store_dir.path(),
@@ -467,6 +473,7 @@ async fn union_ground_over_all_empty_corpora_returns_empty_response_without_pani
 /// nothing leaked from the union machinery.
 #[tokio::test]
 async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpus() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let only = seed_repo_wiki(parent.path(), "only", "zphyxnort");
@@ -515,6 +522,7 @@ async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpu
 /// VecDeque queue must preserve both so BOTH corpora appear in the result.
 #[tokio::test]
 async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpora() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
 
@@ -622,6 +630,7 @@ impl EmbedBatch for CountingEmbedder {
 /// count scales with the number of corpora in the union set.
 #[tokio::test]
 async fn ground_union_embeds_query_once_per_corpus_searched() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let alpha = seed_repo_wiki(parent.path(), "alpha", "zphyxnort");
@@ -679,6 +688,7 @@ async fn ground_union_embeds_query_once_per_corpus_searched() {
 /// this text even though attribution-only checks elsewhere might still pass.
 #[tokio::test]
 async fn union_ground_preserves_exact_hit_text_after_queue_refactor() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let alpha = seed_repo_wiki(parent.path(), "alpha", "zphyxnort");

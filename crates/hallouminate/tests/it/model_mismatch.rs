@@ -5,6 +5,8 @@ use hallouminate::config::Config;
 use hallouminate::daemon::DaemonState;
 use hallouminate_adapters::lance::LanceStore;
 
+use crate::common::LANCE_WRITE_LOCK;
+
 const MODEL_A: &str = "BAAI/bge-small-en-v1.5";
 const MODEL_B: &str = "intfloat/multilingual-e5-small";
 
@@ -49,6 +51,7 @@ ground_dir = {dir:?}
 /// the same shape as the pre-rewire CLI surface.
 #[tokio::test]
 async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let corpus_root = dir.path().join("corpus");
     fs::create_dir_all(&corpus_root).unwrap();

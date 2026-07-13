@@ -13,11 +13,10 @@
 //! many simultaneous writers.
 //!
 //! The embedder and tokenizer are loaded once at daemon boot and shared
-//! across requests. The embedder is wrapped in an async `Mutex` because
-//! `Embedder::embed_batch` takes `&mut self` (it owns the fastembed runtime
-//! handle); only one batch can run at a time per process today, so the
-//! mutex matches the underlying constraint rather than introducing a new
-//! one. Tokenizers are cheap to clone (`Arc` internally) and need no lock.
+//! across requests. The embedder is built eagerly (tolerating load failure)
+//! and handed into `LanceStore::open_or_create`, which owns embedding
+//! internally from then on; `state.rs` holds no embedder handle of its own.
+//! Tokenizers are cheap to clone (`Arc` internally) and need no lock.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -145,33 +144,6 @@ pub struct RequestResources {
     pub tokenizer: tokenizers::Tokenizer,
     pub embeddings_enabled: bool,
     pub ground_dir: PathBuf,
-    embedder: Arc<Mutex<Option<Embedder>>>,
-    model: String,
-    quantized: bool,
-    cache_dir: PathBuf,
-    last_activity_secs: Arc<AtomicU64>,
-}
-
-impl RequestResources {
-    /// Lazy-load mirror of the old `DaemonState::embedder()`, scoped to this
-    /// resource set's model instead of the daemon-wide one.
-    pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard> {
-        let mut guard = Arc::clone(&self.embedder).lock_owned().await;
-        if guard.is_none() {
-            let (model, quantized, cache_dir) =
-                (self.model.clone(), self.quantized, self.cache_dir.clone());
-            let embedder =
-                tokio::task::block_in_place(|| Embedder::try_new(&model, quantized, &cache_dir))
-                    .map_err(|e| anyhow::anyhow!("init embedder ({model}): {e}"))?;
-            *guard = Some(embedder);
-        }
-        self.last_activity_secs
-            .store(monotonic_secs(), Ordering::Relaxed);
-        Ok(EmbedderGuard {
-            guard,
-            last_use_secs: Arc::clone(&self.last_activity_secs),
-        })
-    }
 }
 
 /// Owned daemon state. Cheap to clone (`Arc` inside); one instance lives for
@@ -284,8 +256,8 @@ impl DaemonState {
         // doesn't pay the load cost mid-call. Tolerate failure (e.g. offline
         // first run with no cached model) so the daemon can still serve
         // model-independent ops (`ping`, `list_corpora`, `list_files`,
-        // `read_markdown`, `delete_markdown`); a later embedder() call will
-        // retry the load and surface the error then.
+        // `read_markdown`, `delete_markdown`); a later request needing embeddings
+        // will surface the error when it tries to open a resource set.
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
         let mut embedder: Option<Embedder> = if cfg.embeddings.enabled {
             match Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir) {
@@ -462,7 +434,6 @@ impl DaemonState {
             }
         }
         let shutdown = CancellationToken::new();
-        let embedder_arc = Arc::new(Mutex::new(embedder));
         let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
@@ -496,11 +467,6 @@ impl DaemonState {
             tokenizer,
             embeddings_enabled: cfg.embeddings.enabled,
             ground_dir,
-            embedder: embedder_arc,
-            model: cfg.embeddings.model.clone(),
-            quantized: cfg.embeddings.quantized,
-            cache_dir,
-            last_activity_secs: Arc::clone(&last_activity),
         });
         let mut resources_map = HashMap::new();
         resources_map.insert(baseline_key, Arc::clone(&baseline_resources));
@@ -633,24 +599,6 @@ impl DaemonState {
         self.inner.baseline_resources.embeddings_enabled
     }
 
-    /// Borrow the shared embedder for one call, loading it lazily on first
-    /// use. Daemon boot tries an eager load (see `open`) but tolerates
-    /// failure so model-independent ops (ping, list_corpora, list_files,
-    /// read_markdown, delete_markdown) keep working offline. The first call
-    /// that *needs* embedding pays the load cost (or surfaces a clean error
-    /// when the model is unreachable).
-    ///
-    /// The fastembed runtime is `&mut`-only, so concurrent embed batches
-    /// serialize behind this mutex; that matches the underlying constraint
-    /// (one model handle per process) rather than introducing a new one.
-    ///
-    /// Uses `block_in_place` internally, which panics on a current-thread
-    /// runtime — callers (and their tests) must run under the `multi_thread`
-    /// flavor.
-    pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard> {
-        self.inner.baseline_resources.embedder().await
-    }
-
     /// Per-request resource seam (B2+B3): resolve (or lazily build) the
     /// `RequestResources` for the effective config's `(ground_dir, model,
     /// quantized, enabled)` key. A repo-layer override of any of those
@@ -728,11 +676,6 @@ impl DaemonState {
             tokenizer,
             embeddings_enabled: cfg.embeddings.enabled,
             ground_dir: ground_dir.clone(),
-            embedder: Arc::new(Mutex::new(None)),
-            model: cfg.embeddings.model.clone(),
-            quantized: cfg.embeddings.quantized,
-            cache_dir,
-            last_activity_secs: Arc::clone(&self.inner.last_activity_secs),
         });
         self.inner
             .resources
@@ -1018,40 +961,8 @@ async fn prune_stale_backups(
     Ok(())
 }
 
-/// Owned guard around the lazily-loaded embedder. Derefs to `Embedder` so
-/// existing call sites (`ground`, `index_corpus`, `apply`) keep their
-/// `&mut Embedder` signatures unchanged — only the *acquisition* shape
-/// (Result instead of infallible) differs.
-pub struct EmbedderGuard {
-    guard: OwnedMutexGuard<Option<Embedder>>,
-    last_use_secs: Arc<AtomicU64>,
-}
-
-impl std::ops::Deref for EmbedderGuard {
-    type Target = Embedder;
-    fn deref(&self) -> &Embedder {
-        // SAFETY-of-correctness: `embedder()` populates `Some(...)` before
-        // handing the guard out, and the guard holds the mutex so no one
-        // else can swap it back to `None`.
-        self.guard.as_ref().expect("embedder loaded")
-    }
-}
-
-impl std::ops::DerefMut for EmbedderGuard {
-    fn deref_mut(&mut self) -> &mut Embedder {
-        self.guard.as_mut().expect("embedder loaded")
-    }
-}
-
-impl Drop for EmbedderGuard {
-    fn drop(&mut self) {
-        self.last_use_secs
-            .store(monotonic_secs(), Ordering::Relaxed);
-    }
-}
-
-/// Owned guard around the lazily-loaded crossencoder, mirroring
-/// `EmbedderGuard`. Derefs to `FastembedCrossencoder` so callers can
+/// Owned guard around the lazily-loaded crossencoder. Derefs to
+/// `FastembedCrossencoder` so callers can
 /// pass `&mut *guard` directly into anything that wants
 /// `&mut dyn Crossencoder`. Holds an `OwnedMutexGuard` (not a borrowed
 /// `MutexGuard<'a, ...>`) so it can be boxed as `Box<dyn Crossencoder>` and
@@ -1330,24 +1241,6 @@ mod tests {
             monotonic < wall_clock_secs / 2,
             "idle clock must be process-relative (Instant-based), not wall-clock \
              Unix seconds: monotonic={monotonic}, wall_clock={wall_clock_secs}",
-        );
-    }
-
-    #[tokio::test]
-    async fn embedder_guard_updates_last_use_on_drop() {
-        let last_use_secs = Arc::new(AtomicU64::new(1));
-        let guard = Arc::new(Mutex::new(None)).lock_owned().await;
-        let before_drop = monotonic_secs();
-
-        drop(EmbedderGuard {
-            guard,
-            last_use_secs: Arc::clone(&last_use_secs),
-        });
-
-        let observed = last_use_secs.load(Ordering::Relaxed);
-        assert!(
-            observed >= before_drop,
-            "drop should stamp embedder use at or after guard lifetime start: observed {observed}, before {before_drop}",
         );
     }
 

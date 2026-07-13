@@ -16,6 +16,7 @@ use hallouminate_domain::indexer::{HandlerRegistry, index_corpus};
 use hallouminate_domain::search::search_with_ripgrep;
 use text_splitter::Characters;
 
+use crate::common::LANCE_WRITE_LOCK;
 use crate::common::StubEmbedder;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
@@ -103,6 +104,7 @@ fn seed_fixture_corpus(dir: &Path) {
 
 #[tokio::test]
 async fn fixture_corpus_indexes_and_serves_oracle_queries() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
     seed_fixture_corpus(corpus_dir.path());
@@ -179,6 +181,7 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
 
 #[tokio::test]
 async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
     seed_fixture_corpus(corpus_dir.path());
@@ -223,6 +226,7 @@ async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
 
 #[tokio::test]
 async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
     seed_fixture_corpus(corpus_dir.path());
@@ -279,6 +283,7 @@ const SMALL_BUDGET: usize = 60;
 
 #[tokio::test]
 async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
 
@@ -317,6 +322,7 @@ async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
 
 #[tokio::test]
 async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     // Same-action divergence regression (daemon single-file path evicts on
     // truncate-to-empty; bulk index_corpus previously left stale rows behind).
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -396,6 +402,7 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
 
 #[tokio::test]
 async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     // Pointing a corpus at a path that doesn't exist would fail at scan time,
     // not prepare time. To exercise the prepare_file error propagation we
     // create then yank the file out from under the indexer between scan and
@@ -462,6 +469,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
 /// right file for a distinctive token.
 #[tokio::test]
 async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     use hallouminate_domain::ground::{GroundOpts, ground};
 
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -535,6 +543,7 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
 /// `ground/orchestrate.rs` that locks the query side to `EmbedRole::Query`.
 #[tokio::test]
 async fn index_corpus_embeds_passages_with_passage_role() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
     seed_fixture_corpus(corpus_dir.path());
@@ -598,6 +607,7 @@ async fn chunker_budget_compliance_with_characters_sizer() {
 /// frontmatter block).
 #[tokio::test]
 async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
 
@@ -702,6 +712,7 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
 /// and `line_start`/`line_end` still match on-disk lines after the strip.
 #[tokio::test]
 async fn claim_marks_round_trip_through_ground_with_clean_snippets() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
     use hallouminate_domain::corpus::{ClaimMark, ClaimStatus};
     use hallouminate_domain::ground::{GroundOpts, ground};
 
