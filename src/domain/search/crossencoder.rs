@@ -104,6 +104,14 @@ impl FastembedCrossencoder {
     }
 }
 
+/// Bounded fastembed batch size for the ONNX rerank pass. Passing `None`
+/// selects fastembed's internal default (256 sequences), which sets the ORT
+/// CPU arena's high-water mark in the multi-GB range and is never reclaimed
+/// afterwards — the same retention mode documented for the embedder in
+/// `.hallouminate/wiki/ort-arena-retention.md`. `Some(32)` mirrors the
+/// embedder's `EMBED_BATCH_SIZE` mitigation.
+const RERANK_BATCH_SIZE: usize = 32;
+
 impl Crossencoder for FastembedCrossencoder {
     fn rerank(&mut self, query: &str, hits: &mut [SearchHit]) -> Result<()> {
         if hits.is_empty() {
@@ -112,7 +120,7 @@ impl Crossencoder for FastembedCrossencoder {
         let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
         let scored = self
             .inner
-            .rerank(query, &docs, false, None)
+            .rerank(query, &docs, false, Some(RERANK_BATCH_SIZE))
             .map_err(|e| HallouminateError::Embed(format!("crossencoder rerank: {e}")))?;
         // fastembed returns RerankResult sorted by score descending,
         // each carrying the original `index` into the docs slice. Apply
