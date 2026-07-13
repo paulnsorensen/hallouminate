@@ -1,5 +1,9 @@
+use std::path::{Path, PathBuf};
+
 use crate::adapters::lance::{EMBEDDING_DIM, LanceStore, PreparedFile};
-use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Result};
+use crate::domain::common::{
+    CorpusConfig, FileRef, HallouminateError, Result, canonicalize_or_passthrough, expand_tilde,
+};
 use crate::domain::corpus::blake3_file;
 use crate::domain::embeddings::{EmbedBatch, EmbedRole};
 
@@ -139,8 +143,31 @@ pub async fn apply(
     )
     .await?;
 
-    // Deletes: one delete-by-(corpus, file_ref) per gone file.
+    // Deletes: one delete-by-(corpus, file_ref) per gone file, scoped to this
+    // request's configured roots. `plan.deletes` is every store row for this
+    // corpus name that `list_files` returned (`list_files` filters by corpus
+    // name only, not by which root produced this request) minus what `disk`
+    // walked; a row whose `file_ref` falls outside every root in `corpus.paths`
+    // is out of scope for this run, not actually gone from disk, so deleting
+    // it would be a false-positive eviction (#215).
+    let delete_roots: Vec<PathBuf> = corpus
+        .paths
+        .iter()
+        .map(|p| canonicalize_or_passthrough(&expand_tilde(p)).into_path_buf())
+        .collect();
     for snap in plan.deletes {
+        let in_scope = delete_roots
+            .iter()
+            .any(|root| Path::new(&snap.file_ref).starts_with(root));
+        if !in_scope {
+            tracing::debug!(
+                target: "hallouminate::indexer",
+                file_ref = %snap.file_ref,
+                corpus = %snap.corpus,
+                "skipping delete: file_ref outside this request's configured roots"
+            );
+            continue;
+        }
         store.delete_file(&snap.corpus, &snap.file_ref).await?;
         stats.files_deleted += 1;
     }
@@ -242,7 +269,14 @@ async fn run_in_batches(
                 let mut vectors = if all_texts.is_empty() {
                     Vec::new()
                 } else {
-                    embedder.embed_batch(&all_texts, EmbedRole::Passage)?
+                    // Blocking CPU work (ONNX forward pass): run on this
+                    // worker thread's blocking slot so the async runtime is
+                    // not starved while it runs (#217, matches #176's
+                    // discipline). `embedder` is `Option<&mut dyn EmbedBatch>`
+                    // (non-'static), which rules out `spawn_blocking`.
+                    tokio::task::block_in_place(|| {
+                        embedder.embed_batch(&all_texts, EmbedRole::Passage)
+                    })?
                 };
                 if vectors.len() != all_texts.len() {
                     return Err(HallouminateError::Indexer(format!(
@@ -278,4 +312,98 @@ async fn run_in_batches(
         stats.files_upserted += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::indexer::index_corpus;
+
+    /// #215: `apply()` must scope `plan.deletes` to this request's
+    /// `corpus.paths` roots. `plan.deletes` comes from a diff against every
+    /// store row for the corpus *name* (not the caller's roots), so a
+    /// snapshot indexed under a different root sharing the same corpus name
+    /// must survive an `apply` run whose `corpus.paths` doesn't cover it —
+    /// otherwise a scoped reindex (e.g. one root of a multi-root corpus)
+    /// would evict rows that are still very much present on disk under the
+    /// other root.
+    #[tokio::test]
+    async fn apply_skips_deletes_outside_corpus_paths() {
+        let store_dir = tempfile::tempdir().expect("tempdir store");
+        let store = LanceStore::open_or_create(store_dir.path(), "BAAI/bge-small-en-v1.5", false, false)
+            .await
+            .expect("open store");
+        let registry = HandlerRegistry::new(text_splitter::Characters, 1500);
+
+        // Seed two files under two distinct roots, both in the "docs" corpus.
+        let in_scope_dir = tempfile::tempdir().expect("tempdir in-scope");
+        let out_of_scope_dir = tempfile::tempdir().expect("tempdir out-of-scope");
+        std::fs::write(in_scope_dir.path().join("keep-gone.md"), "in scope")
+            .expect("write in-scope fixture");
+        std::fs::write(out_of_scope_dir.path().join("other-gone.md"), "out of scope")
+            .expect("write out-of-scope fixture");
+
+        let seed_corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![
+                in_scope_dir.path().to_string_lossy().into_owned(),
+                out_of_scope_dir.path().to_string_lossy().into_owned(),
+            ],
+            ..Default::default()
+        };
+        index_corpus(&seed_corpus, &store, None, &registry)
+            .await
+            .expect("seed both files into the store");
+
+        let snaps = store.list_files("docs").await.expect("list seeded files");
+        let in_scope_snap = snaps
+            .values()
+            .find(|s| s.file_ref.contains("keep-gone.md"))
+            .cloned()
+            .expect("in-scope snapshot present after seeding");
+        let out_of_scope_snap = snaps
+            .values()
+            .find(|s| s.file_ref.contains("other-gone.md"))
+            .cloned()
+            .expect("out-of-scope snapshot present after seeding");
+
+        // Now run `apply` for a request scoped to ONLY `in_scope_dir`, with
+        // both snapshots queued as deletes — as would happen if `list_files`
+        // returned rows from a sibling root sharing the same corpus name.
+        let scoped_corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![in_scope_dir.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let plan = IndexPlan {
+            deletes: vec![in_scope_snap, out_of_scope_snap],
+            ..Default::default()
+        };
+        let stats = apply(
+            plan,
+            &store,
+            None,
+            &registry,
+            &scoped_corpus,
+            DEFAULT_BATCH_SIZE,
+            None,
+        )
+        .await
+        .expect("apply must not error on a mixed-scope delete batch");
+
+        assert_eq!(
+            stats.files_deleted, 1,
+            "only the in-scope delete must fire; the out-of-scope one must be skipped"
+        );
+
+        let remaining = store.list_files("docs").await.expect("list after apply");
+        assert!(
+            !remaining.values().any(|s| s.file_ref.contains("keep-gone.md")),
+            "in-scope delete must actually remove its row from the store"
+        );
+        assert!(
+            remaining.values().any(|s| s.file_ref.contains("other-gone.md")),
+            "out-of-scope row must survive: it is outside this request's corpus.paths"
+        );
+    }
 }

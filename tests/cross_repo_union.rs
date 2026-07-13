@@ -47,7 +47,7 @@ fn seed_repo_wiki(parent: &Path, repo: &str, token: &str) -> std::path::PathBuf 
     repo_root
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -240,7 +240,7 @@ async fn index_wikis(
 /// chunk_id) would survive the e2e (which runs no crossencoder) but cross-wire
 /// attributions here, where the reversing rerank guarantees the merged order
 /// differs from the per-corpus search order.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuffle() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -311,7 +311,7 @@ async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuf
 
 /// Edge case: a union set of exactly ONE corpus must behave like a single
 /// search — every hit attributed to that one corpus, no panic, hits present.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_ground_with_single_corpus_attributes_all_hits_to_it() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -359,7 +359,7 @@ async fn union_ground_with_single_corpus_attributes_all_hits_to_it() {
 /// wiki: a real `repo:empty:wiki` target whose corpus has zero rows in the
 /// store, so `search_corpus` returns an empty `Vec` for it (the store is
 /// populated, but the corpus filter matches nothing).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -420,7 +420,7 @@ async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
 /// empty response, not a panic — this also exercises the crossencoder-skip
 /// branch (`!hits.is_empty()`), which a reversing rerank on an empty slice would
 /// otherwise be asked to run.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_ground_over_all_empty_corpora_returns_empty_response_without_panic() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
@@ -452,7 +452,7 @@ async fn union_ground_over_all_empty_corpora_returns_empty_response_without_pani
 /// parent DocFile.corpus. #106 added the additive `provenance.corpus` stamp on
 /// this path; this locks that the stamp equals the single requested corpus and
 /// nothing leaked from the union machinery.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpus() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -496,7 +496,7 @@ async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpu
 /// their chunk_ids collide (chunk_id = blake3(file_ref#ord), file_ref = absolute
 /// path). A HashMap<chunk_id, corpus> collapses both attributions to one. The
 /// VecDeque queue must preserve both so BOTH corpora appear in the result.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpora() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -595,7 +595,7 @@ impl EmbedBatch for CountingEmbedder {
 
 /// AC: `ground_union` must embed the query exactly once and reuse the vector
 /// across every corpus in the union set, regardless of corpus count.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ground_union_embeds_query_exactly_once_across_three_corpora() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
@@ -633,7 +633,7 @@ async fn ground_union_embeds_query_exactly_once_across_three_corpora() {
 /// snippet text must still equal its true source file's body — a broken move
 /// (e.g. building docs from a stale or duplicated hit) would corrupt or lose
 /// this text even though attribution-only checks elsewhere might still pass.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn union_ground_preserves_exact_hit_text_after_queue_refactor() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");

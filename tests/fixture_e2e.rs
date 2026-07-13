@@ -101,7 +101,7 @@ fn seed_fixture_corpus(dir: &Path) {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixture_corpus_indexes_and_serves_oracle_queries() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -176,7 +176,7 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -215,7 +215,7 @@ async fn fixture_corpus_reindex_is_idempotent_no_phantom_files() {
     let _ = stats1;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -270,7 +270,7 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
 #[allow(dead_code)] // used only by const-budget compliance test
 const SMALL_BUDGET: usize = 60;
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -303,7 +303,7 @@ async fn empty_files_are_skipped_and_counted_not_re_processed_each_run() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
     // Same-action divergence regression (daemon single-file path evicts on
     // truncate-to-empty; bulk index_corpus previously left stale rows behind).
@@ -435,7 +435,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
 /// embedder, indexing writes null embeddings (zero `embeddings_inserted`) and
 /// ground takes the lexical-only (FTS + ripgrep) path, still returning the
 /// right file for a distinctive token.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
     use hallouminate::domain::ground::{GroundOpts, ground};
 
@@ -509,7 +509,7 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
 /// Spec testing #7 (indexing side): `index_corpus` must embed chunks with
 /// `EmbedRole::Passage`, never `Query`. Pairs with the unit test in
 /// `ground/orchestrate.rs` that locks the query side to `EmbedRole::Query`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn index_corpus_embeds_passages_with_passage_role() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -564,7 +564,7 @@ async fn chunker_budget_compliance_with_characters_sizer() {
 /// heading paths, and the frontmatter page's line numbers map back to real
 /// on-disk source lines (offset proven by a heading placed below a multi-line
 /// frontmatter block).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -672,7 +672,7 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
 /// references, and notes; embeddings/snippets carry no raw `<!--claim:...-->`
 /// text; the on-disk file is untouched (what `read_markdown` returns verbatim);
 /// and `line_start`/`line_end` still match on-disk lines after the strip.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn claim_marks_round_trip_through_ground_with_clean_snippets() {
     use hallouminate::domain::corpus::{ClaimMark, ClaimStatus};
     use hallouminate::domain::ground::{GroundOpts, ground};

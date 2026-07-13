@@ -47,7 +47,7 @@ async fn open_store(dir: &Path) -> LanceStore {
 
 // ── Plain text ──────────────────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn plain_text_corpus_indexes_and_grounds() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -100,7 +100,7 @@ async fn plain_text_corpus_indexes_and_grounds() {
 
 // ── CSV ───────────────────────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn csv_indexes_one_self_describing_chunk_per_row() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -174,7 +174,7 @@ fn write_xlsx(path: &Path) {
     wb.save(path).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xlsx_indexes_each_sheet_row_with_sheet_and_row_metadata() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -243,7 +243,7 @@ fn write_ods(path: &Path) {
     zip.finish().unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ods_indexes_rows_with_sheet_and_row_metadata() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -282,7 +282,7 @@ async fn ods_indexes_rows_with_sheet_and_row_metadata() {
 
 // ── Graceful per-file skips ────────────────────────────────────────────────
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -326,7 +326,7 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
     assert!(hits.iter().any(|h| h.file_ref.ends_with("good.md")));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
@@ -371,7 +371,7 @@ async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
     assert!(hits.iter().any(|h| h.file_ref.ends_with("ok.csv")));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
     // apply.rs's unreadable-skip branch must never evict a previously-indexed
     // file's rows on re-index (distinct from the truncate-to-empty eviction
@@ -538,7 +538,7 @@ fn markdown_handler_golden_snapshot_is_byte_stable() {
 /// the `f64` debug form (`42.0`) or the `Data::Float(..)` enum form. The earlier
 /// xlsx test wrote every cell as a string, so the `Data::Float`/`Data::Int`
 /// rendering path in `cell_to_string` was never exercised; this pins it.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xlsx_numeric_cell_renders_as_bare_number_not_float_debug() {
     use rust_xlsxwriter::Workbook;
     let store_dir = tempfile::tempdir().unwrap();
@@ -593,7 +593,7 @@ async fn xlsx_numeric_cell_renders_as_bare_number_not_float_debug() {
 /// row index restarting at 1 per sheet and the breadcrumb carrying each sheet's
 /// own name. The single-sheet test could not catch a regression that, say, kept a
 /// running row counter across sheets or only read the first sheet.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
     use rust_xlsxwriter::Workbook;
     let store_dir = tempfile::tempdir().unwrap();
@@ -667,7 +667,7 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
 /// extra cell: the handler synthesizes a positional `col_N` key (spec:
 /// "no cell is silently dropped"). A blank cell inside a row is omitted from the
 /// `col: val` rendering, but the populated cells around it still render.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn csv_ragged_row_uses_col_n_fallback_and_omits_blank_cells() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
