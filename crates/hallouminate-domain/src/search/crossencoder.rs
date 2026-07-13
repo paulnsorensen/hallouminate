@@ -11,7 +11,7 @@
 //! `hallouminate config download` warms both.
 
 use crate::common::{HallouminateError, Result};
-use crate::indexer::chunk::SearchHit;
+use crate::indexer::SearchHit;
 
 /// Trait so `ground()` can stay generic over "no rerank" (Noop) and
 /// a concrete adapter-backed rerank. Sync, takes `&mut self` because

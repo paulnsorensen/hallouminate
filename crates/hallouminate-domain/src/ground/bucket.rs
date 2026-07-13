@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::common::Result;
 use crate::corpus::make_snippet;
-use crate::indexer::chunk::SearchHit;
+use crate::indexer::SearchHit;
 
 use super::types::{ChunkProvenance, DocChunk, DocFile};
 

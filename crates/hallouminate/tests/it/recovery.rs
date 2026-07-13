@@ -39,9 +39,15 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
 
     // Phase 1: successfully apply file A
     {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
-            .await
-            .expect("open initial");
+        let store = LanceStore::open_or_create(
+            store_dir.path(),
+            MODEL,
+            false,
+            true,
+            Some(Box::new(StubEmbedder)),
+        )
+        .await
+        .expect("open initial");
         let pf_a = placeholder_prepared_file("/tmp/a.md", 3);
         store.apply_batch(vec![pf_a]).await.expect("apply A");
         assert_eq!(store.count_rows().await.unwrap(), 3);
@@ -102,11 +108,22 @@ async fn re_run_after_crash_converges_to_correct_state() {
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
 
     // Pre-crash: index file A
+    let a_ref = std::fs::canonicalize(corpus_dir.path())
+        .expect("canonical corpus root")
+        .join("a.md")
+        .to_string_lossy()
+        .into_owned();
     {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
-            .await
-            .expect("open");
-        let pf_a = placeholder_prepared_file("/tmp/a.md", 2);
+        let store = LanceStore::open_or_create(
+            store_dir.path(),
+            MODEL,
+            false,
+            true,
+            Some(Box::new(StubEmbedder)),
+        )
+        .await
+        .expect("open");
+        let pf_a = placeholder_prepared_file(&a_ref, 2);
         store.apply_batch(vec![pf_a]).await.expect("apply A");
     }
 
@@ -152,17 +169,14 @@ async fn re_run_after_crash_converges_to_correct_state() {
         .await
         .expect("recovered index_corpus");
 
-    // /tmp/a.md is in DB but not on disk anymore (it lived in a synthetic
-    // file_ref that doesn't exist as a real file). The scan-based indexer
-    // will plan a delete for it. So after recovery:
-    //   - file A: deleted (not on disk)
-    //   - file B: upserted (on disk, not in DB pre-recovery)
+    // A is in the indexed root but no longer on disk, while B was added after
+    // the prior snapshot. Recovery must converge by deleting A and upserting B.
     assert!(stats.files_upserted >= 1, "B must upsert");
     assert!(stats.files_deleted >= 1, "A must be deleted (not on disk)");
 
     let snaps = store.list_files("docs").await.expect("list_files");
     assert!(snaps.iter().any(|s| s.file_ref.ends_with("b.md")));
-    assert!(!snaps.iter().any(|s| s.file_ref == "/tmp/a.md"));
+    assert!(!snaps.iter().any(|s| s.file_ref == a_ref));
 }
 
 #[tokio::test]
@@ -173,9 +187,15 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
 
     let cycles: &[&str] = &["/tmp/x.md", "/tmp/y.md", "/tmp/z.md"];
     for (i, file_ref) in cycles.iter().enumerate() {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
-            .await
-            .expect("reopen cycle");
+        let store = LanceStore::open_or_create(
+            store_dir.path(),
+            MODEL,
+            false,
+            true,
+            Some(Box::new(StubEmbedder)),
+        )
+        .await
+        .expect("reopen cycle");
         let n_chunks = i + 1;
         let pf = placeholder_prepared_file(file_ref, n_chunks);
         store.apply_batch(vec![pf]).await.expect("apply cycle");

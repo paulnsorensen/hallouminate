@@ -18,7 +18,7 @@ pub static LANCE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_
 
 use hallouminate_adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use hallouminate_domain::common::Result;
-use hallouminate_domain::indexer::chunk::{PreparedChunk, PreparedFile};
+use hallouminate_domain::indexer::{PreparedChunk, PreparedFile};
 
 pub struct StubEmbedder;
 

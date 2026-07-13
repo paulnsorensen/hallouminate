@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::common::{HallouminateError, Result};
-use crate::indexer::chunk::SearchHit;
-use crate::indexer::store::ChunkStore;
+use crate::indexer::{ChunkStore, SearchHit};
 use crate::search::{Crossencoder, search_with_ripgrep};
 
 use super::bucket::{build_docs, normalize_scores};
@@ -311,9 +310,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::indexer::chunk::PreparedFile;
-    use crate::indexer::plan::FileSnapshot;
-    use crate::indexer::store::BatchWriteStats;
+    use crate::indexer::{BatchWriteStats, FileSnapshot, PreparedFile};
 
     /// In-memory `ChunkStore` test double for orchestration/rerank tests:
     /// `hybrid_search` returns a canned, pre-seeded hit list; writes are
