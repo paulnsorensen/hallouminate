@@ -200,11 +200,7 @@ fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
 /// Render a `TreeNode` as an indented ASCII outline — subdirs first, then
 /// files, with one entry per line and two-space indents per depth level.
 /// Mirrors the structured tree for clients that only want the text block.
-fn render_tree_outline(
-    node: &crate::domain::corpus::sandbox::TreeNode,
-    depth: usize,
-    out: &mut String,
-) {
+fn render_tree_outline(node: &crate::domain::corpus::TreeNode, depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth);
     let label = if node.path.is_empty() {
         ".".to_string()
@@ -957,7 +953,7 @@ mod tests {
     //! MCP-specific tests. The corpus-boundary helpers
     //! (`safe_relative_path`, `pick_corpus`, `ensure_corpus_allows_file`,
     //! `first_corpus_root`, `atomic_write_no_follow`, `list_corpus_files`)
-    //! live in `crate::domain::corpus::sandbox` and are tested there once.
+    //! live in `crate::domain::corpus` and are tested there once.
     //! Daemon RPC error mapping has its own contract — pin the JSON-RPC
     //! code each error variant maps to so a future refactor of the
     //! daemon's `ErrorKind` would have to deliberately update the test.

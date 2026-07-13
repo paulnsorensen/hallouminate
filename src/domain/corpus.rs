@@ -37,7 +37,17 @@ pub use claim_marks::{
 };
 pub use frontmatter::{Frontmatter, LifecycleStatus, lint_frontmatter, split_frontmatter};
 pub use hasher::{blake3_bytes, blake3_file};
+pub use index_md::{
+    INDEX_END_MARKER, INDEX_FILENAME, INDEX_START_MARKER, RewriteOutcome, ancestor_dirs,
+    compose_index_md, is_index_md,
+};
 pub use keywords::extract_keywords;
+pub use sandbox::{
+    FileEntry, SandboxError, TreeNode, WriteError, WriteErrorKind, atomic_write_no_follow,
+    build_corpus_tree, delete_no_follow, ensure_corpus_allows_file, first_corpus_root,
+    list_corpus_files, pick_corpus, read_no_follow, read_no_follow_with_mtime, resolve_read_root,
+    safe_relative_path,
+};
 pub use section::{
     LineRange, MatchError, Position, RangeError, SectionError, replace_line_range,
     replace_unique_match, splice_under_heading,
