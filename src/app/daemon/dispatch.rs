@@ -12,7 +12,7 @@
 //!     errors and `DaemonResponse::Err(Internal, ...)` for daemon faults.
 //!
 //! The corpus-selection / path-traversal / glob-validation / atomic-write
-//! helpers live in `crate::domain::corpus::sandbox` and are shared with the
+//! helpers live in `crate::domain::corpus` and are shared with the
 //! MCP tools transport, closing the maintenance liability of two divergent
 //! forks (and the security asymmetry where the daemon was using
 //! `tokio::fs::write` while MCP used `atomic_write_no_follow`).
@@ -26,15 +26,15 @@ use crate::app::cli::{CorpusReport, IndexReport};
 use crate::app::config::{Config, ResolvedLayers, resolve_for_cwd};
 use crate::domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
 #[cfg(test)]
-use crate::domain::corpus::sandbox::FileEntry;
-use crate::domain::corpus::sandbox::{
-    WriteError, WriteErrorKind, atomic_write_no_follow, delete_no_follow,
-    ensure_corpus_allows_file, first_corpus_root, list_corpus_files, pick_corpus, read_no_follow,
-    resolve_read_root, safe_relative_path,
-};
+use crate::domain::corpus::FileEntry;
 use crate::domain::corpus::scan;
 use crate::domain::corpus::{
     SlugResolution, blake3_bytes, find_wikilinks, normalize_slug, resolve_slug,
+};
+use crate::domain::corpus::{
+    WriteError, WriteErrorKind, atomic_write_no_follow, delete_no_follow,
+    ensure_corpus_allows_file, first_corpus_root, list_corpus_files, pick_corpus, read_no_follow,
+    resolve_read_root, safe_relative_path,
 };
 use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
@@ -208,7 +208,7 @@ fn pick_corpus_or_default(
     repositories: &[RepositoryConfig],
     cwd: &Path,
     requested: Option<&str>,
-) -> Result<CorpusConfig, crate::domain::corpus::sandbox::SandboxError> {
+) -> Result<CorpusConfig, crate::domain::corpus::SandboxError> {
     if requested.is_none()
         && let Some(name) = default_wiki_for_cwd(repositories, cwd)
         && let Some(found) = corpora.iter().find(|c| c.name == name).cloned()
@@ -263,7 +263,7 @@ async fn handle_list_tree(cfg: &Config, cwd: &Path, req: ListTreeRequest) -> Dae
             Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
         };
     ensure_paths_exist(&corpus).await;
-    let root = match crate::domain::corpus::sandbox::build_corpus_tree(&corpus) {
+    let root = match crate::domain::corpus::build_corpus_tree(&corpus) {
         Ok(node) => node,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
@@ -727,7 +727,7 @@ async fn handle_add_markdown(
     let mut warnings = crate::domain::corpus::lint_markdown(&req.content);
     warnings.extend(crate::domain::corpus::lint_frontmatter(&req.content));
     warnings.extend(crate::domain::corpus::lint_claim_marks(&req.content));
-    match crate::domain::corpus::sandbox::list_corpus_files(&corpus) {
+    match crate::domain::corpus::list_corpus_files(&corpus) {
         Ok(entries) => {
             let mut known_paths: Vec<String> = entries.into_iter().map(|e| e.path).collect();
             known_paths.push(req.path.clone());
@@ -1463,9 +1463,7 @@ async fn rebuild_wiki_indexes(
     root: &Path,
     file_relative: &Path,
 ) -> Result<crate::domain::indexer::ApplyStats, String> {
-    use crate::domain::corpus::index_md::{
-        INDEX_FILENAME, ancestor_dirs, compose_index_md, is_index_md,
-    };
+    use crate::domain::corpus::{INDEX_FILENAME, ancestor_dirs, compose_index_md, is_index_md};
 
     let written_is_index = is_index_md(file_relative);
     let mut totals = crate::domain::indexer::ApplyStats::default();
@@ -1525,10 +1523,10 @@ async fn rebuild_wiki_indexes(
         let (new_content, outcome) = compose_index_md(root, dir, is_root, existing.as_deref())
             .map_err(|e| format!("compose index {}: {e}", dir.display()))?;
         match outcome {
-            crate::domain::corpus::index_md::RewriteOutcome::NoMarkers
-            | crate::domain::corpus::index_md::RewriteOutcome::Unchanged => continue,
-            crate::domain::corpus::index_md::RewriteOutcome::Created
-            | crate::domain::corpus::index_md::RewriteOutcome::Updated => {}
+            crate::domain::corpus::RewriteOutcome::NoMarkers
+            | crate::domain::corpus::RewriteOutcome::Unchanged => continue,
+            crate::domain::corpus::RewriteOutcome::Created
+            | crate::domain::corpus::RewriteOutcome::Updated => {}
         }
 
         // Use the same atomic-write-no-follow path that AddMarkdown uses so
@@ -1718,7 +1716,7 @@ mod tests {
     //! Dispatch-level tests. The corpus-boundary helpers
     //! (`safe_relative_path`, `pick_corpus`, `ensure_corpus_allows_file`,
     //! `first_corpus_root`, `atomic_write_no_follow`, `list_corpus_files`)
-    //! moved to `crate::domain::corpus::sandbox` and are tested there once,
+    //! moved to `crate::domain::corpus` and are tested there once,
     //! against a single contract. These tests only cover the daemon-only
     //! helpers (`derived_corpus_name`, `pong_value`).
 

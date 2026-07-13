@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 
-use crate::domain::corpus::index_md::{INDEX_END_MARKER, INDEX_START_MARKER};
+use crate::domain::corpus::{INDEX_END_MARKER, INDEX_START_MARKER};
 use crate::domain::repository::{RepoCorpusKind, WIKI_RELATIVE_PATH, repo_corpus_name};
 
 #[derive(Debug)]

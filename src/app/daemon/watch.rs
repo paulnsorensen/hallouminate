@@ -23,7 +23,7 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 
 use crate::domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
-use crate::domain::corpus::sandbox::ensure_corpus_allows_file;
+use crate::domain::corpus::ensure_corpus_allows_file;
 
 use super::dispatch::index_single_file_with_content;
 use super::state::DaemonState;
@@ -333,7 +333,7 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
         let relative = path
             .strip_prefix(&owner.canonical_watched)
             .expect("owning_corpus guarantees path starts_with canonical_watched");
-        let (bytes, mtime) = match crate::domain::corpus::sandbox::read_no_follow_with_mtime(
+        let (bytes, mtime) = match crate::domain::corpus::read_no_follow_with_mtime(
             &owner.canonical_watched,
             relative,
         ) {

@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::app::cli::IndexReport;
-use crate::domain::corpus::sandbox::{FileEntry, TreeNode};
+use crate::domain::corpus::{FileEntry, TreeNode};
 use crate::domain::ground::GroundResponse;
 
 pub use crate::domain::corpus::{LineRange, Position};
