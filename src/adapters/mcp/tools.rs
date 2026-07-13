@@ -680,7 +680,7 @@ impl HallouminateTools {
         description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = false
         )
