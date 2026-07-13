@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use hallouminate::adapters::lance::{EMBEDDING_DIM, LanceStore};
-use hallouminate::domain::common::{CorpusConfig, FileRef, Result};
+use hallouminate::domain::common::{CorpusConfig, FileRef, Result, canonicalize_or_passthrough};
 use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
 use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
 use text_splitter::Characters;
@@ -33,7 +33,7 @@ impl EmbedBatch for PanickingEmbedder {
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
@@ -91,17 +91,29 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn re_run_after_crash_converges_to_correct_state() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
 
-    // Pre-crash: index file A
+    // Pre-crash: index file A — an in-root file_ref that never exists on
+    // disk, so the recovery scan plans a delete that survives the #215
+    // root-scope filter (an out-of-root ref like /tmp/a.md would be skipped).
+    // Anchor it under the CANONICALIZED corpus dir so it matches what the
+    // walker stores (walker.rs canonicalizes every file_ref) and what the
+    // #215 filter canonicalizes corpus.paths to. Without this the raw
+    // `/var/...` ref fails `starts_with` against the canonical `/private/var/...`
+    // root on macOS (symlinked temp dirs), and the delete is wrongly skipped.
+    let a_ref = canonicalize_or_passthrough(corpus_dir.path())
+        .into_path_buf()
+        .join("a.md")
+        .to_string_lossy()
+        .into_owned();
     {
         let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
             .await
             .expect("open");
-        let pf_a = placeholder_prepared_file("/tmp/a.md", 2);
+        let pf_a = placeholder_prepared_file(&a_ref, 2);
         store.apply_batch(vec![pf_a]).await.expect("apply A");
     }
 
@@ -137,17 +149,17 @@ async fn re_run_after_crash_converges_to_correct_state() {
         .await
         .expect("recovered index_corpus");
 
-    // /tmp/a.md is in DB but not on disk anymore (it lived in a synthetic
-    // file_ref that doesn't exist as a real file). The scan-based indexer
-    // will plan a delete for it. So after recovery:
-    //   - file A: deleted (not on disk)
+    // a.md is in DB but not on disk. The scan-based indexer plans a delete
+    // for it, and because it sits under corpus.paths the root-scoped delete
+    // filter lets it through. So after recovery:
+    //   - file A: deleted (in-root, not on disk)
     //   - file B: upserted (on disk, not in DB pre-recovery)
     assert!(stats.files_upserted >= 1, "B must upsert");
     assert!(stats.files_deleted >= 1, "A must be deleted (not on disk)");
 
     let snaps = store.list_files("docs").await.expect("list_files");
     assert!(snaps.values().any(|s| s.file_ref.ends_with("b.md")));
-    assert!(!snaps.values().any(|s| s.file_ref == "/tmp/a.md"));
+    assert!(!snaps.values().any(|s| s.file_ref.ends_with("a.md")));
 }
 
 #[tokio::test]

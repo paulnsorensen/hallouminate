@@ -117,7 +117,18 @@ pub async fn ground(
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-    let query_vec = embed_query(query, embedder)?;
+    // In ON mode `embed_query` calls the blocking ONNX forward pass; run it on
+    // this worker thread's blocking slot so the async runtime is not starved
+    // while it runs (#217, matches #176's discipline). `embedder` is
+    // `Option<&mut dyn EmbedBatch>` (non-'static), which rules out
+    // `spawn_blocking`. In OFF mode (`embedder: None`) `embed_query` does no
+    // blocking work, so skip `block_in_place` — it panics on a `current_thread`
+    // runtime and there is nothing to offload for lexical-only callers.
+    let query_vec = if embedder.is_some() {
+        tokio::task::block_in_place(|| embed_query(query, embedder))?
+    } else {
+        embed_query(query, embedder)?
+    };
     let mut hits = search_corpus(
         query,
         corpus,
@@ -232,8 +243,14 @@ pub async fn ground_union(
     // the per-corpus partition survives the shared rerank's reshuffle. The
     // query is embedded ONCE up front and shared across every corpus — each
     // embed is a forward pass serialized on the embedder mutex, so hoisting
-    // it out of the loop turns N passes into 1.
-    let query_vec = embed_query(query, embedder)?;
+    // it out of the loop turns N passes into 1. In OFF mode (`embedder: None`)
+    // there is no blocking inference to offload, so skip `block_in_place` — it
+    // panics on a `current_thread` runtime (see `ground()`).
+    let query_vec = if embedder.is_some() {
+        tokio::task::block_in_place(|| embed_query(query, embedder))?
+    } else {
+        embed_query(query, embedder)?
+    };
     let mut tagged: Vec<(SearchHit, String)> = Vec::new();
     for (name, paths) in corpora {
         let hits = search_corpus(query, name, paths, store, query_vec.as_ref(), opts.limit).await?;
@@ -396,7 +413,7 @@ mod tests {
         .expect("open store")
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ground_errors_when_embedder_returns_no_vector() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = open_test_store(dir.path()).await;
@@ -431,7 +448,7 @@ mod tests {
     /// empty on an empty store, so the z_score assertion is vacuous; the
     /// structural enforcement (stamp lexically inside the block) is verified
     /// by `rrf_mode_docs_have_no_z_score` in bucket.rs.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ground_off_mode_returns_lexical_response_without_an_embedder() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = open_test_store(dir.path()).await;
@@ -454,7 +471,7 @@ mod tests {
     /// ON mode: `ground` must embed the query with `EmbedRole::Query` so the
     /// per-model instruction prefix matches the query side. The embed call
     /// runs before search, so an empty store still exercises it.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ground_embeds_query_with_query_role() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = open_test_store(dir.path()).await;
@@ -697,7 +714,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ground_union_applies_z_scores_when_rerank_finishes_in_time() {
         // Positive control for the two timeout tests below: with a generous
         // timeout and a fast crossencoder, z_scores must appear. Guards the
@@ -736,7 +753,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ground_union_honors_opts_rerank_timeout() {
         // Proves the knob is actually wired through GroundOpts into
         // ground_union, not just present on the struct: a tiny
@@ -782,7 +799,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ground_honors_opts_rerank_timeout() {
         // Mirrors ground_union_honors_opts_rerank_timeout for the single-
         // corpus `ground()` entry point (#139): a regression that rewires

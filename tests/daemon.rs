@@ -2720,7 +2720,7 @@ fn cfg_stale_corpus(ground: &Path, corpus_root: &Path) -> Config {
     toml::from_str(&toml).expect("stale corpus toml parses")
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ground_marks_stale_true_when_file_modified_after_index() {
     // Quality gate for #135 wiring: index a file through the daemon, bump
     // its on-disk mtime out-of-band, issue a `ground` request through the
