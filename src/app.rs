@@ -1,11 +1,12 @@
 //! Application entry layer: CLI parsing, configuration loading, the daemon,
-//! and logging.
+//! logging, and the MCP server.
 
 pub mod cli;
 pub mod config;
 pub mod daemon;
 pub mod input_error;
 pub mod logging;
+pub mod mcp;
 pub mod xdg;
 
 use clap::Parser;

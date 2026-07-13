@@ -286,7 +286,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Serve => {
             crate::app::daemon::ensure_daemon_running().await?;
-            crate::adapters::mcp::serve_stdio().await
+            crate::app::mcp::serve_stdio().await
         }
         Command::Daemon(args) => {
             let action = args.action.clone().unwrap_or(DaemonAction::Run);
