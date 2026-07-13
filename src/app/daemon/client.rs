@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
-use super::ipc::{DaemonRequest, DaemonResponse, ErrorKind};
+use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
 use super::socket::daemon_socket_path;
 
 /// Client handle: just remembers which socket path to dial. Stateless
@@ -162,9 +162,12 @@ impl DaemonClient {
 
     /// Convenience wrapper: send a request and decode the `Ok` payload as
     /// `T`. Daemon-side `Err` variants surface as `anyhow::Error` with the
-    /// daemon's message preserved.
+    /// daemon's message preserved. Bounded by [`timeout_for`]'s per-class
+    /// deadline — `call_raw` itself never times out, so an unbounded `call`
+    /// would hang the caller forever on a wedged daemon (issue #216).
     pub async fn call<T: DeserializeOwned>(&self, req: DaemonRequest) -> anyhow::Result<T> {
-        match self.call_raw(req).await? {
+        let timeout = timeout_for(&req.payload);
+        match self.call_raw_with_timeout(req, timeout).await? {
             DaemonResponse::Ok { result } => serde_json::from_value(result)
                 .map_err(|e| anyhow::anyhow!("daemon returned unexpected payload: {e}")),
             DaemonResponse::Err { kind, message } => match kind {
@@ -172,6 +175,31 @@ impl DaemonClient {
                 ErrorKind::Internal => Err(DaemonRpcError::internal(message).into()),
             },
         }
+    }
+}
+
+/// Per-request-class RPC deadline for [`DaemonClient::call`]. Reads
+/// (listings, single-file markdown ops, corpus stats) are cheap lookups;
+/// `ground` embeds the query and searches, so it gets more room; `index`
+/// rebuilds a corpus and mutating writes (`add_markdown`, `delete_markdown`)
+/// can block behind the embedder mutex held across bulk indexing (#219), so
+/// both get the longest class. `Ping` and `Shutdown` aren't routed through
+/// `call` in practice (lifecycle.rs calls `call_raw_with_timeout` directly
+/// with its own short deadlines) but are classified for match exhaustiveness.
+fn timeout_for(payload: &DaemonRequestPayload) -> Duration {
+    match payload {
+        DaemonRequestPayload::Ground(_) => Duration::from_secs(120),
+        DaemonRequestPayload::Index(_)
+        | DaemonRequestPayload::AddMarkdown(_)
+        | DaemonRequestPayload::DeleteMarkdown(_) => Duration::from_secs(15 * 60),
+        DaemonRequestPayload::Ping
+        | DaemonRequestPayload::ListCorpora
+        | DaemonRequestPayload::ListFiles(_)
+        | DaemonRequestPayload::ListTree(_)
+        | DaemonRequestPayload::ReadMarkdown(_)
+        | DaemonRequestPayload::Backlinks(_)
+        | DaemonRequestPayload::CorpusStats { .. }
+        | DaemonRequestPayload::Shutdown => Duration::from_secs(60),
     }
 }
 
@@ -208,7 +236,10 @@ impl std::error::Error for DaemonRpcError {}
 
 #[cfg(test)]
 mod tests {
-    use super::super::ipc::DaemonRequestPayload;
+    use super::super::ipc::{
+        AddMarkdownRequest, BacklinksRequest, DaemonRequestPayload, DeleteMarkdownRequest,
+        GroundRequest, IndexRequest, ListFilesRequest, ListTreeRequest, ReadMarkdownRequest,
+    };
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -266,6 +297,88 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "call_raw_with_timeout must not block past its deadline",
+        );
+    }
+
+    #[test]
+    fn timeout_for_classifies_by_request_class() {
+        // #216: `call<T>` must bound every RPC class, not just lifecycle
+        // status/stop. Reads stay short; `ground` gets more room for
+        // embedding + search; `index` and single-file mutations get the
+        // longest class because both can queue behind the embedder mutex
+        // held across bulk indexing (#219).
+        let read_class = Duration::from_secs(60);
+        let ground_class = Duration::from_secs(120);
+        let mutation_class = Duration::from_secs(15 * 60);
+
+        assert_eq!(timeout_for(&DaemonRequestPayload::Ping), read_class);
+        assert_eq!(timeout_for(&DaemonRequestPayload::ListCorpora), read_class);
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::ListFiles(ListFilesRequest {
+                corpus: None
+            })),
+            read_class,
+        );
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::ListTree(ListTreeRequest {
+                corpus: None
+            })),
+            read_class,
+        );
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: None,
+                path: "x.md".to_string(),
+            })),
+            read_class,
+        );
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::Backlinks(BacklinksRequest {
+                corpus: None,
+                path: "x.md".to_string(),
+            })),
+            read_class,
+        );
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::CorpusStats { corpus: None }),
+            read_class,
+        );
+        assert_eq!(timeout_for(&DaemonRequestPayload::Shutdown), read_class);
+
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::Ground(GroundRequest {
+                query: "q".to_string(),
+                corpus: None,
+                top_files: None,
+                chunks_per_file: None,
+                limit: None,
+                snippet_chars: None,
+            })),
+            ground_class,
+        );
+
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::Index(IndexRequest {
+                corpus: None,
+                paths_from: None,
+                strict: false,
+            })),
+            mutation_class,
+        );
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::AddMarkdown(
+                AddMarkdownRequest::default()
+            )),
+            mutation_class,
+        );
+        assert_eq!(
+            timeout_for(&DaemonRequestPayload::DeleteMarkdown(
+                DeleteMarkdownRequest {
+                    corpus: "c".to_string(),
+                    path: "x.md".to_string(),
+                }
+            )),
+            mutation_class,
         );
     }
 }

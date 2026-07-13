@@ -537,7 +537,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus` from a directory above all repos, the search unions every effective corpus: discovered sub-repo wikis, baseline-registered `[[repository]]` wikis, user-declared `[[corpus]]` entries, and each repository's `repo:<name>:corpus` source corpus when configured — each hit carries its source corpus. Passing an explicit `corpus` pins the search to that one corpus. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set."
+        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus` from a directory above all repos, the search unions every effective corpus: discovered sub-repo wikis, baseline-registered `[[repository]]` wikis, user-declared `[[corpus]]` entries, and each repository's `repo:<name>:corpus` source corpus when configured — each hit carries its source corpus. Passing an explicit `corpus` pins the search to that one corpus. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn ground(
         &self,
@@ -570,7 +576,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Build or refresh the LanceDB index for one or all configured corpora. Returns a one-line summary in `content` and the per-corpus IndexReport in `structuredContent`."
+        description = "Build or refresh the LanceDB index for one or all configured corpora. Returns a one-line summary in `content` and the per-corpus IndexReport in `structuredContent`.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn index(
         &self,
@@ -604,7 +616,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted."
+        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn list_tree(
         &self,
@@ -626,7 +644,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted."
+        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn list_files(
         &self,
@@ -653,7 +677,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams."
+        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
     pub async fn add_markdown(
         &self,
@@ -690,7 +720,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim."
+        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn read_markdown(
         &self,
@@ -717,7 +753,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Unlink a markdown file from the corpus' single configured root and prune its rows from the LanceDB index. Requires a single-root corpus — multi-root corpora are read- and search-only. Irreversible. Symlinks are rejected. `content` is a one-line summary; `structuredContent` is { corpus, path, absolute_path, file_ref }."
+        description = "Unlink a markdown file from the corpus' single configured root and prune its rows from the LanceDB index. Requires a single-root corpus — multi-root corpora are read- and search-only. Irreversible. Symlinks are rejected. `content` is a one-line summary; `structuredContent` is { corpus, path, absolute_path, file_ref }.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn delete_markdown(
         &self,
@@ -744,7 +786,13 @@ impl HallouminateTools {
                       the corpus has never been indexed), and how many on-disk files matching the \
                       corpus globs have not yet been indexed. Corpus selection follows the same \
                       default resolution as `list_files`. `structuredContent` is \
-                      { corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }."
+                      { corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn corpus_stats(
         &self,
@@ -776,7 +824,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List corpora configured in the hallouminate config file, including derived `repo:{name}:wiki` / `repo:{name}:corpus` entries from `[[repository]]` declarations. `content` is newline-separated corpus names; `structuredContent` is { corpora: [{name, paths}, …] }. Run `hallouminate config validate` for a richer summary."
+        description = "List corpora configured in the hallouminate config file, including derived `repo:{name}:wiki` / `repo:{name}:corpus` entries from `[[repository]]` declarations. `content` is newline-separated corpus names; `structuredContent` is { corpora: [{name, paths}, …] }. Run `hallouminate config validate` for a richer summary.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn list_corpora(
         &self,
@@ -802,7 +856,13 @@ impl HallouminateTools {
 
     #[tool(
         description = "Resolve a single citation: return the footnote target (source text / link) \
-                      for page#footnote_number without pulling the whole document."
+                      for page#footnote_number without pulling the whole document.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn get_footnote(
         &self,
@@ -834,7 +894,13 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Return corpus-relative paths of every page that links to the given page via a `[[wikilink]]`. `structuredContent` is { corpus, path, backlinks }; `content` is a newline-joined list of backlink paths, or a message noting there are none."
+        description = "Return corpus-relative paths of every page that links to the given page via a `[[wikilink]]`. `structuredContent` is { corpus, path, backlinks }; `content` is a newline-joined list of backlink paths, or a message noting there are none.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     pub async fn backlinks(
         &self,
