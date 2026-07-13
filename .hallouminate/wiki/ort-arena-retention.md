@@ -45,12 +45,29 @@ rationale in `docs/adr/daemon-idle-exit-001..003.md`).
   `daemon-idle-exit` design: exit after `[daemon].idle_exit_secs` of
   inactivity with zero active connections; clients respawn via
   `client_for(None)` → `ensure_daemon_running()`.
+  **Caveat (2026-07-13 audit, #222):** idle-exit is starved under
+  multi-instance fleets — `touch_activity()` fires on every request
+  completion and `ConnectionGuard` defers exit while any connection is
+  active (`src/app/daemon/state.rs:743-779`); the 30-min maintenance
+  tick also touches the clock (`state.rs:534-567`). With N concurrent
+  Claude Code instances a true `idle_exit_secs` (default 900s) global
+  gap becomes rare, so the only reclaim mechanism rarely fires exactly
+  when memory pressure is highest.
 - **Smaller high-water mark.** Capping the embed batch
   (`embed(texts, Some(32))` instead of `None`) shrinks the arena
   peak roughly proportionally — a separate mitigation, not a fix.
+  **Gap (#221):** the crossencoder rerank path never got this cap —
+  `rerank(query, &docs, false, None)`
+  (`src/domain/search/crossencoder.rs:115`) with a default 50-doc pool
+  (`crossencoder.rs:6`), so each rerank call's arena scratch high-water
+  is unbounded by config. Reranks do serialize daemon-wide behind a
+  whole-map mutex (`src/app/daemon/state.rs:724-738`), so it's one
+  arena, but sized by the uncapped joint batch.
 
 ## For future agents
 
 - `embeddings.idle_evict_secs` is a deprecated no-op after
   `daemon-idle-exit` lands; the config warns and does nothing.
 - Full cited diagnosis: `.cheese/research/fastembed-ort-arena-leak/`.
+
+_Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-13 · Supersedes: —_

@@ -96,3 +96,16 @@ git operation: `checkout -- .`, `restore`, `reset --hard`.
   reset)".
 - If files appear to revert mid-session, suspect a sibling's tree-wide
   git operation first, then the tilth parent-checkout leak above.
+
+
+## Wiki index rows stomp across worktrees
+
+Added 2026-07-13. Indexing or `add_markdown`-ing the repo wiki from one
+worktree **deletes the sibling worktrees' rows** for that corpus from the
+shared LanceDB table — on-disk files are untouched, but `ground` stops
+finding pages written from the other checkout. If wiki pages you wrote
+"disappear" from search after working in another worktree, this is why.
+Mechanism, symptoms, and the agreed fix direction (#215):
+[worktree-corpus-identity](worktree-corpus-identity.md). Recover the view
+you want with `hallouminate index` from the checkout you care about.
+

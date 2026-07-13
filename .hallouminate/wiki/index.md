@@ -11,12 +11,14 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [architecture](architecture.md) — sliced-bread layout: `app/`, `domain/`, `adapters/`, dependency direction, entry points.
 - [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis.
 - [daemon-and-cli](daemon-and-cli.md) — why there's a daemon, the JSON-line socket protocol, the CLI subcommand surface.
+- [blocking-inference-offload](blocking-inference-offload.md) — which CPU-bound daemon paths hop off tokio workers and which still run inline; coverage gaps (#217, #219).
 - [corpus-walker](corpus-walker.md) — gitignore-aware corpus walking and the explicit-root opt-in escape hatch.
 - [multi-format-ingestion](multi-format-ingestion.md) — why hallouminate is markdown-only today, the per-format dispatch pattern (text/code/PDF), reachable tooling, and the open design questions before extending the indexer.
 - [claim-provenance-marks](claim-provenance-marks.md) — inline `<!--claim:STATUS-->` marks parsed at index time, stored per chunk in Lance and surfaced in `ground`; how they differ from page-level frontmatter.
 - [config-layering](config-layering.md) — XDG baseline plus repo-layer merge; how a single daemon serves many repos.
 - [ort-arena-retention](ort-arena-retention.md) — why session eviction never reclaimed embedder memory: upstream ONNX Runtime BFCArena retention; superseded by daemon idle-exit.
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
+- [worktree-corpus-identity](worktree-corpus-identity.md) — indexing the same corpus from two git worktrees deletes each other's index rows (#215); mechanism, symptoms, fix direction.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
 
 ## How to use this index
