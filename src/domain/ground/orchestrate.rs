@@ -9,15 +9,6 @@ use crate::domain::search::{Crossencoder, fts_with_ripgrep, hybrid_with_ripgrep}
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats};
 
-/// Bound on the crossencoder rerank step (#139). The crossencoder is
-/// synchronous CPU-bound code with no `.await` points, so a bare
-/// `tokio::time::timeout` around `rerank()` cannot preempt it — see
-/// `rerank_with_timeout` below. Chosen against the documented ~1.25 s
-/// typical worst case for the default N=50 pool (`crossencoder.rs:6,30-32`):
-/// generous enough to cover a normal run, tight enough to cap a stalled
-/// request at roughly one typical rerank's worth of latency.
-const RERANK_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Run `crossencoder.rerank(query, &mut hits)` on a blocking-pool thread and
 /// bound it with `timeout`. `Crossencoder::rerank` is synchronous CPU-bound
 /// work with no `.await`, so wrapping `tokio::time::timeout` directly around
@@ -98,6 +89,11 @@ pub struct GroundOpts {
     pub top_files: usize,
     pub chunks_per_file: usize,
     pub limit: usize,
+    /// Bound on the crossencoder rerank step (#139), configurable via
+    /// `[search].rerank_timeout_ms`. See `rerank_with_timeout` for why a
+    /// real OS-thread boundary (not a bare `tokio::time::timeout`) is
+    /// required to preempt the synchronous crossencoder.
+    pub rerank_timeout: Duration,
 }
 
 impl Default for GroundOpts {
@@ -106,6 +102,7 @@ impl Default for GroundOpts {
             top_files: 10,
             chunks_per_file: 3,
             limit: 50,
+            rerank_timeout: Duration::from_secs(2),
         }
     }
 }
@@ -135,7 +132,7 @@ pub async fn ground(
         // hit lists so a no-match query doesn't pay the model latency.
         if !hits.is_empty() {
             let (reranked, applied) =
-                rerank_with_timeout(rerank, query.to_string(), hits, RERANK_TIMEOUT).await?;
+                rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await?;
             hits = reranked;
             if applied {
                 // RRF-mode guard (decision 4): z only when the cross-encoder ran.
@@ -269,7 +266,7 @@ pub async fn ground_union(
         && !hits.is_empty()
     {
         let (reranked, applied) =
-            rerank_with_timeout(rerank, query.to_string(), hits, RERANK_TIMEOUT).await?;
+            rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await?;
         hits = reranked;
         if applied {
             let zs = normalize_scores(&hits);
@@ -609,7 +606,7 @@ mod tests {
             Box::new(ReversingCrossencoderStub),
             "q".to_string(),
             hits,
-            RERANK_TIMEOUT,
+            Duration::from_secs(2),
         )
         .await
         .expect("fast path must not error");
@@ -620,6 +617,250 @@ mod tests {
             observed,
             vec!["/b.md", "/a.md"],
             "fast path must apply the crossencoder's reordering"
+        );
+    }
+
+    // --- #139: GroundOpts.rerank_timeout wiring ---
+
+    /// Seed `dir` with five markdown files whose bodies all contain "spice"
+    /// so a lexical (embedder=None) FTS query for "spice" returns >=5 real
+    /// hits — enough for `normalize_scores` (MIN_N = 5) to emit Some
+    /// z-scores when the crossencoder runs. Fewer hits would make the
+    /// timeout tests' `z_score.is_none()` assertions tautological: below
+    /// MIN_N, normalize_scores returns all-None unconditionally.
+    /// Indexes the files into `store` under the `fixtures` corpus and
+    /// returns the corpus paths to search.
+    async fn seed_and_index_fixture_corpus(
+        content_dir: &std::path::Path,
+        store: &LanceStore,
+    ) -> Vec<String> {
+        for (name, body) in [
+            (
+                "arrakis.md",
+                "# Arrakis\n\nThe spice melange flows from the deep desert.\n",
+            ),
+            ("dune.md", "# Dune\n\nSpice must flow across the sietch.\n"),
+            (
+                "harvester.md",
+                "# Harvester\n\nA harvester pulls spice from the open sand.\n",
+            ),
+            ("guild.md", "# Guild\n\nThe guild folds space with spice.\n"),
+            (
+                "fremen.md",
+                "# Fremen\n\nFremen trade spice water in the sietch caves.\n",
+            ),
+        ] {
+            std::fs::write(content_dir.join(name), body).expect("write fixture file");
+        }
+
+        let paths = vec![content_dir.to_string_lossy().into_owned()];
+        let corpus = crate::domain::common::CorpusConfig {
+            name: "fixtures".to_string(),
+            paths: paths.clone(),
+            ..Default::default()
+        };
+        let registry =
+            crate::domain::indexer::HandlerRegistry::new(text_splitter::Characters, 1500);
+        crate::domain::indexer::index_corpus(&corpus, store, None, &registry)
+            .await
+            .expect("index fixture corpus");
+        paths
+    }
+
+    /// Sleeps past the tiny timeouts used below, then assigns distinct
+    /// scores. The distinct scores guarantee `normalize_scores` has spread
+    /// (sigma > 0), so if this rerank is ever allowed to finish — i.e. the
+    /// configured timeout was ignored — z_scores WILL be Some and the
+    /// `is_none()` assertions fail loudly.
+    struct SleepingCrossencoder;
+    impl Crossencoder for SleepingCrossencoder {
+        fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            for (i, hit) in hits.iter_mut().enumerate() {
+                hit.score = i as f32;
+            }
+            Ok(())
+        }
+    }
+
+    /// Assigns distinct scores immediately (no sleep). Positive control:
+    /// proves the fixture + score assignment CAN produce Some z-scores when
+    /// the rerank finishes inside the timeout, so the timeout tests'
+    /// `is_none()` assertions pass for the right reason.
+    struct ScoringCrossencoder;
+    impl Crossencoder for ScoringCrossencoder {
+        fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+            for (i, hit) in hits.iter_mut().enumerate() {
+                hit.score = i as f32;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn ground_union_applies_z_scores_when_rerank_finishes_in_time() {
+        // Positive control for the two timeout tests below: with a generous
+        // timeout and a fast crossencoder, z_scores must appear. Guards the
+        // fixture against silently shrinking below MIN_N (which would make
+        // the is_none() assertions pass unconditionally).
+        let content_dir = tempfile::tempdir().expect("tempdir content");
+        let store_dir = tempfile::tempdir().expect("tempdir store");
+        let store = open_test_store(store_dir.path()).await;
+        let paths = seed_and_index_fixture_corpus(content_dir.path(), &store).await;
+
+        let opts = GroundOpts {
+            rerank_timeout: Duration::from_secs(5),
+            ..GroundOpts::default()
+        };
+        let resp = ground_union(
+            "spice",
+            &[("fixtures".to_string(), paths)],
+            &store,
+            None,
+            Some(Box::new(ScoringCrossencoder)),
+            opts,
+        )
+        .await
+        .expect("fast rerank inside a generous timeout must not error");
+
+        assert!(
+            resp.stats.hits >= 5,
+            "fixture corpus must yield >= MIN_N (5) hits so normalize_scores can emit \
+             Some — got {}; below that the timeout tests are tautological",
+            resp.stats.hits
+        );
+        assert!(
+            resp.docs.values().any(|d| d.z_score.is_some()),
+            "a completed rerank over >=5 spread-score hits must produce Some z_score; \
+             all-None means the assertion channel the timeout tests rely on is dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn ground_union_honors_opts_rerank_timeout() {
+        // Proves the knob is actually wired through GroundOpts into
+        // ground_union, not just present on the struct: a tiny
+        // opts.rerank_timeout must trigger the timeout fallback path on a
+        // POPULATED store, so the crossencoder branch actually runs. If
+        // ground_union ignored opts.rerank_timeout (e.g. a hardcoded 2s),
+        // the 200ms sleep would finish well inside 2s, `applied` would be
+        // true, and the spread scores assigned by SleepingCrossencoder
+        // would yield Some z_scores over >=5 hits, failing the assertion
+        // below (positive control:
+        // ground_union_applies_z_scores_when_rerank_finishes_in_time).
+        let content_dir = tempfile::tempdir().expect("tempdir content");
+        let store_dir = tempfile::tempdir().expect("tempdir store");
+        let store = open_test_store(store_dir.path()).await;
+        let paths = seed_and_index_fixture_corpus(content_dir.path(), &store).await;
+
+        let opts = GroundOpts {
+            rerank_timeout: Duration::from_millis(20),
+            ..GroundOpts::default()
+        };
+        let resp = ground_union(
+            "spice",
+            &[("fixtures".to_string(), paths)],
+            &store,
+            None,
+            Some(Box::new(SleepingCrossencoder)),
+            opts,
+        )
+        .await
+        .expect("tiny rerank_timeout must not error, only fall back to fusion order");
+
+        assert!(
+            resp.stats.hits >= 5,
+            "fixture corpus must yield >= MIN_N (5) hits so the z_score assertion is \
+             falsifiable, got {}",
+            resp.stats.hits
+        );
+        assert!(
+            resp.docs.values().all(|d| d.z_score.is_none()),
+            "a 20ms opts.rerank_timeout must time out the 200ms-sleeping crossencoder, \
+             leaving z_score unset (applied == false); a Some z_score means the \
+             configured timeout was ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn ground_honors_opts_rerank_timeout() {
+        // Mirrors ground_union_honors_opts_rerank_timeout for the single-
+        // corpus `ground()` entry point (#139): a regression that rewires
+        // only ground_union to read opts.rerank_timeout while ground() keeps
+        // (or reverts to) a hardcoded duration would pass every other test
+        // in this file but must fail here.
+        let content_dir = tempfile::tempdir().expect("tempdir content");
+        let store_dir = tempfile::tempdir().expect("tempdir store");
+        let store = open_test_store(store_dir.path()).await;
+        let paths = seed_and_index_fixture_corpus(content_dir.path(), &store).await;
+
+        let opts = GroundOpts {
+            rerank_timeout: Duration::from_millis(20),
+            ..GroundOpts::default()
+        };
+        let resp = ground(
+            "spice",
+            "fixtures",
+            &paths,
+            &store,
+            None,
+            Some(Box::new(SleepingCrossencoder)),
+            opts,
+        )
+        .await
+        .expect("tiny rerank_timeout must not error, only fall back to fusion order");
+
+        assert!(
+            resp.stats.hits >= 5,
+            "fixture corpus must yield >= MIN_N (5) hits so the z_score assertion is \
+             falsifiable, got {}",
+            resp.stats.hits
+        );
+        assert!(
+            resp.docs.values().all(|d| d.z_score.is_none()),
+            "a 20ms opts.rerank_timeout must time out the 200ms-sleeping crossencoder in ground(), \
+             leaving z_score unset (applied == false); a Some z_score means the \
+             configured timeout was ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn rerank_with_timeout_zero_duration_falls_back_without_panic() {
+        // Boundary (#139): rerank_timeout_ms = 0 must degrade gracefully to
+        // fusion order rather than panicking or erroring — a 0ms deadline is
+        // already expired the instant the task is spawned.
+        struct SleepingCrossencoder;
+        impl Crossencoder for SleepingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                hits.reverse();
+                Ok(())
+            }
+        }
+
+        let hits = vec![
+            hit_for_timeout_test("/a.md", 0.1),
+            hit_for_timeout_test("/b.md", 0.9),
+        ];
+        let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+
+        let (result, applied) = rerank_with_timeout(
+            Box::new(SleepingCrossencoder),
+            "q".to_string(),
+            hits,
+            Duration::from_millis(0),
+        )
+        .await
+        .expect("zero timeout must not error, only fall back to fusion order");
+
+        assert!(
+            !applied,
+            "a zero-duration timeout must report applied == false"
+        );
+        let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
+        assert_eq!(
+            observed, fusion_order,
+            "zero-duration timeout fallback must preserve the original fusion order"
         );
     }
 }
