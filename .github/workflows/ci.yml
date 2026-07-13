@@ -83,7 +83,7 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-hub-${{ runner.os }}-arctic-embed-s
       - name: Build
-        run: cargo build --locked --all-targets
+        run: cargo build --workspace --locked --all-targets
       - name: Warm tokenizer cache
         # Fetch the tokenizer once, serially, with backoff. Without this the
         # parallel test threads each call huggingface.co at startup and trip
@@ -92,7 +92,7 @@ jobs:
           set -euo pipefail
           printf '[embeddings]\nenabled = false\n' > "${RUNNER_TEMP}/hf-warm.toml"
           for attempt in 1 2 3 4 5; do
-            if cargo run --locked --quiet -- config download --config "${RUNNER_TEMP}/hf-warm.toml"; then
+            if cargo run -p hallouminate --locked --quiet -- config download --config "${RUNNER_TEMP}/hf-warm.toml"; then
               exit 0
             fi
             echo "tokenizer warm attempt ${attempt} failed; retrying after backoff"
@@ -106,7 +106,7 @@ jobs:
         # #[ignore]-gated and is not run here.
         env:
           HF_HUB_OFFLINE: "1"
-        run: cargo test --locked
+        run: cargo test --workspace --locked
 
   # Aggregation gate: the branch ruleset requires a single status check named
   # "build & test", but the matrix expands to "build & test (ubuntu-latest)" etc.
