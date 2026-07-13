@@ -14,8 +14,7 @@ use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
 use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
 use text_splitter::Characters;
 
-mod common;
-use common::{StubEmbedder, placeholder_prepared_file};
+use crate::common::{StubEmbedder, placeholder_prepared_file};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
