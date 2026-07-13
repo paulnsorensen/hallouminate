@@ -25,8 +25,7 @@ use hallouminate::app::daemon::{
 use hallouminate::domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
 
-mod common;
-use common::daemon::DaemonHarness;
+use crate::common::daemon::DaemonHarness;
 
 fn cfg_with_repository(ground_dir: &Path, repo_name: &str, repo_path: &Path) -> Config {
     let toml = format!(

@@ -10,8 +10,7 @@ use hallouminate::adapters::lance::{LanceStore, chunk_id_for};
 use hallouminate::domain::common::FileRef;
 use hallouminate::domain::search::hybrid_search;
 
-mod common;
-use common::{StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks};
+use crate::common::{StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 

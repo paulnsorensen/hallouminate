@@ -24,8 +24,7 @@ use hallouminate::domain::indexer::{
 use hallouminate::domain::search::hybrid_search;
 use text_splitter::Characters;
 
-mod common;
-use common::StubEmbedder;
+use crate::common::StubEmbedder;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 

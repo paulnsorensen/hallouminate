@@ -7,8 +7,7 @@ use hallouminate::app::daemon::{
     CorpusEntry, DaemonRequest, DaemonRequestPayload, DaemonResponse, ListCorporaResult, connect_at,
 };
 
-mod common;
-use common::daemon::DaemonHarness;
+use crate::common::daemon::DaemonHarness;
 
 fn write_config(config_path: &Path, corpus_root: &Path, ground_dir: &Path, cache_dir: &Path) {
     let toml = format!(

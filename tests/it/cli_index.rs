@@ -8,8 +8,7 @@ use hallouminate::app::daemon::{
     DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest, connect_at,
 };
 
-mod common;
-use common::daemon::DaemonHarness;
+use crate::common::daemon::DaemonHarness;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
