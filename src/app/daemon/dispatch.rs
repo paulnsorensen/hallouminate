@@ -40,10 +40,8 @@ use crate::domain::ground::{
     Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
 };
 use crate::domain::indexer::HandlerRegistry;
-#[cfg(test)]
-use crate::domain::indexer::Upsert;
 use crate::domain::indexer::{
-    DEFAULT_BATCH_SIZE, FileSnapshot, IndexPlan, apply, index_corpus, plan,
+    ChunkStore, DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan,
 };
 #[cfg(test)]
 use crate::domain::repository::{RepoCorpusKind, repo_corpus_name};
@@ -306,14 +304,12 @@ async fn handle_corpus_stats(
         Ok(f) => f,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    let indexed_map = match store.list_files(&corpus_cfg.name).await {
+    let indexed_files = match store.list_files(&corpus_cfg.name).await {
         Ok(m) => m,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    let indexed_paths: std::collections::HashSet<String> = indexed_map
-        .keys()
-        .map(|r| r.as_path().to_string_lossy().into_owned())
-        .collect();
+    let indexed_paths: std::collections::HashSet<String> =
+        indexed_files.into_iter().map(|s| s.file_ref).collect();
     let unindexed_files = disk_files
         .iter()
         .filter(|e| !indexed_paths.contains(&e.absolute_path))
@@ -369,16 +365,6 @@ async fn handle_ground(
         }
     };
 
-    // Embeddings-OFF: skip the embedder entirely and let the search run the
-    // lexical-only path. ON: borrow the shared embedder (lazy-loaded).
-    let mut embedder = if res.embeddings_enabled {
-        match res.embedder().await {
-            Ok(g) => Some(g),
-            Err(e) => return DaemonResponse::internal(e.to_string()),
-        }
-    } else {
-        None
-    };
     // crossencoder is best-effort: if it's configured but failed to
     // load (e.g. model file vanished), log and ground without it
     // rather than refusing the request. Unconfigured paths return
@@ -398,17 +384,13 @@ async fn handle_ground(
     // `ground_union` can hand it to `spawn_blocking` for the rerank timeout.
     let crossencoder_box: Option<Box<dyn crate::domain::search::Crossencoder>> =
         crossencoder.map(|g| Box::new(g) as Box<dyn crate::domain::search::Crossencoder>);
-    let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
-        .as_mut()
-        .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
 
     let response = if let Some(corpus) = &single_corpus {
         ground(
             &req.query,
             &corpus.name,
             &corpus.paths,
-            store,
-            embedder_dyn,
+            store.as_ref(),
             crossencoder_box,
             opts,
         )
@@ -418,21 +400,12 @@ async fn handle_ground(
             .iter()
             .map(|c| (c.name.clone(), c.paths.clone()))
             .collect();
-        ground_union(
-            &req.query,
-            &targets,
-            store,
-            embedder_dyn,
-            crossencoder_box,
-            opts,
-        )
-        .await
+        ground_union(&req.query, &targets, store.as_ref(), crossencoder_box, opts).await
     };
     let mut response = match response {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    drop(embedder);
 
     // #135: stale-index detection.
     mark_stale(&mut response).await;
@@ -529,22 +502,10 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             ));
             continue;
         }
-        let mut embedder = if res.embeddings_enabled {
-            match res.embedder().await {
-                Ok(g) => Some(g),
-                Err(e) => return DaemonResponse::internal(e.to_string()),
-            }
-        } else {
-            None
-        };
-        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
-            .as_mut()
-            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = match index_corpus(&corpus, store, embedder_dyn, &registry).await {
+        let stats = match index_corpus(&corpus, store.as_ref(), &registry).await {
             Ok(s) => s,
             Err(e) => return DaemonResponse::internal(e.to_string()),
         };
-        drop(embedder);
         drop(guard);
         report.corpora.push(CorpusReport {
             name: corpus.name.clone(),
@@ -861,18 +822,7 @@ async fn handle_add_markdown(
     } else {
         let store = &res.store;
         let registry = state.make_registry();
-        let mut embedder = if res.embeddings_enabled {
-            match res.embedder().await {
-                Ok(g) => Some(g),
-                Err(e) => return DaemonResponse::internal(e.to_string()),
-            }
-        } else {
-            None
-        };
-        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
-            .as_mut()
-            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file(store, embedder_dyn, &registry, &corpus, &dest).await {
+        match index_single_file(store, &registry, &corpus, &dest).await {
             Ok(s) => s,
             Err(e) => {
                 // The write above already durably completed; a model/store
@@ -1285,14 +1235,13 @@ async fn mark_stale(response: &mut crate::domain::ground::GroundResponse) {
 /// TOCTOU between validation and content read.
 pub(super) async fn index_single_file(
     store: &LanceStore,
-    embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     file: &Path,
 ) -> anyhow::Result<crate::domain::indexer::ApplyStats> {
     let mtime = tokio::fs::metadata(file).await?.modified()?;
     let bytes = tokio::fs::read(file).await?;
-    index_single_file_with_content(store, embedder, registry, corpus, file, &bytes, mtime).await
+    index_single_file_with_content(store, registry, corpus, file, &bytes, mtime).await
 }
 
 /// Reindex a single file from already-read content and mtime, so the caller
@@ -1302,7 +1251,6 @@ pub(super) async fn index_single_file(
 /// validation and the content read.
 pub(super) async fn index_single_file_with_content(
     store: &LanceStore,
-    embedder: Option<&mut dyn crate::domain::embeddings::EmbedBatch>,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     file: &Path,
@@ -1369,7 +1317,6 @@ pub(super) async fn index_single_file_with_content(
         tokio::runtime::Handle::current().block_on(apply(
             p,
             store,
-            embedder,
             registry,
             corpus,
             DEFAULT_BATCH_SIZE,
@@ -1439,23 +1386,20 @@ async fn catch_up_corpus(
     corpus: &CorpusConfig,
 ) -> anyhow::Result<Option<crate::domain::indexer::ApplyStats>> {
     let disk = scan(corpus)?;
-    let db = res.store.list_files(&corpus.name).await?;
+    let db: HashMap<FileRef, FileSnapshot> = res
+        .store
+        .list_files(&corpus.name)
+        .await?
+        .into_iter()
+        .map(|s| (FileRef::new(std::path::PathBuf::from(&s.file_ref)), s))
+        .collect();
     let p = plan(disk, db);
     if p.upserts.is_empty() && p.mtime_touches.is_empty() && p.deletes.is_empty() {
         return Ok(None);
     }
-    let mut embedder = if plan_needs_embedder(&p, res.embeddings_enabled) {
-        Some(res.embedder().await?)
-    } else {
-        None
-    };
-    let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
-        .as_mut()
-        .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
     let stats = apply(
         p,
-        &res.store,
-        embedder_dyn,
+        res.store.as_ref(),
         registry,
         corpus,
         DEFAULT_BATCH_SIZE,
@@ -1463,13 +1407,6 @@ async fn catch_up_corpus(
     )
     .await?;
     Ok(Some(stats))
-}
-
-/// Whether applying `plan` needs the embedder — embeddings on AND content to
-/// (re)embed. Deletes need none; an all-empty plan needs none, which is what
-/// keeps an unchanged corpus from loading the model.
-fn plan_needs_embedder(plan: &IndexPlan, embeddings_enabled: bool) -> bool {
-    embeddings_enabled && (!plan.upserts.is_empty() || !plan.mtime_touches.is_empty())
 }
 
 /// Best-effort `mkdir -p` on daemon-managed corpus roots so a fresh
@@ -1631,25 +1568,12 @@ async fn rebuild_wiki_indexes(
             }
         };
 
-        // Refresh LanceDB rows for the just-rewritten index.md. Embeddings
-        // are opt-in: when enabled, the embedder must load (a cold-cache or
-        // network failure fails the mutation, same shape as the primary
-        // add_markdown path); when disabled, reindex lexical-only.
-        let mut embedder = if res.embeddings_enabled {
-            match res.embedder().await {
-                Ok(g) => Some(g),
-                Err(e) => return Err(format!("embedder: {e}")),
-            }
-        } else {
-            None
-        };
-        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
-            .as_mut()
-            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        let stats = index_single_file(store, embedder_dyn, &registry, corpus, &dest)
+        // Refresh LanceDB rows for the just-rewritten index.md. The store owns
+        // embedding now (opt-in via its own `Option<Embedder>`): reindex is
+        // lexical-only when embeddings are disabled, embedded when enabled.
+        let stats = index_single_file(store, &registry, corpus, &dest)
             .await
             .map_err(|e| format!("reindex {}: {e}", dest.display()))?;
-        drop(embedder);
         fold_apply_stats(&mut totals, &stats);
     }
     Ok(totals)
@@ -2017,38 +1941,6 @@ mod tests {
         let cfg_dir = repo_root.join(".hallouminate");
         std::fs::create_dir_all(&cfg_dir).expect("mkdir .hallouminate");
         std::fs::write(cfg_dir.join("config.toml"), body).expect("write repo config");
-    }
-
-    #[test]
-    fn plan_needs_embedder_is_false_for_empty_plan() {
-        assert!(!plan_needs_embedder(&IndexPlan::default(), true));
-    }
-
-    #[test]
-    fn plan_needs_embedder_is_false_when_embeddings_disabled() {
-        let mut plan = IndexPlan::default();
-        plan.upserts.push(Upsert {
-            file: FileRef::from(std::path::PathBuf::from("/x.md")),
-            mtime: Mtime(1),
-        });
-        assert!(!plan_needs_embedder(&plan, false));
-    }
-
-    #[test]
-    fn plan_needs_embedder_is_true_for_upserts_when_enabled() {
-        let mut plan = IndexPlan::default();
-        plan.upserts.push(Upsert {
-            file: FileRef::from(std::path::PathBuf::from("/x.md")),
-            mtime: Mtime(1),
-        });
-        assert!(plan_needs_embedder(&plan, true));
-    }
-
-    #[test]
-    fn plan_needs_embedder_is_false_for_deletes_only() {
-        let mut plan = IndexPlan::default();
-        plan.deletes.push(FileSnapshot::default());
-        assert!(!plan_needs_embedder(&plan, true));
     }
 
     #[tokio::test]
@@ -2622,7 +2514,7 @@ mod tests {
     /// Open an embeddings-OFF store. The eviction policy is independent of
     /// embeddings, so `None` keeps the test free of the embedding model.
     async fn open_off_store(dir: &Path) -> LanceStore {
-        LanceStore::open_or_create(dir, "BAAI/bge-small-en-v1.5", false, false)
+        LanceStore::open_or_create(dir, "BAAI/bge-small-en-v1.5", false, false, None)
             .await
             .expect("open store")
     }
@@ -2649,7 +2541,7 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string();
-        let s1 = index_single_file(&store, None, &registry, &corpus, &file)
+        let s1 = index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("first index of a valid file must succeed");
         assert_eq!(s1.files_upserted, 1, "valid CSV indexes");
@@ -2662,7 +2554,7 @@ mod tests {
         // 2. Corrupt the file in place, then re-index. The extraction fails →
         //    counted as unreadable, NOT empty; the last-good rows must survive.
         std::fs::write(&file, b"\xff\xfe\x00 not,a valid\x00 spreadsheet").unwrap();
-        let s2 = index_single_file(&store, None, &registry, &corpus, &file)
+        let s2 = index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("a corrupt re-extraction must not hard-error");
         assert_eq!(
@@ -2717,7 +2609,7 @@ mod tests {
             .to_string();
 
         std::fs::write(&file, "# Note\n\nspice melange harvested on Arrakis\n").unwrap();
-        index_single_file(&store, None, &registry, &corpus, &file)
+        index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("first index must succeed");
         assert!(
@@ -2732,7 +2624,7 @@ mod tests {
 
         // Truncate to empty: zero chunks → genuine empty → eviction fires.
         std::fs::write(&file, "").unwrap();
-        let s = index_single_file(&store, None, &registry, &corpus, &file)
+        let s = index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("re-index of a now-empty file must not hard-error");
         assert_eq!(
@@ -2785,7 +2677,7 @@ mod tests {
             .to_string();
 
         std::fs::write(&file, "# Note\n\nspice melange harvested on Arrakis\n").unwrap();
-        index_single_file(&store, None, &registry, &corpus, &file)
+        index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("first index must succeed");
         assert!(
@@ -2809,7 +2701,7 @@ mod tests {
             .set_modified(indexed_mtime)
             .unwrap();
 
-        let s = index_single_file(&store, None, &registry, &corpus, &file)
+        let s = index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("re-index of a now-empty file with unchanged mtime must not hard-error");
         assert_eq!(

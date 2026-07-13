@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::adapters::lance::{LanceStore, SearchHit};
 use crate::domain::common::{HallouminateError, Result};
-use crate::domain::embeddings::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
-use crate::domain::search::{Crossencoder, fts_with_ripgrep, hybrid_with_ripgrep};
+use crate::domain::indexer::chunk::SearchHit;
+use crate::domain::indexer::store::ChunkStore;
+use crate::domain::search::{Crossencoder, search_with_ripgrep};
 
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats};
@@ -111,22 +111,12 @@ pub async fn ground(
     query: &str,
     corpus: &str,
     corpus_paths: &[String],
-    store: &LanceStore,
-    embedder: Option<&mut dyn EmbedBatch>,
+    store: &dyn ChunkStore,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-    let query_vec = embed_query(query, embedder)?;
-    let mut hits = search_corpus(
-        query,
-        corpus,
-        corpus_paths,
-        store,
-        query_vec.as_ref(),
-        opts.limit,
-    )
-    .await?;
+    let mut hits = search_corpus(query, corpus, corpus_paths, store, opts.limit).await?;
     if let Some(rerank) = crossencoder {
         // The crossencoder is the most expensive step; skip it on empty
         // hit lists so a no-match query doesn't pay the model latency.
@@ -163,45 +153,19 @@ pub async fn ground(
     })
 }
 
-/// Embed `query` once under `EmbedRole::Query`, or return `None` in OFF mode
-/// (no embedder). Shared by `ground` and `ground_union` so the query is
-/// embedded exactly once regardless of how many corpora are searched.
-fn embed_query(
-    query: &str,
-    embedder: Option<&mut dyn EmbedBatch>,
-) -> Result<Option<[f32; EMBEDDING_DIM]>> {
-    match embedder {
-        Some(embedder) => {
-            let embeddings = embedder.embed_batch(&[query.to_string()], EmbedRole::Query)?;
-            let query_vec = embeddings.into_iter().next().ok_or_else(|| {
-                HallouminateError::Embed("embed_batch returned no vector for query".into())
-            })?;
-            Ok(Some(query_vec))
-        }
-        None => Ok(None),
-    }
-}
-
 /// Search one corpus, returning its un-reranked hits.
 ///
-/// ON mode (`query_vec` present): fuse FTS + vector + rg.
-/// OFF mode (`None`): lexical-only FTS + rg. The crossencoder rerank is the
-/// caller's concern — `ground` reranks per corpus, `ground_union` hoists the
-/// single rerank past the cross-corpus merge (#106).
+/// The crossencoder rerank is the caller's concern — `ground` reranks per
+/// corpus, `ground_union` hoists the single rerank past the cross-corpus
+/// merge (#106).
 async fn search_corpus(
     query: &str,
     corpus: &str,
     corpus_paths: &[String],
-    store: &LanceStore,
-    query_vec: Option<&[f32; EMBEDDING_DIM]>,
+    store: &dyn ChunkStore,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    match query_vec {
-        Some(query_vec) => {
-            hybrid_with_ripgrep(store, corpus, corpus_paths, query, query_vec, limit).await
-        }
-        None => fts_with_ripgrep(store, corpus, corpus_paths, query, limit).await,
-    }
+    search_with_ripgrep(store, corpus, corpus_paths, query, limit).await
 }
 
 /// Fan one query across every effective corpus and merge into a single,
@@ -221,22 +185,17 @@ async fn search_corpus(
 pub async fn ground_union(
     query: &str,
     corpora: &[(String, Vec<String>)],
-    store: &LanceStore,
-    embedder: Option<&mut dyn EmbedBatch>,
+    store: &dyn ChunkStore,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
 
     // Search each corpus independently, tagging every hit with its source so
-    // the per-corpus partition survives the shared rerank's reshuffle. The
-    // query is embedded ONCE up front and shared across every corpus — each
-    // embed is a forward pass serialized on the embedder mutex, so hoisting
-    // it out of the loop turns N passes into 1.
-    let query_vec = embed_query(query, embedder)?;
+    // the per-corpus partition survives the shared rerank's reshuffle.
     let mut tagged: Vec<(SearchHit, String)> = Vec::new();
     for (name, paths) in corpora {
-        let hits = search_corpus(query, name, paths, store, query_vec.as_ref(), opts.limit).await?;
+        let hits = search_corpus(query, name, paths, store, opts.limit).await?;
         for hit in hits {
             tagged.push((hit, name.clone()));
         }
@@ -349,98 +308,66 @@ pub async fn ground_union(
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use super::*;
-    use crate::domain::embeddings::EMBEDDING_DIM;
+    use crate::domain::indexer::chunk::PreparedFile;
+    use crate::domain::indexer::plan::FileSnapshot;
+    use crate::domain::indexer::store::BatchWriteStats;
 
-    /// Fake embedder whose `embed_batch` always returns an empty Vec, exercising
-    /// the defensive `ok_or_else` branch in `ground` that protects against an
-    /// embedder impl violating the "one input → one output" invariant.
-    struct EmptyVecEmbedder;
+    /// In-memory `ChunkStore` test double for orchestration/rerank tests:
+    /// `hybrid_search` returns a canned, pre-seeded hit list; writes are
+    /// no-ops. Keeps these tests off the real Lance/embedder adapter stack
+    /// (US-002: embedding is adapter-owned, invisible to domain code).
+    #[derive(Default)]
+    struct FakeChunkStore {
+        hits: Vec<SearchHit>,
+    }
 
-    impl EmbedBatch for EmptyVecEmbedder {
-        fn embed_batch(
-            &mut self,
-            _texts: &[String],
-            _role: EmbedRole,
-        ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+    #[async_trait]
+    impl ChunkStore for FakeChunkStore {
+        async fn list_files(&self, _corpus: &str) -> Result<Vec<FileSnapshot>> {
             Ok(Vec::new())
         }
-    }
 
-    /// Records the role each `embed_batch` call received so tests can assert
-    /// the query side of the asymmetric-prefix wiring is `EmbedRole::Query`.
-    #[derive(Default)]
-    struct RoleRecordingEmbedder {
-        roles: Vec<EmbedRole>,
-    }
+        async fn hybrid_search(
+            &self,
+            _corpus: &str,
+            _query: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(self.hits.iter().take(limit).cloned().collect())
+        }
 
-    impl EmbedBatch for RoleRecordingEmbedder {
-        fn embed_batch(
-            &mut self,
-            texts: &[String],
-            role: EmbedRole,
-        ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
-            self.roles.push(role);
-            Ok(texts.iter().map(|_| [0.1_f32; EMBEDDING_DIM]).collect())
+        async fn touch_mtime(&self, _corpus: &str, _file_ref: &str, _mtime_ms: i64) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_file(&self, _corpus: &str, _file_ref: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
+            Ok(BatchWriteStats::default())
         }
     }
 
-    async fn open_test_store(dir: &std::path::Path) -> LanceStore {
-        crate::adapters::lance::LanceStore::open_or_create(
-            dir,
-            "BAAI/bge-small-en-v1.5",
-            false,
-            true,
-        )
-        .await
-        .expect("open store")
-    }
-
+    /// OFF mode: with no crossencoder configured, `ground` must take the
+    /// lexical-only path and return a well-formed (empty, for an empty
+    /// store) response. Decision-4 note: `crossencoder` is `None` here, so
+    /// the `if let Some(rerank)` stamp loop in `ground` never fires — this
+    /// is the orchestrator-level RRF/OFF path. Docs are empty on an empty
+    /// store, so the z_score assertion is vacuous; the structural
+    /// enforcement (stamp lexically inside the block) is verified by
+    /// `rrf_mode_docs_have_no_z_score` in bucket.rs.
     #[tokio::test]
-    async fn ground_errors_when_embedder_returns_no_vector() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = open_test_store(dir.path()).await;
-        let mut embedder = EmptyVecEmbedder;
-        let err = ground(
-            "spice",
-            "fixtures",
-            &[],
-            &store,
-            Some(&mut embedder),
-            None,
-            GroundOpts::default(),
-        )
-        .await
-        .expect_err("empty embed vec must error");
-        match err {
-            HallouminateError::Embed(msg) => {
-                assert!(
-                    msg.contains("no vector"),
-                    "embed error must mention missing vector: {msg}"
-                );
-            }
-            other => panic!("expected Embed error, got: {other:?}"),
-        }
-    }
-
-    /// OFF mode: with no embedder, `ground` must take the lexical-only path
-    /// and return a well-formed (empty, for an empty store) response instead
-    /// of erroring on a missing query vector. Decision-4 note: `crossencoder`
-    /// is also `None` here, so the `if let Some(rerank)` stamp loop in `ground`
-    /// never fires — this is the orchestrator-level RRF/OFF path. Docs are
-    /// empty on an empty store, so the z_score assertion is vacuous; the
-    /// structural enforcement (stamp lexically inside the block) is verified
-    /// by `rrf_mode_docs_have_no_z_score` in bucket.rs.
-    #[tokio::test]
-    async fn ground_off_mode_returns_lexical_response_without_an_embedder() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = open_test_store(dir.path()).await;
+    async fn ground_off_mode_returns_lexical_response_without_a_crossencoder() {
+        let store = FakeChunkStore::default();
         let resp = ground(
             "spice",
             "fixtures",
             &[],
             &store,
-            None,
             None,
             GroundOpts::default(),
         )
@@ -449,32 +376,6 @@ mod tests {
         assert_eq!(resp.query, "spice");
         assert_eq!(resp.stats.hits, 0, "empty store yields no hits");
         assert!(resp.docs.is_empty());
-    }
-
-    /// ON mode: `ground` must embed the query with `EmbedRole::Query` so the
-    /// per-model instruction prefix matches the query side. The embed call
-    /// runs before search, so an empty store still exercises it.
-    #[tokio::test]
-    async fn ground_embeds_query_with_query_role() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let store = open_test_store(dir.path()).await;
-        let mut embedder = RoleRecordingEmbedder::default();
-        ground(
-            "spice",
-            "fixtures",
-            &[],
-            &store,
-            Some(&mut embedder),
-            None,
-            GroundOpts::default(),
-        )
-        .await
-        .expect("ON-mode ground");
-        assert_eq!(
-            embedder.roles,
-            vec![EmbedRole::Query],
-            "ground must embed the query exactly once, with the Query role"
-        );
     }
 
     // --- #137: relative_path_for ---
@@ -622,49 +523,15 @@ mod tests {
 
     // --- #139: GroundOpts.rerank_timeout wiring ---
 
-    /// Seed `dir` with five markdown files whose bodies all contain "spice"
-    /// so a lexical (embedder=None) FTS query for "spice" returns >=5 real
-    /// hits — enough for `normalize_scores` (MIN_N = 5) to emit Some
-    /// z-scores when the crossencoder runs. Fewer hits would make the
-    /// timeout tests' `z_score.is_none()` assertions tautological: below
-    /// MIN_N, normalize_scores returns all-None unconditionally.
-    /// Indexes the files into `store` under the `fixtures` corpus and
-    /// returns the corpus paths to search.
-    async fn seed_and_index_fixture_corpus(
-        content_dir: &std::path::Path,
-        store: &LanceStore,
-    ) -> Vec<String> {
-        for (name, body) in [
-            (
-                "arrakis.md",
-                "# Arrakis\n\nThe spice melange flows from the deep desert.\n",
-            ),
-            ("dune.md", "# Dune\n\nSpice must flow across the sietch.\n"),
-            (
-                "harvester.md",
-                "# Harvester\n\nA harvester pulls spice from the open sand.\n",
-            ),
-            ("guild.md", "# Guild\n\nThe guild folds space with spice.\n"),
-            (
-                "fremen.md",
-                "# Fremen\n\nFremen trade spice water in the sietch caves.\n",
-            ),
-        ] {
-            std::fs::write(content_dir.join(name), body).expect("write fixture file");
-        }
-
-        let paths = vec![content_dir.to_string_lossy().into_owned()];
-        let corpus = crate::domain::common::CorpusConfig {
-            name: "fixtures".to_string(),
-            paths: paths.clone(),
-            ..Default::default()
-        };
-        let registry =
-            crate::domain::indexer::HandlerRegistry::new(text_splitter::Characters, 1500);
-        crate::domain::indexer::index_corpus(&corpus, store, None, &registry)
-            .await
-            .expect("index fixture corpus");
-        paths
+    /// Five hits with distinct file_refs so `normalize_scores` (MIN_N = 5)
+    /// can emit Some z-scores once the crossencoder assigns spread scores.
+    /// Fewer hits would make the timeout tests' `z_score.is_none()`
+    /// assertions tautological: below MIN_N, normalize_scores returns
+    /// all-None unconditionally.
+    fn fixture_hits() -> Vec<SearchHit> {
+        (0..5)
+            .map(|i| hit_for_timeout_test(&format!("/spice{i}.md"), i as f32))
+            .collect()
     }
 
     /// Sleeps past the tiny timeouts used below, then assigns distinct
@@ -703,10 +570,9 @@ mod tests {
         // timeout and a fast crossencoder, z_scores must appear. Guards the
         // fixture against silently shrinking below MIN_N (which would make
         // the is_none() assertions pass unconditionally).
-        let content_dir = tempfile::tempdir().expect("tempdir content");
-        let store_dir = tempfile::tempdir().expect("tempdir store");
-        let store = open_test_store(store_dir.path()).await;
-        let paths = seed_and_index_fixture_corpus(content_dir.path(), &store).await;
+        let store = FakeChunkStore {
+            hits: fixture_hits(),
+        };
 
         let opts = GroundOpts {
             rerank_timeout: Duration::from_secs(5),
@@ -714,9 +580,8 @@ mod tests {
         };
         let resp = ground_union(
             "spice",
-            &[("fixtures".to_string(), paths)],
+            &[("fixtures".to_string(), vec![])],
             &store,
-            None,
             Some(Box::new(ScoringCrossencoder)),
             opts,
         )
@@ -748,10 +613,9 @@ mod tests {
         // would yield Some z_scores over >=5 hits, failing the assertion
         // below (positive control:
         // ground_union_applies_z_scores_when_rerank_finishes_in_time).
-        let content_dir = tempfile::tempdir().expect("tempdir content");
-        let store_dir = tempfile::tempdir().expect("tempdir store");
-        let store = open_test_store(store_dir.path()).await;
-        let paths = seed_and_index_fixture_corpus(content_dir.path(), &store).await;
+        let store = FakeChunkStore {
+            hits: fixture_hits(),
+        };
 
         let opts = GroundOpts {
             rerank_timeout: Duration::from_millis(20),
@@ -759,9 +623,8 @@ mod tests {
         };
         let resp = ground_union(
             "spice",
-            &[("fixtures".to_string(), paths)],
+            &[("fixtures".to_string(), vec![])],
             &store,
-            None,
             Some(Box::new(SleepingCrossencoder)),
             opts,
         )
@@ -789,10 +652,9 @@ mod tests {
         // only ground_union to read opts.rerank_timeout while ground() keeps
         // (or reverts to) a hardcoded duration would pass every other test
         // in this file but must fail here.
-        let content_dir = tempfile::tempdir().expect("tempdir content");
-        let store_dir = tempfile::tempdir().expect("tempdir store");
-        let store = open_test_store(store_dir.path()).await;
-        let paths = seed_and_index_fixture_corpus(content_dir.path(), &store).await;
+        let store = FakeChunkStore {
+            hits: fixture_hits(),
+        };
 
         let opts = GroundOpts {
             rerank_timeout: Duration::from_millis(20),
@@ -801,9 +663,8 @@ mod tests {
         let resp = ground(
             "spice",
             "fixtures",
-            &paths,
+            &[],
             &store,
-            None,
             Some(Box::new(SleepingCrossencoder)),
             opts,
         )
@@ -823,7 +684,6 @@ mod tests {
              configured timeout was ignored"
         );
     }
-
     #[tokio::test]
     async fn rerank_with_timeout_zero_duration_falls_back_without_panic() {
         // Boundary (#139): rerank_timeout_ms = 0 must degrade gracefully to

@@ -6,12 +6,11 @@
 //! Covers spec §8.3 from `.cheese/specs/lancedb-rewrite.md`.
 
 use std::fs;
-use std::path::PathBuf;
 
-use hallouminate::adapters::lance::{EMBEDDING_DIM, LanceStore};
-use hallouminate::domain::common::{CorpusConfig, FileRef, Result};
-use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
-use hallouminate::domain::indexer::{HandlerRegistry, index_corpus};
+use hallouminate::adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
+use hallouminate::adapters::lance::LanceStore;
+use hallouminate::domain::common::{CorpusConfig, Result};
+use hallouminate::domain::indexer::{ChunkStore, HandlerRegistry, index_corpus};
 use text_splitter::Characters;
 
 use crate::common::{StubEmbedder, placeholder_prepared_file};
@@ -39,7 +38,7 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
 
     // Phase 1: successfully apply file A
     {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
             .await
             .expect("open initial");
         let pf_a = placeholder_prepared_file("/tmp/a.md", 3);
@@ -61,12 +60,17 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     let store_path = store_dir.path().to_path_buf();
     let corpus_clone = corpus.clone();
     let crashed = tokio::task::spawn(async move {
-        let store = LanceStore::open_or_create(&store_path, MODEL, false, true)
-            .await
-            .expect("reopen for crash");
+        let store = LanceStore::open_or_create(
+            &store_path,
+            MODEL,
+            false,
+            true,
+            Some(Box::new(PanickingEmbedder)),
+        )
+        .await
+        .expect("reopen for crash");
         let registry = HandlerRegistry::new(Characters, 1500);
-        let mut emb = PanickingEmbedder;
-        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &registry).await;
+        let _ = index_corpus(&corpus_clone, &store, &registry).await;
     })
     .await;
     assert!(
@@ -75,12 +79,12 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     );
 
     // Phase 3: reopen the store; file A still present, no orphan partial writes
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
         .await
         .expect("reopen after crash");
     let snaps = store.list_files("docs").await.expect("list_files");
     assert!(
-        snaps.contains_key(&FileRef::new(PathBuf::from("/tmp/a.md"))),
+        snaps.iter().any(|s| s.file_ref == "/tmp/a.md"),
         "file A must survive the crash"
     );
     assert_eq!(
@@ -97,7 +101,7 @@ async fn re_run_after_crash_converges_to_correct_state() {
 
     // Pre-crash: index file A
     {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
             .await
             .expect("open");
         let pf_a = placeholder_prepared_file("/tmp/a.md", 2);
@@ -116,23 +120,33 @@ async fn re_run_after_crash_converges_to_correct_state() {
     let store_path = store_dir.path().to_path_buf();
     let corpus_clone = corpus.clone();
     let crashed = tokio::task::spawn(async move {
-        let store = LanceStore::open_or_create(&store_path, MODEL, false, true)
-            .await
-            .expect("reopen");
+        let store = LanceStore::open_or_create(
+            &store_path,
+            MODEL,
+            false,
+            true,
+            Some(Box::new(PanickingEmbedder)),
+        )
+        .await
+        .expect("reopen");
         let registry = HandlerRegistry::new(Characters, 1500);
-        let mut emb = PanickingEmbedder;
-        let _ = index_corpus(&corpus_clone, &store, Some(&mut emb), &registry).await;
+        let _ = index_corpus(&corpus_clone, &store, &registry).await;
     })
     .await;
     assert!(crashed.is_err());
 
     // Recovery: re-run with a healthy embedder; convergence to final state
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("recover");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("recover");
     let registry = HandlerRegistry::new(Characters, 1500);
-    let mut emb = StubEmbedder;
-    let stats = index_corpus(&corpus, &store, Some(&mut emb), &registry)
+    let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("recovered index_corpus");
 
@@ -145,8 +159,8 @@ async fn re_run_after_crash_converges_to_correct_state() {
     assert!(stats.files_deleted >= 1, "A must be deleted (not on disk)");
 
     let snaps = store.list_files("docs").await.expect("list_files");
-    assert!(snaps.values().any(|s| s.file_ref.ends_with("b.md")));
-    assert!(!snaps.values().any(|s| s.file_ref == "/tmp/a.md"));
+    assert!(snaps.iter().any(|s| s.file_ref.ends_with("b.md")));
+    assert!(!snaps.iter().any(|s| s.file_ref == "/tmp/a.md"));
 }
 
 #[tokio::test]
@@ -156,7 +170,7 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
 
     let cycles: &[&str] = &["/tmp/x.md", "/tmp/y.md", "/tmp/z.md"];
     for (i, file_ref) in cycles.iter().enumerate() {
-        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+        let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
             .await
             .expect("reopen cycle");
         let n_chunks = i + 1;
@@ -165,7 +179,7 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
         // explicit drop via scope end
     }
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
         .await
         .expect("final reopen");
     let total = store.count_rows().await.unwrap();

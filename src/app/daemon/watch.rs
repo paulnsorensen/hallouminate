@@ -349,31 +349,7 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
             }
         };
         let registry = state.make_registry();
-        let mut embedder = if state.embeddings_enabled() {
-            match state.embedder().await {
-                Ok(g) => Some(g),
-                Err(e) => {
-                    tracing::warn!(target: "hallouminate::daemon", error = %e, "watcher: embedder unavailable; skipping reindex");
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let embedder_dyn: Option<&mut dyn crate::domain::embeddings::EmbedBatch> = embedder
-            .as_mut()
-            .map(|g| &mut **g as &mut dyn crate::domain::embeddings::EmbedBatch);
-        match index_single_file_with_content(
-            &store,
-            embedder_dyn,
-            &registry,
-            corpus,
-            path,
-            &bytes,
-            mtime,
-        )
-        .await
-        {
+        match index_single_file_with_content(&store, &registry, corpus, path, &bytes, mtime).await {
             Ok(stats) => tracing::debug!(
                 target: "hallouminate::daemon",
                 corpus = %corpus.name,

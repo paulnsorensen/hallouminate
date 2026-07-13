@@ -1,7 +1,7 @@
-use crate::adapters::lance::{EMBEDDING_DIM, LanceStore, PreparedFile};
-use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Result};
+use crate::domain::common::{CorpusConfig, FileRef, Result};
 use crate::domain::corpus::blake3_file;
-use crate::domain::embeddings::{EmbedBatch, EmbedRole};
+use crate::domain::indexer::chunk::PreparedFile;
+use crate::domain::indexer::store::ChunkStore;
 
 use super::format::HandlerRegistry;
 use super::plan::{IndexPlan, MtimeCandidate};
@@ -52,7 +52,7 @@ enum EmptyFilePolicy {
 /// batch width. Groups what would otherwise be four extra parameters on
 /// `run_in_batches` (mirroring `PrepareCtx` in format.rs).
 struct RunCtx<'a> {
-    store: &'a LanceStore,
+    store: &'a dyn ChunkStore,
     registry: &'a HandlerRegistry,
     indexed_at_ms: i64,
     batch_size: usize,
@@ -64,8 +64,7 @@ pub const DEFAULT_BATCH_SIZE: usize = 16;
 
 pub async fn apply(
     plan: IndexPlan,
-    store: &LanceStore,
-    mut embedder: Option<&mut dyn EmbedBatch>,
+    store: &dyn ChunkStore,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     batch_size: usize,
@@ -95,7 +94,6 @@ pub async fn apply(
     run_in_batches(
         upsert_reqs,
         &run,
-        embedder.as_deref_mut(),
         &mut stats,
         EmptyFilePolicy::Retain,
         precomputed,
@@ -132,7 +130,6 @@ pub async fn apply(
     run_in_batches(
         fallthrough_reqs,
         &run,
-        embedder,
         &mut stats,
         EmptyFilePolicy::Evict,
         precomputed,
@@ -156,11 +153,6 @@ pub async fn apply(
 async fn run_in_batches(
     reqs: Vec<WriteRequest<'_>>,
     run: &RunCtx<'_>,
-    // `+ '_` decouples the trait-object lifetime from the reference lifetime
-    // so `apply` can hand out two successive short reborrows via
-    // `as_deref_mut()` without the first borrow being pinned for the whole
-    // function body.
-    mut embedder: Option<&mut (dyn EmbedBatch + '_)>,
     stats: &mut ApplyStats,
     empty_file_policy: EmptyFilePolicy,
     precomputed: Option<(&FileRef, &[u8])>,
@@ -227,54 +219,13 @@ async fn run_in_batches(
         if prepared.is_empty() {
             continue;
         }
-        // Embed all chunks across all prepared files in this batch in a single call.
-        let mut all_texts: Vec<String> = Vec::new();
-        let mut splits: Vec<usize> = Vec::with_capacity(prepared.len());
-        for pf in &prepared {
-            splits.push(pf.chunks.len());
-            for c in &pf.chunks {
-                all_texts.push(c.text.clone());
-            }
-        }
-        match embedder.as_deref_mut() {
-            // ON mode: embed the passages and de-flatten back per file.
-            Some(embedder) => {
-                let mut vectors = if all_texts.is_empty() {
-                    Vec::new()
-                } else {
-                    embedder.embed_batch(&all_texts, EmbedRole::Passage)?
-                };
-                if vectors.len() != all_texts.len() {
-                    return Err(HallouminateError::Indexer(format!(
-                        "embedder returned {} vectors for {} chunks",
-                        vectors.len(),
-                        all_texts.len()
-                    )));
-                }
-                let mut iter = vectors.drain(..);
-                for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
-                    let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        let v = iter.next().ok_or_else(|| {
-                            HallouminateError::Indexer("embedding count drained early".into())
-                        })?;
-                        buf.push(v);
-                    }
-                    stats.chunks_inserted += count;
-                    stats.embeddings_inserted += count;
-                    pf.embeddings = Some(buf);
-                }
-            }
-            // OFF mode: write null embeddings, count chunks but no embeddings.
-            None => {
-                for (pf, count) in prepared.iter_mut().zip(splits.iter().copied()) {
-                    stats.chunks_inserted += count;
-                    pf.embeddings = None;
-                }
-            }
-        }
         let n = prepared.len();
-        run.store.apply_batch(prepared).await?;
+        // Embedding happens inside the store (US-002: embeddings are
+        // adapter-owned), so this just hands the batch off and folds the
+        // returned counts into the run's stats.
+        let write_stats = run.store.apply_batch(prepared).await?;
+        stats.chunks_inserted += write_stats.chunks_written;
+        stats.embeddings_inserted += write_stats.embeddings_written;
         stats.files_upserted += n;
     }
     Ok(())

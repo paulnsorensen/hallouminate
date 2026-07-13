@@ -30,14 +30,16 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::adapters::lance::{LanceStore, SearchHit};
+use crate::adapters::crossencoder::FastembedCrossencoder;
+use crate::adapters::embedder::{EmbedBatch, Embedder};
+use crate::adapters::lance::LanceStore;
 use crate::app::config::Config;
 use crate::domain::common::{HallouminateError, expand_tilde};
 use crate::domain::corpus::{load_tokenizer, missing_roots};
-use crate::domain::embeddings::{EmbedBatch, Embedder};
 use crate::domain::indexer::HandlerRegistry;
+use crate::domain::indexer::chunk::SearchHit;
 use crate::domain::indexer::index::index_corpus;
-use crate::domain::search::{Crossencoder, FastembedCrossencoder, canonical_crossencoder_model};
+use crate::domain::search::{Crossencoder, canonical_crossencoder_model};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
@@ -309,6 +311,7 @@ impl DaemonState {
             &cfg.embeddings.model,
             cfg.embeddings.quantized,
             cfg.embeddings.enabled,
+            embedder.take().map(|e| Box::new(e) as Box<dyn EmbedBatch>),
         )
         .await
         {
@@ -327,11 +330,35 @@ impl DaemonState {
                 // fresh dir so the next boot re-enters the "no ground dir" path
                 // and retries the rebuild, rather than opening an empty-but-valid store.
                 let rebuild_result: anyhow::Result<LanceStore> = async {
+                    // `embedder` was moved into the first `open_or_create` call
+                    // above (now None regardless of outcome) -- `Embedder` isn't
+                    // `Clone`, so build a fresh one for the rebuilt store.
+                    let rebuild_embedder: Option<Embedder> = if cfg.embeddings.enabled {
+                        match Embedder::try_new(
+                            &cfg.embeddings.model,
+                            cfg.embeddings.quantized,
+                            &cache_dir,
+                        ) {
+                            Ok(e) => Some(e),
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "hallouminate::daemon",
+                                    model = %cfg.embeddings.model,
+                                    error = %e,
+                                    "embedder unavailable for rebuild; will retry on first embedding request",
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let fresh = LanceStore::open_or_create(
                         &ground_dir,
                         &cfg.embeddings.model,
                         cfg.embeddings.quantized,
                         cfg.embeddings.enabled,
+                        rebuild_embedder.map(|e| Box::new(e) as Box<dyn EmbedBatch>),
                     )
                     .await
                     .map_err(|e| {
@@ -354,9 +381,7 @@ impl DaemonState {
                             );
                             continue;
                         }
-                        let emb: Option<&mut dyn EmbedBatch> =
-                            embedder.as_mut().map(|e| e as &mut dyn EmbedBatch);
-                        let stats = index_corpus(&corpus, &fresh, emb, &registry)
+                        let stats = index_corpus(&corpus, &fresh, &registry)
                             .await
                             .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
                         tracing::info!(
@@ -667,10 +692,26 @@ impl DaemonState {
                 .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
         }
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        // Embedder construction is a cold ONNX model load (seconds). Leave it
-        // `None` here; the lazy per-entry `RequestResources::embedder()` loads
-        // it on first use under its OWN lock, so a first-touch model load
-        // never blocks the build lock held for this key.
+        // The store now owns embedding (ChunkStore reads/writes take text and
+        // embed internally), so it must hold an embedder when embeddings are
+        // enabled. Load eagerly, tolerating failure exactly as `DaemonState::open`
+        // does, so a model-independent op can still be served if the load fails.
+        let embedder: Option<Embedder> = if cfg.embeddings.enabled {
+            match Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        model = %cfg.embeddings.model,
+                        error = %e,
+                        "embedder unavailable for resource set; will retry on first embedding request",
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
         let store = LanceStore::open_or_create(
@@ -678,6 +719,7 @@ impl DaemonState {
             &cfg.embeddings.model,
             cfg.embeddings.quantized,
             cfg.embeddings.enabled,
+            embedder.map(|e| Box::new(e) as Box<dyn EmbedBatch>),
         )
         .await
         .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;

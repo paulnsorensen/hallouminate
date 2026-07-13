@@ -73,6 +73,7 @@ async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
         MODEL,
         false,
         true,
+        Some(Box::new(StubEmbedder)),
     )
     .await
     .expect("open store");
@@ -80,8 +81,7 @@ async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
     let mut corpora: Vec<CorpusConfig> = Vec::new();
     for repo in &repos {
         let corpus = repository_wiki_corpus(repo).expect("derive wiki corpus");
-        let mut embedder = StubEmbedder;
-        index_corpus(&corpus, &store, Some(&mut embedder), &registry)
+        index_corpus(&corpus, &store, &registry)
             .await
             .unwrap_or_else(|e| panic!("index {}: {e}", corpus.name));
         corpora.push(corpus);
@@ -92,12 +92,10 @@ async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
         .iter()
         .map(|c| (c.name.clone(), c.paths.clone()))
         .collect();
-    let mut embedder = StubEmbedder;
     let resp = ground_union(
         "distinctive token wiki",
         &targets,
         &store,
-        Some(&mut embedder),
         None,
         GroundOpts::default(),
     )
@@ -189,8 +187,9 @@ fn discovery_respects_depth_cap_and_gitignore_above_all_repos() {
 // rerank only reshuffles (no inserts/deletes); a reversing stub exercises that
 // reshuffle hard.
 
-use hallouminate::adapters::lance::{LanceStore, SearchHit};
+use hallouminate::adapters::lance::LanceStore;
 use hallouminate::domain::ground::{GroundResponse, ground};
+use hallouminate::domain::indexer::chunk::SearchHit;
 use hallouminate::domain::search::Crossencoder;
 
 /// A crossencoder that reverses the hit list in place. It changes the order of
@@ -224,8 +223,7 @@ async fn index_wikis(
     let mut targets = Vec::new();
     for repo in &repos {
         let corpus = repository_wiki_corpus(repo).expect("derive wiki corpus");
-        let mut embedder = StubEmbedder;
-        index_corpus(&corpus, store, Some(&mut embedder), &registry)
+        index_corpus(&corpus, store, &registry)
             .await
             .unwrap_or_else(|e| panic!("index {}: {e}", corpus.name));
         targets.push((corpus.name.clone(), corpus.paths.clone()));
@@ -250,17 +248,21 @@ async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuf
     let beta = seed_repo_wiki(parent.path(), "beta", "qwobblefrotz");
     let gamma = seed_repo_wiki(parent.path(), "gamma", "vummelthwap");
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let targets = index_wikis(&store, &[alpha, beta, gamma]).await;
 
-    let mut embedder = StubEmbedder;
     let resp = ground_union(
         "distinctive token wiki",
         &targets,
         &store,
-        Some(&mut embedder),
         Some(Box::new(ReversingCrossencoder)),
         GroundOpts::default(),
     )
@@ -316,18 +318,22 @@ async fn union_ground_with_single_corpus_attributes_all_hits_to_it() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let solo = seed_repo_wiki(parent.path(), "solo", "zphyxnort");
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let targets = index_wikis(&store, &[solo]).await;
     assert_eq!(targets.len(), 1, "exactly one corpus in the union set");
 
-    let mut embedder = StubEmbedder;
     let resp = ground_union(
         "distinctive token wiki",
         &targets,
         &store,
-        Some(&mut embedder),
         None,
         GroundOpts::default(),
     )
@@ -374,9 +380,15 @@ async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
         .join("wiki");
     fs::create_dir_all(&empty_wiki).expect("mkdir empty wiki");
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     // Index only the full wiki. The empty corpus is a valid target with no
     // indexed rows — exactly what a discovered-but-never-indexed sub-repo wiki
     // looks like in the live union: the corpus filter matches zero LanceDB rows.
@@ -387,12 +399,10 @@ async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
     ));
     assert_eq!(targets.len(), 2, "both corpora present in the union set");
 
-    let mut embedder = StubEmbedder;
     let resp = ground_union(
         "distinctive token wiki",
         &targets,
         &store,
-        Some(&mut embedder),
         None,
         GroundOpts::default(),
     )
@@ -422,18 +432,22 @@ async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
 #[tokio::test]
 async fn union_ground_over_all_empty_corpora_returns_empty_response_without_panic() {
     let store_dir = tempfile::tempdir().expect("tempdir store");
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
 
     // No corpora at all is the degenerate floor; a crossencoder is supplied so
     // the empty-hit skip is exercised rather than handed an empty slice.
-    let mut embedder = StubEmbedder;
     let resp = ground_union(
         "distinctive token wiki",
         &[],
         &store,
-        Some(&mut embedder),
         Some(Box::new(ReversingCrossencoder)),
         GroundOpts::default(),
     )
@@ -457,19 +471,23 @@ async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpu
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let only = seed_repo_wiki(parent.path(), "only", "zphyxnort");
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let targets = index_wikis(&store, &[only]).await;
     let (corpus_name, corpus_paths) = &targets[0];
 
-    let mut embedder = StubEmbedder;
     let resp: GroundResponse = ground(
         "distinctive token wiki",
         corpus_name,
         corpus_paths,
         &store,
-        Some(&mut embedder),
         None,
         GroundOpts::default(),
     )
@@ -511,9 +529,15 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
     )
     .expect("write shared wiki");
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let registry =
         hallouminate::domain::indexer::HandlerRegistry::new(text_splitter::Characters, 1500);
 
@@ -532,12 +556,10 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
         exclude: Vec::new(),
         global: false,
     };
-    let mut embedder = StubEmbedder;
-    index_corpus(&corpus_a, &store, Some(&mut embedder), &registry)
+    index_corpus(&corpus_a, &store, &registry)
         .await
         .expect("index alpha");
-    let mut embedder = StubEmbedder;
-    index_corpus(&corpus_b, &store, Some(&mut embedder), &registry)
+    index_corpus(&corpus_b, &store, &registry)
         .await
         .expect("index beta");
 
@@ -545,12 +567,10 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
         (corpus_a.name.clone(), corpus_a.paths.clone()),
         (corpus_b.name.clone(), corpus_b.paths.clone()),
     ];
-    let mut embedder = StubEmbedder;
     let resp = ground_union(
         "distinctive token",
         &targets,
         &store,
-        Some(&mut embedder),
         None,
         GroundOpts::default(),
     )
@@ -569,14 +589,19 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
 
 // ── Package C: ground_union efficiency (single embed, no clones) ─────────
 
-use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
+use hallouminate::adapters::embedder::{EmbedBatch, EmbedRole};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Wraps `StubEmbedder`, counting `embed_batch` invocations. Regression guard
-/// for the union query-embed hoist: a multi-corpus union must embed the query
-/// exactly ONCE and share the vector, not re-embed per corpus (each embed is
-/// a forward pass serialized on the embedder mutex).
+/// Wraps `StubEmbedder`, counting `embed_batch` invocations via a shared
+/// counter (the store owns the boxed embedder, so the test can't hold a
+/// `&mut` handle to it after construction). Regression guard for the
+/// per-corpus query embed: `ground_union` searches each corpus with its own
+/// `hybrid_search` call, and the store-owned embedder embeds the query fresh
+/// on every such call (no cross-call cache) — so the count equals the number
+/// of corpora searched, not 1.
 struct CountingEmbedder {
-    calls: usize,
+    calls: Arc<AtomicUsize>,
 }
 
 impl EmbedBatch for CountingEmbedder {
@@ -585,35 +610,54 @@ impl EmbedBatch for CountingEmbedder {
         texts: &[String],
         role: EmbedRole,
     ) -> hallouminate::domain::common::Result<
-        Vec<[f32; hallouminate::adapters::lance::EMBEDDING_DIM]>,
+        Vec<[f32; hallouminate::adapters::embedder::EMBEDDING_DIM]>,
     > {
-        self.calls += 1;
+        self.calls.fetch_add(1, Ordering::SeqCst);
         StubEmbedder.embed_batch(texts, role)
     }
 }
 
-/// AC: `ground_union` must embed the query exactly once and reuse the vector
-/// across every corpus in the union set, regardless of corpus count.
+/// AC: `ground_union` embeds the query once per corpus searched (the store
+/// owns the embedder and embeds fresh on every `hybrid_search` call), so the
+/// count scales with the number of corpora in the union set.
 #[tokio::test]
-async fn ground_union_embeds_query_exactly_once_across_three_corpora() {
+async fn ground_union_embeds_query_once_per_corpus_searched() {
     let parent = tempfile::tempdir().expect("tempdir parent");
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let alpha = seed_repo_wiki(parent.path(), "alpha", "zphyxnort");
     let beta = seed_repo_wiki(parent.path(), "beta", "qwobblefrotz");
     let gamma = seed_repo_wiki(parent.path(), "gamma", "vummelthwap");
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
+    let targets = {
+        let store = LanceStore::open_or_create(
+            store_dir.path(),
+            MODEL,
+            false,
+            true,
+            Some(Box::new(StubEmbedder)),
+        )
         .await
         .expect("open store");
-    let targets = index_wikis(&store, &[alpha, beta, gamma]).await;
+        index_wikis(&store, &[alpha, beta, gamma]).await
+    };
     assert_eq!(targets.len(), 3, "three corpora in the union set");
 
-    let mut embedder = CountingEmbedder { calls: 0 };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(CountingEmbedder {
+            calls: calls.clone(),
+        })),
+    )
+    .await
+    .expect("reopen store");
     ground_union(
         "distinctive token wiki",
         &targets,
         &store,
-        Some(&mut embedder),
         None,
         GroundOpts::default(),
     )
@@ -621,8 +665,9 @@ async fn ground_union_embeds_query_exactly_once_across_three_corpora() {
     .expect("union ground");
 
     assert_eq!(
-        embedder.calls, 1,
-        "query must be embedded exactly once and shared across all corpora, not re-embedded per corpus"
+        calls.load(Ordering::SeqCst),
+        targets.len(),
+        "query must be embedded once per corpus searched (adapter-owned embed, no cross-call cache)"
     );
 }
 
@@ -639,17 +684,21 @@ async fn union_ground_preserves_exact_hit_text_after_queue_refactor() {
     let alpha = seed_repo_wiki(parent.path(), "alpha", "zphyxnort");
     let beta = seed_repo_wiki(parent.path(), "beta", "qwobblefrotz");
 
-    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true)
-        .await
-        .expect("open store");
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
     let targets = index_wikis(&store, &[alpha, beta]).await;
 
-    let mut embedder = StubEmbedder;
     let resp = ground_union(
         "distinctive token wiki",
         &targets,
         &store,
-        Some(&mut embedder),
         None,
         GroundOpts::default(),
     )

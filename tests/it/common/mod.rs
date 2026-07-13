@@ -8,9 +8,9 @@
 
 pub mod daemon;
 
-use hallouminate::adapters::lance::{EMBEDDING_DIM, PreparedChunk, PreparedFile};
+use hallouminate::adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use hallouminate::domain::common::Result;
-use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
+use hallouminate::domain::indexer::chunk::{PreparedChunk, PreparedFile};
 
 pub struct StubEmbedder;
 
@@ -55,7 +55,6 @@ impl EmbedBatch for ZeroEmbedder {
 }
 
 /// Build a `PreparedFile` with N chunks, each carrying the given body text.
-/// Embeddings are stub-generated from each chunk's text via `StubEmbedder`.
 pub fn prepared_file_with_chunks(
     file_ref: &str,
     corpus: &str,
@@ -63,7 +62,6 @@ pub fn prepared_file_with_chunks(
     content_hash: &str,
     chunk_texts: Vec<&str>,
 ) -> PreparedFile {
-    let mut emb = StubEmbedder;
     let chunks: Vec<PreparedChunk> = chunk_texts
         .iter()
         .enumerate()
@@ -76,10 +74,6 @@ pub fn prepared_file_with_chunks(
             claim_marks: None,
         })
         .collect();
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-    let embeddings = emb
-        .embed_batch(&texts, EmbedRole::Passage)
-        .expect("stub embed");
     PreparedFile {
         file_ref: file_ref.to_string(),
         corpus: corpus.to_string(),
@@ -90,7 +84,6 @@ pub fn prepared_file_with_chunks(
         frontmatter: None,
         indexed_at_ms: 1_700_000_000_000,
         chunks,
-        embeddings: Some(embeddings),
     }
 }
 
