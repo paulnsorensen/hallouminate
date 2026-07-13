@@ -25,7 +25,7 @@ jobs:
       - name: Verify tag matches Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          manifest="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          manifest="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="hallouminate") | .version')"
           if [ "$tag" != "$manifest" ]; then
             echo "::error::Tag version '$tag' does not match Cargo.toml version '$manifest'"
             exit 1
@@ -37,7 +37,7 @@ jobs:
       - name: Skip if version already on crates.io
         id: published
         run: |
-          v="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          v="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="hallouminate") | .version')"
           if curl -sf --retry 3 --retry-connrefused "https://index.crates.io/ha/ll/hallouminate" | jq -r .vers | grep -Fqx "$v"; then
             echo "::notice::hallouminate $v already published — skipping cargo publish"
             echo "skip=true" >> "$GITHUB_OUTPUT"
@@ -50,7 +50,7 @@ jobs:
         # whose build script needs protoc (same dep ci.yml/dist install).
         if: steps.published.outputs.skip != 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo publish --locked
+      - run: cargo publish --workspace --locked
         if: steps.published.outputs.skip != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

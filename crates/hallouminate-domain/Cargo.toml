@@ -1,0 +1,54 @@
+[package]
+name = "hallouminate-domain"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Domain layer for hallouminate."
+
+[dependencies]
+tokio.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+# `cap-std` is the cross-platform `Dir`-relative API the corpus sandbox uses
+# (built on rustix on unix, windows-sys on Windows). Confines all writes to
+# the corpus root capability and is the symlink-safe replacement for the
+# rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
+cap-std = "4"
+rustix.workspace = true
+ignore = "0.4"
+globset = "0.4"
+pulldown-cmark = { version = "0.13", default-features = false }
+stop-words = "0.10"
+unicode-segmentation = "1"
+text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
+# Kept in lockstep with text-splitter's `tokenizers` requirement (now ^0.23):
+# text-splitter's `ChunkSizer for Tokenizer` impl targets a specific tokenizers
+# major, so this direct dep MUST match text-splitter or the `ChunkSizer` impl no
+# longer applies to our `Tokenizer`. fastembed pins its own tokenizers 0.22
+# internally, so the lock carries both — benign, since those types never cross.
+tokenizers = { version = "0.23", features = ["http"] }
+# Multi-format ingestion (Phase 1): plain-text uses the existing text-splitter
+# `TextSplitter`; spreadsheets use calamine (xlsx/xls/ods) + csv; file-format is
+# the magic-byte fallback when an extension is missing or ambiguous. The
+# `reader-*` features gate the discriminators we actually rely on: reader-zip
+# (OOXML xlsx + ODF ods, both ZIP containers), reader-cfb (OLE2 xls), and
+# reader-txt (plain-text detection). Without cfb/txt those formats fall through
+# to ArbitraryBinaryData and the magic-byte fallback silently fails.
+calamine = "0.36"
+csv = "1.4"
+file-format = { version = "0.29", features = ["reader-zip", "reader-cfb", "reader-txt"] }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+thiserror = "2"
+anyhow.workspace = true
+tracing.workspace = true
+directories = "6"
+shellexpand.workspace = true
+chrono.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

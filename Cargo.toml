@@ -1,87 +1,28 @@
-[package]
-name = "hallouminate"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.3.2"
 edition = "2024"
 rust-version = "1.91"
-description = "A markdown corpus indexer for LLMs to build and query their own per-repo wikis."
 license = "MIT"
-readme = "README.md"
 repository = "https://github.com/paulnsorensen/hallouminate"
 authors = ["Paul Sorensen <paulnsorensen@gmail.com>"]
+description = "A markdown corpus indexer for LLMs to build and query their own per-repo wikis."
 
-[dependencies]
-clap = { version = "4", features = ["derive"] }
-
-# Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "net", "sync", "io-util", "signal"] }
-tokio-util = "0.7"
-
-# Filesystem watching (corpus auto-reindex)
-notify = "8"
-notify-debouncer-full = "0.7"
-
-# Storage
-lancedb = "0.31"
-# Only the `arrow` umbrella: its `arrow::array` / `arrow::datatypes` re-exports
-# replace direct arrow-array/arrow-schema deps, so they can never drift apart.
-arrow = "58"
-async-trait = "0.1"
-futures = "0.3"
-
-# Embeddings
-fastembed = "5"
-
-# Force vendored (compile-from-source) OpenSSL so `openssl-sys` cross-compiles for
-# aarch64-unknown-linux-gnu in the dist release build. openssl-sys is pulled in
-# transitively via native-tls (ort-sys/ureq, fastembed/hf-hub, lancedb/reqwest);
-# vendoring avoids needing the target's system libssl under cargo-zigbuild cross-compile.
-openssl = { version = "0.10", features = ["vendored"] }
-
-# Hashing + filesystem
-blake3 = "1"
-# `cap-std` is the cross-platform `Dir`-relative API the corpus sandbox uses
-# (built on rustix on unix, windows-sys on Windows). Confines all writes to
-# the corpus root capability and is the symlink-safe replacement for the
-# rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
-cap-std = "4"
-# rustix is still pulled in transitively by cap-std; the direct dep is kept
-# for `process::kill_process` (daemon shutdown tests) and `fs::flock`
-# (single-instance daemon lock in `server.rs`).
-rustix = { version = "1", features = ["fs", "process"] }
-# Direct dep for peer-credential auth on the daemon's Unix socket
-# (`SO_PEERCRED` on Linux via raw `getsockopt`, `getpeereid` on macOS/BSD;
-# rustix's `net::sockopt::socket_peercred` is Linux-only, so it can't cover
-# both platforms). Already pulled in transitively.
-libc = "0.2"
-ignore = "0.4"
-globset = "0.4"
-
-# Markdown + text
-pulldown-cmark = { version = "0.13", default-features = false }
-stop-words = "0.10"
-unicode-segmentation = "1"
-text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
-# Kept in lockstep with text-splitter's `tokenizers` requirement (now ^0.23):
-# text-splitter's `ChunkSizer for Tokenizer` impl targets a specific tokenizers
-# major, so this direct dep MUST match text-splitter or the `ChunkSizer` impl no
-# longer applies to our `Tokenizer`. fastembed pins its own tokenizers 0.22
-# internally, so the lock carries both — benign, since those types never cross.
-tokenizers = { version = "0.23", features = ["http"] }
-
-# Multi-format ingestion (Phase 1): plain-text uses the existing text-splitter
-# `TextSplitter`; spreadsheets use calamine (xlsx/xls/ods) + csv; file-format is
-# the magic-byte fallback when an extension is missing or ambiguous. The
-# `reader-*` features gate the discriminators we actually rely on: reader-zip
-# (OOXML xlsx + ODF ods, both ZIP containers), reader-cfb (OLE2 xls), and
-# reader-txt (plain-text detection). Without cfb/txt those formats fall through
-# to ArbitraryBinaryData and the magic-byte fallback silently fails.
-calamine = "0.36"
-csv = "1.4"
-file-format = { version = "0.29", features = ["reader-zip", "reader-cfb", "reader-txt"] }
-
-# Serialization + config
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "process", "net", "sync", "io-util", "signal", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+async-trait = "0.1"
+rustix = { version = "1", features = ["fs", "process"] }
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+shellexpand = "3"
+schemars = "1"
 toml = "1.1"
 # Page-level frontmatter parsing via serde_yaml_ng, the maintained fork of the
 # archived serde_yaml. lindera 3.x already pulls serde_yaml_ng into the build
@@ -89,36 +30,8 @@ toml = "1.1"
 # crate in the tree.
 serde_yaml_ng = "0.10"
 
-# Error handling
-thiserror = "2"
-anyhow = "1"
-
-# Observability
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tracing-appender = "0.2"
-
-# Path resolution
-directories = "6"
-shellexpand = "3"
-url = "2"
-
-# Time + lazy init
-chrono = { version = "0.4", features = ["serde"] }
-once_cell = "1"
-rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
-schemars = "1"
-
-[dev-dependencies]
-tempfile = "3"
-# Spreadsheet ingestion tests generate fixtures in-process (no committed binaries):
-# rust_xlsxwriter writes a real .xlsx calamine can read; .ods is a hand-built ZIP
-# (mimetype + content.xml + META-INF/manifest.xml — calamine requires the manifest)
-# via `zip`, pinned to the 7.x already in the tree (transitive via file-format) so
-# no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
-# is covered by a detection/routing unit test, not a generated binary fixture.
-rust_xlsxwriter = "0.96"
-zip = "8"
+hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.3.2" }
+hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.3.2" }
 
 # The profile that 'dist' will build with
 [profile.dist]
