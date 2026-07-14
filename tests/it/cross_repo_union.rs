@@ -26,8 +26,7 @@ use hallouminate::domain::repository::{
 };
 use text_splitter::Characters;
 
-mod common;
-use common::StubEmbedder;
+use crate::common::StubEmbedder;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
