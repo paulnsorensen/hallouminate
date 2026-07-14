@@ -2831,7 +2831,6 @@ dependencies = [
  "shellexpand",
  "tempfile",
  "text-splitter",
- "tokenizers 0.23.1",
  "tokio",
  "tokio-util",
  "toml",

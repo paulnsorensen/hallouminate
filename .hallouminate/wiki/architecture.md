@@ -66,11 +66,14 @@ Cargo workspace metadata enforces this direction: the application depends on
 both lower crates, adapters depend on domain, and domain has no workspace-crate
 dependency.[^6]
 
-## Current boundary exception
+## Closed boundary seams
 
-`RequestResources` still stores `tokenizers::Tokenizer`.[^7]
+The tokenizer seam is closed: `RequestResources` stores
+`hallouminate_domain::corpus::Tokenizer`, re-exported at the domain crust
+rather than depending on `tokenizers` directly. The application crate no
+longer declares a `tokenizers` dependency.[^7]
 
-The maintenance seam is closed: `LanceStore::maintain` now accepts
+The maintenance seam is also closed: `LanceStore::maintain` now accepts
 adapter-owned `MaintenanceOptions` with `std::time::Duration` and returns
 adapter-owned `MaintenanceStats`, so the application crate no longer depends
 on LanceDB. New adapter APIs should follow this pattern.[^8]
@@ -87,6 +90,6 @@ module per concern.[^9]
 [^4]: `crates/hallouminate-domain/src/corpus/sandbox.rs:1-46`; `crates/hallouminate-domain/src/search/ripgrep.rs:1-64`.
 [^5]: `crates/hallouminate-adapters/src/lib.rs:1-13`; `crates/hallouminate-adapters/src/lance.rs:17-23`.
 [^6]: `crates/hallouminate/Cargo.toml:15-17`; `crates/hallouminate-adapters/Cargo.toml:10-12`; `crates/hallouminate-domain/Cargo.toml:10-51`.
-[^7]: `crates/hallouminate/src/daemon/state.rs:151-155`.
+[^7]: `crates/hallouminate-domain/src/corpus/chunker.rs:10-13`; `crates/hallouminate/src/daemon/state.rs:151-156`.
 [^8]: `crates/hallouminate-adapters/src/lance.rs:39-51,754-782`; `crates/hallouminate/src/daemon/state.rs:500-529`; `crates/hallouminate/Cargo.toml:15-58`.
 [^9]: `crates/hallouminate/tests/it/main.rs:1-16`.
