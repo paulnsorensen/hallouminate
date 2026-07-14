@@ -385,7 +385,6 @@ mod tests {
             .await
             .expect("apply");
 
-        assert_eq!(stats.files_deleted, 1);
         assert_eq!(
             stats.files_deleted, 1,
             "a delete under a ~-rooted corpus must fire; an unexpanded root would skip it"
