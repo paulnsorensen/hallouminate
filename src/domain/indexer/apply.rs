@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::domain::common::{CorpusConfig, FileRef, Result, canonicalize_or_passthrough};
+use crate::domain::common::{
+    CorpusConfig, FileRef, Result, canonicalize_or_passthrough, expand_tilde,
+};
 use crate::domain::corpus::blake3_file;
 use crate::domain::indexer::chunk::PreparedFile;
 use crate::domain::indexer::store::ChunkStore;
@@ -140,17 +142,28 @@ pub async fn apply(
 
     // A corpus name can span several roots. `list_files` therefore feeds the
     // planner snapshots from sibling roots too; only delete snapshots that
-    // belong to a root covered by this invocation.
+    // belong to a root covered by this invocation. Roots are tilde-expanded
+    // before canonicalizing: `corpus.paths` carry literal `~` until consumption
+    // (the walker expands them too), and stored `file_ref`s are already
+    // canonical absolute paths — so an unexpanded `~/…` root would never match,
+    // and every in-scope delete under it would be silently skipped (#215).
     let roots: Vec<PathBuf> = corpus
         .paths
         .iter()
-        .map(|root| canonicalize_or_passthrough(Path::new(root)).into_path_buf())
+        .map(|root| canonicalize_or_passthrough(&expand_tilde(root)).into_path_buf())
         .collect();
     for snap in plan.deletes {
         let file = canonicalize_or_passthrough(Path::new(&snap.file_ref));
         if roots.iter().any(|root| file.as_path().starts_with(root)) {
             store.delete_file(&snap.corpus, &snap.file_ref).await?;
             stats.files_deleted += 1;
+        } else {
+            tracing::debug!(
+                target: "hallouminate::indexer",
+                file_ref = %snap.file_ref,
+                corpus = %snap.corpus,
+                "skipping delete: file_ref outside this request's configured roots"
+            );
         }
     }
 
@@ -336,6 +349,50 @@ mod tests {
         assert_eq!(
             *store.deleted.lock().expect("deleted mutex"),
             vec![selected_file.to_string_lossy().into_owned()]
+        );
+    }
+
+    /// #215 regression: `corpus.paths` carry a literal `~` until consumption
+    /// (the "expand at consumption time" convention), while stored `file_ref`s
+    /// are canonical absolute paths. The delete-scope roots must tilde-expand
+    /// before matching — otherwise an in-scope delete under a `~/…` root fails
+    /// `starts_with` and is silently skipped, so the deleted file is never
+    /// evicted from the index.
+    #[tokio::test]
+    async fn apply_expands_tilde_in_roots_so_home_rooted_deletes_fire() {
+        // A `~`-rooted corpus path, kept non-existent on disk so both the root
+        // and the file_ref resolve via passthrough to the same expanded prefix
+        // (no symlink-canonicalization skew). The delete decision is pure path
+        // logic, so no files on disk are needed.
+        let raw_root = "~/.hallouminate-affinage-236-tilde-scope-test";
+        let gone = expand_tilde(raw_root).join("gone.md");
+        let plan = IndexPlan {
+            upserts: Vec::new(),
+            mtime_touches: Vec::new(),
+            deletes: vec![snapshot(&gone)],
+        };
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![raw_root.to_string()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let store = RecordingStore::default();
+        let registry = HandlerRegistry::new(Characters, 384);
+
+        let stats = apply(plan, &store, &registry, &corpus, 16, None)
+            .await
+            .expect("apply");
+
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(
+            stats.files_deleted, 1,
+            "a delete under a ~-rooted corpus must fire; an unexpanded root would skip it"
+        );
+        assert_eq!(
+            *store.deleted.lock().expect("deleted mutex"),
+            vec![gone.to_string_lossy().into_owned()]
         );
     }
 }
