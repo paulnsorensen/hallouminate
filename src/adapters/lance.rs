@@ -18,8 +18,8 @@ use crate::adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use crate::domain::common::{HallouminateError, Result};
 use crate::domain::corpus::ClaimMark;
 use crate::domain::embeddings::canonical_model_name;
+use crate::domain::indexer::FileSnapshot;
 use crate::domain::indexer::chunk::{PreparedFile, SearchHit};
-use crate::domain::indexer::plan::FileSnapshot;
 use crate::domain::indexer::store::{BatchWriteStats, ChunkStore};
 
 const TABLE_NAME: &str = "chunks";

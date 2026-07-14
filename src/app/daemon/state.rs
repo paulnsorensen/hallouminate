@@ -36,9 +36,7 @@ use crate::adapters::lance::LanceStore;
 use crate::app::config::Config;
 use crate::domain::common::{HallouminateError, expand_tilde};
 use crate::domain::corpus::{load_tokenizer, missing_roots};
-use crate::domain::indexer::HandlerRegistry;
-use crate::domain::indexer::chunk::SearchHit;
-use crate::domain::indexer::index::index_corpus;
+use crate::domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use crate::domain::search::{Crossencoder, canonical_crossencoder_model};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
