@@ -11,8 +11,7 @@ use hallouminate_adapters::embedder::{EmbedBatch, EmbedRole};
 use hallouminate_adapters::lance::LanceStore;
 use hallouminate_domain::common::CorpusConfig;
 use hallouminate_domain::corpus::MarkdownChunker;
-use hallouminate_domain::indexer::store::ChunkStore;
-use hallouminate_domain::indexer::{HandlerRegistry, index_corpus};
+use hallouminate_domain::indexer::{ChunkStore, HandlerRegistry, index_corpus};
 use hallouminate_domain::search::search_with_ripgrep;
 use text_splitter::Characters;
 

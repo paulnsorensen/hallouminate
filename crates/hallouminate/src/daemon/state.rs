@@ -1,5 +1,5 @@
-//! Shared daemon state: config, LanceStore handle, per-corpus locks, the
-//! global write-lane semaphore, and a cached embedder + tokenizer.
+//! Shared daemon state: baseline configuration, per-request LanceDB resources,
+//! mutation locks, the global write lane, and lifecycle accounting.
 //!
 //! Lock acquisition rule (enforced by every mutating dispatcher):
 //!
@@ -12,11 +12,9 @@
 //! LanceDB commit so we never hit LanceDB's retry-limit warning around
 //! many simultaneous writers.
 //!
-//! The embedder and tokenizer are loaded once at daemon boot and shared
-//! across requests. The embedder is built eagerly (tolerating load failure)
-//! and handed into `LanceStore::open_or_create`, which owns embedding
-//! internally from then on; `state.rs` holds no embedder handle of its own.
-//! Tokenizers are cheap to clone (`Arc` internally) and need no lock.
+//! Stores, tokenizers, and embedders are cached by effective request config.
+//! A baseline embedder that fails during startup remains retryable: the next
+//! normal request for that resource key initializes and installs it in place.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -255,22 +253,37 @@ impl DaemonState {
                 .await
                 .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
         }
-        // Build embedder + tokenizer BEFORE opening the store so we have them
-        // available for a potential stale-store rebuild on the same boot.
-        //
-        // Embeddings are opt-in. When disabled, the embedder stays `None` for
-        // the daemon's lifetime (no model download, no load) and every
-        // retrieval/index path runs lexical-only. The tokenizer is still
-        // loaded here — chunking needs it regardless of the embedding mode.
-        //
-        // When enabled, try to load the embedder eagerly so the first request
-        // doesn't pay the load cost mid-call. Tolerate failure (e.g. offline
-        // first run with no cached model) so the daemon can still serve
-        // model-independent ops (`ping`, `list_corpora`, `list_files`,
-        // `read_markdown`, `delete_markdown`); a later request needing embeddings
-        // will surface the error when it tries to open a resource set.
+        let stale_version = match LanceStore::validate_existing_metadata(
+            &ground_dir,
+            &cfg.embeddings.model,
+            cfg.embeddings.quantized,
+            cfg.embeddings.enabled,
+        ) {
+            Ok(()) => None,
+            Err(HallouminateError::StoreSchemaStale {
+                found, expected, ..
+            }) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    %found,
+                    %expected,
+                    "ground store schema v{found} < expected v{expected}; rebuilding from source",
+                );
+                move_stale_store(&ground_dir, found).await?;
+                Some(found)
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "validate ground dir {}: {e}",
+                    ground_dir.display()
+                ));
+            }
+        };
+
+        // Model construction and ONNX session setup are synchronous and
+        // CPU-heavy. Keep them off Tokio's async worker capacity.
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        let mut embedder: Option<Box<dyn EmbedBatch>> = if cfg.embeddings.enabled {
+        let embedder: Option<Box<dyn EmbedBatch>> = if cfg.embeddings.enabled {
             match init_embedder(
                 &cfg.embeddings.model,
                 cfg.embeddings.quantized,
@@ -295,122 +308,64 @@ impl DaemonState {
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
 
-        let store = match LanceStore::open_or_create(
-            &ground_dir,
-            &cfg.embeddings.model,
-            cfg.embeddings.quantized,
-            cfg.embeddings.enabled,
-            embedder.take(),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(HallouminateError::StoreSchemaStale {
-                found, expected, ..
-            }) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    %found,
-                    %expected,
-                    "ground store schema v{found} < expected v{expected}; rebuilding from source",
-                );
-                move_stale_store(&ground_dir, found).await?;
-                // If anything in the rebuild fails, clean up the partially-created
-                // fresh dir so the next boot re-enters the "no ground dir" path
-                // and retries the rebuild, rather than opening an empty-but-valid store.
-                let rebuild_result: anyhow::Result<LanceStore> = async {
-                    // `embedder` was moved into the first `open_or_create` call
-                    // above (now None regardless of outcome) -- `Embedder` isn't
-                    // `Clone`, so build a fresh one for the rebuilt store.
-                    let rebuild_embedder: Option<Box<dyn EmbedBatch>> =
-                        if cfg.embeddings.enabled {
-                            match init_embedder(
-                                &cfg.embeddings.model,
-                                cfg.embeddings.quantized,
-                                cache_dir.clone(),
-                            )
-                            .await
-                            {
-                                Ok(embedder) => Some(embedder),
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "hallouminate::daemon",
-                                        model = %cfg.embeddings.model,
-                                        error = %e,
-                                        "embedder unavailable for rebuild; the next request will retry initialization",
-                                    );
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
-                    let fresh = LanceStore::open_or_create(
-                        &ground_dir,
-                        &cfg.embeddings.model,
-                        cfg.embeddings.quantized,
-                        cfg.embeddings.enabled,
-                        rebuild_embedder,
-                    )
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!(
-                            "rebuild: open fresh ground dir {}: {e}",
-                            ground_dir.display()
-                        )
-                    })?;
-                    let registry = HandlerRegistry::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
-                    for corpus in cfg
-                        .effective_corpora()
-                        .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
-                    {
-                        let missing = missing_roots(&corpus);
-                        if !missing.is_empty() {
-                            tracing::warn!(
-                                target: "hallouminate::daemon",
-                                corpus = %corpus.name,
-                                "rebuild: corpus root missing; skipped",
-                            );
-                            continue;
-                        }
-                        let stats = index_corpus(&corpus, &fresh, &registry)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
-                        tracing::info!(
+        // Metadata validation happened before model ownership moved into the
+        // store, so stale-schema recovery reuses this single ONNX session.
+        let build_result: anyhow::Result<LanceStore> = async {
+            let store = LanceStore::open_or_create(
+                &ground_dir,
+                &cfg.embeddings.model,
+                cfg.embeddings.quantized,
+                cfg.embeddings.enabled,
+                embedder,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
+
+            if stale_version.is_some() {
+                let registry = HandlerRegistry::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+                for corpus in cfg
+                    .effective_corpora()
+                    .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
+                {
+                    let missing = missing_roots(&corpus);
+                    if !missing.is_empty() {
+                        tracing::warn!(
                             target: "hallouminate::daemon",
                             corpus = %corpus.name,
-                            files = stats.files_upserted,
-                            chunks = stats.chunks_inserted,
-                            "rebuild: reindexed",
+                            "rebuild: corpus root missing; skipped",
                         );
+                        continue;
                     }
-                    Ok(fresh)
-                }
-                .await;
-                match rebuild_result {
-                    Ok(fresh) => fresh,
-                    Err(e) => {
-                        // Remove the fresh (empty/partial) ground dir so the next boot
-                        // sees "no store" and retries the rebuild rather than booting
-                        // with an empty index.
-                        if ground_dir.exists() {
-                            let _ = tokio::fs::remove_dir_all(&ground_dir).await;
-                            tracing::warn!(
-                                target: "hallouminate::daemon",
-                                "rebuild failed; removed partial ground dir so next boot retries. \
-                                 Backup preserved at {}.bak-v{found}",
-                                ground_dir.display(),
-                            );
-                        }
-                        return Err(e);
-                    }
+                    let stats = index_corpus(&corpus, &store, &registry)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
+                    tracing::info!(
+                        target: "hallouminate::daemon",
+                        corpus = %corpus.name,
+                        files = stats.files_upserted,
+                        chunks = stats.chunks_inserted,
+                        "rebuild: reindexed",
+                    );
                 }
             }
+            Ok(store)
+        }
+        .await;
+        let store = match build_result {
+            Ok(store) => store,
             Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "open ground dir {}: {e}",
-                    ground_dir.display()
-                ));
+                if let Some(found) = stale_version
+                    && ground_dir.exists()
+                {
+                    let _ = tokio::fs::remove_dir_all(&ground_dir).await;
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        "rebuild failed; removed partial ground dir so next boot retries. \
+                         Backup preserved at {}.bak-v{found}",
+                        ground_dir.display(),
+                    );
+                }
+                return Err(e);
             }
         };
         // Recoverable-until-pruned backups from a prior schema rebuild
@@ -697,7 +652,7 @@ impl DaemonState {
                 initialize(
                     cfg.embeddings.model.clone(),
                     cfg.embeddings.quantized,
-                    cache_dir.clone(),
+                    cache_dir,
                 )
                 .await?,
             )

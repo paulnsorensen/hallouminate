@@ -18,9 +18,9 @@ use crate::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use hallouminate_domain::common::{HallouminateError, Result};
 use hallouminate_domain::corpus::ClaimMark;
 use hallouminate_domain::embeddings::canonical_model_name;
-use hallouminate_domain::indexer::FileSnapshot;
-use hallouminate_domain::indexer::chunk::{PreparedFile, SearchHit};
-use hallouminate_domain::indexer::store::{BatchWriteStats, ChunkStore};
+use hallouminate_domain::indexer::{
+    BatchWriteStats, ChunkStore, FileSnapshot, PreparedFile, SearchHit,
+};
 
 const TABLE_NAME: &str = "chunks";
 const META_FILENAME: &str = "meta.toml";
@@ -602,8 +602,36 @@ async fn run_embedding_blocking(
         ))),
     }
 }
-
 impl LanceStore {
+    /// Validates an existing store's metadata without opening LanceDB or
+    /// taking ownership of an embedder. A missing store has nothing to
+    /// validate and is accepted.
+    ///
+    /// # Errors
+    ///
+    /// Delegates to `meta_check_or_init`, so an existing store can fail for any
+    /// of these reasons:
+    /// - `StoreSchemaStale` — the stored schema version is older than this
+    ///   build expects (remedy: delete + reindex).
+    /// - `Config` — the stored schema version is newer than this build expects
+    ///   (fatal downgrade), or `meta.toml` cannot be parsed.
+    /// - `Embed` — the requested embedding configuration (model, quantization,
+    ///   or enabled flag) mismatches the stored sidecar.
+    /// - the requested model is unsupported, or the stored model name is
+    ///   corrupt (via `canonical_model_name`).
+    pub fn validate_existing_metadata(
+        ground_dir: &Path,
+        model_name: &str,
+        quantized: bool,
+        embeddings_enabled: bool,
+    ) -> Result<()> {
+        let meta_path = ground_dir.join(META_FILENAME);
+        if meta_path.exists() {
+            meta_check_or_init(&meta_path, model_name, quantized, embeddings_enabled)?;
+        }
+        Ok(())
+    }
+
     /// Opens the `chunks` table under `ground_dir`, creating it (and the
     /// `meta.toml` sidecar) when absent.
     ///
@@ -850,7 +878,6 @@ impl LanceStore {
                 embeddings: embeddings.as_deref(),
             })
             .collect();
-
         let schema = chunks_schema();
         let record_batch = build_record_batch(&paired, schema.clone())?;
         let mut file_refs: Vec<String> = Vec::with_capacity(batch.len());
@@ -1240,7 +1267,7 @@ impl ChunkStore for LanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallouminate_domain::indexer::chunk::PreparedChunk;
+    use hallouminate_domain::indexer::PreparedChunk;
 
     struct ThreadRecordingEmbedder {
         threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,

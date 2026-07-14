@@ -13,8 +13,7 @@ pub mod ripgrep;
 use std::collections::HashMap;
 
 use crate::common::Result;
-use crate::indexer::chunk::SearchHit;
-use crate::indexer::store::ChunkStore;
+use crate::indexer::{ChunkStore, SearchHit};
 
 pub use crossencoder::Noop as NoopCrossencoder;
 pub use crossencoder::{

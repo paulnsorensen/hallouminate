@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
 
 use hallouminate_domain::common::{HallouminateError, Result};
-use hallouminate_domain::indexer::chunk::SearchHit;
-use hallouminate_domain::search::crossencoder::{Crossencoder, canonical_crossencoder_model};
+use hallouminate_domain::indexer::SearchHit;
+use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
 fn resolve_model(canonical: &'static str) -> RerankerModel {
     match canonical {
@@ -113,7 +113,7 @@ fn apply_permutation(hits: &mut [SearchHit], order: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallouminate_domain::search::crossencoder::DEFAULT_CROSSENCODER_MODEL;
+    use hallouminate_domain::search::DEFAULT_CROSSENCODER_MODEL;
 
     fn hit(file_ref: &str, ord: usize, score: f32, text: &str) -> SearchHit {
         SearchHit {

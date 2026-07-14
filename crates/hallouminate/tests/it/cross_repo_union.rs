@@ -191,7 +191,7 @@ fn discovery_respects_depth_cap_and_gitignore_above_all_repos() {
 
 use hallouminate_adapters::lance::LanceStore;
 use hallouminate_domain::ground::{GroundResponse, ground};
-use hallouminate_domain::indexer::chunk::SearchHit;
+use hallouminate_domain::indexer::SearchHit;
 use hallouminate_domain::search::Crossencoder;
 
 /// A crossencoder that reverses the hit list in place. It changes the order of
