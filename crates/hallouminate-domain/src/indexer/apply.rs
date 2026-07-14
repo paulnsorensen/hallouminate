@@ -262,8 +262,8 @@ mod tests {
     use text_splitter::Characters;
 
     use super::*;
-    use crate::domain::common::HallouminateError;
-    use crate::domain::indexer::{BatchWriteStats, FileSnapshot, SearchHit};
+    use crate::common::HallouminateError;
+    use crate::indexer::{BatchWriteStats, FileSnapshot, SearchHit};
 
     #[derive(Default)]
     struct RecordingStore {
@@ -383,11 +383,6 @@ mod tests {
             .await
             .expect("apply");
 
-        let stats = apply(plan, &store, &registry, &corpus, 16, None)
-            .await
-            .expect("apply");
-
-        assert_eq!(stats.files_deleted, 1);
         assert_eq!(
             stats.files_deleted, 1,
             "a delete under a ~-rooted corpus must fire; an unexpanded root would skip it"

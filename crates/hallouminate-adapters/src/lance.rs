@@ -21,10 +21,6 @@ use hallouminate_domain::embeddings::canonical_model_name;
 use hallouminate_domain::indexer::FileSnapshot;
 use hallouminate_domain::indexer::chunk::{PreparedFile, SearchHit};
 use hallouminate_domain::indexer::store::{BatchWriteStats, ChunkStore};
-use crate::adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
-use crate::domain::indexer::FileSnapshot;
-use crate::domain::indexer::chunk::{PreparedFile, SearchHit};
-use crate::domain::indexer::store::{BatchWriteStats, ChunkStore};
 
 const TABLE_NAME: &str = "chunks";
 const META_FILENAME: &str = "meta.toml";
