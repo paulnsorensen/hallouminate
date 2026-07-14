@@ -23,7 +23,7 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use crate::cli::{CorpusReport, IndexReport};
 use crate::config::{Config, ResolvedLayers, resolve_for_cwd};
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
 #[cfg(test)]
 use hallouminate_domain::corpus::FileEntry;

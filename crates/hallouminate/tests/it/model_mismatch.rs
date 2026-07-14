@@ -3,7 +3,7 @@ use std::path::Path;
 
 use hallouminate::config::Config;
 use hallouminate::daemon::DaemonState;
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::LanceStore;
 
 use crate::common::LANCE_WRITE_LOCK;
 

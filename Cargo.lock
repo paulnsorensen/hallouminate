@@ -2818,7 +2818,6 @@ dependencies = [
  "directories",
  "hallouminate-adapters",
  "hallouminate-domain",
- "lancedb",
  "libc",
  "notify",
  "notify-debouncer-full",

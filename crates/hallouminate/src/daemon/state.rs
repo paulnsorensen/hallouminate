@@ -28,9 +28,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
-use hallouminate_adapters::crossencoder::FastembedCrossencoder;
-use hallouminate_adapters::embedder::{EmbedBatch, Embedder};
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::{
+    EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, MaintenanceOptions,
+};
 use hallouminate_domain::common::{HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
@@ -506,18 +506,17 @@ impl DaemonState {
             .inner
             .baseline_resources
             .store
-            .maintain(lancedb::table::Duration::seconds(
-                MAINTENANCE_PRUNE_GRACE_SECS as i64,
-            ))
+            .maintain(MaintenanceOptions {
+                prune_older_than: Duration::from_secs(MAINTENANCE_PRUNE_GRACE_SECS),
+            })
             .await
         {
             Ok(stats) => {
                 tracing::info!(
                     target: "hallouminate::lance",
-                    fragments_removed = stats.compaction.as_ref().map(|c| c.fragments_removed),
-                    fragments_added = stats.compaction.as_ref().map(|c| c.fragments_added),
-                    old_versions_pruned = stats.prune.as_ref().map(|p| p.old_versions),
-                    "periodic LanceDB maintenance completed",
+                    fragments_removed = stats.fragments_removed,
+                    fragments_added = stats.fragments_added,
+                    old_versions_pruned = stats.old_versions_pruned,
                 );
             }
             Err(e) => {
@@ -1021,6 +1020,7 @@ impl std::fmt::Debug for DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole};
 
     /// Covers AC #9 (daemon half): the baseline accessor returns the config
     /// that was passed into `open`, unchanged. The dispatcher layers
@@ -1488,14 +1488,9 @@ mod tests {
         fn embed_batch(
             &mut self,
             texts: &[String],
-            _role: hallouminate_adapters::embedder::EmbedRole,
-        ) -> hallouminate_domain::common::Result<
-            Vec<[f32; hallouminate_adapters::embedder::EMBEDDING_DIM]>,
-        > {
-            Ok(vec![
-                [0.0; hallouminate_adapters::embedder::EMBEDDING_DIM];
-                texts.len()
-            ])
+            _role: EmbedRole,
+        ) -> hallouminate_domain::common::Result<Vec<[f32; EMBEDDING_DIM]>> {
+            Ok(vec![[0.0; EMBEDDING_DIM]; texts.len()])
         }
     }
 

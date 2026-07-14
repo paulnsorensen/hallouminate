@@ -3,6 +3,6 @@ mod format;
 mod orchestrate;
 mod types;
 
-pub mod index;
+mod index;
 
 pub use index::*;

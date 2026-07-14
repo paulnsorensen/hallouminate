@@ -7,8 +7,7 @@
 
 use std::fs;
 
-use hallouminate_adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole, LanceStore};
 use hallouminate_domain::common::{CorpusConfig, Result};
 use hallouminate_domain::indexer::{ChunkStore, HandlerRegistry, index_corpus};
 use text_splitter::Characters;

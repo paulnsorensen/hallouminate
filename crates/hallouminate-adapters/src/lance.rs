@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use arrow::array::ListArray;
 use arrow::array::builder::{ListBuilder, StringBuilder};
@@ -33,6 +34,20 @@ pub struct CorpusChunkStats {
     pub indexed_files: u64,
     pub total_chunks: u64,
     pub last_indexed_ms: Option<i64>,
+}
+
+/// Configures one LanceDB maintenance pass.
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenanceOptions {
+    pub prune_older_than: Duration,
+}
+
+/// Reports the effects of one LanceDB maintenance pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaintenanceStats {
+    pub fragments_removed: Option<usize>,
+    pub fragments_added: Option<usize>,
+    pub old_versions_pruned: Option<u64>,
 }
 
 /// Stable, deterministic chunk identifier derived from (file_ref, ord).
@@ -722,7 +737,7 @@ impl LanceStore {
     /// fragment + a version, so an unmaintained store accumulates both
     /// without limit.
     ///
-    /// `prune_older_than` bounds how far back pruning reaches rather than
+    /// `options.prune_older_than` bounds how far back pruning reaches rather than
     /// always reclaiming every superseded version: this `LanceStore` is
     /// always the single writer for its table (see the daemon's write-lane
     /// invariant), so no concurrent *process* can have an older version
@@ -736,10 +751,7 @@ impl LanceStore {
     /// # Errors
     ///
     /// Returns an error if the LanceDB compaction or version-cleanup fails.
-    pub async fn maintain(
-        &self,
-        prune_older_than: lancedb::table::Duration,
-    ) -> Result<lancedb::table::OptimizeStats> {
+    pub async fn maintain(&self, options: MaintenanceOptions) -> Result<MaintenanceStats> {
         let mut stats = self
             .table
             .optimize(lancedb::table::OptimizeAction::Compact {
@@ -751,14 +763,23 @@ impl LanceStore {
         let prune = self
             .table
             .optimize(lancedb::table::OptimizeAction::Prune {
-                older_than: Some(prune_older_than),
+                older_than: Some(lancedb::table::Duration::seconds(
+                    options.prune_older_than.as_secs() as i64,
+                )),
                 delete_unverified: Some(true),
                 error_if_tagged_old_versions: None,
             })
             .await
             .map_err(map_lance_err)?;
         stats.prune = prune.prune;
-        Ok(stats)
+        Ok(MaintenanceStats {
+            fragments_removed: stats
+                .compaction
+                .as_ref()
+                .map(|stats| stats.fragments_removed),
+            fragments_added: stats.compaction.as_ref().map(|stats| stats.fragments_added),
+            old_versions_pruned: stats.prune.as_ref().map(|stats| stats.old_versions),
+        })
     }
 
     pub async fn corpus_chunk_stats(&self, corpus: &str) -> Result<CorpusChunkStats> {
@@ -1451,10 +1472,16 @@ mod tests {
         // Zero retention is safe here: the test has no concurrent queries,
         // so there is no in-process read window for a zero-duration prune
         // to race (see `maintain`'s doc comment).
-        store
-            .maintain(lancedb::table::Duration::zero())
+        let stats = store
+            .maintain(MaintenanceOptions {
+                prune_older_than: Duration::ZERO,
+            })
             .await
             .expect("maintain");
+        assert!(
+            stats.old_versions_pruned.is_some(),
+            "maintain reports version pruning"
+        );
 
         let versions_after = store
             .table

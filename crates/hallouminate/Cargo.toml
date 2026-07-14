@@ -39,11 +39,7 @@ url = "2"
 chrono.workspace = true
 schemars.workspace = true
 rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
-# Leaked storage/embedding types surface directly in daemon state (lancedb::table::Duration,
-# tokenizers::Tokenizer) and dispatch (text_splitter::Characters) despite the crate boundary.
-lancedb = "0.31"
 tokenizers = { version = "0.23", features = ["http"] }
-text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -59,3 +55,4 @@ hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
 blake3.workspace = true
 serde_yaml_ng.workspace = true
+text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }

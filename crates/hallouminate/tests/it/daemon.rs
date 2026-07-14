@@ -3428,7 +3428,7 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     std::fs::write(corpus_root.join("hello.md"), "# Hello\n\nworld\n").expect("seed");
 
     // Write a stale meta at schema_version = current - 1.
-    let current = hallouminate_adapters::lance::default_schema_version_pub();
+    let current = hallouminate_adapters::default_schema_version_pub();
     let stale = current - 1;
     write_stale_meta(&ground, stale);
 
@@ -3470,7 +3470,7 @@ async fn downgrade_store_is_fatal_and_original_untouched() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
 
-    let current = hallouminate_adapters::lance::default_schema_version_pub();
+    let current = hallouminate_adapters::default_schema_version_pub();
     let newer = current + 1;
     write_stale_meta(&ground, newer);
 
@@ -3508,7 +3508,7 @@ async fn matching_version_store_is_untouched() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
 
-    let current = hallouminate_adapters::lance::default_schema_version_pub();
+    let current = hallouminate_adapters::default_schema_version_pub();
     write_stale_meta(&ground, current);
 
     let cfg = cfg_with_corpus(&ground, &corpus_root);
@@ -3539,7 +3539,7 @@ async fn stale_rebuild_reproduces_corpus_content() {
     let seeded = corpus_root.join("doc.md");
     std::fs::write(&seeded, "# Doc\n\ncontent here\n").expect("seed doc");
 
-    let current = hallouminate_adapters::lance::default_schema_version_pub();
+    let current = hallouminate_adapters::default_schema_version_pub();
     write_stale_meta(&ground, current - 1);
 
     let cfg = cfg_with_corpus(&ground, &corpus_root);
@@ -3580,7 +3580,7 @@ async fn stale_rebuild_overwrites_prior_backup() {
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     std::fs::write(corpus_root.join("doc.md"), "# Doc\n\ncontent\n").expect("seed");
 
-    let current = hallouminate_adapters::lance::default_schema_version_pub();
+    let current = hallouminate_adapters::default_schema_version_pub();
     let stale = current - 1;
     write_stale_meta(&ground, stale);
 
@@ -3615,7 +3615,7 @@ async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     std::fs::write(corpus_root.join("doc.md"), "# Doc\n\ncontent\n").expect("seed");
 
-    let current = hallouminate_adapters::lance::default_schema_version_pub();
+    let current = hallouminate_adapters::default_schema_version_pub();
     let stale = current - 1;
     write_stale_meta(&ground, stale);
 

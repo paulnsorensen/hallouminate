@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 
 use crate::config::{self, Config, ResolvedLayers, xdg_config_path};
-use hallouminate_adapters::crossencoder::FastembedCrossencoder;
-use hallouminate_adapters::embedder::Embedder;
+use hallouminate_adapters::{Embedder, FastembedCrossencoder};
 use hallouminate_domain::common::{canonicalize_or_passthrough, expand_tilde};
 use hallouminate_domain::corpus::load_tokenizer;
 

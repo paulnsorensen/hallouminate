@@ -7,7 +7,7 @@
 use crate::common::{
     LANCE_WRITE_LOCK, StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks,
 };
-use hallouminate_adapters::lance::{LanceStore, chunk_id_for};
+use hallouminate_adapters::{LanceStore, chunk_id_for};
 use hallouminate_domain::indexer::ChunkStore;
 use hallouminate_domain::search::search_with_ripgrep;
 

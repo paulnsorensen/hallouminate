@@ -1,70 +1,92 @@
 # Architecture
 
-Hallouminate uses a Sliced Bread layout — vertical slices with public
-APIs at slice boundaries, no cross-slice peeks at internals. Three
-top-level concerns.
+Hallouminate is a three-crate ports-and-adapters workspace with Sliced Bread
+applied inside the core: business-capability modules expose crust facades, while
+the workspace crates enforce dependency direction. It is not a crate-per-feature
+layout.[^1]
 
-## `src/app/` — orchestration and driving adapters
+## `crates/hallouminate/` — application and driving adapters
 
-The application layer. Owns:
+The application crate owns process orchestration and inbound transports:
 
-- `cli/` and `cli.rs` — clap-derived subcommands (`index`, `ground`, `serve`, `daemon`, `config`, `hook`)
-- `daemon/` — the long-lived RPC daemon: `bootstrap.rs`, `client.rs`, `dispatch.rs`, `ipc.rs`, `mod.rs`, `server.rs`, `socket.rs`, `state.rs`
-- `mcp/` — the rmcp-based stdio MCP server; it is a driving adapter beside the CLI, not a driven external-system adapter[^1]
-- `config.rs` — XDG baseline parser plus repo-layer merge (see `config-layering.md`)
-- `logging.rs` — `tracing-subscriber` bootstrap with a rolling appender under the XDG state dir
-- `xdg.rs` — centralized XDG path resolution (config, cache, state)
-- `input_error.rs` — caller-input error shape distinct from internal errors
+- `cli.rs` and `cli/` — clap commands and user-facing command handlers
+- `daemon/` — the long-lived local RPC daemon, request dispatch, lifecycle,
+  filesystem watching, and application resource composition
+- `mcp.rs` and `mcp/` — the rmcp stdio server; MCP drives application use
+  cases, so it belongs beside the CLI rather than among driven adapters
+- `config.rs` — XDG baseline parsing plus repository-layer merge
+- `logging.rs` and `xdg.rs` — process-wide runtime wiring
+- `input_error.rs` — caller-input error marker
 
-App depends on `domain` and `adapters`. App composes them — it does not
-own pure logic. MCP belongs here because it receives external requests and
-drives application use cases; putting it under `adapters/` blurred driving
-and driven boundaries.[^1]
+`src/lib.rs` is the crate root and exports `run()`; `src/main.rs` is the
+thin binary entry point.[^2]
 
-## `src/domain/` — pure logic
+## `crates/hallouminate-domain/` — application core
 
-No dependency on app, LanceDB, Arrow, fastembed, or other concrete
-infrastructure. Slices:
+The core is organized by capability:
 
-- `corpus/` — `chunker.rs`, `walker.rs`, `hasher.rs`, `sandbox.rs`, `snippet.rs`, `summary.rs`, `keywords.rs`
-- `embeddings/` — model-identity policy; concrete inference lives behind adapter-owned implementations
-- `ground/` — `orchestrate.rs`, `bucket.rs`, `format.rs`, `types.rs`, `index.rs`
-- `indexer/` — `plan.rs`, `apply.rs`, `writer.rs`, `index.rs`, plus the `ChunkStore` port and domain-owned chunk/search DTOs[^2]
-- `repository.rs` — `RepositoryConfig` plus the `effective_corpora` derivation that turns each `[[repository]]` into `repo:NAME:wiki` and `repo:NAME:corpus`
-- `common.rs` and `common/paths.rs` — shared types: `Mtime`, `FileRef`, `HallouminateError`, `expand_tilde`, `canonicalize_or_passthrough`
-- `search.rs` — read-side query types and the crossencoder policy port
+- `corpus` — markdown chunking, validation, filesystem walking, sandboxed
+  corpus file operations, summaries, keywords, frontmatter, and claim marks
+- `embeddings` — supported-model identity policy
+- `ground` — search orchestration, bucketing, response types, and rendering
+- `indexer` — scan/plan/apply orchestration, format handlers, DTOs, and the
+  domain-owned `ChunkStore` port
+- `search` — hybrid-search policy, crossencoder port, and exact-match fusion
+- `repository`, `discovery`, and `footnotes` — repository-derived corpora,
+  bounded wiki discovery, and footnote resolution
+- `common` — shared value and error types
 
-Domain slice facades re-export the types and operations app consumers need;
-application code imports through those facades rather than reaching into child
-modules.[^3]
+Slice root modules are the intended crusts. Consumers should import from
+`hallouminate_domain::<slice>`, not a slice's child module. Most child modules
+are private and their intentional API is re-exported by the crust.[^3]
 
-## `src/adapters/` — driven external systems
+The crate is the application core rather than a strictly side-effect-free
+domain model: corpus walking/sandboxing and the current ripgrep implementation
+perform filesystem or process I/O here. This is a current boundary exception;
+strict Sliced Bread conformance would move those mechanisms behind domain-owned
+ports with driven implementations in the adapters crate.[^4]
 
-- `lance.rs` — LanceDB persistence plus the `ChunkStore` implementation
+## `crates/hallouminate-adapters/` — driven external systems
+
+- `lance.rs` — LanceDB persistence and the `ChunkStore` implementation
 - `embedder.rs` — fastembed passage/query embedding
 - `crossencoder.rs` — fastembed reranking
 
-This directory contains driven implementations called by the application.
-Adapters depend on domain ports and types, but not on app.[^2]
+Adapters depend on domain ports and types, never on the application crate.[^5]
 
 ## Dependency direction
 
-`adapters → domain ← app → adapters`. Domain is the stable core; app
-composes adapter implementations with domain orchestration; driven adapters
-implement domain ports. Driving adapters such as CLI and MCP live in app.
+```text
+hallouminate-adapters -> hallouminate-domain <- hallouminate
+                                              |
+                                              -> hallouminate-adapters
+```
 
-## Entry points
+Cargo workspace metadata enforces this direction: the application depends on
+both lower crates, adapters depend on domain, and domain has no workspace-crate
+dependency.[^6]
 
-- `src/main.rs` — process entry; calls `hallouminate::app::run()`.
-- `src/lib.rs` — library facade for tests and downstream callers.
-- `src/app.rs` — top-level `run()`: parses CLI, dispatches to the right subcommand.
+## Current boundary exception
+
+`RequestResources` still stores `tokenizers::Tokenizer`.[^7]
+
+The maintenance seam is closed: `LanceStore::maintain` now accepts
+adapter-owned `MaintenanceOptions` with `std::time::Duration` and returns
+adapter-owned `MaintenanceStats`, so the application crate no longer depends
+on LanceDB. New adapter APIs should follow this pattern.[^8]
 
 ## Testing
 
-- Unit tests live alongside their module (`#[cfg(test)] mod tests`).
-- Integration tests share one harness at `tests/it/main.rs`, with one module per test concern and common fixtures under `tests/it/common/`.[^4]
+Unit tests live beside their modules. Integration tests are under
+`crates/hallouminate/tests/it/`, with `main.rs` as the shared harness and one
+module per concern.[^9]
 
-[^1]: `src/app.rs:1-10`; `src/app/mcp.rs:1-11`; commit `c67ee057` (landed via PR #237).
-[^2]: `src/domain/indexer/store.rs:1-27`; `src/adapters.rs:1-6`; `src/adapters/lance.rs:1213-1238`.
-[^3]: `src/domain/corpus.rs:40-50`; `src/domain/indexer.rs:10-14`; `src/app/daemon/state.rs:37-40`; commit `348846d`.
-[^4]: `tests/it/main.rs`; commit `6194e572`.
+[^1]: `Cargo.toml:1-34`; `crates/hallouminate-domain/src/lib.rs:7-15`.
+[^2]: `crates/hallouminate/src/lib.rs:1-20`; `crates/hallouminate/src/main.rs:1-4`; commit `a0a530a` (PR #238).
+[^3]: `crates/hallouminate-domain/src/corpus.rs:1-60`; `crates/hallouminate-domain/src/indexer.rs:1-14`; commit `64669f9` (PR #239).
+[^4]: `crates/hallouminate-domain/src/corpus/sandbox.rs:1-46`; `crates/hallouminate-domain/src/search/ripgrep.rs:1-64`.
+[^5]: `crates/hallouminate-adapters/src/lib.rs:1-13`; `crates/hallouminate-adapters/src/lance.rs:17-23`.
+[^6]: `crates/hallouminate/Cargo.toml:15-17`; `crates/hallouminate-adapters/Cargo.toml:10-12`; `crates/hallouminate-domain/Cargo.toml:10-51`.
+[^7]: `crates/hallouminate/src/daemon/state.rs:151-155`.
+[^8]: `crates/hallouminate-adapters/src/lance.rs:39-51,754-782`; `crates/hallouminate/src/daemon/state.rs:500-529`; `crates/hallouminate/Cargo.toml:15-58`.
+[^9]: `crates/hallouminate/tests/it/main.rs:1-16`.

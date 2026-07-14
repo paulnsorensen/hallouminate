@@ -389,7 +389,7 @@ mod tests {
         // Regression for #137: the emitted relative path must be accepted by
         // `safe_relative_path`, which is the gate on read_markdown/add_markdown.
         // If this fails the field is useless as a handoff from ground.
-        use crate::corpus::sandbox::safe_relative_path;
+        use crate::corpus::safe_relative_path;
         let roots = vec!["/var/hallouminate/wiki".to_string()];
         let rel = relative_path_for("/var/hallouminate/wiki/concepts/design.md", &roots)
             .expect("must produce a relative path");

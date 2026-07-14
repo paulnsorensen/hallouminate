@@ -16,7 +16,7 @@ pub mod daemon;
 /// default parallelism does). Acquire and hold this for a test's whole body.
 pub static LANCE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-use hallouminate_adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
+use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use hallouminate_domain::common::Result;
 use hallouminate_domain::indexer::{PreparedChunk, PreparedFile};
 
