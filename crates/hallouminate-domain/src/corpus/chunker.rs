@@ -7,9 +7,10 @@ use crate::embeddings::canonical_model_name;
 
 const MAX_HEADING_LEVEL: usize = 3;
 
-/// Re-export `text_splitter::ChunkSizer` so callers don't have to depend on
-/// the crate directly.
+/// Re-export `text_splitter::ChunkSizer` and `tokenizers::Tokenizer` so
+/// callers don't have to depend on either crate directly.
 pub use text_splitter::ChunkSizer;
+pub use tokenizers::Tokenizer;
 
 /// Object-safe chunker abstraction used by the indexer.  Hides the generic
 /// `ChunkSizer` parameter so `apply`/`writer` can take `&dyn CorpusChunker`
@@ -107,7 +108,7 @@ pub fn chunk_markdown<S: ChunkSizer>(text: &str, sizer: S) -> Vec<Chunk> {
 /// Load a Hugging Face tokenizer for the given model and wrap it as a sizer
 /// that text-splitter can use. Networked on first call; cached in the standard
 /// HF cache directory.
-pub fn load_tokenizer(model_id: &str) -> Result<tokenizers::Tokenizer> {
+pub fn load_tokenizer(model_id: &str) -> Result<Tokenizer> {
     let canonical_model_id = canonical_model_name(model_id)?;
     tokenizers::Tokenizer::from_pretrained(canonical_model_id, None)
         .map_err(|e| HallouminateError::Embed(format!("load tokenizer {canonical_model_id}: {e}")))

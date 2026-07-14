@@ -1,0 +1,23 @@
+# Crate-boundary enforcement only. Advisories, licenses, and sources checks
+# are not adopted in this pass — CI runs `cargo deny check bans` specifically.
+
+[graph]
+targets = []
+
+[bans]
+# fastembed pins tokenizers 0.22 while hallouminate-domain pins 0.23, so
+# duplicate versions exist in the graph. That's expected here; this file
+# polices boundary seams, not duplicate-version hygiene.
+multiple-versions = "allow"
+wildcards = "allow"
+
+deny = [
+  # wrappers lists every crate cargo-deny sees as a direct dependent of
+  # tokenizers in the resolved graph: hallouminate-domain is the intended
+  # workspace owner; fastembed and text-splitter are third-party crates that
+  # legitimately declare tokenizers directly (fastembed always, text-splitter
+  # via its "tokenizers" feature). Any other direct dependent — e.g. the app
+  # crate re-adding tokenizers itself — fails the check.
+  { crate = "tokenizers", wrappers = ["hallouminate-domain", "fastembed", "text-splitter"], reason = "only the domain crate (plus its own third-party deps) may depend on tokenizers directly" },
+  { crate = "lancedb", wrappers = ["hallouminate-adapters"], reason = "only the adapters crate may depend on lancedb directly" },
+]

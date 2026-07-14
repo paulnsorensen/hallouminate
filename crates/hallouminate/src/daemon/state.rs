@@ -32,7 +32,7 @@ use hallouminate_adapters::{
     EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, MaintenanceOptions,
 };
 use hallouminate_domain::common::{HallouminateError, expand_tilde};
-use hallouminate_domain::corpus::{load_tokenizer, missing_roots};
+use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
@@ -150,7 +150,7 @@ impl ResourceKey {
 /// mirrors the `crossencoders: Arc<Mutex<HashMap<..>>>` cache precedent.
 pub struct RequestResources {
     pub store: Arc<LanceStore>,
-    pub tokenizer: tokenizers::Tokenizer,
+    pub tokenizer: Tokenizer,
     pub embeddings_enabled: bool,
     pub ground_dir: PathBuf,
 }
