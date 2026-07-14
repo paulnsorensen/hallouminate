@@ -76,6 +76,19 @@ fn monotonic_secs() -> u64 {
     PROCESS_START.get_or_init(Instant::now).elapsed().as_secs()
 }
 
+async fn init_embedder(
+    model: &str,
+    quantized: bool,
+    cache_dir: PathBuf,
+) -> anyhow::Result<Box<dyn EmbedBatch>> {
+    let model = model.to_owned();
+    tokio::task::spawn_blocking(move || Embedder::try_new(&model, quantized, &cache_dir))
+        .await
+        .map_err(|e| anyhow::anyhow!("embedder initialization task failed: {e}"))?
+        .map(|embedder| Box::new(embedder) as Box<dyn EmbedBatch>)
+        .map_err(|e| anyhow::anyhow!("init embedder: {e}"))
+}
+
 fn is_idle(last_use_secs: u64, now_secs: u64, idle_secs: u64) -> bool {
     now_secs.saturating_sub(last_use_secs) >= idle_secs
 }
@@ -287,15 +300,21 @@ impl DaemonState {
         // `read_markdown`, `delete_markdown`); a later embedder() call will
         // retry the load and surface the error then.
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        let mut embedder: Option<Embedder> = if cfg.embeddings.enabled {
-            match Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir) {
-                Ok(e) => Some(e),
+        let mut embedder: Option<Box<dyn EmbedBatch>> = if cfg.embeddings.enabled {
+            match init_embedder(
+                &cfg.embeddings.model,
+                cfg.embeddings.quantized,
+                cache_dir.clone(),
+            )
+            .await
+            {
+                Ok(embedder) => Some(embedder),
                 Err(e) => {
                     tracing::warn!(
                         target: "hallouminate::daemon",
                         model = %cfg.embeddings.model,
                         error = %e,
-                        "embedder unavailable at startup; will retry on first embedding request",
+                        "embedder unavailable at startup; the next request will retry initialization",
                     );
                     None
                 }
@@ -311,7 +330,7 @@ impl DaemonState {
             &cfg.embeddings.model,
             cfg.embeddings.quantized,
             cfg.embeddings.enabled,
-            embedder.take().map(|e| Box::new(e) as Box<dyn EmbedBatch>),
+            embedder.take(),
         )
         .await
         {
@@ -333,32 +352,35 @@ impl DaemonState {
                     // `embedder` was moved into the first `open_or_create` call
                     // above (now None regardless of outcome) -- `Embedder` isn't
                     // `Clone`, so build a fresh one for the rebuilt store.
-                    let rebuild_embedder: Option<Embedder> = if cfg.embeddings.enabled {
-                        match Embedder::try_new(
-                            &cfg.embeddings.model,
-                            cfg.embeddings.quantized,
-                            &cache_dir,
-                        ) {
-                            Ok(e) => Some(e),
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "hallouminate::daemon",
-                                    model = %cfg.embeddings.model,
-                                    error = %e,
-                                    "embedder unavailable for rebuild; will retry on first embedding request",
-                                );
-                                None
+                    let rebuild_embedder: Option<Box<dyn EmbedBatch>> =
+                        if cfg.embeddings.enabled {
+                            match init_embedder(
+                                &cfg.embeddings.model,
+                                cfg.embeddings.quantized,
+                                cache_dir.clone(),
+                            )
+                            .await
+                            {
+                                Ok(embedder) => Some(embedder),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        target: "hallouminate::daemon",
+                                        model = %cfg.embeddings.model,
+                                        error = %e,
+                                        "embedder unavailable for rebuild; the next request will retry initialization",
+                                    );
+                                    None
+                                }
                             }
-                        }
-                    } else {
-                        None
-                    };
+                        } else {
+                            None
+                        };
                     let fresh = LanceStore::open_or_create(
                         &ground_dir,
                         &cfg.embeddings.model,
                         cfg.embeddings.quantized,
                         cfg.embeddings.enabled,
-                        rebuild_embedder.map(|e| Box::new(e) as Box<dyn EmbedBatch>),
+                        rebuild_embedder,
                     )
                     .await
                     .map_err(|e| {
@@ -462,7 +484,7 @@ impl DaemonState {
             }
         }
         let shutdown = CancellationToken::new();
-        let embedder_arc = Arc::new(Mutex::new(embedder));
+        let embedder_arc: Arc<Mutex<Option<Embedder>>> = Arc::new(Mutex::new(None));
         let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
@@ -650,7 +672,6 @@ impl DaemonState {
     pub async fn embedder(&self) -> anyhow::Result<EmbedderGuard> {
         self.inner.baseline_resources.embedder().await
     }
-
     /// Per-request resource seam (B2+B3): resolve (or lazily build) the
     /// `RequestResources` for the effective config's `(ground_dir, model,
     /// quantized, enabled)` key. A repo-layer override of any of those
@@ -664,25 +685,57 @@ impl DaemonState {
     /// just surfaces as an `Err`, no worse than today's "can't point at a
     /// different ground_dir at all".
     pub async fn resources_for(&self, cfg: &Config) -> anyhow::Result<Arc<RequestResources>> {
+        self.resources_for_with_initializer(cfg, |model, quantized, cache_dir| async move {
+            init_embedder(&model, quantized, cache_dir).await
+        })
+        .await
+    }
+
+    async fn resources_for_with_initializer<F, Fut>(
+        &self,
+        cfg: &Config,
+        initialize: F,
+    ) -> anyhow::Result<Arc<RequestResources>>
+    where
+        F: FnOnce(String, bool, PathBuf) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Box<dyn EmbedBatch>>>,
+    {
         let key = ResourceKey::from_config(cfg);
-        // Fast path: a cache hit takes the `resources` map lock only long
-        // enough to clone the entry — never across the async build below.
-        if let Some(existing) = self.inner.resources.lock().await.get(&key) {
+        if let Some(existing) = self.inner.resources.lock().await.get(&key)
+            && (!cfg.embeddings.enabled || existing.store.embedder_available())
+        {
             return Ok(Arc::clone(existing));
         }
-        // Cache miss: serialize the build on the per-key lock so two requests
-        // sharing a key never open the same ground dir concurrently (the
-        // single-open-per-ground-dir invariant), while distinct keys build in
-        // parallel. The `resources` map lock is deliberately NOT held across
-        // the `create_dir_all` / `open_or_create` awaits — holding it there
-        // would stall unrelated requests (including cache hits on other keys)
-        // behind slow filesystem/LanceDB work.
+
         let _build = self.inner.resource_build_locks.lock(&key).await;
-        // Re-check under the map lock: another task may have built this key
-        // while we waited on the build lock.
-        if let Some(existing) = self.inner.resources.lock().await.get(&key) {
-            return Ok(Arc::clone(existing));
+        if let Some(existing) = self.inner.resources.lock().await.get(&key).cloned() {
+            if cfg.embeddings.enabled && !existing.store.embedder_available() {
+                let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
+                let retry = match initialize(
+                    cfg.embeddings.model.clone(),
+                    cfg.embeddings.quantized,
+                    cache_dir,
+                )
+                .await
+                {
+                    Ok(embedder) => existing
+                        .store
+                        .install_embedder(embedder)
+                        .map_err(anyhow::Error::from),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = retry {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        model = %cfg.embeddings.model,
+                        error = %error,
+                        "embedder retry failed; serving cached resources without embeddings",
+                    );
+                }
+            }
+            return Ok(existing);
         }
+
         let ground_dir = key.ground_dir.clone();
         if let Some(parent) = ground_dir.parent()
             && !parent.as_os_str().is_empty()
@@ -692,23 +745,15 @@ impl DaemonState {
                 .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
         }
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-        // The store now owns embedding (ChunkStore reads/writes take text and
-        // embed internally), so it must hold an embedder when embeddings are
-        // enabled. Load eagerly, tolerating failure exactly as `DaemonState::open`
-        // does, so a model-independent op can still be served if the load fails.
-        let embedder: Option<Embedder> = if cfg.embeddings.enabled {
-            match Embedder::try_new(&cfg.embeddings.model, cfg.embeddings.quantized, &cache_dir) {
-                Ok(e) => Some(e),
-                Err(e) => {
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        model = %cfg.embeddings.model,
-                        error = %e,
-                        "embedder unavailable for resource set; will retry on first embedding request",
-                    );
-                    None
-                }
-            }
+        let embedder = if cfg.embeddings.enabled {
+            Some(
+                initialize(
+                    cfg.embeddings.model.clone(),
+                    cfg.embeddings.quantized,
+                    cache_dir.clone(),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -719,7 +764,7 @@ impl DaemonState {
             &cfg.embeddings.model,
             cfg.embeddings.quantized,
             cfg.embeddings.enabled,
-            embedder.map(|e| Box::new(e) as Box<dyn EmbedBatch>),
+            embedder,
         )
         .await
         .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
@@ -1585,5 +1630,88 @@ mod tests {
                  store was opened more than once for one ground dir",
             );
         }
+    }
+    struct ZeroEmbedder;
+
+    impl EmbedBatch for ZeroEmbedder {
+        fn embed_batch(
+            &mut self,
+            texts: &[String],
+            _role: crate::adapters::embedder::EmbedRole,
+        ) -> crate::domain::common::Result<Vec<[f32; crate::adapters::embedder::EMBEDDING_DIM]>>
+        {
+            Ok(vec![
+                [0.0; crate::adapters::embedder::EMBEDDING_DIM];
+                texts.len()
+            ])
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_enabled_resource_retries_transient_embedder_failure() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let mut baseline = Config::default();
+        baseline.embeddings.enabled = false;
+        baseline.storage.ground_dir = baseline_dir.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(baseline, None)
+            .await
+            .expect("open daemon state");
+
+        let retry_dir = tempfile::tempdir().expect("retry tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = true;
+        cfg.storage.ground_dir = retry_dir.path().to_string_lossy().into_owned();
+        let store = LanceStore::open_or_create(
+            retry_dir.path(),
+            &cfg.embeddings.model,
+            cfg.embeddings.quantized,
+            true,
+            None,
+        )
+        .await
+        .expect("open enabled store without embedder");
+        let cached = Arc::new(RequestResources {
+            store: Arc::new(store),
+            tokenizer: load_tokenizer(&cfg.embeddings.model).expect("tokenizer"),
+            embeddings_enabled: true,
+            ground_dir: retry_dir.path().to_path_buf(),
+            embedder: Arc::new(Mutex::new(None)),
+            model: cfg.embeddings.model.clone(),
+            quantized: cfg.embeddings.quantized,
+            cache_dir: expand_tilde(&cfg.embeddings.cache_dir),
+            last_activity_secs: Arc::clone(&state.inner.last_activity_secs),
+        });
+        state
+            .inner
+            .resources
+            .lock()
+            .await
+            .insert(ResourceKey::from_config(&cfg), Arc::clone(&cached));
+
+        let first = state
+            .resources_for_with_initializer(&cfg, |_, _, _| async {
+                Err(anyhow::anyhow!("transient initialization failure"))
+            })
+            .await
+            .expect("cached resources remain usable after retry failure");
+        assert!(Arc::ptr_eq(&cached, &first));
+        assert!(!first.store.embedder_available());
+
+        let retried = state
+            .resources_for_with_initializer(&cfg, |_, _, _| async {
+                Ok(Box::new(ZeroEmbedder) as Box<dyn EmbedBatch>)
+            })
+            .await
+            .expect("second request retries initialization");
+        assert!(Arc::ptr_eq(&cached, &retried));
+        assert!(retried.store.embedder_available());
+
+        let normal = state
+            .resources_for_with_initializer(&cfg, |_, _, _| async {
+                panic!("ready cache hit must not initialize again")
+            })
+            .await
+            .expect("normal request reuses repaired resource");
+        assert!(Arc::ptr_eq(&retried, &normal));
     }
 }

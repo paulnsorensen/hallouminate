@@ -1,4 +1,6 @@
-use crate::domain::common::{CorpusConfig, FileRef, Result};
+use std::path::{Path, PathBuf};
+
+use crate::domain::common::{CorpusConfig, FileRef, Result, canonicalize_or_passthrough};
 use crate::domain::corpus::blake3_file;
 use crate::domain::indexer::chunk::PreparedFile;
 use crate::domain::indexer::store::ChunkStore;
@@ -136,10 +138,20 @@ pub async fn apply(
     )
     .await?;
 
-    // Deletes: one delete-by-(corpus, file_ref) per gone file.
+    // A corpus name can span several roots. `list_files` therefore feeds the
+    // planner snapshots from sibling roots too; only delete snapshots that
+    // belong to a root covered by this invocation.
+    let roots: Vec<PathBuf> = corpus
+        .paths
+        .iter()
+        .map(|root| canonicalize_or_passthrough(Path::new(root)).into_path_buf())
+        .collect();
     for snap in plan.deletes {
-        store.delete_file(&snap.corpus, &snap.file_ref).await?;
-        stats.files_deleted += 1;
+        let file = canonicalize_or_passthrough(Path::new(&snap.file_ref));
+        if roots.iter().any(|root| file.as_path().starts_with(root)) {
+            store.delete_file(&snap.corpus, &snap.file_ref).await?;
+            stats.files_deleted += 1;
+        }
     }
 
     tracing::debug!(
@@ -229,4 +241,101 @@ async fn run_in_batches(
         stats.files_upserted += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use text_splitter::Characters;
+
+    use super::*;
+    use crate::domain::common::HallouminateError;
+    use crate::domain::indexer::{BatchWriteStats, FileSnapshot, SearchHit};
+
+    #[derive(Default)]
+    struct RecordingStore {
+        deleted: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl ChunkStore for RecordingStore {
+        async fn list_files(&self, _corpus: &str) -> Result<Vec<FileSnapshot>> {
+            Ok(Vec::new())
+        }
+
+        async fn hybrid_search(
+            &self,
+            _corpus: &str,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn touch_mtime(&self, _corpus: &str, _file_ref: &str, _mtime_ms: i64) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_file(&self, _corpus: &str, file_ref: &str) -> Result<()> {
+            self.deleted
+                .lock()
+                .map_err(|_| HallouminateError::Indexer("deleted mutex poisoned".into()))?
+                .push(file_ref.to_string());
+            Ok(())
+        }
+
+        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
+            Ok(BatchWriteStats::default())
+        }
+    }
+
+    fn snapshot(path: &Path) -> FileSnapshot {
+        FileSnapshot {
+            file_ref: path.to_string_lossy().into_owned(),
+            corpus: "docs".into(),
+            mtime_ms: 0,
+            content_hash: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_only_deletes_snapshots_under_the_requested_roots() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let selected = parent.path().join("selected");
+        let sibling = parent.path().join("sibling");
+        std::fs::create_dir_all(&selected).expect("create selected root");
+        std::fs::create_dir_all(&sibling).expect("create sibling root");
+        let selected_file = canonicalize_or_passthrough(&selected)
+            .into_path_buf()
+            .join("gone.md");
+        let sibling_file = canonicalize_or_passthrough(&sibling)
+            .into_path_buf()
+            .join("keep.md");
+        let plan = IndexPlan {
+            upserts: Vec::new(),
+            mtime_touches: Vec::new(),
+            deletes: vec![snapshot(&selected_file), snapshot(&sibling_file)],
+        };
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![selected.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let store = RecordingStore::default();
+        let registry = HandlerRegistry::new(Characters, 384);
+
+        let stats = apply(plan, &store, &registry, &corpus, 16, None)
+            .await
+            .expect("apply");
+
+        assert_eq!(stats.files_deleted, 1);
+        assert_eq!(
+            *store.deleted.lock().expect("deleted mutex"),
+            vec![selected_file.to_string_lossy().into_owned()]
+        );
+    }
 }
