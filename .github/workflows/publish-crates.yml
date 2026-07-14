@@ -1,23 +1,71 @@
-# Publishes the crate to crates.io on a version tag (e.g. v0.1.0).
+# Publishes the workspace crates to crates.io on a version tag.
 # Runs alongside release.yml (dist), which builds the GitHub Release binaries.
 #
-# Auth uses crates.io Trusted Publishing (OIDC) — no stored token. One-time setup:
-#   crates.io → hallouminate → Settings → Trusted Publishing → add GitHub publisher
-#   repository: paulnsorensen/hallouminate, workflow: publish-crates.yml
-# See: https://crates.io/docs/trusted-publishing
+# Normal releases use crates.io Trusted Publishing (OIDC). The two library
+# crates must exist before crates.io can attach trusted publishers; use the
+# manual bootstrap job once, as documented in docs/src/releasing.md.
 name: publish-crates
 
 on:
   push:
     tags:
       - "**[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      bootstrap:
+        description: "Publish the first hallouminate-domain/adapters releases with CRATES_IO_TOKEN"
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   id-token: write # required for crates.io OIDC trusted publishing
 
 jobs:
+  bootstrap:
+    if: github.event_name == 'workflow_dispatch' && inputs.bootstrap
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Publish new library crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          test -n "$CARGO_REGISTRY_TOKEN"
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="hallouminate") | .version')"
+          wait_for_index() {
+            crate="$1"
+            index_url="$2"
+            for attempt in $(seq 1 20); do
+              if curl -sf --retry 3 --retry-connrefused "$index_url" | jq -e --arg version "$version" 'select(.vers == $version)' >/dev/null; then
+                echo "::notice::$crate $version is available in the sparse index"
+                return
+              fi
+              echo "Waiting for $crate $version in the sparse index (attempt $attempt/20)"
+              sleep 15
+            done
+            echo "::error::$crate $version did not appear in the sparse index"
+            return 1
+          }
+          publish_if_missing() {
+            crate="$1"
+            index_url="$2"
+            if curl -sf --retry 3 --retry-connrefused "$index_url" | jq -e --arg version "$version" 'select(.vers == $version)' >/dev/null; then
+              echo "::notice::$crate $version already published — skipping"
+              return
+            fi
+            cargo publish -p "$crate" --locked
+          }
+          publish_if_missing hallouminate-domain https://index.crates.io/ha/ll/hallouminate-domain
+          wait_for_index hallouminate-domain https://index.crates.io/ha/ll/hallouminate-domain
+          publish_if_missing hallouminate-adapters https://index.crates.io/ha/ll/hallouminate-adapters
+
   publish:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -25,32 +73,45 @@ jobs:
       - name: Verify tag matches Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
-          manifest="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
+          manifest="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="hallouminate") | .version')"
           if [ "$tag" != "$manifest" ]; then
             echo "::error::Tag version '$tag' does not match Cargo.toml version '$manifest'"
             exit 1
           fi
-      # Idempotency guard: crates.io versions are immutable, so re-tagging an
-      # already-published version makes `cargo publish` fail "already exists".
-      # Skip the publish when the version is already on the sparse index so a
-      # re-tag (to re-ship binaries) exits green instead of red.
-      - name: Skip if version already on crates.io
-        id: published
-        run: |
-          v="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[0].version')"
-          if curl -sf --retry 3 --retry-connrefused "https://index.crates.io/ha/ll/hallouminate" | jq -r .vers | grep -Fqx "$v"; then
-            echo "::notice::hallouminate $v already published — skipping cargo publish"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
       - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
         id: auth
-        if: steps.published.outputs.skip != 'true'
       - name: Install protoc
-        # `cargo publish` runs a verify build that compiles lance-encoding,
-        # whose build script needs protoc (same dep ci.yml/dist install).
-        if: steps.published.outputs.skip != 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo publish --locked
-        if: steps.published.outputs.skip != 'true'
+      - name: Publish unpublished workspace crates in dependency order
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="hallouminate") | .version')"
+          wait_for_index() {
+            crate="$1"
+            index_url="$2"
+            for attempt in $(seq 1 20); do
+              if curl -sf --retry 3 --retry-connrefused "$index_url" | jq -e --arg version "$version" 'select(.vers == $version)' >/dev/null; then
+                echo "::notice::$crate $version is available in the sparse index"
+                return
+              fi
+              echo "Waiting for $crate $version in the sparse index (attempt $attempt/20)"
+              sleep 15
+            done
+            echo "::error::$crate $version did not appear in the sparse index"
+            return 1
+          }
+          publish_if_missing() {
+            crate="$1"
+            index_url="$2"
+            if curl -sf --retry 3 --retry-connrefused "$index_url" | jq -e --arg version "$version" 'select(.vers == $version)' >/dev/null; then
+              echo "::notice::$crate $version already published — skipping"
+              return
+            fi
+            cargo publish -p "$crate" --locked
+          }
+          publish_if_missing hallouminate-domain https://index.crates.io/ha/ll/hallouminate-domain
+          wait_for_index hallouminate-domain https://index.crates.io/ha/ll/hallouminate-domain
+          publish_if_missing hallouminate-adapters https://index.crates.io/ha/ll/hallouminate-adapters
+          wait_for_index hallouminate-adapters https://index.crates.io/ha/ll/hallouminate-adapters
+          publish_if_missing hallouminate https://index.crates.io/ha/ll/hallouminate

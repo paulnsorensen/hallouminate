@@ -1,0 +1,2260 @@
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use hallouminate_domain::common::{CorpusConfig, HallouminateError, Result};
+use hallouminate_domain::discovery::{DEFAULT_MAX_DEPTH, IgnoreRules, discover_wiki_roots};
+use hallouminate_domain::embeddings::{DEFAULT_EMBED_MODEL, canonical_model_name};
+use hallouminate_domain::repository::{
+    RepositoryConfig, effective_corpora, repository_for_discovered_wiki,
+    union_discovered_repositories,
+};
+
+const DEFAULT_TOP_FILES: usize = 10;
+const DEFAULT_CHUNKS_PER_FILE: usize = 3;
+const DEFAULT_DEBOUNCE_MS: u64 = 500;
+const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
+const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
+// #139: crossencoder rerank timeout, configurable via `[search].rerank_timeout_ms`.
+// 2s covers the measured ~1.25s median rerank for the default N=50 candidate
+// pool — see `domain::search::crossencoder` for the latency rationale.
+const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
+
+/// Search and ranking defaults applied when a query does not override them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Number of files returned per query by default (default `10`).
+    #[serde(default = "default_top_files")]
+    pub top_files_default: usize,
+    /// Number of chunks shown per file by default (default `3`).
+    #[serde(default = "default_chunks_per_file")]
+    pub chunks_per_file_default: usize,
+    /// Crossencoder model identifier (e.g. `"jina-reranker-v1-turbo-en"`).
+    /// `None` (the default) disables the rerank step entirely; the
+    /// FTS+vector+rg fusion result is returned as-is. Names map to
+    /// `domain::search::crossencoder::canonical_crossencoder_model`.
+    #[serde(default)]
+    pub crossencoder: Option<String>,
+    /// Milliseconds to wait for the crossencoder rerank before falling back
+    /// to fusion order (default `2000`, i.e. 2s). See #139 and
+    /// `domain::ground::orchestrate::rerank_with_timeout`.
+    #[serde(default = "default_rerank_timeout_ms")]
+    pub rerank_timeout_ms: u64,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            top_files_default: DEFAULT_TOP_FILES,
+            chunks_per_file_default: DEFAULT_CHUNKS_PER_FILE,
+            crossencoder: None,
+            rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
+        }
+    }
+}
+
+/// Dense-embedding settings: which model to load, whether to load one at all,
+/// and where to cache it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingsConfig {
+    /// Switch for dense embeddings. On by default: hallouminate downloads the
+    /// embedding model on first use and fuses the dense (vector) signal into
+    /// retrieval. Set `false` to run a lexical-only path (FTS + ripgrep +
+    /// rerank) that loads no embedding model — only the tokenizer needed for
+    /// chunking.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Embedding model identifier (default Snowflake Arctic-S). Legacy aliases
+    /// are normalized to a canonical name at load time; unknown names are
+    /// rejected before any download.
+    #[serde(default = "default_model")]
+    pub model: String,
+    /// Select the fastembed `*Q` quantized variant of `model` when one
+    /// exists. Errors at load time for models with no quantized ONNX
+    /// (multilingual-e5-small).
+    #[serde(default)]
+    pub quantized: bool,
+    /// Directory where fastembed caches downloaded model files
+    /// (default `~/.cache/hallouminate/fastembed`).
+    #[serde(default = "default_embed_cache")]
+    pub cache_dir: String,
+    /// Deprecated — does nothing. Session eviction was removed (ADR-001):
+    /// dropping the ORT session never released its `BFCArena` memory. Setting
+    /// this only emits a deprecation warning at daemon start. Use
+    /// `[daemon].idle_exit_secs` instead.
+    #[serde(default = "default_idle_evict_secs")]
+    pub idle_evict_secs: u64,
+}
+
+impl Default for EmbeddingsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: DEFAULT_EMBED_MODEL.into(),
+            quantized: false,
+            cache_dir: DEFAULT_EMBED_CACHE.into(),
+            idle_evict_secs: default_idle_evict_secs(),
+        }
+    }
+}
+
+/// File-watcher settings for incremental re-indexing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchConfig {
+    /// Milliseconds to wait after the last filesystem event before re-indexing,
+    /// coalescing bursts of changes (default `500`).
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
+        }
+    }
+}
+
+/// Daemon-wide runtime settings, orthogonal to any single concern (search,
+/// embeddings, storage).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Seconds of no completed activity (and zero active connections) before
+    /// the daemon exits cleanly so the OS reclaims all memory. The next CLI or
+    /// MCP use transparently respawns it (~4 s cold start). `0` disables
+    /// idle-exit — the daemon lives until stopped. Default: `900` (15 min).
+    #[serde(default = "default_idle_exit_secs")]
+    pub idle_exit_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_exit_secs: default_idle_exit_secs(),
+        }
+    }
+}
+
+/// On-disk storage locations for hallouminate's persistent state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Directory holding the ground (markdown wiki) store
+    /// (default `~/.local/share/hallouminate/ground`).
+    #[serde(default = "default_ground_dir")]
+    pub ground_dir: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            ground_dir: DEFAULT_GROUND_DIR.into(),
+        }
+    }
+}
+
+/// The fully-resolved hallouminate configuration.
+///
+/// Assembled by merging the XDG baseline layer with the discovered per-repo
+/// layer; every nested section falls back to its `Default` when omitted, so an
+/// empty config decodes to a fully-defaulted `Config`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Config {
+    /// User-defined corpora, declared as `[[corpus]]` entries.
+    #[serde(rename = "corpus", default)]
+    pub corpora: Vec<CorpusConfig>,
+    /// Indexed code repositories, declared as `[[repository]]` entries.
+    // Accept the legacy `[[code_repo]]` plural too so configs written
+    // before the rename (PR #21) keep loading instead of silently dropping
+    // every repository entry. `config validate` still warns on the legacy
+    // key so users have a clear nudge to migrate.
+    #[serde(rename = "repository", alias = "code_repo", default)]
+    pub repositories: Vec<RepositoryConfig>,
+    /// Search and ranking defaults.
+    #[serde(default)]
+    pub search: SearchConfig,
+    /// Dense-embedding settings.
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+    /// File-watcher settings.
+    #[serde(default)]
+    pub watch: WatchConfig,
+    /// On-disk storage locations.
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// Daemon-wide runtime settings.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
+}
+
+impl Config {
+    /// All corpora visible to the daemon: explicit `[[corpus]]` entries plus
+    /// `repo:{name}:wiki` / `repo:{name}:corpus` derived from
+    /// `[[repository]]` entries. Fails on duplicate final names so a
+    /// `[[corpus]]` cannot shadow a derived repository corpus.
+    pub fn effective_corpora(&self) -> Result<Vec<CorpusConfig>> {
+        effective_corpora(&self.corpora, &self.repositories)
+    }
+}
+
+/// Per-request diagnostic struct used by `config validate` / `config show`.
+///
+/// `xdg_path` is `None` when the baseline came from `--config PATH`; otherwise
+/// it carries the XDG location actually consulted (even if the file was
+/// absent — `load_xdg` defaults silently on `NotFound`). `repo_path` is
+/// `None` when discovery reached the filesystem root with no `.git` boundary
+/// and `resolve_for_cwd` resolved baseline-only (issue #102); otherwise it
+/// carries the discovered repo config.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedLayers {
+    pub xdg_path: Option<PathBuf>,
+    pub repo_path: Option<PathBuf>,
+    /// Non-fatal advisories raised while resolving corpora — currently only
+    /// the cross-repo union (#106) name-collision warning, when a
+    /// walk-discovered sub-repo wiki shadows a baseline `[[repository]]` of
+    /// the same derived corpus name. `handle_ground` surfaces these on the
+    /// `GroundResponse.warnings` list. Empty in the common case.
+    pub warnings: Vec<String>,
+}
+
+/// Load the XDG baseline (or `--config PATH`).
+///
+/// A confirmed `NotFound` on the resolved path degrades to `Config::default()`
+/// so a fresh install boots without a config file. Other io errors propagate.
+pub fn load_xdg(path: Option<&Path>) -> Result<Config> {
+    let resolved = match path {
+        Some(p) => p.to_path_buf(),
+        None => xdg_config_path(),
+    };
+    // Only treat a confirmed `NotFound` as "no config file, use defaults".
+    // Other io errors (permission denied, broken symlink, unreadable dir)
+    // must propagate so the user isn't silently dropped to an empty
+    // configuration when the actual problem is filesystem state.
+    let text = match std::fs::read_to_string(&resolved) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Config::default());
+        }
+        Err(e) => return Err(HallouminateError::from(e)),
+    };
+    parse(&text, Some(&resolved))
+}
+
+/// Backwards-compatible alias for `load_xdg`. Callers outside this module
+/// (CLI subcommands, the daemon entry point) still use `config::load`, so
+/// the alias stays until those call sites migrate.
+pub fn load(path: Option<&Path>) -> Result<Config> {
+    load_xdg(path)
+}
+
+/// Walk from `cwd` up looking for `.hallouminate/config.toml`.
+///
+/// First-match-wins; never composes multiple repo configs. Three outcomes:
+///   - found a config → `Ok(Some(path))`.
+///   - hit a `.git` entry (file *or* directory — git worktrees use a file)
+///     with no config in between → `Err`. Inside a repo, the daemon refuses
+///     to fall back to baseline-only; explicit repo config is required.
+///   - reached the filesystem root without ever hitting a `.git` boundary →
+///     `Ok(None)`. There is no repo context to be strict about, so callers
+///     degrade to baseline-only instead of failing (issue #102).
+///
+/// Relative `cwd` is normalized to an absolute path against the process'
+/// `current_dir()` before walking, so `Path::parent()` walks reliably reach
+/// the real filesystem root (a relative path bottoms out at the empty
+/// component instead, producing a misleading "reached filesystem root"
+/// error).
+pub fn discover_repo_config(cwd: &Path) -> Result<Option<PathBuf>> {
+    let absolute_cwd = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        let here = std::env::current_dir().map_err(HallouminateError::from)?;
+        absolutize_cwd(cwd, &here)
+    };
+    let mut current: Option<&Path> = Some(&absolute_cwd);
+    while let Some(level) = current {
+        let candidate = level.join(".hallouminate").join("config.toml");
+        // `is_file` returns false on io errors (permission denied, broken
+        // symlink), which is the right call here — we want to continue
+        // walking instead of erroring out partway up the tree.
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+        let git_marker = level.join(".git");
+        if git_marker.is_dir() {
+            // Normal clone: `.git` directory is the hard repo-root boundary.
+            return Err(HallouminateError::Config(format!(
+                "no .hallouminate/config.toml found walking up from {} \
+                 (stopped at repo root {})",
+                cwd.display(),
+                level.display(),
+            )));
+        }
+        if git_marker.is_file() {
+            // `.git` file: either a linked worktree or a submodule.
+            // Only linked worktrees have a gitdir pointer containing `/worktrees/`;
+            // for those, hop to the main checkout and continue searching there.
+            // Submodule pointers (containing `/modules/`) fall through to the
+            // hard-error below so they never inherit the superproject's config.
+            if let Some(main_root) = worktree_main_root(&git_marker) {
+                return discover_repo_config_from(cwd, &main_root);
+            }
+            return Err(HallouminateError::Config(format!(
+                "no .hallouminate/config.toml found walking up from {} \
+                 (stopped at repo root {})",
+                cwd.display(),
+                level.display(),
+            )));
+        }
+        current = level.parent();
+    }
+    // Reached the filesystem root without a `.git` boundary: no repo context
+    // at all. Soft-fall-back to baseline-only rather than stranding the
+    // baseline-declared corpora (issue #102).
+    Ok(None)
+}
+
+/// Normalize a relative `cwd` to an absolute path by joining it against `base`
+/// (the process `current_dir()` in production). Pulled out of
+/// `discover_repo_config` so the join can be asserted hermetically against a
+/// controlled base, without depending on the process' real working directory
+/// (which, when the test runs inside a repo that ships its own
+/// `.hallouminate/config.toml`, would make the discovery walk find that config
+/// instead of exercising the normalization).
+fn absolutize_cwd(cwd: &Path, base: &Path) -> PathBuf {
+    base.join(cwd)
+}
+
+/// If `git_file` is a linked-worktree `.git` file (i.e. its `gitdir:` pointer
+/// contains a `/.git/worktrees/` segment), return the main checkout root.
+///
+/// The pointer looks like `<common-gitdir>/worktrees/<name>`; stripping
+/// `worktrees/<name>` gives `<common-gitdir>` (e.g. `/repo/.git`), and the
+/// main checkout root is its parent (`/repo`).
+///
+/// Relative pointers (written by `git worktree add --relative-paths` or when
+/// `extensions.relativeWorktrees = true`) are resolved against the worktree
+/// root (the parent directory of the `.git` FILE) before stripping.
+///
+/// Returns `None` for submodule pointers (`/modules/` but no `.git/worktrees/`
+/// structural segment) or any file that can't be parsed, so callers treat
+/// those as a hard stop.
+fn worktree_main_root(git_file: &Path) -> Option<PathBuf> {
+    let content = std::fs::read_to_string(git_file).ok()?;
+    let gitdir_line = content.lines().find(|l| l.starts_with("gitdir:"))?;
+    let ptr = gitdir_line.trim_start_matches("gitdir:").trim();
+    let ptr_path = Path::new(ptr);
+    // Resolve relative pointers against the worktree root (the directory that
+    // contains the `.git` FILE) so that `--relative-paths` worktrees work the
+    // same as those written with absolute pointers.
+    let resolved: PathBuf = if ptr_path.is_relative() {
+        let wt_root = git_file.parent()?;
+        wt_root.join(ptr_path)
+    } else {
+        ptr_path.to_path_buf()
+    };
+    // Only hop for worktree pointers; submodule pointers must not inherit the
+    // superproject config (issue #132 guard).
+    //
+    // Structural guard: require the `worktrees` component to be IMMEDIATELY
+    // preceded by a `.git` component so a superproject directory literally
+    // named "worktrees" (e.g. `gitdir: /home/me/worktrees/.git/modules/sub`)
+    // is not mistaken for a linked-worktree pointer.
+    let components: Vec<_> = resolved.components().collect();
+    let worktrees_pos = components
+        .windows(2)
+        .position(|w| w[0].as_os_str() == ".git" && w[1].as_os_str() == "worktrees")
+        .map(|i| i + 1)?; // position of the `worktrees` component itself
+    // Strip `worktrees/<name>` to get the common gitdir, then take its parent.
+    let common_gitdir = components[..worktrees_pos].iter().collect::<PathBuf>();
+    common_gitdir.parent().map(|p| p.to_path_buf())
+}
+
+/// Walk upward from `start` looking for `.hallouminate/config.toml`, treating
+/// any `.git` marker (file or directory) as the hard repo-root boundary. Used after a worktree
+/// hop so that the original `cwd` still appears in any error message.
+fn discover_repo_config_from(cwd: &Path, start: &Path) -> Result<Option<PathBuf>> {
+    let mut current: Option<&Path> = Some(start);
+    while let Some(level) = current {
+        let candidate = level.join(".hallouminate").join("config.toml");
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+        let git_marker = level.join(".git");
+        if git_marker.exists() {
+            return Err(HallouminateError::Config(format!(
+                "no .hallouminate/config.toml found walking up from {} \
+                 (stopped at repo root {})",
+                cwd.display(),
+                level.display(),
+            )));
+        }
+        current = level.parent();
+    }
+    Ok(None)
+}
+/// Parse a repo-layer TOML file, resolving relative paths against the
+/// **repo root** (the parent of `.hallouminate/`, i.e. the directory the
+/// user would `cd` into when working on the repo).
+///
+/// Same schema as `load_xdg`. Differences:
+///   - `[[repository]].path`, `[[repository]].corpus_paths[*]`,
+///     `[[corpus]].paths[*]`, `[storage].ground_dir`, and
+///     `[embeddings].cache_dir` get resolved against the repo root and
+///     stored as absolute strings. Resolving against the repo root (not the
+///     `.hallouminate/` directory) matches user intuition — writing
+///     `paths = ["docs"]` in `.hallouminate/config.toml` means
+///     `<repo>/docs`, and `[[repository]] path = "."` means the repo root
+///     itself (so `wiki_directory` lands at `<repo>/.hallouminate/wiki`,
+///     not `<repo>/.hallouminate/.hallouminate/wiki`).
+///   - Absolute paths and `~`-prefixed paths pass through untouched —
+///     tilde expansion happens at consumption time via `expand_tilde`,
+///     identical to the XDG layer's behavior today.
+///   - The same `validate()` rules apply (post-resolution).
+pub fn load_repo_layer(config_path: &Path) -> Result<Config> {
+    let text = std::fs::read_to_string(config_path).map_err(HallouminateError::from)?;
+    let mut cfg: Config = toml::from_str(&text).map_err(|e| {
+        HallouminateError::Config(format!("parsing config at {}: {e}", config_path.display()))
+    })?;
+    // Resolve against the parent of `.hallouminate/`, i.e. the repo root.
+    // `discover_repo_config` only returns paths ending in
+    // `<repo_root>/.hallouminate/config.toml`, so two `parent()` hops are
+    // always defined for paths produced by discovery. For programmatic
+    // callers that hand us a flatter path we fall back to a single hop
+    // rather than panic.
+    let hallouminate_dir = config_path.parent().ok_or_else(|| {
+        HallouminateError::Config(format!(
+            "repo config path has no parent directory: {}",
+            config_path.display(),
+        ))
+    })?;
+    let repo_root = hallouminate_dir.parent().unwrap_or(hallouminate_dir);
+    resolve_repo_layer_paths(&mut cfg, repo_root);
+    normalize(&mut cfg)?;
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+/// Merge a baseline `Config` with a repo-layer `Config`.
+///
+/// List sections (`corpora`, `repositories`) are appended baseline-first
+/// then repo-layer; cross-layer name collisions surface via
+/// `effective_corpora`'s duplicate-name detection on the combined list.
+///
+/// Scalar sections (`search`, `embeddings`, `watch`, `storage`) merge field
+/// by field. "Explicitly set" is determined by comparison against
+/// `Config::default()` — the practical "sentinel" form sanctioned by the
+/// spec, since `&Config` carries no per-field provenance. The single
+/// consequence is that a layer that explicitly re-states the default cannot
+/// trigger a conflict against an *other* layer holding the default; both
+/// resolve to the default anyway, so behavior is unchanged.
+pub fn merge_layers(baseline: &Config, repo: &Config) -> Result<Config> {
+    merge_layers_with_sources(baseline, repo, None, None)
+}
+
+/// Variant of `merge_layers` that names source paths in conflict messages.
+/// Internal helper so `resolve_for_cwd` can produce richer diagnostics
+/// without inflating the public API surface.
+fn merge_layers_with_sources(
+    baseline: &Config,
+    repo: &Config,
+    baseline_path: Option<&Path>,
+    repo_path: Option<&Path>,
+) -> Result<Config> {
+    let defaults = Config::default();
+    let mut corpora = baseline.corpora.clone();
+    corpora.extend(repo.corpora.iter().cloned());
+    let mut repositories = baseline.repositories.clone();
+    repositories.extend(repo.repositories.iter().cloned());
+
+    let search = SearchConfig {
+        top_files_default: merge_scalar(
+            "search.top_files_default",
+            baseline.search.top_files_default,
+            repo.search.top_files_default,
+            defaults.search.top_files_default,
+            baseline_path,
+            repo_path,
+        )?,
+        chunks_per_file_default: merge_scalar(
+            "search.chunks_per_file_default",
+            baseline.search.chunks_per_file_default,
+            repo.search.chunks_per_file_default,
+            defaults.search.chunks_per_file_default,
+            baseline_path,
+            repo_path,
+        )?,
+        crossencoder: merge_scalar(
+            "search.crossencoder",
+            baseline.search.crossencoder.clone(),
+            repo.search.crossencoder.clone(),
+            defaults.search.crossencoder.clone(),
+            baseline_path,
+            repo_path,
+        )?,
+        rerank_timeout_ms: merge_scalar(
+            "search.rerank_timeout_ms",
+            baseline.search.rerank_timeout_ms,
+            repo.search.rerank_timeout_ms,
+            defaults.search.rerank_timeout_ms,
+            baseline_path,
+            repo_path,
+        )?,
+    };
+    let embeddings = EmbeddingsConfig {
+        enabled: merge_scalar(
+            "embeddings.enabled",
+            baseline.embeddings.enabled,
+            repo.embeddings.enabled,
+            defaults.embeddings.enabled,
+            baseline_path,
+            repo_path,
+        )?,
+        model: merge_scalar(
+            "embeddings.model",
+            baseline.embeddings.model.clone(),
+            repo.embeddings.model.clone(),
+            defaults.embeddings.model.clone(),
+            baseline_path,
+            repo_path,
+        )?,
+        quantized: merge_scalar(
+            "embeddings.quantized",
+            baseline.embeddings.quantized,
+            repo.embeddings.quantized,
+            defaults.embeddings.quantized,
+            baseline_path,
+            repo_path,
+        )?,
+        cache_dir: merge_scalar(
+            "embeddings.cache_dir",
+            baseline.embeddings.cache_dir.clone(),
+            repo.embeddings.cache_dir.clone(),
+            defaults.embeddings.cache_dir.clone(),
+            baseline_path,
+            repo_path,
+        )?,
+        idle_evict_secs: merge_scalar(
+            "embeddings.idle_evict_secs",
+            baseline.embeddings.idle_evict_secs,
+            repo.embeddings.idle_evict_secs,
+            defaults.embeddings.idle_evict_secs,
+            baseline_path,
+            repo_path,
+        )?,
+    };
+    let watch = WatchConfig {
+        debounce_ms: merge_scalar(
+            "watch.debounce_ms",
+            baseline.watch.debounce_ms,
+            repo.watch.debounce_ms,
+            defaults.watch.debounce_ms,
+            baseline_path,
+            repo_path,
+        )?,
+    };
+    let storage = StorageConfig {
+        ground_dir: merge_scalar(
+            "storage.ground_dir",
+            baseline.storage.ground_dir.clone(),
+            repo.storage.ground_dir.clone(),
+            defaults.storage.ground_dir.clone(),
+            baseline_path,
+            repo_path,
+        )?,
+    };
+    let daemon = DaemonConfig {
+        idle_exit_secs: merge_scalar(
+            "daemon.idle_exit_secs",
+            baseline.daemon.idle_exit_secs,
+            repo.daemon.idle_exit_secs,
+            defaults.daemon.idle_exit_secs,
+            baseline_path,
+            repo_path,
+        )?,
+    };
+
+    let merged = Config {
+        corpora,
+        repositories,
+        search,
+        embeddings,
+        watch,
+        storage,
+        daemon,
+    };
+    // Re-run cross-layer validation on the combined lists; the inner
+    // `effective_corpora` call covers duplicate-name detection across
+    // baseline and repo entries.
+    validate(&merged)?;
+    Ok(merged)
+}
+
+/// Per-request top-level: discover the repo config under `cwd`, load it,
+/// and merge with the supplied `baseline`. `xdg_path` is the location the
+/// baseline came from (`None` when the caller used `--config PATH`); it
+/// only feeds the returned `ResolvedLayers` diagnostic and the conflict
+/// messages in `merge_layers`.
+pub fn resolve_for_cwd(
+    baseline: &Config,
+    cwd: &Path,
+    xdg_path: Option<&Path>,
+) -> Result<(Config, ResolvedLayers)> {
+    // No `.git` boundary anywhere up the walk: there is no repo context to
+    // merge, so resolve baseline-only instead of erroring. This keeps the
+    // baseline-declared corpora reachable from a parent-of-repos directory
+    // (issue #102). A `.git` boundary with no config still errors via `?`.
+    let Some(repo_path) = discover_repo_config(cwd)? else {
+        // Baseline-only mode: cwd sits above all repos. Walk downward for
+        // sub-repo wikis and union them with the baseline `[[repository]]`
+        // entries (#106) so a `cd ~/Dev && ground "..."` searches every
+        // repo's wiki at once, not just baseline-registered ones.
+        let mut baseline_only = baseline.clone();
+        let discovered: Vec<RepositoryConfig> =
+            discover_wiki_roots(cwd, DEFAULT_MAX_DEPTH, &IgnoreRules::default())
+                .into_iter()
+                .filter_map(|w| repository_for_discovered_wiki(&w.repo_root))
+                .collect();
+        let (repositories, warnings) =
+            union_discovered_repositories(&baseline_only.repositories, discovered);
+        baseline_only.repositories = repositories;
+        validate(&baseline_only)?;
+        return Ok((
+            baseline_only,
+            ResolvedLayers {
+                xdg_path: xdg_path.map(Path::to_path_buf),
+                repo_path: None,
+                warnings,
+            },
+        ));
+    };
+    let repo = load_repo_layer(&repo_path)?;
+    let effective = merge_layers_with_sources(baseline, &repo, xdg_path, Some(&repo_path))?;
+    Ok((
+        effective,
+        ResolvedLayers {
+            xdg_path: xdg_path.map(Path::to_path_buf),
+            repo_path: Some(repo_path),
+            warnings: Vec::new(),
+        },
+    ))
+}
+
+fn merge_scalar<T>(
+    field: &str,
+    baseline: T,
+    repo: T,
+    default: T,
+    baseline_path: Option<&Path>,
+    repo_path: Option<&Path>,
+) -> Result<T>
+where
+    T: PartialEq + std::fmt::Debug,
+{
+    let baseline_set = baseline != default;
+    let repo_set = repo != default;
+    match (baseline_set, repo_set) {
+        (false, false) => Ok(default),
+        (true, false) => Ok(baseline),
+        (false, true) => Ok(repo),
+        (true, true) => {
+            if baseline == repo {
+                Ok(baseline)
+            } else {
+                let baseline_src = baseline_path
+                    .map(|p| format!(" (baseline at {})", p.display()))
+                    .unwrap_or_else(|| " (baseline)".into());
+                let repo_src = repo_path
+                    .map(|p| format!(" (repo at {})", p.display()))
+                    .unwrap_or_else(|| " (repo layer)".into());
+                Err(HallouminateError::Config(format!(
+                    "scalar conflict on {field}: baseline = {baseline:?}{baseline_src}, \
+                     repo = {repo:?}{repo_src}"
+                )))
+            }
+        }
+    }
+}
+
+/// Rewrite every relative non-tilde path in `cfg` as `base.join(path)`.
+/// `.` / `..` segments are preserved as written — `Path::join` does not
+/// normalize, and we don't post-process via `Path::components` because
+/// canonicalization would require the path to exist on disk. Absolute
+/// paths and `~`-prefixed paths are left alone.
+fn resolve_repo_layer_paths(cfg: &mut Config, base: &Path) {
+    for corpus in cfg.corpora.iter_mut() {
+        for p in corpus.paths.iter_mut() {
+            *p = resolve_repo_path(p, base);
+        }
+    }
+    for repo in cfg.repositories.iter_mut() {
+        repo.path = resolve_repo_path(&repo.path, base);
+        for p in repo.corpus_paths.iter_mut() {
+            *p = resolve_repo_path(p, base);
+        }
+    }
+    cfg.storage.ground_dir = resolve_repo_path(&cfg.storage.ground_dir, base);
+    cfg.embeddings.cache_dir = resolve_repo_path(&cfg.embeddings.cache_dir, base);
+}
+
+fn resolve_repo_path(raw: &str, base: &Path) -> String {
+    if raw.is_empty() {
+        return raw.to_string();
+    }
+    if raw.starts_with('~') {
+        return raw.to_string();
+    }
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return raw.to_string();
+    }
+    base.join(candidate).to_string_lossy().into_owned()
+}
+
+pub fn xdg_config_path() -> PathBuf {
+    crate::xdg::xdg_path(
+        "XDG_CONFIG_HOME",
+        "~/.config",
+        &["hallouminate", "config.toml"],
+    )
+}
+
+/// Pure resolver kept as a thin wrapper so the existing test suite can
+/// exercise both branches without touching process env (unsafe on edition
+/// 2024) or relying on the developer's local shell environment.
+#[cfg(test)]
+fn xdg_config_path_from(xdg_config_home: Option<&std::ffi::OsStr>) -> PathBuf {
+    crate::xdg::xdg_path_from(
+        xdg_config_home,
+        "~/.config",
+        &["hallouminate", "config.toml"],
+    )
+}
+
+fn parse(text: &str, source: Option<&Path>) -> Result<Config> {
+    let mut cfg: Config = toml::from_str(text).map_err(|e| {
+        let where_ = source
+            .map(|p| format!(" at {}", p.display()))
+            .unwrap_or_default();
+        HallouminateError::Config(format!("parsing config{where_}: {e}"))
+    })?;
+    normalize(&mut cfg)?;
+    validate(&cfg)?;
+    Ok(cfg)
+}
+
+fn normalize(cfg: &mut Config) -> Result<()> {
+    cfg.embeddings.model = canonical_model_name(&cfg.embeddings.model)?.to_string();
+    Ok(())
+}
+
+fn validate(cfg: &Config) -> Result<()> {
+    for (idx, c) in cfg.corpora.iter().enumerate() {
+        if c.name.trim().is_empty() {
+            return Err(HallouminateError::Config(format!(
+                "corpus #{idx} has empty name"
+            )));
+        }
+        if c.paths.is_empty() {
+            return Err(HallouminateError::Config(format!(
+                "corpus '{}' has no paths",
+                c.name
+            )));
+        }
+    }
+    for (idx, r) in cfg.repositories.iter().enumerate() {
+        if r.name.trim().is_empty() {
+            return Err(HallouminateError::Config(format!(
+                "repository #{idx} has empty name"
+            )));
+        }
+        if r.path.trim().is_empty() {
+            return Err(HallouminateError::Config(format!(
+                "repository '{}' has empty path",
+                r.name
+            )));
+        }
+    }
+    // At most one corpus may carry `global = true`. A single global corpus
+    // must be unambiguous; two would make the target nondeterministic, so
+    // reject the config outright rather than picking one at request time.
+    let globals: Vec<&str> = cfg
+        .corpora
+        .iter()
+        .filter(|c| c.global)
+        .map(|c| c.name.as_str())
+        .collect();
+    if globals.len() > 1 {
+        return Err(HallouminateError::Config(format!(
+            "more than one corpus marked global = true: {}; exactly one is allowed",
+            globals.join(", "),
+        )));
+    }
+    // Surface duplicate-name and bad-name failures at config-load time
+    // instead of waiting for the daemon to enumerate corpora at request
+    // time.
+    cfg.effective_corpora()?;
+    Ok(())
+}
+
+fn default_top_files() -> usize {
+    DEFAULT_TOP_FILES
+}
+fn default_chunks_per_file() -> usize {
+    DEFAULT_CHUNKS_PER_FILE
+}
+fn default_rerank_timeout_ms() -> u64 {
+    DEFAULT_RERANK_TIMEOUT_MS
+}
+fn default_debounce_ms() -> u64 {
+    DEFAULT_DEBOUNCE_MS
+}
+fn default_enabled() -> bool {
+    true
+}
+fn default_model() -> String {
+    DEFAULT_EMBED_MODEL.into()
+}
+fn default_embed_cache() -> String {
+    DEFAULT_EMBED_CACHE.into()
+}
+fn default_idle_evict_secs() -> u64 {
+    300
+}
+fn default_ground_dir() -> String {
+    DEFAULT_GROUND_DIR.into()
+}
+fn default_idle_exit_secs() -> u64 {
+    900
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rejects_two_global_corpora() {
+        // The single corpus with `global = true` must be unambiguous; two
+        // would be ambiguous, so config validation must reject the file
+        // outright.
+        let err = parse(
+            r#"
+[[corpus]]
+name = "a"
+paths = ["/a"]
+global = true
+
+[[corpus]]
+name = "b"
+paths = ["/b"]
+global = true
+"#,
+            None,
+        )
+        .expect_err("two global corpora must fail validation");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("global"), "got: {msg}");
+                assert!(
+                    msg.contains('a') && msg.contains('b'),
+                    "must name both: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_single_global_corpus() {
+        let cfg = parse(
+            r#"
+[[corpus]]
+name = "global"
+paths = ["/g"]
+global = true
+
+[[corpus]]
+name = "local"
+paths = ["/l"]
+"#,
+            None,
+        )
+        .expect("one global corpus is valid");
+        let global = cfg
+            .corpora
+            .iter()
+            .find(|c| c.global)
+            .expect("global corpus present");
+        assert_eq!(global.name, "global");
+        assert!(
+            !cfg.corpora
+                .iter()
+                .find(|c| c.name == "local")
+                .unwrap()
+                .global
+        );
+    }
+
+    #[test]
+    fn parse_defaults_corpus_global_to_false() {
+        let cfg = parse("[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n", None).expect("parse");
+        assert!(!cfg.corpora[0].global, "global must default to false");
+    }
+
+    const SPEC_EXAMPLE: &str = r#"
+[[corpus]]
+name = "claude-config"
+paths = ["~/.claude/skills", "~/.claude/agents", "~/.claude/CLAUDE.md"]
+globs = ["**/*.md"]
+exclude = ["**/.git/**", "**/node_modules/**"]
+
+[[repository]]
+name = "tern"
+path = "~/Dev/tern"
+
+[search]
+top_files_default       = 10
+chunks_per_file_default = 3
+
+[embeddings]
+enabled   = true
+model     = "BAAI/bge-small-en-v1.5"
+quantized = false
+cache_dir = "~/.cache/hallouminate/fastembed"
+
+[watch]
+debounce_ms = 500
+
+[storage]
+ground_dir = "~/.local/share/hallouminate/ground"
+"#;
+
+    #[test]
+    fn parse_spec_example_decodes_every_field() {
+        let cfg = parse(SPEC_EXAMPLE, None).expect("spec example parses");
+
+        assert_eq!(cfg.corpora.len(), 1);
+        let corpus = &cfg.corpora[0];
+        assert_eq!(corpus.name, "claude-config");
+        assert_eq!(
+            corpus.paths,
+            vec![
+                "~/.claude/skills".to_string(),
+                "~/.claude/agents".into(),
+                "~/.claude/CLAUDE.md".into(),
+            ]
+        );
+        assert_eq!(corpus.globs, vec!["**/*.md".to_string()]);
+        assert_eq!(
+            corpus.exclude,
+            vec!["**/.git/**".to_string(), "**/node_modules/**".into()]
+        );
+
+        assert_eq!(cfg.repositories.len(), 1);
+        assert_eq!(cfg.repositories[0].name, "tern");
+        assert_eq!(cfg.repositories[0].path, "~/Dev/tern");
+
+        assert_eq!(cfg.search.top_files_default, 10);
+        assert_eq!(cfg.search.chunks_per_file_default, 3);
+
+        assert!(cfg.embeddings.enabled);
+        assert_eq!(cfg.embeddings.model, "BAAI/bge-small-en-v1.5");
+        assert!(!cfg.embeddings.quantized);
+        assert_eq!(cfg.embeddings.cache_dir, "~/.cache/hallouminate/fastembed");
+
+        assert_eq!(cfg.watch.debounce_ms, 500);
+        assert_eq!(cfg.storage.ground_dir, "~/.local/share/hallouminate/ground");
+    }
+
+    #[test]
+    fn parse_empty_string_yields_full_defaults() {
+        let cfg = parse("", None).expect("empty toml parses");
+        assert!(cfg.corpora.is_empty());
+        assert!(cfg.repositories.is_empty());
+        assert_eq!(cfg.search, SearchConfig::default());
+        assert_eq!(cfg.embeddings, EmbeddingsConfig::default());
+        assert_eq!(cfg.watch, WatchConfig::default());
+        assert_eq!(cfg.storage, StorageConfig::default());
+    }
+
+    #[test]
+    fn embeddings_default_is_on_snowflake_and_full_precision() {
+        // The headline contract: dense embeddings are on by default, using the
+        // snowflake arctic model, and quantization is off by default.
+        let cfg = EmbeddingsConfig::default();
+        assert!(cfg.enabled, "embeddings must default to enabled");
+        assert!(!cfg.quantized, "quantization must default to off");
+        assert_eq!(cfg.model, "snowflake/snowflake-arctic-embed-s");
+    }
+
+    #[test]
+    fn idle_evict_secs_defaults_to_300() {
+        assert_eq!(EmbeddingsConfig::default().idle_evict_secs, 300);
+    }
+
+    #[test]
+    fn parse_idle_evict_secs_can_be_disabled_with_zero() {
+        let cfg =
+            parse("[embeddings]\nidle_evict_secs = 0\n", None).expect("idle_evict_secs = 0 parses");
+        assert_eq!(cfg.embeddings.idle_evict_secs, 0);
+    }
+
+    #[test]
+    fn parse_idle_evict_secs_custom_timeout() {
+        let cfg = parse("[embeddings]\nidle_evict_secs = 600\n", None)
+            .expect("idle_evict_secs = 600 parses");
+        assert_eq!(cfg.embeddings.idle_evict_secs, 600);
+    }
+
+    #[test]
+    fn daemon_idle_exit_secs_defaults_to_900() {
+        assert_eq!(DaemonConfig::default().idle_exit_secs, 900);
+        let cfg = parse("", None).expect("empty config parses");
+        assert_eq!(cfg.daemon.idle_exit_secs, 900);
+    }
+
+    #[test]
+    fn parse_daemon_idle_exit_secs_can_be_disabled_with_zero() {
+        let cfg = parse("[daemon]\nidle_exit_secs = 0\n", None).expect("idle_exit_secs = 0 parses");
+        assert_eq!(cfg.daemon.idle_exit_secs, 0);
+    }
+
+    #[test]
+    fn parse_daemon_idle_exit_secs_custom_value() {
+        let cfg =
+            parse("[daemon]\nidle_exit_secs = 1800\n", None).expect("idle_exit_secs = 1800 parses");
+        assert_eq!(cfg.daemon.idle_exit_secs, 1800);
+    }
+
+    #[test]
+    fn parse_embeddings_section_omitting_enabled_defaults_to_enabled() {
+        let cfg = parse("[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n", None)
+            .expect("partial embeddings section parses");
+        assert!(
+            cfg.embeddings.enabled,
+            "absent `enabled` must default to true, not false"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_dropped_bare_bge_alias() {
+        // The bare `bge-small-en-v1.5` alias was torched in Curd A. A config
+        // using it now fails the unsupported-model gate at parse time; the
+        // full `BAAI/bge-small-en-v1.5` id stays valid.
+        let err = parse("[embeddings]\nmodel = \"bge-small-en-v1.5\"\n", None)
+            .expect_err("bare bge alias must no longer parse");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("unsupported embedding model"), "got: {msg}");
+                assert!(msg.contains("BAAI/bge-small-en-v1.5"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_embeddings_model_is_the_honest_snowflake_default() {
+        // Pins the actual default behaviour: omitting `embeddings.model`
+        // selects snowflake (ARCTIC_S_MODEL), and the honest-default alias
+        // points at it. Guards against a regression that would reintroduce
+        // the old lie where the const said bge but the default was snowflake.
+        assert_eq!(
+            EmbeddingsConfig::default().model,
+            hallouminate_domain::embeddings::ARCTIC_S_MODEL
+        );
+        assert_eq!(
+            DEFAULT_EMBED_MODEL,
+            hallouminate_domain::embeddings::ARCTIC_S_MODEL
+        );
+        let cfg = parse("[embeddings]\nenabled = true\n", None).expect("partial parses");
+        assert_eq!(
+            cfg.embeddings.model,
+            hallouminate_domain::embeddings::ARCTIC_S_MODEL
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_embedding_model_before_runtime_downloads() {
+        let err = parse("[embeddings]\nmodel = \"clip-vit-b32\"\n", None)
+            .expect_err("unsupported model must fail during config parse");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("unsupported embedding model"), "got: {msg}");
+                assert!(msg.contains("BAAI/bge-small-en-v1.5"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_partial_search_section_uses_defaults_for_missing_fields() {
+        let cfg = parse("[search]\ntop_files_default = 5\n", None).expect("partial search parses");
+        assert_eq!(cfg.search.top_files_default, 5);
+        assert_eq!(cfg.search.chunks_per_file_default, DEFAULT_CHUNKS_PER_FILE);
+        assert_eq!(
+            cfg.search.rerank_timeout_ms, DEFAULT_RERANK_TIMEOUT_MS,
+            "omitted rerank_timeout_ms must default to 2000ms (#139)"
+        );
+    }
+
+    #[test]
+    fn parse_rerank_timeout_ms_custom_value() {
+        let cfg = parse("[search]\nrerank_timeout_ms = 500\n", None).expect("parses");
+        assert_eq!(cfg.search.rerank_timeout_ms, 500);
+    }
+
+    #[test]
+    fn parse_rejects_corpus_with_empty_name() {
+        let err = parse("[[corpus]]\nname = \"\"\npaths = [\"/x\"]\n", None)
+            .expect_err("empty corpus name");
+        match err {
+            HallouminateError::Config(msg) => assert!(msg.contains("empty name"), "got: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_corpus_with_no_paths() {
+        let err = parse("[[corpus]]\nname = \"docs\"\n", None).expect_err("no paths");
+        match err {
+            HallouminateError::Config(msg) => assert!(msg.contains("no paths"), "got: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_repository_with_empty_name() {
+        let err = parse("[[repository]]\nname = \"\"\npath = \"/r\"\n", None)
+            .expect_err("empty repository name");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("empty name"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_repository_with_empty_path() {
+        let err = parse("[[repository]]\nname = \"tern\"\npath = \"\"\n", None)
+            .expect_err("empty repository path");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("empty path"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_repository_name_containing_colon() {
+        let err = parse("[[repository]]\nname = \"bad:name\"\npath = \"/r\"\n", None)
+            .expect_err("colon in repo name must surface during validate");
+        match err {
+            HallouminateError::Config(msg) => assert!(msg.contains("bad:name"), "got: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effective_corpora_includes_repository_wiki_after_user_corpora() {
+        let cfg = parse(
+            r#"
+[[corpus]]
+name = "docs"
+paths = ["/docs"]
+
+[[repository]]
+name = "tern"
+path = "/repos/tern"
+"#,
+            None,
+        )
+        .expect("parses");
+        let all = cfg.effective_corpora().expect("derive");
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["docs", "repo:tern:wiki"]);
+    }
+
+    #[test]
+    fn effective_corpora_includes_repository_source_corpus_when_paths_set() {
+        let cfg = parse(
+            r#"
+[[repository]]
+name = "tern"
+path = "/repos/tern"
+corpus_paths = ["docs"]
+"#,
+            None,
+        )
+        .expect("parses");
+        let all = cfg.effective_corpora().expect("derive");
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["repo:tern:wiki", "repo:tern:corpus"]);
+        let source = &all[1];
+        assert_eq!(source.paths, vec!["/repos/tern/docs".to_string()]);
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_user_corpus_shadowing_repository_wiki() {
+        let err = parse(
+            r#"
+[[corpus]]
+name = "repo:tern:wiki"
+paths = ["/x"]
+
+[[repository]]
+name = "tern"
+path = "/r"
+"#,
+            None,
+        )
+        .expect_err("duplicate must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+                assert!(msg.contains("repo:tern:wiki"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_two_repositories_with_same_name_via_derived_corpus_collision() {
+        // Two `[[repository]]` entries with the same name both derive
+        // `repo:{name}:wiki`, so the second entry must surface as a
+        // duplicate-name failure at config-load time — not at the first
+        // daemon request that happens to enumerate corpora.
+        let err = parse(
+            r#"
+[[repository]]
+name = "tern"
+path = "/r1"
+
+[[repository]]
+name = "tern"
+path = "/r2"
+"#,
+            None,
+        )
+        .expect_err("two repos with the same name must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("duplicate"), "got: {msg}");
+                assert!(msg.contains("repo:tern:wiki"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_xdg_with_explicit_missing_path_returns_defaults() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("does-not-exist.toml");
+        let cfg = load_xdg(Some(&missing)).expect("missing file → defaults");
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn load_xdg_reads_file_from_explicit_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, SPEC_EXAMPLE).expect("write");
+        let cfg = load_xdg(Some(&cfg_path)).expect("load");
+        assert_eq!(cfg.corpora[0].name, "claude-config");
+    }
+
+    #[test]
+    fn load_is_alias_for_load_xdg() {
+        // The legacy `load` name stays as a thin alias for outside callers;
+        // pin the equivalence so future renames notice the contract.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, SPEC_EXAMPLE).expect("write");
+        assert_eq!(
+            load(Some(&cfg_path)).expect("load"),
+            load_xdg(Some(&cfg_path)).expect("load_xdg"),
+        );
+    }
+
+    #[test]
+    fn parse_silently_ignores_legacy_fusion_fields() {
+        // A user upgrading from the SQLite era may still have a config with
+        // `[search].fusion`, `convex_alpha`, `rrf_k`. The restack removed the
+        // knob; serde defaults to ignoring unknown fields, so the load must
+        // succeed and the SearchConfig must come back as defaults rather than
+        // failing with an "unknown field" error.
+        let legacy = r#"
+[search]
+top_files_default       = 7
+chunks_per_file_default = 2
+fusion                  = "convex"
+convex_alpha            = 0.65
+rrf_k                   = 60
+"#;
+        let cfg = parse(legacy, None).expect("legacy config must still parse");
+        assert_eq!(cfg.search.top_files_default, 7);
+        assert_eq!(cfg.search.chunks_per_file_default, 2);
+        assert_eq!(
+            cfg.search,
+            SearchConfig {
+                top_files_default: 7,
+                chunks_per_file_default: 2,
+                crossencoder: None,
+                rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
+            },
+            "SearchConfig must hold only the surviving fields"
+        );
+    }
+
+    #[test]
+    fn xdg_config_path_falls_back_to_dot_config_when_xdg_env_absent() {
+        let path = xdg_config_path_from(None);
+        assert!(
+            path.ends_with(".config/hallouminate/config.toml"),
+            "got {}",
+            path.display()
+        );
+        assert!(path.is_absolute(), "tilde must expand: {}", path.display());
+    }
+
+    #[test]
+    fn xdg_config_path_falls_back_when_xdg_env_is_empty_string() {
+        // POSIX/XDG: an empty XDG_CONFIG_HOME is treated as unset.
+        let path = xdg_config_path_from(Some(std::ffi::OsStr::new("")));
+        assert!(
+            path.ends_with(".config/hallouminate/config.toml"),
+            "empty XDG_CONFIG_HOME must fall back; got {}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn xdg_config_path_honors_custom_xdg_config_home() {
+        // Regression for PR #7 Copilot review: the loader must honor a
+        // custom XDG_CONFIG_HOME instead of always resolving to ~/.config.
+        let custom = std::path::PathBuf::from("/var/tmp/custom-xdg");
+        let path = xdg_config_path_from(Some(custom.as_os_str()));
+        assert_eq!(path, custom.join("hallouminate").join("config.toml"));
+    }
+
+    #[test]
+    fn load_xdg_missing_path_returns_defaults_without_error() {
+        // A confirmed NotFound on an explicit path must still degrade to
+        // defaults — the NotFound-only filter shouldn't regress this case.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope.toml");
+        let cfg = load_xdg(Some(&missing)).expect("missing -> defaults");
+        assert_eq!(cfg, Config::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_xdg_propagates_non_notfound_io_error() {
+        // Regression for PR #7 Copilot review: a non-NotFound io error
+        // (here: unreadable directory → EACCES on read_to_string) must
+        // propagate as HallouminateError::Io, not silently default.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let unreadable = dir.path().join("locked");
+        std::fs::create_dir(&unreadable).expect("mkdir");
+        let cfg_path = unreadable.join("config.toml");
+        std::fs::write(&cfg_path, "").expect("write");
+        // 0o000 on parent dir → read of the file inside fails with EACCES.
+        // root can bypass this; skip the assertion when running as root.
+        let is_root = nix_getuid_is_zero();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        let result = load_xdg(Some(&cfg_path));
+        // Restore perms before any potential test failure unwind, so the
+        // tempdir can be cleaned up.
+        let _ = std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755));
+        if is_root {
+            return; // root reads through 0o000; the negative test is meaningless.
+        }
+        let err = result.expect_err("unreadable parent must surface an io error");
+        match err {
+            HallouminateError::Io(io) => {
+                assert_ne!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "must NOT classify as NotFound: {io}"
+                );
+            }
+            other => panic!("expected HallouminateError::Io, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn nix_getuid_is_zero() -> bool {
+        // Avoid a libc dep just for this; read /proc/self/status on Linux,
+        // shell out to `id -u` everywhere else (macOS, BSDs). The test
+        // tolerates either path failing — worst case we run the assertion
+        // when we shouldn't, which only false-positives in CI containers
+        // running as root, where the assertion is a no-op anyway.
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+            && let Some(line) = s.lines().find(|l| l.starts_with("Uid:"))
+        {
+            return line.split_whitespace().nth(1) == Some("0");
+        }
+        std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+    }
+
+    // ── discover_repo_config ────────────────────────────────────────────
+
+    /// Canonicalize a tempdir so comparisons survive macOS's `/var → /private/var`
+    /// symlink. Without this, paths returned by the walker may not equal-string
+    /// the path we built locally even though they point at the same inode.
+    fn canon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    }
+
+    fn write_repo_config(dir: &Path, body: &str) -> PathBuf {
+        let cfg_dir = dir.join(".hallouminate");
+        std::fs::create_dir_all(&cfg_dir).expect("mkdir .hallouminate");
+        let cfg_path = cfg_dir.join("config.toml");
+        std::fs::write(&cfg_path, body).expect("write repo config");
+        cfg_path
+    }
+
+    #[test]
+    fn discover_repo_config_finds_at_cwd_itself() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        let expected = write_repo_config(&root, "");
+        let found = discover_repo_config(&root)
+            .expect("found at cwd")
+            .expect("config present");
+        assert_eq!(canon(&found), canon(&expected));
+    }
+
+    #[test]
+    fn discover_repo_config_finds_at_ancestor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        let expected = write_repo_config(&root, "");
+        let nested = root.join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        let found = discover_repo_config(&nested)
+            .expect("walked up to ancestor")
+            .expect("config present");
+        assert_eq!(canon(&found), canon(&expected));
+    }
+
+    #[test]
+    fn discover_repo_config_stops_at_git_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        std::fs::create_dir(root.join(".git")).expect("mkdir .git");
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        let err = discover_repo_config(&nested).expect_err("stop at repo root");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
+                // The CWD we walked from must appear in the error so a user can
+                // tell at a glance which directory failed to resolve.
+                assert!(msg.contains(&nested.display().to_string()), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_repo_config_treats_git_file_as_repo_boundary() {
+        // A `.git` *file* whose gitdir pointer does NOT contain `/worktrees/`
+        // (i.e. not a linked worktree — could be an old-style external gitdir or
+        // a bare repo) must still stop the walk with a hard error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        std::fs::write(root.join(".git"), "gitdir: /elsewhere\n").expect("write .git file");
+        let err = discover_repo_config(&root).expect_err("non-worktree git file stops walk");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_repo_config_worktree_resolves_to_main_checkout() {
+        // A linked worktree's `.git` file contains `gitdir: <main>/.git/worktrees/<name>`.
+        // Discovery must hop to the main checkout root and find the config there
+        // rather than hard-erroring at the worktree boundary.
+        //
+        // Layout:
+        //   <tmpdir>/main-repo/.hallouminate/config.toml  ← the config
+        //   <tmpdir>/main-repo/.git/                      ← main gitdir (directory)
+        //   <tmpdir>/main-repo/.git/worktrees/wt1/        ← per-worktree dir
+        //   <tmpdir>/wt1/                                 ← linked worktree
+        //   <tmpdir>/wt1/.git                             ← file: "gitdir: .../worktrees/wt1"
+        let outer = tempfile::tempdir().expect("tempdir");
+        let outer = canon(outer.path());
+
+        // Main checkout
+        let main_repo = outer.join("main-repo");
+        let main_gitdir = main_repo.join(".git");
+        let worktrees_dir = main_gitdir.join("worktrees").join("wt1");
+        std::fs::create_dir_all(&worktrees_dir).expect("mkdir worktrees/wt1");
+        write_repo_config(&main_repo, "");
+
+        // Linked worktree root
+        let wt = outer.join("wt1");
+        std::fs::create_dir_all(&wt).expect("mkdir wt1");
+        let gitdir_ptr = format!("gitdir: {}\n", worktrees_dir.display());
+        std::fs::write(wt.join(".git"), &gitdir_ptr).expect("write worktree .git file");
+
+        let found = discover_repo_config(&wt)
+            .expect("worktree discovery must not error")
+            .expect("config must be found in main checkout");
+        let expected = main_repo.join(".hallouminate").join("config.toml");
+        assert_eq!(canon(&found), canon(&expected), "resolved to wrong path");
+    }
+
+    #[test]
+    fn discover_repo_config_submodule_git_file_does_not_hop() {
+        // A submodule's `.git` file contains `gitdir: <super>/.git/modules/<name>` —
+        // no `/worktrees/` segment. Discovery must NOT hop; it must hard-error at
+        // the submodule boundary (no .hallouminate/config.toml present).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        // Super-repo gitdir lives separately; the submodule's `.git` file points there.
+        let super_modules = outer.join("super-git").join("modules").join("sub");
+        std::fs::create_dir_all(&super_modules).expect("mkdir modules/sub");
+        // The submodule root has a `.git` file (not a directory) pointing at modules/sub.
+        let sub_root = outer.join("sub-root");
+        std::fs::create_dir_all(&sub_root).expect("mkdir sub-root");
+        let gitdir_ptr = format!("gitdir: {}\n", super_modules.display());
+        std::fs::write(sub_root.join(".git"), &gitdir_ptr).expect("write submodule .git file");
+        let err = discover_repo_config(&sub_root).expect_err("submodule git file must stop walk");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_repo_config_relative_gitdir_pointer_resolves_to_main_checkout() {
+        // `git worktree add --relative-paths` (or `extensions.relativeWorktrees = true`)
+        // writes a RELATIVE `gitdir:` pointer in the worktree's `.git` file, e.g.
+        // `gitdir: ../../.git/worktrees/wt1`. Discovery must resolve that pointer
+        // against the worktree root (not the process cwd) and still hop to the
+        // main checkout root where the config lives.
+        //
+        // Layout:
+        //   <tmpdir>/main-repo/.hallouminate/config.toml  ← the config
+        //   <tmpdir>/main-repo/.git/                      ← main gitdir (directory)
+        //   <tmpdir>/main-repo/.git/worktrees/wt1/        ← per-worktree dir
+        //   <tmpdir>/wt1/                                 ← linked worktree
+        //   <tmpdir>/wt1/.git                             ← file: "gitdir: ../../main-repo/.git/worktrees/wt1"
+        let outer = tempfile::tempdir().expect("tempdir");
+        let outer = canon(outer.path());
+
+        let main_repo = outer.join("main-repo");
+        let main_gitdir = main_repo.join(".git");
+        let worktrees_dir = main_gitdir.join("worktrees").join("wt1");
+        std::fs::create_dir_all(&worktrees_dir).expect("mkdir worktrees/wt1");
+        write_repo_config(&main_repo, "");
+
+        let wt = outer.join("wt1");
+        std::fs::create_dir_all(&wt).expect("mkdir wt1");
+        // Relative pointer: from <tmpdir>/wt1/.git → <tmpdir>/main-repo/.git/worktrees/wt1
+        let gitdir_ptr = "gitdir: ../main-repo/.git/worktrees/wt1\n";
+        std::fs::write(wt.join(".git"), gitdir_ptr).expect("write worktree .git file");
+
+        let found = discover_repo_config(&wt)
+            .expect("relative-pointer worktree discovery must not error")
+            .expect("config must be found in main checkout");
+        let expected = main_repo.join(".hallouminate").join("config.toml");
+        assert_eq!(
+            canon(&found),
+            canon(&expected),
+            "relative pointer resolved to wrong path"
+        );
+    }
+
+    #[test]
+    fn discover_repo_config_worktrees_dir_name_in_superproject_does_not_hop() {
+        // Structural guard for Finding 2: a superproject whose checkout lives
+        // inside a directory literally named "worktrees" must NOT be treated as
+        // a linked-worktree hop. A submodule pointer such as
+        // `gitdir: /home/me/worktrees/.git/modules/sub` contains "worktrees"
+        // as a path component, but it is NOT immediately preceded by ".git", so
+        // it must fall through to the hard-error branch (no hop).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        // A directory literally named "worktrees" hosts the superproject's gitdir.
+        // The submodule pointer points at modules/sub inside it.
+        let super_git = outer
+            .join("worktrees")
+            .join(".git")
+            .join("modules")
+            .join("sub");
+        std::fs::create_dir_all(&super_git).expect("mkdir worktrees/.git/modules/sub");
+        let sub_root = outer.join("sub-root");
+        std::fs::create_dir_all(&sub_root).expect("mkdir sub-root");
+        let gitdir_ptr = format!("gitdir: {}\n", super_git.display());
+        std::fs::write(sub_root.join(".git"), &gitdir_ptr).expect("write submodule .git file");
+        // Must NOT hop — must hard-error at the submodule boundary.
+        let err = discover_repo_config(&sub_root)
+            .expect_err("superproject-in-worktrees-dir submodule must stop walk");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_repo_config_relative_cwd_resolves_against_current_dir() {
+        // The relative-cwd normalization fix: a relative `cwd` must be joined
+        // against the base directory (`std::env::current_dir()` in production)
+        // before walking, so `Path::parent()` walks reach the real filesystem
+        // root rather than bottoming out at the empty path.
+        //
+        // This is asserted hermetically against a controlled, config-free base
+        // dir rather than the process' real working directory. This repo ships
+        // its own committed `.hallouminate/config.toml`, so normalizing a
+        // relative input against the *real* cwd would make the walk find that
+        // config and return Ok before the normalization behavior could be
+        // observed. Driving the normalization through `absolutize_cwd` with a
+        // tempdir base isolates the relative→absolute join from repo-root
+        // config discovery while still asserting exactly the join the
+        // production path performs.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = canon(dir.path());
+
+        let rel = Path::new("nested/leaf");
+        // The relative input, normalized against the base, must equal the
+        // absolute path you'd get by joining the base yourself. This is the
+        // contract `discover_repo_config` relies on so a relative cwd ascends
+        // the same parent chain as its absolute equivalent.
+        let normalized = absolutize_cwd(rel, &base);
+        assert_eq!(
+            normalized,
+            base.join(rel),
+            "a relative cwd must resolve by joining against the base dir",
+        );
+        assert!(
+            normalized.is_absolute(),
+            "normalization against an absolute base must yield an absolute path \
+             so the walk reaches the real filesystem root, not the empty component",
+        );
+
+        // End-to-end against the absolute, normalized path: walking it must
+        // ascend a real parent chain and bottom out at a boundary — either the
+        // filesystem-root exhaust branch (`Ok(None)` soft-fallback, the base
+        // tempdir has no `.git` and no `.hallouminate/config.toml` ancestor) or
+        // a `.git` boundary in an unusual CI sandbox (`Err`). This is the
+        // regression the fix guards: before normalization, a relative cwd's
+        // `Path::parent()` walk bottomed out at the empty component, which would
+        // surface as a (misleading) filesystem-root result without ascending to
+        // the real root. What it must NOT do is find a config.
+        match discover_repo_config(&normalized) {
+            Ok(None) => {}
+            Err(HallouminateError::Config(m)) => {
+                assert!(
+                    m.contains("stopped at repo root"),
+                    "the only non-fallback outcome here is a `.git` boundary; got: {m}",
+                );
+            }
+            other => panic!("normalized relative input must not find a config: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn discover_repo_config_soft_falls_back_walking_past_no_git_no_config() {
+        // A subtree with no `.git` and no `.hallouminate/config.toml` anywhere
+        // up to the filesystem root must soft-fall-back (`Ok(None)`) rather than
+        // error — there is no repo context to be strict about, and erroring
+        // would strand the baseline-declared corpora (issue #102). We can't
+        // realistically test "all the way to /" so simulate by walking from a
+        // tempdir whose ancestors are guaranteed not to host
+        // `.hallouminate/config.toml` (the system tmp tree).
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The system tmp dir on macOS *might* have a `.git` ancestor in weird
+        // CI sandboxes; that path is the still-strict `.git`-boundary error.
+        let cwd = canon(dir.path());
+        match discover_repo_config(&cwd) {
+            // The expected outcome: no `.git` boundary, so baseline-only.
+            Ok(None) => {}
+            // Unusual CI sandbox with a `.git` ancestor: still a hard error.
+            Err(HallouminateError::Config(msg)) => {
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
+            }
+            Ok(Some(p)) => panic!("did not expect to find a config; got {}", p.display()),
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    // ── load_repo_layer ─────────────────────────────────────────────────
+
+    #[test]
+    fn load_repo_layer_resolves_relative_paths_against_repo_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        let cfg = r#"
+[[corpus]]
+name = "docs"
+paths = ["docs", "specs/cur"]
+
+[[repository]]
+name = "self"
+path = "."
+corpus_paths = ["sub/docs"]
+
+[storage]
+ground_dir = "var/ground"
+
+[embeddings]
+cache_dir = "var/fastembed"
+"#;
+        let cfg_path = write_repo_config(&repo_root, cfg);
+
+        let parsed = load_repo_layer(&cfg_path).expect("load_repo_layer");
+        // Repo-layer relative paths are resolved against the repo root
+        // (the parent of `.hallouminate/`), not against `.hallouminate/`
+        // itself. This matches user intuition: `paths = ["docs"]` written
+        // in `.hallouminate/config.toml` means `<repo>/docs`.
+        let base = &repo_root;
+
+        assert_eq!(
+            parsed.corpora[0].paths,
+            vec![
+                base.join("docs").to_string_lossy().into_owned(),
+                base.join("specs/cur").to_string_lossy().into_owned(),
+            ]
+        );
+        // Repository `path = "."` resolves to the repo root itself, so
+        // `wiki_directory` lands at `<repo>/.hallouminate/wiki` (no double
+        // `.hallouminate/`).
+        assert_eq!(
+            parsed.repositories[0].path,
+            base.join(".").to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            parsed.repositories[0].corpus_paths,
+            vec![base.join("sub/docs").to_string_lossy().into_owned()],
+        );
+        assert_eq!(
+            parsed.storage.ground_dir,
+            base.join("var/ground").to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            parsed.embeddings.cache_dir,
+            base.join("var/fastembed").to_string_lossy().into_owned(),
+        );
+    }
+
+    #[test]
+    fn load_repo_layer_preserves_absolute_paths_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        let cfg = r#"
+[[corpus]]
+name = "abs"
+paths = ["/abs/docs"]
+
+[[repository]]
+name = "absrepo"
+path = "/abs/repo"
+corpus_paths = ["/abs/repo/docs"]
+
+[storage]
+ground_dir = "/abs/ground"
+
+[embeddings]
+cache_dir = "/abs/cache"
+"#;
+        let cfg_path = write_repo_config(&repo_root, cfg);
+        let parsed = load_repo_layer(&cfg_path).expect("load_repo_layer");
+
+        assert_eq!(parsed.corpora[0].paths, vec!["/abs/docs".to_string()]);
+        assert_eq!(parsed.repositories[0].path, "/abs/repo");
+        assert_eq!(
+            parsed.repositories[0].corpus_paths,
+            vec!["/abs/repo/docs".to_string()],
+        );
+        assert_eq!(parsed.storage.ground_dir, "/abs/ground");
+        assert_eq!(parsed.embeddings.cache_dir, "/abs/cache");
+    }
+
+    #[test]
+    fn load_repo_layer_preserves_tilde_paths_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        let cfg = r#"
+[[corpus]]
+name = "home"
+paths = ["~/docs"]
+
+[[repository]]
+name = "homerepo"
+path = "~/repo"
+corpus_paths = ["~/repo/docs"]
+
+[storage]
+ground_dir = "~/ground"
+
+[embeddings]
+cache_dir = "~/cache"
+"#;
+        let cfg_path = write_repo_config(&repo_root, cfg);
+        let parsed = load_repo_layer(&cfg_path).expect("load_repo_layer");
+
+        // Tilde expansion happens at consumption time via `expand_tilde`;
+        // the loader must NOT rewrite tilde-prefixed strings.
+        assert_eq!(parsed.corpora[0].paths, vec!["~/docs".to_string()]);
+        assert_eq!(parsed.repositories[0].path, "~/repo");
+        assert_eq!(
+            parsed.repositories[0].corpus_paths,
+            vec!["~/repo/docs".to_string()],
+        );
+        assert_eq!(parsed.storage.ground_dir, "~/ground");
+        assert_eq!(parsed.embeddings.cache_dir, "~/cache");
+    }
+
+    // ── merge_layers ────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_layers_appends_repo_corpora_after_baseline() {
+        let baseline = parse(
+            r#"
+[[corpus]]
+name = "global"
+paths = ["/global"]
+"#,
+            None,
+        )
+        .expect("baseline parses");
+        let repo = parse(
+            r#"
+[[corpus]]
+name = "local"
+paths = ["/local"]
+"#,
+            None,
+        )
+        .expect("repo parses");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        let names: Vec<&str> = merged.corpora.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["global", "local"]);
+    }
+
+    #[test]
+    fn merge_layers_appends_repo_repositories_after_baseline() {
+        let baseline = parse(
+            r#"
+[[repository]]
+name = "a"
+path = "/a"
+"#,
+            None,
+        )
+        .expect("baseline parses");
+        let repo = parse(
+            r#"
+[[repository]]
+name = "b"
+path = "/b"
+"#,
+            None,
+        )
+        .expect("repo parses");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        let names: Vec<&str> = merged
+            .repositories
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn merge_layers_uses_baseline_scalar_when_repo_left_default() {
+        let baseline = parse("[search]\ntop_files_default = 20\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo default");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.search.top_files_default, 20);
+    }
+
+    #[test]
+    fn merge_layers_idle_evict_secs_propagates_baseline_value_over_repo_default() {
+        // Regression trap: if the merge_scalar call for idle_evict_secs is
+        // removed and the field is hardcoded to its default, this fails.
+        let baseline = parse("[embeddings]\nidle_evict_secs = 600\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo default");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.embeddings.idle_evict_secs, 600);
+    }
+
+    #[test]
+    fn merge_layers_rerank_timeout_ms_propagates_repo_value_over_baseline_default() {
+        // Regression trap (#139): if the merge_scalar call for
+        // rerank_timeout_ms is removed and the field is hardcoded to its
+        // default, this fails.
+        let baseline = parse("", None).expect("baseline default");
+        let repo = parse("[search]\nrerank_timeout_ms = 500\n", None).expect("repo");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.search.rerank_timeout_ms, 500);
+    }
+
+    #[test]
+    fn merge_layers_daemon_idle_exit_secs_propagates_baseline_over_repo_default() {
+        // Regression trap: if the merge_scalar call for daemon.idle_exit_secs
+        // is removed and the field is hardcoded to its default, this fails.
+        let baseline = parse("[daemon]\nidle_exit_secs = 1800\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo default");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.daemon.idle_exit_secs, 1800);
+    }
+
+    #[test]
+    fn merge_layers_uses_repo_scalar_when_baseline_left_default() {
+        let baseline = parse("", None).expect("baseline default");
+        let repo = parse("[search]\ntop_files_default = 30\n", None).expect("repo");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.search.top_files_default, 30);
+    }
+
+    #[test]
+    fn merge_layers_accepts_both_sides_explicit_equal() {
+        let cfg = "[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\ncache_dir = \"/shared\"\n";
+        let baseline = parse(cfg, None).expect("baseline");
+        let repo = parse(cfg, None).expect("repo");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.embeddings.cache_dir, "/shared");
+        assert_eq!(merged.embeddings.model, "BAAI/bge-small-en-v1.5");
+    }
+
+    #[test]
+    fn merge_layers_fails_on_scalar_conflict_with_field_name_in_message() {
+        // AC #7: scalar conflict produces HallouminateError::Config naming
+        // the field. We assert on `embeddings.cache_dir` because both layers
+        // can set it to genuinely different non-default values without
+        // running into the `canonical_model_name` normalization that would
+        // collapse two "different" model strings.
+        let baseline = parse("[embeddings]\ncache_dir = \"/a\"\n", None).expect("baseline");
+        let repo = parse("[embeddings]\ncache_dir = \"/b\"\n", None).expect("repo");
+        let err = merge_layers(&baseline, &repo).expect_err("conflict must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("embeddings.cache_dir"), "got: {msg}");
+                assert!(msg.contains("\"/a\""), "got: {msg}");
+                assert!(msg.contains("\"/b\""), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_layers_conflict_names_both_source_paths_when_supplied() {
+        // The internal `merge_layers_with_sources` carries source paths so
+        // `resolve_for_cwd` can produce a richer error. Pin both paths in
+        // the message — AC #7 wants this for the user-facing flow.
+        let baseline = parse("[embeddings]\ncache_dir = \"/a\"\n", None).expect("baseline");
+        let repo = parse("[embeddings]\ncache_dir = \"/b\"\n", None).expect("repo");
+        let xdg = Path::new("/etc/hallouminate/config.toml");
+        let repo_p = Path::new("/work/.hallouminate/config.toml");
+        let err = merge_layers_with_sources(&baseline, &repo, Some(xdg), Some(repo_p))
+            .expect_err("conflict must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("/etc/hallouminate/config.toml"), "got: {msg}");
+                assert!(
+                    msg.contains("/work/.hallouminate/config.toml"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    // ── resolve_for_cwd ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_for_cwd_walks_finds_and_merges_repo_layer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        write_repo_config(
+            &repo_root,
+            r#"
+[[corpus]]
+name = "repo-docs"
+paths = ["docs"]
+"#,
+        );
+        let baseline = parse(
+            r#"
+[[corpus]]
+name = "global"
+paths = ["/g"]
+"#,
+            None,
+        )
+        .expect("baseline");
+
+        let nested = repo_root.join("src").join("inner");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+
+        let xdg = PathBuf::from("/etc/hallouminate/config.toml");
+        let (effective, layers) = resolve_for_cwd(&baseline, &nested, Some(&xdg)).expect("resolve");
+
+        let names: Vec<&str> = effective.corpora.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["global", "repo-docs"]);
+        assert_eq!(layers.xdg_path, Some(xdg));
+        let repo_path = layers.repo_path.expect("repo config discovered");
+        assert_eq!(
+            canon(&repo_path),
+            canon(&repo_root.join(".hallouminate").join("config.toml")),
+        );
+    }
+
+    #[test]
+    fn resolve_for_cwd_with_repository_dot_path_derives_corpora_against_repo_root() {
+        // AC #8: `[[repository]] name="X" path="."` must derive
+        // `repo:X:wiki` and `repo:X:corpus` with paths resolved against the
+        // repo root (the parent of `.hallouminate/`, i.e. the directory the
+        // user `cd`s into).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        write_repo_config(
+            &repo_root,
+            r#"
+[[repository]]
+name = "X"
+path = "."
+corpus_paths = ["docs"]
+"#,
+        );
+
+        let baseline = Config::default();
+        let (effective, _layers) = resolve_for_cwd(&baseline, &repo_root, None).expect("resolve");
+
+        let all = effective.effective_corpora().expect("derive corpora");
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["repo:X:wiki", "repo:X:corpus"]);
+
+        // The wiki corpus resolves under the repo root — no double
+        // `.hallouminate/.hallouminate/` segment.
+        let wiki_expected = repo_root
+            .join(".")
+            .join(".hallouminate")
+            .join("wiki")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(all[0].paths, vec![wiki_expected]);
+
+        // The repo source corpus resolves "docs" against the repo root at
+        // `load_repo_layer` time, then `resolve_under` sees it as already
+        // absolute and passes it through verbatim — so the final path is
+        // `<repo_root>/docs` with no extra `.` segment.
+        let docs_expected = repo_root.join("docs").to_string_lossy().into_owned();
+        assert_eq!(all[1].paths, vec![docs_expected]);
+    }
+
+    #[test]
+    fn resolve_for_cwd_returns_hard_error_when_no_repo_config_found() {
+        // A `.git` boundary with no config in between must surface as a
+        // hard error — the daemon refuses to fall back to baseline-only.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        std::fs::create_dir(repo_root.join(".git")).expect("mkdir .git");
+        let nested = repo_root.join("src");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+
+        let baseline = Config::default();
+        let err = resolve_for_cwd(&baseline, &nested, None).expect_err("must error");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("stopped at repo root"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_for_cwd_falls_back_to_baseline_when_cwd_above_all_repos() {
+        // Issue #102: from a parent-of-repos directory — no `.hallouminate/`,
+        // no `.git`, the walk reaches the filesystem root — `resolve_for_cwd`
+        // must resolve *baseline-only* instead of hard-erroring. Otherwise the
+        // baseline-declared corpora become unreachable the moment the cwd sits
+        // above all repos, stranding stateless ops (`list_corpora`, `ground`).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let above_repos = canon(dir.path());
+
+        // A baseline that declares a globally-searchable corpus, mirroring the
+        // XDG `cheese-global` / `cheez-wiki` entries in the issue repro.
+        let baseline = parse(
+            r#"
+[[corpus]]
+name = "cheese-global"
+paths = ["/srv/cheese-global"]
+"#,
+            None,
+        )
+        .expect("baseline parse");
+
+        let (effective, layers) =
+            resolve_for_cwd(&baseline, &above_repos, None).expect("baseline-only must resolve");
+
+        // The baseline corpus is reachable from above-all-repos.
+        let corpora = effective.effective_corpora().expect("derive corpora");
+        let names: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["cheese-global"]);
+
+        // No repo config was discovered, so the diagnostic records `None`
+        // rather than fabricating a path.
+        assert_eq!(layers.repo_path, None);
+    }
+
+    #[test]
+    fn resolve_for_cwd_unions_discovered_sub_repo_wikis_from_above_all_repos() {
+        // #106: from a parent-of-repos dir, the downward walk discovers each
+        // sub-repo's local `.hallouminate` wiki and unions them with the
+        // baseline corpora, so a no-corpus ground searches all of them.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let above_repos = canon(dir.path());
+
+        // Two sub-repos, each with only a LOCAL `.hallouminate/config.toml`
+        // (and wiki dir) — neither is a baseline `[[repository]]`.
+        for repo in ["alpha", "beta"] {
+            let repo_root = above_repos.join(repo);
+            std::fs::create_dir_all(repo_root.join(".hallouminate").join("wiki"))
+                .expect("mkdir wiki");
+            std::fs::write(repo_root.join(".hallouminate").join("config.toml"), "")
+                .expect("write local config");
+        }
+
+        let baseline = parse(
+            r#"
+[[corpus]]
+name = "cheese-global"
+paths = ["/srv/cheese-global"]
+"#,
+            None,
+        )
+        .expect("baseline parse");
+
+        let (effective, layers) =
+            resolve_for_cwd(&baseline, &above_repos, None).expect("baseline-only must resolve");
+
+        let corpora = effective.effective_corpora().expect("derive corpora");
+        let names: Vec<&str> = corpora.iter().map(|c| c.name.as_str()).collect();
+        assert!(
+            names.contains(&"cheese-global"),
+            "baseline corpus preserved: {names:?}"
+        );
+        assert!(
+            names.contains(&"repo:alpha:wiki") && names.contains(&"repo:beta:wiki"),
+            "both discovered sub-repo wikis must be unioned in: {names:?}"
+        );
+        assert_eq!(
+            layers.repo_path, None,
+            "no single repo discovered above all"
+        );
+        assert!(
+            layers.warnings.is_empty(),
+            "no name collision => no warnings: {:?}",
+            layers.warnings
+        );
+    }
+
+    #[test]
+    fn resolve_for_cwd_keeps_both_same_basename_sibling_wikis_and_warns() {
+        // #106 regression: two discovered sub-repos sharing a directory
+        // basename at different paths (`work/tern` and `personal/tern`) both
+        // derive `repo:tern:wiki`. The earlier union dropped one silently,
+        // contradicting "search the union of ALL discovered wikis". Both must
+        // survive end-to-end through `resolve_for_cwd` -> `effective_corpora`,
+        // and a `cross-repo-union` warning (the payload the dispatch copy-loop
+        // surfaces verbatim) must be generated naming the discovered sibling.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let above_repos = canon(dir.path());
+
+        for parent in ["work", "personal"] {
+            let repo_root = above_repos.join(parent).join("tern");
+            std::fs::create_dir_all(repo_root.join(".hallouminate").join("wiki"))
+                .expect("mkdir wiki");
+            std::fs::write(repo_root.join(".hallouminate").join("config.toml"), "")
+                .expect("write local config");
+        }
+
+        let baseline = parse("", None).expect("empty baseline parse");
+
+        let (effective, layers) =
+            resolve_for_cwd(&baseline, &above_repos, None).expect("baseline-only must resolve");
+
+        // `effective_corpora` must NOT collapse or reject the pair: the
+        // disambiguated names round-trip through the duplicate-name guard.
+        let corpora = effective.effective_corpora().expect("derive corpora");
+        let wiki_names: Vec<&str> = corpora
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| n.starts_with("repo:") && n.ends_with(":wiki"))
+            .collect();
+        assert_eq!(
+            wiki_names.len(),
+            2,
+            "both same-basename sibling wikis must survive, not one: {wiki_names:?}"
+        );
+        assert!(
+            wiki_names.contains(&"repo:tern:wiki"),
+            "the first sibling keeps the canonical corpus name: {wiki_names:?}"
+        );
+        assert!(
+            wiki_names
+                .iter()
+                .any(|n| n.contains("tern") && *n != "repo:tern:wiki"),
+            "the second sibling is parent-qualified to stay distinct: {wiki_names:?}"
+        );
+
+        // The collision is surfaced as a `cross-repo-union` advisory, and its
+        // text names the discovered sibling rather than a (non-existent)
+        // baseline shadow.
+        assert_eq!(
+            layers.warnings.len(),
+            1,
+            "one sibling collision => exactly one warning: {:?}",
+            layers.warnings
+        );
+        let w = &layers.warnings[0];
+        assert!(
+            w.contains("another discovered sub-repo") && !w.contains("baseline"),
+            "warning must name the discovered sibling, not a baseline shadow: {w:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_for_cwd_passes_xdg_path_into_conflict_messages() {
+        // Verifies the source-path threading: a scalar conflict between
+        // baseline (XDG) and the repo layer should name *both* paths.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        let cfg_path = write_repo_config(&repo_root, "[embeddings]\ncache_dir = \"/repo-cache\"\n");
+        let baseline =
+            parse("[embeddings]\ncache_dir = \"/xdg-cache\"\n", None).expect("baseline parse");
+        let xdg = PathBuf::from("/etc/hallouminate/config.toml");
+
+        let err =
+            resolve_for_cwd(&baseline, &repo_root, Some(&xdg)).expect_err("conflict must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("embeddings.cache_dir"), "got: {msg}");
+                assert!(msg.contains("/etc/hallouminate/config.toml"), "got: {msg}");
+                assert!(msg.contains(&cfg_path.display().to_string()), "got: {msg}");
+                assert!(msg.contains("/xdg-cache"), "got: {msg}");
+                assert!(msg.contains("/repo-cache"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+}
