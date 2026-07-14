@@ -29,7 +29,7 @@ is weak or freshness matters.
 
 The on-disk markdown is canonical. LanceDB rows are derived state, refreshed
 after `add_markdown` / `delete_markdown`; `index` is the only way to pick up
-edits made outside hallouminate (`src/adapters/mcp/tools.rs:67-69`). The
+edits made outside hallouminate (`src/app/mcp/tools.rs:67-69`). The
 consequence: the wiki stays human-readable and git-versionable, and the vector
 store can always be rebuilt from disk. A database-first design would be more
 transactional but less inspectable and less agent-friendly — re-derivability
