@@ -8,15 +8,16 @@ use hallouminate::adapters::lance::{LanceStore, chunk_id_for};
 use hallouminate::domain::indexer::store::ChunkStore;
 use hallouminate::domain::search::search_with_ripgrep;
 
-use crate::common::{placeholder_prepared_file, prepared_file_with_chunks};
+use crate::common::{StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 async fn fresh_store() -> (tempfile::TempDir, LanceStore) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = LanceStore::open_or_create(dir.path(), MODEL, false, true, None)
-        .await
-        .expect("open LanceStore");
+    let store =
+        LanceStore::open_or_create(dir.path(), MODEL, false, true, Some(Box::new(StubEmbedder)))
+            .await
+            .expect("open LanceStore");
     (dir, store)
 }
 
