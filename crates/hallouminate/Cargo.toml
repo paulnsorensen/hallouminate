@@ -1,0 +1,61 @@
+[package]
+name = "hallouminate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+description.workspace = true
+
+[[bin]]
+name = "hallouminate"
+path = "src/main.rs"
+
+[dependencies]
+hallouminate-domain.workspace = true
+hallouminate-adapters.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio.workspace = true
+tokio-util = "0.7"
+notify = "8"
+notify-debouncer-full = "0.7"
+# Direct dep for peer-credential auth on the daemon's Unix socket
+# (`SO_PEERCRED` on Linux via raw `getsockopt`, `getpeereid` on macOS/BSD;
+# rustix's `net::sockopt::socket_peercred` is Linux-only, so it can't cover
+# both platforms). Already pulled in transitively.
+libc = "0.2"
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
+directories = "6"
+shellexpand.workspace = true
+url = "2"
+chrono.workspace = true
+schemars.workspace = true
+rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schemars"] }
+# Leaked storage/embedding types surface directly in daemon state (lancedb::table::Duration,
+# tokenizers::Tokenizer) and dispatch (text_splitter::Characters) despite the crate boundary.
+lancedb = "0.31"
+tokenizers = { version = "0.23", features = ["http"] }
+text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
+
+[dev-dependencies]
+tempfile = "3"
+# Spreadsheet ingestion tests generate fixtures in-process (no committed binaries):
+# rust_xlsxwriter writes a real .xlsx calamine can read; .ods is a hand-built ZIP
+# (mimetype + content.xml + META-INF/manifest.xml — calamine requires the manifest)
+# via `zip`, pinned to the 7.x already in the tree (transitive via file-format) so
+# no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
+# is covered by a detection/routing unit test, not a generated binary fixture.
+rust_xlsxwriter = "0.96"
+zip = "8"
+hallouminate-domain.workspace = true
+hallouminate-adapters.workspace = true
+blake3.workspace = true
+serde_yaml_ng.workspace = true
