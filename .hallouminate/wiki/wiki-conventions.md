@@ -2,7 +2,7 @@
 
 You — the LLM writing wiki entries via `add_markdown` — are bound by a
 few conventions hallouminate counts on. They are echoed from
-`SERVER_INSTRUCTIONS` in `src/adapters/mcp/tools.rs` plus practical
+`SERVER_INSTRUCTIONS` in `src/app/mcp/tools.rs` plus practical
 extensions.
 
 ## One topic per file

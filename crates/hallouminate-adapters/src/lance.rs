@@ -519,7 +519,7 @@ pub struct LanceStore {
     /// Owns query/passage embedding when embeddings are enabled. The shared
     /// synchronous mutex is acquired only on Tokio's blocking pool, keeping
     /// model access serial without blocking either runtime flavor's workers.
-    embedder: std::sync::Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>,
+    embedder: Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>,
     embedder_available: AtomicBool,
 }
 
@@ -577,7 +577,7 @@ fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
 }
 
 async fn run_embedding_blocking(
-    embedder: std::sync::Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>,
+    embedder: Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>,
     texts: Vec<String>,
     role: EmbedRole,
 ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
@@ -602,7 +602,6 @@ async fn run_embedding_blocking(
         ))),
     }
 }
-
 impl LanceStore {
     /// Validates an existing store's metadata without opening LanceDB or
     /// taking ownership of an embedder. A missing store has nothing to
@@ -668,7 +667,7 @@ impl LanceStore {
             indexes_ensured: AtomicBool::new(false),
             text_index_present: AtomicBool::new(false),
             _dir_lock: dir_lock,
-            embedder: std::sync::Arc::new(std::sync::Mutex::new(embedder)),
+            embedder: Arc::new(std::sync::Mutex::new(embedder)),
             embedder_available: AtomicBool::new(embedder_available),
         })
     }
@@ -833,12 +832,8 @@ impl LanceStore {
             let mut vectors = if all_texts.is_empty() {
                 Vec::new()
             } else {
-                run_embedding_blocking(
-                    std::sync::Arc::clone(&self.embedder),
-                    all_texts,
-                    EmbedRole::Passage,
-                )
-                .await?
+                run_embedding_blocking(Arc::clone(&self.embedder), all_texts, EmbedRole::Passage)
+                    .await?
             };
             if vectors.len() != expected {
                 return Err(HallouminateError::Indexer(format!(
@@ -875,7 +870,6 @@ impl LanceStore {
                 embeddings: embeddings.as_deref(),
             })
             .collect();
-
         let schema = chunks_schema();
         let record_batch = build_record_batch(&paired, schema.clone())?;
         let mut file_refs: Vec<String> = Vec::with_capacity(batch.len());
@@ -1162,7 +1156,7 @@ impl LanceStore {
         let mut out: Vec<SearchHit> = Vec::new();
         if self.embeddings_enabled {
             let vectors = run_embedding_blocking(
-                std::sync::Arc::clone(&self.embedder),
+                Arc::clone(&self.embedder),
                 vec![query.to_string()],
                 EmbedRole::Query,
             )
@@ -1170,7 +1164,7 @@ impl LanceStore {
             let query_vec = vectors.into_iter().next().ok_or_else(|| {
                 HallouminateError::Embed("embed_batch returned no vector for query".into())
             })?;
-            let reranker = std::sync::Arc::new(weighted_rrf::WeightedRRFReranker::default());
+            let reranker = Arc::new(weighted_rrf::WeightedRRFReranker::default());
             let stream = self
                 .table
                 .query()
@@ -1267,18 +1261,6 @@ mod tests {
     use super::*;
     use hallouminate_domain::indexer::PreparedChunk;
 
-    struct ZeroEmbedder;
-
-    impl EmbedBatch for ZeroEmbedder {
-        fn embed_batch(
-            &mut self,
-            texts: &[String],
-            _role: EmbedRole,
-        ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
-            Ok(vec![[0.0; EMBEDDING_DIM]; texts.len()])
-        }
-    }
-
     struct ThreadRecordingEmbedder {
         threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
     }
@@ -1326,6 +1308,47 @@ mod tests {
                 "embedding must run on Tokio's blocking pool"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabled_store_without_embedder_rejects_embedding_dependent_operations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(ThreadRecordingEmbedder { threads })),
+        )
+        .await
+        .expect("open enabled store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/seed.md", 1)])
+            .await
+            .expect("seed store");
+        *store.embedder.lock().expect("embedder lock") = None;
+        store.embedder_available.store(false, Ordering::Release);
+
+        let write_error = store
+            .apply_batch(vec![synthetic_prepared("/tmp/unavailable.md", 1)])
+            .await
+            .expect_err("enabled writes must not degrade to null vectors");
+        assert!(
+            write_error
+                .to_string()
+                .contains("embedding model is unavailable")
+        );
+
+        let query_error = store
+            .hybrid_search("docs", "seed", 10)
+            .await
+            .expect_err("enabled queries must not degrade to lexical-only search");
+        assert!(
+            query_error
+                .to_string()
+                .contains("embedding model is unavailable")
+        );
     }
 
     #[tokio::test]
@@ -2288,48 +2311,6 @@ schema_version = 1
         assert!(
             msg.to_lowercase().contains("upgrade"),
             "must advise upgrade: {msg}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn enabled_store_without_embedder_rejects_embedding_dependent_operations() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LanceStore::open_or_create(
-            dir.path(),
-            "BAAI/bge-small-en-v1.5",
-            false,
-            true,
-            Some(Box::new(ZeroEmbedder)),
-        )
-        .await
-        .unwrap();
-        store
-            .apply_batch(vec![synthetic_prepared("/tmp/seed.md", 1)])
-            .await
-            .unwrap();
-        *store.embedder.lock().expect("embedder lock") = None;
-        store.embedder_available.store(false, Ordering::Release);
-
-        let write_err = store
-            .apply_batch(vec![synthetic_prepared("/tmp/unavailable.md", 1)])
-            .await
-            .expect_err("enabled embeddings must not degrade to null vectors");
-        assert!(
-            write_err
-                .to_string()
-                .contains("embedding model is unavailable"),
-            "unexpected write error: {write_err}"
-        );
-
-        let search_err = store
-            .hybrid_search("docs", "chunk", 10)
-            .await
-            .expect_err("enabled embeddings must not degrade to lexical-only search");
-        assert!(
-            search_err
-                .to_string()
-                .contains("embedding model is unavailable"),
-            "unexpected search error: {search_err}"
         );
     }
 }

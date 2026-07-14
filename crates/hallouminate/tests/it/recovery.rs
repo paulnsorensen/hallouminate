@@ -106,13 +106,15 @@ async fn re_run_after_crash_converges_to_correct_state() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
-
-    // Pre-crash: index file A
-    let a_ref = std::fs::canonicalize(corpus_dir.path())
-        .expect("canonical corpus root")
+    let file_a = corpus_dir
+        .path()
+        .canonicalize()
+        .expect("canonical corpus dir")
         .join("a.md")
         .to_string_lossy()
         .into_owned();
+
+    // Pre-crash: index file A
     {
         let store = LanceStore::open_or_create(
             store_dir.path(),
@@ -123,7 +125,7 @@ async fn re_run_after_crash_converges_to_correct_state() {
         )
         .await
         .expect("open");
-        let pf_a = placeholder_prepared_file(&a_ref, 2);
+        let pf_a = placeholder_prepared_file(&file_a, 2);
         store.apply_batch(vec![pf_a]).await.expect("apply A");
     }
 
@@ -169,14 +171,16 @@ async fn re_run_after_crash_converges_to_correct_state() {
         .await
         .expect("recovered index_corpus");
 
-    // A is in the indexed root but no longer on disk, while B was added after
-    // the prior snapshot. Recovery must converge by deleting A and upserting B.
+    // File A is in DB but not on disk. The scan-based indexer will plan a
+    // delete for it. So after recovery:
+    //   - file A: deleted (not on disk)
+    //   - file B: upserted (on disk, not in DB pre-recovery)
     assert!(stats.files_upserted >= 1, "B must upsert");
     assert!(stats.files_deleted >= 1, "A must be deleted (not on disk)");
 
     let snaps = store.list_files("docs").await.expect("list_files");
     assert!(snaps.iter().any(|s| s.file_ref.ends_with("b.md")));
-    assert!(!snaps.iter().any(|s| s.file_ref == a_ref));
+    assert!(!snaps.iter().any(|s| s.file_ref == file_a));
 }
 
 #[tokio::test]
