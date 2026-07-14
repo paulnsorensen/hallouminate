@@ -613,16 +613,27 @@ impl DaemonState {
         if let Some(existing) = self.inner.resources.lock().await.get(&key).cloned() {
             if cfg.embeddings.enabled && !existing.store.embedder_available() {
                 let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
-                let embedder = initialize(
+                let retry = match initialize(
                     cfg.embeddings.model.clone(),
                     cfg.embeddings.quantized,
                     cache_dir,
                 )
-                .await?;
-                existing
-                    .store
-                    .install_embedder(embedder)
-                    .map_err(anyhow::Error::from)?;
+                .await
+                {
+                    Ok(embedder) => existing
+                        .store
+                        .install_embedder(embedder)
+                        .map_err(anyhow::Error::from),
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = retry {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        model = %cfg.embeddings.model,
+                        error = %error,
+                        "embedder retry failed; serving cached resources without embeddings",
+                    );
+                }
             }
             return Ok(existing);
         }
@@ -1471,7 +1482,6 @@ mod tests {
             );
         }
     }
-
     struct ZeroEmbedder;
 
     impl EmbedBatch for ZeroEmbedder {
@@ -1525,21 +1535,14 @@ mod tests {
             .await
             .insert(ResourceKey::from_config(&cfg), Arc::clone(&cached));
 
-        let first = match state
+        let first = state
             .resources_for_with_initializer(&cfg, |_, _, _| async {
                 Err(anyhow::anyhow!("transient initialization failure"))
             })
             .await
-        {
-            Ok(_) => panic!("first request must report initialization failure"),
-            Err(error) => error,
-        };
-        assert!(
-            first
-                .to_string()
-                .contains("transient initialization failure")
-        );
-        assert!(!cached.store.embedder_available());
+            .expect("cached resources remain usable after retry failure");
+        assert!(Arc::ptr_eq(&cached, &first));
+        assert!(!first.store.embedder_available());
 
         let retried = state
             .resources_for_with_initializer(&cfg, |_, _, _| async {
