@@ -4,12 +4,12 @@
 //! Covers spec §8.1 #2, #3, #4, #6, #7, #8 from
 //! `.cheese/specs/lancedb-rewrite.md`.
 
-use hallouminate_adapters::lance::{LanceStore, chunk_id_for};
-use hallouminate_domain::indexer::ChunkStore;
-use hallouminate_domain::search::search_with_ripgrep;
 use crate::common::{
     LANCE_WRITE_LOCK, StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks,
 };
+use hallouminate_adapters::lance::{LanceStore, chunk_id_for};
+use hallouminate_domain::indexer::ChunkStore;
+use hallouminate_domain::search::search_with_ripgrep;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 

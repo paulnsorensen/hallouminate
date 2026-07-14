@@ -609,8 +609,16 @@ impl LanceStore {
     ///
     /// # Errors
     ///
-    /// Returns an error when the requested embedding configuration mismatches
-    /// the stored sidecar.
+    /// Delegates to `meta_check_or_init`, so an existing store can fail for any
+    /// of these reasons:
+    /// - `StoreSchemaStale` — the stored schema version is older than this
+    ///   build expects (remedy: delete + reindex).
+    /// - `Config` — the stored schema version is newer than this build expects
+    ///   (fatal downgrade), or `meta.toml` cannot be parsed.
+    /// - `Embed` — the requested embedding configuration (model, quantization,
+    ///   or enabled flag) mismatches the stored sidecar.
+    /// - the requested model is unsupported, or the stored model name is
+    ///   corrupt (via `canonical_model_name`).
     pub fn validate_existing_metadata(
         ground_dir: &Path,
         model_name: &str,
