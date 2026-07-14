@@ -200,11 +200,7 @@ fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
 /// Render a `TreeNode` as an indented ASCII outline — subdirs first, then
 /// files, with one entry per line and two-space indents per depth level.
 /// Mirrors the structured tree for clients that only want the text block.
-fn render_tree_outline(
-    node: &hallouminate_domain::corpus::TreeNode,
-    depth: usize,
-    out: &mut String,
-) {
+fn render_tree_outline(node: &hallouminate_domain::corpus::TreeNode, depth: usize, out: &mut String) {
     let indent = "  ".repeat(depth);
     let label = if node.path.is_empty() {
         ".".to_string()

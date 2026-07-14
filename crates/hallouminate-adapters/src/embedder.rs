@@ -6,6 +6,9 @@ use hallouminate_domain::common::{HallouminateError, Result};
 use hallouminate_domain::embeddings::{
     ARCTIC_S_MODEL, BGE_SMALL_MODEL, E5_SMALL_MODEL, canonical_model_name,
 };
+use crate::domain::embeddings::{
+    ARCTIC_S_MODEL, BGE_SMALL_MODEL, E5_SMALL_MODEL, canonical_model_name,
+};
 
 /// Output dimensionality shared by every supported model. All three embed to
 /// 384-dim vectors, so the rest of the pipeline can use a fixed-size array.

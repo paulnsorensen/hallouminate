@@ -311,9 +311,11 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::indexer::chunk::PreparedFile;
+    use crate::domain::indexer::chunk::PreparedFile;
     use crate::indexer::plan::FileSnapshot;
     use crate::indexer::store::BatchWriteStats;
+    use crate::domain::indexer::plan::FileSnapshot;
+    use crate::domain::indexer::store::BatchWriteStats;
 
     /// In-memory `ChunkStore` test double for orchestration/rerank tests:
     /// `hybrid_search` returns a canned, pre-seeded hit list; writes are

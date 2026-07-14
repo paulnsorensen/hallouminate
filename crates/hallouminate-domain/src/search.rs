@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use crate::common::Result;
 use crate::indexer::chunk::SearchHit;
 use crate::indexer::store::ChunkStore;
+use crate::domain::indexer::chunk::SearchHit;
+use crate::domain::indexer::store::ChunkStore;
 
 pub use crossencoder::Noop as NoopCrossencoder;
 pub use crossencoder::{

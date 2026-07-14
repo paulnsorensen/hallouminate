@@ -35,9 +35,7 @@ use hallouminate_adapters::embedder::{EmbedBatch, Embedder};
 use hallouminate_adapters::lance::LanceStore;
 use hallouminate_domain::common::{HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{load_tokenizer, missing_roots};
-use hallouminate_domain::indexer::HandlerRegistry;
-use hallouminate_domain::indexer::chunk::SearchHit;
-use hallouminate_domain::indexer::index::index_corpus;
+use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
