@@ -517,6 +517,7 @@ impl DaemonState {
                     fragments_removed = stats.fragments_removed,
                     fragments_added = stats.fragments_added,
                     old_versions_pruned = stats.old_versions_pruned,
+                    "periodic LanceDB maintenance completed",
                 );
             }
             Err(e) => {

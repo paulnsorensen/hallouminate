@@ -50,6 +50,15 @@ pub struct MaintenanceStats {
     pub old_versions_pruned: Option<u64>,
 }
 
+/// Rounds a prune-retention `Duration` to whole seconds for LanceDB's
+/// `Duration::seconds` (i64), saturating instead of wrapping on overflow.
+/// A non-zero sub-second remainder rounds up so a sub-second grace window
+/// never truncates to zero-retention pruning.
+fn prune_retention_secs(d: Duration) -> i64 {
+    let secs = d.as_secs() + u64::from(d.subsec_nanos() > 0);
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
 /// Stable, deterministic chunk identifier derived from (file_ref, ord).
 ///
 /// Same (file_ref, ord) → same chunk_id; lets `merge_insert(chunk_id)` cleanly
@@ -760,12 +769,11 @@ impl LanceStore {
             })
             .await
             .map_err(map_lance_err)?;
+        let prune_secs = prune_retention_secs(options.prune_older_than);
         let prune = self
             .table
             .optimize(lancedb::table::OptimizeAction::Prune {
-                older_than: Some(lancedb::table::Duration::seconds(
-                    options.prune_older_than.as_secs() as i64,
-                )),
+                older_than: Some(lancedb::table::Duration::seconds(prune_secs)),
                 delete_unverified: Some(true),
                 error_if_tagged_old_versions: None,
             })
@@ -1290,6 +1298,15 @@ mod tests {
     use super::*;
     use hallouminate_domain::indexer::PreparedChunk;
 
+    #[test]
+    fn prune_retention_secs_rounds_up_sub_second_remainder() {
+        assert_eq!(prune_retention_secs(Duration::ZERO), 0);
+        assert_eq!(prune_retention_secs(Duration::from_secs(5)), 5);
+        assert_eq!(prune_retention_secs(Duration::from_millis(500)), 1);
+        assert_eq!(prune_retention_secs(Duration::from_millis(1500)), 2);
+        assert_eq!(prune_retention_secs(Duration::new(u64::MAX, 0)), i64::MAX);
+    }
+
     struct ThreadRecordingEmbedder {
         threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
     }
@@ -1479,8 +1496,9 @@ mod tests {
             .await
             .expect("maintain");
         assert!(
-            stats.old_versions_pruned.is_some(),
-            "maintain reports version pruning"
+            stats.old_versions_pruned.is_some_and(|n| n > 0),
+            "maintain must report a positive pruned-version count: {:?}",
+            stats.old_versions_pruned
         );
 
         let versions_after = store
