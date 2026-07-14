@@ -70,7 +70,7 @@ async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
 
     // Derive each repo's `repo:{name}:wiki` corpus and index it into a shared
     // store. (One store, distinct corpus per repo — mirrors the daemon.)
-    let store = hallouminate_adapters::lance::LanceStore::open_or_create(
+    let store = hallouminate_adapters::LanceStore::open_or_create(
         store_dir.path(),
         MODEL,
         false,
@@ -189,7 +189,7 @@ fn discovery_respects_depth_cap_and_gitignore_above_all_repos() {
 // rerank only reshuffles (no inserts/deletes); a reversing stub exercises that
 // reshuffle hard.
 
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::LanceStore;
 use hallouminate_domain::ground::{GroundResponse, ground};
 use hallouminate_domain::indexer::SearchHit;
 use hallouminate_domain::search::Crossencoder;
@@ -597,7 +597,7 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
 
 // ── Package C: ground_union efficiency (single embed, no clones) ─────────
 
-use hallouminate_adapters::embedder::{EmbedBatch, EmbedRole};
+use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -617,9 +617,7 @@ impl EmbedBatch for CountingEmbedder {
         &mut self,
         texts: &[String],
         role: EmbedRole,
-    ) -> hallouminate_domain::common::Result<
-        Vec<[f32; hallouminate_adapters::embedder::EMBEDDING_DIM]>,
-    > {
+    ) -> hallouminate_domain::common::Result<Vec<[f32; EMBEDDING_DIM]>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         StubEmbedder.embed_batch(texts, role)
     }

@@ -15,7 +15,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime};
 use hallouminate_domain::indexer::{
     Format, HandlerRegistry, PrepareCtx, detect_format, index_corpus,

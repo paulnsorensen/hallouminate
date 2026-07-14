@@ -7,8 +7,7 @@
 use std::fs;
 use std::path::Path;
 
-use hallouminate_adapters::embedder::{EmbedBatch, EmbedRole};
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole, LanceStore};
 use hallouminate_domain::common::CorpusConfig;
 use hallouminate_domain::corpus::MarkdownChunker;
 use hallouminate_domain::indexer::{ChunkStore, HandlerRegistry, index_corpus};
@@ -32,14 +31,9 @@ impl EmbedBatch for RoleRecordingEmbedder {
         &mut self,
         texts: &[String],
         role: EmbedRole,
-    ) -> hallouminate_domain::common::Result<
-        Vec<[f32; hallouminate_adapters::embedder::EMBEDDING_DIM]>,
-    > {
+    ) -> hallouminate_domain::common::Result<Vec<[f32; EMBEDDING_DIM]>> {
         self.roles.lock().unwrap().push(role);
-        Ok(texts
-            .iter()
-            .map(|_| [0.1_f32; hallouminate_adapters::embedder::EMBEDDING_DIM])
-            .collect())
+        Ok(texts.iter().map(|_| [0.1_f32; EMBEDDING_DIM]).collect())
     }
 }
 

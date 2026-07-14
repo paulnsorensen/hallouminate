@@ -12,8 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use hallouminate_domain::corpus;
-use hallouminate_domain::corpus::index_md::{INDEX_END_MARKER, INDEX_START_MARKER};
+use hallouminate_domain::corpus::{self, INDEX_END_MARKER, INDEX_START_MARKER};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")

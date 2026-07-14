@@ -6,7 +6,7 @@ use hallouminate::config::Config;
 use hallouminate::daemon::{
     DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest, connect_at,
 };
-use hallouminate_adapters::lance::LanceStore;
+use hallouminate_adapters::LanceStore;
 
 use crate::common::LANCE_WRITE_LOCK;
 use crate::common::daemon::DaemonHarness;
