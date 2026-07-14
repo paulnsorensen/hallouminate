@@ -63,7 +63,7 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
     // 1. Establish meta.toml under model A. We do not need to index any rows
     //    — open_or_create alone writes the sidecar.
     {
-        let _store = LanceStore::open_or_create(&ground_dir, MODEL_A, false, true)
+        let _store = LanceStore::open_or_create(&ground_dir, MODEL_A, false, true, None)
             .await
             .expect("open store with model A");
     }
@@ -102,7 +102,7 @@ async fn switching_embedding_model_refuses_with_reset_hint_and_no_writes() {
 
     // 4. No rows written: reopen under MODEL_A (allowed by the meta check)
     //    and confirm count_rows == 0.
-    let reopened = LanceStore::open_or_create(&ground_dir, MODEL_A, false, true)
+    let reopened = LanceStore::open_or_create(&ground_dir, MODEL_A, false, true, None)
         .await
         .expect("reopen store with original model");
     assert_eq!(

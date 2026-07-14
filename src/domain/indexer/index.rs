@@ -1,7 +1,6 @@
-use crate::adapters::lance::LanceStore;
 use crate::domain::common::{CorpusConfig, Result};
 use crate::domain::corpus::scan;
-use crate::domain::embeddings::EmbedBatch;
+use crate::domain::indexer::store::ChunkStore;
 
 pub use super::apply::{ApplyStats, DEFAULT_BATCH_SIZE, apply};
 pub use super::format::HandlerRegistry;
@@ -11,26 +10,26 @@ pub type IndexStats = ApplyStats;
 
 /// Crust facade: scan → snapshot → plan → apply.
 ///
-/// `embedder` is `None` in embeddings-OFF mode — indexing then writes null
-/// embeddings and builds no vector index. `registry` dispatches each file to
-/// its format handler.
+/// The store embeds passages internally when it owns an embedder
+/// (embeddings-OFF mode indexes with null embeddings and builds no vector
+/// index). `registry` dispatches each file to its format handler.
 pub async fn index_corpus(
     corpus: &CorpusConfig,
-    store: &LanceStore,
-    embedder: Option<&mut dyn EmbedBatch>,
+    store: &dyn ChunkStore,
     registry: &HandlerRegistry,
 ) -> Result<IndexStats> {
     let disk = scan(corpus)?;
-    let db = store.list_files(&corpus.name).await?;
+    let db: std::collections::HashMap<crate::domain::common::FileRef, FileSnapshot> = store
+        .list_files(&corpus.name)
+        .await?
+        .into_iter()
+        .map(|s| {
+            (
+                crate::domain::common::FileRef::new(std::path::PathBuf::from(&s.file_ref)),
+                s,
+            )
+        })
+        .collect();
     let p = plan(disk, db);
-    apply(
-        p,
-        store,
-        embedder,
-        registry,
-        corpus,
-        DEFAULT_BATCH_SIZE,
-        None,
-    )
-    .await
+    apply(p, store, registry, corpus, DEFAULT_BATCH_SIZE, None).await
 }

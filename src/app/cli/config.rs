@@ -3,11 +3,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 
+use crate::adapters::crossencoder::FastembedCrossencoder;
+use crate::adapters::embedder::Embedder;
 use crate::app::config::{self, Config, ResolvedLayers, xdg_config_path};
 use crate::domain::common::{canonicalize_or_passthrough, expand_tilde};
 use crate::domain::corpus::load_tokenizer;
-use crate::domain::embeddings::Embedder;
-use crate::domain::search::FastembedCrossencoder;
 
 const DEFAULT_TEMPLATE: &str = include_str!("config-default.toml");
 

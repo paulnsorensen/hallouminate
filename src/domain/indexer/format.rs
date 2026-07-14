@@ -18,7 +18,7 @@ use calamine::{Data, Reader, open_workbook_auto_from_rs};
 use file_format::FileFormat;
 use text_splitter::{ChunkConfig, ChunkSizer, TextSplitter};
 
-use crate::adapters::lance::{PreparedChunk, PreparedFile};
+use super::chunk::{PreparedChunk, PreparedFile};
 use crate::domain::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
 use crate::domain::corpus::{
     ClaimMark, CorpusChunker, Frontmatter, build_line_starts, byte_to_line, extract_claim_marks,
@@ -200,7 +200,6 @@ impl FormatHandler for MarkdownHandler {
             frontmatter: frontmatter.as_ref().map(Frontmatter::to_canonical_json),
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
-            embeddings: None,
         })
     }
 }
@@ -269,7 +268,6 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
             frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
-            embeddings: None,
         })
     }
 }
@@ -314,7 +312,6 @@ impl FormatHandler for SpreadsheetHandler {
             frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
-            embeddings: None,
         })
     }
 }

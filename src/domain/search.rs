@@ -12,12 +12,14 @@ pub mod ripgrep;
 
 use std::collections::HashMap;
 
-use crate::adapters::lance::{LanceStore, SearchHit};
 use crate::domain::common::Result;
+use crate::domain::indexer::chunk::SearchHit;
+use crate::domain::indexer::store::ChunkStore;
 
+pub use crossencoder::Noop as NoopCrossencoder;
 pub use crossencoder::{
-    Crossencoder, DEFAULT_CROSSENCODER_MODEL, FastembedCrossencoder, Noop as NoopCrossencoder,
-    SUPPORTED_CROSSENCODER_MODELS, canonical_crossencoder_model,
+    Crossencoder, DEFAULT_CROSSENCODER_MODEL, SUPPORTED_CROSSENCODER_MODELS,
+    canonical_crossencoder_model,
 };
 pub use ripgrep::RipgrepHit;
 
@@ -30,75 +32,21 @@ pub const RIPGREP_WEIGHT: f32 = 1.0;
 /// dampening curve as the inner reranker.
 const RRF_K: f32 = 60.0;
 
-pub async fn hybrid_search(
-    store: &LanceStore,
-    corpus: &str,
-    query: &str,
-    query_vec: &[f32],
-    limit: usize,
-) -> Result<Vec<SearchHit>> {
-    store.hybrid_search(corpus, query, query_vec, limit).await
-}
-
-/// Hybrid search PLUS a parallel ripgrep pass that boosts every chunk
-/// in matched files by `RIPGREP_WEIGHT / (K + rg_rank)`, where
-/// `rg_rank` is the position of the file's first match in rg's output.
-///
-/// Why per-file boost rather than three-way RRF on raw scores: the
-/// LanceDB hybrid step already returns chunk-level relevance scores
-/// reranked across FTS+vector. Mixing those into an RRF with a
-/// rank-only rg list would require collapsing the chunk scores back to
-/// ranks first, which loses the within-file ordering Lance gives us
-/// for free. Boosting at the file level keeps that ordering and still
-/// pulls rg-matched files toward the top.
-///
-/// `corpus_paths` is the resolved root list from `CorpusConfig.paths`.
-/// Pass an empty slice (or empty `query`) to skip the rg pass entirely.
-pub async fn hybrid_with_ripgrep(
-    store: &LanceStore,
-    corpus: &str,
-    corpus_paths: &[String],
-    query: &str,
-    query_vec: &[f32],
-    limit: usize,
-) -> Result<Vec<SearchHit>> {
-    let hybrid_fut = hybrid_search(store, corpus, query, query_vec, limit);
-    let rg_fut = ripgrep::run(corpus_paths, query, limit);
-    let (hybrid_res, rg_res) = tokio::join!(hybrid_fut, rg_fut);
-    let mut hits = hybrid_res?;
-    let rg_hits = match rg_res {
-        Ok(v) => v,
-        Err(e) => {
-            // rg is best-effort; a missing binary or a path that
-            // disappeared shouldn't take down the whole ground call.
-            tracing::warn!(target: "hallouminate::search", err = %e, "ripgrep pass failed; returning hybrid-only results");
-            Vec::new()
-        }
-    };
-    apply_rg_boost(&mut hits, &rg_hits);
-    Ok(hits)
-}
-
-/// Lexical-only sibling of `hybrid_with_ripgrep` for the embeddings-OFF
-/// path: BM25 (`fts_search`) PLUS the same per-file ripgrep boost, with no
-/// vector leg. Identical fusion math — the only difference is the base
-/// signal is FTS-only instead of FTS+vector. `corpus_paths` is the resolved
-/// root list; pass an empty slice (or empty `query`) to skip the rg pass.
-pub async fn fts_with_ripgrep(
-    store: &LanceStore,
+pub async fn search_with_ripgrep(
+    store: &dyn ChunkStore,
     corpus: &str,
     corpus_paths: &[String],
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    let fts_fut = store.fts_search(corpus, query, limit);
+    let search_fut = store.hybrid_search(corpus, query, limit);
     let rg_fut = ripgrep::run(corpus_paths, query, limit);
-    let (fts_res, rg_res) = tokio::join!(fts_fut, rg_fut);
-    let mut hits = fts_res?;
+    let (search_res, rg_res) = tokio::join!(search_fut, rg_fut);
+    let mut hits = search_res?;
     let rg_hits = match rg_res {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!(target: "hallouminate::search", err = %e, "ripgrep pass failed; returning fts-only results");
+            tracing::warn!(target: "hallouminate::search", err = %e, "ripgrep pass failed; returning search-only results");
             Vec::new()
         }
     };

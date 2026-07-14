@@ -4,11 +4,9 @@
 //! Covers spec §8.1 #2, #3, #4, #6, #7, #8 from
 //! `.cheese/specs/lancedb-rewrite.md`.
 
-use std::path::PathBuf;
-
 use hallouminate::adapters::lance::{LanceStore, chunk_id_for};
-use hallouminate::domain::common::FileRef;
-use hallouminate::domain::search::hybrid_search;
+use hallouminate::domain::indexer::store::ChunkStore;
+use hallouminate::domain::search::search_with_ripgrep;
 
 use crate::common::{StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks};
 
@@ -16,9 +14,10 @@ const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
 async fn fresh_store() -> (tempfile::TempDir, LanceStore) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = LanceStore::open_or_create(dir.path(), MODEL, false, true)
-        .await
-        .expect("open LanceStore");
+    let store =
+        LanceStore::open_or_create(dir.path(), MODEL, false, true, Some(Box::new(StubEmbedder)))
+            .await
+            .expect("open LanceStore");
     (dir, store)
 }
 
@@ -66,10 +65,14 @@ async fn delete_file_removes_all_chunks_for_that_file_only() {
     );
 
     let snaps = store.list_files("docs").await.expect("list_files");
-    let a_key = FileRef::new(PathBuf::from("/tmp/a.md"));
-    let b_key = FileRef::new(PathBuf::from("/tmp/b.md"));
-    assert!(!snaps.contains_key(&a_key), "a.md must be gone");
-    assert!(snaps.contains_key(&b_key), "b.md must remain");
+    assert!(
+        !snaps.iter().any(|s| s.file_ref == "/tmp/a.md"),
+        "a.md must be gone"
+    );
+    assert!(
+        snaps.iter().any(|s| s.file_ref == "/tmp/b.md"),
+        "b.md must remain"
+    );
 }
 
 // ── fts_search: BM25-only sibling, corpus-scoped ─────────────────────────
@@ -98,9 +101,9 @@ async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
     store.apply_batch(vec![b]).await.expect("apply beta");
 
     let hits = store
-        .fts_search("alpha", "zebrafish", 10)
+        .hybrid_search("alpha", "zebrafish", 10)
         .await
-        .expect("fts_search");
+        .expect("hybrid_search");
     assert!(!hits.is_empty(), "must find the token in corpus alpha");
     assert!(
         hits.iter().all(|h| h.file_ref == "/tmp/a.md"),
@@ -113,9 +116,9 @@ async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
 async fn fts_search_on_empty_store_returns_no_hits() {
     let (_dir, store) = fresh_store().await;
     let hits = store
-        .fts_search("docs", "anything", 10)
+        .hybrid_search("docs", "anything", 10)
         .await
-        .expect("fts_search on empty store");
+        .expect("hybrid_search on empty store");
     assert!(hits.is_empty(), "empty store must yield zero FTS hits");
 }
 
@@ -147,7 +150,8 @@ async fn touch_mtime_updates_only_mtime_column() {
 
     let snaps = store.list_files("docs").await.expect("list_files");
     let snap = snaps
-        .get(&FileRef::new(PathBuf::from("/tmp/touch.md")))
+        .iter()
+        .find(|s| s.file_ref == "/tmp/touch.md")
         .expect("snapshot present");
     assert_eq!(snap.mtime_ms, 999, "mtime must have advanced");
     assert_eq!(
@@ -172,13 +176,7 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
     store.apply_batch(vec![pf]).await.expect("apply");
 
     // Use the stub embedder to compute a query vector deterministically.
-    let mut emb = StubEmbedder;
-    use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
-    let qv = emb
-        .embed_batch(&["spice melange".into()], EmbedRole::Query)
-        .expect("embed query")[0];
-
-    let hits = hybrid_search(&store, "docs", "spice", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &[], "spice", 5)
         .await
         .expect("hybrid_search");
     assert!(
@@ -196,8 +194,7 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
 #[tokio::test]
 async fn hybrid_search_on_empty_corpus_returns_empty_vec() {
     let (_dir, store) = fresh_store().await;
-    let qv = [0.1_f32; hallouminate::adapters::lance::EMBEDDING_DIM];
-    let hits = hybrid_search(&store, "docs", "anything", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &[], "anything", 5)
         .await
         .expect("empty corpus must yield Ok, not error");
     assert!(hits.is_empty(), "empty corpus must yield zero hits");
@@ -218,13 +215,7 @@ async fn single_file_corpus_top_hit_is_that_file() {
     );
     store.apply_batch(vec![pf]).await.expect("apply");
 
-    let mut emb = StubEmbedder;
-    use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
-    let qv = emb
-        .embed_batch(&["unique_token_witness_me".into()], EmbedRole::Query)
-        .expect("embed query")[0];
-
-    let hits = hybrid_search(&store, "docs", "unique_token_witness_me", &qv, 5)
+    let hits = search_with_ripgrep(&store, "docs", &[], "unique_token_witness_me", 5)
         .await
         .expect("hybrid_search");
     assert!(!hits.is_empty(), "expected at least one hit");
@@ -245,14 +236,21 @@ async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
     assert_eq!(store.count_rows().await.unwrap(), 2);
 
     let snaps = store.list_files("docs").await.unwrap();
-    assert!(snaps.contains_key(&FileRef::new(PathBuf::from(weird))));
+    assert!(snaps.iter().any(|s| s.file_ref == weird));
 
     store
         .touch_mtime("docs", weird, 4242)
         .await
         .expect("touch weird");
     let snaps2 = store.list_files("docs").await.unwrap();
-    assert_eq!(snaps2[&FileRef::new(PathBuf::from(weird))].mtime_ms, 4242);
+    assert_eq!(
+        snaps2
+            .iter()
+            .find(|s| s.file_ref == weird)
+            .unwrap()
+            .mtime_ms,
+        4242
+    );
 
     store
         .delete_file("docs", weird)
@@ -279,8 +277,8 @@ async fn list_files_returns_only_the_requested_corpus() {
 
     assert_eq!(alpha.len(), 1, "alpha should see only its own file");
     assert_eq!(beta.len(), 1, "beta should see only its own file");
-    assert!(alpha.contains_key(&FileRef::new(PathBuf::from("/tmp/a.md"))));
-    assert!(beta.contains_key(&FileRef::new(PathBuf::from("/tmp/b.md"))));
+    assert!(alpha.iter().any(|s| s.file_ref == "/tmp/a.md"));
+    assert!(beta.iter().any(|s| s.file_ref == "/tmp/b.md"));
 }
 
 // ── Multi-corpus apply_batch rejects mixed-corpus batches ───────────────
@@ -328,7 +326,7 @@ async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
         .expect("delete alpha row");
     assert_eq!(store.count_rows().await.unwrap(), 1);
     let beta = store.list_files("beta").await.unwrap();
-    assert!(beta.contains_key(&FileRef::new(PathBuf::from(shared))));
+    assert!(beta.iter().any(|s| s.file_ref == shared));
 }
 
 // ── Multi-corpus isolation: hybrid_search stays inside its corpus ───────
@@ -356,16 +354,10 @@ async fn hybrid_search_returns_only_hits_from_requested_corpus() {
     store.apply_batch(vec![a]).await.expect("apply alpha");
     store.apply_batch(vec![b]).await.expect("apply beta");
 
-    use hallouminate::domain::embeddings::{EmbedBatch, EmbedRole};
-    let mut emb = StubEmbedder;
-    let qv = emb
-        .embed_batch(&["unique_alpha_marker".into()], EmbedRole::Query)
-        .expect("embed")[0];
-
-    let hits_alpha = hybrid_search(&store, "alpha", "unique_alpha_marker", &qv, 5)
+    let hits_alpha = search_with_ripgrep(&store, "alpha", &[], "unique_alpha_marker", 5)
         .await
         .expect("alpha search");
-    let hits_beta = hybrid_search(&store, "beta", "unique_alpha_marker", &qv, 5)
+    let hits_beta = search_with_ripgrep(&store, "beta", &[], "unique_alpha_marker", 5)
         .await
         .expect("beta search");
 

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,90 +9,23 @@ use arrow::array::{
     StringArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 
-use crate::domain::common::{FileRef, HallouminateError, Result};
+use crate::adapters::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
+use crate::domain::common::{HallouminateError, Result};
 use crate::domain::corpus::ClaimMark;
 use crate::domain::embeddings::canonical_model_name;
+use crate::domain::indexer::chunk::{PreparedFile, SearchHit};
 use crate::domain::indexer::plan::FileSnapshot;
+use crate::domain::indexer::store::{BatchWriteStats, ChunkStore};
 
-/// Dimensionality of every stored embedding vector.
-///
-/// Matches the output width of the `BAAI/bge-small-en-v1.5` model the indexer
-/// embeds with. The `embedding` column is a `FixedSizeList` of exactly this
-/// many `f32`s, and `hybrid_search` rejects query vectors of any other length.
-pub const EMBEDDING_DIM: usize = 384;
 const TABLE_NAME: &str = "chunks";
 const META_FILENAME: &str = "meta.toml";
 /// Single-owner lockfile inside the ground dir — see [`acquire_store_lock`].
 const STORE_LOCK_FILENAME: &str = "store.lock";
-
-/// One chunk of a prepared file, ready to be written as a row in the `chunks`
-/// table.
-#[derive(Debug, Clone)]
-pub struct PreparedChunk {
-    pub ord: usize,
-    pub heading_path: Vec<String>,
-    pub line_start: usize,
-    pub line_end: usize,
-    pub text: String,
-    /// Canonical JSON of the claim marks anchored within this chunk's line
-    /// range, or `None` when the chunk has no marks. Per-chunk (positional),
-    /// unlike the page-level `frontmatter` denormalized identically onto every
-    /// row. Stored in the nullable `claim_marks` column.
-    pub claim_marks: Option<String>,
-}
-
-/// A single source file plus all of its chunks, ready for `apply_batch`.
-///
-/// File-level metadata (`summary`, `keywords`, `mtime_ms`, …) is denormalized
-/// onto every chunk row when the batch is built.
-#[derive(Debug, Clone)]
-pub struct PreparedFile {
-    pub file_ref: String,
-    pub corpus: String,
-    pub mtime_ms: i64,
-    pub content_hash: String,
-    pub summary: String,
-    pub keywords: Vec<String>,
-    /// Canonical JSON of the page's parsed frontmatter, or `None` when the file
-    /// has no frontmatter block (or it was malformed). Denormalized onto every
-    /// chunk row, like `summary`/`keywords`.
-    pub frontmatter: Option<String>,
-    pub indexed_at_ms: i64,
-    pub chunks: Vec<PreparedChunk>,
-    /// `Some(v)` (embeddings ON): one vector per chunk, length-checked
-    /// against `chunks`. `None` (embeddings OFF): the indexer ran without an
-    /// embedder, so every chunk row is written with a null embedding.
-    pub embeddings: Option<Vec<[f32; EMBEDDING_DIM]>>,
-}
-
-/// One ranked result row returned by `hybrid_search` or `fts_search`.
-///
-/// Carries the chunk's text and location plus its parent file's `summary`,
-/// `keywords`, and `mtime_ms`, with `score` set by the active reranker.
-#[derive(Debug, Clone)]
-pub struct SearchHit {
-    pub chunk_id: String,
-    pub file_ref: String,
-    pub heading_path: Vec<String>,
-    pub line_start: usize,
-    pub line_end: usize,
-    pub text: String,
-    pub summary: String,
-    pub keywords: Vec<String>,
-    pub score: f32,
-    pub mtime_ms: i64,
-    /// Claim marks decoded from the chunk's `claim_marks` JSON column. Empty
-    /// when the chunk carried no marks (a null column value).
-    pub claim_marks: Vec<ClaimMark>,
-    /// Per-query z-score of `score`, stamped by the orchestrator after rerank.
-    /// TRANSIENT: not decoded from or persisted to a Lance column; defaults to
-    /// `None` at decode and only the cross-encoder path populates it.
-    pub z_score: Option<f64>,
-}
 
 /// Aggregate statistics for one corpus, returned by [`LanceStore::corpus_chunk_stats`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,7 +235,15 @@ fn build_list_utf8(values: &[Vec<String>]) -> ListArray {
     builder.finish()
 }
 
-fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<RecordBatch> {
+/// Pairs a prepared file with its (optional) per-chunk embeddings for
+/// [`build_record_batch`]. `PreparedFile` no longer carries embeddings
+/// itself (US-002: embeddings are adapter-owned).
+struct FileWithEmbeddings<'a> {
+    file: &'a PreparedFile,
+    embeddings: Option<&'a [[f32; EMBEDDING_DIM]]>,
+}
+
+fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result<RecordBatch> {
     let mut chunk_ids: Vec<String> = Vec::new();
     let mut file_refs: Vec<String> = Vec::new();
     let mut corpora: Vec<String> = Vec::new();
@@ -325,34 +265,34 @@ fn build_record_batch(batch: &[PreparedFile], schema: SchemaRef) -> Result<Recor
     // buffer is dropped entirely and the column is byte-identical to before.
     let mut embedding_valid: Vec<bool> = Vec::new();
 
-    for file in batch {
-        if let Some(embeddings) = &file.embeddings
-            && file.chunks.len() != embeddings.len()
+    for fwe in batch {
+        if let Some(embeddings) = &fwe.embeddings
+            && fwe.file.chunks.len() != embeddings.len()
         {
             return Err(HallouminateError::Indexer(format!(
                 "prepared file {:?}: {} chunks but {} embeddings",
-                file.file_ref,
-                file.chunks.len(),
+                fwe.file.file_ref,
+                fwe.file.chunks.len(),
                 embeddings.len()
             )));
         }
-        for (idx, chunk) in file.chunks.iter().enumerate() {
-            chunk_ids.push(chunk_id_for(&file.file_ref, chunk.ord));
-            file_refs.push(file.file_ref.clone());
-            corpora.push(file.corpus.clone());
-            mtimes.push(file.mtime_ms);
-            hashes.push(file.content_hash.clone());
-            summaries.push(file.summary.clone());
-            keywords.push(file.keywords.clone());
-            frontmatters.push(file.frontmatter.clone());
-            indexed_at.push(file.indexed_at_ms);
+        for (idx, chunk) in fwe.file.chunks.iter().enumerate() {
+            chunk_ids.push(chunk_id_for(&fwe.file.file_ref, chunk.ord));
+            file_refs.push(fwe.file.file_ref.clone());
+            corpora.push(fwe.file.corpus.clone());
+            mtimes.push(fwe.file.mtime_ms);
+            hashes.push(fwe.file.content_hash.clone());
+            summaries.push(fwe.file.summary.clone());
+            keywords.push(fwe.file.keywords.clone());
+            frontmatters.push(fwe.file.frontmatter.clone());
+            indexed_at.push(fwe.file.indexed_at_ms);
             ords.push(chunk.ord as i64);
             heading_paths.push(chunk.heading_path.clone());
             line_starts.push(chunk.line_start as i64);
             line_ends.push(chunk.line_end as i64);
             texts.push(chunk.text.clone());
             claim_marks.push(chunk.claim_marks.clone());
-            match &file.embeddings {
+            match &fwe.embeddings {
                 Some(embeddings) => {
                     embeddings_flat.extend_from_slice(&embeddings[idx]);
                     embedding_valid.push(true);
@@ -576,6 +516,11 @@ pub struct LanceStore {
     /// Pins the single-owner invariant to the store itself — see
     /// [`acquire_store_lock`].
     _dir_lock: std::fs::File,
+    /// Owns query/passage embedding when embeddings are enabled. The shared
+    /// synchronous mutex is acquired only on Tokio's blocking pool, keeping
+    /// model access serial without blocking either runtime flavor's workers.
+    embedder: Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>,
+    embedder_available: AtomicBool,
 }
 
 /// Take a non-blocking exclusive `flock` on `store.lock` inside the ground
@@ -631,6 +576,33 @@ fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
+async fn run_embedding_blocking(
+    embedder: Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>,
+    texts: Vec<String>,
+    role: EmbedRole,
+) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+    match tokio::task::spawn_blocking(move || {
+        let mut guard = embedder
+            .lock()
+            .map_err(|_| HallouminateError::Embed("embedding model lock poisoned".into()))?;
+        let Some(embedder) = guard.as_mut() else {
+            return Err(HallouminateError::Embed(
+                "embeddings are enabled but the embedding model is unavailable; retry the request"
+                    .into(),
+            ));
+        };
+        embedder.embed_batch(&texts, role)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(HallouminateError::Embed(format!(
+            "embedding task failed: {error}"
+        ))),
+    }
+}
+
 impl LanceStore {
     /// Opens the `chunks` table under `ground_dir`, creating it (and the
     /// `meta.toml` sidecar) when absent.
@@ -646,6 +618,7 @@ impl LanceStore {
         model_name: &str,
         quantized: bool,
         embeddings_enabled: bool,
+        embedder: Option<Box<dyn EmbedBatch>>,
     ) -> Result<Self> {
         std::fs::create_dir_all(ground_dir)?;
         let meta_path = ground_dir.join(META_FILENAME);
@@ -665,6 +638,7 @@ impl LanceStore {
             .await
             .map_err(map_lance_err)?;
         let table = open_or_create_table(&connection).await?;
+        let embedder_available = embedder.is_some();
         Ok(Self {
             table,
             connection,
@@ -673,7 +647,31 @@ impl LanceStore {
             indexes_ensured: AtomicBool::new(false),
             text_index_present: AtomicBool::new(false),
             _dir_lock: dir_lock,
+            embedder: Arc::new(std::sync::Mutex::new(embedder)),
+            embedder_available: AtomicBool::new(embedder_available),
         })
+    }
+
+    /// Returns whether this enabled store currently owns a usable embedder.
+    pub fn embedder_available(&self) -> bool {
+        self.embedder_available.load(Ordering::Acquire)
+    }
+
+    /// Installs an embedder after a transient initialization failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model lock was poisoned.
+    pub fn install_embedder(&self, embedder: Box<dyn EmbedBatch>) -> Result<()> {
+        let mut guard = self
+            .embedder
+            .lock()
+            .map_err(|_| HallouminateError::Embed("embedding model lock poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(embedder);
+            self.embedder_available.store(true, Ordering::Release);
+        }
+        Ok(())
     }
 
     /// Returns the total number of chunk rows in the table.
@@ -774,20 +772,21 @@ impl LanceStore {
         })
     }
 
-    /// Upsert a batch of prepared files. All files in a single call MUST
-    /// belong to the same corpus — the orphan-drop predicate is scoped to
-    /// that corpus, so mixing corpora here would risk deleting unrelated
-    /// rows. The merge join key is `(corpus, chunk_id)` so two corpora that
-    /// happen to share a `file_ref` keep independent rows.
+    /// Upsert a batch of prepared files, embedding their chunk text when this
+    /// store owns an [`Embedder`]. All files in a single call MUST belong to
+    /// the same corpus — the orphan-drop predicate is scoped to that corpus,
+    /// so mixing corpora here would risk deleting unrelated rows. The merge
+    /// join key is `(corpus, chunk_id)` so two corpora that happen to share a
+    /// `file_ref` keep independent rows.
     ///
     /// # Errors
     ///
-    /// Returns an error when the batch mixes corpora, when building the Arrow
-    /// record batch fails (e.g. a chunk/embedding length mismatch), or when
-    /// the LanceDB `merge_insert` or index build fails.
-    pub async fn apply_batch(&self, batch: Vec<PreparedFile>) -> Result<()> {
+    /// Returns an error when the batch mixes corpora, when the embedder
+    /// returns a mismatched vector count, when building the Arrow record
+    /// batch fails, or when the LanceDB `merge_insert` or index build fails.
+    async fn apply_batch(&self, batch: Vec<PreparedFile>) -> Result<BatchWriteStats> {
         if batch.is_empty() {
-            return Ok(());
+            return Ok(BatchWriteStats::default());
         }
         let corpus = batch[0].corpus.clone();
         if batch.iter().any(|f| f.corpus != corpus) {
@@ -795,8 +794,65 @@ impl LanceStore {
                 "apply_batch: all PreparedFiles in a batch must share the same corpus".into(),
             ));
         }
+
+        let mut all_texts: Vec<String> = Vec::new();
+        let mut splits: Vec<usize> = Vec::with_capacity(batch.len());
+        for pf in &batch {
+            splits.push(pf.chunks.len());
+            for c in &pf.chunks {
+                all_texts.push(c.text.clone());
+            }
+        }
+
+        let mut stats = BatchWriteStats::default();
+        let mut file_embeddings: Vec<Option<Vec<[f32; EMBEDDING_DIM]>>> =
+            Vec::with_capacity(batch.len());
+        if self.embeddings_enabled {
+            let expected = all_texts.len();
+            let mut vectors = if all_texts.is_empty() {
+                Vec::new()
+            } else {
+                run_embedding_blocking(Arc::clone(&self.embedder), all_texts, EmbedRole::Passage)
+                    .await?
+            };
+            if vectors.len() != expected {
+                return Err(HallouminateError::Indexer(format!(
+                    "embedder returned {} vectors for {} chunks",
+                    vectors.len(),
+                    expected
+                )));
+            }
+            let mut iter = vectors.drain(..);
+            for count in splits.iter().copied() {
+                let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let v = iter.next().ok_or_else(|| {
+                        HallouminateError::Indexer("embedding count drained early".into())
+                    })?;
+                    buf.push(v);
+                }
+                stats.chunks_written += count;
+                stats.embeddings_written += count;
+                file_embeddings.push(Some(buf));
+            }
+        } else {
+            for count in splits.iter().copied() {
+                stats.chunks_written += count;
+                file_embeddings.push(None);
+            }
+        }
+
+        let paired: Vec<FileWithEmbeddings> = batch
+            .iter()
+            .zip(file_embeddings.iter())
+            .map(|(file, embeddings)| FileWithEmbeddings {
+                file,
+                embeddings: embeddings.as_deref(),
+            })
+            .collect();
+
         let schema = chunks_schema();
-        let record_batch = build_record_batch(&batch, schema.clone())?;
+        let record_batch = build_record_batch(&paired, schema.clone())?;
         let mut file_refs: Vec<String> = Vec::with_capacity(batch.len());
         for file in &batch {
             file_refs.push(file.file_ref.clone());
@@ -828,7 +884,7 @@ impl LanceStore {
             );
             return Err(e);
         }
-        Ok(())
+        Ok(stats)
     }
 
     /// Build the FTS index on `text` (and the ANN index on `embedding`) if
@@ -1023,7 +1079,7 @@ impl LanceStore {
     ///
     /// Returns an error if the LanceDB query fails or a returned column has an
     /// unexpected type.
-    pub async fn list_files(&self, corpus: &str) -> Result<HashMap<FileRef, FileSnapshot>> {
+    async fn list_files(&self, corpus: &str) -> Result<Vec<FileSnapshot>> {
         let predicate = format!("corpus = '{}' AND ord = 0", escape_sql_str(corpus));
         let stream = self
             .table
@@ -1039,21 +1095,19 @@ impl LanceStore {
             .await
             .map_err(map_lance_err)?;
         let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
-        let mut out: HashMap<FileRef, FileSnapshot> = HashMap::new();
+        let mut out: Vec<FileSnapshot> = Vec::new();
         for rb in batches {
             let file_ref_col = string_col(&rb, "file_ref")?;
             let corpus_col = string_col(&rb, "corpus")?;
             let mtime_col = int64_col(&rb, "mtime_ms")?;
             let hash_col = string_col(&rb, "content_hash")?;
             for i in 0..rb.num_rows() {
-                let file_ref = file_ref_col.value(i).to_string();
-                let snap = FileSnapshot {
-                    file_ref: file_ref.clone(),
+                out.push(FileSnapshot {
+                    file_ref: file_ref_col.value(i).to_string(),
                     corpus: corpus_col.value(i).to_string(),
                     mtime_ms: mtime_col.value(i),
                     content_hash: hash_col.value(i).to_string(),
-                };
-                out.insert(FileRef::new(std::path::PathBuf::from(&file_ref)), snap);
+                });
             }
         }
         Ok(out)
@@ -1061,64 +1115,16 @@ impl LanceStore {
 
     /// Hybrid BM25 + vector search reranked with a `WeightedRRFReranker`
     /// biased toward FTS (see `weighted_rrf::FTS_WEIGHT` /
-    /// `VECTOR_WEIGHT`), scoped to a single `corpus`. Returns an empty
-    /// `Vec` for an empty corpus or when no rows match the corpus filter.
+    /// `VECTOR_WEIGHT`) when this store owns an [`Embedder`]; falls back to
+    /// BM25-only search otherwise. Scoped to a single `corpus`. Returns an
+    /// empty `Vec` for an empty corpus or when no rows match the corpus
+    /// filter.
     ///
     /// # Errors
     ///
-    /// Returns an error if `query_vec` is not [`EMBEDDING_DIM`] long, or if the
-    /// LanceDB search, rerank, or row decode fails.
-    pub async fn hybrid_search(
-        &self,
-        corpus: &str,
-        query: &str,
-        query_vec: &[f32],
-        limit: usize,
-    ) -> Result<Vec<SearchHit>> {
-        if query_vec.len() != EMBEDDING_DIM {
-            return Err(HallouminateError::Embed(format!(
-                "query vector dim mismatch: got {}, expected {}",
-                query_vec.len(),
-                EMBEDDING_DIM
-            )));
-        }
-        if !self.has_text_index().await? {
-            return Ok(Vec::new());
-        }
-        let reranker = std::sync::Arc::new(weighted_rrf::WeightedRRFReranker::default());
-        let corpus_filter = format!("corpus = '{}'", escape_sql_str(corpus));
-        let stream = self
-            .table
-            .query()
-            .only_if(corpus_filter)
-            .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
-                query.to_string(),
-            ))
-            .nearest_to(query_vec)
-            .map_err(map_lance_err)?
-            .limit(limit)
-            .rerank(reranker)
-            .execute()
-            .await
-            .map_err(map_lance_err)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
-        let mut out: Vec<SearchHit> = Vec::new();
-        for rb in batches {
-            decode_hits(&rb, &mut out)?;
-        }
-        Ok(out)
-    }
-
-    /// BM25-only search, scoped to a single `corpus`. The embeddings-OFF
-    /// sibling of `hybrid_search`: same FTS path, but no `.nearest_to()`
-    /// vector leg, no reranker (there is only one signal to rank), and no
-    /// query-vector dim guard. Returns an empty `Vec` for an empty corpus or
-    /// when no rows match the corpus filter.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the LanceDB full-text search or row decode fails.
-    pub async fn fts_search(
+    /// Returns an error if embedding the query fails, or if the LanceDB
+    /// search, rerank, or row decode fails.
+    async fn hybrid_search(
         &self,
         corpus: &str,
         query: &str,
@@ -1128,21 +1134,52 @@ impl LanceStore {
             return Ok(Vec::new());
         }
         let corpus_filter = format!("corpus = '{}'", escape_sql_str(corpus));
-        let stream = self
-            .table
-            .query()
-            .only_if(corpus_filter)
-            .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
-                query.to_string(),
-            ))
-            .limit(limit)
-            .execute()
-            .await
-            .map_err(map_lance_err)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
         let mut out: Vec<SearchHit> = Vec::new();
-        for rb in batches {
-            decode_hits(&rb, &mut out)?;
+        if self.embeddings_enabled {
+            let vectors = run_embedding_blocking(
+                Arc::clone(&self.embedder),
+                vec![query.to_string()],
+                EmbedRole::Query,
+            )
+            .await?;
+            let query_vec = vectors.into_iter().next().ok_or_else(|| {
+                HallouminateError::Embed("embed_batch returned no vector for query".into())
+            })?;
+            let reranker = Arc::new(weighted_rrf::WeightedRRFReranker::default());
+            let stream = self
+                .table
+                .query()
+                .only_if(corpus_filter)
+                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
+                    query.to_string(),
+                ))
+                .nearest_to(&query_vec[..])
+                .map_err(map_lance_err)?
+                .limit(limit)
+                .rerank(reranker)
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            for rb in batches {
+                decode_hits(&rb, &mut out)?;
+            }
+        } else {
+            let stream = self
+                .table
+                .query()
+                .only_if(corpus_filter)
+                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
+                    query.to_string(),
+                ))
+                .limit(limit)
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            for rb in batches {
+                decode_hits(&rb, &mut out)?;
+            }
         }
         Ok(out)
     }
@@ -1172,18 +1209,138 @@ async fn open_or_create_table(connection: &lancedb::Connection) -> Result<lanced
         .map_err(map_lance_err)
 }
 
+#[async_trait]
+impl ChunkStore for LanceStore {
+    async fn list_files(&self, corpus: &str) -> Result<Vec<FileSnapshot>> {
+        LanceStore::list_files(self, corpus).await
+    }
+
+    async fn hybrid_search(
+        &self,
+        corpus: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        LanceStore::hybrid_search(self, corpus, query, limit).await
+    }
+
+    async fn touch_mtime(&self, corpus: &str, file_ref: &str, mtime_ms: i64) -> Result<()> {
+        LanceStore::touch_mtime(self, corpus, file_ref, mtime_ms).await
+    }
+
+    async fn delete_file(&self, corpus: &str, file_ref: &str) -> Result<()> {
+        LanceStore::delete_file(self, corpus, file_ref).await
+    }
+
+    async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
+        LanceStore::apply_batch(self, files).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::indexer::chunk::PreparedChunk;
+
+    struct ThreadRecordingEmbedder {
+        threads: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl EmbedBatch for ThreadRecordingEmbedder {
+        fn embed_batch(
+            &mut self,
+            texts: &[String],
+            _role: EmbedRole,
+        ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+            self.threads
+                .lock()
+                .expect("recording lock")
+                .push(std::thread::current().id());
+            Ok(vec![[0.0; EMBEDDING_DIM]; texts.len()])
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn passage_and_query_embedding_use_blocking_pool_on_current_thread_runtime() {
+        let runtime_thread = std::thread::current().id();
+        let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let embedder: Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>> = Arc::new(
+            std::sync::Mutex::new(Some(Box::new(ThreadRecordingEmbedder {
+                threads: Arc::clone(&threads),
+            }))),
+        );
+
+        run_embedding_blocking(
+            Arc::clone(&embedder),
+            vec!["passage".to_string()],
+            EmbedRole::Passage,
+        )
+        .await
+        .expect("passage embedding");
+        run_embedding_blocking(embedder, vec!["query".to_string()], EmbedRole::Query)
+            .await
+            .expect("query embedding");
+
+        let threads = threads.lock().expect("recording lock");
+        assert_eq!(threads.len(), 2);
+        for embedding_thread in threads.iter() {
+            assert_ne!(
+                *embedding_thread, runtime_thread,
+                "embedding must run on Tokio's blocking pool"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enabled_store_without_embedder_rejects_embedding_dependent_operations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(ThreadRecordingEmbedder { threads })),
+        )
+        .await
+        .expect("open enabled store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/seed.md", 1)])
+            .await
+            .expect("seed store");
+        *store.embedder.lock().expect("embedder lock") = None;
+        store.embedder_available.store(false, Ordering::Release);
+
+        let write_error = store
+            .apply_batch(vec![synthetic_prepared("/tmp/unavailable.md", 1)])
+            .await
+            .expect_err("enabled writes must not degrade to null vectors");
+        assert!(
+            write_error
+                .to_string()
+                .contains("embedding model is unavailable")
+        );
+
+        let query_error = store
+            .hybrid_search("docs", "seed", 10)
+            .await
+            .expect_err("enabled queries must not degrade to lexical-only search");
+        assert!(
+            query_error
+                .to_string()
+                .contains("embedding model is unavailable")
+        );
+    }
 
     #[tokio::test]
     async fn corpus_chunk_stats_scoped_to_requested_corpus() {
         // Seed a two-corpus table and verify that corpus_chunk_stats returns
         // counts for only the requested corpus with no cross-corpus bleed.
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
-            .await
-            .expect("open store");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
 
         let mut alpha_a = synthetic_prepared("/alpha/a.md", 3);
         alpha_a.corpus = "alpha".into();
@@ -1237,9 +1394,10 @@ mod tests {
         // new dataset version, so many small upserts + deletes build up a
         // version history that maintain() (compact + prune) should shrink.
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
-            .await
-            .expect("open store");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
 
         for i in 0..20 {
             let pf = synthetic_prepared(&format!("/tmp/f{i}.md"), 1);
@@ -1290,11 +1448,11 @@ mod tests {
         );
         let snaps = store.list_files("docs").await.expect("list_files");
         assert!(
-            snaps.contains_key(&FileRef::new(PathBuf::from("/tmp/f10.md"))),
+            snaps.iter().any(|s| s.file_ref == "/tmp/f10.md"),
             "surviving file must still be queryable after maintain"
         );
         assert!(
-            !snaps.contains_key(&FileRef::new(PathBuf::from("/tmp/f0.md"))),
+            !snaps.iter().any(|s| s.file_ref == "/tmp/f0.md"),
             "deleted file must stay gone after maintain"
         );
     }
@@ -1302,9 +1460,10 @@ mod tests {
     #[tokio::test]
     async fn has_text_index_latches_and_skips_list_indices_after_first_true() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
-            .await
-            .expect("open store");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
         assert!(
             !store.text_index_present.load(Ordering::Relaxed),
             "fresh store starts unlatched"
@@ -1654,7 +1813,6 @@ schema_version = 1
     }
 
     fn synthetic_prepared(file_ref: &str, chunks: usize) -> PreparedFile {
-        let mut embeddings = Vec::new();
         let mut pf = PreparedFile {
             file_ref: file_ref.to_string(),
             corpus: "docs".into(),
@@ -1665,7 +1823,6 @@ schema_version = 1
             frontmatter: None,
             indexed_at_ms: 11,
             chunks: Vec::new(),
-            embeddings: None,
         };
         for i in 0..chunks {
             pf.chunks.push(PreparedChunk {
@@ -1676,25 +1833,29 @@ schema_version = 1
                 text: format!("chunk-{i}"),
                 claim_marks: None,
             });
-            embeddings.push([0.0_f32; EMBEDDING_DIM]);
         }
-        pf.embeddings = Some(embeddings);
         pf
     }
 
-    /// Embeddings-OFF variant: same chunks, but `embeddings: None` so every
-    /// row is written with a null vector.
-    fn synthetic_prepared_no_embeddings(file_ref: &str, chunks: usize) -> PreparedFile {
-        let mut pf = synthetic_prepared(file_ref, chunks);
-        pf.embeddings = None;
-        pf
+    fn synth_embeddings(n: usize) -> Vec<[f32; EMBEDDING_DIM]> {
+        vec![[0.0_f32; EMBEDDING_DIM]; n]
     }
 
     #[test]
     fn build_record_batch_row_count_matches_total_chunks_across_files() {
+        let a = synthetic_prepared("/tmp/a.md", 3);
+        let a_emb = synth_embeddings(a.chunks.len());
+        let b = synthetic_prepared("/tmp/b.md", 2);
+        let b_emb = synth_embeddings(b.chunks.len());
         let batch = vec![
-            synthetic_prepared("/tmp/a.md", 3),
-            synthetic_prepared("/tmp/b.md", 2),
+            FileWithEmbeddings {
+                file: &a,
+                embeddings: Some(&a_emb),
+            },
+            FileWithEmbeddings {
+                file: &b,
+                embeddings: Some(&b_emb),
+            },
         ];
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
@@ -1704,7 +1865,12 @@ schema_version = 1
 
     #[test]
     fn build_record_batch_denormalizes_file_metadata_onto_every_chunk_row() {
-        let batch = vec![synthetic_prepared("/tmp/dup.md", 3)];
+        let pf = synthetic_prepared("/tmp/dup.md", 3);
+        let emb = synth_embeddings(pf.chunks.len());
+        let batch = vec![FileWithEmbeddings {
+            file: &pf,
+            embeddings: Some(&emb),
+        }];
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
         let file_refs = rb
@@ -1729,9 +1895,24 @@ schema_version = 1
     fn build_record_batch_denormalizes_frontmatter_with_null_for_absent() {
         let mut with_fm = synthetic_prepared("/tmp/fm.md", 2);
         with_fm.frontmatter = Some(r#"{"status":"draft"}"#.to_string());
+        let with_fm_emb = synth_embeddings(with_fm.chunks.len());
         let without_fm = synthetic_prepared("/tmp/plain.md", 1); // frontmatter: None
+        let without_fm_emb = synth_embeddings(without_fm.chunks.len());
         let schema = chunks_schema();
-        let rb = build_record_batch(&[with_fm, without_fm], schema).expect("build batch");
+        let rb = build_record_batch(
+            &[
+                FileWithEmbeddings {
+                    file: &with_fm,
+                    embeddings: Some(&with_fm_emb),
+                },
+                FileWithEmbeddings {
+                    file: &without_fm,
+                    embeddings: Some(&without_fm_emb),
+                },
+            ],
+            schema,
+        )
+        .expect("build batch");
         let fm = rb
             .column_by_name("frontmatter")
             .expect("frontmatter column")
@@ -1758,8 +1939,16 @@ schema_version = 1
         let mut pf = synthetic_prepared("/tmp/marks.md", 3);
         pf.chunks[1].claim_marks =
             Some(r#"[{"status":"confirmed","line":2,"reference":null,"note":null}]"#.to_string());
+        let emb = synth_embeddings(pf.chunks.len());
         let schema = chunks_schema();
-        let rb = build_record_batch(&[pf], schema).expect("build batch");
+        let rb = build_record_batch(
+            &[FileWithEmbeddings {
+                file: &pf,
+                embeddings: Some(&emb),
+            }],
+            schema,
+        )
+        .expect("build batch");
         let cm = rb
             .column_by_name("claim_marks")
             .expect("claim_marks column")
@@ -1778,12 +1967,18 @@ schema_version = 1
 
     #[test]
     fn build_record_batch_rejects_chunk_embedding_length_mismatch() {
-        let mut pf = synthetic_prepared("/tmp/bad.md", 2);
-        if let Some(v) = pf.embeddings.as_mut() {
-            v.pop(); // 2 chunks, 1 embedding
-        }
+        let pf = synthetic_prepared("/tmp/bad.md", 2);
+        let mut emb = synth_embeddings(pf.chunks.len());
+        emb.pop(); // 2 chunks, 1 embedding
         let schema = chunks_schema();
-        let err = build_record_batch(&[pf], schema).unwrap_err();
+        let err = build_record_batch(
+            &[FileWithEmbeddings {
+                file: &pf,
+                embeddings: Some(&emb),
+            }],
+            schema,
+        )
+        .unwrap_err();
         assert!(
             err.to_string().contains("chunks but 1 embeddings"),
             "got: {err}"
@@ -1792,7 +1987,11 @@ schema_version = 1
 
     #[test]
     fn build_record_batch_off_mode_writes_null_embeddings_for_every_chunk() {
-        let batch = vec![synthetic_prepared_no_embeddings("/tmp/off.md", 3)];
+        let pf = synthetic_prepared("/tmp/off.md", 3);
+        let batch = vec![FileWithEmbeddings {
+            file: &pf,
+            embeddings: None,
+        }];
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build OFF batch");
         assert_eq!(rb.num_rows(), 3);
@@ -1809,7 +2008,12 @@ schema_version = 1
 
     #[test]
     fn build_record_batch_on_mode_has_no_null_embeddings() {
-        let batch = vec![synthetic_prepared("/tmp/on.md", 3)];
+        let pf = synthetic_prepared("/tmp/on.md", 3);
+        let emb = synth_embeddings(pf.chunks.len());
+        let batch = vec![FileWithEmbeddings {
+            file: &pf,
+            embeddings: Some(&emb),
+        }];
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build ON batch");
         let embedding = rb.column_by_name("embedding").expect("embedding column");
@@ -1822,7 +2026,12 @@ schema_version = 1
 
     #[test]
     fn build_record_batch_assigns_deterministic_chunk_ids_via_chunk_id_for() {
-        let batch = vec![synthetic_prepared("/tmp/det.md", 2)];
+        let pf = synthetic_prepared("/tmp/det.md", 2);
+        let emb = synth_embeddings(pf.chunks.len());
+        let batch = vec![FileWithEmbeddings {
+            file: &pf,
+            embeddings: Some(&emb),
+        }];
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
         let chunk_ids = rb
@@ -1862,16 +2071,16 @@ schema_version = 1
     /// Re-indexing across more than one batch must produce the same row state
     /// whether or not the `indexes_ensured` latch short-circuits the
     /// `list_indices()` round-trip. The latch is an optimization: it must not
-    /// change what ends up in the table. In embeddings-ON mode below the ANN
-    /// row threshold the latch deliberately stays open (a later batch could
-    /// cross the threshold and still need the vector index built), yet both
-    /// files' rows must be present, durable, and searchable.
+    /// change what ends up in the table. In embeddings-OFF mode the latch
+    /// closes after the FTS index is built, and both files' rows must remain
+    /// present, durable, and searchable.
     #[tokio::test]
     async fn re_indexing_across_batches_keeps_rows_durable_with_indexes_built() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
-            .await
-            .expect("open store");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
 
         assert!(
             !store.indexes_ensured.load(Ordering::Acquire),
@@ -1884,9 +2093,8 @@ schema_version = 1
             .expect("first batch");
         assert_eq!(store.count_rows().await.unwrap(), 3);
         assert!(
-            !store.indexes_ensured.load(Ordering::Acquire),
-            "ON mode below the ANN row threshold must NOT latch — a later, \
-             larger batch still needs the chance to build the vector index"
+            store.indexes_ensured.load(Ordering::Acquire),
+            "OFF mode must latch after building its only search index (FTS)"
         );
 
         store
@@ -1899,12 +2107,12 @@ schema_version = 1
             "second batch must still write its rows"
         );
         assert!(
-            !store.indexes_ensured.load(Ordering::Acquire),
-            "latch must stay open while the corpus is still below the ANN threshold"
+            store.indexes_ensured.load(Ordering::Acquire),
+            "the OFF-mode latch must remain closed across later batches"
         );
 
         let hits = store
-            .fts_search("docs", "chunk-0", 10)
+            .hybrid_search("docs", "chunk-0", 10)
             .await
             .expect("fts search after re-index");
         assert!(
@@ -1921,12 +2129,13 @@ schema_version = 1
     #[tokio::test]
     async fn off_mode_latches_after_first_batch_then_skips_list_indices() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false)
-            .await
-            .expect("open OFF-mode store");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open OFF-mode store");
 
         store
-            .apply_batch(vec![synthetic_prepared_no_embeddings("/tmp/a.md", 3)])
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 3)])
             .await
             .expect("first OFF batch");
         assert!(
@@ -1935,7 +2144,7 @@ schema_version = 1
         );
 
         store
-            .apply_batch(vec![synthetic_prepared_no_embeddings("/tmp/b.md", 2)])
+            .apply_batch(vec![synthetic_prepared("/tmp/b.md", 2)])
             .await
             .expect("second OFF batch on the cached path");
         assert_eq!(
@@ -1945,7 +2154,7 @@ schema_version = 1
         );
 
         let hits = store
-            .fts_search("docs", "chunk-1", 10)
+            .hybrid_search("docs", "chunk-1", 10)
             .await
             .expect("fts search after cached re-index");
         assert!(
@@ -1961,14 +2170,16 @@ schema_version = 1
     /// `Indexer("missing column chunk_id")` and crashed the whole call. The
     /// cross-repo union ground fans across every effective corpus, so a single
     /// empty / unindexed sub-repo wiki would otherwise take down results from
-    /// every other repo. Both the ON-mode (`hybrid_search`) and OFF-mode
-    /// (`fts_search`) decode paths must tolerate it.
+    /// every other repo. Only the lexical (embedder-less) decode path is
+    /// exercised here — ON-mode would require a real embedder, which would
+    /// make this a network/model-dependent unit test.
     #[tokio::test]
     async fn searching_an_empty_corpus_in_a_populated_store_returns_no_hits_not_error() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, true)
-            .await
-            .expect("open store");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
         // Populate the store under corpus "docs" so count_rows() > 0 and the
         // FTS index exists — the empty-corpus query then hits the real search
         // path rather than the early count_rows()==0 / no-index short-circuits.
@@ -1981,28 +2192,21 @@ schema_version = 1
             "store must be populated"
         );
 
-        // OFF-mode decode path.
-        let fts = store
-            .fts_search("repo:empty:wiki", "chunk", 10)
+        // Decode path must tolerate a zero-row corpus rather than erroring
+        // (an unindexed corpus surfaces empty result columns). ON-mode
+        // exercise via a real embedder would make this a network/model-
+        // dependent unit test, so only the lexical (embedder-less) decode
+        // path is covered here; ON-mode zero-row decoding is covered by
+        // `build_record_batch_off_mode_writes_null_embeddings_for_every_chunk`
+        // and friends at the row-encode layer.
+        let hits = store
+            .hybrid_search("repo:empty:wiki", "chunk", 10)
             .await
-            .expect("fts on an empty corpus must not error");
+            .expect("hybrid search on an empty corpus must not error");
         assert!(
-            fts.is_empty(),
-            "a zero-row corpus must yield no FTS hits, got {}",
-            fts.len()
-        );
-
-        // ON-mode decode path: a well-formed (zero) query vector exercises the
-        // hybrid query + decode without needing a real embedding model.
-        let query_vec = [0.0_f32; EMBEDDING_DIM];
-        let hybrid = store
-            .hybrid_search("repo:empty:wiki", "chunk", &query_vec, 10)
-            .await
-            .expect("hybrid on an empty corpus must not error");
-        assert!(
-            hybrid.is_empty(),
-            "a zero-row corpus must yield no hybrid hits, got {}",
-            hybrid.len()
+            hits.is_empty(),
+            "a zero-row corpus must yield no hits, got {}",
+            hits.len()
         );
     }
 
