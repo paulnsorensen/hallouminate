@@ -659,14 +659,20 @@ impl DaemonState {
             return MaintenanceTick::Stop;
         };
         lifecycle.write_lane_acquired();
-        let result = tokio::select! {
+        let maintenance = maintain(lifecycle.maintenance_id);
+        tokio::pin!(maintenance);
+        let (result, shutdown_requested) = tokio::select! {
             biased;
+            result = &mut maintenance => (result, false),
             _ = shutdown.cancelled() => {
-                lifecycle.shutdown();
-                return MaintenanceTick::Stop;
+                (maintenance.await, true)
             }
-            result = maintain(lifecycle.maintenance_id) => result,
         };
+        if shutdown_requested {
+            lifecycle.shutdown();
+            self.touch_activity();
+            return MaintenanceTick::Stop;
+        }
         match result {
             Ok(stats) => lifecycle.success(stats),
             Err(error) => lifecycle.failure(&error),
@@ -1554,19 +1560,36 @@ mod tests {
         let subscriber = Registry::default().with(capture.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
         let state = test_state().await;
+        let lane = state.write_lane();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let tick_state = state.clone();
         let task = tokio::spawn(async move {
             tick_state
                 .run_maintenance_tick_with(|_| async move {
                     started_tx.send(()).expect("maintenance started");
-                    std::future::pending().await
+                    finish_rx.await.expect("finish maintenance");
+                    Ok(MaintenanceStats {
+                        fragments_removed: None,
+                        fragments_added: None,
+                        old_versions_pruned: None,
+                    })
                 })
                 .await
         });
 
         started_rx.await.expect("maintenance start signal");
         state.shutdown_token().cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "shutdown must not cancel in-flight maintenance",
+        );
+        assert!(
+            lane.try_acquire().is_err(),
+            "write lane must remain held until in-flight maintenance completes",
+        );
+        finish_tx.send(()).expect("finish signal");
         let tick = task.await.expect("maintenance task");
 
         assert_eq!(tick, MaintenanceTick::Stop);
