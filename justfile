@@ -63,6 +63,7 @@ prepare-release version:
     git switch -c "$branch"
     python3 - "$version" <<'PY'
     import json
+    import re
     import sys
     from pathlib import Path
 
@@ -70,20 +71,21 @@ prepare-release version:
 
     cargo = Path("Cargo.toml")
     lines = cargo.read_text().splitlines()
-    in_package = False
-    changed = False
+    in_workspace_package = False
+    version_set = False
     for index, line in enumerate(lines):
-        if line == "[package]":
-            in_package = True
+        if line == "[workspace.package]":
+            in_workspace_package = True
             continue
-        if in_package and line.startswith("["):
-            break
-        if in_package and line.startswith("version = "):
+        if in_workspace_package and line.startswith("["):
+            in_workspace_package = False
+        if in_workspace_package and not version_set and line.startswith("version = "):
             lines[index] = f'version = "{version}"'
-            changed = True
-            break
-    if not changed:
-        raise SystemExit("Cargo.toml [package].version not found")
+            version_set = True
+        if re.match(r"hallouminate-(domain|adapters) = ", line):
+            lines[index] = re.sub(r'version = "[^"]*"', f'version = "{version}"', line)
+    if not version_set:
+        raise SystemExit("Cargo.toml [workspace.package].version not found")
     cargo.write_text("\n".join(lines) + "\n")
 
     for manifest in [
