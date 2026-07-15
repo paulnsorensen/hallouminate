@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
@@ -214,6 +215,8 @@ struct DaemonStateInner {
     /// Count of connection handlers in flight. Idle-exit defers while non-zero
     /// so the daemon never exits mid-request (ADR-003).
     active_connections: Arc<AtomicUsize>,
+    /// Retained so shutdown drains maintenance before releasing the daemon flock.
+    maintenance_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
@@ -290,9 +293,9 @@ impl MaintenanceLifecycle {
             queue_wait_ms,
             maintenance_ms,
             total_ms,
-            fragments_removed = ?stats.fragments_removed,
-            fragments_added = ?stats.fragments_added,
-            old_versions_pruned = ?stats.old_versions_pruned,
+            fragments_removed = stats.fragments_removed,
+            fragments_added = stats.fragments_added,
+            old_versions_pruned = stats.old_versions_pruned,
             "periodic LanceDB maintenance completed",
         );
         self.finished = true;
@@ -586,6 +589,7 @@ impl DaemonState {
                 crossencoders: crossencoders_arc,
                 last_activity_secs: last_activity,
                 active_connections: Arc::new(AtomicUsize::new(0)),
+                maintenance_task: Mutex::new(None),
                 shutdown,
             }),
         };
@@ -597,7 +601,7 @@ impl DaemonState {
         // the write lane still preserves the documented `corpus ->
         // write_lane` order (a lock that is never acquired can't be
         // acquired out of order).
-        {
+        let maintenance_task = {
             let state = state.clone();
             let cancel = state.shutdown_token().clone();
             tokio::spawn(async move {
@@ -612,8 +616,9 @@ impl DaemonState {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
+        *state.inner.maintenance_task.lock().await = Some(maintenance_task);
 
         Ok(state)
     }
@@ -686,6 +691,10 @@ impl DaemonState {
     /// signal handlers call [`CancellationToken::cancel`].
     pub fn shutdown_token(&self) -> &CancellationToken {
         &self.inner.shutdown
+    }
+
+    pub(crate) async fn take_maintenance_task(&self) -> Option<JoinHandle<()>> {
+        self.inner.maintenance_task.lock().await.take()
     }
 
     /// Source path of the baseline config the daemon booted from — the XDG
@@ -1446,10 +1455,22 @@ mod tests {
             "old_versions_pruned",
         ] {
             assert!(
-                terminal.strings.contains_key(field) || terminal.numbers.contains_key(field),
-                "success event must retain {field}: {terminal:?}",
+                terminal.numbers.contains_key(field),
+                "success event must retain numeric {field}: {terminal:?}",
             );
         }
+        for field in ["fragments_removed", "fragments_added"] {
+            assert!(
+                events[3].numbers.contains_key(field),
+                "compaction event must retain numeric {field}: {:?}",
+                events[3],
+            );
+        }
+        assert!(
+            events[5].numbers.contains_key("old_versions_pruned"),
+            "prune event must retain numeric old_versions_pruned: {:?}",
+            events[5],
+        );
         assert!(
             !terminal.numbers.contains_key("bytes_read")
                 && !terminal.numbers.contains_key("bytes_written"),

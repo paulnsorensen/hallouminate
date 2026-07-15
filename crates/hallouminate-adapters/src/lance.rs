@@ -787,11 +787,11 @@ impl LanceStore {
                     maintenance_event = "compaction_finished",
                     maintenance_id = options.maintenance_id,
                     outcome = "success",
-                    fragments_removed = ?stats
+                    fragments_removed = stats
                         .compaction
                         .as_ref()
                         .map(|stats| stats.fragments_removed),
-                    fragments_added = ?stats
+                    fragments_added = stats
                         .compaction
                         .as_ref()
                         .map(|stats| stats.fragments_added),
@@ -835,7 +835,7 @@ impl LanceStore {
                     maintenance_event = "prune_finished",
                     maintenance_id = options.maintenance_id,
                     outcome = "success",
-                    old_versions_pruned = ?prune.prune.as_ref().map(|stats| stats.old_versions),
+                    old_versions_pruned = prune.prune.as_ref().map(|stats| stats.old_versions),
                     "LanceDB maintenance prune completed",
                 );
                 prune

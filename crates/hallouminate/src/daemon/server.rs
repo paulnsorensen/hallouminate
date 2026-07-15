@@ -9,12 +9,12 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config::{self, Config};
 
@@ -47,10 +47,9 @@ const MAX_REQUEST_LINE_BYTES: u64 = 4 * 1024 * 1024;
 /// blocking the accept loop.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
-/// Upper bound on how long shutdown waits for in-flight connection handlers
-/// to finish before releasing the socket and single-instance flock. A
-/// handler that ignores this deadline is aborted rather than allowed to
-/// block shutdown forever.
+/// Upper bound on how long shutdown waits for in-flight work before releasing
+/// the socket and single-instance flock. A task that ignores this deadline is
+/// aborted rather than allowed to block shutdown forever.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Boot the daemon and serve until SIGINT/SIGTERM (or stdin close on the
@@ -86,9 +85,15 @@ async fn serve_with_config(
     spawn_signal_handlers(&state);
     spawn_idle_exit(&state, state.baseline().daemon.idle_exit_secs);
     tokio::spawn(super::dispatch::catch_up_index(state.clone()));
-    let result = serve_on_listener(&state, socket_path, IDLE_READ_TIMEOUT).await;
+    let (result, shutdown_deadline): (anyhow::Result<()>, Instant) =
+        match serve_on_listener(&state, socket_path, IDLE_READ_TIMEOUT).await {
+            Ok(deadline) => (Ok(()), deadline),
+            Err(error) => (Err(error), Instant::now() + SHUTDOWN_DRAIN_TIMEOUT),
+        };
     drop(watcher);
-    cleanup(lock, socket_path).await;
+    state.shutdown_token().cancel();
+    let maintenance = state.take_maintenance_task().await;
+    finish_shutdown(maintenance, lock, socket_path, shutdown_deadline).await;
     result
 }
 
@@ -163,6 +168,41 @@ fn spawn_idle_exit(state: &DaemonState, idle_exit_secs: u64) {
     });
 }
 
+async fn finish_shutdown(
+    maintenance: Option<JoinHandle<()>>,
+    lock: std::fs::File,
+    socket_path: &Path,
+    deadline: Instant,
+) {
+    if let Some(mut task) = maintenance {
+        tracing::info!(
+            target: "hallouminate::daemon",
+            "draining periodic maintenance before releasing daemon resources",
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %error,
+                    "periodic maintenance task exited unexpectedly during shutdown",
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    timeout_secs = remaining.as_secs_f64(),
+                    "shutdown drain timed out; aborting periodic maintenance",
+                );
+                task.abort();
+                drop(task.await);
+            }
+        }
+    }
+    cleanup(lock, socket_path).await;
+}
+
 /// Remove the socket file, then release the single-instance flock (dropping
 /// the `File` releases the advisory lock, POSIX). This order matters: if the
 /// flock were released first, a respawning daemon could win it, remove the
@@ -225,9 +265,8 @@ async fn remove_stale_socket(socket_path: &Path) {
 /// Public for tests: drive the accept loop against an already-opened
 /// `DaemonState` and a known socket path. The accept loop breaks when
 /// `state.shutdown_token()` is cancelled — the IPC `Shutdown` request
-/// cancels that token, so `serve` returns once shutdown is requested (or
-/// on an unrecoverable bind error). After the loop breaks, the caller runs
-/// cleanup: dropping the single-instance flock and removing the socket.
+/// cancels that token. Before returning, the server drains connection handlers
+/// and periodic maintenance, then removes the socket and releases the flock.
 pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
     serve_with_idle_timeout(state, socket_path, IDLE_READ_TIMEOUT).await
 }
@@ -251,9 +290,15 @@ pub async fn serve_with_idle_timeout(
     remove_stale_socket(socket_path).await;
     let watcher = super::watch::spawn_corpus_watcher(state);
     spawn_idle_exit(state, state.baseline().daemon.idle_exit_secs);
-    let result = serve_on_listener(state, socket_path, idle_timeout).await;
+    let (result, shutdown_deadline): (anyhow::Result<()>, Instant) =
+        match serve_on_listener(state, socket_path, idle_timeout).await {
+            Ok(deadline) => (Ok(()), deadline),
+            Err(error) => (Err(error), Instant::now() + SHUTDOWN_DRAIN_TIMEOUT),
+        };
     drop(watcher);
-    cleanup(lock, socket_path).await;
+    state.shutdown_token().cancel();
+    let maintenance = state.take_maintenance_task().await;
+    finish_shutdown(maintenance, lock, socket_path, shutdown_deadline).await;
     result
 }
 
@@ -261,7 +306,7 @@ async fn serve_on_listener(
     state: &DaemonState,
     socket_path: &Path,
     idle_timeout: Duration,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Instant> {
     let listener = UnixListener::bind(socket_path).map_err(|e| {
         tracing::error!(
             target: "hallouminate::daemon",
@@ -345,8 +390,9 @@ async fn serve_on_listener(
             }
         });
     }
-    drain_handlers(&mut handlers, SHUTDOWN_DRAIN_TIMEOUT).await;
-    Ok(())
+    let shutdown_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    drain_handlers(&mut handlers, shutdown_deadline).await;
+    Ok(shutdown_deadline)
 }
 
 /// Wait for in-flight connection handlers to finish before the caller
@@ -354,7 +400,7 @@ async fn serve_on_listener(
 /// replacement daemon could open the same LanceDB while an old mutation is
 /// still running. Bounded by `deadline`: handlers that don't finish in time
 /// are aborted so shutdown can never hang forever on a wedged handler.
-async fn drain_handlers(handlers: &mut JoinSet<()>, deadline: Duration) {
+async fn drain_handlers(handlers: &mut JoinSet<()>, deadline: Instant) {
     if handlers.is_empty() {
         return;
     }
@@ -364,14 +410,15 @@ async fn drain_handlers(handlers: &mut JoinSet<()>, deadline: Duration) {
         pending,
         "draining in-flight connection handlers before releasing daemon resources",
     );
-    let drained = tokio::time::timeout(deadline, async {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let drained = tokio::time::timeout(remaining, async {
         while handlers.join_next().await.is_some() {}
     })
     .await;
     if drained.is_err() {
         tracing::warn!(
             target: "hallouminate::daemon",
-            timeout_secs = deadline.as_secs(),
+            timeout_secs = remaining.as_secs_f64(),
             "shutdown drain timed out; aborting remaining in-flight handlers",
         );
         handlers.abort_all();
@@ -675,5 +722,39 @@ mod tests {
             authorize_peer(None, 501, &payload).is_some(),
             "unresolvable peer credentials must fail closed for a mutating request"
         );
+    }
+
+    #[tokio::test]
+    async fn finish_shutdown_drains_maintenance_before_releasing_lock() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("daemon.sock");
+        let lock_path = lock_path_for(&socket_path);
+        let lock = acquire_single_instance(&lock_path).expect("first daemon lock");
+        let (release, wait_for_release) = tokio::sync::oneshot::channel::<()>();
+        let maintenance = tokio::spawn(async move {
+            wait_for_release.await.expect("release maintenance");
+        });
+        let cleanup_socket_path = socket_path.clone();
+        let shutdown = tokio::spawn(async move {
+            finish_shutdown(
+                Some(maintenance),
+                lock,
+                &cleanup_socket_path,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            acquire_single_instance(&lock_path).is_err(),
+            "replacement daemon must not acquire the lock while maintenance is running",
+        );
+
+        release.send(()).expect("finish maintenance");
+        shutdown.await.expect("finish shutdown");
+        let replacement =
+            acquire_single_instance(&lock_path).expect("replacement daemon acquires released lock");
+        drop(replacement);
     }
 }
