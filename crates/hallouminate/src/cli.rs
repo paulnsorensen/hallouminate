@@ -282,7 +282,7 @@ pub enum ConfigAction {
     },
 }
 
-pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+pub async fn dispatch(cli: Cli, startup: crate::config::Config) -> anyhow::Result<()> {
     match cli.command {
         Command::Index(args) => cmd_index(args.into()).await,
         Command::Ground(args) => cmd_ground(args.into()).await,
@@ -306,7 +306,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Daemon(args) => {
             let action = args.action.clone().unwrap_or(DaemonAction::Run);
             match action {
-                DaemonAction::Run => crate::daemon::run_daemon(args.into()).await,
+                DaemonAction::Run => crate::daemon::run_daemon(startup, args.into()).await,
                 DaemonAction::Stop => {
                     crate::daemon::stop().await?;
                     println!("daemon stopped");

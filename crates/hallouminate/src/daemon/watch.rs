@@ -67,6 +67,14 @@ struct WatchRoot {
 
 const MAX_FAILURE_SIGNATURES: usize = 256;
 
+// Keys on the full `anyhow::Error` display string (see the `e.to_string()`
+// call site in `handle_changed_path`) because `index_single_file_with_content`
+// returns an opaque `anyhow::Result` with no stable error variant to key on
+// instead. Two known tradeoffs from this: (1) volatile error text (offsets,
+// transient ids) yields a distinct signature per occurrence, defeating
+// suppression for errors that vary slightly between reindex attempts; (2) the
+// last window's suppressed count is never flushed once failures for a
+// signature stop, so a trailing `suppressed: N` reminder can be lost.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct FailureSignature {
     path: PathBuf,

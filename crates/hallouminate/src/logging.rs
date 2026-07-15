@@ -66,7 +66,10 @@ fn log_writer(
         Compression::None,
         None,
     );
-    let (writer, guard) = NonBlockingBuilder::default().lossy(false).finish(appender);
+    // Stay lossy (the crate default): the async daemon must not block a tokio
+    // worker on a full log buffer. Flush-on-exit is guaranteed by `WorkerGuard`
+    // drop, not by non-lossy mode.
+    let (writer, guard) = NonBlockingBuilder::default().finish(appender);
     Ok((writer, guard))
 }
 
@@ -204,7 +207,10 @@ mod tests {
                 total_bytes += entry.metadata()?.len();
             }
         }
-        assert_eq!(file_count, 1, "equal limits must retain only the active file");
+        assert_eq!(
+            file_count, 1,
+            "equal limits must retain only the active file"
+        );
         assert!(
             total_bytes <= MAX_FILE_BYTES,
             "retained logs total {total_bytes} bytes, above {MAX_FILE_BYTES}"

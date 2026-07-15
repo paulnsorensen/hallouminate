@@ -657,6 +657,23 @@ fn merge_layers_with_sources(
         )?,
     };
 
+    // `[logging]` is process-wide and baseline-owned (it configures the
+    // daemon's file appender before any repo context exists), so unlike the
+    // scalar fields above it is never merged from the repo layer. A
+    // non-default repo `[logging]` block would be silently ignored if we let
+    // it through, so fail fast instead, mirroring `merge_scalar`'s conflict
+    // error shape.
+    if repo.logging != defaults.logging {
+        let repo_src = repo_path
+            .map(|p| format!(" (repo at {})", p.display()))
+            .unwrap_or_else(|| " (repo layer)".into());
+        return Err(HallouminateError::Config(format!(
+            "repo-layer conflict on logging: [logging] is baseline-owned and process-wide, \
+             repo = {:?}{repo_src}",
+            repo.logging
+        )));
+    }
+
     let merged = Config {
         corpora,
         repositories,
@@ -2172,6 +2189,34 @@ path = "/b"
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_layers_fails_fast_on_non_default_repo_logging_naming_repo_path() {
+        let baseline = Config::default();
+        let repo = parse("[logging]\nmax_file_bytes = 1024\n", None).expect("repo");
+        let repo_p = Path::new("/work/.hallouminate/config.toml");
+        let err = merge_layers_with_sources(&baseline, &repo, None, Some(repo_p))
+            .expect_err("non-default repo [logging] must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("logging"), "got: {msg}");
+                assert!(
+                    msg.contains("/work/.hallouminate/config.toml"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_layers_allows_default_repo_logging_and_keeps_baseline() {
+        let mut baseline = Config::default();
+        baseline.logging.max_file_bytes = 2048;
+        let repo = parse("", None).expect("repo");
+        let merged = merge_layers(&baseline, &repo).expect("default repo logging must merge");
+        assert_eq!(merged.logging, baseline.logging);
     }
 
     // ── resolve_for_cwd ─────────────────────────────────────────────────

@@ -28,7 +28,8 @@ hallouminate config validate   # parse + flag unknown top-level keys
 The **baseline** owns explicit `[[corpus]]` entries, `[[repository]]`
 declarations, and the `[search]`/`[embeddings]`/`[logging]`/`[watch]`/`[storage]`
 defaults. It is loaded once at daemon startup — change it and restart the
-daemon. Process-wide `[logging]` values are never taken from the repo layer.
+daemon. `[logging]` is process-wide and baseline-owned — a repo layer that
+sets a non-default `[logging]` errors, naming the repo config path.
 
 The **repo layer** is `<repo>/.hallouminate/config.toml`, found by walking up
 from the cwd to the first `.git` boundary. It overrides scalars and adds
@@ -54,8 +55,9 @@ so the wiki lands at `<repo>/.hallouminate/wiki` and is searchable as
 - Array entries (`[[corpus]]`, `[[repository]]`) — repo entries append after
   baseline entries; duplicate names error.
 - Scalars — the repo wins if it sets a non-default value; conflicting
-  non-default values error and name both source paths. `[logging]` is the
-  exception: it remains process-wide and baseline-owned.
+  non-default values error and name both source paths. `[logging]` stays
+  baseline-owned: a repo layer that sets a non-default `[logging]` is an
+  ERROR naming the repo config path, rather than being silently ignored.
 
 ## Logging
 
