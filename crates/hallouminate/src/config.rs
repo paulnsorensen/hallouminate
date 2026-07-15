@@ -2173,7 +2173,8 @@ path = "/b"
         // Regression trap: if the merge_scalar call for
         // daemon.maintenance_interval_secs is removed and the field is
         // hardcoded to its default, this fails.
-        let baseline = parse("[daemon]\nmaintenance_interval_secs = 3600\n", None).expect("baseline");
+        let baseline =
+            parse("[daemon]\nmaintenance_interval_secs = 3600\n", None).expect("baseline");
         let repo = parse("", None).expect("repo default");
         let merged = merge_layers(&baseline, &repo).expect("merge");
         assert_eq!(merged.daemon.maintenance_interval_secs, 3600);

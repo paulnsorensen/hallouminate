@@ -415,7 +415,9 @@ async fn maintenance_loop(
         let mut consecutive_defers: u32 = 0;
         while let Some(reason) = state.maintenance_defer_reason(probe.as_ref()) {
             consecutive_defers += 1;
-            if consecutive_defers > 10 && (consecutive_defers == 11 || consecutive_defers % 10 == 0) {
+            if consecutive_defers > 10
+                && (consecutive_defers == 11 || consecutive_defers.is_multiple_of(10))
+            {
                 tracing::warn!(
                     target: "hallouminate::daemon",
                     ?reason,

@@ -727,6 +727,22 @@ mod tests {
         );
     }
 
+    /// Acquire a lock we expect to have just been released, tolerating the
+    /// brief `flock`-release-after-close window (deferred `fput`). Panics if
+    /// the lock never becomes acquirable — that is a real leak, not the window.
+    fn acquire_released_lock(lock_path: &Path) -> std::fs::File {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match acquire_single_instance(lock_path) {
+                Ok(file) => return file,
+                Err(e) if Instant::now() >= deadline => {
+                    panic!("replacement daemon never acquired released lock: {e}")
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+
     #[tokio::test]
     async fn finish_shutdown_drains_maintenance_before_releasing_lock() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -756,8 +772,14 @@ mod tests {
 
         release.send(()).expect("finish maintenance");
         shutdown.await.expect("finish shutdown");
-        let replacement =
-            acquire_single_instance(&lock_path).expect("replacement daemon acquires released lock");
+        // `finish_shutdown` has returned, so cleanup dropped the lock file —
+        // but Linux releases the `flock` during deferred `fput`, so an
+        // immediate re-acquire on a fresh fd can still momentarily see
+        // `EWOULDBLOCK` under load. This is the same benign window `cleanup`
+        // documents for a racing respawn; a real replacement daemon is
+        // restarted and retries, so the test retries too. A genuinely leaked
+        // lock never becomes acquirable and exhausts the budget below.
+        let replacement = acquire_released_lock(&lock_path);
         drop(replacement);
     }
 }
