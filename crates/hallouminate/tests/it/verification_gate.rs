@@ -7,6 +7,8 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::Duration;
 
+const LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+
 fn run_git(worktree: &Path, args: &[&str]) -> Output {
     Command::new("git")
         .args(args)
@@ -81,6 +83,17 @@ fn just_command(
     command
 }
 
+fn write_fake_cargo(bin: &Path, script: &str) -> PathBuf {
+    let cargo = bin.join("cargo");
+    fs::write(&cargo, script).expect("write fake cargo");
+    let mut permissions = fs::metadata(&cargo)
+        .expect("fake cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&cargo, permissions).expect("make fake cargo executable");
+    cargo
+}
+
 fn parse_jsonl(path: &Path) -> Vec<serde_json::Value> {
     let text = fs::read_to_string(path).expect("read JSONL");
     let mut records = Vec::new();
@@ -118,6 +131,16 @@ fn verification_gate_contract_is_enforced_through_just_and_linked_worktrees() {
         run_git(&primary, &["commit", "-m", "fixture"]),
         "git commit",
     );
+    let head_output = run_git(&primary, &["rev-parse", "HEAD"]);
+    assert!(
+        head_output.status.success(),
+        "resolve fixture HEAD failed: {}",
+        String::from_utf8_lossy(&head_output.stderr)
+    );
+    let head_sha = String::from_utf8(head_output.stdout)
+        .expect("HEAD sha is UTF-8")
+        .trim()
+        .to_owned();
 
     let linked = temp.path().join("linked");
     let output = Command::new("git")
@@ -325,7 +348,7 @@ if command[0] != "fmt" and "VERIFY_TEST_SLEEP" in os.environ:
         );
         assert_eq!(record["command"], full_command);
         full_records += 1;
-        assert!(record["head"].as_str().expect("HEAD string").len() >= 40);
+        assert_eq!(record["head"].as_str().expect("HEAD string"), head_sha);
         assert_eq!(
             record["state_digest"]
                 .as_str()
@@ -684,4 +707,161 @@ if command[0] != "fmt" and "VERIFY_TEST_SLEEP" in os.environ:
         0,
         "rejected commands must not invoke Cargo"
     );
+}
+
+#[test]
+fn verification_log_rotates_when_oversized() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let primary = temp.path().join("primary");
+    fs::create_dir(&primary).expect("create primary worktree");
+    assert_success(run_git(&primary, &["init", "-b", "main"]), "git init");
+    assert_success(
+        run_git(&primary, &["config", "user.email", "verify@example.test"]),
+        "configure git email",
+    );
+    assert_success(
+        run_git(&primary, &["config", "user.name", "Verification Test"]),
+        "configure git name",
+    );
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::create_dir(primary.join("scripts")).expect("create scripts directory");
+    fs::copy(
+        repo_root.join("scripts/verify.py"),
+        primary.join("scripts/verify.py"),
+    )
+    .expect("copy verification script");
+    fs::write(primary.join("README.md"), "verification fixture\n").expect("write fixture");
+    assert_success(run_git(&primary, &["add", "."]), "git add");
+    assert_success(
+        run_git(&primary, &["commit", "-m", "fixture"]),
+        "git commit",
+    );
+
+    let primary_common_dir = common_dir(&primary);
+    let lock = primary_common_dir.join("hallouminate-verify.lock");
+    let log = primary_common_dir.join("hallouminate-verify.jsonl");
+
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).expect("create fake bin");
+    write_fake_cargo(&bin, "#!/usr/bin/env python3\nimport sys\nsys.exit(0)\n");
+
+    let marker = temp.path().join("cargo-running");
+    let invocation_log = temp.path().join("invocations.jsonl");
+    let existing_path = std::env::var_os("PATH").expect("PATH");
+    let mut paths = vec![bin.into_os_string()];
+    for path in std::env::split_paths(&existing_path) {
+        paths.push(path.into_os_string());
+    }
+    let path = std::env::join_paths(paths).expect("build PATH");
+
+    let oversized = fs::File::create(&log).expect("create oversized log");
+    oversized
+        .set_len(LOG_MAX_BYTES + 1)
+        .expect("size oversized log");
+    drop(oversized);
+
+    let output = verification_command(
+        &repo_root,
+        &primary,
+        &path,
+        &lock,
+        &marker,
+        &invocation_log,
+        &[],
+    )
+    .output()
+    .expect("run verification");
+    assert_success(output, "verification with pre-existing oversized log");
+
+    let rotated = primary_common_dir.join("hallouminate-verify.jsonl.1");
+    assert!(rotated.is_file(), "oversized log must be rotated to .1");
+    assert_eq!(
+        fs::metadata(&rotated).expect("rotated log metadata").len(),
+        LOG_MAX_BYTES + 1,
+        "rotated log must retain the pre-existing oversized content"
+    );
+
+    let records = parse_jsonl(&log);
+    assert!(
+        !records.is_empty(),
+        "fresh log must contain this run's records"
+    );
+    for record in &records {
+        assert!(
+            record["event"].is_string(),
+            "fresh log must parse clean, with no giant prefix from the rotated generation"
+        );
+    }
+}
+
+#[test]
+fn fmt_check_failure_is_logged_before_default_mode_returns() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let primary = temp.path().join("primary");
+    fs::create_dir(&primary).expect("create primary worktree");
+    assert_success(run_git(&primary, &["init", "-b", "main"]), "git init");
+    assert_success(
+        run_git(&primary, &["config", "user.email", "verify@example.test"]),
+        "configure git email",
+    );
+    assert_success(
+        run_git(&primary, &["config", "user.name", "Verification Test"]),
+        "configure git name",
+    );
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::create_dir(primary.join("scripts")).expect("create scripts directory");
+    fs::copy(
+        repo_root.join("scripts/verify.py"),
+        primary.join("scripts/verify.py"),
+    )
+    .expect("copy verification script");
+    fs::write(primary.join("README.md"), "verification fixture\n").expect("write fixture");
+    assert_success(run_git(&primary, &["add", "."]), "git add");
+    assert_success(
+        run_git(&primary, &["commit", "-m", "fixture"]),
+        "git commit",
+    );
+
+    let primary_common_dir = common_dir(&primary);
+    let lock = primary_common_dir.join("hallouminate-verify.lock");
+    let log = primary_common_dir.join("hallouminate-verify.jsonl");
+
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).expect("create fake bin");
+    write_fake_cargo(
+        &bin,
+        "#!/usr/bin/env python3\nimport sys\nif sys.argv[1:] == [\"fmt\", \"--all\", \"--check\"]:\n    sys.exit(1)\nsys.exit(0)\n",
+    );
+
+    let marker = temp.path().join("cargo-running");
+    let invocation_log = temp.path().join("invocations.jsonl");
+    let existing_path = std::env::var_os("PATH").expect("PATH");
+    let mut paths = vec![bin.into_os_string()];
+    for path in std::env::split_paths(&existing_path) {
+        paths.push(path.into_os_string());
+    }
+    let path = std::env::join_paths(paths).expect("build PATH");
+
+    let output = verification_command(
+        &repo_root,
+        &primary,
+        &path,
+        &lock,
+        &marker,
+        &invocation_log,
+        &[],
+    )
+    .output()
+    .expect("run default-mode verification");
+    assert!(
+        !output.status.success(),
+        "default-mode verification must fail when fmt --all --check fails"
+    );
+
+    let records = parse_jsonl(&log);
+    let fmt_check_record = records
+        .iter()
+        .find(|record| record["event"] == "fmt-check")
+        .expect("evidence log must contain an fmt-check record");
+    assert_eq!(fmt_check_record["exit_status"], 1);
 }

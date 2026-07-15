@@ -13,6 +13,8 @@ import time
 JOBS = 1
 LOCK_NAME = "hallouminate-verify.lock"
 LOG_NAME = "hallouminate-verify.jsonl"
+LOG_MAX_BYTES = 5 * 1024 * 1024
+UNTRACKED_HASH_CAP = 8 * 1024 * 1024
 FMT_CHECK = ["cargo", "fmt", "--all", "--check"]
 HEAVY_COMMANDS = [
     ["cargo", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"],
@@ -67,7 +69,13 @@ def repository_state() -> tuple[str, str]:
         if path.is_symlink():
             digest.update(os.fsencode(os.readlink(path)))
         elif path.is_file():
-            digest.update(path.read_bytes())
+            stat = path.stat()
+            if stat.st_size > UNTRACKED_HASH_CAP:
+                digest.update(b"\0oversized\0")
+                digest.update(str(stat.st_size).encode())
+                digest.update(str(stat.st_mtime_ns).encode())
+            else:
+                digest.update(path.read_bytes())
         digest.update(b"\0")
     return head, digest.hexdigest()
 
@@ -129,14 +137,21 @@ def append_record(log: Path, event: str, command: object, **fields: object) -> N
         **fields,
     }
     line = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode()
+    try:
+        if log.stat().st_size >= LOG_MAX_BYTES:
+            os.replace(log, Path(str(log) + ".1"))
+    except FileNotFoundError:
+        pass
     descriptor = os.open(log, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
         os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
         view = memoryview(line)
         while view:
             written = os.write(descriptor, view)
             view = view[written:]
     finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
@@ -227,6 +242,7 @@ def main(arguments: list[str]) -> int:
 
     status = subprocess.run(FMT_CHECK).returncode
     if status != 0:
+        append_record(git_common_dir() / LOG_NAME, "fmt-check", FMT_CHECK, exit_status=status)
         return status
     return run_leased(HEAVY_COMMANDS, HEAVY_COMMANDS)
 
