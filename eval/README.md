@@ -63,7 +63,7 @@ kept are actually correct at rank 1 — this is the #149 calibration input.
 
 ## Embedding model substitution
 
-The config's default embedding model (`snowflake-arctic-embed-s`) has no
+The config's default embedding model (`snowflake/snowflake-arctic-embed-s`) has no
 cached ONNX weight blob in `~/.cache/hallouminate/fastembed` on this
 machine (only tokenizer/config files) — using it would trigger a second
 model download. The eval pins `BAAI/bge-small-en-v1.5` (quantized) instead,

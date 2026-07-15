@@ -138,6 +138,12 @@ async fn run_variant(variant: &Variant, queries: &[LabelledQuery]) -> Vec<QueryR
     let socket = harness.socket().to_path_buf();
 
     cmd_index(IndexArgs {
+        // Scope indexing to the eval corpus. `corpus: None` would index every
+        // effective corpus discovered under the test's CWD — including the
+        // repo's own `repo:hallouminate:wiki` (whose fixture is a snapshot) —
+        // making each variant's index slower and non-hermetic w.r.t. ambient
+        // repo config.
+        corpus: Some(CORPUS_NAME.into()),
         socket: Some(socket.clone()),
         ..Default::default()
     })
