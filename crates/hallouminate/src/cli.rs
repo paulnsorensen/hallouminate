@@ -37,6 +37,21 @@ pub struct Cli {
     pub command: Command,
 }
 
+impl Cli {
+    pub(crate) fn logging_config_path(&self) -> Option<&std::path::Path> {
+        let Command::Daemon(args) = &self.command else {
+            return None;
+        };
+        match &args.action {
+            None => args.config.as_deref(),
+            Some(DaemonAction::Run) => args.config.as_deref(),
+            Some(DaemonAction::Stop) => None,
+            Some(DaemonAction::Restart) => None,
+            Some(DaemonAction::Status) => None,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Index(IndexCli),
@@ -267,7 +282,7 @@ pub enum ConfigAction {
     },
 }
 
-pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
+pub async fn dispatch(cli: Cli, startup: crate::config::Config) -> anyhow::Result<()> {
     match cli.command {
         Command::Index(args) => cmd_index(args.into()).await,
         Command::Ground(args) => cmd_ground(args.into()).await,
@@ -291,7 +306,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Daemon(args) => {
             let action = args.action.clone().unwrap_or(DaemonAction::Run);
             match action {
-                DaemonAction::Run => crate::daemon::run_daemon(args.into()).await,
+                DaemonAction::Run => crate::daemon::run_daemon(startup, args.into()).await,
                 DaemonAction::Stop => {
                     crate::daemon::stop().await?;
                     println!("daemon stopped");
@@ -641,5 +656,52 @@ mod tests {
     fn rejects_init_repo_without_name() {
         let err = Cli::try_parse_from(["hallouminate", "init-repo"]).expect_err("name required");
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn logging_config_path_uses_only_foreground_daemon_override() {
+        let daemon =
+            Cli::try_parse_from(["hallouminate", "daemon", "--config", "/tmp/logging.toml"])
+                .expect("parse foreground daemon config");
+        assert_eq!(
+            daemon.logging_config_path(),
+            Some(std::path::Path::new("/tmp/logging.toml"))
+        );
+
+        let index = Cli::try_parse_from(["hallouminate", "index", "--config", "/tmp/ignored.toml"])
+            .expect("parse index config");
+        assert_eq!(index.logging_config_path(), None);
+    }
+
+    #[test]
+    fn logging_config_path_ignores_daemon_lifecycle_subcommands() {
+        let explicit_run = Cli::try_parse_from([
+            "hallouminate",
+            "daemon",
+            "--config",
+            "/tmp/logging.toml",
+            "run",
+        ])
+        .expect("parse explicit daemon run config");
+        assert_eq!(
+            explicit_run.logging_config_path(),
+            Some(std::path::Path::new("/tmp/logging.toml"))
+        );
+
+        for lifecycle_arg in ["stop", "restart", "status"] {
+            let cli = Cli::try_parse_from([
+                "hallouminate",
+                "daemon",
+                "--config",
+                "/tmp/logging.toml",
+                lifecycle_arg,
+            ])
+            .unwrap_or_else(|e| panic!("parse daemon {lifecycle_arg} config: {e}"));
+            assert_eq!(
+                cli.logging_config_path(),
+                None,
+                "daemon {lifecycle_arg} must not consult the foreground --config override"
+            );
+        }
     }
 }

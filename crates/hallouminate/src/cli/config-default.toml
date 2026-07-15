@@ -44,8 +44,12 @@ model     = "snowflake/snowflake-arctic-embed-s"
 quantized = false
 cache_dir = "~/.cache/hallouminate/fastembed"
 
+[logging]
+max_file_bytes  = 10485760
+max_total_bytes = 104857600
 [watch]
 debounce_ms = 500
+failure_reminder_secs = 60
 
 [storage]
 ground_dir = "~/.local/share/hallouminate/ground"
