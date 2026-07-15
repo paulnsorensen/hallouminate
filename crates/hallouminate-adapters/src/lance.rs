@@ -39,6 +39,8 @@ pub struct CorpusChunkStats {
 /// Configures one LanceDB maintenance pass.
 #[derive(Debug, Clone, Copy)]
 pub struct MaintenanceOptions {
+    /// Correlates adapter stage events with the daemon's lifecycle event.
+    pub maintenance_id: u64,
     pub prune_older_than: Duration,
 }
 
@@ -757,18 +759,66 @@ impl LanceStore {
     /// `MAINTENANCE_PRUNE_GRACE_SECS`) leaves recently-superseded versions
     /// in place long enough for such in-flight queries to drain.
     ///
+    /// LanceDB's optimize result reports fragment and version counts but no
+    /// reliable bytes-read or bytes-written counters, so maintenance events
+    /// intentionally omit byte fields rather than report estimates.
+    ///
     /// # Errors
     ///
     /// Returns an error if the LanceDB compaction or version-cleanup fails.
     pub async fn maintain(&self, options: MaintenanceOptions) -> Result<MaintenanceStats> {
-        let mut stats = self
+        tracing::debug!(
+            target: "hallouminate::lance",
+            maintenance_event = "compaction_started",
+            maintenance_id = options.maintenance_id,
+            "LanceDB maintenance compaction started",
+        );
+        let compact = self
             .table
             .optimize(lancedb::table::OptimizeAction::Compact {
                 options: lancedb::table::CompactionOptions::default(),
                 remap_options: None,
             })
-            .await
-            .map_err(map_lance_err)?;
+            .await;
+        let mut stats = match compact {
+            Ok(stats) => {
+                tracing::debug!(
+                    target: "hallouminate::lance",
+                    maintenance_event = "compaction_finished",
+                    maintenance_id = options.maintenance_id,
+                    outcome = "success",
+                    fragments_removed = stats
+                        .compaction
+                        .as_ref()
+                        .map(|stats| stats.fragments_removed),
+                    fragments_added = stats
+                        .compaction
+                        .as_ref()
+                        .map(|stats| stats.fragments_added),
+                    "LanceDB maintenance compaction completed",
+                );
+                stats
+            }
+            Err(error) => {
+                let error = map_lance_err(error);
+                tracing::warn!(
+                    target: "hallouminate::lance",
+                    maintenance_event = "compaction_finished",
+                    maintenance_id = options.maintenance_id,
+                    outcome = "failure",
+                    error = %error,
+                    "LanceDB maintenance compaction failed",
+                );
+                return Err(error);
+            }
+        };
+
+        tracing::debug!(
+            target: "hallouminate::lance",
+            maintenance_event = "prune_started",
+            maintenance_id = options.maintenance_id,
+            "LanceDB maintenance prune started",
+        );
         let prune_secs = prune_retention_secs(options.prune_older_than);
         let prune = self
             .table
@@ -777,8 +827,32 @@ impl LanceStore {
                 delete_unverified: Some(true),
                 error_if_tagged_old_versions: None,
             })
-            .await
-            .map_err(map_lance_err)?;
+            .await;
+        let prune = match prune {
+            Ok(prune) => {
+                tracing::debug!(
+                    target: "hallouminate::lance",
+                    maintenance_event = "prune_finished",
+                    maintenance_id = options.maintenance_id,
+                    outcome = "success",
+                    old_versions_pruned = prune.prune.as_ref().map(|stats| stats.old_versions),
+                    "LanceDB maintenance prune completed",
+                );
+                prune
+            }
+            Err(error) => {
+                let error = map_lance_err(error);
+                tracing::warn!(
+                    target: "hallouminate::lance",
+                    maintenance_event = "prune_finished",
+                    maintenance_id = options.maintenance_id,
+                    outcome = "failure",
+                    error = %error,
+                    "LanceDB maintenance prune failed",
+                );
+                return Err(error);
+            }
+        };
         stats.prune = prune.prune;
         Ok(MaintenanceStats {
             fragments_removed: stats
@@ -1491,6 +1565,7 @@ mod tests {
         // to race (see `maintain`'s doc comment).
         let stats = store
             .maintain(MaintenanceOptions {
+                maintenance_id: 1,
                 prune_older_than: Duration::ZERO,
             })
             .await

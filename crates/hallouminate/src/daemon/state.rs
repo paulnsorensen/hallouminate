@@ -25,11 +25,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::Config;
 use hallouminate_adapters::{
-    EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, MaintenanceOptions,
+    EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, MaintenanceOptions, MaintenanceStats,
 };
 use hallouminate_domain::common::{HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
@@ -54,7 +55,7 @@ const MAINTENANCE_INTERVAL_SECS: u64 = 1800;
 const MAINTENANCE_PRUNE_GRACE_SECS: u64 = 300;
 
 /// Whether the maintenance loop should keep ticking after a pass. `Stop`
-/// means the write lane is closed — the daemon is shutting down.
+/// means daemon shutdown was requested or the write lane was closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaintenanceTick {
     Continue,
@@ -62,6 +63,7 @@ enum MaintenanceTick {
 }
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
+static NEXT_MAINTENANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Monotonic seconds elapsed since process start (`Instant`-based), not
 /// wall-clock Unix time — a clock step (NTP correction, manual clock change)
@@ -213,6 +215,8 @@ struct DaemonStateInner {
     /// Count of connection handlers in flight. Idle-exit defers while non-zero
     /// so the daemon never exits mid-request (ADR-003).
     active_connections: Arc<AtomicUsize>,
+    /// Retained so shutdown drains maintenance before releasing the daemon flock.
+    maintenance_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
@@ -241,6 +245,133 @@ impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+struct MaintenanceLifecycle {
+    maintenance_id: u64,
+    started_at: Instant,
+    lane_acquired_at: Option<Instant>,
+    finished: bool,
+}
+
+impl MaintenanceLifecycle {
+    fn start() -> Self {
+        let maintenance_id = NEXT_MAINTENANCE_ID.fetch_add(1, Ordering::Relaxed);
+        tracing::info!(
+            target: "hallouminate::lance",
+            maintenance_event = "started",
+            maintenance_id,
+            "periodic LanceDB maintenance started",
+        );
+        Self {
+            maintenance_id,
+            started_at: Instant::now(),
+            lane_acquired_at: None,
+            finished: false,
+        }
+    }
+
+    fn write_lane_acquired(&mut self) {
+        let acquired_at = Instant::now();
+        self.lane_acquired_at = Some(acquired_at);
+        tracing::debug!(
+            target: "hallouminate::lance",
+            maintenance_event = "write_lane_acquired",
+            maintenance_id = self.maintenance_id,
+            queue_wait_ms = duration_ms(acquired_at.duration_since(self.started_at)),
+            "periodic LanceDB maintenance acquired the write lane",
+        );
+    }
+
+    fn success(mut self, stats: MaintenanceStats) {
+        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
+        tracing::info!(
+            target: "hallouminate::lance",
+            maintenance_event = "finished",
+            maintenance_id = self.maintenance_id,
+            outcome = "success",
+            queue_wait_ms,
+            maintenance_ms,
+            total_ms,
+            fragments_removed = stats.fragments_removed,
+            fragments_added = stats.fragments_added,
+            old_versions_pruned = stats.old_versions_pruned,
+            "periodic LanceDB maintenance completed",
+        );
+        self.finished = true;
+    }
+
+    fn failure(mut self, error: &HallouminateError) {
+        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
+        tracing::warn!(
+            target: "hallouminate::lance",
+            maintenance_event = "finished",
+            maintenance_id = self.maintenance_id,
+            outcome = "failure",
+            queue_wait_ms,
+            maintenance_ms,
+            total_ms,
+            error = %error,
+            "periodic LanceDB maintenance failed",
+        );
+        self.finished = true;
+    }
+
+    fn shutdown(mut self) {
+        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
+        tracing::info!(
+            target: "hallouminate::lance",
+            maintenance_event = "finished",
+            maintenance_id = self.maintenance_id,
+            outcome = "shutdown",
+            queue_wait_ms,
+            maintenance_ms,
+            total_ms,
+            "periodic LanceDB maintenance stopped during shutdown",
+        );
+        self.finished = true;
+    }
+
+    fn durations(&self) -> (u64, u64, u64) {
+        let finished_at = Instant::now();
+        let total = finished_at.duration_since(self.started_at);
+        let queue = match self.lane_acquired_at {
+            Some(acquired_at) => acquired_at.duration_since(self.started_at),
+            None => total,
+        };
+        let maintenance = match self.lane_acquired_at {
+            Some(acquired_at) => finished_at.duration_since(acquired_at),
+            None => Duration::ZERO,
+        };
+        (
+            duration_ms(queue),
+            duration_ms(maintenance),
+            duration_ms(total),
+        )
+    }
+}
+
+impl Drop for MaintenanceLifecycle {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
+        tracing::warn!(
+            target: "hallouminate::lance",
+            maintenance_event = "finished",
+            maintenance_id = self.maintenance_id,
+            outcome = "cancelled",
+            queue_wait_ms,
+            maintenance_ms,
+            total_ms,
+            "periodic LanceDB maintenance cancelled",
+        );
+    }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 impl DaemonState {
@@ -458,6 +589,7 @@ impl DaemonState {
                 crossencoders: crossencoders_arc,
                 last_activity_secs: last_activity,
                 active_connections: Arc::new(AtomicUsize::new(0)),
+                maintenance_task: Mutex::new(None),
                 shutdown,
             }),
         };
@@ -469,7 +601,7 @@ impl DaemonState {
         // the write lane still preserves the documented `corpus ->
         // write_lane` order (a lock that is never acquired can't be
         // acquired out of order).
-        {
+        let maintenance_task = {
             let state = state.clone();
             let cancel = state.shutdown_token().clone();
             tokio::spawn(async move {
@@ -484,8 +616,9 @@ impl DaemonState {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
+        *state.inner.maintenance_task.lock().await = Some(maintenance_task);
 
         Ok(state)
     }
@@ -496,37 +629,58 @@ impl DaemonState {
     /// (and releasing the single-instance flock) under a live LanceDB write
     /// (ADR-003) — mirroring `catch_up_index` (dispatch.rs) and the
     /// watcher's `process_change_batch`. Returns [`MaintenanceTick::Stop`]
-    /// when the write lane is closed (daemon shutting down).
+    /// when daemon shutdown is requested or the write lane is closed.
     async fn run_maintenance_tick(&self) -> MaintenanceTick {
+        let store = Arc::clone(&self.inner.baseline_resources.store);
+        self.run_maintenance_tick_with(move |maintenance_id| async move {
+            store
+                .maintain(MaintenanceOptions {
+                    maintenance_id,
+                    prune_older_than: Duration::from_secs(MAINTENANCE_PRUNE_GRACE_SECS),
+                })
+                .await
+        })
+        .await
+    }
+
+    async fn run_maintenance_tick_with<F, Fut>(&self, maintain: F) -> MaintenanceTick
+    where
+        F: FnOnce(u64) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<MaintenanceStats, HallouminateError>>,
+    {
         let _conn = self.enter_connection();
-        let Ok(_permit) = self.inner.write_lane.acquire().await else {
+        let shutdown = self.shutdown_token().clone();
+        let mut lifecycle = MaintenanceLifecycle::start();
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                lifecycle.shutdown();
+                return MaintenanceTick::Stop;
+            }
+            permit = self.inner.write_lane.acquire() => permit,
+        };
+        let Ok(_permit) = permit else {
+            lifecycle.shutdown();
             return MaintenanceTick::Stop;
         };
-        match self
-            .inner
-            .baseline_resources
-            .store
-            .maintain(MaintenanceOptions {
-                prune_older_than: Duration::from_secs(MAINTENANCE_PRUNE_GRACE_SECS),
-            })
-            .await
-        {
-            Ok(stats) => {
-                tracing::info!(
-                    target: "hallouminate::lance",
-                    fragments_removed = stats.fragments_removed,
-                    fragments_added = stats.fragments_added,
-                    old_versions_pruned = stats.old_versions_pruned,
-                    "periodic LanceDB maintenance completed",
-                );
+        lifecycle.write_lane_acquired();
+        let maintenance = maintain(lifecycle.maintenance_id);
+        tokio::pin!(maintenance);
+        let (result, shutdown_requested) = tokio::select! {
+            biased;
+            result = &mut maintenance => (result, false),
+            _ = shutdown.cancelled() => {
+                (maintenance.await, true)
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: "hallouminate::lance",
-                    error = %e,
-                    "periodic LanceDB maintenance failed",
-                );
-            }
+        };
+        if shutdown_requested {
+            lifecycle.shutdown();
+            self.touch_activity();
+            return MaintenanceTick::Stop;
+        }
+        match result {
+            Ok(stats) => lifecycle.success(stats),
+            Err(error) => lifecycle.failure(&error),
         }
         self.touch_activity();
         MaintenanceTick::Continue
@@ -537,6 +691,10 @@ impl DaemonState {
     /// signal handlers call [`CancellationToken::cancel`].
     pub fn shutdown_token(&self) -> &CancellationToken {
         &self.inner.shutdown
+    }
+
+    pub(crate) async fn take_maintenance_task(&self) -> Option<JoinHandle<()>> {
+        self.inner.maintenance_task.lock().await.take()
     }
 
     /// Source path of the baseline config the daemon booted from — the XDG
@@ -1023,6 +1181,103 @@ mod tests {
     use super::*;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole};
 
+    use std::fmt;
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::{Layer, Registry};
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedEvent {
+        strings: HashMap<String, String>,
+        numbers: HashMap<String, u64>,
+    }
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<std::sync::Mutex<Vec<CapturedEvent>>>);
+
+    impl EventCapture {
+        fn maintenance_events(&self) -> Vec<CapturedEvent> {
+            let events = self.0.lock().expect("capture lock");
+            let mut maintenance = Vec::new();
+            for event in events.iter() {
+                if event.strings.contains_key("maintenance_event") {
+                    maintenance.push(event.clone());
+                }
+            }
+            maintenance
+        }
+    }
+
+    impl<S> Layer<S> for EventCapture
+    where
+        S: Subscriber,
+    {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut captured = CapturedEvent::default();
+            event.record(&mut captured);
+            self.0.lock().expect("capture lock").push(captured);
+        }
+    }
+
+    impl Visit for CapturedEvent {
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.numbers.insert(field.name().to_owned(), value);
+        }
+
+        fn record_i64(&mut self, field: &Field, value: i64) {
+            let value = u64::try_from(value).expect("maintenance numeric fields are non-negative");
+            self.numbers.insert(field.name().to_owned(), value);
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.strings
+                .insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.strings
+                .insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    fn event_stages(events: &[CapturedEvent]) -> Vec<&str> {
+        let mut stages = Vec::new();
+        for event in events {
+            stages.push(
+                event
+                    .strings
+                    .get("maintenance_event")
+                    .expect("maintenance event stage")
+                    .as_str(),
+            );
+        }
+        stages
+    }
+
+    fn assert_correlated(events: &[CapturedEvent]) {
+        let id = events[0]
+            .numbers
+            .get("maintenance_id")
+            .expect("first maintenance id");
+        for event in events {
+            assert_eq!(
+                event.numbers.get("maintenance_id"),
+                Some(id),
+                "every lifecycle event must carry the same maintenance id",
+            );
+        }
+    }
+
+    fn assert_terminal_durations(event: &CapturedEvent) {
+        for field in ["queue_wait_ms", "maintenance_ms", "total_ms"] {
+            assert!(
+                event.numbers.contains_key(field),
+                "terminal event must carry numeric {field}: {event:?}",
+            );
+        }
+    }
+
     /// Covers AC #9 (daemon half): the baseline accessor returns the config
     /// that was passed into `open`, unchanged. The dispatcher layers
     /// repo-discovery on top per-request via `resolve_for_cwd`; the
@@ -1158,48 +1413,227 @@ mod tests {
         );
     }
 
-    /// ADR-003 regression: the maintenance tick wrote to LanceDB with no
-    /// connection guard and no clock stamp, so idle-exit could tear the
-    /// daemon down (releasing the single-instance flock) mid-maintenance.
     #[tokio::test]
-    async fn maintenance_tick_stamps_the_idle_clock_and_continues() {
+    async fn maintenance_tick_emits_correlated_structured_lifecycle() {
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
         state.set_last_activity_secs_for_test(1);
-        assert!(
-            state.should_idle_exit_at(300, 1000),
-            "sanity: stale clock with no connections is idle-eligible",
-        );
 
         let tick = state.run_maintenance_tick().await;
 
         assert_eq!(tick, MaintenanceTick::Continue);
+        assert!(!state.should_idle_exit(300));
+        let events = capture.maintenance_events();
+        assert_eq!(
+            event_stages(&events),
+            [
+                "started",
+                "write_lane_acquired",
+                "compaction_started",
+                "compaction_finished",
+                "prune_started",
+                "prune_finished",
+                "finished",
+            ],
+        );
+        assert_correlated(&events);
+        let terminal = events.last().expect("terminal maintenance event");
+        assert_eq!(
+            terminal.strings.get("outcome").map(String::as_str),
+            Some("success"),
+        );
+        assert_terminal_durations(terminal);
+        for field in [
+            "fragments_removed",
+            "fragments_added",
+            "old_versions_pruned",
+        ] {
+            assert!(
+                terminal.numbers.contains_key(field),
+                "success event must retain numeric {field}: {terminal:?}",
+            );
+        }
+        for field in ["fragments_removed", "fragments_added"] {
+            assert!(
+                events[3].numbers.contains_key(field),
+                "compaction event must retain numeric {field}: {:?}",
+                events[3],
+            );
+        }
         assert!(
-            !state.should_idle_exit(300),
-            "a maintenance pass must stamp the activity clock so idle-exit \
-             does not fire immediately after it",
+            events[5].numbers.contains_key("old_versions_pruned"),
+            "prune event must retain numeric old_versions_pruned: {:?}",
+            events[5],
+        );
+        assert!(
+            !terminal.numbers.contains_key("bytes_read")
+                && !terminal.numbers.contains_key("bytes_written"),
+            "unmeasured byte counters must not be emitted",
         );
     }
 
-    /// `write_lane.acquire()` erring (a closed semaphore) is the other half
-    /// of `run_maintenance_tick`'s match: it must return `Stop` rather than
-    /// panicking or silently continuing, so the caller's maintenance loop
-    /// exits cleanly instead of looping on a permanently-closed lane.
     #[tokio::test]
-    async fn maintenance_tick_stops_when_the_write_lane_is_closed() {
+    async fn maintenance_tick_emits_failure_outcome() {
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = test_state().await;
+
+        let tick = state
+            .run_maintenance_tick_with(|_| async {
+                Err(HallouminateError::Config(
+                    "forced maintenance failure".to_owned(),
+                ))
+            })
+            .await;
+
+        assert_eq!(tick, MaintenanceTick::Continue);
+        let events = capture.maintenance_events();
+        assert_eq!(
+            event_stages(&events),
+            ["started", "write_lane_acquired", "finished"],
+        );
+        assert_correlated(&events);
+        let terminal = events.last().expect("terminal maintenance event");
+        assert_eq!(
+            terminal.strings.get("outcome").map(String::as_str),
+            Some("failure"),
+        );
+        assert_terminal_durations(terminal);
+        assert!(terminal.strings.contains_key("error"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_tick_emits_cancellation_outcome_when_aborted_while_queued() {
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = test_state().await;
+        let lane = state.write_lane();
+        let _permit = lane.acquire().await.expect("write lane");
+        let tick_state = state.clone();
+        let task = tokio::spawn(async move { tick_state.run_maintenance_tick().await });
+
+        for _ in 0..100 {
+            let events = capture.maintenance_events();
+            if event_stages(&events) == ["started"] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let join = task.await;
+        assert!(join.expect_err("aborted task").is_cancelled());
+
+        let events = capture.maintenance_events();
+        assert_eq!(event_stages(&events), ["started", "finished"]);
+        assert_correlated(&events);
+        let terminal = events.last().expect("terminal maintenance event");
+        assert_eq!(
+            terminal.strings.get("outcome").map(String::as_str),
+            Some("cancelled"),
+        );
+        assert_terminal_durations(terminal);
+    }
+
+    #[tokio::test]
+    async fn maintenance_tick_emits_shutdown_outcome_when_cancelled_while_queued() {
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = test_state().await;
+        let lane = state.write_lane();
+        let _permit = lane.acquire().await.expect("write lane");
+        let tick_state = state.clone();
+        let task = tokio::spawn(async move { tick_state.run_maintenance_tick().await });
+
+        for _ in 0..100 {
+            let events = capture.maintenance_events();
+            if event_stages(&events) == ["started"] {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        state.shutdown_token().cancel();
+        let tick = task.await.expect("maintenance task");
+
+        assert_eq!(tick, MaintenanceTick::Stop);
+        let events = capture.maintenance_events();
+        assert_eq!(event_stages(&events), ["started", "finished"]);
+        assert_correlated(&events);
+        let terminal = events.last().expect("terminal maintenance event");
+        assert_eq!(
+            terminal.strings.get("outcome").map(String::as_str),
+            Some("shutdown"),
+        );
+        assert_terminal_durations(terminal);
+    }
+
+    #[tokio::test]
+    async fn maintenance_tick_emits_shutdown_outcome_when_cancelled_while_running() {
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let state = test_state().await;
+        let lane = state.write_lane();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let tick_state = state.clone();
+        let task = tokio::spawn(async move {
+            tick_state
+                .run_maintenance_tick_with(|_| async move {
+                    started_tx.send(()).expect("maintenance started");
+                    finish_rx.await.expect("finish maintenance");
+                    Ok(MaintenanceStats {
+                        fragments_removed: None,
+                        fragments_added: None,
+                        old_versions_pruned: None,
+                    })
+                })
+                .await
+        });
+
+        started_rx.await.expect("maintenance start signal");
+        state.shutdown_token().cancel();
+        tokio::task::yield_now().await;
+        assert!(
+            !task.is_finished(),
+            "shutdown must not cancel in-flight maintenance",
+        );
+        assert!(
+            lane.try_acquire().is_err(),
+            "write lane must remain held until in-flight maintenance completes",
+        );
+        finish_tx.send(()).expect("finish signal");
+        let tick = task.await.expect("maintenance task");
+
+        assert_eq!(tick, MaintenanceTick::Stop);
+        let events = capture.maintenance_events();
+        assert_eq!(
+            event_stages(&events),
+            ["started", "write_lane_acquired", "finished"],
+        );
+        assert_correlated(&events);
+        let terminal = events.last().expect("terminal maintenance event");
+        assert_eq!(
+            terminal.strings.get("outcome").map(String::as_str),
+            Some("shutdown"),
+        );
+        assert_terminal_durations(terminal);
+    }
+
+    async fn test_state() -> DaemonState {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
-        let state = DaemonState::open(cfg, None).await.expect("open");
-        state.write_lane().close();
-
-        let tick = state.run_maintenance_tick().await;
-
-        assert_eq!(tick, MaintenanceTick::Stop);
+        DaemonState::open(cfg, None).await.expect("open")
     }
 
     #[tokio::test]
