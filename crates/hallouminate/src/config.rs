@@ -153,12 +153,18 @@ pub struct DaemonConfig {
     /// idle-exit — the daemon lives until stopped. Default: `900` (15 min).
     #[serde(default = "default_idle_exit_secs")]
     pub idle_exit_secs: u64,
+    /// Seconds between automatic LanceDB maintenance passes (compaction +
+    /// version prune). `0` disables automatic maintenance — matches
+    /// `idle_exit_secs`'s convention. Default: `1800` (30 min).
+    #[serde(default = "default_maintenance_interval_secs")]
+    pub maintenance_interval_secs: u64,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             idle_exit_secs: default_idle_exit_secs(),
+            maintenance_interval_secs: default_maintenance_interval_secs(),
         }
     }
 }
@@ -655,6 +661,14 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        maintenance_interval_secs: merge_scalar(
+            "daemon.maintenance_interval_secs",
+            baseline.daemon.maintenance_interval_secs,
+            repo.daemon.maintenance_interval_secs,
+            defaults.daemon.maintenance_interval_secs,
+            baseline_path,
+            repo_path,
+        )?,
     };
 
     // `[logging]` is process-wide and baseline-owned (it configures the
@@ -953,6 +967,9 @@ fn default_ground_dir() -> String {
 fn default_idle_exit_secs() -> u64 {
     900
 }
+fn default_maintenance_interval_secs() -> u64 {
+    1800
+}
 
 #[cfg(test)]
 mod tests {
@@ -1235,6 +1252,27 @@ ground_dir = "~/.local/share/hallouminate/ground"
         let cfg =
             parse("[daemon]\nidle_exit_secs = 1800\n", None).expect("idle_exit_secs = 1800 parses");
         assert_eq!(cfg.daemon.idle_exit_secs, 1800);
+    }
+
+    #[test]
+    fn daemon_maintenance_interval_secs_defaults_to_1800() {
+        assert_eq!(DaemonConfig::default().maintenance_interval_secs, 1800);
+        let cfg = parse("", None).expect("empty config parses");
+        assert_eq!(cfg.daemon.maintenance_interval_secs, 1800);
+    }
+
+    #[test]
+    fn parse_daemon_maintenance_interval_secs_can_be_disabled_with_zero() {
+        let cfg = parse("[daemon]\nmaintenance_interval_secs = 0\n", None)
+            .expect("maintenance_interval_secs = 0 parses");
+        assert_eq!(cfg.daemon.maintenance_interval_secs, 0);
+    }
+
+    #[test]
+    fn parse_daemon_maintenance_interval_secs_custom_value() {
+        let cfg = parse("[daemon]\nmaintenance_interval_secs = 3600\n", None)
+            .expect("maintenance_interval_secs = 3600 parses");
+        assert_eq!(cfg.daemon.maintenance_interval_secs, 3600);
     }
 
     #[test]
@@ -2128,6 +2166,18 @@ path = "/b"
         let repo = parse("", None).expect("repo default");
         let merged = merge_layers(&baseline, &repo).expect("merge");
         assert_eq!(merged.daemon.idle_exit_secs, 1800);
+    }
+
+    #[test]
+    fn merge_layers_daemon_maintenance_interval_secs_propagates_baseline_over_repo_default() {
+        // Regression trap: if the merge_scalar call for
+        // daemon.maintenance_interval_secs is removed and the field is
+        // hardcoded to its default, this fails.
+        let baseline =
+            parse("[daemon]\nmaintenance_interval_secs = 3600\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo default");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.daemon.maintenance_interval_secs, 3600);
     }
 
     #[test]

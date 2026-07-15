@@ -1,0 +1,6 @@
+# ADR pressure-aware-maintenance-001: Defer maintenance without a force-run bound  [status: accepted]
+
+- **Context:** Issue #230 requires a maintenance pass skipped for activity or I/O pressure to be retried rather than lost. Under *sustained* pressure a pure defer loop can starve maintenance indefinitely, letting LanceDB versions accumulate; a max-defer force-run bounds disk growth but re-creates the incident the change exists to prevent (adding daemon load during an already saturated window — 2026-07-13, 114.7 GiB attributed reads).
+- **Decision:** Deferred passes recheck every 60s and run the moment activity and pressure signals clear. There is no forced run. Deferral persisting past 10 consecutive rechecks escalates the log to warn so starvation is visible, not silent.
+- **Alternatives:** (a) Force-run after N× interval of continuous deferral — rejected: contradicts the incident motivation. (b) Recheck only at the next full interval — rejected: intermittent pressure could slip maintenance by whole intervals repeatedly.
+- **Consequences:** Version/disk growth during long busy or pressured periods is accepted and observable via warn logs. Growth largely tracks the daemon's own write volume, so a fully idle-but-pressured daemon accumulates little. Operators who need a hard bound can lower the interval or run maintenance at a quiet time.

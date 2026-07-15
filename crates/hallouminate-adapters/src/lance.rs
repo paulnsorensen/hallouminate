@@ -549,18 +549,16 @@ pub struct LanceStore {
     embedder_available: AtomicBool,
 }
 
-/// Take a non-blocking exclusive `flock` on `store.lock` inside the ground
-/// dir, binding single ownership to the store rather than to any daemon
-/// socket path.
-///
-/// The daemon's per-socket lock is not enough (#204): socket resolution is
-/// environment-dependent (`XDG_RUNTIME_DIR` present vs the `~/.cache`
-/// fallback), so two daemons spawned from different environments each held
-/// their own socket lock and co-owned this directory — and their interleaved
-/// maintenance/write commits deleted data files the other's manifest still
-/// referenced. Locking here covers every open path (daemon boot baseline,
-/// per-request `resources_for` builds, and any future direct open).
-fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
+/// How long [`acquire_store_lock`] retries a contended `flock` before giving
+/// up. Sized to absorb the deferred-`fput` release window (sub-second, see the
+/// fn doc) while staying far below any genuine second-daemon lifetime, so real
+/// single-ownership violations still fail closed.
+const STORE_LOCK_RETRY_BUDGET: Duration = Duration::from_secs(2);
+const STORE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+/// One non-blocking `flock` attempt on `store.lock`. `Ok(None)` means the lock
+/// is currently held (`WOULDBLOCK`); any other errno is a distinct failure.
+fn try_acquire_store_lock(ground_dir: &Path) -> Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
 
     use rustix::fs::{FlockOperation, flock};
@@ -573,33 +571,56 @@ fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
         .truncate(false)
         .mode(0o600)
         .open(&lock_path)?;
-    if let Err(errno) = flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        if errno == rustix::io::Errno::WOULDBLOCK {
-            // "stop the other daemon" assumes the contender is another
-            // process. True today because the resources cache never evicts
-            // (baseline store stays cached and reused, per ADR-001 dropping
-            // idle-evict), so a same-process re-open can't reach this path.
-            // If cache eviction is ever introduced, distinguish same-process
-            // contention here.
-            return Err(HallouminateError::Config(format!(
-                "ground store {} is locked by another hallouminate process ({}); \
-                 every ground dir has exactly one owner — stop the other daemon \
-                 (`hallouminate daemon stop`) or point [storage].ground_dir \
-                 elsewhere before retrying",
-                ground_dir.display(),
-                std::io::Error::from(errno),
-            )));
-        }
-        // Contention (WOULDBLOCK) is the only errno that implies another
-        // owner; anything else (permissions, I/O, no space, etc.) is a
-        // distinct failure and gets a generic message with path context.
-        return Err(HallouminateError::Config(format!(
+    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(Some(file)),
+        // WOULDBLOCK is the only errno that implies another owner; anything
+        // else (permissions, I/O, no space, etc.) is a distinct failure.
+        Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => Ok(None),
+        Err(errno) => Err(HallouminateError::Config(format!(
             "failed to lock {}: {}",
             ground_dir.display(),
             std::io::Error::from(errno),
-        )));
+        ))),
     }
-    Ok(file)
+}
+
+/// Take a non-blocking exclusive `flock` on `store.lock` inside the ground
+/// dir, binding single ownership to the store rather than to any daemon
+/// socket path.
+///
+/// The daemon's per-socket lock is not enough (#204): socket resolution is
+/// environment-dependent (`XDG_RUNTIME_DIR` present vs the `~/.cache`
+/// fallback), so two daemons spawned from different environments each held
+/// their own socket lock and co-owned this directory — and their interleaved
+/// maintenance/write commits deleted data files the other's manifest still
+/// referenced. Locking here covers every open path (daemon boot baseline,
+/// per-request `resources_for` builds, and any future direct open).
+///
+/// A single non-blocking attempt is not enough: when *this* process closes a
+/// store and immediately reopens the same ground dir, the kernel releases the
+/// advisory lock during deferred `fput` (`task_work`/`delayed_fput`), so the
+/// reopen can momentarily race the release and see `WOULDBLOCK` even though no
+/// other owner exists — reproduced on macOS CI (os error 35). We retry for
+/// [`STORE_LOCK_RETRY_BUDGET`] to absorb that window; a genuinely concurrent
+/// second daemon holds the lock for its whole lifetime, far past the budget,
+/// so the #204 single-owner guarantee still fails closed.
+async fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
+    let deadline = tokio::time::Instant::now() + STORE_LOCK_RETRY_BUDGET;
+    loop {
+        match try_acquire_store_lock(ground_dir)? {
+            Some(file) => return Ok(file),
+            None if tokio::time::Instant::now() >= deadline => {
+                return Err(HallouminateError::Config(format!(
+                    "ground store {} is locked by another hallouminate process; \
+                     every ground dir has exactly one owner — stop the other daemon \
+                     (`hallouminate daemon stop`) or point [storage].ground_dir \
+                     elsewhere before retrying",
+                    ground_dir.display(),
+                )));
+            }
+            None => tokio::time::sleep(STORE_LOCK_RETRY_INTERVAL).await,
+        }
+    }
 }
 
 async fn run_embedding_blocking(
@@ -683,7 +704,7 @@ impl LanceStore {
         // so the dataset itself is never co-owned; error paths after the
         // acquisition drop the handle and release the lock.
         meta_check_or_init(&meta_path, model_name, quantized, embeddings_enabled)?;
-        let dir_lock = acquire_store_lock(ground_dir)?;
+        let dir_lock = acquire_store_lock(ground_dir).await?;
         let uri = ground_dir.to_str().ok_or_else(|| {
             HallouminateError::Config(format!("non-utf8 ground dir: {}", ground_dir.display()))
         })?;

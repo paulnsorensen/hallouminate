@@ -85,7 +85,7 @@ const KNOWN_SEARCH_KEYS: &[&str] = &[
 ];
 const KNOWN_LOGGING_KEYS: &[&str] = &["max_file_bytes", "max_total_bytes"];
 const KNOWN_STORAGE_KEYS: &[&str] = &["ground_dir"];
-const KNOWN_DAEMON_KEYS: &[&str] = &["idle_exit_secs"];
+const KNOWN_DAEMON_KEYS: &[&str] = &["idle_exit_secs", "maintenance_interval_secs"];
 const KNOWN_WATCH_KEYS: &[&str] = &["debounce_ms", "failure_reminder_secs"];
 
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {

@@ -28,6 +28,12 @@ use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use super::pressure::IoPressureProbe;
+#[cfg(not(target_os = "linux"))]
+use super::pressure::NoPressureSignal;
+#[cfg(target_os = "linux")]
+use super::pressure::PsiProbe;
+
 use crate::config::Config;
 use hallouminate_adapters::{
     EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, MaintenanceOptions, MaintenanceStats,
@@ -44,9 +50,6 @@ const CHUNK_BUDGET_TOKENS: usize = 384;
 /// pruned at daemon boot; they're recoverable-until-pruned, not permanent.
 pub(crate) const STALE_BACKUP_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Interval between LanceDB maintenance ticks (compaction + version prune).
-const MAINTENANCE_INTERVAL_SECS: u64 = 1800;
-
 /// Grace window for `maintain`'s prune cutoff: versions younger than this
 /// are retained, letting in-flight queries drain before their snapshotted
 /// version's files can be deleted. Queries don't hold the write lane, so
@@ -60,6 +63,15 @@ const MAINTENANCE_PRUNE_GRACE_SECS: u64 = 300;
 enum MaintenanceTick {
     Continue,
     Stop,
+}
+
+/// Why a due maintenance pass was deferred instead of run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferReason {
+    /// A connection is active, or activity was seen in the last 60s.
+    Active,
+    /// No recent activity, but host I/O pressure is elevated.
+    IoPressure,
 }
 
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
@@ -374,6 +386,64 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn jittered_sleep_secs(interval_secs: u64) -> u64 {
+    let jitter_max = interval_secs / 10;
+    let jitter = if jitter_max == 0 {
+        0
+    } else {
+        fastrand::u64(0..=jitter_max)
+    };
+    interval_secs.saturating_add(jitter)
+}
+
+/// Background task: sleeps `interval` (plus jitter), then runs a maintenance
+/// pass once the daemon is idle and I/O pressure is not elevated --
+/// deferring and rechecking every 60s otherwise (ADR-003). Exits promptly on
+/// `cancel` at every await point. `state` is a clone dedicated to this task.
+async fn maintenance_loop(
+    state: DaemonState,
+    cancel: CancellationToken,
+    interval: Duration,
+    probe: Arc<dyn IoPressureProbe>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(Duration::from_secs(jittered_sleep_secs(interval.as_secs()))) => {}
+        }
+        let mut consecutive_defers: u32 = 0;
+        while let Some(reason) = state.maintenance_defer_reason(probe.as_ref()) {
+            consecutive_defers += 1;
+            if consecutive_defers > 10
+                && (consecutive_defers == 11 || consecutive_defers.is_multiple_of(10))
+            {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    ?reason,
+                    consecutive_defers,
+                    "maintenance pass repeatedly deferred",
+                );
+            } else {
+                tracing::debug!(
+                    target: "hallouminate::daemon",
+                    ?reason,
+                    consecutive_defers,
+                    "maintenance pass deferred",
+                );
+            }
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            }
+        }
+        if state.run_maintenance_tick().await == MaintenanceTick::Stop {
+            break;
+        }
+    }
+}
+
 impl DaemonState {
     pub async fn open(cfg: Config, xdg_path: Option<PathBuf>) -> anyhow::Result<Self> {
         let ground_dir = expand_tilde(&cfg.storage.ground_dir);
@@ -577,6 +647,7 @@ impl DaemonState {
         let mut resources_map = HashMap::new();
         resources_map.insert(baseline_key, Arc::clone(&baseline_resources));
 
+        let maintenance_interval_secs = cfg.daemon.maintenance_interval_secs;
         let state = DaemonState {
             inner: Arc::new(DaemonStateInner {
                 baseline: cfg,
@@ -600,36 +671,36 @@ impl DaemonState {
         // corpus, so there is no corpus lock to acquire first; taking only
         // the write lane still preserves the documented `corpus ->
         // write_lane` order (a lock that is never acquired can't be
-        // acquired out of order).
-        let maintenance_task = {
-            let state = state.clone();
-            let cancel = state.shutdown_token().clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(MAINTENANCE_INTERVAL_SECS)) => {
-                            if state.run_maintenance_tick().await == MaintenanceTick::Stop {
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-        };
-        *state.inner.maintenance_task.lock().await = Some(maintenance_task);
+        // acquired out of order). Deferred while active or under I/O
+        // pressure (ADR-003); `maintenance_interval_secs == 0` disables it.
+        if maintenance_interval_secs == 0 {
+            tracing::info!(
+                target: "hallouminate::daemon",
+                "automatic maintenance disabled (daemon.maintenance_interval_secs = 0)",
+            );
+        } else {
+            let loop_state = state.clone();
+            let cancel = loop_state.shutdown_token().clone();
+            let interval = Duration::from_secs(maintenance_interval_secs);
+            #[cfg(target_os = "linux")]
+            let probe: Arc<dyn IoPressureProbe> = Arc::new(PsiProbe);
+            #[cfg(not(target_os = "linux"))]
+            let probe: Arc<dyn IoPressureProbe> = Arc::new(NoPressureSignal);
+            let maintenance_task =
+                tokio::spawn(maintenance_loop(loop_state, cancel, interval, probe));
+            *state.inner.maintenance_task.lock().await = Some(maintenance_task);
+        }
 
         Ok(state)
     }
 
     /// One LanceDB maintenance pass (compaction + version prune). Holds a
-    /// connection guard for the write's duration and stamps the activity
-    /// clock after, so idle-exit defers instead of tearing the process down
-    /// (and releasing the single-instance flock) under a live LanceDB write
-    /// (ADR-003) — mirroring `catch_up_index` (dispatch.rs) and the
-    /// watcher's `process_change_batch`. Returns [`MaintenanceTick::Stop`]
-    /// when daemon shutdown is requested or the write lane is closed.
+    /// connection guard for the write's duration so idle-exit defers instead
+    /// of tearing the process down (and releasing the single-instance flock)
+    /// under a live LanceDB write, mirroring `catch_up_index` (dispatch.rs)
+    /// and the watcher's `process_change_batch`. This pass does NOT stamp
+    /// the idle-activity clock (ADR-002) — reintroducing that stamp would
+    /// bring back #222.
     async fn run_maintenance_tick(&self) -> MaintenanceTick {
         let store = Arc::clone(&self.inner.baseline_resources.store);
         self.run_maintenance_tick_with(move |maintenance_id| async move {
@@ -675,14 +746,12 @@ impl DaemonState {
         };
         if shutdown_requested {
             lifecycle.shutdown();
-            self.touch_activity();
             return MaintenanceTick::Stop;
         }
         match result {
             Ok(stats) => lifecycle.success(stats),
             Err(error) => lifecycle.failure(&error),
         }
-        self.touch_activity();
         MaintenanceTick::Continue
     }
 
@@ -896,6 +965,36 @@ impl DaemonState {
         ConnectionGuard {
             active: Arc::clone(&self.inner.active_connections),
         }
+    }
+
+    /// Whether a due maintenance pass should defer against the real clock --
+    /// see `maintenance_defer_reason_at`.
+    fn maintenance_defer_reason(&self, probe: &dyn IoPressureProbe) -> Option<DeferReason> {
+        self.maintenance_defer_reason_at(probe, monotonic_secs())
+    }
+
+    /// Injectable-clock variant so tests drive a synthetic `now_secs`. Active
+    /// (connection in flight, or activity within 60s) takes priority over
+    /// I/O pressure so tests can distinguish the two defer reasons.
+    fn maintenance_defer_reason_at(
+        &self,
+        probe: &dyn IoPressureProbe,
+        now_secs: u64,
+    ) -> Option<DeferReason> {
+        if self.inner.active_connections.load(Ordering::SeqCst) != 0 {
+            return Some(DeferReason::Active);
+        }
+        if !is_idle(
+            self.inner.last_activity_secs.load(Ordering::Relaxed),
+            now_secs,
+            60,
+        ) {
+            return Some(DeferReason::Active);
+        }
+        if probe.elevated() {
+            return Some(DeferReason::IoPressure);
+        }
+        None
     }
 
     /// Idle-exit predicate against the real clock: enabled, zero active
@@ -1423,12 +1522,17 @@ mod tests {
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
-        state.set_last_activity_secs_for_test(1);
+        state.set_last_activity_secs_for_test(u64::MAX / 2);
+        let idle_clock_before_tick = state.last_activity_secs();
 
         let tick = state.run_maintenance_tick().await;
 
         assert_eq!(tick, MaintenanceTick::Continue);
-        assert!(!state.should_idle_exit(300));
+        assert_eq!(
+            state.last_activity_secs(),
+            idle_clock_before_tick,
+            "maintenance must not stamp the idle-activity clock (ADR-002)",
+        );
         let events = capture.maintenance_events();
         assert_eq!(
             event_stages(&events),
@@ -1990,5 +2094,266 @@ mod tests {
             .await
             .expect("normal request reuses repaired resource");
         assert!(Arc::ptr_eq(&retried, &normal));
+    }
+
+    // --- Test probe double: mutable atomic pressure signal for live-loop tests ---
+    struct TestProbe(std::sync::atomic::AtomicBool);
+
+    impl TestProbe {
+        fn new(v: bool) -> Self {
+            Self(std::sync::atomic::AtomicBool::new(v))
+        }
+
+        fn set(&self, v: bool) {
+            self.0.store(v, Ordering::SeqCst);
+        }
+    }
+
+    impl IoPressureProbe for TestProbe {
+        fn elevated(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    // --- Decision matrix: maintenance_defer_reason_at ---
+
+    #[tokio::test]
+    async fn defer_reason_idle_and_clear_defers_nothing() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let probe = TestProbe::new(false);
+        // Idle + no pressure means the caller would run a maintenance pass;
+        // the pass itself is covered by the existing run_maintenance_tick tests.
+        assert_eq!(state.maintenance_defer_reason_at(&probe, 1000), None);
+    }
+
+    #[tokio::test]
+    async fn defer_reason_active_connection_defers_as_active() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let probe = TestProbe::new(false);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 1000),
+            Some(DeferReason::Active),
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_reason_recent_activity_defers_as_active() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(970);
+        let probe = TestProbe::new(false);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 1000),
+            Some(DeferReason::Active),
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_reason_io_pressure_defers_and_clears() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let probe = TestProbe::new(true);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 1000),
+            Some(DeferReason::IoPressure),
+        );
+        probe.set(false);
+        assert_eq!(state.maintenance_defer_reason_at(&probe, 1000), None);
+    }
+
+    #[tokio::test]
+    async fn defer_reason_active_takes_priority_over_io_pressure() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let probe = TestProbe::new(true);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 1000),
+            Some(DeferReason::Active),
+        );
+    }
+
+    // --- Boundary: is_idle at exactly the 60s activity window edge ---
+
+    #[tokio::test]
+    async fn defer_reason_idle_boundary_59s_is_still_active() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let probe = TestProbe::new(false);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 59),
+            Some(DeferReason::Active),
+            "59s since last activity must not count as idle",
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_reason_idle_boundary_60s_is_idle() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let probe = TestProbe::new(false);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 60),
+            None,
+            "60s since last activity must count as idle (inclusive boundary)",
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_reason_idle_boundary_61s_is_idle() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let probe = TestProbe::new(false);
+        assert_eq!(state.maintenance_defer_reason_at(&probe, 61), None);
+    }
+
+    // --- Live loop: paused-time, clock-free defer via active_connections ---
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_loop_warns_after_eleven_consecutive_defers() {
+        let state = test_state().await;
+        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(maintenance_loop(
+            state.clone(),
+            cancel.clone(),
+            Duration::from_secs(100),
+            Arc::new(TestProbe::new(false)),
+        ));
+
+        // Let the freshly spawned task register its interval sleep timer
+        // against the current paused clock before advancing it -- otherwise
+        // `advance` moves the clock before the timer exists and the sleep
+        // computes its deadline from the already-advanced time.
+        tokio::task::yield_now().await;
+
+        // Past interval + max jitter (100 + 10): enters the recheck loop, where
+        // the first defer check fires synchronously (consecutive_defers == 1).
+        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::task::yield_now().await;
+
+        // 9 more rechecks bring consecutive_defers to 10 (no warn yet); the
+        // 10th brings it to 11, which crosses the `> 10` warn threshold.
+        for i in 0..10 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let events = capture.0.lock().expect("capture lock");
+            let warned = events
+                .iter()
+                .any(|e| e.numbers.get("consecutive_defers").copied() == Some(11));
+            if i < 9 {
+                assert!(
+                    !warned,
+                    "warn fired before the 11th consecutive defer (i={i})"
+                );
+            } else {
+                assert!(
+                    warned,
+                    "expected a warn event with consecutive_defers == 11 after the 11th recheck"
+                );
+            }
+        }
+
+        cancel.cancel();
+        task.await.expect("maintenance_loop task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_loop_shuts_down_promptly_during_interval_sleep() {
+        let state = test_state().await;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(maintenance_loop(
+            state.clone(),
+            cancel.clone(),
+            Duration::from_secs(100),
+            Arc::new(TestProbe::new(false)),
+        ));
+
+        // Cancel wins the biased select against the interval sleep, so no
+        // time advance is needed for the task to complete.
+        cancel.cancel();
+        task.await.expect("maintenance_loop task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_loop_shuts_down_promptly_during_recheck_sleep() {
+        let state = test_state().await;
+        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(maintenance_loop(
+            state.clone(),
+            cancel.clone(),
+            Duration::from_secs(100),
+            Arc::new(TestProbe::new(false)),
+        ));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::task::yield_now().await;
+
+        cancel.cancel();
+        task.await.expect("maintenance_loop task");
+    }
+
+    #[tokio::test]
+    async fn maintenance_interval_zero_disables_the_background_task() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        cfg.daemon.maintenance_interval_secs = 0;
+
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        assert!(state.take_maintenance_task().await.is_none());
+
+        let events = capture.0.lock().expect("capture lock");
+        let disabled = events.iter().any(|e| {
+            e.strings
+                .get("message")
+                .map(|m| m.contains("disabled"))
+                .unwrap_or(false)
+        });
+        assert!(
+            disabled,
+            "expected a log message mentioning maintenance is disabled"
+        );
+    }
+
+    // --- Jitter ---
+
+    #[test]
+    fn jittered_sleep_secs_stays_within_interval_plus_ten_percent() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let jittered = jittered_sleep_secs(100);
+            assert!(
+                (100..=110).contains(&jittered),
+                "jittered_sleep_secs(100) = {jittered} out of [100, 110]",
+            );
+            seen.insert(jittered);
+        }
+        assert!(
+            seen.contains(&100) && seen.contains(&110),
+            "expected both closed-interval endpoints reachable across 1000 iterations, got {seen:?}",
+        );
+    }
+
+    #[test]
+    fn jittered_sleep_secs_zero_interval_returns_zero() {
+        assert_eq!(jittered_sleep_secs(0), 0);
+    }
+    #[test]
+    fn jittered_sleep_secs_below_ten_adds_no_jitter() {
+        assert_eq!(jittered_sleep_secs(5), 5);
     }
 }
