@@ -55,12 +55,15 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Boot the daemon and serve until SIGINT/SIGTERM (or stdin close on the
 /// rare debug invocations). Returns `Err` if another daemon is already
 /// holding the single-instance lock on the configured socket directory.
-pub async fn run_daemon(args: DaemonArgs) -> anyhow::Result<()> {
-    let cfg = config::load_xdg(args.config.as_deref())?;
+pub async fn run_daemon(cfg: Config, args: DaemonArgs) -> anyhow::Result<()> {
+    // `cfg` is the startup config the caller already loaded (once, in
+    // `lib::run`) to initialize logging before dispatch — loading it a
+    // second time here would re-read and re-validate the same file.
+    //
     // Capture the baseline source path so the dispatcher can name it in
     // scalar-conflict diagnostics (AC #7). When the user passed
     // `--config PATH`, that path *is* the baseline; otherwise the XDG path
-    // is what `load_xdg` consulted.
+    // is what `load_startup` (via `load_xdg`) consulted.
     let xdg_path = args.config.clone().unwrap_or_else(config::xdg_config_path);
     let socket_path = daemon_socket_path();
     serve_with_config(cfg, Some(xdg_path), &socket_path).await

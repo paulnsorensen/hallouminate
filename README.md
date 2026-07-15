@@ -205,6 +205,13 @@ thin clients that talk to it over a Unix domain socket.
 - **Diagnostics** — anything the auto-spawned daemon emits before its logger
   is up (panics, early config errors) lands in
   `~/.local/state/hallouminate/daemon-bootstrap.log` (`$XDG_STATE_HOME`).
+- **Process logs** — `$XDG_STATE_HOME/hallouminate/hallouminate.log`
+  (default `~/.local/state/hallouminate/hallouminate.log`) rotates exactly at
+  10 MiB into numbered archives and retains at most 100 MiB. Configure
+  `[logging].max_file_bytes` / `max_total_bytes`, or override them with
+  `HALLOUMINATE_LOG_MAX_FILE_BYTES` / `HALLOUMINATE_LOG_MAX_TOTAL_BYTES`.
+  `[watch].failure_reminder_secs` defaults to 60 seconds; override it with
+  `HALLOUMINATE_WATCH_FAILURE_REMINDER_SECS` or set `0` to disable suppression.
 - **Windows** — the daemon model is Unix-only; see
   [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
 

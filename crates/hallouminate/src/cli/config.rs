@@ -47,6 +47,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "repository",
     "search",
     "embeddings",
+    "logging",
     "watch",
     "storage",
     "daemon",
@@ -68,10 +69,8 @@ const KNOWN_REPOSITORY_KEYS: &[&str] = &[
 /// serde field names (`src/domain/common.rs`).
 const KNOWN_CORPUS_KEYS: &[&str] = &["name", "paths", "globs", "exclude", "global"];
 
-/// Keys recognized inside `[embeddings]`, `[search]`, `[storage]`,
-/// `[daemon]`, and `[watch]` — scalar (non-array) sections — mirroring the
-/// field names on `EmbeddingsConfig` / `SearchConfig` / `StorageConfig` /
-/// `DaemonConfig` / `WatchConfig` (`src/app/config.rs`).
+/// Keys recognized inside the scalar configuration sections, mirroring the
+/// field names on their corresponding config structs.
 const KNOWN_EMBEDDINGS_KEYS: &[&str] = &[
     "enabled",
     "model",
@@ -84,9 +83,10 @@ const KNOWN_SEARCH_KEYS: &[&str] = &[
     "chunks_per_file_default",
     "crossencoder",
 ];
+const KNOWN_LOGGING_KEYS: &[&str] = &["max_file_bytes", "max_total_bytes"];
 const KNOWN_STORAGE_KEYS: &[&str] = &["ground_dir"];
 const KNOWN_DAEMON_KEYS: &[&str] = &["idle_exit_secs", "maintenance_interval_secs"];
-const KNOWN_WATCH_KEYS: &[&str] = &["debounce_ms"];
+const KNOWN_WATCH_KEYS: &[&str] = &["debounce_ms", "failure_reminder_secs"];
 
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     let target = args.path.unwrap_or_else(xdg_config_path);
@@ -382,6 +382,7 @@ fn key_warnings(raw: &str) -> Vec<String> {
             collect_nested_warnings(&table, "corpus", KNOWN_CORPUS_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "embeddings", KNOWN_EMBEDDINGS_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "search", KNOWN_SEARCH_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "logging", KNOWN_LOGGING_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "storage", KNOWN_STORAGE_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "daemon", KNOWN_DAEMON_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "watch", KNOWN_WATCH_KEYS, &mut out);
