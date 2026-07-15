@@ -15,6 +15,13 @@ name: plugins-smoketest
 on:
   push:
     branches: [main]
+    paths:
+      - "plugins/hallouminate/**"
+      - ".claude-plugin/**"
+      - ".cursor-plugin/**"
+      - ".agents/plugins/**"
+      - "Cargo.toml"
+      - ".github/workflows/plugins-smoketest.yml"
   pull_request:
     paths:
       - "plugins/hallouminate/**"
