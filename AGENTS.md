@@ -2,6 +2,24 @@
 
 Project-specific guidance for coding agents working in `hallouminate`.
 
+## Local verification
+
+Use `just verify` as the canonical local gate. With no arguments it runs the
+full fmt, clippy, build, and test sequence. Route focused Cargo checks through
+the same lease, for example `just verify cargo test -p hallouminate --test it
+verification_gate`. `just ci` and `just llm` are compatibility routes.
+
+Never launch raw compiler/linker-heavy Cargo gates concurrently in this
+repository or its linked worktrees. Nested reviewers must wait for the active
+lease, or reuse a matching successful record from
+`$(git rev-parse --git-common-dir)/hallouminate-verify.jsonl`; matching means
+the command digest, HEAD, and state digest agree and the finish status is zero.
+`cargo fmt` checks and read-only review may run outside the lease.
+
+This repository lease prevents same-project duplication only. Host-wide
+admission control and cgroups or equivalent resource isolation are the
+execution environment's responsibility.
+
 ## Keep the wiki current after each land
 
 This repo dogfoods its own wiki at `.hallouminate/wiki/` (corpus
