@@ -35,8 +35,14 @@ env:
   NIGHTLY_TAG: nightly
 
 jobs:
-  # Recreate the rolling prerelease first so the matrix jobs only upload assets
-  # (race-free: the release exists before any build finishes).
+  # Upsert the rolling prerelease first so the matrix jobs only upload assets
+  # (the release exists before any build finishes). NEVER delete: GitHub's tag
+  # deletion is eventually-consistent, so delete-then-recreate-same-tag races the
+  # async GC and can orphan the fresh release into a draft (public
+  # releases/download/<tag>/ assets then 404). Instead converge to the desired
+  # end-state — move the tag atomically, create-or-heal a published prerelease,
+  # and let the build jobs clobber assets by their stable names. Every step is
+  # safe to re-run and heals a prior broken (draft/orphaned) state.
   prepare-release:
     runs-on: ubuntu-latest
     permissions:
@@ -45,17 +51,27 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Refresh nightly prerelease
+      - name: Upsert nightly prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release delete "$NIGHTLY_TAG" --yes --cleanup-tag || true
-          gh release create "$NIGHTLY_TAG" \
-            --target "$GITHUB_SHA" \
-            --title "nightly (main)" \
-            --notes "Rolling build of main @ ${GITHUB_SHA}. Prerelease — not a stable version." \
-            --prerelease
+          # Point the nightly tag at this commit — atomic force-update, no
+          # async-delete window. Create the ref if it does not yet exist.
+          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/${NIGHTLY_TAG}" \
+              -f sha="$GITHUB_SHA" -F force=true \
+            || gh api -X POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                 -f ref="refs/tags/${NIGHTLY_TAG}" -f sha="$GITHUB_SHA"
+          # Ensure a PUBLISHED prerelease exists. `edit --draft=false` heals a
+          # prior orphaned draft; `create` covers first-ever run.
+          notes="Rolling build of main @ ${GITHUB_SHA}. Prerelease — not a stable version."
+          if gh release view "$NIGHTLY_TAG" >/dev/null 2>&1; then
+            gh release edit "$NIGHTLY_TAG" --draft=false --prerelease \
+              --target "$GITHUB_SHA" --title "nightly (main)" --notes "$notes"
+          else
+            gh release create "$NIGHTLY_TAG" --prerelease \
+              --target "$GITHUB_SHA" --title "nightly (main)" --notes "$notes"
+          fi
 
   build:
     needs: prepare-release
