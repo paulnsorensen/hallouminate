@@ -1,10 +1,9 @@
 //! Cross-manifest drift test for the plugin pack (issue #107).
 //!
-//! The plugin ships manifests for two harnesses (Claude Code under
-//! `.claude-plugin/`, Codex under `.codex-plugin/`) plus a declarative MCP
-//! registration (`.mcp.json`) and two marketplace files. These must agree
-//! with each other and with the crate version in `Cargo.toml`, or installs
-//! silently drift (the pack shipped 0.1.0 while the crate was at 0.1.3).
+//! The plugin pack ships native manifests for Claude Code, Codex, Copilot CLI,
+//! Cursor, and Gemini CLI, plus declarative MCP registration and marketplace
+//! files. These must agree with each other and with the crate version in
+//! `Cargo.toml`, or installs silently drift.
 //!
 //! opencode has no plugin-manifest convention — it loads the MCP server and
 //! skills directly (`opencode.json` + `~/.config/opencode/skills/`), so the
@@ -34,30 +33,41 @@ fn str_at<'a>(value: &'a serde_json::Value, pointer: &str, file: &str) -> &'a st
 
 #[test]
 fn plugin_manifests_share_the_crate_name() {
-    let claude = read_json("plugins/hallouminate/.claude-plugin/plugin.json");
-    let codex = read_json("plugins/hallouminate/.codex-plugin/plugin.json");
-    assert_eq!(
-        str_at(&claude, "/name", "claude plugin.json"),
-        "hallouminate"
-    );
-    assert_eq!(str_at(&codex, "/name", "codex plugin.json"), "hallouminate");
+    let manifests = [
+        ("plugins/hallouminate/.claude-plugin/plugin.json", "claude"),
+        ("plugins/hallouminate/.codex-plugin/plugin.json", "codex"),
+        ("plugins/hallouminate/plugin.json", "copilot"),
+        ("plugins/hallouminate/.cursor-plugin/plugin.json", "cursor"),
+        ("plugins/hallouminate/gemini-extension.json", "gemini"),
+    ];
+    for (path, harness) in manifests {
+        let manifest = read_json(path);
+        assert_eq!(
+            str_at(&manifest, "/name", path),
+            "hallouminate",
+            "{harness} manifest must share the crate name"
+        );
+    }
 }
 
 #[test]
 fn plugin_versions_match_the_crate_version() {
     let crate_version = env!("CARGO_PKG_VERSION");
-    let claude = read_json("plugins/hallouminate/.claude-plugin/plugin.json");
-    let codex = read_json("plugins/hallouminate/.codex-plugin/plugin.json");
-    assert_eq!(
-        str_at(&claude, "/version", "claude plugin.json"),
-        crate_version,
-        "claude plugin.json version drifted from Cargo.toml"
-    );
-    assert_eq!(
-        str_at(&codex, "/version", "codex plugin.json"),
-        crate_version,
-        "codex plugin.json version drifted from Cargo.toml"
-    );
+    let manifests = [
+        "plugins/hallouminate/.claude-plugin/plugin.json",
+        "plugins/hallouminate/.codex-plugin/plugin.json",
+        "plugins/hallouminate/plugin.json",
+        "plugins/hallouminate/.cursor-plugin/plugin.json",
+        "plugins/hallouminate/gemini-extension.json",
+    ];
+    for path in manifests {
+        let manifest = read_json(path);
+        assert_eq!(
+            str_at(&manifest, "/version", path),
+            crate_version,
+            "{path} version drifted from Cargo.toml"
+        );
+    }
 }
 
 #[test]
@@ -117,6 +127,30 @@ fn codex_marketplace_resolves_to_the_plugin_directory() {
 }
 
 #[test]
+fn cursor_marketplace_resolves_to_the_plugin_directory() {
+    let marketplace = read_json(".cursor-plugin/marketplace.json");
+    assert_eq!(
+        str_at(&marketplace, "/name", ".cursor-plugin/marketplace.json"),
+        "hallouminate"
+    );
+    assert_eq!(
+        str_at(
+            &marketplace,
+            "/plugins/0/name",
+            ".cursor-plugin/marketplace.json",
+        ),
+        "hallouminate"
+    );
+    let source = str_at(
+        &marketplace,
+        "/plugins/0/source",
+        ".cursor-plugin/marketplace.json",
+    );
+    assert_eq!(source, "plugins/hallouminate");
+    assert_is_plugin_dir(&repo_root().join(source));
+}
+
+#[test]
 fn codex_plugin_manifest_declares_bundled_components() {
     let codex = read_json("plugins/hallouminate/.codex-plugin/plugin.json");
     assert_eq!(
@@ -138,6 +172,53 @@ fn codex_plugin_manifest_declares_bundled_components() {
         str_at(&codex, "/interface/displayName", "codex plugin.json"),
         "Hallouminate",
         "codex plugin must include required interface metadata"
+    );
+}
+
+#[test]
+fn copilot_plugin_manifest_declares_bundled_components() {
+    let copilot = read_json("plugins/hallouminate/plugin.json");
+    assert_eq!(
+        str_at(&copilot, "/name", "copilot plugin.json"),
+        "hallouminate"
+    );
+    assert_eq!(
+        str_at(&copilot, "/skills", "copilot plugin.json"),
+        "./skills/"
+    );
+    assert_eq!(
+        str_at(&copilot, "/mcpServers", "copilot plugin.json"),
+        "./.mcp.json"
+    );
+}
+
+#[test]
+fn cursor_plugin_manifest_declares_bundled_components() {
+    let cursor = read_json("plugins/hallouminate/.cursor-plugin/plugin.json");
+    assert_eq!(
+        str_at(&cursor, "/skills", "cursor plugin.json"),
+        "./skills/"
+    );
+    assert_eq!(
+        str_at(&cursor, "/mcpServers", "cursor plugin.json"),
+        "./.mcp.json"
+    );
+}
+
+#[test]
+fn gemini_extension_declares_the_bundled_server() {
+    let gemini = read_json("plugins/hallouminate/gemini-extension.json");
+    assert_eq!(
+        str_at(
+            &gemini,
+            "/mcpServers/hallouminate/command",
+            "gemini-extension.json",
+        ),
+        "hallouminate"
+    );
+    assert_eq!(
+        gemini.pointer("/mcpServers/hallouminate/args"),
+        Some(&serde_json::json!(["serve"]))
     );
 }
 
@@ -165,6 +246,21 @@ fn assert_is_plugin_dir(resolved: &Path) {
     assert!(
         resolved.join(".codex-plugin/plugin.json").is_file(),
         "{} does not contain .codex-plugin/plugin.json",
+        resolved.display()
+    );
+    assert!(
+        resolved.join("plugin.json").is_file(),
+        "{} does not contain Copilot plugin.json",
+        resolved.display()
+    );
+    assert!(
+        resolved.join(".cursor-plugin/plugin.json").is_file(),
+        "{} does not contain .cursor-plugin/plugin.json",
+        resolved.display()
+    );
+    assert!(
+        resolved.join("gemini-extension.json").is_file(),
+        "{} does not contain gemini-extension.json",
         resolved.display()
     );
     assert!(
@@ -218,6 +314,93 @@ fn release_workflow_tag_trigger_stays_anchored_at_v() {
         assert!(
             !pattern.starts_with("**"),
             "tag pattern {pattern:?} must not be a greedy ** glob"
+        );
+    }
+}
+
+#[test]
+fn release_workflow_packages_every_marketplace() {
+    let path = repo_root().join(".github/workflows/release-skills.yml");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let workflow: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+
+    let pull_request_paths = workflow
+        .get("on")
+        .and_then(|on| on.get("pull_request"))
+        .and_then(|pull_request| pull_request.get("paths"))
+        .and_then(|paths| paths.as_sequence())
+        .expect("release-skills.yml: on.pull_request.paths must be a sequence");
+    for required in [".agents/**", ".cursor-plugin/**"] {
+        let mut found = false;
+        for path in pull_request_paths {
+            if path.as_str() == Some(required) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "release-skills.yml must run for {required}");
+    }
+
+    let env = workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get("release-skills"))
+        .and_then(|job| job.get("env"))
+        .expect("release-skills.yml: jobs.release-skills.env must exist");
+    for (variable, expected) in [
+        ("MARKETPLACE", ".claude-plugin/marketplace.json"),
+        ("CODEX_MARKETPLACE", ".agents/plugins/marketplace.json"),
+        ("CURSOR_MARKETPLACE", ".cursor-plugin/marketplace.json"),
+    ] {
+        assert_eq!(
+            env.get(variable).and_then(|value| value.as_str()),
+            Some(expected),
+            "release-skills.yml must bind {variable} to {expected}"
+        );
+    }
+
+    let steps = workflow
+        .get("jobs")
+        .and_then(|jobs| jobs.get("release-skills"))
+        .and_then(|job| job.get("steps"))
+        .and_then(|steps| steps.as_sequence())
+        .expect("release-skills.yml: jobs.release-skills.steps must be a sequence");
+    let mut package_run = None;
+    for step in steps {
+        if step.get("name").and_then(|name| name.as_str()) == Some("Package skill pack") {
+            package_run = step.get("run").and_then(|run| run.as_str());
+            break;
+        }
+    }
+    let package_run =
+        package_run.expect("release-skills.yml: 'Package skill pack' step must have a run field");
+    for variable in ["$MARKETPLACE", "$CODEX_MARKETPLACE", "$CURSOR_MARKETPLACE"] {
+        assert!(
+            package_run.contains(variable),
+            "skill archive must copy {variable}"
+        );
+    }
+
+    let mut release_run = None;
+    for step in steps {
+        if step.get("name").and_then(|name| name.as_str()) == Some("Create GitHub Release") {
+            release_run = step.get("run").and_then(|run| run.as_str());
+            break;
+        }
+    }
+    let release_run = release_run
+        .expect("release-skills.yml: 'Create GitHub Release' step must have a run field");
+    for route in [
+        "OMP:",
+        "Codex:",
+        "Copilot CLI:",
+        "Cursor Teams/Enterprise:",
+        "Gemini CLI",
+    ] {
+        assert!(
+            release_run.contains(route),
+            "release notes must mention the {route} install route"
         );
     }
 }

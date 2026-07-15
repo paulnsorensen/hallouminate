@@ -67,16 +67,18 @@ Verify with `hallouminate --version`.
 
 ### Per-harness setup
 
-The MCP server is always the same command: `hallouminate serve` (stdio).
-What differs per harness is how it gets registered:
+The MCP server is always `hallouminate serve` over stdio. Install the shared
+plugin pack through the harness-native route:
 
-| Harness | Plugin / skills | MCP registration |
+| Harness | Install the plugin / skills | MCP registration |
 | --- | --- | --- |
-| **Claude Code** | `/plugin marketplace add paulnsorensen/hallouminate` → `/plugin install hallouminate@hallouminate` → run `/hallouminate:install` | Declarative — the plugin bundles `.mcp.json` (project scope). User scope fallback: `claude mcp add hallouminate --scope user -- hallouminate serve` |
-| **Codex** | `codex plugin marketplace add paulnsorensen/hallouminate`, restart, then `codex plugin add hallouminate@hallouminate` (or install from `/plugins`) | Bundled `.mcp.json` in the plugin payload |
-| **opencode** | Copy skills from `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` — opencode loads the MCP server and skills directly (no plugin manifest) | Add to `opencode.json`: `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` |
-| **Copilot CLI** | — (binary + MCP only) | Add to `~/.copilot/mcp-config.json`: `{ "mcpServers": { "hallouminate": { "command": "hallouminate", "args": ["serve"] } } }` |
-| **Cursor** | — (binary + MCP only) | Add to `~/.cursor/mcp.json`: `{ "mcpServers": { "hallouminate": { "command": "hallouminate", "args": ["serve"] } } }` |
+| **Claude Code** | `/plugin marketplace add paulnsorensen/hallouminate` → `/plugin install hallouminate@hallouminate` | Bundled `.mcp.json`; user fallback: `claude mcp add hallouminate --scope user -- hallouminate serve` |
+| **Codex** | `codex plugin marketplace add paulnsorensen/hallouminate`, restart, then `codex plugin add hallouminate@hallouminate` (or install from `/plugins`) | Bundled `.mcp.json` |
+| **Copilot CLI** | `copilot plugin marketplace add paulnsorensen/hallouminate` → `copilot plugin install hallouminate@hallouminate` | Bundled `.mcp.json` |
+| **OMP** | `/marketplace add paulnsorensen/hallouminate` → `/marketplace install hallouminate@hallouminate` | Bundled Claude-compatible `.mcp.json` |
+| **Cursor** | Teams/Enterprise: import `https://github.com/paulnsorensen/hallouminate` under **Plugins → Team Marketplaces**. Local: clone, copy or symlink `plugins/hallouminate` to `~/.cursor/plugins/local/hallouminate`, then reload/restart Cursor. | Bundled `.mcp.json` through the Cursor manifest |
+| **Gemini CLI** | From a checkout: `gemini extensions install ./plugins/hallouminate --consent`. From an extracted release archive: `gemini extensions install ./hallouminate-skills-<version>/plugins/hallouminate --consent`. | Inline in `gemini-extension.json`; bundled skills are auto-discovered |
+| **opencode** | Copy `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` | Add `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` to `opencode.json` |
 
 ### First run
 
@@ -247,12 +249,13 @@ vectors). Omitting `embeddings.model` selects the default.
 
 A cross-harness plugin pack ships in this repo under
 [`plugins/hallouminate`](plugins/hallouminate): skills for installing
-hallouminate and authoring wikis, plus a bundled `.mcp.json` that registers
-the MCP server declaratively. Claude Code installs it from
-`.claude-plugin/marketplace.json`, Codex from `.agents/plugins/marketplace.json`
-— see the [install matrix](#per-harness-setup). `tests/plugin_manifests.rs`
-pins the pack's manifests to the crate version, and the `release-skills`
-workflow publishes versioned skill-pack archives to GitHub Releases on every
+hallouminate and authoring wikis, plus MCP registration for each supported
+plugin format. Claude Code and OMP use `.claude-plugin/marketplace.json`,
+Codex uses `.agents/plugins/marketplace.json`, Copilot CLI uses the payload's
+root `plugin.json`, Cursor uses `.cursor-plugin/`, and Gemini CLI uses
+`gemini-extension.json` — see the [install matrix](#per-harness-setup).
+`tests/plugin_manifests.rs` pins every manifest to the crate version, and the
+`release-skills` workflow publishes versioned plugin-pack archives on every
 `v*` release tag.
 
 ## License

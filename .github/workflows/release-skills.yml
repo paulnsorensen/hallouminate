@@ -1,12 +1,9 @@
-# Releases the hallouminate skill pack (the Claude Code plugin under plugins/).
+# Releases the cross-harness hallouminate plugin pack under plugins/.
 #
-# There is no `gh skill publish` / `claude plugin publish` command today —
-# Claude Code plugins are distributed by hosting a `.claude-plugin/marketplace.json`
-# in a git repo (users run `/plugin marketplace add paulnsorensen/hallouminate`
-# then `/plugin install hallouminate@hallouminate`). This job complements that by
-# validating the manifests and publishing a versioned, self-contained archive of
-# the marketplace + plugin to a GitHub Release, so a specific skill-pack version
-# can be pinned, downloaded, and added from a local path.
+# Claude Code, OMP, Copilot CLI, Codex, Cursor, and Gemini CLI consume the
+# same skills and MCP server through their native or compatible manifests.
+# This job validates those manifests and publishes a versioned, self-contained
+# archive of every marketplace root plus the shared plugin payload.
 #
 # Triggers: a crate release tag push (`v*` — the same tag that fires the
 # cargo-dist release.yml and publish-crates.yml, so the skill pack ships in
@@ -41,6 +38,8 @@ on:
     paths:
       - "plugins/**"
       - ".claude-plugin/**"
+      - ".agents/**"
+      - ".cursor-plugin/**"
       - ".github/workflows/release-skills.yml"
 
 permissions:
@@ -53,6 +52,8 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       PLUGIN_DIR: plugins/hallouminate
       MARKETPLACE: .claude-plugin/marketplace.json
+      CODEX_MARKETPLACE: .agents/plugins/marketplace.json
+      CURSOR_MARKETPLACE: .cursor-plugin/marketplace.json
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -62,14 +63,21 @@ jobs:
         run: |
           set -euo pipefail
           jq empty "$MARKETPLACE"
+          jq empty "$CODEX_MARKETPLACE"
+          jq empty "$CURSOR_MARKETPLACE"
           jq empty "$PLUGIN_DIR/.claude-plugin/plugin.json"
           jq empty "$PLUGIN_DIR/.codex-plugin/plugin.json"
+          jq empty "$PLUGIN_DIR/.cursor-plugin/plugin.json"
+          jq empty "$PLUGIN_DIR/plugin.json"
+          jq empty "$PLUGIN_DIR/gemini-extension.json"
           jq empty "$PLUGIN_DIR/.mcp.json"
-          jq empty .agents/plugins/marketplace.json
-          # the marketplace must reference the plugin by name
           jq -e '.plugins[] | select(.name == "hallouminate")' "$MARKETPLACE" > /dev/null
-          # the plugin manifest must carry a name and version
+          jq -e '.plugins[] | select(.name == "hallouminate")' "$CODEX_MARKETPLACE" > /dev/null
+          jq -e '.plugins[] | select(.name == "hallouminate")' "$CURSOR_MARKETPLACE" > /dev/null
           jq -e '.name == "hallouminate"' "$PLUGIN_DIR/.claude-plugin/plugin.json" > /dev/null
+          jq -e '.name == "hallouminate"' "$PLUGIN_DIR/plugin.json" > /dev/null
+          jq -e '.name == "hallouminate"' "$PLUGIN_DIR/.cursor-plugin/plugin.json" > /dev/null
+          jq -e '.name == "hallouminate"' "$PLUGIN_DIR/gemini-extension.json" > /dev/null
 
       - name: Validate skill frontmatter
         run: |
@@ -113,11 +121,13 @@ jobs:
           name="hallouminate-skills-${{ steps.ver.outputs.version }}"
           root="$(mktemp -d)"
           dest="$root/$name"
-          # Mirror the repo layout so the archive is a drop-in marketplace:
-          #   <name>/.claude-plugin/marketplace.json
+          # Mirror the repo layout so each harness can consume the archive:
+          #   <name>/{.claude-plugin,.agents/plugins,.cursor-plugin}/marketplace.json
           #   <name>/plugins/hallouminate/...
-          mkdir -p "$dest/.claude-plugin" "$dest/plugins"
+          mkdir -p "$dest/.claude-plugin" "$dest/.agents/plugins" "$dest/.cursor-plugin" "$dest/plugins"
           cp "$MARKETPLACE" "$dest/.claude-plugin/"
+          cp "$CODEX_MARKETPLACE" "$dest/.agents/plugins/"
+          cp "$CURSOR_MARKETPLACE" "$dest/.cursor-plugin/"
           cp -r "$PLUGIN_DIR" "$dest/plugins/"
           ( cd "$root" && zip -rq "$GITHUB_WORKSPACE/$name.zip" "$name" )
           ( cd "$root" && tar -czf "$GITHUB_WORKSPACE/$name.tar.gz" "$name" )
@@ -142,12 +152,14 @@ jobs:
           tag="${{ steps.ver.outputs.tag }}"
           notes="hallouminate skill pack ${{ steps.ver.outputs.version }}.
 
-          Install via the in-repo marketplace:
-          \`/plugin marketplace add paulnsorensen/hallouminate\` then
-          \`/plugin install hallouminate@hallouminate\`, and run \`/hallouminate:install\`.
+          Claude Code: \`/plugin marketplace add paulnsorensen/hallouminate\`, then \`/plugin install hallouminate@hallouminate\`.
+          OMP: \`/marketplace add paulnsorensen/hallouminate\`, then \`/marketplace install hallouminate@hallouminate\`.
+          Codex: \`codex plugin marketplace add paulnsorensen/hallouminate\`, restart, then \`codex plugin add hallouminate@hallouminate\`.
+          Copilot CLI: \`copilot plugin marketplace add paulnsorensen/hallouminate\`, then \`copilot plugin install hallouminate@hallouminate\`.
+          Cursor Teams/Enterprise: import \`https://github.com/paulnsorensen/hallouminate\` as a team marketplace.
+          Gemini CLI (extracted archive): \`gemini extensions install ./hallouminate-skills-${{ steps.ver.outputs.version }}/plugins/hallouminate --consent\`.
 
-          Or add this pinned archive from a local path after extracting it:
-          \`/plugin marketplace add ./hallouminate-skills-${{ steps.ver.outputs.version }}\`."
+          After extracting this pinned archive, marketplace-based harnesses can add \`./hallouminate-skills-${{ steps.ver.outputs.version }}\` instead of the repository."
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "Release $tag already exists — refreshing assets"
             gh release upload "$tag" \
