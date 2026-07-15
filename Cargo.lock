@@ -2816,6 +2816,7 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
+ "fastrand",
  "hallouminate-adapters",
  "hallouminate-domain",
  "libc",

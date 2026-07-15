@@ -23,6 +23,7 @@ mod client;
 mod dispatch;
 mod ipc;
 mod lifecycle;
+mod pressure;
 mod server;
 mod socket;
 mod state;

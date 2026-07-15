@@ -20,6 +20,9 @@ tokio.workspace = true
 tokio-util = "0.7"
 notify = "8"
 notify-debouncer-full = "0.7"
+# Bounded jitter for the periodic maintenance loop (ADR-001); already in the
+# lockfile transitively.
+fastrand = "2"
 # Direct dep for peer-credential auth on the daemon's Unix socket
 # (`SO_PEERCRED` on Linux via raw `getsockopt`, `getpeereid` on macOS/BSD;
 # rustix's `net::sockopt::socket_peercred` is Linux-only, so it can't cover
@@ -42,6 +45,7 @@ rmcp = { version = "2.2", features = ["server", "macros", "transport-io", "schem
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
 # Spreadsheet ingestion tests generate fixtures in-process (no committed binaries):
 # rust_xlsxwriter writes a real .xlsx calamine can read; .ods is a hand-built ZIP
 # (mimetype + content.xml + META-INF/manifest.xml — calamine requires the manifest)

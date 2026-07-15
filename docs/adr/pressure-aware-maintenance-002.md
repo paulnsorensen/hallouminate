@@ -1,0 +1,6 @@
+# ADR pressure-aware-maintenance-002: Maintenance passes stop stamping the idle-activity clock  [status: accepted]
+
+- **Context:** `run_maintenance_tick_with` calls `touch_activity()` after both completed and shutdown-interrupted passes (`crates/hallouminate/src/daemon/state.rs:678,685`). The wiki (`ort-arena-retention.md`) flags this as starving idle-exit (#222). With #230's defer-while-active gating the stamping becomes circular: maintenance only runs when the daemon is idle, and running then extends the daemon's lifetime by another `idle_exit_secs` window per pass.
+- **Decision:** Delete the two `touch_activity()` calls — a background chore is not user activity. The existing test `maintenance_tick_stamps_the_idle_clock_and_continues` inverts to assert no stamp.
+- **Alternatives:** (a) Keep stamping (defer to #222) — rejected: actively circular once defer-while-active lands. (b) Run-before-exit — trigger a final pass on the idle-exit shutdown path — rejected as scope expansion into the shutdown sequence; can be revisited under #222.
+- **Consequences:** Idle daemons exit on schedule even when maintenance ran. A daemon whose last pass is interrupted by idle-exit shutdown relies on the existing drain-before-flock-release ordering (unchanged). Partially relieves, but does not close, #222.

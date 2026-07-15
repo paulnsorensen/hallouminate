@@ -125,12 +125,18 @@ pub struct DaemonConfig {
     /// idle-exit — the daemon lives until stopped. Default: `900` (15 min).
     #[serde(default = "default_idle_exit_secs")]
     pub idle_exit_secs: u64,
+    /// Seconds between automatic LanceDB maintenance passes (compaction +
+    /// version prune). `0` disables automatic maintenance — matches
+    /// `idle_exit_secs`'s convention. Default: `1800` (30 min).
+    #[serde(default = "default_maintenance_interval_secs")]
+    pub maintenance_interval_secs: u64,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             idle_exit_secs: default_idle_exit_secs(),
+            maintenance_interval_secs: default_maintenance_interval_secs(),
         }
     }
 }
@@ -570,6 +576,14 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        maintenance_interval_secs: merge_scalar(
+            "daemon.maintenance_interval_secs",
+            baseline.daemon.maintenance_interval_secs,
+            repo.daemon.maintenance_interval_secs,
+            defaults.daemon.maintenance_interval_secs,
+            baseline_path,
+            repo_path,
+        )?,
     };
 
     let merged = Config {
@@ -824,6 +838,9 @@ fn default_ground_dir() -> String {
 }
 fn default_idle_exit_secs() -> u64 {
     900
+}
+fn default_maintenance_interval_secs() -> u64 {
+    1800
 }
 
 #[cfg(test)]
