@@ -35,7 +35,7 @@ jobs:
           TAG="${{ github.ref_name }}"
           # Strip optional leading "v" — cargo-dist accepts both forms.
           TAG_VER="${TAG#v}"
-          CARGO_VER=$(awk '/^\[package\]/{f=1} f&&/^\[/&&!/^\[package\]/{f=0} f&&/^version[[:space:]]*=/{print; exit}' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          CARGO_VER=$(awk '/^\[workspace\.package\]/{f=1} f&&/^\[/&&!/^\[workspace\.package\]/{f=0} f&&/^version[[:space:]]*=/{print; exit}' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
           NPM_VER=$(jq -r .version npm/package.json)
           echo "Tag: $TAG_VER  Cargo: $CARGO_VER  npm: $NPM_VER"
           if [ "$CARGO_VER" != "$TAG_VER" ]; then
