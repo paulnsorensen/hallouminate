@@ -16,9 +16,11 @@ const PSI_ELEVATED_THRESHOLD: f64 = 10.0;
 /// Kernel PSI file the Linux probe reads.
 const PSI_PATH: &str = "/proc/pressure/io";
 
-/// Guards the fail-open debug log so an absent or unparseable PSI file is
-/// reported once, not on every maintenance cycle.
-static PSI_FAIL_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Guards the fail-open debug logs so each distinct fail reason (missing
+/// file vs. unparseable contents) is reported once, not on every
+/// maintenance cycle.
+static PSI_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+static PSI_UNPARSEABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Host I/O pressure signal, injected into the maintenance loop so tests can
 /// swap in a double instead of reading the real `/proc/pressure/io`.
@@ -29,17 +31,13 @@ pub(crate) trait IoPressureProbe: Send + Sync {
 }
 
 /// Linux PSI probe: parses `/proc/pressure/io`'s "some avg10" field.
+#[cfg(target_os = "linux")]
 pub(crate) struct PsiProbe;
 
+#[cfg(target_os = "linux")]
 impl IoPressureProbe for PsiProbe {
-    #[cfg(target_os = "linux")]
     fn elevated(&self) -> bool {
         psi_elevated_at(Path::new(PSI_PATH))
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn elevated(&self) -> bool {
-        false
     }
 }
 
@@ -52,21 +50,27 @@ fn psi_elevated_at(path: &Path) -> bool {
         Ok(contents) => match parse_some_avg10(&contents) {
             Some(avg10) => avg10 > PSI_ELEVATED_THRESHOLD,
             None => {
-                log_fail_open("PSI io pressure line unparseable; treating as not elevated");
+                log_fail_open(
+                    &PSI_UNPARSEABLE_LOGGED,
+                    "PSI io pressure line unparseable; treating as not elevated",
+                );
                 false
             }
         },
         Err(_) => {
-            log_fail_open("/proc/pressure/io unavailable; treating pressure as not elevated");
+            log_fail_open(
+                &PSI_UNAVAILABLE_LOGGED,
+                "/proc/pressure/io unavailable; treating pressure as not elevated",
+            );
             false
         }
     }
 }
 
-/// Emits the fail-open condition at debug exactly once per process, so a
-/// persistently absent/unparseable PSI file does not log every cycle.
-fn log_fail_open(message: &'static str) {
-    if !PSI_FAIL_LOGGED.swap(true, Ordering::Relaxed) {
+/// Emits a fail-open condition at debug exactly once per process per `guard`,
+/// so a persistently absent/unparseable PSI file does not log every cycle.
+fn log_fail_open(guard: &'static AtomicBool, message: &'static str) {
+    if !guard.swap(true, Ordering::Relaxed) {
         tracing::debug!(target: "hallouminate::daemon", "{message}");
     }
 }

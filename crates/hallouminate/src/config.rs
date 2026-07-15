@@ -1255,6 +1255,27 @@ ground_dir = "~/.local/share/hallouminate/ground"
     }
 
     #[test]
+    fn daemon_maintenance_interval_secs_defaults_to_1800() {
+        assert_eq!(DaemonConfig::default().maintenance_interval_secs, 1800);
+        let cfg = parse("", None).expect("empty config parses");
+        assert_eq!(cfg.daemon.maintenance_interval_secs, 1800);
+    }
+
+    #[test]
+    fn parse_daemon_maintenance_interval_secs_can_be_disabled_with_zero() {
+        let cfg = parse("[daemon]\nmaintenance_interval_secs = 0\n", None)
+            .expect("maintenance_interval_secs = 0 parses");
+        assert_eq!(cfg.daemon.maintenance_interval_secs, 0);
+    }
+
+    #[test]
+    fn parse_daemon_maintenance_interval_secs_custom_value() {
+        let cfg = parse("[daemon]\nmaintenance_interval_secs = 3600\n", None)
+            .expect("maintenance_interval_secs = 3600 parses");
+        assert_eq!(cfg.daemon.maintenance_interval_secs, 3600);
+    }
+
+    #[test]
     fn parse_embeddings_section_omitting_enabled_defaults_to_enabled() {
         let cfg = parse("[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n", None)
             .expect("partial embeddings section parses");
@@ -2145,6 +2166,17 @@ path = "/b"
         let repo = parse("", None).expect("repo default");
         let merged = merge_layers(&baseline, &repo).expect("merge");
         assert_eq!(merged.daemon.idle_exit_secs, 1800);
+    }
+
+    #[test]
+    fn merge_layers_daemon_maintenance_interval_secs_propagates_baseline_over_repo_default() {
+        // Regression trap: if the merge_scalar call for
+        // daemon.maintenance_interval_secs is removed and the field is
+        // hardcoded to its default, this fails.
+        let baseline = parse("[daemon]\nmaintenance_interval_secs = 3600\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo default");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.daemon.maintenance_interval_secs, 3600);
     }
 
     #[test]

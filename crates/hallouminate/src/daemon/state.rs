@@ -393,7 +393,7 @@ fn jittered_sleep_secs(interval_secs: u64) -> u64 {
     } else {
         fastrand::u64(0..=jitter_max)
     };
-    interval_secs + jitter
+    interval_secs.saturating_add(jitter)
 }
 
 /// Background task: sleeps `interval` (plus jitter), then runs a maintenance
@@ -415,7 +415,7 @@ async fn maintenance_loop(
         let mut consecutive_defers: u32 = 0;
         while let Some(reason) = state.maintenance_defer_reason(probe.as_ref()) {
             consecutive_defers += 1;
-            if consecutive_defers > 10 {
+            if consecutive_defers > 10 && (consecutive_defers == 11 || consecutive_defers % 10 == 0) {
                 tracing::warn!(
                     target: "hallouminate::daemon",
                     ?reason,
