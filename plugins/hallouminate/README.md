@@ -6,35 +6,19 @@ your first LLM-authored, per-repo wiki.
 
 ## Install
 
-**Claude Code:**
+| Harness | Install |
+| --- | --- |
+| **Claude Code** | `/plugin marketplace add paulnsorensen/hallouminate` → `/plugin install hallouminate@hallouminate` |
+| **Codex** | `codex plugin marketplace add paulnsorensen/hallouminate`, restart, then `codex plugin add hallouminate@hallouminate` |
+| **Copilot CLI** | `copilot plugin marketplace add paulnsorensen/hallouminate` → `copilot plugin install hallouminate@hallouminate` |
+| **OMP** | `/marketplace add paulnsorensen/hallouminate` → `/marketplace install hallouminate@hallouminate` |
+| **Cursor** | Teams/Enterprise: import `https://github.com/paulnsorensen/hallouminate` under **Plugins → Team Marketplaces**. Local: clone, copy or symlink `plugins/hallouminate` to `~/.cursor/plugins/local/hallouminate`, then reload/restart Cursor. |
+| **Gemini CLI** | `gemini extensions install ./plugins/hallouminate --consent`; for an extracted release archive, use `./hallouminate-skills-<version>/plugins/hallouminate` instead. |
+| **opencode** | Copy `skills/` to `~/.config/opencode/skills/` and register `hallouminate serve` in `opencode.json`. |
 
-```text
-/plugin marketplace add paulnsorensen/hallouminate
-/plugin install hallouminate@hallouminate
-```
-
-Then run the install workflow:
-
-```text
-/hallouminate:install
-```
-
-(Or just ask Claude to "install hallouminate" — the `install` skill is
-model-invocable too.)
-
-**Codex:**
-
-```text
-codex plugin marketplace add paulnsorensen/hallouminate
-codex plugin add hallouminate@hallouminate
-```
-
-Restart Codex after adding the marketplace so the plugin appears in `/plugins`.
-
-**opencode:** add the MCP server to `opencode.json` and copy the skills to
-`~/.config/opencode/skills/` — opencode loads the MCP server and skills
-directly (no plugin manifest). See the
-[install matrix](../../README.md#per-harness-setup) in the root README.
+Claude Code users can then run `/hallouminate:install`. The install skill is
+model-invocable on every harness, so asking the agent to "install hallouminate"
+starts the same workflow.
 
 ## What `/install` does
 
@@ -71,23 +55,20 @@ roadmap into an executable graph with no rework.
 
 ```text
 plugins/hallouminate/
-plugins/hallouminate/
-├── .claude-plugin/plugin.json     # Claude Code plugin manifest
+├── .claude-plugin/plugin.json     # Claude Code and OMP metadata
 ├── .codex-plugin/plugin.json      # Codex plugin manifest
-├── .mcp.json                      # declarative MCP registration (hallouminate serve)
-├── skills/install/SKILL.md        # the /install workflow
-├── skills/wiki-init/SKILL.md      # Socratic wiki bootstrap
-├── skills/wiki-ingest/SKILL.md    # fold source docs into the wiki
-├── skills/wiki-query/SKILL.md     # answer questions from the wiki
-├── skills/wiki-roadmap/SKILL.md   # author milknado-importable roadmaps
-├── templates/wiki-entry.md        # formal wiki-entry shape
-├── templates/roadmap/             # roadmap index.md + goal templates (milknado import format)
+├── .cursor-plugin/plugin.json     # Cursor plugin manifest
+├── plugin.json                    # Copilot CLI plugin manifest
+├── gemini-extension.json          # Gemini CLI extension manifest
+├── .mcp.json                      # shared declarative MCP registration
+├── skills/                        # install and wiki workflows
+├── templates/                     # wiki-entry and roadmap templates
 └── README.md
 ```
 
-The Claude Code marketplace manifest lives at the repository root in
-`.claude-plugin/marketplace.json`; the Codex one in
-`.agents/plugins/marketplace.json`. `tests/plugin_manifests.rs` pins both
-manifests (and this pack's version) to the crate version in `Cargo.toml`.
-Releases are published by the `release-skills` GitHub Actions workflow on
-every `v*` release tag.
+Marketplace manifests live at the repository root: Claude Code, Copilot CLI,
+and OMP use `.claude-plugin/marketplace.json`; Codex uses
+`.agents/plugins/marketplace.json`; Cursor uses
+`.cursor-plugin/marketplace.json`. `tests/plugin_manifests.rs` pins every
+manifest to the crate version in `Cargo.toml`. The `release-skills` workflow
+publishes versioned plugin-pack archives on every `v*` release tag.

@@ -60,16 +60,22 @@ cargo build --release
 
 The binary lands in `target/release/hallouminate`.
 
-## Register the MCP server
+## Install for your harness
 
-Point your agent at `hallouminate serve` — the stdio MCP server that exposes
-the wiki tools. With Claude Code:
+Every integration launches the same `hallouminate serve` stdio server. The
+plugin routes also install the bundled skills:
 
-```sh
-claude mcp add hallouminate -- hallouminate serve
-```
+| Harness | Install the plugin / skills | MCP registration |
+| --- | --- | --- |
+| **Claude Code** | `/plugin marketplace add paulnsorensen/hallouminate` → `/plugin install hallouminate@hallouminate` | Bundled `.mcp.json`; user fallback: `claude mcp add hallouminate --scope user -- hallouminate serve` |
+| **Codex** | `codex plugin marketplace add paulnsorensen/hallouminate`, restart, then `codex plugin add hallouminate@hallouminate` (or install from `/plugins`) | Bundled `.mcp.json` |
+| **Copilot CLI** | `copilot plugin marketplace add paulnsorensen/hallouminate` → `copilot plugin install hallouminate@hallouminate` | Bundled `.mcp.json` |
+| **OMP** | `/marketplace add paulnsorensen/hallouminate` → `/marketplace install hallouminate@hallouminate` | Bundled Claude-compatible `.mcp.json` |
+| **Cursor** | Teams/Enterprise: import `https://github.com/paulnsorensen/hallouminate` under **Plugins → Team Marketplaces**. Local: clone, copy or symlink `plugins/hallouminate` to `~/.cursor/plugins/local/hallouminate`, then reload/restart Cursor. | Bundled `.mcp.json` through the Cursor manifest |
+| **Gemini CLI** | From a checkout: `gemini extensions install ./plugins/hallouminate --consent`. From an extracted release archive: `gemini extensions install ./hallouminate-skills-<version>/plugins/hallouminate --consent`. | Inline in `gemini-extension.json`; bundled skills are auto-discovered |
+| **opencode** | Copy `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` | Add `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` to `opencode.json` |
 
-`hallouminate serve` auto-spawns the daemon if none is running, so there's no
+`hallouminate serve` auto-spawns the daemon if none is running, so there is no
 separate process to manage.
 
 ## Bootstrap a config
@@ -81,19 +87,3 @@ hallouminate config validate   # confirm it parses
 
 See [Configuration](./config.md) for what goes in the config and how the
 XDG baseline merges with a repo-layer `.hallouminate/config.toml`.
-
-## Claude Code skill pack
-
-A Claude Code plugin ships in this repo under
-[`plugins/hallouminate`](https://github.com/paulnsorensen/hallouminate/tree/main/plugins/hallouminate).
-It installs hallouminate and bootstraps your first wiki interactively:
-
-```text
-/plugin marketplace add paulnsorensen/hallouminate
-/plugin install hallouminate@hallouminate
-/hallouminate:install
-```
-
-`/install` installs the binary, registers the MCP server, then asks where and
-how your first wiki should live (Socratic style) before scaffolding, indexing,
-and committing it with git.

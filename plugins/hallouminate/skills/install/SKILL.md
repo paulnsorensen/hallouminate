@@ -2,7 +2,7 @@
 name: install
 description: Install hallouminate and bootstrap the user's first LLM-authored per-repo wiki. Use when the user runs /install from the hallouminate skill pack, or asks to "install hallouminate", "set up hallouminate", or "start a hallouminate wiki". Installs a prebuilt binary (no Rust toolchain needed on supported targets), makes the MCP server available for the current harness, then uses Socratic questioning to decide where and how the wiki lives, seeds it with `hallouminate init-repo`, indexes it, and commits the result with git.
 argument-hint: "[target repo path]"
-allowed-tools: AskUserQuestion, Read, Write, Edit, Bash(curl:*), Bash(sh:*), Bash(uname:*), Bash(cargo:*), Bash(rustup:*), Bash(hallouminate:*), Bash(git:*), Bash(claude:*), Bash(codex:*), Bash(which:*), Bash(command:*), Bash(protoc:*)
+allowed-tools: AskUserQuestion, Read, Write, Edit, Bash(curl:*), Bash(sh:*), Bash(uname:*), Bash(cargo:*), Bash(rustup:*), Bash(hallouminate:*), Bash(git:*), Bash(claude:*), Bash(codex:*), Bash(copilot:*), Bash(gemini:*), Bash(which:*), Bash(command:*), Bash(protoc:*)
 ---
 
 # Install hallouminate & start your first wiki
@@ -72,27 +72,47 @@ step 3.
 
 ## Phase 3 — Make the MCP tools available
 
-The MCP server is `hallouminate serve` (stdio). How it gets registered depends
-on the harness you are running in:
+The MCP server is `hallouminate serve` over stdio. Use the current harness's
+plugin route when available:
 
-- **Claude Code (this plugin)**: nothing to do for the current project — the
-  plugin bundles a `.mcp.json` that registers `hallouminate serve`
-  declaratively when the plugin is installed. If the user wants the server in
-  **every** project (user scope), or the bundled registration hasn't loaded,
-  fall back to the imperative form:
+- **Claude Code**: the installed plugin bundles `.mcp.json`. Install with
+  `/plugin marketplace add paulnsorensen/hallouminate`, then
+  `/plugin install hallouminate@hallouminate`. For user scope, or when the
+  bundled registration has not loaded, run:
 
   ```sh
   claude mcp add hallouminate --scope user -- hallouminate serve
   ```
 
-- **Codex**: the plugin payload's `.mcp.json` registers the server when the
-  plugin is installed (`codex plugin marketplace add paulnsorensen/hallouminate`,
-  restart, then `codex plugin add hallouminate@hallouminate` or install from
-  `/plugins`).
+- **Codex**: run
+  `codex plugin marketplace add paulnsorensen/hallouminate`, restart, then
+  `codex plugin add hallouminate@hallouminate` (or install from `/plugins`).
+  The plugin bundles the skills and `.mcp.json`.
 
-- **opencode**: opencode loads the MCP server and skills directly (no
-  plugin manifest). Add the MCP server to the active `opencode.json`
-  (project or home directory):
+- **Copilot CLI**: run
+  `copilot plugin marketplace add paulnsorensen/hallouminate`, then
+  `copilot plugin install hallouminate@hallouminate`. The root
+  `plugin.json` exposes the bundled skills and `.mcp.json`.
+
+- **OMP**: run `/marketplace add paulnsorensen/hallouminate`, then
+  `/marketplace install hallouminate@hallouminate`. OMP consumes the
+  Claude-compatible marketplace and payload.
+
+- **Cursor**: for Teams/Enterprise, import
+  `https://github.com/paulnsorensen/hallouminate` under
+  **Plugins → Team Marketplaces**. For a local install, clone the repo, copy or
+  symlink `plugins/hallouminate` to
+  `~/.cursor/plugins/local/hallouminate`, then reload/restart Cursor. The
+  Cursor manifest exposes the bundled skills and `.mcp.json`.
+
+- **Gemini CLI**: from a checkout, run
+  `gemini extensions install ./plugins/hallouminate --consent`. From an
+  extracted versioned archive, use
+  `./hallouminate-skills-<version>/plugins/hallouminate` instead. Gemini
+  reads the inline MCP server from `gemini-extension.json` and auto-discovers
+  `skills/`.
+
+- **opencode**: add the MCP server to the active `opencode.json`:
 
   ```json
   {
@@ -105,29 +125,18 @@ on the harness you are running in:
   }
   ```
 
-  Copy the skills to the opencode skills directory:
+  Copy the skills to `~/.config/opencode/skills/`:
 
   ```sh
   cp -r plugins/hallouminate/skills/ ~/.config/opencode/skills/
   ```
 
-  Or, if this repo is cloned locally, symlink them:
+- **Anything else**: any MCP client can launch `hallouminate serve` over
+  stdio.
 
-  ```sh
-  ln -sf "$PWD/plugins/hallouminate/skills/"* ~/.config/opencode/skills/
-  ```
-
-  The hallouminate MCP tools (`ground`, `add_markdown`, `read_markdown`,
-  etc.) surface after an MCP server reload. If they haven't loaded this
-  session, fall back to the CLI for the remaining phases.
-
-- **Anything else**: any MCP client can launch `hallouminate serve` over stdio.
-
-After registering, the tools surface as `mcp__hallouminate__*`. They may only
-load after the session reloads its MCP servers — if they aren't callable yet
-this session, fall back to the CLI (`hallouminate index` / `hallouminate
-ground`) in the later phases and tell the user to re-run later to pick up the
-tools.
+The hallouminate MCP tools (`ground`, `add_markdown`, `read_markdown`,
+etc.) appear after the harness reloads its plugins or MCP servers. If they have
+not loaded in this session, use the CLI for the remaining phases.
 
 ## Phase 4 — Initialize config
 

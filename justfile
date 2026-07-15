@@ -81,6 +81,9 @@ prepare-release version:
     for manifest in [
         Path("plugins/hallouminate/.claude-plugin/plugin.json"),
         Path("plugins/hallouminate/.codex-plugin/plugin.json"),
+        Path("plugins/hallouminate/plugin.json"),
+        Path("plugins/hallouminate/.cursor-plugin/plugin.json"),
+        Path("plugins/hallouminate/gemini-extension.json"),
         Path("npm/package.json"),
     ]:
         data = json.loads(manifest.read_text())
@@ -91,7 +94,12 @@ prepare-release version:
     cargo update -p hallouminate --precise "$version"
     just ci
 
-    git add Cargo.toml Cargo.lock plugins/hallouminate/.claude-plugin/plugin.json plugins/hallouminate/.codex-plugin/plugin.json npm/package.json
+    git add Cargo.toml Cargo.lock npm/package.json \
+        plugins/hallouminate/.claude-plugin/plugin.json \
+        plugins/hallouminate/.codex-plugin/plugin.json \
+        plugins/hallouminate/plugin.json \
+        plugins/hallouminate/.cursor-plugin/plugin.json \
+        plugins/hallouminate/gemini-extension.json
     git commit -m "chore(release): bump version to $version"
     git push -u origin "$branch"
     gh pr create --base main --head "$branch" --title "chore(release): bump version to $version" --body "Release bump for v$version."
@@ -123,8 +131,11 @@ release version:
     manifest_version="$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "hallouminate") | .version')"
     claude_version="$(jq -r .version plugins/hallouminate/.claude-plugin/plugin.json)"
     codex_version="$(jq -r .version plugins/hallouminate/.codex-plugin/plugin.json)"
-    if [ "$manifest_version" != "$version" ] || [ "$claude_version" != "$version" ] || [ "$codex_version" != "$version" ]; then
-        echo "version mismatch: Cargo=$manifest_version Claude=$claude_version Codex=$codex_version target=$version" >&2
+    copilot_version="$(jq -r .version plugins/hallouminate/plugin.json)"
+    cursor_version="$(jq -r .version plugins/hallouminate/.cursor-plugin/plugin.json)"
+    gemini_version="$(jq -r .version plugins/hallouminate/gemini-extension.json)"
+    if [ "$manifest_version" != "$version" ] || [ "$claude_version" != "$version" ] || [ "$codex_version" != "$version" ] || [ "$copilot_version" != "$version" ] || [ "$cursor_version" != "$version" ] || [ "$gemini_version" != "$version" ]; then
+        echo "version mismatch: Cargo=$manifest_version Claude=$claude_version Codex=$codex_version Copilot=$copilot_version Cursor=$cursor_version Gemini=$gemini_version target=$version" >&2
         exit 1
     fi
 
