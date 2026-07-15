@@ -6,9 +6,10 @@
 # does not duplicate them. Its value is exercising the actual CLIs, which catches
 # a manifest that is structurally valid yet rejected by the harness's installer.
 #
-# Claude Code and Codex install paths are verified keyless; Gemini is confirmed by
-# research + CI precedent and validated for real by this workflow's first run.
-# Cursor and Copilot have no keyless install path and stay Layer-1-only.
+# Claude Code and Codex install paths are verified keyless and green in CI.
+# Gemini CLI was dropped: `gemini extensions install --consent` hung in Actions
+# (no non-interactive keyless path), so it stays Layer-1-only alongside Cursor and
+# Copilot — all three are covered by the plugin_manifests.rs cargo tests.
 name: plugins-smoketest
 
 on:
@@ -58,10 +59,3 @@ jobs:
           echo "$out"
           want="$(sed -nE 's/^version = "([^"]+)".*/\1/p' Cargo.toml | head -n1)"
           echo "$out" | jq -e --arg v "$want" '.version == $v' > /dev/null
-
-      - name: Gemini CLI — install + list
-        run: |
-          set -euo pipefail
-          npm i -g @google/gemini-cli
-          gemini extensions install ./plugins/hallouminate --consent
-          gemini extensions list | grep -q hallouminate
