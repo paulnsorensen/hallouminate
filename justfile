@@ -1,3 +1,5 @@
+set unstable
+set lists
 # hallouminate dev commands — run `just` to list recipes.
 #
 # rustup honors rust-toolchain.toml (the crate's MSRV). protoc must be
@@ -8,11 +10,17 @@
 default:
     @just --list
 
-# CI gate — checks only, no writes (mirrors .github/workflows/ci.yml).
-ci: _fmt-check _clippy _build _test
+# Canonical local gate. No args runs fmt, clippy, build, and tests; targeted
+# Cargo commands use the same cross-worktree verification lease.
+verify *args:
+    python3 scripts/verify.py {{quote(args)}}
 
-# For agents/LLMs — auto-fix formatting + machine-applicable lints, then verify.
-llm: _fix _clippy _build _test
+# Compatibility routes retained for contributors and release automation.
+ci:
+    just verify
+
+llm:
+    just verify --fix
 
 # Prepare a new release bump PR: crate version, lockfile, and plugin manifests.
 prepare-release version:
@@ -164,19 +172,3 @@ re-tag version:
     -git tag -d v{{version}}
     git tag v{{version}}
     git push origin v{{version}}
-
-_fmt-check:
-    cargo fmt --all --check
-
-_fix:
-    cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged
-    cargo fmt --all
-
-_clippy:
-    cargo clippy --locked --all-targets --all-features -- -D warnings
-
-_build:
-    cargo build --locked --all-targets
-
-_test:
-    cargo test --locked

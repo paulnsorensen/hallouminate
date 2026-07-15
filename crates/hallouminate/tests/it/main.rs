@@ -15,3 +15,4 @@ mod multi_format;
 mod plugin_manifests;
 mod real_tokenizer;
 mod recovery;
+mod verification_gate;

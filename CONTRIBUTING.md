@@ -14,21 +14,35 @@ to get from "I want to help" to "my change is merged".
 
 ## Setting up locally
 
+Development requires Rust, `protoc`, Python 3, and
+[just](https://github.com/casey/just) 1.53 or newer. Clone the repository and
+route the initial build through the verification lease:
+
 ```sh
 git clone https://github.com/paulnsorensen/hallouminate.git
 cd hallouminate
-cargo build
+just verify cargo build --locked --all-targets
 ```
 
 ## Running tests
 
+Run the full local gate before opening a PR:
+
 ```sh
-cargo test
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
+just verify
 ```
 
-Please run the full test suite before opening a PR.
+Use the same entrypoint for a focused Cargo check:
+
+```sh
+just verify cargo test -p hallouminate --test it verification_gate
+```
+
+Do not run compiler/linker-heavy Cargo gates concurrently in linked worktrees.
+The lease prevents duplicate heavy work for this repository only; host-wide
+admission and resource isolation belong to the execution environment. See
+[Development verification](./docs/src/development-verification.md) for the
+lease, evidence log, compatibility routes, and fix mode.
 
 ## Submitting a pull request
 

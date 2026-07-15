@@ -69,6 +69,10 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust toolchain
         run: rustup show
+      - name: Install just
+        # crates/hallouminate/tests/it/verification_gate.rs shells out to the
+        # real `just` binary to exercise the verification lease end to end.
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
       - name: Expose Xcode compiler runtime
         if: runner.os == 'macOS'
         run: |
