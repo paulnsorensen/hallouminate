@@ -21,8 +21,9 @@ use super::client::connect_at;
 use super::daemon_socket_path;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
 
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
-const POLL_INTERVAL: Duration = Duration::from_millis(200);
+const CONNECTION_BUDGET: Duration = Duration::from_secs(90);
+const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Upper bound on the version probe's `Ping` round-trip. `call_raw` has no
 /// built-in timeout, so a daemon that accepts the connection but never replies
 /// would otherwise hang `ensure_daemon_running` at MCP startup. Cap it: an
@@ -95,17 +96,57 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         .process_group(0)
         .spawn()?;
 
-    let deadline = std::time::Instant::now() + SPAWN_TIMEOUT;
-    while std::time::Instant::now() < deadline {
-        if UnixStream::connect(&socket).await.is_ok() {
+    let started = std::time::Instant::now();
+    let socket_for_connect = socket.clone();
+    wait_for_daemon_socket(
+        &socket,
+        &log_path,
+        CONNECTION_BUDGET,
+        move || {
+            let socket = socket_for_connect.clone();
+            async move { UnixStream::connect(socket).await.is_ok() }
+        },
+        tokio::time::sleep,
+        || started.elapsed(),
+    )
+    .await
+}
+
+async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
+    socket: &Path,
+    log_path: &Path,
+    connection_budget: Duration,
+    mut connect: Connect,
+    mut sleep: Sleep,
+    mut elapsed: Elapsed,
+) -> anyhow::Result<()>
+where
+    Connect: FnMut() -> ConnectFuture,
+    ConnectFuture: std::future::Future<Output = bool>,
+    Sleep: FnMut(Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+    Elapsed: FnMut() -> Duration,
+{
+    let mut poll_interval = INITIAL_POLL_INTERVAL;
+    loop {
+        if connect().await {
             return Ok(());
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+
+        let remaining = connection_budget.saturating_sub(elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+
+        sleep(poll_interval.min(remaining)).await;
+        poll_interval = poll_interval.saturating_mul(2).min(MAX_POLL_INTERVAL);
     }
+
     anyhow::bail!(
-        "daemon did not start within {}s; see {}",
-        SPAWN_TIMEOUT.as_secs(),
-        log_path.display()
+        "daemon socket {} did not become reachable within the {}s total connection budget; see bootstrap log {}",
+        socket.display(),
+        connection_budget.as_secs(),
+        log_path.display(),
     )
 }
 
@@ -260,6 +301,91 @@ mod tests {
         assert!(
             !pong_reports_our_version(&resp),
             "an error response is unverifiable → mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn socket_available_after_thirty_seconds_connects_within_total_budget() {
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let connect_attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let connect_elapsed = elapsed.clone();
+        let observed_connect_attempts = connect_attempts.clone();
+        let sleep_elapsed = elapsed.clone();
+        let socket = Path::new("/tmp/hallouminate-delayed.sock");
+        let log = Path::new("/tmp/hallouminate-bootstrap.log");
+
+        wait_for_daemon_socket(
+            socket,
+            log,
+            CONNECTION_BUDGET,
+            || {
+                observed_connect_attempts.set(observed_connect_attempts.get() + 1);
+                std::future::ready(connect_elapsed.get() > Duration::from_secs(30))
+            },
+            |delay| {
+                sleep_elapsed.set(sleep_elapsed.get() + delay);
+                std::future::ready(())
+            },
+            || elapsed.get(),
+        )
+        .await
+        .expect("daemon becoming available in the second window must connect");
+
+        assert_eq!(elapsed.get(), Duration::from_millis(30_400));
+        assert_eq!(
+            connect_attempts.get(),
+            33,
+            "polling must continue past 30 seconds without restarting the wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_socket_exhausts_total_budget_with_connection_context() {
+        let elapsed = std::rc::Rc::new(std::cell::Cell::new(Duration::ZERO));
+        let sleep_elapsed = elapsed.clone();
+        let delays = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_delays = delays.clone();
+        let socket = Path::new("/tmp/hallouminate-unavailable.sock");
+        let log = Path::new("/tmp/hallouminate-bootstrap.log");
+
+        let error = wait_for_daemon_socket(
+            socket,
+            log,
+            CONNECTION_BUDGET,
+            || std::future::ready(false),
+            |delay| {
+                observed_delays.borrow_mut().push(delay);
+                sleep_elapsed.set(sleep_elapsed.get() + delay);
+                std::future::ready(())
+            },
+            || elapsed.get(),
+        )
+        .await
+        .expect_err("an unavailable daemon must exhaust its bounded budget");
+        let error = error.to_string();
+        let delays = delays.borrow();
+
+        assert_eq!(elapsed.get(), CONNECTION_BUDGET);
+        assert_eq!(delays.len(), 92);
+        assert_eq!(
+            &delays[..3],
+            &[
+                INITIAL_POLL_INTERVAL,
+                Duration::from_millis(400),
+                Duration::from_millis(800),
+            ],
+        );
+        for delay in &delays[3..delays.len() - 1] {
+            assert_eq!(*delay, MAX_POLL_INTERVAL);
+        }
+        assert_eq!(
+            delays.last().copied(),
+            Some(Duration::from_millis(600)),
+            "the final sleep must be clipped to the remaining budget"
+        );
+        assert_eq!(
+            error,
+            "daemon socket /tmp/hallouminate-unavailable.sock did not become reachable within the 90s total connection budget; see bootstrap log /tmp/hallouminate-bootstrap.log"
         );
     }
 
