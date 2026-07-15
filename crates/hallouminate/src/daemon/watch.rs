@@ -16,8 +16,9 @@
 //! `handle_add_markdown` take, so a watch-triggered reindex never races the
 //! daemon's own writes.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
@@ -64,6 +65,94 @@ struct WatchRoot {
     mode: RecursiveMode,
 }
 
+const MAX_FAILURE_SIGNATURES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FailureSignature {
+    path: PathBuf,
+    error: String,
+}
+
+struct FailureState {
+    last_reported: Instant,
+    last_seen: Instant,
+    suppressed: u64,
+}
+
+struct FailureCoalescer {
+    reminder: Duration,
+    max_signatures: usize,
+    states: HashMap<FailureSignature, FailureState>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FailureDecision {
+    First,
+    Suppress,
+    Reminder { suppressed: u64 },
+}
+
+impl FailureCoalescer {
+    fn new(reminder: Duration, max_signatures: usize) -> Self {
+        Self {
+            reminder,
+            max_signatures,
+            states: HashMap::new(),
+        }
+    }
+
+    fn record(&mut self, path: &Path, error: &str, now: Instant) -> FailureDecision {
+        if self.reminder.is_zero() {
+            return FailureDecision::First;
+        }
+
+        let signature = FailureSignature {
+            path: path.to_path_buf(),
+            error: error.to_string(),
+        };
+        if let Some(state) = self.states.get_mut(&signature) {
+            state.last_seen = now;
+            if now.saturating_duration_since(state.last_reported) < self.reminder {
+                state.suppressed = state.suppressed.saturating_add(1);
+                return FailureDecision::Suppress;
+            }
+            let suppressed = state.suppressed;
+            state.last_reported = now;
+            state.suppressed = 0;
+            return FailureDecision::Reminder { suppressed };
+        }
+
+        if self.states.len() >= self.max_signatures {
+            self.evict_oldest();
+        }
+        self.states.insert(
+            signature,
+            FailureState {
+                last_reported: now,
+                last_seen: now,
+                suppressed: 0,
+            },
+        );
+        FailureDecision::First
+    }
+
+    fn evict_oldest(&mut self) {
+        let mut oldest = None;
+        for (signature, state) in &self.states {
+            let replace = match &oldest {
+                None => true,
+                Some((_signature, last_seen)) => state.last_seen < *last_seen,
+            };
+            if replace {
+                oldest = Some((signature.clone(), state.last_seen));
+            }
+        }
+        if let Some((signature, _last_seen)) = oldest {
+            self.states.remove(&signature);
+        }
+    }
+}
+
 /// Owns the background debouncer + event-pump task. Dropping it stops the
 /// watcher (the debouncer's worker thread joins on drop; aborting the task
 /// drops the event receiver so the thread's send fails and it exits).
@@ -81,6 +170,7 @@ pub struct WatcherHandle {
 pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     let cfg = state.baseline();
     let debounce = Duration::from_millis(cfg.watch.debounce_ms);
+    let failure_reminder = Duration::from_secs(cfg.watch.failure_reminder_secs);
     let corpora = match cfg.effective_corpora() {
         Ok(c) => c,
         Err(e) => {
@@ -175,6 +265,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         // a blocking thread per wake; simplest correct shape that respects
         // the shutdown token.
         let wake_rx = std::sync::Arc::new(std::sync::Mutex::new(wake_rx));
+        let mut failures = FailureCoalescer::new(failure_reminder, MAX_FAILURE_SIGNATURES);
         loop {
             let wake_rx_recv = wake_rx.clone();
             let next = tokio::select! {
@@ -213,7 +304,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                 set.drain().collect()
             };
             if !paths.is_empty() {
-                process_change_batch(&state, &roots, paths).await;
+                process_change_batch(&state, &roots, paths, &mut failures).await;
             }
         }
     });
@@ -300,17 +391,27 @@ fn build_watch_root(corpus: &CorpusConfig, raw: &str) -> Option<WatchRoot> {
 /// touches neither an embedder nor the clock) can run while idle-exit tears
 /// the process down mid-write, releasing the single-instance flock under a
 /// live LanceDB writer (ADR-003).
-async fn process_change_batch(state: &DaemonState, roots: &[WatchRoot], paths: Vec<PathBuf>) {
+async fn process_change_batch(
+    state: &DaemonState,
+    roots: &[WatchRoot],
+    paths: Vec<PathBuf>,
+    failures: &mut FailureCoalescer,
+) {
     let _conn = state.enter_connection();
     for path in &paths {
-        handle_changed_path(state, roots, path).await;
+        handle_changed_path(state, roots, path, failures).await;
     }
     state.touch_activity();
 }
 
 /// Reindex (or prune) one changed markdown path against whichever baseline
 /// corpus owns it. Skips paths that no baseline corpus accepts.
-async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Path) {
+async fn handle_changed_path(
+    state: &DaemonState,
+    roots: &[WatchRoot],
+    path: &Path,
+    failures: &mut FailureCoalescer,
+) {
     let Some(owner) = owning_corpus(roots, path) else {
         return;
     };
@@ -357,12 +458,25 @@ async fn handle_changed_path(state: &DaemonState, roots: &[WatchRoot], path: &Pa
                 upserted = stats.files_upserted,
                 "watcher: reindexed changed file",
             ),
-            Err(e) => tracing::warn!(
-                target: "hallouminate::daemon",
-                path = %path.display(),
-                error = %e,
-                "watcher: reindex failed",
-            ),
+            Err(e) => {
+                let error = e.to_string();
+                match failures.record(path, &error, Instant::now()) {
+                    FailureDecision::First => tracing::warn!(
+                        target: "hallouminate::daemon",
+                        path = %path.display(),
+                        error = %error,
+                        "watcher: reindex failed",
+                    ),
+                    FailureDecision::Suppress => {}
+                    FailureDecision::Reminder { suppressed } => tracing::warn!(
+                        target: "hallouminate::daemon",
+                        path = %path.display(),
+                        error = %error,
+                        suppressed,
+                        "watcher: reindex failed",
+                    ),
+                }
+            }
         }
     } else {
         // Deleted (or moved away): prune the LanceDB rows keyed on the same
@@ -476,6 +590,10 @@ mod tests {
 
     fn name_of(owner: Option<&WatchRoot>) -> Option<String> {
         owner.map(|r| r.corpus.name.clone())
+    }
+
+    fn disabled_coalescer() -> FailureCoalescer {
+        FailureCoalescer::new(Duration::ZERO, MAX_FAILURE_SIGNATURES)
     }
 
     /// A file-path corpus root is watched at its parent dir, but only the exact
@@ -704,7 +822,8 @@ mod tests {
         // before the fix.
         let deleted = corpus_dir.join("gone.md");
 
-        process_change_batch(&state, &roots, vec![deleted]).await;
+        let mut failures = disabled_coalescer();
+        process_change_batch(&state, &roots, vec![deleted], &mut failures).await;
         assert_ne!(
             state.last_activity_secs(),
             u64::MAX,
@@ -757,7 +876,8 @@ mod tests {
             .to_string();
 
         // Baseline: the real file indexes and lands a snapshot row.
-        handle_changed_path(&state, &roots, &note).await;
+        let mut failures = disabled_coalescer();
+        handle_changed_path(&state, &roots, &note, &mut failures).await;
         let good = state
             .store()
             .get_file_snapshot("wiki", &file_ref)
@@ -774,7 +894,7 @@ mod tests {
         std::fs::remove_file(&note).expect("rm note");
         std::os::unix::fs::symlink(&secret, &note).expect("symlink note -> secret");
 
-        handle_changed_path(&state, &roots, &note).await;
+        handle_changed_path(&state, &roots, &note, &mut failures).await;
 
         // The reindex through the symlink must have been rejected. Vulnerable
         // code would `canonicalize` the in-corpus path (following the symlink)
@@ -896,6 +1016,83 @@ mod tests {
             std::collections::HashSet::from([uppercase_md, csv]),
             "an uppercase .MD and a .csv must be admitted (matching \
              format_from_extension), while a known-unsupported .docx is dropped"
+        );
+    }
+
+    #[test]
+    fn failure_coalescer_reports_suppresses_reminds_and_distinguishes() {
+        let start = Instant::now();
+        let path = Path::new("/srv/wiki/note.md");
+        let other_path = Path::new("/srv/wiki/other.md");
+        let mut coalescer = FailureCoalescer::new(Duration::from_secs(60), 8);
+
+        assert_eq!(
+            coalescer.record(path, "missing fragment", start),
+            FailureDecision::First
+        );
+        assert_eq!(
+            coalescer.record(path, "missing fragment", start + Duration::from_secs(10)),
+            FailureDecision::Suppress
+        );
+        assert_eq!(
+            coalescer.record(path, "missing fragment", start + Duration::from_secs(20)),
+            FailureDecision::Suppress
+        );
+        assert_eq!(
+            coalescer.record(path, "missing fragment", start + Duration::from_secs(60)),
+            FailureDecision::Reminder { suppressed: 2 }
+        );
+        assert_eq!(
+            coalescer.record(path, "different error", start + Duration::from_secs(61)),
+            FailureDecision::First
+        );
+        assert_eq!(
+            coalescer.record(
+                other_path,
+                "missing fragment",
+                start + Duration::from_secs(61)
+            ),
+            FailureDecision::First
+        );
+    }
+
+    #[test]
+    fn failure_coalescer_disabled_reports_every_occurrence() {
+        let start = Instant::now();
+        let path = Path::new("/srv/wiki/note.md");
+        let mut coalescer = FailureCoalescer::new(Duration::ZERO, 1);
+
+        assert_eq!(
+            coalescer.record(path, "missing fragment", start),
+            FailureDecision::First
+        );
+        assert_eq!(
+            coalescer.record(path, "missing fragment", start),
+            FailureDecision::First
+        );
+        assert!(coalescer.states.is_empty());
+    }
+
+    #[test]
+    fn failure_coalescer_evicts_the_oldest_signature_at_capacity() {
+        let start = Instant::now();
+        let mut coalescer = FailureCoalescer::new(Duration::from_secs(60), 2);
+        assert_eq!(
+            coalescer.record(Path::new("/a"), "a", start),
+            FailureDecision::First
+        );
+        assert_eq!(
+            coalescer.record(Path::new("/b"), "b", start + Duration::from_secs(1)),
+            FailureDecision::First
+        );
+        assert_eq!(
+            coalescer.record(Path::new("/c"), "c", start + Duration::from_secs(2)),
+            FailureDecision::First
+        );
+        assert_eq!(coalescer.states.len(), 2);
+        assert_eq!(
+            coalescer.record(Path::new("/a"), "a", start + Duration::from_secs(3)),
+            FailureDecision::First
         );
     }
 }

@@ -13,6 +13,9 @@ use hallouminate_domain::repository::{
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
 const DEFAULT_DEBOUNCE_MS: u64 = 500;
+const DEFAULT_FAILURE_REMINDER_SECS: u64 = 60;
+const DEFAULT_MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_MAX_LOG_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 // #139: crossencoder rerank timeout, configurable via `[search].rerank_timeout_ms`.
@@ -98,6 +101,26 @@ impl Default for EmbeddingsConfig {
     }
 }
 
+/// Process-wide file logging limits loaded from the XDG baseline config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// Maximum bytes in the active log or any numbered archive (default 10 MiB).
+    #[serde(default = "default_max_log_file_bytes")]
+    pub max_file_bytes: u64,
+    /// Maximum bytes retained across the active log and all archives (default 100 MiB).
+    #[serde(default = "default_max_log_total_bytes")]
+    pub max_total_bytes: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: DEFAULT_MAX_LOG_FILE_BYTES,
+            max_total_bytes: DEFAULT_MAX_LOG_TOTAL_BYTES,
+        }
+    }
+}
+
 /// File-watcher settings for incremental re-indexing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WatchConfig {
@@ -105,12 +128,17 @@ pub struct WatchConfig {
     /// coalescing bursts of changes (default `500`).
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    /// Seconds before an identical reindex failure is logged again (default `60`).
+    /// `0` disables suppression.
+    #[serde(default = "default_failure_reminder_secs")]
+    pub failure_reminder_secs: u64,
 }
 
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
+            failure_reminder_secs: DEFAULT_FAILURE_REMINDER_SECS,
         }
     }
 }
@@ -175,6 +203,9 @@ pub struct Config {
     /// Dense-embedding settings.
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    /// Process-wide file logging settings from the baseline config.
+    #[serde(default)]
+    pub logging: LoggingConfig,
     /// File-watcher settings.
     #[serde(default)]
     pub watch: WatchConfig,
@@ -237,6 +268,52 @@ pub fn load_xdg(path: Option<&Path>) -> Result<Config> {
         Err(e) => return Err(HallouminateError::from(e)),
     };
     parse(&text, Some(&resolved))
+}
+
+/// Load startup configuration and apply process environment overrides.
+pub fn load_startup(path: Option<&Path>) -> Result<Config> {
+    let mut cfg = load_xdg(path)?;
+    apply_env_overrides_with(&mut cfg, |name| std::env::var_os(name))?;
+    Ok(cfg)
+}
+
+fn apply_env_overrides_with<F>(cfg: &mut Config, mut lookup: F) -> Result<()>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    apply_u64_override(
+        &mut lookup,
+        "HALLOUMINATE_LOG_MAX_FILE_BYTES",
+        &mut cfg.logging.max_file_bytes,
+    )?;
+    apply_u64_override(
+        &mut lookup,
+        "HALLOUMINATE_LOG_MAX_TOTAL_BYTES",
+        &mut cfg.logging.max_total_bytes,
+    )?;
+    apply_u64_override(
+        &mut lookup,
+        "HALLOUMINATE_WATCH_FAILURE_REMINDER_SECS",
+        &mut cfg.watch.failure_reminder_secs,
+    )?;
+    validate(cfg)
+}
+
+fn apply_u64_override<F>(lookup: &mut F, name: &str, target: &mut u64) -> Result<()>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    let Some(value) = lookup(name) else {
+        return Ok(());
+    };
+    let value = value.into_string().map_err(|_| {
+        HallouminateError::Config(format!("environment variable {name} must be valid UTF-8"))
+    })?;
+    let value = value
+        .parse::<u64>()
+        .map_err(|e| HallouminateError::Config(format!("invalid {name} value '{value}': {e}")))?;
+    *target = value;
+    Ok(())
 }
 
 /// Backwards-compatible alias for `load_xdg`. Callers outside this module
@@ -550,6 +627,14 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        failure_reminder_secs: merge_scalar(
+            "watch.failure_reminder_secs",
+            baseline.watch.failure_reminder_secs,
+            repo.watch.failure_reminder_secs,
+            defaults.watch.failure_reminder_secs,
+            baseline_path,
+            repo_path,
+        )?,
     };
     let storage = StorageConfig {
         ground_dir: merge_scalar(
@@ -577,6 +662,7 @@ fn merge_layers_with_sources(
         repositories,
         search,
         embeddings,
+        logging: baseline.logging,
         watch,
         storage,
         daemon,
@@ -747,6 +833,22 @@ fn normalize(cfg: &mut Config) -> Result<()> {
 }
 
 fn validate(cfg: &Config) -> Result<()> {
+    if cfg.logging.max_file_bytes == 0 {
+        return Err(HallouminateError::Config(
+            "logging.max_file_bytes must be greater than zero".to_string(),
+        ));
+    }
+    if cfg.logging.max_total_bytes == 0 {
+        return Err(HallouminateError::Config(
+            "logging.max_total_bytes must be greater than zero".to_string(),
+        ));
+    }
+    if cfg.logging.max_total_bytes < cfg.logging.max_file_bytes {
+        return Err(HallouminateError::Config(
+            "logging.max_total_bytes must be greater than or equal to logging.max_file_bytes"
+                .to_string(),
+        ));
+    }
     for (idx, c) in cfg.corpora.iter().enumerate() {
         if c.name.trim().is_empty() {
             return Err(HallouminateError::Config(format!(
@@ -806,6 +908,15 @@ fn default_rerank_timeout_ms() -> u64 {
 }
 fn default_debounce_ms() -> u64 {
     DEFAULT_DEBOUNCE_MS
+}
+fn default_failure_reminder_secs() -> u64 {
+    DEFAULT_FAILURE_REMINDER_SECS
+}
+fn default_max_log_file_bytes() -> u64 {
+    DEFAULT_MAX_LOG_FILE_BYTES
+}
+fn default_max_log_total_bytes() -> u64 {
+    DEFAULT_MAX_LOG_TOTAL_BYTES
 }
 fn default_enabled() -> bool {
     true
@@ -973,6 +1084,91 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.embeddings, EmbeddingsConfig::default());
         assert_eq!(cfg.watch, WatchConfig::default());
         assert_eq!(cfg.storage, StorageConfig::default());
+    }
+
+    #[test]
+    fn logging_and_watch_defaults_and_explicit_values() {
+        let defaults = parse("", None).expect("empty config parses");
+        assert_eq!(defaults.logging.max_file_bytes, 10 * 1024 * 1024);
+        assert_eq!(defaults.logging.max_total_bytes, 100 * 1024 * 1024);
+        assert_eq!(defaults.watch.failure_reminder_secs, 60);
+
+        let explicit = parse(
+            "[logging]\nmax_file_bytes = 64\nmax_total_bytes = 192\n\
+             [watch]\nfailure_reminder_secs = 0\n",
+            None,
+        )
+        .expect("explicit logging and watch values parse");
+        assert_eq!(explicit.logging.max_file_bytes, 64);
+        assert_eq!(explicit.logging.max_total_bytes, 192);
+        assert_eq!(explicit.watch.failure_reminder_secs, 0);
+    }
+
+    #[test]
+    fn logging_limits_are_validated() {
+        let cases = [
+            ("[logging]\nmax_file_bytes = 0\n", "logging.max_file_bytes"),
+            (
+                "[logging]\nmax_total_bytes = 0\n",
+                "logging.max_total_bytes",
+            ),
+            (
+                "[logging]\nmax_file_bytes = 200\nmax_total_bytes = 100\n",
+                "logging.max_total_bytes",
+            ),
+        ];
+        for (text, expected) in cases {
+            let error = parse(text, None).expect_err("invalid logging limits must fail");
+            assert!(error.to_string().contains(expected), "got: {error}");
+        }
+    }
+
+    #[test]
+    fn environment_overrides_take_precedence_without_process_mutation() {
+        let mut cfg = parse(
+            "[logging]\nmax_file_bytes = 80\nmax_total_bytes = 800\n\
+             [watch]\nfailure_reminder_secs = 45\n",
+            None,
+        )
+        .expect("baseline parses");
+        let values = [
+            ("HALLOUMINATE_LOG_MAX_FILE_BYTES", "64"),
+            ("HALLOUMINATE_LOG_MAX_TOTAL_BYTES", "192"),
+            ("HALLOUMINATE_WATCH_FAILURE_REMINDER_SECS", "0"),
+        ];
+        apply_env_overrides_with(&mut cfg, |name| {
+            for (key, value) in values {
+                if key == name {
+                    return Some(std::ffi::OsString::from(value));
+                }
+            }
+            None
+        })
+        .expect("valid environment overrides apply");
+
+        assert_eq!(cfg.logging.max_file_bytes, 64);
+        assert_eq!(cfg.logging.max_total_bytes, 192);
+        assert_eq!(cfg.watch.failure_reminder_secs, 0);
+    }
+
+    #[test]
+    fn invalid_environment_overrides_name_the_variable() {
+        let names = [
+            "HALLOUMINATE_LOG_MAX_FILE_BYTES",
+            "HALLOUMINATE_LOG_MAX_TOTAL_BYTES",
+            "HALLOUMINATE_WATCH_FAILURE_REMINDER_SECS",
+        ];
+        for invalid_name in names {
+            let mut cfg = Config::default();
+            let error = apply_env_overrides_with(&mut cfg, |name| {
+                if name == invalid_name {
+                    return Some(std::ffi::OsString::from("invalid"));
+                }
+                None
+            })
+            .expect_err("invalid environment override must fail");
+            assert!(error.to_string().contains(invalid_name), "got: {error}");
+        }
     }
 
     #[test]

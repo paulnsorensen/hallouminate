@@ -15,6 +15,7 @@ use clap::Parser;
 /// command.
 pub async fn run() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
-    let _log_guard = logging::init()?;
+    let startup = config::load_startup(cli.logging_config_path())?;
+    let _log_guard = logging::init(&startup.logging)?;
     cli::dispatch(cli).await
 }
