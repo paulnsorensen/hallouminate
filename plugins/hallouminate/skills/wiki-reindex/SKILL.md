@@ -160,4 +160,6 @@ or run `hallouminate daemon` (foreground) to see startup errors.
   large corpora, plan for the index step to take several minutes.
 - If `hallouminate daemon stop` times out (> 10 s), kill the process directly
   (`kill $(lsof -t -- <socket-path>)`) and then delete the socket file before
-  proceeding.
+  proceeding. The socket path is `$HALLOUMINATE_SOCKET` when set, otherwise
+  `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, otherwise
+  `~/.cache/hallouminate/daemon.sock`.
