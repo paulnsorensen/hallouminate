@@ -137,8 +137,22 @@ jobs:
           path: target/distrib/
           merge-multiple: true
       - name: Install dependencies
+        # Retry: GitHub-hosted runners (esp. ubuntu-24.04-arm) intermittently
+        # can't reach ports.ubuntu.com / brew's mirror (transient network
+        # blip, not a repo issue) — a bare apt-get/brew failure here should
+        # not fail the whole release.
         run: |
-          ${{ matrix.packages_install }}
+          for attempt in 1 2 3 4 5; do
+            if ${{ matrix.packages_install }}; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              echo "package install failed (attempt ${attempt}/5) - retrying in 15s"
+              sleep 15
+            fi
+          done
+          echo "::error::package install failed after 5 attempts"
+          exit 1
       - name: Expose Xcode compiler runtime
         if: ${{ startsWith(matrix.runner, 'macos-') }}
         run: |
