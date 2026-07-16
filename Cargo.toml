@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -30,8 +30,8 @@ toml = "1.1"
 # crate in the tree.
 serde_yaml_ng = "0.10"
 
-hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.4.0" }
-hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.4.0" }
+hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.4.1" }
+hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.4.1" }
 
 # The profile that 'dist' will build with
 [profile.dist]
