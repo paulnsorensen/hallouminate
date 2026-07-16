@@ -1498,7 +1498,7 @@ mod tests {
     struct GatedFirstCallEmbedder {
         first_call: AtomicBool,
         entered_tx: std::sync::mpsc::SyncSender<()>,
-        release_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        release_rx: std::sync::mpsc::Receiver<()>,
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
@@ -1511,11 +1511,7 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.first_call.swap(false, Ordering::SeqCst) {
                 self.entered_tx.send(()).expect("signal entered");
-                self.release_rx
-                    .lock()
-                    .expect("release lock")
-                    .recv()
-                    .expect("wait for release");
+                self.release_rx.recv().expect("wait for release");
             }
             Ok(vec![[0.0; EMBEDDING_DIM]; texts.len()])
         }
@@ -1545,7 +1541,7 @@ mod tests {
             Some(Box::new(GatedFirstCallEmbedder {
                 first_call: AtomicBool::new(true),
                 entered_tx,
-                release_rx: std::sync::Mutex::new(release_rx),
+                release_rx,
                 calls: Arc::clone(&calls),
             })),
         )
