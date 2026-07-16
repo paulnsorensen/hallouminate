@@ -99,4 +99,7 @@ prereqs: []
 - Never write an Outcome section, harvest markers, `status:`, or
   `last_synced:` — those are milknado's half of the membrane.
 - Acceptance criteria must be verifiable; vague goals execute vaguely.
+- Links in `Intent`/`Acceptance` must resolve inside the corpus — copy a local
+  doc into the wiki (e.g. `sources/`) and link the corpus-relative copy; web
+  URLs and `path:line` code citations pass through as text.
 - One goal per file; the file stem is the goal slug.

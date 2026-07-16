@@ -1,6 +1,6 @@
 ---
 name: install
-description: Install hallouminate and bootstrap the user's first LLM-authored per-repo wiki. Use when the user runs /install from the hallouminate skill pack, or asks to "install hallouminate", "set up hallouminate", or "start a hallouminate wiki". Installs a prebuilt binary (no Rust toolchain needed on supported targets), makes the MCP server available for the current harness, then uses Socratic questioning to decide where and how the wiki lives, seeds it with `hallouminate init-repo`, indexes it, and commits the result with git.
+description: Install hallouminate and bootstrap the user's first LLM-authored per-repo wiki. Use when the user runs /install from the hallouminate skill pack, or asks to "install hallouminate", "set up hallouminate", "get hallouminate working", or "start a hallouminate wiki" on a machine without a working install. Do NOT use when the binary already works — route a brand-new wiki to wiki-init and new content to wiki-ingest.
 argument-hint: "[target repo path]"
 allowed-tools: AskUserQuestion, Read, Write, Edit, Bash(curl:*), Bash(sh:*), Bash(uname:*), Bash(cargo:*), Bash(rustup:*), Bash(hallouminate:*), Bash(git:*), Bash(claude:*), Bash(codex:*), Bash(copilot:*), Bash(gemini:*), Bash(which:*), Bash(command:*), Bash(protoc:*)
 ---
@@ -207,6 +207,14 @@ directly to `.hallouminate/wiki/<slug>.md` instead and rely on Phase 8 to index.
 Make the first page genuinely useful and grounded in the *actual* repo — read
 real code and configs to get it right; don't invent. Resolve any lint warnings
 `add_markdown` reports.
+
+If the page links to a local file outside the wiki (an absolute path, `~`, or
+a relative path escaping `.hallouminate/wiki/`), copy that file into the wiki
+first — `add_markdown` it (e.g. under `sources/<slug>.md`) or, if it belongs to
+a different knowledge base, into a corpus declared in config — then link the
+corpus-relative copy. `ground` never indexes targets outside a corpus, and such
+links break when the wiki moves. Web URLs pass through unchanged; cite code as
+`path:line` text, not a link.
 
 ## Phase 8 — Index & verify
 
