@@ -1,6 +1,6 @@
 ---
 name: wiki-query
-description: Answer a question from a hallouminate wiki with grounded, cited detail. Use when the user asks something the wiki should know — "what does the wiki say about X", "how does Y work here", "look it up in the wiki", "/wiki-query", or any factual question about a repo whose knowledge lives in a hallouminate corpus. An opus root plans the search and synthesizes the answer; haiku sub-agents fan out one `ground` search per sub-question and return cited evidence. Every claim in the answer carries a `path:line` citation back to the corpus. Do NOT use to write or update wiki entries (use wiki-ingest) or to bootstrap a new wiki (use wiki-init).
+description: Answer a question from a hallouminate wiki with grounded, cited detail. Use when the user asks something the wiki should know — "what does the wiki say about X", "how does Y work here", "look it up in the wiki", "/wiki-query", or any factual question about a repo whose knowledge lives in a hallouminate corpus. Every claim in the answer carries a `path:line` citation back to the corpus. Do NOT use to write or update wiki entries (use wiki-ingest) or to bootstrap a new wiki (use wiki-init).
 ---
 
 # wiki-query — cited retrieval from a hallouminate wiki
@@ -11,9 +11,10 @@ corpus does not support a claim, say so — do not fall back to training data.
 
 **Agent topology (required):**
 
-- **Root = opus.** Plans the retrieval, decides what's a distinct sub-question,
+- **Root = opus-tier** (the strongest model the harness offers). Plans the
+  retrieval, decides what's a distinct sub-question,
   synthesizes the final answer, and verifies every citation. Reasoning lives here.
-- **Fan-out = haiku.** One sub-agent per sub-question. Each runs `ground`, reads
+- **Fan-out = haiku-tier** (the cheapest model). One sub-agent per sub-question. Each runs `ground`, reads
   the top chunks, and returns a compact cited evidence digest — never prose for
   the user. Retrieval noise stays in the sub-agent's context, not the root's.
 

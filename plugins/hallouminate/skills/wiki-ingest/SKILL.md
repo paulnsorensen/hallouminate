@@ -1,6 +1,6 @@
 ---
 name: wiki-ingest
-description: Fold new knowledge into an existing hallouminate wiki — route each new fact to the page it extends, merge it in, create a page only when genuinely novel, and never blend contradictions. Use when there's source material to absorb or a fact to record — "add this to the wiki", "ingest these docs", "update the wiki with what we learned", "remember this", "record this decision", "/wiki-ingest <path|topic>". An opus root plans dedup/route/merge/contradiction decisions; haiku sub-agents fan out to `ground` each candidate against the corpus and read the target pages. Do NOT use to bootstrap an empty wiki (use wiki-init) or to answer a question (use wiki-query).
+description: Fold new knowledge into an existing hallouminate wiki — route each new fact to the page it extends, merge it in, create a page only when genuinely novel, and never blend contradictions. Use when there's source material to absorb or a fact to record — "add this to the wiki", "ingest these docs", "update the wiki with what we learned", "remember this", "record this decision", "/wiki-ingest <path|topic>". Do NOT use to bootstrap an empty wiki (use wiki-init) or to answer a question (use wiki-query).
 ---
 
 # wiki-ingest — incremental ingest & update
@@ -13,10 +13,12 @@ unvetted one.
 
 **Agent topology (required):**
 
-- **Root = opus.** Splits source material into atomic claims, decides route vs.
+- **Root = opus-tier** (the strongest model the harness offers). Splits source
+  material into atomic claims, decides route vs.
   merge vs. overwrite vs. new, judges contradictions, and writes the final entries.
   Every judgment call lives here.
-- **Fan-out = haiku.** One sub-agent per candidate claim/topic: runs `ground` to
+- **Fan-out = haiku-tier** (the cheapest model). One sub-agent per candidate
+  claim/topic: runs `ground` to
   find the nearest existing page, reads it, and returns the match, its similarity
   score, and the relevant existing lines. Retrieval and reading are fanned out;
   decisions are not.
@@ -94,7 +96,7 @@ For each atomic claim that survived Layer 1, use the locate step's top `DocFile`
 | `z_score` **absent** (`None`) | unnormalized | Fall back — see below. |
 
 `z_score ≥ 2.0` means "≥2 std-devs above this query's candidate mean" — the most confident match
-the corpus offers for that query. These cutoffs **replace** the old qualitative bands.
+the corpus offers for that query.
 
 **Fallback when `z_score` is `None`** (RRF-only / small corpus): the numeric skip is unavailable,
 so **never skip on `score` alone**. Use the raw `score` *rank* (clear top hit? large gap to #2?)
@@ -114,10 +116,9 @@ Route claims that reach here (novel / merge-band) using `score` ordering cross-c
   layer routes; it does not re-implement contradiction detection.
 
 **Calibration note (tunable, domain-dependent).** The units are hallouminate `z_score`/`score`,
-**not** raw cosine. The cutoffs (`2.0`, `1.0`) are a starting point pending a sample-and-review
-calibration pass before first production deploy. The issue's literal `0.95`/`0.80` *cosine*
-figures are **not used** — no tool exposes a 0–1 cosine between two texts (`ground` returns an
-RRF-fused `score` and a per-query relative `z_score`, not cosine).
+**not** raw cosine — no tool exposes a 0–1 cosine between two texts (`ground` returns an
+RRF-fused `score` and a per-query relative `z_score`). The cutoffs (`2.0`, `1.0`) are a
+starting point; adjust them when sampled decisions look mis-banded.
 
 **Phase 3a — contradiction (LLM-as-judge, root):** When the new claim conflicts with
 an existing page, do NOT average them — blending produces confident wrong answers.
@@ -139,6 +140,12 @@ Apply each decision through the safe update loop:
 - **New page:** draft one-topic entry (H1 first line, kebab slug, lead-first,
   ~50–150 lines, code cited as `path:line`, shaped on the pack's
   `../../templates/wiki-entry.md`) → `add_markdown { overwrite: false }`.
+- **Local links:** if merged or new content links a local file outside the corpus
+  (absolute path, `~`, or a relative path escaping the corpus root — the ingest
+  source itself is the common case), copy that file into the corpus first
+  (`add_markdown`, e.g. `sources/<slug>.md` — or a config-declared corpus it
+  belongs to) and link the corpus-relative copy. Web URLs pass through; code
+  stays a `path:line` citation, never a copied file.
 - **Provenance footer on every touched page:**
   `_Source: <where this came from> · Updated: <date> · Supersedes: <if any>_`
   Freshness is a first-class signal — stale pages produce confident-wrong answers.
@@ -176,6 +183,8 @@ drift).
 - Root decides route/merge/contradiction; haiku only locates and reads. Don't invert.
 - Fan out the locate step in one message so searches run in parallel.
 - Stamp a provenance/updated footer on every page you touch.
+- Links resolve inside a corpus — copy a local link target in before linking it;
+  never link out to the filesystem.
 - Curate, don't accumulate — skip duplicates, split bloated pages, retire the stale.
 - Dedup is three ordered layers: hash identity (Layer 1) → `z_score` band (Layer 2) → route/create (Layer 3). Each runs only if the prior didn't decide.
 - Log every dedup decision in `log.md` — skips included. The Layer-1 hash ledger only works if skips are recorded.

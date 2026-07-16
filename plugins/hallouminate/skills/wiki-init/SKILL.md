@@ -1,6 +1,6 @@
 ---
 name: wiki-init
-description: Bootstrap a hallouminate wiki from scratch by interviewing the user with Socratic questioning, then writing the first entries. Use when a repo has no wiki yet or the corpus is near-empty — "start a wiki", "bootstrap the knowledge base", "interview me about this project", "set up the wiki", "/wiki-init". An opus root runs a semi-structured interview (one question per turn, behavior-first probes) and plans the page taxonomy; haiku sub-agents fan out to draft the captured topics into one-topic-per-file entries in parallel via `add_markdown`. Do NOT use to answer questions (use wiki-query) or to fold new source docs into an existing wiki (use wiki-ingest).
+description: Bootstrap a hallouminate wiki from scratch by interviewing the user with Socratic questioning, then writing the first entries. Use when a repo has no wiki yet or the corpus is near-empty — "start a wiki", "bootstrap the knowledge base", "interview me about this project", "set up the wiki", "/wiki-init". Do NOT use to answer questions (use wiki-query) or to fold new source docs into an existing wiki (use wiki-ingest).
 ---
 
 # wiki-init — Socratic bootstrap of a hallouminate wiki
@@ -11,9 +11,11 @@ about *behavior in concrete situations* and extract the model from their answers
 
 **Agent topology (required):**
 
-- **Root = opus.** Runs the interview, holds the dialogue history, decides the page
+- **Root = opus-tier** (the strongest model the harness offers). Runs the interview,
+  holds the dialogue history, decides the page
   taxonomy, and extracts answers into structured slots. All reasoning lives here.
-- **Fan-out = haiku.** Once topics are captured, one sub-agent per planned page drafts
+- **Fan-out = haiku-tier** (the cheapest model). Once topics are captured, one
+  sub-agent per planned page drafts
   the entry and calls `add_markdown`. Drafting is mechanical formatting of slots the
   root already gathered — cheap, parallel, isolated.
 
@@ -90,6 +92,12 @@ your working notes), separating *what was said* from *how it'll be written*.
     normalized source (`sha256sum`, first 16 hex chars) and records the id in `log.md`;
     a ledger hit skips the whole source. Note the hash convention here so the id format
     is stable across ingests.
+  Also declare the **local-link rule**: links must resolve inside the corpus. A
+  link target that is a local file outside the corpus root gets copied into the
+  corpus first (`add_markdown`, e.g. `sources/<slug>.md`) — or into another
+  corpus declared in config if it belongs elsewhere — and the link rewritten
+  corpus-relative. Web URLs pass through; code is cited as `path:line` text,
+  never linked or copied.
   Later skills (`wiki-ingest`) read all of this to stay consistent.
 - Pick the corpus: `repo:{name}:wiki` for the repo, or ask if ambiguous
   (`list_corpora`). Confirm the page list with the user before fanning out.
@@ -104,7 +112,9 @@ Spawn one haiku sub-agent per planned page, **in a single message**, each with:
 
 > Draft a one-topic markdown entry from these slots. First non-blank line is
 > `# <Title>`. Lead with the conclusion, ~50–150 lines, concrete over abstract,
-> cite code as `path:line` where the slots name files. Add the provenance footer.
+> cite code as `path:line` where the slots name files. Link only corpus-relative
+> targets — if a slot names a local doc that should be linked, do not link it;
+> flag it in your return for the root to copy into the corpus. Add the provenance footer.
 > Then call `add_markdown { corpus, path, content, overwrite: false }` — the target
 > corpus must be single-root (`add_markdown` rejects multi-root corpora);
 > `repo:{name}:wiki` is single-root. Return the path written and any lint `warnings`
@@ -119,6 +129,9 @@ automatically on write.
 
 - Collect the written paths and lint warnings; fix any flagged entry (heading jumps,
   empty links) with an `overwrite: true` redraft.
+- Copy any local docs the drafts flagged into the corpus (`add_markdown`, e.g.
+  `sources/<slug>.md`) and add the corpus-relative links — no page ships a link
+  that resolves outside the corpus.
 - `list_tree` to confirm the shape; write or refine the top-level `index.md` prose
   (outside the `<!-- HALLOUMINATE:INDEX-START -->` / `<!-- HALLOUMINATE:INDEX-END -->`
   markers — the daemon owns the link list between them).
@@ -137,3 +150,5 @@ automatically on write.
 - Confirm the page taxonomy with the user before writing anything.
 - Fan out page drafts in one message so they run in parallel.
 - Never write a fact the interview didn't establish; note thin spots as gaps.
+- Never ship a link to a local file outside the corpus — copy the file in, then
+  link the copy.

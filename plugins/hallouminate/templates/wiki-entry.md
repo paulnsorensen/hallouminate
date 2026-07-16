@@ -18,7 +18,8 @@ you. The file stem matches the title, kebab-cased: "Corpus walker" →
 <H2/H3 headings are the retrieval unit — one per distinct point. Prefer
 concrete examples to abstract description. Cite code by path
 (`src/domain/corpus/walker.rs:42`) and back non-obvious claims with a
-footnote.[^1]>
+footnote.[^1] Link only in-corpus targets — copy a local doc into the corpus
+before linking it; web URLs are fine.>
 
 ## <Second distinct point>
 
