@@ -16,7 +16,7 @@ use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
-use super::socket::daemon_socket_path;
+use super::socket::{daemon_socket_path, sibling_socket_path};
 
 /// Client handle: just remembers which socket path to dial. Stateless
 /// otherwise — every `call` opens a fresh connection.
@@ -43,11 +43,13 @@ pub async fn client_for(socket: Option<&Path>) -> anyhow::Result<DaemonClient> {
 /// `client_for` with an injectable respawn step — the test seam behind it,
 /// mirroring [`super::lifecycle::restart_with`]. Production passes
 /// `ensure_daemon_running` (which no-ops under `HALLOUMINATE_SOCKET`). Only the
-/// default-socket path (`None`) self-heals: on connect failure it runs
+/// default-socket path (`None`) self-heals: on connect failure it probes the
+/// sibling candidate path for a live daemon (#218 — prevents doubled
+/// resident daemons when clients disagree on `XDG_RUNTIME_DIR`), then runs
 /// `respawn` once and retries the connect; a second failure returns the loud
 /// "daemon unavailable" error. Explicit-socket callers (`Some(path)`) —
-/// `lifecycle::status`/`stop` and test harnesses — never spawn: `stop` must not
-/// resurrect what it stopped (ADR-002).
+/// `lifecycle::status`/`stop` and test harnesses — never spawn or probe a
+/// sibling: `stop` must not resurrect what it stopped (ADR-002).
 pub async fn client_for_with<F, Fut>(
     socket: Option<&Path>,
     respawn: F,
@@ -58,13 +60,45 @@ where
 {
     match socket {
         Some(path) => connect_at(path).await,
-        None => match daemon_client().await {
-            Ok(c) => Ok(c),
-            Err(_) => {
-                respawn().await?;
-                daemon_client().await
+        None => {
+            connect_or_spawn(
+                &daemon_socket_path(),
+                sibling_socket_path().as_deref(),
+                respawn,
+            )
+            .await
+        }
+    }
+}
+
+/// Connect to `primary`; on failure, probe `sibling` for a live daemon
+/// before falling back to `respawn` (#218). Clients launched from
+/// environments that disagree on `XDG_RUNTIME_DIR` (a systemd user session
+/// vs a detached shell) resolve different primary socket paths — without
+/// this probe each would auto-spawn its own daemon, doubling resident
+/// ONNX/LanceDB memory. `sibling: None` (an explicit `HALLOUMINATE_SOCKET`
+/// override, via [`super::socket::sibling_socket_path`]) skips straight to
+/// `respawn`, matching pre-#218 behavior.
+async fn connect_or_spawn<F, Fut>(
+    primary: &Path,
+    sibling: Option<&Path>,
+    respawn: F,
+) -> anyhow::Result<DaemonClient>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    match connect_at(primary).await {
+        Ok(c) => Ok(c),
+        Err(_) => {
+            if let Some(sibling) = sibling
+                && let Ok(client) = connect_at(sibling).await
+            {
+                return Ok(client);
             }
-        },
+            respawn().await?;
+            connect_at(primary).await
+        }
     }
 }
 
@@ -264,6 +298,86 @@ mod tests {
             0,
             "explicit-socket path must never invoke the respawn step",
         );
+    }
+
+    // ── sibling probe before spawn (#218) ─────────────────────────────
+
+    #[tokio::test]
+    async fn connect_or_spawn_prefers_live_sibling_over_spawning() {
+        // The core #218 regression: clients that disagree with each other
+        // on `XDG_RUNTIME_DIR` resolve different primary socket paths. If
+        // the primary is dead but a daemon already answers at the sibling
+        // candidate, the client must adopt it instead of spawning a second
+        // resident daemon (doubled ONNX/LanceDB memory).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join("primary.sock");
+        let sibling = tmp.path().join("sibling.sock");
+        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+
+        let respawn_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&respawn_calls);
+        let client = connect_or_spawn(&primary, Some(&sibling), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::Ok(()) }
+        })
+        .await
+        .expect("must connect to the live sibling instead of spawning");
+
+        assert_eq!(client.socket_path(), sibling.as_path());
+        assert_eq!(
+            respawn_calls.load(Ordering::SeqCst),
+            0,
+            "must not spawn a daemon when a sibling already answers",
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_or_spawn_spawns_when_no_sibling_candidate() {
+        // Mirrors `HALLOUMINATE_SOCKET` being set: `sibling_socket_path()`
+        // returns `None` (see `socket::tests`), so `connect_or_spawn` must
+        // fall straight through to `respawn`, exactly as before the sibling
+        // probe was added — no sibling probing on an explicit override.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join("primary.sock");
+        let respawn_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&respawn_calls);
+        let result = connect_or_spawn(&primary, None, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::Ok(()) }
+        })
+        .await;
+        result.expect_err("a still-missing socket after respawn must fail");
+        assert_eq!(
+            respawn_calls.load(Ordering::SeqCst),
+            1,
+            "must respawn when there is no sibling candidate to try",
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_or_spawn_spawns_when_sibling_also_dead() {
+        // A sibling candidate that isn't actually live (no listener bound)
+        // must not block the fallback to `respawn`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let primary = tmp.path().join("primary.sock");
+        let sibling = tmp.path().join("sibling.sock");
+        let respawn_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&respawn_calls);
+        let result = connect_or_spawn(&primary, Some(&sibling), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { anyhow::Ok(()) }
+        })
+        .await;
+        result.expect_err("both candidates dead must still fail");
+        assert_eq!(respawn_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
