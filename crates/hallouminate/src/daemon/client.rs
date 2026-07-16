@@ -94,6 +94,7 @@ where
             if let Some(sibling) = sibling
                 && let Ok(client) = connect_at(sibling).await
             {
+                tracing::debug!(sibling = %sibling.display(), "adopted live sibling daemon instead of spawning (#218)");
                 return Ok(client);
             }
             respawn().await?;

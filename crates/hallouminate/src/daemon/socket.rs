@@ -142,4 +142,32 @@ mod tests {
             Some(PathBuf::from("/run/user/1000/hallouminate/daemon.sock"))
         );
     }
+
+    #[test]
+    fn empty_xdg_runtime_dir_treated_as_unset() {
+        // A set-but-blank `XDG_RUNTIME_DIR=` must be filtered out just like
+        // `daemon_socket_path`'s own handling, so the sibling falls back to
+        // the conventional `/run/user/<euid>` path instead of an empty-string
+        // branch.
+        let sibling = compute_sibling_socket_path(None, Some(OsStr::new("")), 1000);
+        assert_eq!(
+            sibling,
+            Some(PathBuf::from("/run/user/1000/hallouminate/daemon.sock"))
+        );
+    }
+
+    #[test]
+    fn sibling_coincident_with_primary_collapses_to_none() {
+        // When XDG_RUNTIME_DIR's parent equals FALLBACK_BASE's parent, the
+        // XDG-set primary and the cache-candidate sibling resolve to the
+        // same path — the self-coincidence guard must collapse this to
+        // None rather than reporting yourself as your own sibling.
+        let cache = PathBuf::from(shellexpand::tilde(FALLBACK_BASE).into_owned());
+        let runtime = cache.parent().expect("FALLBACK_BASE has a parent");
+        let sibling = compute_sibling_socket_path(None, Some(runtime.as_os_str()), 1000);
+        assert_eq!(
+            sibling, None,
+            "coincident primary/sibling collapses to None"
+        );
+    }
 }
