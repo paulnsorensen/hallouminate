@@ -182,8 +182,8 @@ impl DaemonClient {
 /// (listings, single-file markdown ops, corpus stats) are cheap lookups;
 /// `ground` embeds the query and searches, so it gets more room; `index`
 /// rebuilds a corpus and mutating writes (`add_markdown`, `delete_markdown`)
-/// can block behind the embedder mutex held across bulk indexing (#219), so
-/// both get the longest class. `Ping` and `Shutdown` aren't routed through
+/// are long-running (many batches of disk I/O plus embedding work), so both
+/// get the longest class. `Ping` and `Shutdown` aren't routed through
 /// `call` in practice (lifecycle.rs calls `call_raw_with_timeout` directly
 /// with its own short deadlines) but are classified for match exhaustiveness.
 fn timeout_for(payload: &DaemonRequestPayload) -> Duration {
@@ -305,8 +305,7 @@ mod tests {
         // #216: `call<T>` must bound every RPC class, not just lifecycle
         // status/stop. Reads stay short; `ground` gets more room for
         // embedding + search; `index` and single-file mutations get the
-        // longest class because both can queue behind the embedder mutex
-        // held across bulk indexing (#219).
+        // longest class because both are long-running bulk operations.
         let read_class = Duration::from_secs(60);
         let ground_class = Duration::from_secs(120);
         let mutation_class = Duration::from_secs(15 * 60);

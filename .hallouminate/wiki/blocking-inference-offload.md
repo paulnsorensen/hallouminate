@@ -1,6 +1,6 @@
 ---
 status: reviewed
-last_verified: 2026-07-13
+last_verified: 2026-07-16
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/217
@@ -9,47 +9,58 @@ sources:
 # Blocking-inference offload — coverage map
 
 Which CPU-bound work hops off tokio worker threads, and which still runs
-inline. Coverage is **partial** after #176: the model load and single-file
-reindex are wrapped; the two hottest inference paths are not (#217), and the
-per-key embedder lock is held across entire bulk indexes (#219).
+inline. Coverage is now **complete**: the model load, single-file reindex,
+and the two hottest inference paths (#217) are wrapped; the per-key embedder
+lock issue (#219) is also resolved — see below.
 
 ## Wrapped (safe)
 
-- Model load: `Embedder::try_new` under `block_in_place`
-  (`src/app/daemon/state.rs:162`).
+- Model load: `Embedder::try_new` under `spawn_blocking` in `init_embedder`
+  (`crates/hallouminate/src/daemon/state.rs:94`).
 - Single-file reindex (add_markdown path): `index_single_file[_with_content]`
-  use `block_in_place` (`src/app/daemon/dispatch.rs:1277,1328,1336`). Note the
-  doc comment: `block_in_place` panics on a current-thread runtime — tests of
-  these paths must use the `multi_thread` flavor.
+  (`crates/hallouminate/src/daemon/dispatch.rs:1239,1255`) wrap the
+  content-hash/plan/apply work in `block_in_place`
+  (`crates/hallouminate/src/daemon/dispatch.rs:1279`). Note the doc comment:
+  `block_in_place` panics on a current-thread runtime — tests of these paths
+  must use the `multi_thread` flavor.
 - Crossencoder rerank: `rerank_with_timeout` wraps in `spawn_blocking` with an
-  explanatory comment (`src/domain/ground/orchestrate.rs:12-26`) — the
-  precedent the remaining gaps should copy.
+  explanatory comment (`crates/hallouminate-domain/src/ground/orchestrate.rs:11-26`) —
+  the precedent the remaining gaps should copy.
 - Filesystem ops in handlers (`read_no_follow`, `atomic_write_no_follow`, …)
   use `spawn_blocking` throughout `dispatch.rs`.
 
-## Still inline on tokio workers (#217)
+## Inference offload (#217 — resolved)
 
-- Bulk index: `handle_index → index_corpus → run_in_batches` calls
-  `embed_batch` directly inside an async fn (`src/domain/indexer/apply.rs:245`).
-- Ground query embed: `embed_query` is a sync fn invoked inline on the ground
-  path (`src/domain/ground/orchestrate.rs:169-183`).
+Both hot embedding paths named in #217 — bulk-index `embed_batch` and
+ground-query `embed_query` — are adapter-owned since the US-002 refactor
+(`crates/hallouminate-domain/src/ground/orchestrate.rs:318`) and no longer
+inline on tokio workers. Bulk index and ground query both route through
+`LanceStore::run_embedding_blocking`, which wraps the actual `embed_batch`
+call in `tokio::task::spawn_blocking`
+(`crates/hallouminate-adapters/src/lance.rs:626`, closure body through 651).
+The old inline sites (`embed_query` and the direct `apply.rs:245` call) no
+longer exist in the domain crate.
 
-A burst of embeds across distinct ResourceKeys can occupy multiple worker
-threads simultaneously; the worst case starves the accept loop and the daemon
-appears dead to every client — which then hangs indefinitely because tool RPCs
-have no client-side timeout (#216).
+Worst-case worker starvation from a burst of embeds is resolved by this
+offload — the embed work runs off the tokio worker pool. The remaining
+failure mode, a client stuck waiting on a wedged daemon, is bounded by the
+client-side per-class RPC timeouts added for #216 (`timeout_for`,
+`crates/hallouminate/src/daemon/client.rs`).
 
-## Lock granularity gap (#219)
+## Lock granularity (#219 — resolved)
 
-`handle_index` acquires the per-ResourceKey embedder guard and holds it across
-the whole `index_corpus(...)` await (`src/app/daemon/dispatch.rs:532-543`), so
-every `ground` on the same key queues on that mutex
-(`src/app/daemon/state.rs:156-172`) for the full bulk index — minutes on large
-corpora. Fix direction in #219: re-acquire per embed batch so grounds
-interleave.
+Embedding is adapter-owned since the US-002 refactor: `LanceStore` holds
+`embedder: Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>`
+(`crates/hallouminate-adapters/src/lance.rs:548`), locked fresh per call
+inside `run_embedding_blocking` (lines 626-651). `apply_batch`
+(lines 939-1009) calls it once per batch via `run_in_batches`
+(`crates/hallouminate-domain/src/indexer/apply.rs`), so the lock is released
+between batches — a concurrent `ground` query embed (`hybrid_search`,
+`lance.rs:1278-1336`, same `run_embedding_blocking` call) can acquire it
+in the gap rather than queuing for the whole bulk index.
 
 See also: [ort-arena-retention](ort-arena-retention.md) for why resident
 arena memory makes process topology matter, and
 [daemon-and-cli](daemon-and-cli.md) for the request-concurrency model.
 
-_Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-13 · Supersedes: —_
+_Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-16 · Supersedes: —_
