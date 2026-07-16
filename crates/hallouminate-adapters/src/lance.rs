@@ -1492,6 +1492,108 @@ mod tests {
         );
     }
 
+    /// Blocks its first `embed_batch` call until released, so a test can
+    /// observe the embedder mutex mid-call; every later call returns
+    /// immediately and is counted.
+    struct GatedFirstCallEmbedder {
+        first_call: AtomicBool,
+        entered_tx: std::sync::mpsc::SyncSender<()>,
+        release_rx: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl EmbedBatch for GatedFirstCallEmbedder {
+        fn embed_batch(
+            &mut self,
+            texts: &[String],
+            _role: EmbedRole,
+        ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.first_call.swap(false, Ordering::SeqCst) {
+                self.entered_tx.send(()).expect("signal entered");
+                self.release_rx
+                    .lock()
+                    .expect("release lock")
+                    .recv()
+                    .expect("wait for release");
+            }
+            Ok(vec![[0.0; EMBEDDING_DIM]; texts.len()])
+        }
+    }
+
+    /// Regression guard for #219: the embedder mutex must be acquired fresh
+    /// per batch inside `run_embedding_blocking`, not held by the caller
+    /// across a whole bulk index. Proves two properties deterministically
+    /// (no wall-clock timing): (1) the mutex IS contended while one batch's
+    /// embed call is in flight, and (2) as soon as that call returns, the
+    /// mutex is free again for the *next* batch — i.e. `apply_batch` never
+    /// wraps the mutex around more than a single `run_embedding_blocking`
+    /// call. `GatedFirstCallEmbedder`'s call count also confirms a second
+    /// batch triggers its own fresh acquisition rather than reusing a
+    /// lock the first batch never released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn embedder_lock_releases_between_batches() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(GatedFirstCallEmbedder {
+                first_call: AtomicBool::new(true),
+                entered_tx,
+                release_rx: std::sync::Mutex::new(release_rx),
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        let store = Arc::new(store);
+
+        let batch_one = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            batch_one
+                .apply_batch(vec![synthetic_prepared("/tmp/batch-one.md", 1)])
+                .await
+                .expect("apply batch one")
+        });
+
+        // Wait until batch one's embed call has entered and is blocked —
+        // it is holding the mutex right now.
+        entered_rx.recv().expect("embed_batch entered");
+        assert!(
+            store.embedder.try_lock().is_err(),
+            "embedder mutex must be held while a batch's embed call is in flight"
+        );
+
+        // Let batch one's embed call return.
+        release_tx.send(()).expect("release embed call");
+        handle.await.expect("batch one task");
+
+        // The mutex must be free again immediately — nothing in apply_batch
+        // holds it past the embed call, so a second batch (or a concurrent
+        // `ground` query-embed) is never queued behind the first.
+        assert!(
+            store.embedder.try_lock().is_ok(),
+            "embedder mutex must be released once batch one's embed call returns, \
+             not held across the rest of the index (#219 regression)"
+        );
+
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/batch-two.md", 1)])
+            .await
+            .expect("apply batch two");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "each batch must trigger its own fresh embed call, not reuse a held lock"
+        );
+    }
+
     #[tokio::test]
     async fn corpus_chunk_stats_scoped_to_requested_corpus() {
         // Seed a two-corpus table and verify that corpus_chunk_stats returns

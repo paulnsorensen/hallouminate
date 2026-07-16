@@ -10,8 +10,8 @@ sources:
 
 Which CPU-bound work hops off tokio worker threads, and which still runs
 inline. Coverage is **partial** after #176: the model load and single-file
-reindex are wrapped; the two hottest inference paths are not (#217), and the
-per-key embedder lock is held across entire bulk indexes (#219).
+reindex are wrapped; the two hottest inference paths are not (#217). The
+per-key embedder lock issue (#219) is resolved — see below.
 
 ## Wrapped (safe)
 
@@ -39,14 +39,17 @@ threads simultaneously; the worst case starves the accept loop and the daemon
 appears dead to every client — which then hangs indefinitely because tool RPCs
 have no client-side timeout (#216).
 
-## Lock granularity gap (#219)
+## Lock granularity (#219 — resolved)
 
-`handle_index` acquires the per-ResourceKey embedder guard and holds it across
-the whole `index_corpus(...)` await (`src/app/daemon/dispatch.rs:532-543`), so
-every `ground` on the same key queues on that mutex
-(`src/app/daemon/state.rs:156-172`) for the full bulk index — minutes on large
-corpora. Fix direction in #219: re-acquire per embed batch so grounds
-interleave.
+Embedding is adapter-owned since the US-002 refactor: `LanceStore` holds
+`embedder: Arc<std::sync::Mutex<Option<Box<dyn EmbedBatch>>>>`
+(`crates/hallouminate-adapters/src/lance.rs:548`), locked fresh per call
+inside `run_embedding_blocking` (lines 626-651). `apply_batch`
+(lines 939-1009) calls it once per batch via `run_in_batches`
+(`crates/hallouminate-domain/src/indexer/apply.rs`), so the lock is released
+between batches — a concurrent `ground` query embed (`hybrid_search`,
+`lance.rs:1278-1336`, same `run_embedding_blocking` call) can acquire it
+in the gap rather than queuing for the whole bulk index.
 
 See also: [ort-arena-retention](ort-arena-retention.md) for why resident
 arena memory makes process topology matter, and
