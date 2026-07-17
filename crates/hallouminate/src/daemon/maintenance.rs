@@ -220,6 +220,20 @@ impl Drop for MaintenanceLifecycle {
     }
 }
 
+/// Sleeps `total`, bumping the Maintenance heartbeat every <= 60s so the
+/// self-armed watchdog's stall window can't trip while a single long
+/// interval sleep is in flight.
+async fn sleep_with_heartbeat(state: &DaemonState, total: Duration) {
+    const CHUNK: Duration = Duration::from_secs(60);
+    let mut remaining = total;
+    while remaining > CHUNK {
+        tokio::time::sleep(CHUNK).await;
+        state.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+        remaining -= CHUNK;
+    }
+    tokio::time::sleep(remaining).await;
+}
+
 /// Background task: sleeps `interval` (plus jitter), then runs a maintenance
 /// pass once the daemon is idle and I/O pressure is not elevated --
 /// deferring and rechecking every 60s otherwise (ADR-003). Exits promptly on
@@ -234,7 +248,7 @@ pub(super) async fn maintenance_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(Duration::from_secs(jittered_sleep_secs(interval.as_secs()))) => {}
+            _ = sleep_with_heartbeat(&state, Duration::from_secs(jittered_sleep_secs(interval.as_secs()))) => {}
         }
         let due_since = tokio::time::Instant::now();
         let defer_bound = Duration::from_secs(state.baseline().daemon.defer_bound_secs);
@@ -291,6 +305,7 @@ pub(super) async fn maintenance_loop(
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(recheck) => {}
                 }
+                state.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
             }
         }
         // A Hard-forced pass stays `Pace::Full` even under elevated PSI --
@@ -584,7 +599,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Past interval + max jitter: the pass becomes due and defers.
-        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(51)).await;
         tokio::task::yield_now().await;
         // Two full 60s rechecks (120s deferred), then one second short of
         // the 150s bound: still deferred.
@@ -646,7 +663,9 @@ mod tests {
         ));
         tokio::task::yield_now().await;
 
-        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(51)).await;
         tokio::task::yield_now().await;
         for _ in 0..2 {
             tokio::time::advance(Duration::from_secs(60)).await;
@@ -692,7 +711,9 @@ mod tests {
         ));
         tokio::task::yield_now().await;
 
-        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(51)).await;
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
@@ -908,5 +929,39 @@ mod tests {
         // Unmeasurable progress must not slice forever.
         assert_eq!(tick, MaintenanceTick::Continue);
         assert_eq!(calls.lock().expect("calls lock").len(), 1);
+    }
+
+    /// A self-armed watchdog polls at stall/4; a naive single sleep for the
+    /// whole jittered interval would starve it of any bump for up to the
+    /// full interval. The interval sleep must be chunked so the epoch
+    /// advances at least every 60s even mid-sleep.
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_epoch_advances_at_least_every_60s_during_a_long_interval_sleep() {
+        let (state, _ground) = test_state(|cfg| cfg.daemon.defer_bound_secs = 0).await;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(maintenance_loop(
+            state.clone(),
+            cancel.clone(),
+            Duration::from_secs(3600),
+            Arc::new(TestProbe::new(false)),
+        ));
+        tokio::task::yield_now().await;
+
+        let mut previous = state.heartbeat().epoch(super::super::heartbeat::TaskName::Maintenance);
+        // Advance in 60s steps through most of the hour-long interval sleep;
+        // the epoch must move on every step, never stalling for a full 60s.
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let current = state.heartbeat().epoch(super::super::heartbeat::TaskName::Maintenance);
+            assert!(
+                current > previous,
+                "Maintenance epoch must advance at least every 60s during the interval sleep"
+            );
+            previous = current;
+        }
+
+        cancel.cancel();
+        task.await.expect("maintenance_loop task");
     }
 }

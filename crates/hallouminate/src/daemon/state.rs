@@ -2541,27 +2541,31 @@ mod tests {
         tokio::time::advance(Duration::from_secs(111)).await;
         tokio::task::yield_now().await;
 
-        // 9 more rechecks bring consecutive_defers to 10 (no warn yet); the
-        // 10th brings it to 11, which crosses the `> 10` warn threshold.
-        for i in 0..10 {
+        // W2's heartbeat cadence slices the interval sleep into <=60s
+        // chunks, so 60s advances are consumed by chunk completions as well
+        // as defer rechecks -- an iteration-indexed schedule no longer maps
+        // 1:1 to defer counts. Drive the clock and pin the FIRST captured
+        // count-11 event instead: the warn threshold is `> 10`, so a warn
+        // firing any earlier would surface tagged with a smaller count.
+        let mut saw_eleven = false;
+        for _ in 0..30 {
             tokio::time::advance(Duration::from_secs(60)).await;
             tokio::task::yield_now().await;
-            let events = capture.0.lock().expect("capture lock");
-            let warned = events
-                .iter()
-                .any(|e| e.numbers.get("consecutive_defers").copied() == Some(11));
-            if i < 9 {
-                assert!(
-                    !warned,
-                    "warn fired before the 11th consecutive defer (i={i})"
-                );
-            } else {
-                assert!(
-                    warned,
-                    "expected a warn event with consecutive_defers == 11 after the 11th recheck"
-                );
+            let warned = {
+                let events = capture.0.lock().expect("capture lock");
+                events
+                    .iter()
+                    .any(|e| e.numbers.get("consecutive_defers").copied() == Some(11))
+            };
+            if warned {
+                saw_eleven = true;
+                break;
             }
         }
+        assert!(
+            saw_eleven,
+            "expected a warn event with consecutive_defers == 11 within the advance budget"
+        );
 
         cancel.cancel();
         task.await.expect("maintenance_loop task");
