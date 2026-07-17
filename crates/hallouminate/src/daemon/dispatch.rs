@@ -41,7 +41,8 @@ use hallouminate_domain::ground::{
 };
 use hallouminate_domain::indexer::HandlerRegistry;
 use hallouminate_domain::indexer::{
-    ChunkStore, DEFAULT_BATCH_SIZE, FileSnapshot, apply, index_corpus, plan,
+    ApplyStats, ChunkStore, DEFAULT_BATCH_SIZE, FileSnapshot, IndexPlan, MtimeCandidate, apply,
+    index_corpus, plan,
 };
 #[cfg(test)]
 use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
@@ -1273,52 +1274,54 @@ pub(super) async fn index_single_file_with_content(
         .ok_or_else(|| anyhow::anyhow!("non-utf8 path: {}", file_ref.as_path().display()))?
         .to_string();
     let existing = store.get_file_snapshot(&corpus.name, &file_ref_str).await?;
-    let mut db: HashMap<FileRef, FileSnapshot> = HashMap::new();
     // Truncate-to-empty eviction (files_skipped_empty > 0 for a file that HAD
     // a snapshot) is handled inside `apply`'s mtime-fallthrough batch — see
     // `EmptyFilePolicy::Evict` in `src/domain/indexer/apply.rs` — so both this
     // single-file path and bulk `index_corpus` share one eviction rule.
     let stats = tokio::task::block_in_place(|| {
-        // Carries the snapshot when the mtime lied (same-second truncation/edit)
-        // but the content hash moved: `plan()` would otherwise skip this file
-        // entirely (mtime unchanged) or, if omitted from `db`, misroute it as a
-        // brand-new upsert with no prior rows to evict. Neither is right — it
-        // must go through the mtime-fallthrough path so a truncate-to-empty here
-        // still evicts stale rows (`EmptyFilePolicy::Evict`).
-        //
-        // The hash (when needed) is computed here, inside block_in_place,
-        // since blake3-hashing file bytes is blocking CPU work same as the
-        // rest of this closure.
-        let mut reindex_despite_same_mtime: Option<(FileSnapshot, String)> = None;
-        if let Some(snap) = existing {
-            let hash_changed_without_mtime = if snap.mtime_ms == mtime_ms {
+        // Content-hash gate (ADR daemon-rework-003): the bytes are already in
+        // hand, so hash them once — inside block_in_place, since blake3 over
+        // file bytes is blocking CPU work — and compare against the stored
+        // snapshot. Never re-read the file from disk here: the caller's
+        // no-follow read is the content of record, and a second read would
+        // reopen the symlink-swap TOCTOU this function exists to close.
+        let p = match existing {
+            Some(snap) => {
                 let hash = blake3_bytes(bytes);
-                if hash != snap.content_hash.as_str() {
-                    reindex_despite_same_mtime = Some((snap.clone(), hash));
-                    true
-                } else {
-                    false
+                if hash == snap.content_hash {
+                    if snap.mtime_ms == mtime_ms {
+                        tracing::debug!(
+                            target: "hallouminate::daemon",
+                            corpus = %corpus.name,
+                            file = %file_ref_str,
+                            "reindex skipped: content hash and mtime match stored snapshot"
+                        );
+                        return Ok(ApplyStats::default());
+                    }
+                    tracing::debug!(
+                        target: "hallouminate::daemon",
+                        corpus = %corpus.name,
+                        file = %file_ref_str,
+                        "reindex skipped: content hash matches stored snapshot; bumping stored mtime"
+                    );
                 }
-            } else {
-                false
-            };
-            if !hash_changed_without_mtime {
-                db.insert(file_ref.clone(), snap);
+                // One candidate, hash pre-computed: `apply` touches the stored
+                // mtime when the hash matches, and otherwise falls through to
+                // a full re-index whose truncate-to-empty case still evicts
+                // the prior rows (`EmptyFilePolicy::Evict`).
+                IndexPlan {
+                    upserts: Vec::new(),
+                    mtime_touches: vec![MtimeCandidate {
+                        file: file_ref.clone(),
+                        snap,
+                        new_mtime: Mtime(mtime_ms),
+                        known_hash: Some(hash),
+                    }],
+                    deletes: Vec::new(),
+                }
             }
-        }
-        let mut p = plan(vec![(file_ref.clone(), Mtime(mtime_ms))], db);
-        if let Some((snap, known_hash)) = reindex_despite_same_mtime
-            && let Some(idx) = p.upserts.iter().position(|u| u.file == file_ref)
-        {
-            let upsert = p.upserts.remove(idx);
-            p.mtime_touches
-                .push(hallouminate_domain::indexer::MtimeCandidate {
-                    file: upsert.file,
-                    snap,
-                    new_mtime: upsert.mtime,
-                    known_hash: Some(known_hash),
-                });
-        }
+            None => plan(vec![(file_ref.clone(), Mtime(mtime_ms))], HashMap::new()),
+        };
         tokio::runtime::Handle::current().block_on(apply(
             p,
             store,
@@ -2733,6 +2736,222 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "the truncated file's snapshot row must be gone after eviction"
+        );
+    }
+
+    // ── single-file content-hash gate (blake3 vs stored snapshot) ────────
+    //
+    // ADR daemon-rework-003: the single-file reindex gate compares the blake3
+    // of the bytes ALREADY READ (the watcher's no-follow read) against the
+    // stored snapshot's content_hash. Hash-equal must skip re-chunk/re-embed
+    // and report zero upserts; the comparison must never re-read the file
+    // from disk, which would reopen the symlink-swap TOCTOU window and judge
+    // content the caller never read.
+
+    fn md_corpus_at(root: &Path) -> CorpusConfig {
+        CorpusConfig {
+            name: "docs".into(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_single_file_skips_rechunk_when_content_hash_and_mtime_match_snapshot() {
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let file = corpus_dir.path().join("note.md");
+        let corpus = md_corpus_at(corpus_dir.path());
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+
+        let content: &[u8] = b"# Note\n\nthe spice must flow\n";
+        std::fs::write(&file, content).unwrap();
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        index_single_file(&store, &registry, &corpus, &file)
+            .await
+            .expect("first index must succeed");
+        let baseline = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        assert!(baseline.total_chunks > 0, "first index must produce rows");
+
+        // Swap the DISK content after the (simulated) no-follow read: the
+        // gate must judge the bytes in hand, not a second disk read.
+        std::fs::write(&file, "# Note\n\nswapped after the read\n").unwrap();
+
+        let stats =
+            index_single_file_with_content(&store, &registry, &corpus, &file, content, mtime)
+                .await
+                .expect("hash-equal reindex must succeed");
+        assert_eq!(
+            stats.files_upserted, 0,
+            "identical content must not be re-chunked or re-embedded"
+        );
+        assert_eq!(stats.files_touched, 0, "identical mtime needs no touch");
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&corpus.name)
+                .await
+                .unwrap()
+                .total_chunks,
+            baseline.total_chunks,
+            "chunk rows must be untouched by a noop reindex"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_single_file_touches_mtime_without_rechunk_when_content_hash_matches() {
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let file = corpus_dir.path().join("note.md");
+        let corpus = md_corpus_at(corpus_dir.path());
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+        let file_ref = canonicalize_or_passthrough(&file)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let content: &[u8] = b"# Note\n\nthe spice must flow\n";
+        std::fs::write(&file, content).unwrap();
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        index_single_file(&store, &registry, &corpus, &file)
+            .await
+            .expect("first index must succeed");
+        let baseline = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+
+        // Remove the file from disk entirely: a hash-equal gate that only
+        // needs a stored-mtime bump must not read the disk at all.
+        std::fs::remove_file(&file).unwrap();
+
+        let later = mtime + Duration::from_secs(2);
+        let later_ms = i64::try_from(
+            later
+                .duration_since(UNIX_EPOCH)
+                .expect("post-epoch")
+                .as_millis(),
+        )
+        .expect("mtime fits i64");
+        let stats =
+            index_single_file_with_content(&store, &registry, &corpus, &file, content, later)
+                .await
+                .expect("hash-equal reindex with moved mtime must succeed without disk access");
+        assert_eq!(
+            stats.files_upserted, 0,
+            "identical content must not be re-chunked or re-embedded"
+        );
+        assert_eq!(stats.files_touched, 1, "moved mtime takes the touch fast path");
+        let snap = store
+            .get_file_snapshot(&corpus.name, &file_ref)
+            .await
+            .unwrap()
+            .expect("snapshot must survive a touch");
+        assert_eq!(snap.mtime_ms, later_ms, "stored mtime must advance to the new value");
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&corpus.name)
+                .await
+                .unwrap()
+                .total_chunks,
+            baseline.total_chunks,
+            "chunk rows must be untouched by a mtime-only touch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_single_file_reindexes_and_stores_fresh_snapshot_when_content_hash_differs() {
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let file = corpus_dir.path().join("note.md");
+        let corpus = md_corpus_at(corpus_dir.path());
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+        let file_ref = canonicalize_or_passthrough(&file)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        std::fs::write(&file, "# Note\n\nthe spice must flow\n").unwrap();
+        let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
+        index_single_file(&store, &registry, &corpus, &file)
+            .await
+            .expect("first index must succeed");
+
+        let new_content: &[u8] = b"# Note\n\na completely different harvest\n";
+        std::fs::write(&file, new_content).unwrap();
+        let later = mtime + Duration::from_secs(2);
+        let later_ms = i64::try_from(
+            later
+                .duration_since(UNIX_EPOCH)
+                .expect("post-epoch")
+                .as_millis(),
+        )
+        .expect("mtime fits i64");
+
+        let stats =
+            index_single_file_with_content(&store, &registry, &corpus, &file, new_content, later)
+                .await
+                .expect("hash-unequal reindex must succeed");
+        assert_eq!(stats.files_upserted, 1, "changed content must re-index in full");
+        let snap = store
+            .get_file_snapshot(&corpus.name, &file_ref)
+            .await
+            .unwrap()
+            .expect("snapshot must exist after re-index");
+        assert_eq!(
+            snap.content_hash,
+            blake3_bytes(new_content),
+            "stored snapshot must carry the fresh content hash"
+        );
+        assert_eq!(snap.mtime_ms, later_ms, "stored mtime must advance to the new value");
+    }
+
+    /// The gate on the ambient-path wrapper (add-markdown / write handlers):
+    /// re-running `index_single_file` over an untouched file must be a full
+    /// noop — zero upserts (feeding the noop-reindex counter), zero touches,
+    /// zero embeddings — not a silent re-chunk/re-embed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_single_file_rerun_on_untouched_file_is_a_full_noop() {
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let file = corpus_dir.path().join("note.md");
+        let corpus = md_corpus_at(corpus_dir.path());
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+
+        std::fs::write(&file, "# Note\n\nthe spice must flow\n").unwrap();
+        index_single_file(&store, &registry, &corpus, &file)
+            .await
+            .expect("first index must succeed");
+        let baseline = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+
+        let stats = index_single_file(&store, &registry, &corpus, &file)
+            .await
+            .expect("re-index of an untouched file must succeed");
+        assert_eq!(
+            stats,
+            hallouminate_domain::indexer::ApplyStats::default(),
+            "an untouched file must produce all-zero stats (noop reindex)"
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&corpus.name)
+                .await
+                .unwrap()
+                .total_chunks,
+            baseline.total_chunks,
+            "chunk rows must be untouched by a noop reindex"
         );
     }
 }
