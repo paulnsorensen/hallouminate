@@ -11,7 +11,9 @@
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ErrorData, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ErrorCode, ErrorData, ServerCapabilities, ServerInfo,
+};
 use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -259,6 +261,21 @@ fn invalid_params(msg: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(msg.into(), None)
 }
 
+/// JSON-RPC `-32603` carrying `data: {"retryable": true}`: the daemon
+/// classified the failure as safe to retry (an RPC deadline expired, or a
+/// bounded backpressure wait timed out). The code stays `-32603` because a
+/// transient server-side stall is a server fault, not caller input; the
+/// `data` member is JSON-RPC's designated slot for machine-readable extras,
+/// so clients pattern on `data.retryable` instead of a bespoke error-code
+/// constant or message text.
+fn retryable_error(msg: impl Into<String>) -> ErrorData {
+    ErrorData::new(
+        ErrorCode::INTERNAL_ERROR,
+        msg.into(),
+        Some(serde_json::json!({ "retryable": true })),
+    )
+}
+
 /// Open a `DaemonClient` for one tool call, surfacing a clear
 /// "daemon unavailable" error if the socket is missing. The MCP server is
 /// long-lived but the daemon may not be, so we dial per-call instead of
@@ -276,16 +293,17 @@ async fn daemon_for_tool() -> Result<DaemonClient, ErrorData> {
 }
 
 /// Translate a daemon RPC error into the MCP transport's `ErrorData` shape.
-/// Daemon `InvalidParams` becomes `-32602`; `Internal` and `Retryable` both
-/// become `-32603`, as do transport / decode failures (already
-/// `anyhow::Error` by the time we get here) so MCP clients don't
-/// misinterpret a network flake as a user error.
+/// Daemon `InvalidParams` becomes `-32602`, `Internal` becomes `-32603`,
+/// `Retryable` becomes `-32603` + `data.retryable` (see [`retryable_error`]),
+/// and transport / decode failures (already `anyhow::Error` by the time we
+/// get here) collapse to `-32603` so MCP clients don't misinterpret a network
+/// flake as a user error.
 fn map_daemon_err(err: anyhow::Error) -> ErrorData {
     if let Some(rpc) = err.downcast_ref::<DaemonRpcError>() {
         return match rpc.kind {
             ErrorKind::InvalidParams => invalid_params(rpc.message.clone()),
             ErrorKind::Internal => internal_error(rpc.message.clone()),
-            ErrorKind::Retryable => internal_error(rpc.message.clone()),
+            ErrorKind::Retryable => retryable_error(rpc.message.clone()),
         };
     }
     internal_error(format!("{err:#}"))
@@ -978,6 +996,24 @@ mod tests {
         let mapped = map_daemon_err(err);
         assert_eq!(mapped.code.0, -32603);
         assert!(mapped.message.contains("disk on fire"));
+    }
+
+    #[test]
+    fn map_daemon_err_routes_retryable_to_minus_32603_with_retryable_data() {
+        // A Retryable daemon error (RPC timeout, or a bounded backpressure
+        // wait that expired) must be distinguishable by MCP clients without
+        // parsing message text: same -32603 server-fault code, plus the
+        // machine-readable `data.retryable` flag. Losing the flag silently
+        // downgrades retryable stalls to terminal failures.
+        let err: anyhow::Error = DaemonRpcError::retryable("hard-debt wait expired").into();
+        let mapped = map_daemon_err(err);
+        assert_eq!(mapped.code.0, -32603);
+        assert!(mapped.message.contains("hard-debt wait expired"));
+        assert_eq!(
+            mapped.data,
+            Some(serde_json::json!({ "retryable": true })),
+            "retryable daemon errors must carry data.retryable = true",
+        );
     }
 
     #[test]
