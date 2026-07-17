@@ -180,6 +180,13 @@ impl DaemonClient {
     /// writes/reads would otherwise hang the caller forever. Lifecycle
     /// commands (`stop`, `status`) that must never wait indefinitely for an
     /// accepted-but-silent socket use this instead of bare `call_raw`.
+    ///
+    /// Deadline expiry is typed [`DaemonRpcError`] with
+    /// [`ErrorKind::Retryable`] (#216): the daemon accepted the connection,
+    /// so it is likely busy rather than down, and the caller can retry.
+    /// Transport failures inside `call_raw` (connect/write/read/EOF) keep
+    /// the untyped "daemon unavailable" shape with its restart hint —
+    /// retrying against a dead daemon cannot succeed.
     pub async fn call_raw_with_timeout(
         &self,
         req: DaemonRequest,
@@ -187,11 +194,12 @@ impl DaemonClient {
     ) -> anyhow::Result<DaemonResponse> {
         match tokio::time::timeout(timeout, self.call_raw(req)).await {
             Ok(result) => result,
-            Err(_elapsed) => Err(daemon_client_unavailable(format!(
-                "no response from {} within {}s",
+            Err(_elapsed) => Err(DaemonRpcError::retryable(format!(
+                "no response from {} within {}s; the daemon may be busy — retry",
                 self.socket.display(),
                 timeout.as_secs(),
-            ))),
+            ))
+            .into()),
         }
     }
 
@@ -501,6 +509,80 @@ mod tests {
                 }
             )),
             mutation_class,
+        );
+    }
+
+    #[tokio::test]
+    async fn rpc_timeout_is_typed_retryable() {
+        // #216: when an RPC exceeds its deadline the caller must get a typed
+        // `DaemonRpcError { kind: Retryable }` — not an opaque "daemon
+        // unavailable" — so MCP/CLI callers regain control with an error
+        // they can pattern on and retry. The daemon accepted the connection,
+        // so "start it with `hallouminate daemon`" would be the wrong hint.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock_path = tmp.path().join("silent.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        tokio::spawn(async move {
+            let (_stream, _addr) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+
+        let client = connect_at(&sock_path).await.expect("connect");
+        let err = client
+            .call_raw_with_timeout(
+                DaemonRequest {
+                    cwd: PathBuf::from("."),
+                    payload: DaemonRequestPayload::Ping,
+                },
+                Duration::from_millis(100),
+            )
+            .await
+            .expect_err("a silent server must time out");
+        let rpc = err
+            .downcast_ref::<DaemonRpcError>()
+            .expect("timeout must surface as a typed DaemonRpcError");
+        assert_eq!(rpc.kind, ErrorKind::Retryable);
+        assert!(
+            rpc.message.contains("retry"),
+            "CLI callers see only the message, so it must say the error is \
+             retryable: {}",
+            rpc.message,
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_eof_is_not_typed_retryable() {
+        // Conservative classification (#216): only a deadline expiry is
+        // typed Retryable. A daemon that closes the connection before
+        // responding is a transport failure — it keeps the untyped
+        // "daemon unavailable" shape (restart hint), because retrying
+        // against a dead daemon cannot succeed.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock_path = tmp.path().join("eof.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+
+        let client = connect_at(&sock_path).await.expect("connect");
+        let err = client
+            .call_raw_with_timeout(
+                DaemonRequest {
+                    cwd: PathBuf::from("."),
+                    payload: DaemonRequestPayload::Ping,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("an immediate EOF must fail");
+        assert!(
+            err.downcast_ref::<DaemonRpcError>().is_none(),
+            "transport EOF must not be classified retryable: {err:#}",
         );
     }
 }
