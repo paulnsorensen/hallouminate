@@ -21,7 +21,7 @@ use crate::config::{self, Config};
 use super::dispatch::dispatch;
 use super::ipc::{DaemonRequest, DaemonResponse};
 use super::socket::daemon_socket_path;
-use super::state::DaemonState;
+use super::state::{DaemonState, WorkClass};
 
 #[derive(Debug, Default, Clone)]
 pub struct DaemonArgs {
@@ -378,7 +378,7 @@ async fn serve_on_listener(
             },
         };
         let state = state.clone();
-        let conn = state.enter_connection();
+        let conn = state.enter_connection(WorkClass::External);
         handlers.spawn(async move {
             // Held for the handler's lifetime; decrements the active-connection
             // count on drop so idle-exit never fires mid-request (ADR-003).
@@ -479,7 +479,7 @@ async fn handle_connection(
     };
     // Request completed; stamp the activity clock so idle-exit keys on real
     // request throughput, not just embed use (ADR-003).
-    state.touch_activity();
+    state.touch_activity(WorkClass::External);
     let mut text = serde_json::to_string(&response)?;
     text.push('\n');
     let write_result = tokio::time::timeout(idle_timeout, async {

@@ -18,16 +18,25 @@
 //!
 //! Lock order across the dispatcher is documented in `state.rs`.
 
+mod backpressure;
 mod bootstrap;
+mod churn;
 mod client;
+mod debt;
 mod dispatch;
+mod heartbeat;
 mod ipc;
+mod ladder;
 mod lifecycle;
+mod maintenance;
 mod pressure;
 mod server;
 mod socket;
 mod state;
+mod status;
+mod supervisor;
 mod watch;
+mod watchdog;
 
 pub use bootstrap::ensure_daemon_running;
 pub use client::{
@@ -47,4 +56,4 @@ pub use server::{
     spawn_signal_handlers,
 };
 pub use socket::daemon_socket_path;
-pub use state::DaemonState;
+pub use state::{DaemonState, WorkClass};

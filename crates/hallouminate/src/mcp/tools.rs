@@ -285,6 +285,7 @@ fn map_daemon_err(err: anyhow::Error) -> ErrorData {
         return match rpc.kind {
             ErrorKind::InvalidParams => invalid_params(rpc.message.clone()),
             ErrorKind::Internal => internal_error(rpc.message.clone()),
+            ErrorKind::Retryable => internal_error(rpc.message.clone()),
         };
     }
     internal_error(format!("{err:#}"))

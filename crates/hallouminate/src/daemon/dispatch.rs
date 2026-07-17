@@ -53,7 +53,8 @@ use super::ipc::{
     DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest,
     ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
-use super::state::{DaemonState, RequestResources};
+use super::state::{DaemonState, RequestResources, WorkClass};
+use super::status;
 
 pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
     // Resolve per-request config layering on every request: discover the
@@ -111,6 +112,7 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::CorpusStats { corpus } => {
             handle_corpus_stats(state, &effective, &req_cwd, corpus).await
         }
+        DaemonRequestPayload::Status => DaemonResponse::ok(&status::report(state)),
         DaemonRequestPayload::Shutdown => {
             // Handled before `resolve_for_cwd` above; unreachable here.
             DaemonResponse::ok(&"stopping")
@@ -1339,7 +1341,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
     // Boot reconciliation is in-flight work: hold a connection guard for the
     // whole sweep so idle-exit defers until it finishes instead of tearing a
     // reindex mid-scan under a small `idle_exit_secs` (ADR-003).
-    let _conn = state.enter_connection();
+    let _conn = state.enter_connection(WorkClass::Internal);
     let corpora = match state.baseline().effective_corpora() {
         Ok(c) => c,
         Err(e) => {
