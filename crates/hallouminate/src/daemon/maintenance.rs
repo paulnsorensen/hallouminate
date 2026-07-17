@@ -300,6 +300,7 @@ pub(super) async fn maintenance_loop(
             Pace::Full => state.run_maintenance_tick().await,
             Pace::Paced { .. } => state.run_maintenance_pass(pace).await,
         };
+        state.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
         if hard_forced {
             // The forced pass just ran off a possibly-stale Hard reading;
             // re-read + classify real debt so a write-idle-but-read-active
@@ -308,8 +309,8 @@ pub(super) async fn maintenance_loop(
             backpressure::refresh_observed(&state).await;
         }
         if tick == MaintenanceTick::Stop {
-            break;
-        }
+        break;
+    }
     }
 }
 

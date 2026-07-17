@@ -294,6 +294,17 @@ mod tests {
     }
 
     fn captured_warns(run: impl FnOnce()) -> String {
+        // Pin a permissive process-global dispatcher once. Without it, the
+        // global MAX_LEVEL and callsite-interest caches rebuild every time a
+        // parallel test's scoped subscriber is installed or dropped, and an
+        // event emitted mid-rebuild can be skipped — observed as the act-tier
+        // WARN vanishing from this capture while counts 3/4/6 arrive. With a
+        // permanent global default the caches never collapse; the thread-local
+        // default below still receives every event emitted in `run`.
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
         let capture = Capture::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(capture.clone())
