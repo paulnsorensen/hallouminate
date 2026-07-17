@@ -327,12 +327,30 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
 /// pending set, coalescing duplicates within *and across* batches — a burst
 /// that touches one file many times (or arrives in several batches before the
 /// consumer next drains) still reindexes it once per drain.
+///
+/// Filters by event *kind* first: `notify` 8.x's inotify backend subscribes
+/// `WatchMask::OPEN`, so read-opens (including the reads reindexing itself
+/// performs) surface as `EventKind::Access(_)`. Admitting those would make the
+/// watcher feed itself — boot catch-up reads every corpus file, each read
+/// emits an Access event, each Access event schedules a reindex, forever.
+/// Only actual mutations schedule reindexing: `Create`, `Modify` (data,
+/// metadata, or a rename's `Name(RenameMode::_)`), and `Remove`. The
+/// catch-all `EventKind::Any` (used in tests and by backends that can't
+/// distinguish, e.g. `PollWatcher`) is admitted too — dropping it risks
+/// discarding a real mutation the backend just couldn't classify, and a
+/// spurious reindex is cheap. `EventKind::Other` is admitted-by-default here
+/// as well: notify's inotify backend only emits it for an inotify queue
+/// overflow forcing a directory rescan (`Flag::Rescan`), never for a
+/// non-mutating access, so treating it like `Any` is the conservative call.
 fn record_pending(
     pending: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
     events: &[notify_debouncer_full::DebouncedEvent],
 ) {
     let mut set = pending.lock().expect("watch pending-paths mutex");
     for event in events {
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            continue;
+        }
         for path in &event.paths {
             // Extension-only, matching `format_from_extension`'s classification
             // without reading bytes: a deleted path no longer exists to sniff, and
@@ -1024,6 +1042,89 @@ mod tests {
             std::collections::HashSet::from([uppercase_md, csv]),
             "an uppercase .MD and a .csv must be admitted (matching \
              format_from_extension), while a known-unsupported .docx is dropped"
+        );
+    }
+
+    /// `record_pending` must never schedule a reindex for an `Access` event
+    /// — the fix for the self-sustaining watcher loop: `notify` 8.x's inotify
+    /// backend subscribes `WatchMask::OPEN`, so a plain read-open (including
+    /// the read `handle_changed_path` performs while reindexing) surfaces as
+    /// `EventKind::Access(_)`. Admitting Access events would make every
+    /// reindex re-trigger itself.
+    #[test]
+    fn record_pending_drops_access_events() {
+        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
+            std::sync::Mutex::new(std::collections::HashSet::new());
+        let read = PathBuf::from("/srv/wiki/read.md");
+
+        let batch = vec![notify_debouncer_full::DebouncedEvent::new(
+            notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Open(
+                notify::event::AccessMode::Any,
+            )))
+            .add_path(read.clone()),
+            std::time::Instant::now(),
+        )];
+
+        record_pending(&pending, &batch);
+
+        let drained: std::collections::HashSet<PathBuf> =
+            pending.lock().expect("pending mutex").drain().collect();
+        assert!(
+            drained.is_empty(),
+            "an Access(Open) event must never schedule a reindex — it is what \
+             drives the watcher's self-feeding loop, not a real change"
+        );
+    }
+
+    /// Companion to `record_pending_drops_access_events`: every mutation kind
+    /// — create, data/metadata modify, a rename's `Name(RenameMode::Both)`,
+    /// and remove — must still be admitted, so the Access filter above only
+    /// narrows admission and does not regress real change detection.
+    #[test]
+    fn record_pending_admits_mutation_kinds() {
+        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
+            std::sync::Mutex::new(std::collections::HashSet::new());
+        let created = PathBuf::from("/srv/wiki/created.md");
+        let modified = PathBuf::from("/srv/wiki/modified.md");
+        let renamed = PathBuf::from("/srv/wiki/renamed.md");
+        let removed = PathBuf::from("/srv/wiki/removed.md");
+
+        let batch = vec![
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                    .add_path(created.clone()),
+                std::time::Instant::now(),
+            ),
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                    notify::event::DataChange::Any,
+                )))
+                .add_path(modified.clone()),
+                std::time::Instant::now(),
+            ),
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                    notify::event::RenameMode::Both,
+                )))
+                .add_path(renamed.clone()),
+                std::time::Instant::now(),
+            ),
+            notify_debouncer_full::DebouncedEvent::new(
+                notify::Event::new(notify::EventKind::Remove(notify::event::RemoveKind::File))
+                    .add_path(removed.clone()),
+                std::time::Instant::now(),
+            ),
+        ];
+
+        record_pending(&pending, &batch);
+
+        let drained: std::collections::HashSet<PathBuf> =
+            pending.lock().expect("pending mutex").drain().collect();
+        assert_eq!(
+            drained,
+            std::collections::HashSet::from([created, modified, renamed, removed]),
+            "create, modify (data + rename), and remove events must all still \
+             schedule a reindex"
         );
     }
 
