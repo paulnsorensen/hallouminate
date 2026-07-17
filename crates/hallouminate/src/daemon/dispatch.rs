@@ -2819,6 +2819,16 @@ mod tests {
 
         let content: &[u8] = b"# Note\n\nthe spice must flow\n";
         std::fs::write(&file, content).unwrap();
+        // Backdate so the explicit `later` mtime below stays strictly in
+        // the past: a mtime at/after indexing time is smudged by the
+        // racy-clean guard (`smudge_racy_mtime`), which would fail the
+        // exact-mtime assertion here.
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
         let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
         index_single_file(&store, &registry, &corpus, &file)
             .await
@@ -2887,6 +2897,15 @@ mod tests {
             .to_string();
 
         std::fs::write(&file, "# Note\n\nthe spice must flow\n").unwrap();
+        // Backdate for the same reason as the touch-path test above: keep
+        // `later` strictly past so the racy-clean smudge stays out of the
+        // exact-mtime assertion.
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(10))
+            .unwrap();
         let mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
         index_single_file(&store, &registry, &corpus, &file)
             .await

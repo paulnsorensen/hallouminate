@@ -185,6 +185,20 @@ pub struct DaemonConfig {
     /// longer than this should fail fast and retry).
     #[serde(default = "default_hard_block_wait_secs")]
     pub hard_block_wait_secs: u64,
+    /// Per-mutation delay applied under `DebtLevel::Soft`. Default: `250`
+    /// (slows a write storm enough to curb debt growth while staying small
+    /// next to a mutation's own embedding/IO cost -- a cost signal, not a
+    /// wall).
+    #[serde(default = "default_debt_soft_delay_ms")]
+    pub debt_soft_delay_ms: u64,
+    /// Seconds a debt reading stays cached before the next mutation
+    /// re-reads lance metadata. Default: `5` (bounds `LanceStore::debt`
+    /// metadata reads to one per window under a write storm, yet stays
+    /// well under `hard_block_wait_secs` so a Hard-blocked mutation
+    /// observes maintenance finishing within a few polls). `0` disables
+    /// caching.
+    #[serde(default = "default_debt_cache_ttl_secs")]
+    pub debt_cache_ttl_secs: u64,
     /// Max fragments compacted per paced maintenance slice. Default: `8`
     /// (small enough to release the write guard frequently under PSI).
     #[serde(default = "default_paced_slice_budget")]
@@ -233,6 +247,8 @@ impl Default for DaemonConfig {
             debt_soft_stale_versions: default_debt_soft_stale_versions(),
             debt_hard_stale_versions: default_debt_hard_stale_versions(),
             hard_block_wait_secs: default_hard_block_wait_secs(),
+            debt_soft_delay_ms: default_debt_soft_delay_ms(),
+            debt_cache_ttl_secs: default_debt_cache_ttl_secs(),
             paced_slice_budget: default_paced_slice_budget(),
             paced_slice_sleep_ms: default_paced_slice_sleep_ms(),
             churn_warn_at: default_churn_warn_at(),
@@ -794,6 +810,22 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        debt_soft_delay_ms: merge_scalar(
+            "daemon.debt_soft_delay_ms",
+            baseline.daemon.debt_soft_delay_ms,
+            repo.daemon.debt_soft_delay_ms,
+            defaults.daemon.debt_soft_delay_ms,
+            baseline_path,
+            repo_path,
+        )?,
+        debt_cache_ttl_secs: merge_scalar(
+            "daemon.debt_cache_ttl_secs",
+            baseline.daemon.debt_cache_ttl_secs,
+            repo.daemon.debt_cache_ttl_secs,
+            defaults.daemon.debt_cache_ttl_secs,
+            baseline_path,
+            repo_path,
+        )?,
         paced_slice_budget: merge_scalar(
             "daemon.paced_slice_budget",
             baseline.daemon.paced_slice_budget,
@@ -1185,6 +1217,12 @@ fn default_debt_hard_stale_versions() -> u64 {
 fn default_hard_block_wait_secs() -> u64 {
     30
 }
+fn default_debt_soft_delay_ms() -> u64 {
+    250
+}
+fn default_debt_cache_ttl_secs() -> u64 {
+    5
+}
 fn default_paced_slice_budget() -> u64 {
     8
 }
@@ -1526,6 +1564,8 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.debt_soft_stale_versions, 50);
         assert_eq!(cfg.debt_hard_stale_versions, 250);
         assert_eq!(cfg.hard_block_wait_secs, 30);
+        assert_eq!(cfg.debt_soft_delay_ms, 250);
+        assert_eq!(cfg.debt_cache_ttl_secs, 5);
         assert_eq!(cfg.paced_slice_budget, 8);
         assert_eq!(cfg.paced_slice_sleep_ms, 500);
         assert_eq!(cfg.churn_warn_at, 10);
@@ -1553,6 +1593,8 @@ debt_hard_fragments = 900
 debt_soft_stale_versions = 75
 debt_hard_stale_versions = 400
 hard_block_wait_secs = 45
+debt_soft_delay_ms = 100
+debt_cache_ttl_secs = 10
 paced_slice_budget = 4
 paced_slice_sleep_ms = 250
 churn_warn_at = 20
@@ -1570,6 +1612,8 @@ boot_backoff_cap_secs = 600
         assert_eq!(cfg.daemon.debt_soft_stale_versions, 75);
         assert_eq!(cfg.daemon.debt_hard_stale_versions, 400);
         assert_eq!(cfg.daemon.hard_block_wait_secs, 45);
+        assert_eq!(cfg.daemon.debt_soft_delay_ms, 100);
+        assert_eq!(cfg.daemon.debt_cache_ttl_secs, 10);
         assert_eq!(cfg.daemon.paced_slice_budget, 4);
         assert_eq!(cfg.daemon.paced_slice_sleep_ms, 250);
         assert_eq!(cfg.daemon.churn_warn_at, 20);
