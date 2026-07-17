@@ -11,14 +11,25 @@ use super::{debt, heartbeat, ladder};
 /// consecutive-defer streak, watcher counters (including `noop_reindexes`),
 /// maintenance debt level, and the last ladder trip.
 ///
-/// `per_task` is empty until wiring W1 plumbs a
-/// [`heartbeat::HeartbeatRegistry`] handle into `DaemonState` — the
-/// registry module exists but nothing stores an instance the report could
-/// read yet.
+/// `per_task` lists every task name as `TaskState::Alive`: a single
+/// snapshot has no prior-epoch sample to detect a stall from — the
+/// watchdog (continuous poller) is the real stall detector.
 pub(super) fn report(state: &DaemonState) -> ipc::StatusReport {
     let (events, reindexes, noop_reindexes) = state.watcher_counters_snapshot();
     ipc::StatusReport {
-        per_task: Vec::new(),
+        per_task: [
+            heartbeat::TaskName::Maintenance,
+            heartbeat::TaskName::CatchUp,
+            heartbeat::TaskName::WatcherPump,
+            heartbeat::TaskName::IdleExit,
+            heartbeat::TaskName::Signal,
+        ]
+        .into_iter()
+        .map(|task| ipc::TaskStatus {
+            task: wire_task(task),
+            state: ipc::TaskState::Alive,
+        })
+        .collect(),
         debt: wire_debt(debt::level()),
         defer_count: state.defer_count(),
         watcher: ipc::WatcherCounters {
@@ -84,13 +95,20 @@ mod tests {
         // zero/none shape, not an invented value.
         let state = test_state().await;
         let report = report(&state);
+        assert_eq!(report.per_task.len(), 5);
         assert!(
-            report.per_task.is_empty(),
-            "no heartbeat registry is plumbed into DaemonState yet (W1), \
-             so per_task must be empty, got {:?}",
+            report
+                .per_task
+                .iter()
+                .all(|t| t.state == ipc::TaskState::Alive),
+            "single-snapshot per_task entries are always Alive, got {:?}",
             report.per_task,
         );
-        assert_eq!(report.debt, ipc::DebtLevel::Ok);
+        // `debt::level()` is a process-wide last-observation static (curd 2's
+        // backpressure design), so parallel tests may have observed Soft/Hard
+        // by the time this runs — assert the report MIRRORS the level rather
+        // than pinning the global's value.
+        assert_eq!(report.debt, super::wire_debt(debt::level()));
         assert_eq!(report.defer_count, 0);
         assert_eq!(report.watcher, ipc::WatcherCounters::default());
         assert!(

@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -22,6 +22,8 @@ use super::dispatch::dispatch;
 use super::ipc::{DaemonRequest, DaemonResponse};
 use super::socket::daemon_socket_path;
 use super::state::{DaemonState, WorkClass};
+use super::heartbeat::TaskName;
+use super::watchdog;
 
 #[derive(Debug, Default, Clone)]
 pub struct DaemonArgs {
@@ -79,21 +81,74 @@ async fn serve_with_config(
     xdg_path: Option<PathBuf>,
     socket_path: &Path,
 ) -> anyhow::Result<()> {
+    // Crash-loop boot backoff (ADR daemon-rework-004): a recent watchdog
+    // trip streak imposes an escalating wait before the daemon may bind.
+    // Distinct exit code so wrappers can tell "backing off" from failure;
+    // never a permanent refusal — trips decay after a quiet window.
+    let now_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if let watchdog::BootDecision::Backoff {
+        retry_after_secs,
+        backoff_secs,
+        recent_trips,
+    } = watchdog::check_boot_backoff(
+        &watchdog::default_trip_state_path(),
+        cfg.daemon.boot_backoff_floor_secs,
+        cfg.daemon.boot_backoff_cap_secs,
+        now_unix,
+    ) {
+        tracing::error!(
+            target: "hallouminate::daemon",
+            retry_after_secs,
+            backoff_secs,
+            recent_trips,
+            "watchdog trip backoff active; refusing to start yet",
+        );
+        std::process::exit(watchdog::BOOT_BACKOFF_EXIT_CODE);
+    }
     prepare_socket_dir(socket_path).await?;
     let lock_path = lock_path_for(socket_path);
     let lock = acquire_single_instance(&lock_path)?;
     let state = DaemonState::open(cfg, xdg_path).await?;
     remove_stale_socket(socket_path).await;
-    let watcher = super::watch::spawn_corpus_watcher(&state);
+    // One-shot probe to learn whether the watcher is enabled (watchable
+    // roots exist and the backend initializes); the probe handle is dropped
+    // before the supervised factory creates the long-lived instance, so two
+    // debouncers never run at once.
+    let watcher_enabled = super::watch::spawn_corpus_watcher(&state).is_some();
+    {
+        let sup = state.supervisor().clone();
+        let factory_state = state.clone();
+        sup.spawn(TaskName::WatcherPump, move || {
+            let state = factory_state.clone();
+            async move {
+                match super::watch::spawn_corpus_watcher(&state) {
+                    Some(handle) => handle.join().await,
+                    // Creation failed on this (re)start: park instead of
+                    // hot-looping the factory; a restart only helps after
+                    // conditions change, which needs a daemon restart anyway.
+                    None => std::future::pending::<()>().await,
+                }
+            }
+        });
+    }
     spawn_signal_handlers(&state);
     spawn_idle_exit(&state, state.baseline().daemon.idle_exit_secs);
-    tokio::spawn(super::dispatch::catch_up_index(state.clone()));
+    {
+        let sup = state.supervisor().clone();
+        let factory_state = state.clone();
+        sup.spawn(TaskName::CatchUp, move || {
+            super::dispatch::catch_up_index(factory_state.clone())
+        });
+    }
+    spawn_watchdog_when_armed(&state, watcher_enabled);
     let (result, shutdown_deadline): (anyhow::Result<()>, Instant) =
         match serve_on_listener(&state, socket_path, IDLE_READ_TIMEOUT).await {
             Ok(deadline) => (Ok(()), deadline),
             Err(error) => (Err(error), Instant::now() + SHUTDOWN_DRAIN_TIMEOUT),
         };
-    drop(watcher);
     state.shutdown_token().cancel();
     let maintenance = state.take_maintenance_task().await;
     finish_shutdown(maintenance, lock, socket_path, shutdown_deadline).await;
@@ -112,24 +167,32 @@ async fn serve_with_config(
 /// integration test relies on to raise the signal without a spawn race.
 pub fn spawn_signal_handlers(state: &DaemonState) {
     let token = state.shutdown_token().clone();
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
+    let sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(target: "hallouminate::daemon", error = %e, "failed to install SIGTERM handler");
             return;
         }
     };
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!(target: "hallouminate::daemon", "received SIGINT; shutting down");
+    // The Signal stream survives restarts inside the shared Mutex: the
+    // supervisor factory can't re-register (registration is the synchronous
+    // postcondition above), so each (re)start re-locks the same stream.
+    let sigterm = Arc::new(tokio::sync::Mutex::new(sigterm));
+    state.supervisor().spawn(TaskName::Signal, move || {
+        let token = token.clone();
+        let sigterm = Arc::clone(&sigterm);
+        async move {
+            let mut sigterm = sigterm.lock().await;
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!(target: "hallouminate::daemon", "received SIGINT; shutting down");
+                }
+                _ = sigterm.recv() => {
+                    tracing::info!(target: "hallouminate::daemon", "received SIGTERM; shutting down");
+                }
             }
-            _ = sigterm.recv() => {
-                tracing::info!(target: "hallouminate::daemon", "received SIGTERM; shutting down");
-            }
+            token.cancel();
         }
-        token.cancel();
     });
 }
 
@@ -142,32 +205,108 @@ fn spawn_idle_exit(state: &DaemonState, idle_exit_secs: u64) {
     if idle_exit_secs == 0 {
         return;
     }
-    let state = state.clone();
-    let cancel = state.shutdown_token().clone();
-    tokio::spawn(async move {
-        loop {
-            // Sleep to the deadline, not a fixed period: recomputing the
-            // remaining window each iteration bounds idle-exit overshoot to
-            // ~one short sleep regardless of `idle_exit_secs`. The `.max(1)`
-            // floor avoids a busy-loop when the deadline has already passed
-            // but a connection is still active (`should_idle_exit` false).
-            let secs = state.secs_until_idle(idle_exit_secs).max(1);
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                    if state.should_idle_exit(idle_exit_secs) {
-                        tracing::info!(
-                            target: "hallouminate::daemon",
-                            idle_secs = idle_exit_secs,
-                            "daemon idle-exit; exiting so the OS reclaims all memory",
-                        );
-                        state.shutdown_token().cancel();
-                        break;
+    let sup = state.supervisor().clone();
+    let factory_state = state.clone();
+    sup.spawn(TaskName::IdleExit, move || {
+        let state = factory_state.clone();
+        async move {
+            let cancel = state.shutdown_token().clone();
+            loop {
+                // Sleep to the deadline, not a fixed period: recomputing the
+                // remaining window each iteration bounds idle-exit overshoot
+                // to ~one short sleep regardless of `idle_exit_secs`. The
+                // `.max(1)` floor avoids a busy-loop when the deadline has
+                // already passed but a connection is still active
+                // (`should_idle_exit` false).
+                let secs = state.secs_until_idle(idle_exit_secs).max(1);
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(secs)) => {
+                        state.heartbeat().bump(TaskName::IdleExit);
+                        if state.should_idle_exit(idle_exit_secs) {
+                            tracing::info!(
+                                target: "hallouminate::daemon",
+                                idle_secs = idle_exit_secs,
+                                "daemon idle-exit; exiting so the OS reclaims all memory",
+                            );
+                            state.shutdown_token().cancel();
+                            break;
+                        }
                     }
                 }
             }
         }
+    });
+}
+
+/// Self-arming watchdog start (ADR daemon-rework-005). A task joins the
+/// watchdog's monitored set only after its first heartbeat bump, so a task
+/// whose first cycle is slower than the stall window can't false-trip
+/// before it has run once. `watchdog::Watchdog` monitors a static task list
+/// from construction (curd 8's API), so arming happens here: wait for every
+/// *enabled* periodic loop to bump once, then spawn the watchdog. Tasks
+/// disabled at boot (maintenance_interval_secs == 0, idle_exit_secs == 0,
+/// no watchable corpus roots) are excluded entirely. CatchUp (one-shot) and
+/// Signal (bumps only on signals) are never monitored — a stall detector
+/// keyed on periodic heartbeats would always false-trip them.
+/// Fire-and-forget, tied to the daemon shutdown token, so it never blocks
+/// socket accept and tears down cleanly even mid-arming.
+/// Known accepted gap: a fully-idle WatcherPump (no filesystem events for
+/// the stall window) still looks identical to "stalled" once armed; the
+/// wiring cadence pass (W2/W3) closes this before release.
+fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) {
+    let daemon = &state.baseline().daemon;
+    let stall_secs = daemon.watchdog_stall_secs;
+    let mut candidates: Vec<TaskName> = Vec::new();
+    if daemon.maintenance_interval_secs != 0 {
+        candidates.push(TaskName::Maintenance);
+    }
+    if watcher_enabled {
+        candidates.push(TaskName::WatcherPump);
+    }
+    if daemon.idle_exit_secs != 0 {
+        candidates.push(TaskName::IdleExit);
+    }
+    // `watchdog_stall_secs == 0` disables the watchdog subsystem entirely.
+    if stall_secs == 0 || candidates.is_empty() {
+        tracing::info!(
+            target: "hallouminate::daemon",
+            stall_secs,
+            candidate_count = candidates.len(),
+            "watchdog disabled (no stall window or no monitorable tasks)",
+        );
+        return;
+    }
+    // Same cadence for the arming wait and the watchdog's own poll:
+    // stall/4 keeps detection latency within ~1.25x the stall window,
+    // clamped so tiny windows still poll and huge ones don't go quiet.
+    let poll = Duration::from_secs((stall_secs / 4).clamp(1, 60));
+    let stall = Duration::from_secs(stall_secs);
+    let state = state.clone();
+    tokio::spawn(async move {
+        let shutdown = state.shutdown_token().clone();
+        let heartbeat = state.heartbeat().clone();
+        loop {
+            if candidates.iter().all(|task| heartbeat.epoch(*task) > 0) {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(poll) => {}
+            }
+        }
+        let watchdog = watchdog::Watchdog::spawn(
+            heartbeat,
+            candidates,
+            stall,
+            poll,
+            watchdog::default_trip_state_path(),
+            Box::new(|_| std::process::abort()),
+        );
+        shutdown.cancelled().await;
+        watchdog.stop();
     });
 }
 

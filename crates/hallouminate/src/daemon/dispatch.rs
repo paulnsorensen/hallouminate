@@ -1384,6 +1384,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
                 error = %e, "boot catch-up: reindex failed; skipped"),
         }
     }
+    state.heartbeat().bump(super::heartbeat::TaskName::CatchUp);
 }
 
 /// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed

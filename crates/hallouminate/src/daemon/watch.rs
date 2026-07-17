@@ -172,6 +172,15 @@ pub struct WatcherHandle {
     _debouncer: Box<dyn std::any::Any + Send>,
 }
 
+impl WatcherHandle {
+    /// Await the pump task; used by the supervisor factory so a watcher
+    /// restart rebuilds the whole debouncer + pump pair. Holds `self` (and
+    /// so the debouncer) alive until the pump future completes.
+    pub(crate) async fn join(self) {
+        let _ = self._task.await;
+    }
+}
+
 /// Watch the baseline corpora roots and spawn a task that reindexes changed
 /// markdown files (debounced by `cfg.watch.debounce_ms`). Returns `None` when
 /// there are no watchable roots or the watcher backend fails to initialize —
@@ -310,6 +319,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                     break;
                 }
             }
+            state.heartbeat().bump(super::heartbeat::TaskName::WatcherPump);
             let paths: Vec<PathBuf> = {
                 let mut set = pending.lock().expect("watch pending-paths mutex");
                 set.drain().collect()
