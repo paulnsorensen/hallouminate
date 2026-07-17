@@ -1992,13 +1992,35 @@ async fn status_reports_running_then_not_running_across_shutdown() {
     }
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
 
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok while running"),
-        hallouminate::daemon::DaemonStatus::Running,
-        "status must be Running against a live daemon"
-    );
+    // End-to-end acceptance (curd 9): the Status IPC round trip must carry
+    // the full report — per-task states, debt, defer count, watcher counters
+    // including noop_reindexes, and trip state — from DaemonState storage.
+    // A fresh daemon has recorded nothing, so every field is default-shaped.
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok while running")
+    {
+        hallouminate::daemon::DaemonStatus::Running(report) => {
+            assert!(
+                report.per_task.is_empty(),
+                "per_task must be empty until W1 plumbs the heartbeat registry"
+            );
+            assert_eq!(report.debt, hallouminate::daemon::DebtLevel::Ok);
+            assert_eq!(report.defer_count, 0);
+            assert_eq!(
+                report.watcher,
+                hallouminate::daemon::WatcherCounters::default()
+            );
+            assert!(
+                matches!(report.trips, hallouminate::daemon::TripState::None),
+                "fresh daemon must report no ladder trip, got {:?}",
+                report.trips,
+            );
+        }
+        hallouminate::daemon::DaemonStatus::NotRunning => {
+            panic!("status must be Running against a live daemon")
+        }
+    }
 
     // Drive a graceful shutdown via the IPC path, then assert NotRunning.
     let client = connect_at(&socket).await.expect("connect");
@@ -2014,11 +2036,13 @@ async fn status_reports_running_then_not_running_across_shutdown() {
         .expect("join ok");
     served.expect("serve Ok on shutdown");
 
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok while stopped"),
-        hallouminate::daemon::DaemonStatus::NotRunning,
+    assert!(
+        matches!(
+            hallouminate::daemon::status()
+                .await
+                .expect("status ok while stopped"),
+            hallouminate::daemon::DaemonStatus::NotRunning
+        ),
         "status must be NotRunning once the socket is gone"
     );
 }
@@ -2094,11 +2118,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     // First daemon up and reachable.
     let first = spawn_serve(cfg.clone(), &socket).await;
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok while first daemon runs"),
-        hallouminate::daemon::DaemonStatus::Running,
+    assert!(
+        matches!(
+            hallouminate::daemon::status()
+                .await
+                .expect("status ok while first daemon runs"),
+            hallouminate::daemon::DaemonStatus::Running(_)
+        ),
         "the first daemon must be reachable before restart",
     );
 
@@ -2113,11 +2139,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     let stash = second_handle.clone();
     hallouminate::daemon::restart_with(|| async move {
         // After restart's stop(), nothing must answer on the socket.
-        assert_eq!(
-            hallouminate::daemon::status()
-                .await
-                .expect("status ok between stop and respawn"),
-            hallouminate::daemon::DaemonStatus::NotRunning,
+        assert!(
+            matches!(
+                hallouminate::daemon::status()
+                    .await
+                    .expect("status ok between stop and respawn"),
+                hallouminate::daemon::DaemonStatus::NotRunning
+            ),
             "restart must stop the old daemon before respawning",
         );
         let handle = spawn_serve(restarted_cfg, &restart_socket).await;
@@ -2135,11 +2163,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     first_result.expect("first serve returns Ok on shutdown");
 
     // The freshly respawned daemon must be reachable.
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok after restart"),
-        hallouminate::daemon::DaemonStatus::Running,
+    assert!(
+        matches!(
+            hallouminate::daemon::status()
+                .await
+                .expect("status ok after restart"),
+            hallouminate::daemon::DaemonStatus::Running(_)
+        ),
         "restart must leave a fresh, reachable daemon up",
     );
 

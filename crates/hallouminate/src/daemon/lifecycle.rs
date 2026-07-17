@@ -12,24 +12,28 @@ use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_at;
-use super::ipc::{DaemonRequest, DaemonRequestPayload};
+use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, StatusReport};
 use super::socket::daemon_socket_path;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_POLL: Duration = Duration::from_millis(50);
-/// Bound on the `Ping` round trip `status` uses to probe liveness — an
-/// accepted-but-silent socket must report `NotRunning`, not hang the CLI.
+/// Bound on the `Status` round trip `status` uses — an accepted-but-silent
+/// socket must report `NotRunning`, not hang the CLI.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Liveness of the daemon for `daemon status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Result of `daemon status`: a reachable daemon answers with its full
+/// [`StatusReport`]; anything unreachable is `NotRunning`.
+#[derive(Debug, Clone)]
 pub enum DaemonStatus {
-    Running,
+    Running(StatusReport),
     NotRunning,
 }
 
-/// Probe the daemon: `Ping` over the control socket. A connect failure (no
-/// socket, or a stale socket with no listener) maps to `NotRunning`.
+/// Query the daemon's self-status over the control socket. Transport
+/// failures (no socket, stale socket with no listener, silent or timed-out
+/// peer) map to `NotRunning`; a daemon that answers but returns an error or
+/// an unparseable payload is a real fault and surfaces as `Err` — it IS
+/// running, so reporting `NotRunning` would be a lie.
 pub async fn status() -> anyhow::Result<DaemonStatus> {
     let socket = daemon_socket_path();
     let client = match connect_at(&socket).await {
@@ -40,13 +44,20 @@ pub async fn status() -> anyhow::Result<DaemonStatus> {
         .call_raw_with_timeout(
             DaemonRequest {
                 cwd: std::env::current_dir().unwrap_or_default(),
-                payload: DaemonRequestPayload::Ping,
+                payload: DaemonRequestPayload::Status,
             },
             STATUS_TIMEOUT,
         )
         .await
     {
-        Ok(_) => Ok(DaemonStatus::Running),
+        Ok(DaemonResponse::Ok { result }) => {
+            let report: StatusReport = serde_json::from_value(result)
+                .map_err(|e| anyhow::anyhow!("daemon returned unexpected status payload: {e}"))?;
+            Ok(DaemonStatus::Running(report))
+        }
+        Ok(DaemonResponse::Err { kind, message }) => {
+            anyhow::bail!("daemon status request failed ({kind:?}): {message}")
+        }
         Err(_) => Ok(DaemonStatus::NotRunning),
     }
 }
