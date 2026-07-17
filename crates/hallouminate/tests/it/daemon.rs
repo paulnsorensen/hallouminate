@@ -2071,6 +2071,50 @@ async fn stop_is_a_noop_against_an_already_stopped_daemon() {
     );
 }
 
+#[tokio::test]
+async fn status_surfaces_daemon_error_response_as_err_not_not_running() {
+    // Curd 9 deferred gap: a daemon that ANSWERS the Status RPC but returns a
+    // `DaemonResponse::Err` envelope IS running — `status()` must surface that
+    // as `Err`, never fold it into `NotRunning` (which callers read as "safe
+    // to spawn another daemon"). Bind a stub server that replies to any
+    // request with an internal-error envelope and assert the error (with the
+    // daemon's message preserved) comes back.
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("erroring.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind stub socket");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                // The wire shape of `DaemonResponse::internal(...)` (ipc.rs:
+                // tag = "status", snake_case kinds).
+                let _ = write_half
+                    .write_all(
+                        b"{\"status\":\"err\",\"kind\":\"internal\",\"message\":\"status assembly failed\"}\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
+
+    let err = hallouminate::daemon::status().await.expect_err(
+        "an answering daemon that returns an error envelope must surface Err, not NotRunning",
+    );
+    assert!(
+        format!("{err:#}").contains("status assembly failed"),
+        "the daemon's error message must be preserved for the operator: {err:#}"
+    );
+}
+
 /// Spawn an in-process `serve` on `socket` from a fresh `DaemonState` and wait
 /// until the socket is reachable. Returns the serve task handle so the caller
 /// can join it after a graceful shutdown.

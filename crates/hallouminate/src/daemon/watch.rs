@@ -1039,6 +1039,109 @@ mod tests {
         );
     }
 
+    /// Churn wiring (G7, wiring task W3): consecutive zero-upsert reindexes
+    /// driven through `handle_changed_path` must trip the act-tier ladder —
+    /// recorded via `state.record_ladder_trip` as `ForceMaintenance` — and a
+    /// real upsert must reset the streak. Once-per-streak refire suppression
+    /// is pinned at unit level in churn.rs; this pins the wiring: config
+    /// thresholds → tracker → `LadderOutcome::Action` arm → trip snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consecutive_noop_reindexes_trip_force_maintenance_and_reset_on_upsert() {
+        use super::super::ladder::LadderAction;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = crate::config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        cfg.daemon.churn_warn_at = 2;
+        cfg.daemon.churn_act_at = 3;
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let note = corpus_dir.join("note.md");
+        std::fs::write(&note, "# Note\n\nbody\n").expect("write note");
+
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        let mut failures = disabled_coalescer();
+        // Mirrors the pump construction in `spawn_corpus_watcher`: thresholds
+        // come from the baseline daemon config, not test-local constants.
+        let baseline = state.baseline();
+        let mut churn =
+            ChurnTracker::new(baseline.daemon.churn_warn_at, baseline.daemon.churn_act_at);
+
+        // A noop reindex = mtime moved (passes the stage-1 gate) but content
+        // unchanged (indexer hash fast path upserts nothing).
+        let bump_mtime = |path: &Path| {
+            let bumped = std::fs::metadata(path)
+                .expect("stat")
+                .modified()
+                .expect("mtime")
+                + Duration::from_millis(10);
+            set_mtime(path, bumped);
+        };
+
+        // Initial index: a real upsert; no trip.
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        assert_eq!(
+            state.last_ladder_trip(),
+            None,
+            "a real upsert must not trip the ladder",
+        );
+
+        // Two noops: streak 2 < act_at 3 — warn tier at most, no trip.
+        for _ in 0..2 {
+            bump_mtime(&note);
+            handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        }
+        assert_eq!(
+            state.last_ladder_trip(),
+            None,
+            "a noop streak below act_at must not trip the ladder",
+        );
+
+        // A real upsert (content rewritten) must reset the streak...
+        std::fs::write(&note, "# Note\n\nrewritten body\n").expect("rewrite note");
+        bump_mtime(&note);
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+
+        // ...so two more noops stay below the threshold. Without the reset
+        // the streak would be 4 >= act_at 3 here and this assertion fails.
+        for _ in 0..2 {
+            bump_mtime(&note);
+            handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        }
+        assert_eq!(
+            state.last_ladder_trip(),
+            None,
+            "a real upsert must reset the noop streak; a trip here means reset-on-upsert is broken",
+        );
+
+        // Third consecutive noop reaches act_at: the act-tier trip is
+        // recorded as ForceMaintenance.
+        bump_mtime(&note);
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        let trip = state
+            .last_ladder_trip()
+            .expect("act threshold reached: the trip must be recorded on state");
+        assert!(
+            matches!(trip.action, LadderAction::ForceMaintenance),
+            "churn escalation must force maintenance, got {:?}",
+            trip.action,
+        );
+        assert_eq!(
+            state.watcher_counters_snapshot(),
+            (0, 7, 5),
+            "2 real + 5 noop reindexes must be counted (events stay 0: driven \
+             directly, not through the pump)",
+        );
+    }
+
     /// Acceptance (ADR daemon-rework-003 stage 1): WHEN a watched file emits
     /// an event but its mtime equals the stored snapshot, the watcher SHALL
     /// NOT read the file's content. Encoded by rewriting the content *behind*
