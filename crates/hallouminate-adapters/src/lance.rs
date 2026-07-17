@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1053,12 +1054,29 @@ impl LanceStore {
             return Ok(());
         }
         let existing = self.table.list_indices().await.map_err(map_lance_err)?;
-        let has_text_index = existing
-            .iter()
-            .any(|i| i.columns.iter().any(|c| c == "text"));
+        let has_text_index = existing.iter().any(|i| {
+            i.index_type == lancedb::index::IndexType::FTS && i.columns.iter().any(|c| c == "text")
+        });
         if !has_text_index {
             self.table
                 .create_index(&["text"], lancedb::index::Index::FTS(Default::default()))
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+        }
+        // FM-Index is built unconditionally on `text` too (mirrors FTS, not
+        // row-gated like the ANN index below) — an additive exact-substring
+        // signal for `hybrid_search`'s `contains_matches` boost. Its
+        // `index_type` must be checked (not just the column), since an FTS
+        // index also lives on `text` and `columns.iter().any(...)` alone
+        // can't tell them apart.
+        let has_fm_index = existing.iter().any(|i| {
+            i.index_type == lancedb::index::IndexType::Fm && i.columns.iter().any(|c| c == "text")
+        });
+        if !has_fm_index {
+            self.table
+                .create_index(&["text"], lancedb::index::Index::Fm(Default::default()))
+                .name("text_fm_idx".to_string())
                 .execute()
                 .await
                 .map_err(map_lance_err)?;
@@ -1127,9 +1145,9 @@ impl LanceStore {
             return Ok(true);
         }
         let existing = self.table.list_indices().await.map_err(map_lance_err)?;
-        let present = existing
-            .iter()
-            .any(|i| i.columns.iter().any(|c| c == "text"));
+        let present = existing.iter().any(|i| {
+            i.index_type == lancedb::index::IndexType::FTS && i.columns.iter().any(|c| c == "text")
+        });
         if present {
             self.text_index_present.store(true, Ordering::Release);
         }
@@ -1332,8 +1350,104 @@ impl LanceStore {
                 decode_hits(&rb, &mut out)?;
             }
         }
+        if out.is_empty() {
+            return Ok(out);
+        }
+        let chunk_ids: Vec<String> = out.iter().map(|h| h.chunk_id.clone()).collect();
+        let matched = match self.contains_matches(corpus, query, &chunk_ids).await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::lance",
+                    error = %e,
+                    "FM-Index contains() query failed; returning FTS+vector-only results"
+                );
+                HashSet::new()
+            }
+        };
+        apply_contains_boost(&mut out, &matched, CONTAINS_WEIGHT, weighted_rrf::K);
         Ok(out)
     }
+
+    /// Runs the FM-Index `contains()` substring filter that backs
+    /// `hybrid_search`'s exact-substring boost signal, scoped to `corpus`
+    /// and to the chunk_ids already present in `out` (via a `chunk_id IN
+    /// (...)` clause) instead of an unscoped `.limit`-capped corpus-wide
+    /// scan -- every chunk this can boost is already in that set, so this
+    /// both bounds the query to at most `chunk_ids.len()` rows and
+    /// guarantees every genuinely-matching `out` hit gets boosted. Returns
+    /// the empty set without querying when `query` or `chunk_ids` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB query or row decode fails; the caller
+    /// in `hybrid_search` treats this as non-fatal (logs and falls back to an
+    /// empty match set) rather than failing the whole search.
+    async fn contains_matches(
+        &self,
+        corpus: &str,
+        query: &str,
+        chunk_ids: &[String],
+    ) -> Result<HashSet<String>> {
+        if query.is_empty() || chunk_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let quoted: Vec<String> = chunk_ids
+            .iter()
+            .map(|c| format!("'{}'", escape_sql_str(c)))
+            .collect();
+        let predicate = format!(
+            "corpus = '{}' AND contains(text, '{}') AND chunk_id IN ({})",
+            escape_sql_str(corpus),
+            escape_sql_str(query),
+            quoted.join(", ")
+        );
+        let stream = self
+            .table
+            .query()
+            .only_if(predicate)
+            .select(lancedb::query::Select::columns(&["chunk_id"]))
+            .execute()
+            .await
+            .map_err(map_lance_err)?;
+        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let mut matched = HashSet::new();
+        for rb in &batches {
+            if rb.num_rows() == 0 {
+                continue;
+            }
+            let chunk_id = string_col(rb, "chunk_id")?;
+            for i in 0..rb.num_rows() {
+                matched.insert(chunk_id.value(i).to_string());
+            }
+        }
+        Ok(matched)
+    }
+}
+
+/// Boost weight for an FM-Index `contains()` match in [`apply_contains_boost`],
+/// matching `hallouminate_domain::search::RIPGREP_WEIGHT`'s value.
+const CONTAINS_WEIGHT: f32 = 1.0;
+
+/// Flat per-chunk boost for an FM-Index `contains()` match — deliberately not
+/// rank-based like `apply_rg_boost` (`hallouminate_domain::search`), since a
+/// `contains()` filter carries no positional/ranking meaning, unlike `rg`'s
+/// first-occurrence-in-file rank. Unlike `apply_rg_boost`, this always
+/// re-sorts even when `matched` is empty: not just a skipped optimization,
+/// but deliberate — the sort's `chunk_id` tie-break keeps ranking
+/// deterministic regardless of whether any chunk was boosted.
+fn apply_contains_boost(hits: &mut [SearchHit], matched: &HashSet<String>, weight: f32, k: f32) {
+    for hit in hits.iter_mut() {
+        if matched.contains(&hit.chunk_id) {
+            hit.score += weight / k;
+        }
+    }
+    hits.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+    });
 }
 
 async fn open_or_create_table(connection: &lancedb::Connection) -> Result<lancedb::Table> {
@@ -2558,6 +2672,282 @@ schema_version = 1
         assert!(
             msg.to_lowercase().contains("upgrade"),
             "must advise upgrade: {msg}"
+        );
+    }
+
+    /// FM-Index + FTS coexistence (spec's [BLOCKED] open question, resolved
+    /// empirically): `ensure_search_indexes` must be able to build BOTH an
+    /// FM-Index and an FTS index on the same `text` column without either
+    /// `create_index` call erroring or one index displacing the other.
+    #[tokio::test]
+    async fn fm_index_and_fts_coexist_on_text_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 3)])
+            .await
+            .expect("seed docs corpus (triggers ensure_search_indexes)");
+
+        let indices = store.table.list_indices().await.expect("list_indices");
+        let text_indices: Vec<_> = indices
+            .iter()
+            .filter(|i| i.columns.iter().any(|c| c == "text"))
+            .collect();
+        assert_eq!(
+            text_indices.len(),
+            2,
+            "expected exactly two distinct indexes on `text` (FM-Index + FTS), got: {:?}",
+            text_indices
+                .iter()
+                .map(|i| &i.index_type)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            text_indices
+                .iter()
+                .any(|i| i.index_type == lancedb::index::IndexType::Fm),
+            "expected an FM-Index on `text`, got: {:?}",
+            text_indices
+                .iter()
+                .map(|i| &i.index_type)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            text_indices
+                .iter()
+                .any(|i| i.index_type == lancedb::index::IndexType::FTS),
+            "expected an FTS index on `text`, got: {:?}",
+            text_indices
+                .iter()
+                .map(|i| &i.index_type)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Two chunks with identical word count/structure, differing only in the
+    /// casing of one word. LanceDB's FTS tokenizer lowercases (case-
+    /// insensitive), so both chunks tie in raw BM25 score for a lowercase
+    /// query; `contains()` is case-sensitive and only matches the literal-
+    /// lowercase chunk, so the boost must break the tie deterministically in
+    /// its favor.
+    #[tokio::test]
+    async fn contains_boost_changes_ranking_between_fts_tied_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+
+        let mut pf_a = synthetic_prepared("/tmp/a.md", 0);
+        pf_a.chunks.push(PreparedChunk {
+            ord: 0,
+            heading_path: vec!["H".into()],
+            line_start: 1,
+            line_end: 2,
+            text: "Word is here now filler pad pad pad".into(),
+            claim_marks: None,
+        });
+        let mut pf_b = synthetic_prepared("/tmp/b.md", 0);
+        pf_b.chunks.push(PreparedChunk {
+            ord: 0,
+            heading_path: vec!["H".into()],
+            line_start: 1,
+            line_end: 2,
+            text: "word is here now filler pad pad pad".into(),
+            claim_marks: None,
+        });
+        store
+            .apply_batch(vec![pf_a, pf_b])
+            .await
+            .expect("seed tied corpus");
+
+        let hits = store
+            .hybrid_search("docs", "word", 10)
+            .await
+            .expect("hybrid search");
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected both chunks to match FTS on `word`, got: {hits:?}"
+        );
+        let a = hits
+            .iter()
+            .find(|h| h.file_ref == "/tmp/a.md")
+            .expect("chunk a present");
+        let b = hits
+            .iter()
+            .find(|h| h.file_ref == "/tmp/b.md")
+            .expect("chunk b present");
+
+        assert_eq!(
+            hits[0].file_ref, "/tmp/b.md",
+            "lowercase substring match must sort first after the contains() boost, got: {hits:?}"
+        );
+        assert!(
+            b.score > a.score,
+            "contains()-matched chunk must score strictly higher, got a={} b={}",
+            a.score,
+            b.score
+        );
+        let expected_delta = CONTAINS_WEIGHT / weighted_rrf::K;
+        assert!(
+            (b.score - a.score - expected_delta).abs() < 1e-6,
+            "score delta must equal exactly the contains() boost (proving FTS tied pre-boost), \
+             expected delta {expected_delta}, got {}",
+            b.score - a.score
+        );
+    }
+
+    /// Non-regression: when `contains()` matches nothing for the query (here,
+    /// because the case-sensitive substring never appears literally even
+    /// though the case-insensitive FTS tokenizer matches both chunks), the
+    /// boost must be a no-op — scores stay FTS-tied and the tie-break order
+    /// is unaffected by the FM-Index signal.
+    #[tokio::test]
+    async fn no_substring_match_leaves_fts_ranking_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+
+        let mut pf_a = synthetic_prepared("/tmp/a.md", 0);
+        pf_a.chunks.push(PreparedChunk {
+            ord: 0,
+            heading_path: vec!["H".into()],
+            line_start: 1,
+            line_end: 2,
+            text: "Word is here now filler pad pad pad".into(),
+            claim_marks: None,
+        });
+        let mut pf_b = synthetic_prepared("/tmp/b.md", 0);
+        pf_b.chunks.push(PreparedChunk {
+            ord: 0,
+            heading_path: vec!["H".into()],
+            line_start: 1,
+            line_end: 2,
+            text: "word is here now filler pad pad pad".into(),
+            claim_marks: None,
+        });
+        store
+            .apply_batch(vec![pf_a, pf_b])
+            .await
+            .expect("seed tied corpus");
+
+        // Uppercase query: FTS tokenizer still matches both (case-insensitive),
+        // but the literal substring "WORD" appears in neither chunk's text, so
+        // contains() matches zero rows and the boost is a no-op.
+        let hits = store
+            .hybrid_search("docs", "WORD", 10)
+            .await
+            .expect("hybrid search");
+        assert_eq!(
+            hits.len(),
+            2,
+            "expected both chunks to still match FTS on `WORD`, got: {hits:?}"
+        );
+        let a = hits
+            .iter()
+            .find(|h| h.file_ref == "/tmp/a.md")
+            .expect("chunk a present");
+        let b = hits
+            .iter()
+            .find(|h| h.file_ref == "/tmp/b.md")
+            .expect("chunk b present");
+        assert_eq!(
+            a.score, b.score,
+            "no contains() match must leave the FTS tie unbroken, got a={} b={}",
+            a.score, b.score
+        );
+        let expected_order = {
+            let mut ids = vec![chunk_id_for("/tmp/a.md", 0), chunk_id_for("/tmp/b.md", 0)];
+            ids.sort();
+            ids
+        };
+        let actual_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+        assert_eq!(
+            actual_order, expected_order,
+            "with tied scores, order must follow the chunk_id tie-break exactly"
+        );
+    }
+
+    /// Spec acceptance: FM-Index is built "unconditionally (no row
+    /// threshold)", unlike the ANN index on `embedding` which is row-gated
+    /// at 256 rows. A single-chunk corpus (well under that threshold) must
+    /// still get an FM-Index, while the ANN index must NOT exist yet --
+    /// proving the two indexes really do have different gating policies
+    /// rather than both happening to pass a shared implicit minimum.
+    #[tokio::test]
+    async fn fm_index_builds_below_ann_row_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", true, false, None)
+                .await
+                .expect("open store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 1)])
+            .await
+            .expect("seed single-chunk corpus (well under the 256-row ANN threshold)");
+
+        let indices = store.table.list_indices().await.expect("list_indices");
+        assert!(
+            indices
+                .iter()
+                .any(|i| i.index_type == lancedb::index::IndexType::Fm
+                    && i.columns.iter().any(|c| c == "text")),
+            "FM-Index must be built unconditionally even with only 1 row, got: {:?}",
+            indices.iter().map(|i| &i.index_type).collect::<Vec<_>>()
+        );
+        assert!(
+            !indices
+                .iter()
+                .any(|i| i.columns.iter().any(|c| c == "embedding")),
+            "ANN index on `embedding` must NOT exist below the 256-row threshold, got: {:?}",
+            indices.iter().map(|i| &i.index_type).collect::<Vec<_>>()
+        );
+    }
+
+    /// Regression for the index-naming-collision bug documented in ADR
+    /// `fm-index-search-signal-001`'s Addendum: LanceDB's `create_index`
+    /// auto-names a single-column index `<column>_idx` regardless of type,
+    /// so an unnamed FM-Index build after FTS silently replaces it instead
+    /// of erroring. Guards specifically against a regression of the fix
+    /// (explicit `.name("text_fm_idx")`) by asserting the FTS index's own
+    /// distinct, non-generic name survives FM-Index creation -- the
+    /// coexistence test above only counts index entries and would still
+    /// pass if a *different* future collision silently replaced FTS with
+    /// something else that also reported `IndexType::FTS`.
+    #[tokio::test]
+    async fn fm_index_build_does_not_rename_or_collide_with_fts_index_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 3)])
+            .await
+            .expect("seed docs corpus (triggers ensure_search_indexes)");
+
+        let indices = store.table.list_indices().await.expect("list_indices");
+        let fts_index = indices
+            .iter()
+            .find(|i| i.index_type == lancedb::index::IndexType::FTS)
+            .expect("FTS index must exist on `text`");
+        let fm_index = indices
+            .iter()
+            .find(|i| i.index_type == lancedb::index::IndexType::Fm)
+            .expect("FM-Index must exist on `text`");
+        assert_ne!(
+            fts_index.name, fm_index.name,
+            "FTS and FM-Index must have distinct names, or one silently replaced the other"
+        );
+        assert_eq!(
+            fm_index.name, "text_fm_idx",
+            "FM-Index must keep its explicit disambiguating name"
         );
     }
 }
