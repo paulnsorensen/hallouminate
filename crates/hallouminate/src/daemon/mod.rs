@@ -50,6 +50,10 @@ pub use ipc::{
     ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
     Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
+pub use ipc::{
+    DebtLevel, LadderAction, StatusReport, TaskName, TaskState, TaskStatus, TripState,
+    WatcherCounters,
+};
 pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
 pub use server::{
     DaemonArgs, IDLE_READ_TIMEOUT, run_daemon, serve, serve_with_idle_timeout,
