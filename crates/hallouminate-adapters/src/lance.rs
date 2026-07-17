@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -524,6 +525,53 @@ fn map_lance_err<E: std::fmt::Display>(e: E) -> HallouminateError {
     HallouminateError::Db(Box::new(std::io::Error::other(format!("lance: {e}"))))
 }
 
+/// Runs one lance scan on its own supervised task so a death inside lance's
+/// scan machinery is observed as a `JoinError` and mapped to a failed result
+/// (a failed RPC at the daemon boundary) instead of crashing the daemon.
+/// lance 8.0.0's `filtered_read.rs:426` unwraps an internal `JoinError` and
+/// panics when its scan task is cancelled -- observed at shutdown when
+/// `abort_all` fires (#223, ADR daemon-rework-006).
+/// A supervised scan runs to completion even when the caller's future is
+/// dropped -- deliberate: caller-side cancellation reaching lance's scan
+/// task is exactly what trips the upstream unwrap.
+async fn supervise_scan<T: Send + 'static>(
+    op: &'static str,
+    scan: impl Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    match tokio::spawn(scan).await {
+        Ok(result) => result,
+        Err(join_error) => Err(scan_join_error(op, join_error)),
+    }
+}
+
+/// Maps a scan task's `JoinError` to the adapter error type, logging a panic
+/// payload at error level with the scan `op` so the trace carries enough
+/// context to file upstream (ADR daemon-rework-006).
+fn scan_join_error(op: &str, join_error: tokio::task::JoinError) -> HallouminateError {
+    if join_error.is_panic() {
+        let payload = join_error.into_panic();
+        let panic_msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".into());
+        tracing::error!(
+            target: "hallouminate::lance",
+            op,
+            panic_payload = %panic_msg,
+            "lance scan task panicked (#223: lance filtered_read unwraps JoinError); surfacing as failed RPC"
+        );
+        map_lance_err(format!("scan '{op}' panicked: {panic_msg}"))
+    } else {
+        tracing::error!(
+            target: "hallouminate::lance",
+            op,
+            "lance scan task cancelled before completion; surfacing as failed RPC"
+        );
+        map_lance_err(format!("scan '{op}' cancelled"))
+    }
+}
+
 /// Handle to a single LanceDB `chunks` table and its `meta.toml` sidecar.
 ///
 /// One instance binds to one table for its whole lifetime: the table is
@@ -770,11 +818,12 @@ impl LanceStore {
     ///
     /// Returns an error if the LanceDB count query fails.
     pub async fn count_rows(&self) -> Result<u64> {
-        self.table
-            .count_rows(None)
-            .await
-            .map_err(map_lance_err)
-            .map(|n| n as u64)
+        let table = self.table.clone();
+        supervise_scan("count_rows", async move {
+            table.count_rows(None).await.map_err(map_lance_err)
+        })
+        .await
+        .map(|n| n as u64)
     }
 
     /// Compacts small fragments into larger ones and prunes superseded
@@ -921,21 +970,29 @@ impl LanceStore {
 
     pub async fn corpus_chunk_stats(&self, corpus: &str) -> Result<CorpusChunkStats> {
         let esc = escape_sql_str(corpus);
-        let total_chunks = self
-            .table
-            .count_rows(Some(format!("corpus = '{esc}'")))
-            .await
-            .map_err(map_lance_err)? as u64;
+        let table = self.table.clone();
+        let count_predicate = format!("corpus = '{esc}'");
+        let total_chunks = supervise_scan("corpus_chunk_stats_count", async move {
+            table
+                .count_rows(Some(count_predicate))
+                .await
+                .map_err(map_lance_err)
+        })
+        .await? as u64;
         let predicate = format!("corpus = '{esc}' AND ord = 0");
-        let stream = self
-            .table
-            .query()
-            .only_if(predicate)
-            .select(lancedb::query::Select::columns(&["indexed_at_ms"]))
-            .execute()
-            .await
-            .map_err(map_lance_err)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let table = self.table.clone();
+        let batches = supervise_scan("corpus_chunk_stats", async move {
+            let stream = table
+                .query()
+                .only_if(predicate)
+                .select(lancedb::query::Select::columns(&["indexed_at_ms"]))
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await?;
         let mut indexed_files: u64 = 0;
         let mut last_indexed_ms: Option<i64> = None;
         for rb in &batches {
@@ -1238,21 +1295,25 @@ impl LanceStore {
             escape_sql_str(corpus),
             escape_sql_str(file_ref)
         );
-        let stream = self
-            .table
-            .query()
-            .only_if(predicate)
-            .select(lancedb::query::Select::columns(&[
-                "file_ref",
-                "corpus",
-                "mtime_ms",
-                "content_hash",
-            ]))
-            .limit(1)
-            .execute()
-            .await
-            .map_err(map_lance_err)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let table = self.table.clone();
+        let batches = supervise_scan("get_file_snapshot", async move {
+            let stream = table
+                .query()
+                .only_if(predicate)
+                .select(lancedb::query::Select::columns(&[
+                    "file_ref",
+                    "corpus",
+                    "mtime_ms",
+                    "content_hash",
+                ]))
+                .limit(1)
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await?;
         for rb in batches {
             if rb.num_rows() == 0 {
                 continue;
@@ -1283,20 +1344,24 @@ impl LanceStore {
     /// unexpected type.
     async fn list_files(&self, corpus: &str) -> Result<Vec<FileSnapshot>> {
         let predicate = format!("corpus = '{}' AND ord = 0", escape_sql_str(corpus));
-        let stream = self
-            .table
-            .query()
-            .only_if(predicate)
-            .select(lancedb::query::Select::columns(&[
-                "file_ref",
-                "corpus",
-                "mtime_ms",
-                "content_hash",
-            ]))
-            .execute()
-            .await
-            .map_err(map_lance_err)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let table = self.table.clone();
+        let batches = supervise_scan("list_files", async move {
+            let stream = table
+                .query()
+                .only_if(predicate)
+                .select(lancedb::query::Select::columns(&[
+                    "file_ref",
+                    "corpus",
+                    "mtime_ms",
+                    "content_hash",
+                ]))
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await?;
         let mut out: Vec<FileSnapshot> = Vec::new();
         for rb in batches {
             let file_ref_col = string_col(&rb, "file_ref")?;
@@ -1348,37 +1413,43 @@ impl LanceStore {
                 HallouminateError::Embed("embed_batch returned no vector for query".into())
             })?;
             let reranker = Arc::new(weighted_rrf::WeightedRRFReranker::default());
-            let stream = self
-                .table
-                .query()
-                .only_if(corpus_filter)
-                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
-                    query.to_string(),
-                ))
-                .nearest_to(&query_vec[..])
-                .map_err(map_lance_err)?
-                .limit(limit)
-                .rerank(reranker)
-                .execute()
-                .await
-                .map_err(map_lance_err)?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            let table = self.table.clone();
+            let fts_query = query.to_string();
+            let batches = supervise_scan("hybrid_search", async move {
+                let stream = table
+                    .query()
+                    .only_if(corpus_filter)
+                    .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
+                    .nearest_to(&query_vec[..])
+                    .map_err(map_lance_err)?
+                    .limit(limit)
+                    .rerank(reranker)
+                    .execute()
+                    .await
+                    .map_err(map_lance_err)?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+                Ok(batches)
+            })
+            .await?;
             for rb in batches {
                 decode_hits(&rb, &mut out)?;
             }
         } else {
-            let stream = self
-                .table
-                .query()
-                .only_if(corpus_filter)
-                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(
-                    query.to_string(),
-                ))
-                .limit(limit)
-                .execute()
-                .await
-                .map_err(map_lance_err)?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            let table = self.table.clone();
+            let fts_query = query.to_string();
+            let batches = supervise_scan("fts_search", async move {
+                let stream = table
+                    .query()
+                    .only_if(corpus_filter)
+                    .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
+                    .limit(limit)
+                    .execute()
+                    .await
+                    .map_err(map_lance_err)?;
+                let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+                Ok(batches)
+            })
+            .await?;
             for rb in batches {
                 decode_hits(&rb, &mut out)?;
             }
@@ -1435,15 +1506,19 @@ impl LanceStore {
             escape_sql_str(query),
             quoted.join(", ")
         );
-        let stream = self
-            .table
-            .query()
-            .only_if(predicate)
-            .select(lancedb::query::Select::columns(&["chunk_id"]))
-            .execute()
-            .await
-            .map_err(map_lance_err)?;
-        let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+        let table = self.table.clone();
+        let batches = supervise_scan("contains_matches", async move {
+            let stream = table
+                .query()
+                .only_if(predicate)
+                .select(lancedb::query::Select::columns(&["chunk_id"]))
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await?;
         let mut matched = HashSet::new();
         for rb in &batches {
             if rb.num_rows() == 0 {
@@ -1547,6 +1622,66 @@ mod tests {
         assert_eq!(prune_retention_secs(Duration::from_millis(500)), 1);
         assert_eq!(prune_retention_secs(Duration::from_millis(1500)), 2);
         assert_eq!(prune_retention_secs(Duration::new(u64::MAX, 0)), i64::MAX);
+    }
+
+    #[tokio::test]
+    async fn supervise_scan_returns_inner_ok_and_err_unchanged() {
+        let ok: Result<u32> = supervise_scan("ok_scan", async { Ok(7) }).await;
+        assert_eq!(ok.unwrap(), 7);
+
+        let err: Result<u32> =
+            supervise_scan("err_scan", async { Err(map_lance_err("scan failed")) }).await;
+        assert_eq!(err.unwrap_err().to_string(), "db: lance: scan failed");
+    }
+
+    #[tokio::test]
+    async fn supervise_scan_contains_panicked_scan_as_error_not_crash() {
+        let result: Result<u32> =
+            supervise_scan("panicking_scan", async { panic!("lance filtered_read unwrap") }).await;
+        let err = result.unwrap_err();
+        assert!(matches!(err, HallouminateError::Db(_)), "wrong variant: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("panicking_scan"), "missing op name: {msg}");
+        assert!(msg.contains("panicked"), "missing panic marker: {msg}");
+        assert!(msg.contains("lance filtered_read unwrap"), "missing payload: {msg}");
+    }
+
+    #[tokio::test]
+    async fn supervise_scan_extracts_owned_string_panic_payload() {
+        let detail = String::from("owned payload 42");
+        let result: Result<u32> =
+            supervise_scan("string_panic_scan", async move { panic!("{detail}") }).await;
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("owned payload 42"), "missing payload: {msg}");
+    }
+
+    #[tokio::test]
+    async fn scan_join_error_maps_deliberately_cancelled_scan_to_error() {
+        let handle = tokio::spawn(std::future::pending::<Result<u32>>());
+        handle.abort();
+        let join_error = handle
+            .await
+            .expect_err("aborted pending task must fail to join");
+        assert!(join_error.is_cancelled());
+        let err = scan_join_error("cancelled_scan", join_error);
+        assert!(matches!(err, HallouminateError::Db(_)), "wrong variant: {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("cancelled_scan"), "missing op name: {msg}");
+        assert!(msg.contains("cancelled"), "missing cancel marker: {msg}");
+    }
+
+    #[tokio::test]
+    async fn supervise_scan_reports_non_string_panic_payload_without_crashing() {
+        let result: Result<u32> = supervise_scan("weird_panic_scan", async {
+            std::panic::panic_any(42_u64)
+        })
+        .await;
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("weird_panic_scan"), "missing op name: {msg}");
+        assert!(
+            msg.contains("<non-string panic payload>"),
+            "missing placeholder: {msg}"
+        );
     }
 
     struct ThreadRecordingEmbedder {
