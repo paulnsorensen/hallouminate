@@ -27,7 +27,9 @@ use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
 use hallouminate_domain::corpus::ensure_corpus_allows_file;
 
+use super::churn::ChurnTracker;
 use super::dispatch::index_single_file_with_content;
+use super::ladder::LadderOutcome;
 use super::state::{DaemonState, WorkClass};
 
 /// One watched location: the directory handed to `notify`, the corpus that
@@ -277,25 +279,41 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         }
     }
 
+    let churn_warn_at = cfg.daemon.churn_warn_at;
+    let churn_act_at = cfg.daemon.churn_act_at;
     let state = state.clone();
     let shutdown = state.shutdown_token().clone();
     let task = tokio::spawn(async move {
         // Bridge the std mpsc receiver into the async runtime via
         // spawn_blocking-style recv with cancellation. We poll the channel on
         // a blocking thread per wake; simplest correct shape that respects
-        // the shutdown token.
+        // the shutdown token. `recv_timeout` (rather than a third `select!`
+        // arm racing a `tokio::time::sleep`) keeps the blocking task itself
+        // bounded to 60s, so a quiet pump never leaves an orphaned blocking
+        // task holding the `Arc<Mutex<Receiver>>` lock past its own wake wait.
         let wake_rx = std::sync::Arc::new(std::sync::Mutex::new(wake_rx));
         let mut failures = FailureCoalescer::new(failure_reminder, MAX_FAILURE_SIGNATURES);
+        let mut churn = ChurnTracker::new(churn_warn_at, churn_act_at);
         loop {
             let wake_rx_recv = wake_rx.clone();
             let next = tokio::select! {
                 _ = shutdown.cancelled() => break,
                 got = tokio::task::spawn_blocking(move || {
-                    wake_rx_recv.lock().expect("watch wake-rx mutex").recv()
+                    wake_rx_recv
+                        .lock()
+                        .expect("watch wake-rx mutex")
+                        .recv_timeout(Duration::from_secs(60))
                 }) => got,
             };
             match next {
                 Ok(Ok(())) => {}
+                Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
+                    // Quiet pump: no wake arrived within the heartbeat window.
+                    // Bump the watchdog and go back to waiting instead of
+                    // spawning a fresh blocking task every 60s.
+                    state.heartbeat().bump(super::heartbeat::TaskName::WatcherPump);
+                    continue;
+                }
                 // Channel disconnected: the debouncer (and its `wake_tx`) was
                 // dropped, so nothing more will ever arrive. Distinct from the
                 // `shutdown.cancelled()` branch above, which is an expected,
@@ -303,7 +321,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                 // still meant to be serving is worth structured error context
                 // so it shows up in telemetry instead of auto-reindex just
                 // going quiet.
-                Ok(Err(_recv_err)) => {
+                Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
                     tracing::warn!(
                         target: "hallouminate::daemon",
                         "watcher: event channel disconnected unexpectedly; auto-reindex pump stopping",
@@ -325,7 +343,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                 set.drain().collect()
             };
             if !paths.is_empty() {
-                process_change_batch(&state, &roots, paths, &mut failures).await;
+                process_change_batch(&state, &roots, paths, &mut failures, &mut churn).await;
             }
         }
     });
@@ -435,10 +453,11 @@ async fn process_change_batch(
     roots: &[WatchRoot],
     paths: Vec<PathBuf>,
     failures: &mut FailureCoalescer,
+    churn: &mut ChurnTracker,
 ) {
     let _conn = state.enter_connection(WorkClass::Internal);
     for path in &paths {
-        handle_changed_path(state, roots, path, failures).await;
+        handle_changed_path(state, roots, path, failures, churn).await;
     }
     state.touch_activity(WorkClass::Internal);
 }
@@ -450,6 +469,7 @@ async fn handle_changed_path(
     roots: &[WatchRoot],
     path: &Path,
     failures: &mut FailureCoalescer,
+    churn: &mut ChurnTracker,
 ) {
     let Some(owner) = owning_corpus(roots, path) else {
         return;
@@ -505,7 +525,16 @@ async fn handle_changed_path(
         let registry = state.make_registry();
         match index_single_file_with_content(&store, &registry, corpus, path, &bytes, mtime).await {
             Ok(stats) => {
-                state.record_watcher_reindex(stats.files_upserted == 0);
+                let noop = stats.files_upserted == 0;
+                state.record_watcher_reindex(noop);
+                if let LadderOutcome::Action(action) = churn.record_reindex(noop, path) {
+                    state.record_ladder_trip(action);
+                    // ForceMaintenance reconciles index state without killing the watcher.
+                    let s = state.clone();
+                    tokio::spawn(async move {
+                        let _ = s.run_maintenance_tick().await;
+                    });
+                }
                 tracing::debug!(
                     target: "hallouminate::daemon",
                     corpus = %corpus.name,
@@ -697,6 +726,12 @@ mod tests {
 
     fn disabled_coalescer() -> FailureCoalescer {
         FailureCoalescer::new(Duration::ZERO, MAX_FAILURE_SIGNATURES)
+    }
+
+    /// High thresholds so tests using this helper never cross warn/act by
+    /// accident; use `ChurnTracker::new` directly to test escalation itself.
+    fn disabled_churn() -> ChurnTracker {
+        ChurnTracker::new(u32::MAX, u32::MAX)
     }
 
     /// Set `path`'s modified time exactly (nanosecond precision), for tests
@@ -937,7 +972,8 @@ mod tests {
         let deleted = corpus_dir.join("gone.md");
 
         let mut failures = disabled_coalescer();
-        process_change_batch(&state, &roots, vec![deleted], &mut failures).await;
+        let mut churn = disabled_churn();
+        process_change_batch(&state, &roots, vec![deleted], &mut failures, &mut churn).await;
         assert_ne!(
             state.last_activity_secs(),
             u64::MAX,
@@ -966,8 +1002,9 @@ mod tests {
             None,
         )];
         let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
 
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 1, 0),
@@ -977,7 +1014,7 @@ mod tests {
         // Same file, unchanged content and mtime: the stage-1 mtime gate
         // (ADR daemon-rework-003) sheds the event before any read — a skip,
         // not a reindex, so no counter moves.
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 1, 0),
@@ -994,7 +1031,7 @@ mod tests {
             .expect("note mtime")
             + Duration::from_millis(10);
         set_mtime(&note, bumped);
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 2, 1),
@@ -1032,7 +1069,8 @@ mod tests {
             None,
         )];
         let mut failures = disabled_coalescer();
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        let mut churn = disabled_churn();
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
 
         let file_ref = canonicalize_or_passthrough(&note)
             .as_path()
@@ -1052,7 +1090,7 @@ mod tests {
             .expect("rewrite note");
         set_mtime(&note, indexed_mtime);
 
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
 
         assert_eq!(
             state.watcher_counters_snapshot(),
@@ -1117,7 +1155,8 @@ mod tests {
 
         // Baseline: the real file indexes and lands a snapshot row.
         let mut failures = disabled_coalescer();
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        let mut churn = disabled_churn();
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         let good = state
             .store()
             .get_file_snapshot("wiki", &file_ref)
@@ -1134,7 +1173,7 @@ mod tests {
         std::fs::remove_file(&note).expect("rm note");
         std::os::unix::fs::symlink(&secret, &note).expect("symlink note -> secret");
 
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
 
         // The reindex through the symlink must have been rejected. Vulnerable
         // code would `canonicalize` the in-corpus path (following the symlink)
