@@ -229,8 +229,9 @@ struct DaemonStateInner {
     /// completed, and reindexes that upserted nothing) -- additive storage
     /// for curd 9's status surface.
     watcher_counters: WatcherCounters,
-    /// Most recent ladder trip, if any (curd 1 writes this once the ladder
-    /// is wired into a loop; curd 9's status surface reads it).
+    /// Most recent ladder trip, if any (written by `watch.rs`'s churn
+    /// ladder and `state.rs`'s supervisor WatchdogTrip escalation hook;
+    /// curd 9's status surface reads it).
     last_ladder_trip: std::sync::Mutex<Option<LadderTrip>>,
     /// Supervisor owning the daemon's five long-lived loops (G5). Holds the
     /// escalation hook below; loops route through `supervisor().spawn(..)`
@@ -312,8 +313,8 @@ struct WatcherCounters {
 }
 
 /// Snapshot of the most recent ladder trip: which escalation action fired
-/// and when (monotonic seconds). Curd 1's future ladder wiring is the only
-/// writer; this seed only provides storage + accessors.
+/// and when (monotonic seconds). Written by the churn ladder (`watch.rs`)
+/// and the supervisor's WatchdogTrip escalation hook (`state.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LadderTrip {
     pub(crate) action: LadderAction,
@@ -860,7 +861,6 @@ impl DaemonState {
     }
 
     /// Current consecutive-defer streak (curd 9's status surface).
-    #[allow(dead_code)]
     pub(crate) fn defer_count(&self) -> u32 {
         self.inner.defer_count.load(Ordering::Relaxed)
     }
@@ -901,7 +901,6 @@ impl DaemonState {
 
     /// Snapshot of `(events, reindexes, noop_reindexes)` (curd 9's status
     /// surface).
-    #[allow(dead_code)]
     pub(crate) fn watcher_counters_snapshot(&self) -> (u64, u64, u64) {
         (
             self.inner.watcher_counters.events.load(Ordering::Relaxed),
@@ -918,7 +917,6 @@ impl DaemonState {
 
     /// Record a ladder trip (curd 1's future ladder wiring calls this when
     /// `Ladder::evaluate` returns `Action`). Overwrites any prior snapshot.
-    #[allow(dead_code)]
     pub(crate) fn record_ladder_trip(&self, action: LadderAction) {
         let at_secs = monotonic_secs();
         *self
@@ -929,7 +927,6 @@ impl DaemonState {
     }
 
     /// The most recent ladder trip, if any (curd 9's status surface).
-    #[allow(dead_code)]
     pub(crate) fn last_ladder_trip(&self) -> Option<LadderTrip> {
         *self
             .inner

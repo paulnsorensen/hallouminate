@@ -1,17 +1,17 @@
 //! Backpressure ladder (ADR daemon-rework seed 4): pure evaluation of what
 //! a rising count (e.g. consecutive maintenance defers) should trigger --
-//! nothing, a warn, or an escalation action. No wiring into any loop yet --
-//! that is a later curd's job. Concrete `Ladder` instances (with real
-//! thresholds) are not constructed here either; only the types + evaluation.
+//! nothing, a warn, or an escalation action. Wired into `watch.rs`'s churn
+//! ladder (`ForceMaintenance` on reindex churn) and `state.rs`'s supervisor
+//! seed (`WatchdogTrip` on restart-intensity escalation).
 
 use super::heartbeat::TaskName;
 
 /// Escalating response a ladder can fire once its `act_at` threshold is
 /// crossed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum LadderAction {
     ForceMaintenance,
+    #[allow(dead_code)] // not constructed in production yet; only WatchdogTrip/ForceMaintenance are seeded today
     RestartTask(TaskName),
     WatchdogTrip,
 }
@@ -19,7 +19,6 @@ pub(crate) enum LadderAction {
 /// What a ladder evaluation determined for a given count: nothing, a warn,
 /// or the ladder's action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum LadderOutcome {
     Nothing,
     Warn,
@@ -29,7 +28,6 @@ pub(crate) enum LadderOutcome {
 /// A two-threshold ladder: below `warn_at` fires nothing, at/above `warn_at`
 /// (but below `act_at`) fires a warn, at/above `act_at` fires `action`.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct Ladder {
     pub(crate) warn_at: u32,
     pub(crate) act_at: u32,
@@ -37,7 +35,6 @@ pub(crate) struct Ladder {
 }
 
 impl Ladder {
-    #[allow(dead_code)]
     pub(crate) fn evaluate(&self, count: u32) -> LadderOutcome {
         if count >= self.act_at {
             LadderOutcome::Action(self.action)

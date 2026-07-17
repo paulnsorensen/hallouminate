@@ -1,14 +1,13 @@
 //! Per-task heartbeat epoch registry (ADR daemon-rework seed 4): each
-//! long-lived daemon loop bumps its own epoch once per pass; a future
-//! watchdog compares epochs across polls to detect a stalled task. This seed
-//! only provides the registry and the epoch-comparison primitive -- wiring a
-//! loop to bump its epoch, or a watchdog to poll it, is a later curd's job.
+//! long-lived daemon loop bumps its own epoch once per pass; the watchdog
+//! (`watchdog.rs`) compares epochs across polls to detect a stalled task.
+//! Bumped by `maintenance.rs`, `server.rs`'s loops, and `supervisor.rs`;
+//! read by `watchdog.rs`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The five long-lived daemon loops a watchdog can monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum TaskName {
     Maintenance,
     CatchUp,
@@ -32,7 +31,6 @@ fn slot(task: TaskName) -> usize {
 /// A task's health as inferred by comparing heartbeat epochs across two
 /// watchdog polls: `Stalled` when the epoch hasn't moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum TaskStatus {
     Alive,
     Stalled,
@@ -41,7 +39,6 @@ pub(crate) enum TaskStatus {
 /// Per-task heartbeat epoch counters, bumpable by the owning loop and
 /// readable by a future watchdog.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct HeartbeatRegistry {
     epochs: [AtomicU64; TASK_COUNT],
 }
@@ -56,13 +53,11 @@ impl Default for HeartbeatRegistry {
 
 impl HeartbeatRegistry {
     /// Bump `task`'s epoch by one and return the new value.
-    #[allow(dead_code)]
     pub(crate) fn bump(&self, task: TaskName) -> u64 {
         self.epochs[slot(task)].fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Current epoch for `task`.
-    #[allow(dead_code)]
     pub(crate) fn epoch(&self, task: TaskName) -> u64 {
         self.epochs[slot(task)].load(Ordering::Relaxed)
     }
@@ -70,7 +65,6 @@ impl HeartbeatRegistry {
 
 /// Compare a task's epoch across two watchdog polls: `Stalled` when no
 /// progress was made, `Alive` otherwise.
-#[allow(dead_code)]
 pub(crate) fn compare_epochs(previous: u64, current: u64) -> TaskStatus {
     if current == previous {
         TaskStatus::Stalled
