@@ -2739,8 +2739,6 @@ mod tests {
         );
     }
 
-    // ── single-file content-hash gate (blake3 vs stored snapshot) ────────
-    //
     // ADR daemon-rework-003: the single-file reindex gate compares the blake3
     // of the bytes ALREADY READ (the watcher's no-follow read) against the
     // stored snapshot's content_hash. Hash-equal must skip re-chunk/re-embed
