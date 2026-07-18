@@ -528,7 +528,7 @@ impl DaemonState {
         let restart_cap = cfg.daemon.restart_intensity_cap;
         let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
         let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
-        // Invented defaults, no existing analog in debt.rs; revisit if noisy.
+        // Invented defaults, no existing analog in debt.rs.
         let ladder = super::ladder::Ladder {
             warn_at: 3,
             act_at: 5,
