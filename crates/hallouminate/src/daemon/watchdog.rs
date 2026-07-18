@@ -215,7 +215,12 @@ struct StallTracker {
 }
 
 impl StallTracker {
-    fn new(registry: &HeartbeatRegistry, tasks: &[TaskName], stall: Duration, now: Instant) -> Self {
+    fn new(
+        registry: &HeartbeatRegistry,
+        tasks: &[TaskName],
+        stall: Duration,
+        now: Instant,
+    ) -> Self {
         let mut watches = Vec::with_capacity(tasks.len());
         for &task in tasks {
             watches.push(TaskWatch {
@@ -286,7 +291,11 @@ impl Watchdog {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let handle = std::thread::Builder::new()
             .name("hallouminate-watchdog".into())
-            .spawn(move || run(&registry, &tasks, stall, poll, &trip_file, on_trip, &stop_rx))
+            .spawn(move || {
+                run(
+                    &registry, &tasks, stall, poll, &trip_file, on_trip, &stop_rx,
+                )
+            })
             .expect("failed to spawn watchdog thread");
         Self { stop_tx, handle }
     }
@@ -378,11 +387,7 @@ mod tests {
         let expected = [10, 20, 40, 80, 160, 300, 300];
         for (i, want) in expected.iter().enumerate() {
             let trips = u32::try_from(i).unwrap() + 1;
-            assert_eq!(
-                backoff_secs(FLOOR, CAP, trips),
-                *want,
-                "trip count {trips}"
-            );
+            assert_eq!(backoff_secs(FLOOR, CAP, trips), *want, "trip count {trips}");
         }
     }
 
@@ -453,7 +458,11 @@ mod tests {
 
         let stored = read_recent_trips(&path, now);
         assert_eq!(stored.len(), MAX_STORED_TRIPS);
-        assert_eq!(*stored.last().unwrap(), now, "newest trip must survive the cap");
+        assert_eq!(
+            *stored.last().unwrap(),
+            now,
+            "newest trip must survive the cap"
+        );
     }
 
     #[test]
@@ -589,7 +598,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = trip_file(&dir);
         let now = 100_000;
-        write_trips(&path, &[now - TRIP_DECAY_SECS - 10, now - TRIP_DECAY_SECS - 5]);
+        write_trips(
+            &path,
+            &[now - TRIP_DECAY_SECS - 10, now - TRIP_DECAY_SECS - 5],
+        );
         assert_eq!(
             check_boot_backoff(&path, FLOOR, CAP, now),
             BootDecision::Proceed,
@@ -658,8 +670,7 @@ mod tests {
         let registry = HeartbeatRegistry::default();
         let stall = Duration::from_secs(300);
         let start = Instant::now();
-        let mut tracker =
-            StallTracker::new(&registry, &[TaskName::Maintenance], stall, start);
+        let mut tracker = StallTracker::new(&registry, &[TaskName::Maintenance], stall, start);
 
         registry.bump(TaskName::Maintenance);
         assert!(
@@ -673,8 +684,7 @@ mod tests {
         let registry = HeartbeatRegistry::default();
         let stall = Duration::from_secs(300);
         let start = Instant::now();
-        let mut tracker =
-            StallTracker::new(&registry, &[TaskName::Maintenance], stall, start);
+        let mut tracker = StallTracker::new(&registry, &[TaskName::Maintenance], stall, start);
 
         assert!(
             tracker
@@ -693,8 +703,7 @@ mod tests {
         let registry = HeartbeatRegistry::default();
         let stall = Duration::from_secs(300);
         let start = Instant::now();
-        let mut tracker =
-            StallTracker::new(&registry, &[TaskName::Maintenance], stall, start);
+        let mut tracker = StallTracker::new(&registry, &[TaskName::Maintenance], stall, start);
 
         registry.bump(TaskName::Maintenance);
         let mid = start + Duration::from_secs(200);
@@ -733,8 +742,7 @@ mod tests {
         let registry = HeartbeatRegistry::default();
         let stall = Duration::from_secs(300);
         let start = Instant::now();
-        let mut tracker =
-            StallTracker::new(&registry, &[TaskName::WatcherPump], stall, start);
+        let mut tracker = StallTracker::new(&registry, &[TaskName::WatcherPump], stall, start);
 
         registry.bump(TaskName::WatcherPump);
         // Maintenance never bumps, but it is not monitored.

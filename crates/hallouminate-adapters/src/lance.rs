@@ -1427,7 +1427,8 @@ impl LanceStore {
                     .execute()
                     .await
                     .map_err(map_lance_err)?;
-                let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+                let batches: Vec<RecordBatch> =
+                    stream.try_collect().await.map_err(map_lance_err)?;
                 Ok(batches)
             })
             .await?;
@@ -1446,7 +1447,8 @@ impl LanceStore {
                     .execute()
                     .await
                     .map_err(map_lance_err)?;
-                let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+                let batches: Vec<RecordBatch> =
+                    stream.try_collect().await.map_err(map_lance_err)?;
                 Ok(batches)
             })
             .await?;
@@ -1636,14 +1638,22 @@ mod tests {
 
     #[tokio::test]
     async fn supervise_scan_contains_panicked_scan_as_error_not_crash() {
-        let result: Result<u32> =
-            supervise_scan("panicking_scan", async { panic!("lance filtered_read unwrap") }).await;
+        let result: Result<u32> = supervise_scan("panicking_scan", async {
+            panic!("lance filtered_read unwrap")
+        })
+        .await;
         let err = result.unwrap_err();
-        assert!(matches!(err, HallouminateError::Db(_)), "wrong variant: {err:?}");
+        assert!(
+            matches!(err, HallouminateError::Db(_)),
+            "wrong variant: {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("panicking_scan"), "missing op name: {msg}");
         assert!(msg.contains("panicked"), "missing panic marker: {msg}");
-        assert!(msg.contains("lance filtered_read unwrap"), "missing payload: {msg}");
+        assert!(
+            msg.contains("lance filtered_read unwrap"),
+            "missing payload: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1664,7 +1674,10 @@ mod tests {
             .expect_err("aborted pending task must fail to join");
         assert!(join_error.is_cancelled());
         let err = scan_join_error("cancelled_scan", join_error);
-        assert!(matches!(err, HallouminateError::Db(_)), "wrong variant: {err:?}");
+        assert!(
+            matches!(err, HallouminateError::Db(_)),
+            "wrong variant: {err:?}"
+        );
         let msg = err.to_string();
         assert!(msg.contains("cancelled_scan"), "missing op name: {msg}");
         assert!(msg.contains("cancelled"), "missing cancel marker: {msg}");
@@ -1672,10 +1685,8 @@ mod tests {
 
     #[tokio::test]
     async fn supervise_scan_reports_non_string_panic_payload_without_crashing() {
-        let result: Result<u32> = supervise_scan("weird_panic_scan", async {
-            std::panic::panic_any(42_u64)
-        })
-        .await;
+        let result: Result<u32> =
+            supervise_scan("weird_panic_scan", async { std::panic::panic_any(42_u64) }).await;
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("weird_panic_scan"), "missing op name: {msg}");
         assert!(

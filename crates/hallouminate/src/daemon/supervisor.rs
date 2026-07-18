@@ -256,7 +256,9 @@ impl Supervisor {
 /// Backoff for the nth consecutive quick panic: floor doubling to the cap.
 fn backoff_for(consecutive: u32) -> Duration {
     let exponent = consecutive.saturating_sub(1).min(6);
-    BACKOFF_FLOOR.saturating_mul(1u32 << exponent).min(BACKOFF_CAP)
+    BACKOFF_FLOOR
+        .saturating_mul(1u32 << exponent)
+        .min(BACKOFF_CAP)
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -420,7 +422,9 @@ mod tests {
 
         tokio::time::sleep(Duration::from_secs(1)).await;
         shutdown.cancel();
-        monitor.await.expect("monitor must exit cleanly on shutdown");
+        monitor
+            .await
+            .expect("monitor must exit cleanly on shutdown");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(sup.restart_count(TaskName::Signal), 0);
     }
@@ -439,7 +443,9 @@ mod tests {
         // Cancel while the monitor is inside the first 1s backoff sleep.
         tokio::time::sleep(Duration::from_millis(500)).await;
         shutdown.cancel();
-        monitor.await.expect("monitor must exit cleanly on shutdown");
+        monitor
+            .await
+            .expect("monitor must exit cleanly on shutdown");
         assert_eq!(
             attempts.load(Ordering::SeqCst),
             1,
@@ -520,7 +526,13 @@ mod tests {
             sink.lock().unwrap().push((task, action));
         });
         // act_at 100 is unreachable in this test's horizon: only warns fire.
-        let sup = Supervisor::new(2, WINDOW, ladder(1, 100), escalate, CancellationToken::new());
+        let sup = Supervisor::new(
+            2,
+            WINDOW,
+            ladder(1, 100),
+            escalate,
+            CancellationToken::new(),
+        );
         sup.spawn(TaskName::WatcherPump, || async { panic!("crash loop") });
 
         tokio::time::sleep(Duration::from_secs(120)).await;
