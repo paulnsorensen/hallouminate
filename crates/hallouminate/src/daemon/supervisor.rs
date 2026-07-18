@@ -190,12 +190,13 @@ impl Supervisor {
                 recent_panics.retain(|t| now.duration_since(*t) <= window);
                 restarts.counts[slot(name)].fetch_add(1, Ordering::Relaxed);
 
-                // Once escalated, stay escalated: the cool-down paces
-                // restarts at exactly the window, so the pruned count alone
-                // would never exceed the cap again and the ladder would fire
-                // at most once for a permanent crash loop. Any quick panic
-                // while strikes are outstanding is a further strike; only
-                // healthy uptime (the reset above) de-escalates.
+                // Once escalated, stay escalated: escalation is sticky via
+                // `escalation_strikes`, independent of how the cool-down
+                // (capped at BACKOFF_CAP) compares to the intensity window,
+                // so the ladder keeps firing for a permanent crash loop even
+                // when the pruned count alone would stay under the cap. Any
+                // quick panic while strikes are outstanding is a further
+                // strike; only healthy uptime (the reset above) de-escalates.
                 let delay = if recent_panics.len() as u32 > cap || escalation_strikes > 0 {
                     escalation_strikes += 1;
                     tracing::error!(
