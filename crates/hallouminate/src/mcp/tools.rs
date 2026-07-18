@@ -276,10 +276,10 @@ async fn daemon_for_tool() -> Result<DaemonClient, ErrorData> {
 }
 
 /// Translate a daemon RPC error into the MCP transport's `ErrorData` shape.
-/// Daemon `InvalidParams` becomes `-32602`, `Internal` becomes `-32603`, and
-/// transport / decode failures (already `anyhow::Error` by the time we get
-/// here) collapse to `-32603` so MCP clients don't misinterpret a network
-/// flake as a user error.
+/// Daemon `InvalidParams` becomes `-32602`; `Internal` and `Retryable` both
+/// become `-32603`, as do transport / decode failures (already
+/// `anyhow::Error` by the time we get here) so MCP clients don't
+/// misinterpret a network flake as a user error.
 fn map_daemon_err(err: anyhow::Error) -> ErrorData {
     if let Some(rpc) = err.downcast_ref::<DaemonRpcError>() {
         return match rpc.kind {

@@ -48,10 +48,7 @@ pub(super) enum DeferReason {
 #[allow(dead_code)]
 enum Pace {
     Full,
-    Paced {
-        slice_budget: Duration,
-        sleep: Duration,
-    },
+    Paced { slice_budget: u64, sleep: Duration },
 }
 
 fn duration_ms(duration: Duration) -> u64 {

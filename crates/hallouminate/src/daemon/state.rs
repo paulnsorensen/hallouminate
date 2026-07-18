@@ -41,8 +41,8 @@ use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
-use super::maintenance::{DeferReason, maintenance_loop};
 use super::ladder::LadderAction;
+use super::maintenance::{DeferReason, maintenance_loop};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
@@ -871,7 +871,10 @@ impl DaemonState {
 
     /// Whether a due maintenance pass should defer against the real clock --
     /// see `maintenance_defer_reason_at`.
-    pub(super) fn maintenance_defer_reason(&self, probe: &dyn IoPressureProbe) -> Option<DeferReason> {
+    pub(super) fn maintenance_defer_reason(
+        &self,
+        probe: &dyn IoPressureProbe,
+    ) -> Option<DeferReason> {
         self.maintenance_defer_reason_at(probe, monotonic_secs())
     }
 
@@ -1170,9 +1173,9 @@ impl std::fmt::Debug for DaemonState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::maintenance::{MaintenanceTick, jittered_sleep_secs};
     use super::*;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
-    use super::super::maintenance::{MaintenanceTick, jittered_sleep_secs};
 
     use std::fmt;
     use tracing::Subscriber;
@@ -1659,8 +1662,20 @@ mod tests {
         let baseline = state.last_activity_secs();
 
         let ext = state.enter_connection(WorkClass::External);
-        assert_eq!(state.inner.active_external_connections.load(Ordering::SeqCst), 1);
-        assert_eq!(state.inner.active_internal_connections.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .inner
+                .active_external_connections
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            state
+                .inner
+                .active_internal_connections
+                .load(Ordering::SeqCst),
+            0
+        );
         assert_eq!(
             state.inner.active_connections.load(Ordering::SeqCst),
             1,
@@ -1668,22 +1683,49 @@ mod tests {
         );
 
         let int = state.enter_connection(WorkClass::Internal);
-        assert_eq!(state.inner.active_internal_connections.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state
+                .inner
+                .active_internal_connections
+                .load(Ordering::SeqCst),
+            1
+        );
         assert_eq!(state.inner.active_connections.load(Ordering::SeqCst), 2);
 
         state.touch_activity(WorkClass::External);
-        assert!(state.inner.external_last_activity_secs.load(Ordering::Relaxed) >= baseline);
+        assert!(
+            state
+                .inner
+                .external_last_activity_secs
+                .load(Ordering::Relaxed)
+                >= baseline
+        );
         assert_eq!(
-            state.inner.internal_last_activity_secs.load(Ordering::Relaxed),
+            state
+                .inner
+                .internal_last_activity_secs
+                .load(Ordering::Relaxed),
             baseline,
             "External touch must not stamp the Internal clock",
         );
 
         state.touch_activity(WorkClass::Internal);
-        assert!(state.inner.internal_last_activity_secs.load(Ordering::Relaxed) >= baseline);
+        assert!(
+            state
+                .inner
+                .internal_last_activity_secs
+                .load(Ordering::Relaxed)
+                >= baseline
+        );
 
         drop(ext);
-        assert_eq!(state.inner.active_external_connections.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .inner
+                .active_external_connections
+                .load(Ordering::SeqCst),
+            0
+        );
         assert_eq!(
             state.inner.active_connections.load(Ordering::SeqCst),
             1,
@@ -1691,7 +1733,13 @@ mod tests {
         );
 
         drop(int);
-        assert_eq!(state.inner.active_internal_connections.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            state
+                .inner
+                .active_internal_connections
+                .load(Ordering::SeqCst),
+            0
+        );
         assert_eq!(state.inner.active_connections.load(Ordering::SeqCst), 0);
 
         // Existing predicate (aggregate-based) must be unaffected by class split.
