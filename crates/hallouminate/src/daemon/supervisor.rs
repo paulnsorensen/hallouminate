@@ -340,7 +340,10 @@ mod tests {
         // Starts at t=0 then after 1s, 2s, 4s of backoff.
         tokio::time::sleep(Duration::from_secs(8)).await;
         let starts = starts.lock().unwrap();
-        let gaps: Vec<Duration> = starts.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut gaps = Vec::new();
+        for w in starts.windows(2) {
+            gaps.push(w[1] - w[0]);
+        }
         assert_eq!(
             gaps[..3],
             [

@@ -1643,10 +1643,10 @@ mod tests {
         })
         .await;
         let err = result.unwrap_err();
-        assert!(
-            matches!(err, HallouminateError::Db(_)),
-            "wrong variant: {err:?}"
-        );
+        match err {
+            HallouminateError::Db(_) => {}
+            other => panic!("wrong variant: {other:?}"),
+        }
         let msg = err.to_string();
         assert!(msg.contains("panicking_scan"), "missing op name: {msg}");
         assert!(msg.contains("panicked"), "missing panic marker: {msg}");
@@ -1674,10 +1674,10 @@ mod tests {
             .expect_err("aborted pending task must fail to join");
         assert!(join_error.is_cancelled());
         let err = scan_join_error("cancelled_scan", join_error);
-        assert!(
-            matches!(err, HallouminateError::Db(_)),
-            "wrong variant: {err:?}"
-        );
+        match err {
+            HallouminateError::Db(_) => {}
+            other => panic!("wrong variant: {other:?}"),
+        }
         let msg = err.to_string();
         assert!(msg.contains("cancelled_scan"), "missing op name: {msg}");
         assert!(msg.contains("cancelled"), "missing cancel marker: {msg}");

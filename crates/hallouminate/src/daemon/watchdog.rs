@@ -48,8 +48,6 @@ pub(crate) fn default_trip_state_path() -> PathBuf {
     super::socket::daemon_socket_path().with_file_name("watchdog-trips")
 }
 
-// ── trip-state file ─────────────────────────────────────────────────────
-
 /// Read the trip timestamps still inside the decay window, oldest first.
 /// Corruption-tolerant by design (a missing, unreadable, or garbled file
 /// must never block boot): unparseable lines are skipped, and timestamps in
@@ -110,8 +108,6 @@ fn record_trip(path: &Path, now_unix: u64) -> io::Result<()> {
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)
 }
-
-// ── boot backoff ────────────────────────────────────────────────────────
 
 /// Escalating backoff floor for `trips` recent trips: `floor` doubling per
 /// additional trip, saturating at `cap`. Zero trips ⇒ no floor.
@@ -198,8 +194,6 @@ pub(crate) fn check_boot_backoff(
     }
 }
 
-// ── stall detection ─────────────────────────────────────────────────────
-
 struct TaskWatch {
     task: TaskName,
     last_epoch: u64,
@@ -253,8 +247,6 @@ impl StallTracker {
         stalled
     }
 }
-
-// ── watchdog thread ─────────────────────────────────────────────────────
 
 /// Trip action fired after the trip is persisted (production:
 /// `Box::new(|_| std::process::abort())`; tests inject a recorder).
@@ -379,8 +371,6 @@ mod tests {
         std::fs::write(path, body).expect("write trip fixture");
     }
 
-    // ── backoff math ────────────────────────────────────────────────
-
     #[test]
     fn backoff_escalates_from_floor_doubling_to_cap() {
         // The spec-fixed ladder: 10s doubling per trip, capped at 5min.
@@ -413,8 +403,6 @@ mod tests {
     fn backoff_floor_zero_imposes_no_wait() {
         assert_eq!(backoff_secs(0, CAP, 5), 0);
     }
-
-    // ── trip-state file ─────────────────────────────────────────────
 
     #[test]
     fn record_trip_creates_file_and_parent_dirs() {
@@ -451,7 +439,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = trip_file(&dir);
         let now = 100_000;
-        let many: Vec<u64> = (0..100).map(|i| now - 100 + i).collect();
+        let mut many: Vec<u64> = Vec::new();
+        for i in 0..100 {
+            many.push(now - 100 + i);
+        }
         write_trips(&path, &many);
 
         record_trip(&path, now).unwrap();
@@ -491,8 +482,6 @@ mod tests {
         write_trips(&path, &[5_000_000, 990]);
         assert_eq!(read_recent_trips(&path, 1_000), vec![990]);
     }
-
-    // ── boot backoff decision ───────────────────────────────────────
 
     #[test]
     fn boot_proceeds_with_no_trip_state() {
@@ -551,7 +540,10 @@ mod tests {
     fn boot_backoff_caps_at_five_minutes() {
         let dir = tempfile::tempdir().unwrap();
         let path = trip_file(&dir);
-        let trips: Vec<u64> = (0..10).map(|i| 900 + i * 10).collect();
+        let mut trips: Vec<u64> = Vec::new();
+        for i in 0..10 {
+            trips.push(900 + i * 10);
+        }
         write_trips(&path, &trips);
         let BootDecision::Backoff {
             retry_after_secs,
@@ -573,7 +565,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = trip_file(&dir);
         let now = 1_000_000;
-        let mut on_disk: Vec<u64> = (0..200).map(|i| now - i).collect();
+        let mut on_disk: Vec<u64> = Vec::new();
+        for i in 0..200 {
+            on_disk.push(now - i);
+        }
         on_disk.push(now + 1_000_000); // future timestamp
         write_trips(&path, &on_disk);
 
@@ -663,8 +658,6 @@ mod tests {
         );
     }
 
-    // ── stall detection core ────────────────────────────────────────
-
     #[test]
     fn tracker_reports_no_stall_while_epochs_advance() {
         let registry = HeartbeatRegistry::default();
@@ -751,8 +744,6 @@ mod tests {
             "an unmonitored frozen task must not trip the watchdog",
         );
     }
-
-    // ── watchdog thread ─────────────────────────────────────────────
 
     #[test]
     fn watchdog_thread_persists_trip_before_firing_abort_hook() {
