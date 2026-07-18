@@ -16,20 +16,21 @@ use super::{debt, heartbeat, ladder};
 /// watchdog (continuous poller) is the real stall detector.
 pub(super) fn report(state: &DaemonState) -> ipc::StatusReport {
     let (events, reindexes, noop_reindexes) = state.watcher_counters_snapshot();
-    ipc::StatusReport {
-        per_task: [
-            heartbeat::TaskName::Maintenance,
-            heartbeat::TaskName::CatchUp,
-            heartbeat::TaskName::WatcherPump,
-            heartbeat::TaskName::IdleExit,
-            heartbeat::TaskName::Signal,
-        ]
-        .into_iter()
-        .map(|task| ipc::TaskStatus {
+    let mut per_task = Vec::new();
+    for task in [
+        heartbeat::TaskName::Maintenance,
+        heartbeat::TaskName::CatchUp,
+        heartbeat::TaskName::WatcherPump,
+        heartbeat::TaskName::IdleExit,
+        heartbeat::TaskName::Signal,
+    ] {
+        per_task.push(ipc::TaskStatus {
             task: wire_task(task),
             state: ipc::TaskState::Alive,
-        })
-        .collect(),
+        });
+    }
+    ipc::StatusReport {
+        per_task,
         debt: wire_debt(debt::level()),
         defer_count: state.defer_count(),
         watcher: ipc::WatcherCounters {
@@ -111,11 +112,10 @@ mod tests {
         assert_eq!(report.debt, super::wire_debt(debt::level()));
         assert_eq!(report.defer_count, 0);
         assert_eq!(report.watcher, ipc::WatcherCounters::default());
-        assert!(
-            matches!(report.trips, ipc::TripState::None),
-            "fresh state has no recorded ladder trip, got {:?}",
-            report.trips,
-        );
+        match report.trips {
+            ipc::TripState::None => {}
+            other => panic!("fresh state has no recorded ladder trip, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

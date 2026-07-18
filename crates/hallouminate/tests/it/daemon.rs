@@ -2016,11 +2016,10 @@ async fn status_reports_running_then_not_running_across_shutdown() {
                 report.watcher,
                 hallouminate::daemon::WatcherCounters::default()
             );
-            assert!(
-                matches!(report.trips, hallouminate::daemon::TripState::None),
-                "fresh daemon must report no ladder trip, got {:?}",
-                report.trips,
-            );
+            match report.trips {
+                hallouminate::daemon::TripState::None => {}
+                other => panic!("fresh daemon must report no ladder trip, got {other:?}"),
+            }
         }
         hallouminate::daemon::DaemonStatus::NotRunning => {
             panic!("status must be Running against a live daemon")
@@ -2041,15 +2040,13 @@ async fn status_reports_running_then_not_running_across_shutdown() {
         .expect("join ok");
     served.expect("serve Ok on shutdown");
 
-    assert!(
-        matches!(
-            hallouminate::daemon::status()
-                .await
-                .expect("status ok while stopped"),
-            hallouminate::daemon::DaemonStatus::NotRunning
-        ),
-        "status must be NotRunning once the socket is gone"
-    );
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok while stopped")
+    {
+        hallouminate::daemon::DaemonStatus::NotRunning => {}
+        other => panic!("status must be NotRunning once the socket is gone, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2167,15 +2164,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     // First daemon up and reachable.
     let first = spawn_serve(cfg.clone(), &socket).await;
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
-    assert!(
-        matches!(
-            hallouminate::daemon::status()
-                .await
-                .expect("status ok while first daemon runs"),
-            hallouminate::daemon::DaemonStatus::Running(_)
-        ),
-        "the first daemon must be reachable before restart",
-    );
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok while first daemon runs")
+    {
+        hallouminate::daemon::DaemonStatus::Running(_) => {}
+        other => panic!("the first daemon must be reachable before restart, got {other:?}"),
+    }
 
     // Restart: stop() takes the first daemon down (its serve future returns),
     // then the injected respawn brings a fresh in-process daemon up. The
@@ -2188,15 +2183,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     let stash = second_handle.clone();
     hallouminate::daemon::restart_with(|| async move {
         // After restart's stop(), nothing must answer on the socket.
-        assert!(
-            matches!(
-                hallouminate::daemon::status()
-                    .await
-                    .expect("status ok between stop and respawn"),
-                hallouminate::daemon::DaemonStatus::NotRunning
-            ),
-            "restart must stop the old daemon before respawning",
-        );
+        match hallouminate::daemon::status()
+            .await
+            .expect("status ok between stop and respawn")
+        {
+            hallouminate::daemon::DaemonStatus::NotRunning => {}
+            other => panic!("restart must stop the old daemon before respawning, got {other:?}"),
+        }
         let handle = spawn_serve(restarted_cfg, &restart_socket).await;
         *stash.lock().expect("stash lock") = Some(handle);
         Ok(())
@@ -2212,15 +2205,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     first_result.expect("first serve returns Ok on shutdown");
 
     // The freshly respawned daemon must be reachable.
-    assert!(
-        matches!(
-            hallouminate::daemon::status()
-                .await
-                .expect("status ok after restart"),
-            hallouminate::daemon::DaemonStatus::Running(_)
-        ),
-        "restart must leave a fresh, reachable daemon up",
-    );
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok after restart")
+    {
+        hallouminate::daemon::DaemonStatus::Running(_) => {}
+        other => panic!("restart must leave a fresh, reachable daemon up, got {other:?}"),
+    }
 
     // Tear down the second daemon so the test leaves no listener behind.
     let second = second_handle

@@ -12,11 +12,19 @@ use std::path::Path;
 
 use super::ladder::{Ladder, LadderAction, LadderOutcome};
 
+/// Outcome of one completed reindex pass, as observed by [`ChurnTracker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReindexEffect {
+    /// The pass upserted at least one row -- real work, resets the streak.
+    Upserted,
+    /// The pass upserted no rows -- counts toward the churn streak.
+    NoOp,
+}
+
 /// Consecutive zero-upsert reindex tracker. Owned by the watcher pump (the
 /// single caller), hence `&mut self` -- wiring wraps it in a lock only if it
 /// ever shares the tracker.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct ChurnTracker {
     ladder: Ladder,
     consecutive_noops: u32,
@@ -32,7 +40,6 @@ impl ChurnTracker {
     /// forced maintenance pass reconciles index state without killing the
     /// watcher (`RestartTask` re-enters the same feedback loop;
     /// `WatchdogTrip` is for stalls, not busy loops).
-    #[allow(dead_code)]
     pub(crate) fn new(warn_at: u32, act_at: u32) -> Self {
         Self {
             ladder: Ladder {
@@ -45,13 +52,12 @@ impl ChurnTracker {
         }
     }
 
-    /// Record one completed reindex pass; `noop` marks a pass that upserted
-    /// no rows (`ApplyStats::files_upserted == 0`), `path` is the reindexed
-    /// file (log context only). Returns the fired outcome so the call site
-    /// (wiring task W3) executes any `LadderOutcome::Action`.
-    #[allow(dead_code)]
-    pub(crate) fn record_reindex(&mut self, noop: bool, path: &Path) -> LadderOutcome {
-        if !noop {
+    /// Record one completed reindex pass; `effect` marks whether the pass
+    /// upserted rows, `path` is the reindexed file (log context only).
+    /// Returns the fired outcome so the call site (wiring task W3) executes
+    /// any `LadderOutcome::Action`.
+    pub(crate) fn record_reindex(&mut self, effect: ReindexEffect, path: &Path) -> LadderOutcome {
+        if effect == ReindexEffect::Upserted {
             self.consecutive_noops = 0;
             self.action_armed = true;
             return LadderOutcome::Nothing;
@@ -106,11 +112,11 @@ mod tests {
     }
 
     fn noop(t: &mut ChurnTracker) -> LadderOutcome {
-        t.record_reindex(true, Path::new("wiki/hot-page.md"))
+        t.record_reindex(ReindexEffect::NoOp, Path::new("wiki/hot-page.md"))
     }
 
     fn real_upsert(t: &mut ChurnTracker) -> LadderOutcome {
-        t.record_reindex(false, Path::new("wiki/hot-page.md"))
+        t.record_reindex(ReindexEffect::Upserted, Path::new("wiki/hot-page.md"))
     }
 
     #[test]
@@ -207,16 +213,16 @@ mod tests {
     #[test]
     fn streak_is_global_across_paths_and_reset_by_any_real_upsert() {
         let mut t = tracker();
-        t.record_reindex(true, Path::new("wiki/a.md"));
-        t.record_reindex(true, Path::new("wiki/b.md"));
+        t.record_reindex(ReindexEffect::NoOp, Path::new("wiki/a.md"));
+        t.record_reindex(ReindexEffect::NoOp, Path::new("wiki/b.md"));
         assert_eq!(
-            t.record_reindex(true, Path::new("wiki/c.md")),
+            t.record_reindex(ReindexEffect::NoOp, Path::new("wiki/c.md")),
             LadderOutcome::Warn,
             "noops on different paths must accumulate one global streak",
         );
-        t.record_reindex(false, Path::new("wiki/other.md"));
+        t.record_reindex(ReindexEffect::Upserted, Path::new("wiki/other.md"));
         assert_eq!(
-            t.record_reindex(true, Path::new("wiki/a.md")),
+            t.record_reindex(ReindexEffect::NoOp, Path::new("wiki/a.md")),
             LadderOutcome::Nothing,
             "a real upsert on any path must reset the global streak",
         );

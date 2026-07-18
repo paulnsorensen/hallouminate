@@ -27,7 +27,7 @@ use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
 use hallouminate_domain::corpus::ensure_corpus_allows_file;
 
-use super::churn::ChurnTracker;
+use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
 use super::state::{DaemonState, WorkClass};
@@ -531,7 +531,12 @@ async fn handle_changed_path(
             Ok(stats) => {
                 let noop = stats.files_upserted == 0;
                 state.record_watcher_reindex(noop);
-                if let LadderOutcome::Action(action) = churn.record_reindex(noop, path) {
+                let effect = if noop {
+                    ReindexEffect::NoOp
+                } else {
+                    ReindexEffect::Upserted
+                };
+                if let LadderOutcome::Action(action) = churn.record_reindex(effect, path) {
                     state.record_ladder_trip(action);
                     // ForceMaintenance reconciles index state without killing the watcher.
                     let s = state.clone();
@@ -1133,11 +1138,10 @@ mod tests {
         let trip = state
             .last_ladder_trip()
             .expect("act threshold reached: the trip must be recorded on state");
-        assert!(
-            matches!(trip.action, LadderAction::ForceMaintenance),
-            "churn escalation must force maintenance, got {:?}",
-            trip.action,
-        );
+        match trip.action {
+            LadderAction::ForceMaintenance => {}
+            other => panic!("churn escalation must force maintenance, got {other:?}"),
+        }
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 7, 5),
