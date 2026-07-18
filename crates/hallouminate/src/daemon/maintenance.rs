@@ -228,7 +228,9 @@ async fn sleep_with_heartbeat(state: &DaemonState, total: Duration) {
     let mut remaining = total;
     while remaining > CHUNK {
         tokio::time::sleep(CHUNK).await;
-        state.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+        state
+            .heartbeat()
+            .bump(super::heartbeat::TaskName::Maintenance);
         if debt::level() == DebtLevel::Hard {
             return;
         }
@@ -315,7 +317,9 @@ pub(super) async fn maintenance_loop(
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(recheck) => {}
                 }
-                state.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+                state
+                    .heartbeat()
+                    .bump(super::heartbeat::TaskName::Maintenance);
             }
         }
         // A Hard-forced pass stays `Pace::Full` even under elevated PSI --
@@ -325,7 +329,9 @@ pub(super) async fn maintenance_loop(
             Pace::Full => state.run_maintenance_tick().await,
             Pace::Paced { .. } => state.run_maintenance_pass(pace).await,
         };
-        state.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+        state
+            .heartbeat()
+            .bump(super::heartbeat::TaskName::Maintenance);
         if hard_forced {
             // The forced pass just ran off a possibly-stale Hard reading;
             // re-read + classify real debt so a write-idle-but-read-active
@@ -334,8 +340,8 @@ pub(super) async fn maintenance_loop(
             backpressure::refresh_observed(&state).await;
         }
         if tick == MaintenanceTick::Stop {
-        break;
-    }
+            break;
+        }
     }
 }
 
@@ -957,13 +963,17 @@ mod tests {
         ));
         tokio::task::yield_now().await;
 
-        let mut previous = state.heartbeat().epoch(super::super::heartbeat::TaskName::Maintenance);
+        let mut previous = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::Maintenance);
         // Advance in 60s steps through most of the hour-long interval sleep;
         // the epoch must move on every step, never stalling for a full 60s.
         for _ in 0..50 {
             tokio::time::advance(Duration::from_secs(60)).await;
             tokio::task::yield_now().await;
-            let current = state.heartbeat().epoch(super::super::heartbeat::TaskName::Maintenance);
+            let current = state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::Maintenance);
             assert!(
                 current > previous,
                 "Maintenance epoch must advance at least every 60s during the interval sleep"
@@ -1085,9 +1095,15 @@ mod tests {
             "a Hard debt onset during the defer loop must force the pass on the next recheck"
         );
         let forced = capture.forced_event().expect("forced-pass warn event");
-        assert_eq!(forced.strings.get("hard_onset").map(String::as_str), Some("true"));
+        assert_eq!(
+            forced.strings.get("hard_onset").map(String::as_str),
+            Some("true")
+        );
         assert!(
-            forced.numbers.get("deferred_secs").is_some_and(|&secs| secs < 600),
+            forced
+                .numbers
+                .get("deferred_secs")
+                .is_some_and(|&secs| secs < 600),
             "must fire well before the 600s defer bound, via the Hard onset, not the bound"
         );
 

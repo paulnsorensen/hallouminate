@@ -311,7 +311,9 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                     // Quiet pump: no wake arrived within the heartbeat window.
                     // Bump the watchdog and go back to waiting instead of
                     // spawning a fresh blocking task every 60s.
-                    state.heartbeat().bump(super::heartbeat::TaskName::WatcherPump);
+                    state
+                        .heartbeat()
+                        .bump(super::heartbeat::TaskName::WatcherPump);
                     continue;
                 }
                 // Channel disconnected: the debouncer (and its `wake_tx`) was
@@ -337,7 +339,9 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                     break;
                 }
             }
-            state.heartbeat().bump(super::heartbeat::TaskName::WatcherPump);
+            state
+                .heartbeat()
+                .bump(super::heartbeat::TaskName::WatcherPump);
             let paths: Vec<PathBuf> = {
                 let mut set = pending.lock().expect("watch pending-paths mutex");
                 set.drain().collect()

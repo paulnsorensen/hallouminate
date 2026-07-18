@@ -540,24 +540,23 @@ impl DaemonState {
             // reports them); a `Weak` breaks the ownership cycle.
             inner: Arc::new_cyclic(|weak: &std::sync::Weak<DaemonStateInner>| {
                 let weak = weak.clone();
-                let escalate: super::supervisor::EscalationHook =
-                    Arc::new(move |task, action| {
-                        tracing::error!(
-                            target: "hallouminate::daemon",
-                            task = ?task,
-                            action = ?action,
-                            "supervised task exceeded the restart intensity cap",
-                        );
-                        if let Some(inner) = weak.upgrade() {
-                            *inner
-                                .last_ladder_trip
-                                .lock()
-                                .expect("ladder trip mutex poisoned") = Some(LadderTrip {
-                                action,
-                                at_secs: monotonic_secs(),
-                            });
-                        }
-                    });
+                let escalate: super::supervisor::EscalationHook = Arc::new(move |task, action| {
+                    tracing::error!(
+                        target: "hallouminate::daemon",
+                        task = ?task,
+                        action = ?action,
+                        "supervised task exceeded the restart intensity cap",
+                    );
+                    if let Some(inner) = weak.upgrade() {
+                        *inner
+                            .last_ladder_trip
+                            .lock()
+                            .expect("ladder trip mutex poisoned") = Some(LadderTrip {
+                            action,
+                            at_secs: monotonic_secs(),
+                        });
+                    }
+                });
                 DaemonStateInner {
                     baseline: cfg,
                     baseline_xdg_path: xdg_path,
@@ -611,12 +610,18 @@ impl DaemonState {
             let probe: Arc<dyn IoPressureProbe> = Arc::new(PsiProbe);
             #[cfg(not(target_os = "linux"))]
             let probe: Arc<dyn IoPressureProbe> = Arc::new(NoPressureSignal);
-            let maintenance_task = state.inner.supervisor.spawn(
-                super::heartbeat::TaskName::Maintenance,
-                move || {
-                    maintenance_loop(loop_state.clone(), cancel.clone(), interval, probe.clone())
-                },
-            );
+            let maintenance_task =
+                state
+                    .inner
+                    .supervisor
+                    .spawn(super::heartbeat::TaskName::Maintenance, move || {
+                        maintenance_loop(
+                            loop_state.clone(),
+                            cancel.clone(),
+                            interval,
+                            probe.clone(),
+                        )
+                    });
             *state.inner.maintenance_task.lock().await = Some(maintenance_task);
         }
 
