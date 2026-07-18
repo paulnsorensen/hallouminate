@@ -1150,6 +1150,24 @@ fn validate(cfg: &Config) -> Result<()> {
             globals.join(", "),
         )));
     }
+    // The Hard-debt gate polls every `max(debt_cache_ttl_secs, 1)` seconds
+    // inside the `hard_block_wait_secs` window; if that effective poll interval
+    // meets or exceeds the block wait, the loop sleeps straight to the deadline
+    // and loses the early-unblock re-probe. Reject the pairing so a Hard-blocked
+    // mutation can observe maintenance catching up before it fails retryable.
+    // Compare the effective poll (the `.max(1)` floor also collapses the window
+    // at `ttl = 0, wait = 1`). Guarded on a non-zero wait: `hard_block_wait_secs
+    // = 0` disables blocking entirely, so there is no window to poll within.
+    let daemon = &cfg.daemon;
+    let poll_floor_secs = daemon.debt_cache_ttl_secs.max(1);
+    if daemon.hard_block_wait_secs > 0 && poll_floor_secs >= daemon.hard_block_wait_secs {
+        return Err(HallouminateError::Config(format!(
+            "daemon Hard-debt poll interval (max(debt_cache_ttl_secs, 1) = {poll_floor_secs}s) must \
+             be less than daemon.hard_block_wait_secs ({}s) so a Hard-blocked mutation re-probes \
+             before the deadline",
+            daemon.hard_block_wait_secs,
+        )));
+    }
     // Surface duplicate-name and bad-name failures at config-load time
     // instead of waiting for the daemon to enumerate corpora at request
     // time.
@@ -1553,6 +1571,63 @@ ground_dir = "~/.local/share/hallouminate/ground"
         let cfg = parse("[daemon]\nmaintenance_interval_secs = 3600\n", None)
             .expect("maintenance_interval_secs = 3600 parses");
         assert_eq!(cfg.daemon.maintenance_interval_secs, 3600);
+    }
+
+    #[test]
+    fn parse_rejects_debt_cache_ttl_at_or_above_hard_block_wait() {
+        // A cache TTL >= the Hard block wait collapses the gate's early-unblock
+        // re-probe (the poll loop sleeps straight to the deadline and only
+        // probes once, at the deadline), so config load must reject the pairing
+        // rather than silently degrade Hard-blocked mutations to full-wait.
+        let err = parse(
+            "[daemon]\nhard_block_wait_secs = 30\ndebt_cache_ttl_secs = 30\n",
+            None,
+        )
+        .expect_err("ttl >= wait must fail validation");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(
+                    msg.contains("debt_cache_ttl_secs") && msg.contains("hard_block_wait_secs"),
+                    "must name both fields: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rejects_zero_debt_cache_ttl_against_one_second_hard_block() {
+        // `debt_cache_ttl_secs = 0` disables caching but the poll interval
+        // floors at `max(0, 1) = 1s`, so paired with a 1s block wait the loop
+        // still collapses to a single deadline probe. The check compares the
+        // effective poll floor, not the raw TTL, so this must be rejected.
+        let err = parse(
+            "[daemon]\nhard_block_wait_secs = 1\ndebt_cache_ttl_secs = 0\n",
+            None,
+        )
+        .expect_err("poll floor >= wait must fail validation even at ttl = 0");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(
+                    msg.contains("poll interval") && msg.contains("hard_block_wait_secs"),
+                    "must explain the poll-floor collapse: {msg}"
+                );
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_accepts_large_debt_cache_ttl_when_hard_block_disabled() {
+        // `hard_block_wait_secs = 0` disables Hard blocking, so there is no
+        // window to poll within and any cache TTL is admissible.
+        let cfg = parse(
+            "[daemon]\nhard_block_wait_secs = 0\ndebt_cache_ttl_secs = 60\n",
+            None,
+        )
+        .expect("ttl above a disabled hard block parses");
+        assert_eq!(cfg.daemon.hard_block_wait_secs, 0);
+        assert_eq!(cfg.daemon.debt_cache_ttl_secs, 60);
     }
 
     #[test]

@@ -110,6 +110,7 @@ impl WarnThrottle {
 
 static DEBT_READ_FAILURE_WARN: WarnThrottle = WarnThrottle::new();
 static HARD_DEBT_NO_MAINTENANCE_WARN: WarnThrottle = WarnThrottle::new();
+static HARD_DEBT_BLOCK_WARN: WarnThrottle = WarnThrottle::new();
 
 /// Re-reads real debt from the store, classifies it, and records the fresh
 /// level into `debt::OBSERVED`. Used by the mutation gate's cache-miss path
@@ -166,11 +167,16 @@ where
             Ok(())
         }
         DebtLevel::Hard => {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                hard_block_wait_secs = hard_wait.as_secs(),
-                "maintenance debt is Hard; blocking mutation until maintenance catches up",
-            );
+            // Throttled: under a write storm every blocked mutation reaches
+            // this branch, so emit at most one WARN per `WARN_WINDOW` -- the
+            // condition, not each instance, is what an operator needs.
+            if HARD_DEBT_BLOCK_WARN.should_log() {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    hard_block_wait_secs = hard_wait.as_secs(),
+                    "maintenance debt is Hard; blocking mutation until maintenance catches up",
+                );
+            }
             let deadline = tokio::time::Instant::now() + hard_wait;
             loop {
                 let now = tokio::time::Instant::now();

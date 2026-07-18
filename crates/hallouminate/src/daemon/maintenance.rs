@@ -293,6 +293,9 @@ pub(super) async fn maintenance_loop(
                 }
             }
         }
+        // A Hard-forced pass stays `Pace::Full` even under elevated PSI --
+        // unlike the defer-bound-forced path above, which calls `forced_pace`.
+        // Hard already blocks writes, so fast debt recovery outranks pacing.
         let tick = match pace {
             Pace::Full => state.run_maintenance_tick().await,
             Pace::Paced { .. } => state.run_maintenance_pass(pace).await,
