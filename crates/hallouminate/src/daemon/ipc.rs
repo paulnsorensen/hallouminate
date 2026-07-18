@@ -75,6 +75,11 @@ pub enum DaemonRequestPayload {
     /// Read-only index health summary for a corpus: file counts, chunk count,
     /// newest index timestamp, and unindexed-file count.
     CorpusStats { corpus: Option<String> },
+    /// Daemon self-status: per-task heartbeat state, maintenance debt
+    /// level, deferral count, watcher counters, and the last ladder trip.
+    /// Stubbed to a default/empty [`StatusReport`] until curd 9 wires the
+    /// real daemon-internal sources (status.rs).
+    Status,
     /// Ask the daemon to shut down gracefully: cancel the accept loop, drop
     /// the flock guard, and remove the socket file. The server acks with
     /// `"stopping"` before tearing down.
@@ -200,6 +205,10 @@ impl DaemonResponse {
 pub enum ErrorKind {
     InvalidParams,
     Internal,
+    /// A mutation was blocked (e.g. `DebtLevel::Hard`'s bounded wait expired)
+    /// and the caller should retry -- distinct from `Internal` so a client
+    /// can safely retry without risking a non-idempotent operation twice.
+    Retryable,
 }
 
 // ── Response payload structs ───────────────────────────────────────────
@@ -313,6 +322,83 @@ pub struct ListTreeResult {
 
 /// `ListCorpora` payload alias — daemon emits an array of [`CorpusEntry`].
 pub type ListCorporaResult = Vec<CorpusEntry>;
+
+/// `Status` payload. Wire-side mirror of daemon-internal status types
+/// (`heartbeat::{TaskName, TaskStatus}`, `debt::DebtLevel`,
+/// `state::WatcherCounters`, `ladder::LadderTrip`/`LadderAction`) -- ipc.rs
+/// does not depend on sibling daemon modules today (see module doc), so the
+/// wire shape is mirrored here rather than referencing those types directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusReport {
+    pub per_task: Vec<TaskStatus>,
+    pub debt: DebtLevel,
+    pub defer_count: u32,
+    pub watcher: WatcherCounters,
+    pub trips: TripState,
+}
+
+/// One of the five long-lived daemon loops a watchdog can monitor. Mirrors
+/// `heartbeat::TaskName`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskName {
+    Maintenance,
+    CatchUp,
+    WatcherPump,
+    IdleExit,
+    Signal,
+}
+
+/// A task's heartbeat health. Mirrors `heartbeat::TaskStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Alive,
+    Stalled,
+}
+
+/// Per-task status entry within [`StatusReport::per_task`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStatus {
+    pub task: TaskName,
+    pub state: TaskState,
+}
+
+/// Graduated maintenance debt level. Mirrors `debt::DebtLevel`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebtLevel {
+    Ok,
+    Soft,
+    Hard,
+}
+
+/// Watcher event/reindex counters. Mirrors `state::WatcherCounters`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatcherCounters {
+    pub events: u64,
+    pub reindexes: u64,
+    pub noop_reindexes: u64,
+}
+
+/// An escalating ladder action. Mirrors `ladder::LadderAction`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LadderAction {
+    ForceMaintenance,
+    RestartTask(TaskName),
+    WatchdogTrip,
+}
+
+/// The daemon's last recorded ladder trip, if any. Mirrors
+/// `state::LadderTrip` as an `Option`-shaped enum for a clean wire
+/// representation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TripState {
+    None,
+    Tripped { action: LadderAction, at_secs: u64 },
+}
 
 #[cfg(test)]
 mod tests {

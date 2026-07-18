@@ -1,0 +1,6 @@
+# ADR daemon-rework-005: Internal watchdog over systemd supervision  [status: accepted]
+
+- **Context:** The daemon is self-spawned on demand by MCP clients holding a socket flock — there is no init-system supervisor. A stall detector must survive a frozen tokio runtime, which rules out any in-runtime watchdog. systemd's WatchdogSec/sd_notify contract provides liveness supervision for free but requires adopting systemd as the daemon's owner.
+- **Decision:** Internal watchdog only: a dedicated OS thread (nano-watchdog pattern) checking per-task heartbeat epochs bumped by supervised tasks. Trip behavior per ADR daemon-rework-004.
+- **Alternatives rejected:** systemd user service + sd_notify (changes the deployment model and daemon ownership ADRs, Linux-only, breaks macOS portability); both-layered (sd_notify when under systemd) — deferred, not rejected: the internal detector is the invariant layer and sd_notify can be added later without redesign.
+- **Consequences:** watchdog trip diagnosis relies on our own StatusReport/trip-state trail rather than systemd's journal integration. Today's churn-style failure (tasks heartbeating while doing useless work) does NOT trip the watchdog by design — the no-op churn ladder (G7) is the detector for that class.

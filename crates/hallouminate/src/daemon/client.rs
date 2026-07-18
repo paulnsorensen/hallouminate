@@ -208,6 +208,7 @@ impl DaemonClient {
             DaemonResponse::Err { kind, message } => match kind {
                 ErrorKind::InvalidParams => Err(DaemonRpcError::invalid_params(message).into()),
                 ErrorKind::Internal => Err(DaemonRpcError::internal(message).into()),
+                ErrorKind::Retryable => Err(DaemonRpcError::retryable(message).into()),
             },
         }
     }
@@ -234,6 +235,7 @@ fn timeout_for(payload: &DaemonRequestPayload) -> Duration {
         | DaemonRequestPayload::ReadMarkdown(_)
         | DaemonRequestPayload::Backlinks(_)
         | DaemonRequestPayload::CorpusStats { .. }
+        | DaemonRequestPayload::Status
         | DaemonRequestPayload::Shutdown => Duration::from_secs(60),
     }
 }
@@ -250,6 +252,12 @@ impl DaemonRpcError {
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         Self {
             kind: ErrorKind::InvalidParams,
+            message: msg.into(),
+        }
+    }
+    pub fn retryable(msg: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Retryable,
             message: msg.into(),
         }
     }

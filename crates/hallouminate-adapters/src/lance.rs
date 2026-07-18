@@ -43,6 +43,11 @@ pub struct MaintenanceOptions {
     /// Correlates adapter stage events with the daemon's lifecycle event.
     pub maintenance_id: u64,
     pub prune_older_than: Duration,
+    /// Bounds one compaction pass to at most this many source fragments
+    /// (ADR daemon-rework-001 paced mode: a `Pace::Paced` slice runs a
+    /// bounded chunk of the backlog instead of the whole thing in one shot).
+    /// `None` preserves today's unbounded behaviour.
+    pub max_fragments_per_slice: Option<usize>,
 }
 
 /// Reports the effects of one LanceDB maintenance pass.
@@ -51,6 +56,15 @@ pub struct MaintenanceStats {
     pub fragments_removed: Option<usize>,
     pub fragments_added: Option<usize>,
     pub old_versions_pruned: Option<u64>,
+}
+
+/// Real backlog signals read from LanceDB metadata, feeding the daemon's
+/// maintenance-debt ladder (ADR daemon-rework-001). Cheap: table stats +
+/// version list, no compaction/prune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LanceDebt {
+    pub fragments: u64,
+    pub stale_versions: u64,
 }
 
 /// Rounds a prune-retention `Duration` to whole seconds for LanceDB's
@@ -798,7 +812,10 @@ impl LanceStore {
         let compact = self
             .table
             .optimize(lancedb::table::OptimizeAction::Compact {
-                options: lancedb::table::CompactionOptions::default(),
+                options: lancedb::table::CompactionOptions {
+                    max_source_fragments: options.max_fragments_per_slice,
+                    ..Default::default()
+                },
                 remap_options: None,
             })
             .await;
@@ -883,6 +900,22 @@ impl LanceStore {
                 .map(|stats| stats.fragments_removed),
             fragments_added: stats.compaction.as_ref().map(|stats| stats.fragments_added),
             old_versions_pruned: stats.prune.as_ref().map(|stats| stats.old_versions),
+        })
+    }
+
+    /// Reads real backlog signals used by the daemon's maintenance-debt ladder
+    /// (ADR daemon-rework-001): fragment count from table statistics, and stale
+    /// (superseded) dataset version count from version history. Cheap relative
+    /// to a full maintenance pass -- no compaction or pruning runs.
+    ///
+    /// # Errors
+    /// Returns an error if the LanceDB stats or version-listing call fails.
+    pub async fn debt(&self) -> Result<LanceDebt> {
+        let stats = self.table.stats().await.map_err(map_lance_err)?;
+        let versions = self.table.list_versions().await.map_err(map_lance_err)?;
+        Ok(LanceDebt {
+            fragments: stats.fragment_stats.num_fragments as u64,
+            stale_versions: versions.len().saturating_sub(1) as u64,
         })
     }
 
@@ -1800,6 +1833,7 @@ mod tests {
             .maintain(MaintenanceOptions {
                 maintenance_id: 1,
                 prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
             })
             .await
             .expect("maintain");
@@ -1835,6 +1869,123 @@ mod tests {
             !snaps.iter().any(|s| s.file_ref == "/tmp/f0.md"),
             "deleted file must stay gone after maintain"
         );
+    }
+
+    #[tokio::test]
+    async fn debt_reports_fragment_and_stale_version_counts() {
+        // Mirrors maintain_prunes_versions_and_preserves_query_correctness's
+        // setup: many small upserts + deletes build up fragments and a
+        // version history that debt() should report without running any
+        // compaction or pruning itself.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+
+        for i in 0..20 {
+            let pf = synthetic_prepared(&format!("/tmp/f{i}.md"), 1);
+            store.apply_batch(vec![pf]).await.expect("apply");
+        }
+        for i in 0..10 {
+            store
+                .delete_file("docs", &format!("/tmp/f{i}.md"))
+                .await
+                .expect("delete");
+        }
+
+        let versions_before = store
+            .table
+            .list_versions()
+            .await
+            .expect("list_versions")
+            .len() as u64;
+        let debt_before = store.debt().await.expect("debt");
+        assert!(
+            debt_before.fragments >= 1,
+            "expected at least one fragment: {:?}",
+            debt_before
+        );
+        assert_eq!(
+            debt_before.stale_versions,
+            versions_before - 1,
+            "stale_versions must equal the retained-version count minus the current version"
+        );
+
+        store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 1,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
+            })
+            .await
+            .expect("maintain");
+
+        let debt_after = store.debt().await.expect("debt");
+        assert!(
+            debt_after.stale_versions < debt_before.stale_versions,
+            "maintain must reduce debt's stale_versions count: before {}, after {}",
+            debt_before.stale_versions,
+            debt_after.stale_versions
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_max_fragments_per_slice_bounds_one_compaction_pass() {
+        // Two identically-seeded stores: one maintained with a tight
+        // fragment-per-slice bound, one unbounded. The bound must make the
+        // single compaction pass touch strictly fewer fragments than the
+        // unbounded pass on the same backlog (ADR daemon-rework-001 paced
+        // mode -- a bounded slice does a chunk of the backlog, not all of it).
+        async fn seed_store(dir: &std::path::Path) -> LanceStore {
+            let store =
+                LanceStore::open_or_create(dir, "BAAI/bge-small-en-v1.5", false, false, None)
+                    .await
+                    .expect("open store");
+            for i in 0..20 {
+                let pf = synthetic_prepared(&format!("/tmp/f{i}.md"), 1);
+                store.apply_batch(vec![pf]).await.expect("apply");
+            }
+            store
+        }
+
+        let bounded_dir = tempfile::tempdir().unwrap();
+        let bounded_store = seed_store(bounded_dir.path()).await;
+        let bounded_stats = bounded_store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 1,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: Some(2),
+            })
+            .await
+            .expect("bounded maintain");
+
+        let unbounded_dir = tempfile::tempdir().unwrap();
+        let unbounded_store = seed_store(unbounded_dir.path()).await;
+        let unbounded_stats = unbounded_store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 2,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
+            })
+            .await
+            .expect("unbounded maintain");
+
+        let bounded_removed = bounded_stats
+            .fragments_removed
+            .expect("bounded pass must report a fragments_removed count");
+        let unbounded_removed = unbounded_stats
+            .fragments_removed
+            .expect("unbounded pass must report a fragments_removed count");
+        assert!(
+            bounded_removed < unbounded_removed,
+            "max_fragments_per_slice must constrain one pass to fewer removed fragments \
+             than the unbounded pass on the same backlog: bounded {bounded_removed}, \
+             unbounded {unbounded_removed}"
+        );
+
+        // The bounded run must still leave correct, queryable data behind.
+        assert_eq!(bounded_store.count_rows().await.unwrap(), 20);
     }
 
     #[tokio::test]

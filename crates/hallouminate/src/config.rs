@@ -158,6 +158,68 @@ pub struct DaemonConfig {
     /// `idle_exit_secs`'s convention. Default: `1800` (30 min).
     #[serde(default = "default_maintenance_interval_secs")]
     pub maintenance_interval_secs: u64,
+    /// Max continuous maintenance deferral before a due tick is forced,
+    /// regardless of Active/IoPressure gating. Default: `3600` (1h — one
+    /// defer-bound of staleness is tolerable for wiki freshness; the
+    /// incident that motivated this deferred 17h).
+    #[serde(default = "default_defer_bound_secs")]
+    pub defer_bound_secs: u64,
+    /// Fragment count entering `DebtLevel::Soft`. Default: `100` (the point
+    /// compaction measurably helps).
+    #[serde(default = "default_debt_soft_fragments")]
+    pub debt_soft_fragments: u64,
+    /// Fragment count entering `DebtLevel::Hard`. Default: `500` (well
+    /// before the 114.7GiB pile-on regime).
+    #[serde(default = "default_debt_hard_fragments")]
+    pub debt_hard_fragments: u64,
+    /// Stale-version count entering `DebtLevel::Soft`. Default: `50` (same
+    /// shape as fragment debt).
+    #[serde(default = "default_debt_soft_stale_versions")]
+    pub debt_soft_stale_versions: u64,
+    /// Stale-version count entering `DebtLevel::Hard`. Default: `250` (same
+    /// shape as fragment debt).
+    #[serde(default = "default_debt_hard_stale_versions")]
+    pub debt_hard_stale_versions: u64,
+    /// Bounded wait for a mutation blocked under `DebtLevel::Hard` before it
+    /// fails with a retryable error. Default: `30` (a client-visible stall
+    /// longer than this should fail fast and retry).
+    #[serde(default = "default_hard_block_wait_secs")]
+    pub hard_block_wait_secs: u64,
+    /// Max fragments compacted per paced maintenance slice. Default: `8`
+    /// (small enough to release the write guard frequently under PSI).
+    #[serde(default = "default_paced_slice_budget")]
+    pub paced_slice_budget: u64,
+    /// Sleep between paced maintenance slices. Default: `500` (yields I/O
+    /// bandwidth between slices on a saturated system).
+    #[serde(default = "default_paced_slice_sleep_ms")]
+    pub paced_slice_sleep_ms: u64,
+    /// Consecutive noop reindexes before a WARN. Default: `10` (already
+    /// pathological at this count).
+    #[serde(default = "default_churn_warn_at")]
+    pub churn_warn_at: u32,
+    /// Consecutive noop reindexes before a laddered action. Default: `50`
+    /// (demands action).
+    #[serde(default = "default_churn_act_at")]
+    pub churn_act_at: u32,
+    /// Supervisor restarts allowed per `restart_intensity_window_secs`.
+    /// Default: `5` (OTP's classic 5-in-60 shape).
+    #[serde(default = "default_restart_intensity_cap")]
+    pub restart_intensity_cap: u32,
+    /// Window over which `restart_intensity_cap` is measured. Default: `60`
+    /// (OTP's classic 5-in-60 shape).
+    #[serde(default = "default_restart_intensity_window_secs")]
+    pub restart_intensity_window_secs: u64,
+    /// Heartbeat age counted as a stall. Default: `300` (5min — longest
+    /// legitimate tick pause under load, per the incident timeline).
+    #[serde(default = "default_watchdog_stall_secs")]
+    pub watchdog_stall_secs: u64,
+    /// Crash-loop boot backoff floor. Default: `10` (spec-fixed: 10s
+    /// doubling to the cap).
+    #[serde(default = "default_boot_backoff_floor_secs")]
+    pub boot_backoff_floor_secs: u64,
+    /// Crash-loop boot backoff cap. Default: `300` (spec-fixed: 5min cap).
+    #[serde(default = "default_boot_backoff_cap_secs")]
+    pub boot_backoff_cap_secs: u64,
 }
 
 impl Default for DaemonConfig {
@@ -165,6 +227,21 @@ impl Default for DaemonConfig {
         Self {
             idle_exit_secs: default_idle_exit_secs(),
             maintenance_interval_secs: default_maintenance_interval_secs(),
+            defer_bound_secs: default_defer_bound_secs(),
+            debt_soft_fragments: default_debt_soft_fragments(),
+            debt_hard_fragments: default_debt_hard_fragments(),
+            debt_soft_stale_versions: default_debt_soft_stale_versions(),
+            debt_hard_stale_versions: default_debt_hard_stale_versions(),
+            hard_block_wait_secs: default_hard_block_wait_secs(),
+            paced_slice_budget: default_paced_slice_budget(),
+            paced_slice_sleep_ms: default_paced_slice_sleep_ms(),
+            churn_warn_at: default_churn_warn_at(),
+            churn_act_at: default_churn_act_at(),
+            restart_intensity_cap: default_restart_intensity_cap(),
+            restart_intensity_window_secs: default_restart_intensity_window_secs(),
+            watchdog_stall_secs: default_watchdog_stall_secs(),
+            boot_backoff_floor_secs: default_boot_backoff_floor_secs(),
+            boot_backoff_cap_secs: default_boot_backoff_cap_secs(),
         }
     }
 }
@@ -669,6 +746,126 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        defer_bound_secs: merge_scalar(
+            "daemon.defer_bound_secs",
+            baseline.daemon.defer_bound_secs,
+            repo.daemon.defer_bound_secs,
+            defaults.daemon.defer_bound_secs,
+            baseline_path,
+            repo_path,
+        )?,
+        debt_soft_fragments: merge_scalar(
+            "daemon.debt_soft_fragments",
+            baseline.daemon.debt_soft_fragments,
+            repo.daemon.debt_soft_fragments,
+            defaults.daemon.debt_soft_fragments,
+            baseline_path,
+            repo_path,
+        )?,
+        debt_hard_fragments: merge_scalar(
+            "daemon.debt_hard_fragments",
+            baseline.daemon.debt_hard_fragments,
+            repo.daemon.debt_hard_fragments,
+            defaults.daemon.debt_hard_fragments,
+            baseline_path,
+            repo_path,
+        )?,
+        debt_soft_stale_versions: merge_scalar(
+            "daemon.debt_soft_stale_versions",
+            baseline.daemon.debt_soft_stale_versions,
+            repo.daemon.debt_soft_stale_versions,
+            defaults.daemon.debt_soft_stale_versions,
+            baseline_path,
+            repo_path,
+        )?,
+        debt_hard_stale_versions: merge_scalar(
+            "daemon.debt_hard_stale_versions",
+            baseline.daemon.debt_hard_stale_versions,
+            repo.daemon.debt_hard_stale_versions,
+            defaults.daemon.debt_hard_stale_versions,
+            baseline_path,
+            repo_path,
+        )?,
+        hard_block_wait_secs: merge_scalar(
+            "daemon.hard_block_wait_secs",
+            baseline.daemon.hard_block_wait_secs,
+            repo.daemon.hard_block_wait_secs,
+            defaults.daemon.hard_block_wait_secs,
+            baseline_path,
+            repo_path,
+        )?,
+        paced_slice_budget: merge_scalar(
+            "daemon.paced_slice_budget",
+            baseline.daemon.paced_slice_budget,
+            repo.daemon.paced_slice_budget,
+            defaults.daemon.paced_slice_budget,
+            baseline_path,
+            repo_path,
+        )?,
+        paced_slice_sleep_ms: merge_scalar(
+            "daemon.paced_slice_sleep_ms",
+            baseline.daemon.paced_slice_sleep_ms,
+            repo.daemon.paced_slice_sleep_ms,
+            defaults.daemon.paced_slice_sleep_ms,
+            baseline_path,
+            repo_path,
+        )?,
+        churn_warn_at: merge_scalar(
+            "daemon.churn_warn_at",
+            baseline.daemon.churn_warn_at,
+            repo.daemon.churn_warn_at,
+            defaults.daemon.churn_warn_at,
+            baseline_path,
+            repo_path,
+        )?,
+        churn_act_at: merge_scalar(
+            "daemon.churn_act_at",
+            baseline.daemon.churn_act_at,
+            repo.daemon.churn_act_at,
+            defaults.daemon.churn_act_at,
+            baseline_path,
+            repo_path,
+        )?,
+        restart_intensity_cap: merge_scalar(
+            "daemon.restart_intensity_cap",
+            baseline.daemon.restart_intensity_cap,
+            repo.daemon.restart_intensity_cap,
+            defaults.daemon.restart_intensity_cap,
+            baseline_path,
+            repo_path,
+        )?,
+        restart_intensity_window_secs: merge_scalar(
+            "daemon.restart_intensity_window_secs",
+            baseline.daemon.restart_intensity_window_secs,
+            repo.daemon.restart_intensity_window_secs,
+            defaults.daemon.restart_intensity_window_secs,
+            baseline_path,
+            repo_path,
+        )?,
+        watchdog_stall_secs: merge_scalar(
+            "daemon.watchdog_stall_secs",
+            baseline.daemon.watchdog_stall_secs,
+            repo.daemon.watchdog_stall_secs,
+            defaults.daemon.watchdog_stall_secs,
+            baseline_path,
+            repo_path,
+        )?,
+        boot_backoff_floor_secs: merge_scalar(
+            "daemon.boot_backoff_floor_secs",
+            baseline.daemon.boot_backoff_floor_secs,
+            repo.daemon.boot_backoff_floor_secs,
+            defaults.daemon.boot_backoff_floor_secs,
+            baseline_path,
+            repo_path,
+        )?,
+        boot_backoff_cap_secs: merge_scalar(
+            "daemon.boot_backoff_cap_secs",
+            baseline.daemon.boot_backoff_cap_secs,
+            repo.daemon.boot_backoff_cap_secs,
+            defaults.daemon.boot_backoff_cap_secs,
+            baseline_path,
+            repo_path,
+        )?,
     };
 
     // `[logging]` is process-wide and baseline-owned (it configures the
@@ -969,6 +1166,51 @@ fn default_idle_exit_secs() -> u64 {
 }
 fn default_maintenance_interval_secs() -> u64 {
     1800
+}
+fn default_defer_bound_secs() -> u64 {
+    3600
+}
+fn default_debt_soft_fragments() -> u64 {
+    100
+}
+fn default_debt_hard_fragments() -> u64 {
+    500
+}
+fn default_debt_soft_stale_versions() -> u64 {
+    50
+}
+fn default_debt_hard_stale_versions() -> u64 {
+    250
+}
+fn default_hard_block_wait_secs() -> u64 {
+    30
+}
+fn default_paced_slice_budget() -> u64 {
+    8
+}
+fn default_paced_slice_sleep_ms() -> u64 {
+    500
+}
+fn default_churn_warn_at() -> u32 {
+    10
+}
+fn default_churn_act_at() -> u32 {
+    50
+}
+fn default_restart_intensity_cap() -> u32 {
+    5
+}
+fn default_restart_intensity_window_secs() -> u64 {
+    60
+}
+fn default_watchdog_stall_secs() -> u64 {
+    300
+}
+fn default_boot_backoff_floor_secs() -> u64 {
+    10
+}
+fn default_boot_backoff_cap_secs() -> u64 {
+    300
 }
 
 #[cfg(test)]
@@ -1273,6 +1515,70 @@ ground_dir = "~/.local/share/hallouminate/ground"
         let cfg = parse("[daemon]\nmaintenance_interval_secs = 3600\n", None)
             .expect("maintenance_interval_secs = 3600 parses");
         assert_eq!(cfg.daemon.maintenance_interval_secs, 3600);
+    }
+
+    #[test]
+    fn daemon_config_new_thresholds_default_to_spec_values() {
+        let cfg = DaemonConfig::default();
+        assert_eq!(cfg.defer_bound_secs, 3600);
+        assert_eq!(cfg.debt_soft_fragments, 100);
+        assert_eq!(cfg.debt_hard_fragments, 500);
+        assert_eq!(cfg.debt_soft_stale_versions, 50);
+        assert_eq!(cfg.debt_hard_stale_versions, 250);
+        assert_eq!(cfg.hard_block_wait_secs, 30);
+        assert_eq!(cfg.paced_slice_budget, 8);
+        assert_eq!(cfg.paced_slice_sleep_ms, 500);
+        assert_eq!(cfg.churn_warn_at, 10);
+        assert_eq!(cfg.churn_act_at, 50);
+        assert_eq!(cfg.restart_intensity_cap, 5);
+        assert_eq!(cfg.restart_intensity_window_secs, 60);
+        assert_eq!(cfg.watchdog_stall_secs, 300);
+        assert_eq!(cfg.boot_backoff_floor_secs, 10);
+        assert_eq!(cfg.boot_backoff_cap_secs, 300);
+
+        let parsed = parse("", None).expect("empty config parses");
+        assert_eq!(
+            parsed.daemon, cfg,
+            "an empty [daemon] section must fully default"
+        );
+    }
+
+    #[test]
+    fn parse_daemon_new_thresholds_override_round_trip() {
+        let toml = r#"
+[daemon]
+defer_bound_secs = 1200
+debt_soft_fragments = 200
+debt_hard_fragments = 900
+debt_soft_stale_versions = 75
+debt_hard_stale_versions = 400
+hard_block_wait_secs = 45
+paced_slice_budget = 4
+paced_slice_sleep_ms = 250
+churn_warn_at = 20
+churn_act_at = 80
+restart_intensity_cap = 3
+restart_intensity_window_secs = 30
+watchdog_stall_secs = 120
+boot_backoff_floor_secs = 5
+boot_backoff_cap_secs = 600
+"#;
+        let cfg = parse(toml, None).expect("daemon threshold overrides parse");
+        assert_eq!(cfg.daemon.defer_bound_secs, 1200);
+        assert_eq!(cfg.daemon.debt_soft_fragments, 200);
+        assert_eq!(cfg.daemon.debt_hard_fragments, 900);
+        assert_eq!(cfg.daemon.debt_soft_stale_versions, 75);
+        assert_eq!(cfg.daemon.debt_hard_stale_versions, 400);
+        assert_eq!(cfg.daemon.hard_block_wait_secs, 45);
+        assert_eq!(cfg.daemon.paced_slice_budget, 4);
+        assert_eq!(cfg.daemon.paced_slice_sleep_ms, 250);
+        assert_eq!(cfg.daemon.churn_warn_at, 20);
+        assert_eq!(cfg.daemon.churn_act_at, 80);
+        assert_eq!(cfg.daemon.restart_intensity_cap, 3);
+        assert_eq!(cfg.daemon.restart_intensity_window_secs, 30);
+        assert_eq!(cfg.daemon.watchdog_stall_secs, 120);
+        assert_eq!(cfg.daemon.boot_backoff_floor_secs, 5);
+        assert_eq!(cfg.daemon.boot_backoff_cap_secs, 600);
     }
 
     #[test]

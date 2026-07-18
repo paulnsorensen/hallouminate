@@ -21,7 +21,7 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
@@ -35,13 +35,14 @@ use super::pressure::NoPressureSignal;
 use super::pressure::PsiProbe;
 
 use crate::config::Config;
-use hallouminate_adapters::{
-    EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, MaintenanceOptions, MaintenanceStats,
-};
+use hallouminate_adapters::{EmbedBatch, Embedder, FastembedCrossencoder, LanceStore};
 use hallouminate_domain::common::{HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
+
+use super::ladder::LadderAction;
+use super::maintenance::{DeferReason, maintenance_loop};
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
@@ -50,32 +51,7 @@ const CHUNK_BUDGET_TOKENS: usize = 384;
 /// pruned at daemon boot; they're recoverable-until-pruned, not permanent.
 pub(crate) const STALE_BACKUP_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-/// Grace window for `maintain`'s prune cutoff: versions younger than this
-/// are retained, letting in-flight queries drain before their snapshotted
-/// version's files can be deleted. Queries don't hold the write lane, so
-/// this is the only thing protecting them from a maintenance tick's version
-/// prune.
-const MAINTENANCE_PRUNE_GRACE_SECS: u64 = 300;
-
-/// Whether the maintenance loop should keep ticking after a pass. `Stop`
-/// means daemon shutdown was requested or the write lane was closed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MaintenanceTick {
-    Continue,
-    Stop,
-}
-
-/// Why a due maintenance pass was deferred instead of run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeferReason {
-    /// A connection is active, or activity was seen in the last 60s.
-    Active,
-    /// No recent activity, but host I/O pressure is elevated.
-    IoPressure,
-}
-
 static PROCESS_START: OnceLock<Instant> = OnceLock::new();
-static NEXT_MAINTENANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Monotonic seconds elapsed since process start (`Instant`-based), not
 /// wall-clock Unix time — a clock step (NTP correction, manual clock change)
@@ -227,6 +203,31 @@ struct DaemonStateInner {
     /// Count of connection handlers in flight. Idle-exit defers while non-zero
     /// so the daemon never exits mid-request (ADR-003).
     active_connections: Arc<AtomicUsize>,
+    /// Per-class activity clock (WorkClass::External). Additive alongside
+    /// `last_activity_secs` (the aggregate) -- ADR daemon-rework-002 seed:
+    /// existing predicates keep reading the aggregate; the External-only
+    /// defer gate is curd 5's job, not this seed's.
+    external_last_activity_secs: Arc<AtomicU64>,
+    /// Per-class activity clock (WorkClass::Internal). See above.
+    internal_last_activity_secs: Arc<AtomicU64>,
+    /// Per-class in-flight count (WorkClass::External). Additive alongside
+    /// `active_connections` (the aggregate).
+    active_external_connections: Arc<AtomicUsize>,
+    /// Per-class in-flight count (WorkClass::Internal). See above.
+    active_internal_connections: Arc<AtomicUsize>,
+    /// Consecutive-defer streak the maintenance loop is on right now
+    /// (relocated from a loop-local in maintenance.rs so curd 9's status
+    /// surface and the ladder (curd 1) can read it). Reset once per outer
+    /// pass via `reset_defer_count`; the observable WARN-at-11 behaviour is
+    /// unchanged, only the storage moved.
+    defer_count: AtomicU32,
+    /// Watcher activity counters (events admitted, reindex passes
+    /// completed, and reindexes that upserted nothing) -- additive storage
+    /// for curd 9's status surface.
+    watcher_counters: WatcherCounters,
+    /// Most recent ladder trip, if any (curd 1 writes this once the ladder
+    /// is wired into a loop; curd 9's status surface reads it).
+    last_ladder_trip: std::sync::Mutex<Option<LadderTrip>>,
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
@@ -246,202 +247,63 @@ pub struct MutationGuard {
     _corpus: OwnedMutexGuard<()>,
 }
 
+impl MutationGuard {
+    /// Constructs a guard from its two held locks. `pub(super)` so only
+    /// `backpressure::acquire` (the sole place that assembles a
+    /// `MutationGuard`) can build one -- the private fields above stay an
+    /// invariant, not a convention, for every other caller in the crate.
+    pub(super) fn new(permit: OwnedSemaphorePermit, corpus: OwnedMutexGuard<()>) -> Self {
+        Self {
+            _permit: permit,
+            _corpus: corpus,
+        }
+    }
+}
+
+/// Which subsystem is driving a connection/activity stamp (ADR daemon-
+/// rework-002): client RPC handlers are `External`; watcher batches,
+/// boot catch-up indexing, and the maintenance tick are `Internal`. Per-
+/// class counters/clocks are additive storage in this seed -- existing
+/// predicates (`idle_exit_eligible`, maintenance-defer logic) keep reading
+/// the aggregate; the External-only defer gate is curd 5's job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkClass {
+    External,
+    Internal,
+}
+
 /// Decrements the daemon's active-connection count when dropped. Held by a
 /// connection handler task for its whole lifetime so idle-exit sees a non-zero
 /// count for the duration of every in-flight request (ADR-003).
 pub struct ConnectionGuard {
     active: Arc<AtomicUsize>,
+    class_active: Arc<AtomicUsize>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::SeqCst);
+        self.class_active.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-struct MaintenanceLifecycle {
-    maintenance_id: u64,
-    started_at: Instant,
-    lane_acquired_at: Option<Instant>,
-    finished: bool,
+/// Watcher activity counters (ADR daemon-rework seed 4): raw notify events
+/// admitted per debounced batch, completed reindex passes, and reindexes
+/// that upserted no rows (`ApplyStats::files_upserted == 0`).
+#[derive(Debug, Default)]
+struct WatcherCounters {
+    events: AtomicU64,
+    reindexes: AtomicU64,
+    noop_reindexes: AtomicU64,
 }
 
-impl MaintenanceLifecycle {
-    fn start() -> Self {
-        let maintenance_id = NEXT_MAINTENANCE_ID.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(
-            target: "hallouminate::lance",
-            maintenance_event = "started",
-            maintenance_id,
-            "periodic LanceDB maintenance started",
-        );
-        Self {
-            maintenance_id,
-            started_at: Instant::now(),
-            lane_acquired_at: None,
-            finished: false,
-        }
-    }
-
-    fn write_lane_acquired(&mut self) {
-        let acquired_at = Instant::now();
-        self.lane_acquired_at = Some(acquired_at);
-        tracing::debug!(
-            target: "hallouminate::lance",
-            maintenance_event = "write_lane_acquired",
-            maintenance_id = self.maintenance_id,
-            queue_wait_ms = duration_ms(acquired_at.duration_since(self.started_at)),
-            "periodic LanceDB maintenance acquired the write lane",
-        );
-    }
-
-    fn success(mut self, stats: MaintenanceStats) {
-        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
-        tracing::info!(
-            target: "hallouminate::lance",
-            maintenance_event = "finished",
-            maintenance_id = self.maintenance_id,
-            outcome = "success",
-            queue_wait_ms,
-            maintenance_ms,
-            total_ms,
-            fragments_removed = stats.fragments_removed,
-            fragments_added = stats.fragments_added,
-            old_versions_pruned = stats.old_versions_pruned,
-            "periodic LanceDB maintenance completed",
-        );
-        self.finished = true;
-    }
-
-    fn failure(mut self, error: &HallouminateError) {
-        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
-        tracing::warn!(
-            target: "hallouminate::lance",
-            maintenance_event = "finished",
-            maintenance_id = self.maintenance_id,
-            outcome = "failure",
-            queue_wait_ms,
-            maintenance_ms,
-            total_ms,
-            error = %error,
-            "periodic LanceDB maintenance failed",
-        );
-        self.finished = true;
-    }
-
-    fn shutdown(mut self) {
-        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
-        tracing::info!(
-            target: "hallouminate::lance",
-            maintenance_event = "finished",
-            maintenance_id = self.maintenance_id,
-            outcome = "shutdown",
-            queue_wait_ms,
-            maintenance_ms,
-            total_ms,
-            "periodic LanceDB maintenance stopped during shutdown",
-        );
-        self.finished = true;
-    }
-
-    fn durations(&self) -> (u64, u64, u64) {
-        let finished_at = Instant::now();
-        let total = finished_at.duration_since(self.started_at);
-        let queue = match self.lane_acquired_at {
-            Some(acquired_at) => acquired_at.duration_since(self.started_at),
-            None => total,
-        };
-        let maintenance = match self.lane_acquired_at {
-            Some(acquired_at) => finished_at.duration_since(acquired_at),
-            None => Duration::ZERO,
-        };
-        (
-            duration_ms(queue),
-            duration_ms(maintenance),
-            duration_ms(total),
-        )
-    }
-}
-
-impl Drop for MaintenanceLifecycle {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
-        tracing::warn!(
-            target: "hallouminate::lance",
-            maintenance_event = "finished",
-            maintenance_id = self.maintenance_id,
-            outcome = "cancelled",
-            queue_wait_ms,
-            maintenance_ms,
-            total_ms,
-            "periodic LanceDB maintenance cancelled",
-        );
-    }
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn jittered_sleep_secs(interval_secs: u64) -> u64 {
-    let jitter_max = interval_secs / 10;
-    let jitter = if jitter_max == 0 {
-        0
-    } else {
-        fastrand::u64(0..=jitter_max)
-    };
-    interval_secs.saturating_add(jitter)
-}
-
-/// Background task: sleeps `interval` (plus jitter), then runs a maintenance
-/// pass once the daemon is idle and I/O pressure is not elevated --
-/// deferring and rechecking every 60s otherwise (ADR-003). Exits promptly on
-/// `cancel` at every await point. `state` is a clone dedicated to this task.
-async fn maintenance_loop(
-    state: DaemonState,
-    cancel: CancellationToken,
-    interval: Duration,
-    probe: Arc<dyn IoPressureProbe>,
-) {
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(Duration::from_secs(jittered_sleep_secs(interval.as_secs()))) => {}
-        }
-        let mut consecutive_defers: u32 = 0;
-        while let Some(reason) = state.maintenance_defer_reason(probe.as_ref()) {
-            consecutive_defers += 1;
-            if consecutive_defers > 10
-                && (consecutive_defers == 11 || consecutive_defers.is_multiple_of(10))
-            {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    ?reason,
-                    consecutive_defers,
-                    "maintenance pass repeatedly deferred",
-                );
-            } else {
-                tracing::debug!(
-                    target: "hallouminate::daemon",
-                    ?reason,
-                    consecutive_defers,
-                    "maintenance pass deferred",
-                );
-            }
-            tokio::select! {
-                biased;
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(Duration::from_secs(60)) => {}
-            }
-        }
-        if state.run_maintenance_tick().await == MaintenanceTick::Stop {
-            break;
-        }
-    }
+/// Snapshot of the most recent ladder trip: which escalation action fired
+/// and when (monotonic seconds). Curd 1's future ladder wiring is the only
+/// writer; this seed only provides storage + accessors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LadderTrip {
+    pub(crate) action: LadderAction,
+    pub(crate) at_secs: u64,
 }
 
 impl DaemonState {
@@ -660,6 +522,13 @@ impl DaemonState {
                 crossencoders: crossencoders_arc,
                 last_activity_secs: last_activity,
                 active_connections: Arc::new(AtomicUsize::new(0)),
+                external_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
+                internal_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
+                active_external_connections: Arc::new(AtomicUsize::new(0)),
+                active_internal_connections: Arc::new(AtomicUsize::new(0)),
+                defer_count: AtomicU32::new(0),
+                watcher_counters: WatcherCounters::default(),
+                last_ladder_trip: std::sync::Mutex::new(None),
                 maintenance_task: Mutex::new(None),
                 shutdown,
             }),
@@ -692,67 +561,6 @@ impl DaemonState {
         }
 
         Ok(state)
-    }
-
-    /// One LanceDB maintenance pass (compaction + version prune). Holds a
-    /// connection guard for the write's duration so idle-exit defers instead
-    /// of tearing the process down (and releasing the single-instance flock)
-    /// under a live LanceDB write, mirroring `catch_up_index` (dispatch.rs)
-    /// and the watcher's `process_change_batch`. This pass does NOT stamp
-    /// the idle-activity clock (ADR-002) — reintroducing that stamp would
-    /// bring back #222.
-    async fn run_maintenance_tick(&self) -> MaintenanceTick {
-        let store = Arc::clone(&self.inner.baseline_resources.store);
-        self.run_maintenance_tick_with(move |maintenance_id| async move {
-            store
-                .maintain(MaintenanceOptions {
-                    maintenance_id,
-                    prune_older_than: Duration::from_secs(MAINTENANCE_PRUNE_GRACE_SECS),
-                })
-                .await
-        })
-        .await
-    }
-
-    async fn run_maintenance_tick_with<F, Fut>(&self, maintain: F) -> MaintenanceTick
-    where
-        F: FnOnce(u64) -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<MaintenanceStats, HallouminateError>>,
-    {
-        let _conn = self.enter_connection();
-        let shutdown = self.shutdown_token().clone();
-        let mut lifecycle = MaintenanceLifecycle::start();
-        let permit = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                lifecycle.shutdown();
-                return MaintenanceTick::Stop;
-            }
-            permit = self.inner.write_lane.acquire() => permit,
-        };
-        let Ok(_permit) = permit else {
-            lifecycle.shutdown();
-            return MaintenanceTick::Stop;
-        };
-        lifecycle.write_lane_acquired();
-        let maintenance = maintain(lifecycle.maintenance_id);
-        tokio::pin!(maintenance);
-        let (result, shutdown_requested) = tokio::select! {
-            biased;
-            result = &mut maintenance => (result, false),
-            _ = shutdown.cancelled() => {
-                (maintenance.await, true)
-            }
-        };
-        if shutdown_requested {
-            lifecycle.shutdown();
-            return MaintenanceTick::Stop;
-        }
-        match result {
-            Ok(stats) => lifecycle.success(stats),
-            Err(error) => lifecycle.failure(&error),
-        }
-        MaintenanceTick::Continue
     }
 
     /// The daemon-wide shutdown token. The accept loop selects on
@@ -951,25 +759,122 @@ impl DaemonState {
 
     /// Bump the activity clock to now — called at request completion so
     /// idle-exit keys on real request throughput, not just embed use (ADR-003).
-    pub fn touch_activity(&self) {
-        self.inner
-            .last_activity_secs
-            .store(monotonic_secs(), Ordering::Relaxed);
+    pub fn touch_activity(&self, class: WorkClass) {
+        let now = monotonic_secs();
+        self.inner.last_activity_secs.store(now, Ordering::Relaxed);
+        match class {
+            WorkClass::External => self
+                .inner
+                .external_last_activity_secs
+                .store(now, Ordering::Relaxed),
+            WorkClass::Internal => self
+                .inner
+                .internal_last_activity_secs
+                .store(now, Ordering::Relaxed),
+        }
     }
 
     /// Register an active connection; the returned guard decrements the count
     /// on drop. Held for a connection handler's lifetime so idle-exit never
     /// fires mid-request (ADR-003).
-    pub fn enter_connection(&self) -> ConnectionGuard {
+    pub fn enter_connection(&self, class: WorkClass) -> ConnectionGuard {
         self.inner.active_connections.fetch_add(1, Ordering::SeqCst);
+        let class_counter = match class {
+            WorkClass::External => &self.inner.active_external_connections,
+            WorkClass::Internal => &self.inner.active_internal_connections,
+        };
+        class_counter.fetch_add(1, Ordering::SeqCst);
         ConnectionGuard {
             active: Arc::clone(&self.inner.active_connections),
+            class_active: Arc::clone(class_counter),
         }
+    }
+
+    /// Current consecutive-defer streak (curd 9's status surface).
+    #[allow(dead_code)]
+    pub(crate) fn defer_count(&self) -> u32 {
+        self.inner.defer_count.load(Ordering::Relaxed)
+    }
+
+    /// Reset the consecutive-defer streak to zero. Called once per outer
+    /// maintenance-loop pass, before the inner defer-recheck loop starts.
+    pub(super) fn reset_defer_count(&self) {
+        self.inner.defer_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Increment the consecutive-defer streak and return the new value.
+    pub(super) fn increment_defer_count(&self) -> u32 {
+        self.inner.defer_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Record `count` raw notify events admitted from one debounced batch.
+    pub(crate) fn record_watcher_events(&self, count: u64) {
+        self.inner
+            .watcher_counters
+            .events
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Record one completed reindex pass; `noop` marks a pass that upserted
+    /// no rows (`ApplyStats::files_upserted == 0`).
+    pub(crate) fn record_watcher_reindex(&self, noop: bool) {
+        self.inner
+            .watcher_counters
+            .reindexes
+            .fetch_add(1, Ordering::Relaxed);
+        if noop {
+            self.inner
+                .watcher_counters
+                .noop_reindexes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot of `(events, reindexes, noop_reindexes)` (curd 9's status
+    /// surface).
+    #[allow(dead_code)]
+    pub(crate) fn watcher_counters_snapshot(&self) -> (u64, u64, u64) {
+        (
+            self.inner.watcher_counters.events.load(Ordering::Relaxed),
+            self.inner
+                .watcher_counters
+                .reindexes
+                .load(Ordering::Relaxed),
+            self.inner
+                .watcher_counters
+                .noop_reindexes
+                .load(Ordering::Relaxed),
+        )
+    }
+
+    /// Record a ladder trip (curd 1's future ladder wiring calls this when
+    /// `Ladder::evaluate` returns `Action`). Overwrites any prior snapshot.
+    #[allow(dead_code)]
+    pub(crate) fn record_ladder_trip(&self, action: LadderAction) {
+        let at_secs = monotonic_secs();
+        *self
+            .inner
+            .last_ladder_trip
+            .lock()
+            .expect("ladder trip mutex poisoned") = Some(LadderTrip { action, at_secs });
+    }
+
+    /// The most recent ladder trip, if any (curd 9's status surface).
+    #[allow(dead_code)]
+    pub(crate) fn last_ladder_trip(&self) -> Option<LadderTrip> {
+        *self
+            .inner
+            .last_ladder_trip
+            .lock()
+            .expect("ladder trip mutex poisoned")
     }
 
     /// Whether a due maintenance pass should defer against the real clock --
     /// see `maintenance_defer_reason_at`.
-    fn maintenance_defer_reason(&self, probe: &dyn IoPressureProbe) -> Option<DeferReason> {
+    pub(super) fn maintenance_defer_reason(
+        &self,
+        probe: &dyn IoPressureProbe,
+    ) -> Option<DeferReason> {
         self.maintenance_defer_reason_at(probe, monotonic_secs())
     }
 
@@ -1084,16 +989,7 @@ impl DaemonState {
         &self,
         corpus: &str,
     ) -> Result<MutationGuard, &'static str> {
-        let corpus = self.lock_corpus(corpus).await;
-        let permit = self
-            .write_lane()
-            .acquire_owned()
-            .await
-            .map_err(|_| "write lane closed")?;
-        Ok(MutationGuard {
-            _permit: permit,
-            _corpus: corpus,
-        })
+        super::backpressure::acquire(self, corpus).await
     }
 }
 
@@ -1277,8 +1173,9 @@ impl std::fmt::Debug for DaemonState {
 
 #[cfg(test)]
 mod tests {
+    use super::super::maintenance::{MaintenanceTick, jittered_sleep_secs};
     use super::*;
-    use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole};
+    use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
 
     use std::fmt;
     use tracing::Subscriber;
@@ -1500,7 +1397,7 @@ mod tests {
         let state = DaemonState::open(cfg, None).await.expect("open");
         let last = state.last_activity_secs();
 
-        let guard = state.enter_connection();
+        let guard = state.enter_connection(WorkClass::External);
         assert!(
             !state.should_idle_exit_at(300, last + 10_000),
             "an active connection must defer idle-exit even when long idle",
@@ -1752,10 +1649,138 @@ mod tests {
             state.should_idle_exit_at(300, 1000),
             "clock stale at 1 s; now=1000 is well past idle",
         );
-        state.touch_activity();
+        state.touch_activity(WorkClass::External);
         assert!(
             !state.should_idle_exit_at(300, state.last_activity_secs() + 1),
             "touch_activity must reset the clock so a fresh now is not idle",
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_connection_and_touch_activity_track_per_class_state() {
+        let state = test_state().await;
+        let baseline = state.last_activity_secs();
+
+        let ext = state.enter_connection(WorkClass::External);
+        assert_eq!(
+            state
+                .inner
+                .active_external_connections
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            state
+                .inner
+                .active_internal_connections
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            state.inner.active_connections.load(Ordering::SeqCst),
+            1,
+            "aggregate must still count both classes",
+        );
+
+        let int = state.enter_connection(WorkClass::Internal);
+        assert_eq!(
+            state
+                .inner
+                .active_internal_connections
+                .load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(state.inner.active_connections.load(Ordering::SeqCst), 2);
+
+        state.touch_activity(WorkClass::External);
+        assert!(
+            state
+                .inner
+                .external_last_activity_secs
+                .load(Ordering::Relaxed)
+                >= baseline
+        );
+        assert_eq!(
+            state
+                .inner
+                .internal_last_activity_secs
+                .load(Ordering::Relaxed),
+            baseline,
+            "External touch must not stamp the Internal clock",
+        );
+
+        state.touch_activity(WorkClass::Internal);
+        assert!(
+            state
+                .inner
+                .internal_last_activity_secs
+                .load(Ordering::Relaxed)
+                >= baseline
+        );
+
+        drop(ext);
+        assert_eq!(
+            state
+                .inner
+                .active_external_connections
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            state.inner.active_connections.load(Ordering::SeqCst),
+            1,
+            "aggregate reflects only the dropped guard",
+        );
+
+        drop(int);
+        assert_eq!(
+            state
+                .inner
+                .active_internal_connections
+                .load(Ordering::SeqCst),
+            0
+        );
+        assert_eq!(state.inner.active_connections.load(Ordering::SeqCst), 0);
+
+        // Existing predicate (aggregate-based) must be unaffected by class split.
+        assert!(!state.should_idle_exit_at(300, baseline + 1));
+    }
+
+    #[tokio::test]
+    async fn defer_count_resets_and_increments() {
+        let state = test_state().await;
+        assert_eq!(state.defer_count(), 0);
+        assert_eq!(state.increment_defer_count(), 1);
+        assert_eq!(state.increment_defer_count(), 2);
+        assert_eq!(state.defer_count(), 2);
+        state.reset_defer_count();
+        assert_eq!(state.defer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn watcher_counters_track_events_and_reindex_outcomes() {
+        let state = test_state().await;
+        state.record_watcher_events(3);
+        state.record_watcher_reindex(false);
+        state.record_watcher_reindex(true);
+        assert_eq!(state.watcher_counters_snapshot(), (3, 2, 1));
+    }
+
+    #[tokio::test]
+    async fn ladder_trip_storage_records_and_overwrites_the_latest_action() {
+        let state = test_state().await;
+        assert_eq!(state.last_ladder_trip(), None);
+
+        state.record_ladder_trip(LadderAction::ForceMaintenance);
+        assert_eq!(
+            state.last_ladder_trip().expect("trip recorded").action,
+            LadderAction::ForceMaintenance,
+        );
+
+        state.record_ladder_trip(LadderAction::WatchdogTrip);
+        assert_eq!(
+            state.last_ladder_trip().expect("trip recorded").action,
+            LadderAction::WatchdogTrip,
         );
     }
 

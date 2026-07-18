@@ -27,7 +27,7 @@ use hallouminate_domain::common::{CorpusConfig, canonicalize_or_passthrough, exp
 use hallouminate_domain::corpus::ensure_corpus_allows_file;
 
 use super::dispatch::index_single_file_with_content;
-use super::state::DaemonState;
+use super::state::{DaemonState, WorkClass};
 
 /// One watched location: the directory handed to `notify`, the corpus that
 /// owns it, and — for a **file-path** corpus root — the exact declared file.
@@ -219,12 +219,14 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel::<()>(1);
 
+    let state_for_debouncer = state.clone();
     let pending_for_debouncer = pending.clone();
     let mut debouncer = match new_debouncer(debounce, None, move |res: DebounceEventResult| {
         // The debouncer worker thread calls this on each debounced batch.
         match res {
             Ok(events) => {
                 record_pending(&pending_for_debouncer, &events);
+                state_for_debouncer.record_watcher_events(events.len() as u64);
                 // Non-blocking: `Full` means a wake is already queued (this
                 // batch's paths are already recorded in `pending` above, so
                 // the outstanding wake will pick them up); `Disconnected`
@@ -423,11 +425,11 @@ async fn process_change_batch(
     paths: Vec<PathBuf>,
     failures: &mut FailureCoalescer,
 ) {
-    let _conn = state.enter_connection();
+    let _conn = state.enter_connection(WorkClass::Internal);
     for path in &paths {
         handle_changed_path(state, roots, path, failures).await;
     }
-    state.touch_activity();
+    state.touch_activity(WorkClass::Internal);
 }
 
 /// Reindex (or prune) one changed markdown path against whichever baseline
@@ -477,13 +479,16 @@ async fn handle_changed_path(
         };
         let registry = state.make_registry();
         match index_single_file_with_content(&store, &registry, corpus, path, &bytes, mtime).await {
-            Ok(stats) => tracing::debug!(
-                target: "hallouminate::daemon",
-                corpus = %corpus.name,
-                path = %path.display(),
-                upserted = stats.files_upserted,
-                "watcher: reindexed changed file",
-            ),
+            Ok(stats) => {
+                state.record_watcher_reindex(stats.files_upserted == 0);
+                tracing::debug!(
+                    target: "hallouminate::daemon",
+                    corpus = %corpus.name,
+                    path = %path.display(),
+                    upserted = stats.files_upserted,
+                    "watcher: reindexed changed file",
+                );
+            }
             Err(e) => {
                 let error = e.to_string();
                 match failures.record(path, &error, Instant::now()) {
@@ -855,6 +860,44 @@ mod tests {
             u64::MAX,
             "batch processing must stamp the activity clock so idle-exit does \
              not fire immediately after a delete-branch write",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handle_changed_path_records_watcher_reindex_counters() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = crate::config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let note = corpus_dir.join("note.md");
+        std::fs::write(&note, "# Note\n\nbody\n").expect("write note");
+
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        let mut failures = disabled_coalescer();
+
+        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        assert_eq!(
+            state.watcher_counters_snapshot(),
+            (0, 1, 0),
+            "first reindex of a new file must count as a real (non-noop) reindex",
+        );
+
+        // Same file, unchanged content and mtime: the indexer takes the
+        // mtime-fallthrough fast path and upserts nothing.
+        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        assert_eq!(
+            state.watcher_counters_snapshot(),
+            (0, 2, 1),
+            "reindexing unchanged content must count as a noop reindex",
         );
     }
 
