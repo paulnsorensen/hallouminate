@@ -19,10 +19,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use crate::config::{self, Config};
 
 use super::dispatch::dispatch;
+use super::heartbeat::TaskName;
 use super::ipc::{DaemonRequest, DaemonResponse};
 use super::socket::daemon_socket_path;
 use super::state::{DaemonState, WorkClass};
-use super::heartbeat::TaskName;
 use super::watchdog;
 
 #[derive(Debug, Default, Clone)]

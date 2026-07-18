@@ -11,7 +11,8 @@ use super::heartbeat::TaskName;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LadderAction {
     ForceMaintenance,
-    #[allow(dead_code)] // not constructed in production yet; only WatchdogTrip/ForceMaintenance are seeded today
+    #[allow(dead_code)]
+    // not constructed in production yet; only WatchdogTrip/ForceMaintenance are seeded today
     RestartTask(TaskName),
     WatchdogTrip,
 }
