@@ -109,22 +109,6 @@ fn record_trip(path: &Path, now_unix: u64) -> io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-/// Escalating backoff floor for `trips` recent trips: `floor` doubling per
-/// additional trip, saturating at `cap`. Zero trips ⇒ no floor.
-fn backoff_secs(floor: u64, cap: u64, trips: u32) -> u64 {
-    if trips == 0 {
-        return 0;
-    }
-    let mut backoff = floor.min(cap);
-    for _ in 1..trips {
-        if backoff >= cap {
-            return cap;
-        }
-        backoff = backoff.saturating_mul(2).min(cap);
-    }
-    backoff
-}
-
 /// Trip-state summary for StatusReport (curd 9) and the boot check:
 /// how many trips are inside the decay window, when the last one was, and
 /// the backoff floor they currently impose.
@@ -150,7 +134,7 @@ pub(crate) fn trip_snapshot(
     TripSnapshot {
         recent_trips,
         last_trip_unix: trips.last().copied(),
-        backoff_secs: backoff_secs(floor_secs, cap_secs, recent_trips),
+        backoff_secs: super::backoff::exponential_backoff_secs(floor_secs, cap_secs, recent_trips),
     }
 }
 
@@ -371,38 +355,9 @@ mod tests {
         std::fs::write(path, body).expect("write trip fixture");
     }
 
-    #[test]
-    fn backoff_escalates_from_floor_doubling_to_cap() {
-        // The spec-fixed ladder: 10s doubling per trip, capped at 5min.
-        let expected = [10, 20, 40, 80, 160, 300, 300];
-        for (i, want) in expected.iter().enumerate() {
-            let trips = u32::try_from(i).unwrap() + 1;
-            assert_eq!(backoff_secs(FLOOR, CAP, trips), *want, "trip count {trips}");
-        }
-    }
-
-    #[test]
-    fn backoff_is_zero_with_no_trips() {
-        assert_eq!(backoff_secs(FLOOR, CAP, 0), 0);
-    }
-
-    #[test]
-    fn backoff_never_overflows_at_huge_trip_counts() {
-        // Doubling must saturate at the cap, not wrap or panic, no matter
-        // how many trips accumulated.
-        assert_eq!(backoff_secs(FLOOR, CAP, u32::MAX), CAP);
-        assert_eq!(backoff_secs(u64::MAX, u64::MAX, u32::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn backoff_floor_above_cap_is_clamped_to_cap() {
-        assert_eq!(backoff_secs(500, CAP, 1), CAP);
-    }
-
-    #[test]
-    fn backoff_floor_zero_imposes_no_wait() {
-        assert_eq!(backoff_secs(0, CAP, 5), 0);
-    }
+    // The backoff curve itself (floor doubling to cap, zero-case, overflow
+    // saturation) is tested in `super::backoff`; these tests exercise how the
+    // watchdog *applies* it via `trip_snapshot` / `check_boot_backoff`.
 
     #[test]
     fn record_trip_creates_file_and_parent_dirs() {

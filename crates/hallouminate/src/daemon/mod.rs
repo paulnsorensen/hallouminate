@@ -18,6 +18,7 @@
 //!
 //! Lock order across the dispatcher is documented in `state.rs`.
 
+mod backoff;
 mod backpressure;
 mod bootstrap;
 mod churn;
