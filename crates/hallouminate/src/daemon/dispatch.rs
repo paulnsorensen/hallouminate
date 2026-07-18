@@ -2847,13 +2847,19 @@ mod tests {
             stats.files_upserted, 0,
             "identical content must not be re-chunked or re-embedded"
         );
-        assert_eq!(stats.files_touched, 1, "moved mtime takes the touch fast path");
+        assert_eq!(
+            stats.files_touched, 1,
+            "moved mtime takes the touch fast path"
+        );
         let snap = store
             .get_file_snapshot(&corpus.name, &file_ref)
             .await
             .unwrap()
             .expect("snapshot must survive a touch");
-        assert_eq!(snap.mtime_ms, later_ms, "stored mtime must advance to the new value");
+        assert_eq!(
+            snap.mtime_ms, later_ms,
+            "stored mtime must advance to the new value"
+        );
         assert_eq!(
             store
                 .corpus_chunk_stats(&corpus.name)
@@ -2903,7 +2909,10 @@ mod tests {
             index_single_file_with_content(&store, &registry, &corpus, &file, new_content, later)
                 .await
                 .expect("hash-unequal reindex must succeed");
-        assert_eq!(stats.files_upserted, 1, "changed content must re-index in full");
+        assert_eq!(
+            stats.files_upserted, 1,
+            "changed content must re-index in full"
+        );
         let snap = store
             .get_file_snapshot(&corpus.name, &file_ref)
             .await
@@ -2914,7 +2923,10 @@ mod tests {
             blake3_bytes(new_content),
             "stored snapshot must carry the fresh content hash"
         );
-        assert_eq!(snap.mtime_ms, later_ms, "stored mtime must advance to the new value");
+        assert_eq!(
+            snap.mtime_ms, later_ms,
+            "stored mtime must advance to the new value"
+        );
     }
 
     /// The gate on the ambient-path wrapper (add-markdown / write handlers):
