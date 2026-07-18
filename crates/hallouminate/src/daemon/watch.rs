@@ -18,11 +18,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 
+use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
 use hallouminate_domain::corpus::ensure_corpus_allows_file;
 
@@ -444,6 +445,21 @@ async fn handle_changed_path(
         return;
     };
     let corpus = &owner.corpus;
+    let store = state.store();
+    // Stage 1 of the change gate (ADR daemon-rework-003, "git's algorithm,
+    // not git's state"): compare the on-disk mtime against the last-indexed
+    // snapshot before taking any lock or reading any bytes. Equal means the
+    // event is a no-op (e.g. the access-event feedback loop that burned 200%
+    // CPU) and is shed for the price of one stat + one snapshot row read.
+    if mtime_matches_last_index(&store, &corpus.name, path).await {
+        tracing::debug!(
+            target: "hallouminate::daemon",
+            corpus = %corpus.name,
+            path = %path.display(),
+            "watcher: skipped event, mtime matches last-indexed snapshot",
+        );
+        return;
+    }
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
         Err(e) => {
@@ -452,7 +468,6 @@ async fn handle_changed_path(
         }
     };
     let exists = path.is_file();
-    let store = state.store();
     if exists {
         // `path.is_file()` above follows symlinks, so a symlinked leaf whose
         // target is a regular file elsewhere still reaches here. A single
@@ -531,6 +546,53 @@ async fn handle_changed_path(
         }
     }
     drop(guard);
+}
+
+/// Stage-1 change gate (ADR daemon-rework-003): does `path`'s on-disk mtime
+/// equal the stored `FileSnapshot.mtime_ms` from the last index?
+///
+/// Stat-only — never reads content. The stat is no-follow
+/// (`symlink_metadata`) and gates only regular files, so a symlinked leaf
+/// never matches here and falls through to the no-follow read, which rejects
+/// it. Millisecond truncation mirrors `mtime_ms_from_duration` (dispatch.rs),
+/// which produced the stored value. Every failure — stat error, pre-epoch or
+/// overflowing mtime, non-UTF-8 path, missing snapshot, store error — answers
+/// `false`: the gate only skips work it can prove redundant; anything
+/// unprovable proceeds to the full read-and-index path, which owns the loud
+/// error handling.
+async fn mtime_matches_last_index(store: &LanceStore, corpus: &str, path: &Path) -> bool {
+    let Ok(meta) = path.symlink_metadata() else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(since_epoch) = modified.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let Ok(mtime_ms) = i64::try_from(since_epoch.as_millis()) else {
+        return false;
+    };
+    let file_ref = canonicalize_or_passthrough(path);
+    let Some(file_ref) = file_ref.as_path().to_str() else {
+        return false;
+    };
+    match store.get_file_snapshot(corpus, file_ref).await {
+        Ok(Some(snap)) => snap.mtime_ms == mtime_ms,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                path = %path.display(),
+                error = %e,
+                "watcher: snapshot lookup failed; proceeding to reindex",
+            );
+            false
+        }
+    }
 }
 
 /// Find the baseline corpus that owns `path`: the deepest watched root that is
@@ -625,6 +687,17 @@ mod tests {
 
     fn disabled_coalescer() -> FailureCoalescer {
         FailureCoalescer::new(Duration::ZERO, MAX_FAILURE_SIGNATURES)
+    }
+
+    /// Set `path`'s modified time exactly (nanosecond precision), for tests
+    /// that pin the stage-1 mtime gate's compare against the stored snapshot.
+    fn set_mtime(path: &Path, to: std::time::SystemTime) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for set_times");
+        file.set_times(std::fs::FileTimes::new().set_modified(to))
+            .expect("set mtime");
     }
 
     /// A file-path corpus root is watched at its parent dir, but only the exact
@@ -891,13 +964,101 @@ mod tests {
             "first reindex of a new file must count as a real (non-noop) reindex",
         );
 
-        // Same file, unchanged content and mtime: the indexer takes the
-        // mtime-fallthrough fast path and upserts nothing.
+        // Same file, unchanged content and mtime: the stage-1 mtime gate
+        // (ADR daemon-rework-003) sheds the event before any read — a skip,
+        // not a reindex, so no counter moves.
+        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        assert_eq!(
+            state.watcher_counters_snapshot(),
+            (0, 1, 0),
+            "an event whose mtime matches the stored snapshot must be skipped, \
+             not counted as a reindex",
+        );
+
+        // mtime moved but content did not: the gate lets it through and the
+        // indexer takes the hash fast path, upserting nothing — a noop
+        // reindex.
+        let bumped = std::fs::metadata(&note)
+            .expect("stat note")
+            .modified()
+            .expect("note mtime")
+            + Duration::from_millis(10);
+        set_mtime(&note, bumped);
         handle_changed_path(&state, &roots, &note, &mut failures).await;
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 2, 1),
             "reindexing unchanged content must count as a noop reindex",
+        );
+    }
+
+    /// Acceptance (ADR daemon-rework-003 stage 1): WHEN a watched file emits
+    /// an event but its mtime equals the stored snapshot, the watcher SHALL
+    /// NOT read the file's content. Encoded by rewriting the content *behind*
+    /// a restored mtime: only a content read could notice the rewrite, so a
+    /// gate regression reaches the indexer's same-mtime hash check, reindexes
+    /// the new content, and fails both assertions below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_mtime_event_skips_without_reading_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = crate::config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let note = corpus_dir.join("note.md");
+        std::fs::write(&note, "# Note\n\nbody\n").expect("write note");
+        let indexed_mtime = std::fs::metadata(&note)
+            .expect("stat note")
+            .modified()
+            .expect("note mtime");
+
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        let mut failures = disabled_coalescer();
+        handle_changed_path(&state, &roots, &note, &mut failures).await;
+
+        let file_ref = canonicalize_or_passthrough(&note)
+            .as_path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let indexed = state
+            .store()
+            .get_file_snapshot("wiki", &file_ref)
+            .await
+            .expect("snapshot query")
+            .expect("initial index must store a snapshot");
+
+        // Rewrite the content, then put the mtime back: from the outside the
+        // file looks untouched, and only a content read could tell otherwise.
+        std::fs::write(&note, "# Note\n\nrewritten body the gate must not see\n")
+            .expect("rewrite note");
+        set_mtime(&note, indexed_mtime);
+
+        handle_changed_path(&state, &roots, &note, &mut failures).await;
+
+        assert_eq!(
+            state.watcher_counters_snapshot(),
+            (0, 1, 0),
+            "the skip must not count as a reindex",
+        );
+        let after = state
+            .store()
+            .get_file_snapshot("wiki", &file_ref)
+            .await
+            .expect("snapshot query")
+            .expect("snapshot must survive the skip");
+        assert_eq!(
+            after.content_hash, indexed.content_hash,
+            "unchanged mtime must skip without reading content — the stored \
+             hash still describes the pre-rewrite content",
         );
     }
 
