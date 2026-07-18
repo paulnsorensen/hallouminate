@@ -957,6 +957,9 @@ mod tests {
     /// advances at least every 60s even mid-sleep.
     #[tokio::test(start_paused = true)]
     async fn maintenance_epoch_advances_at_least_every_60s_during_a_long_interval_sleep() {
+        // Shared OBSERVED slot: an ambient Hard recorded by a concurrent
+        // test would interrupt the interval sleep this test asserts on.
+        let _coord = debt::OBSERVED_HARD_COORD.read().await;
         let (state, _ground) = test_state(|cfg| cfg.daemon.defer_bound_secs = 0).await;
         let cancel = CancellationToken::new();
         let task = tokio::spawn(maintenance_loop(
@@ -1052,6 +1055,9 @@ mod tests {
     /// waiting out the full jittered interval.
     #[tokio::test(start_paused = true)]
     async fn hard_debt_onset_during_interval_sleep_forces_pass_within_one_chunk() {
+        // Shared OBSERVED slot: an ambient Hard recorded by a concurrent test
+        // would fire maintenance before this test sets its own Hard onset.
+        let _coord = debt::OBSERVED_HARD_COORD.read().await;
         let (state, _ground) = test_state(|cfg| cfg.daemon.defer_bound_secs = 0).await;
         let capture = EventCapture::default();
         let subscriber = Registry::default().with(capture.clone());
@@ -1097,6 +1103,9 @@ mod tests {
     /// for `defer_bound_secs` to elapse.
     #[tokio::test(start_paused = true)]
     async fn hard_debt_onset_during_defer_loop_forces_pass_within_one_recheck() {
+        // Shared OBSERVED slot: an ambient Hard recorded by a concurrent test
+        // would fire maintenance before this test sets its own Hard onset.
+        let _coord = debt::OBSERVED_HARD_COORD.read().await;
         let (state, _ground) = test_state(|cfg| cfg.daemon.defer_bound_secs = 600).await;
         // Continuous external activity keeps the pass deferred until forced.
         let _active = state.enter_connection(WorkClass::External);
