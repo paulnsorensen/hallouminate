@@ -203,17 +203,21 @@ struct DaemonStateInner {
     /// Count of connection handlers in flight. Idle-exit defers while non-zero
     /// so the daemon never exits mid-request (ADR-003).
     active_connections: Arc<AtomicUsize>,
-    /// Per-class activity clock (WorkClass::External). Additive alongside
-    /// `last_activity_secs` (the aggregate) -- ADR daemon-rework-002 seed:
-    /// existing predicates keep reading the aggregate; the External-only
-    /// defer gate is curd 5's job, not this seed's.
+    /// Per-class activity clock (WorkClass::External), stored alongside
+    /// `last_activity_secs` (the aggregate). Maintenance-defer eligibility
+    /// reads this clock only (ADR daemon-rework-002) so internal housekeeping
+    /// cannot starve maintenance; idle-exit keeps reading the aggregate.
     external_last_activity_secs: Arc<AtomicU64>,
-    /// Per-class activity clock (WorkClass::Internal). See above.
+    /// Per-class activity clock (WorkClass::Internal). Stamped by the same
+    /// `touch_activity` path but read by no predicate today -- kept for
+    /// curd 9's status snapshot.
     internal_last_activity_secs: Arc<AtomicU64>,
-    /// Per-class in-flight count (WorkClass::External). Additive alongside
-    /// `active_connections` (the aggregate).
+    /// Per-class in-flight count (WorkClass::External), stored alongside
+    /// `active_connections` (the aggregate). Read by maintenance-defer
+    /// eligibility (ADR daemon-rework-002); idle-exit reads the aggregate.
     active_external_connections: Arc<AtomicUsize>,
-    /// Per-class in-flight count (WorkClass::Internal). See above.
+    /// Per-class in-flight count (WorkClass::Internal). Read by no predicate
+    /// today -- kept for curd 9's status snapshot.
     active_internal_connections: Arc<AtomicUsize>,
     /// Consecutive-defer streak the maintenance loop is on right now
     /// (relocated from a loop-local in maintenance.rs so curd 9's status
@@ -262,10 +266,13 @@ impl MutationGuard {
 
 /// Which subsystem is driving a connection/activity stamp (ADR daemon-
 /// rework-002): client RPC handlers are `External`; watcher batches,
-/// boot catch-up indexing, and the maintenance tick are `Internal`. Per-
-/// class counters/clocks are additive storage in this seed -- existing
-/// predicates (`idle_exit_eligible`, maintenance-defer logic) keep reading
-/// the aggregate; the External-only defer gate is curd 5's job.
+/// boot catch-up indexing, and the maintenance tick are `Internal`.
+/// Maintenance-defer eligibility gates on `External` signals only --
+/// housekeeping never defers housekeeping -- while idle-exit gates on both
+/// classes via the aggregate counter/clock (ADR daemon-idle-exit-003).
+/// Every `enter_connection` caller must name its class explicitly; the
+/// `every_enter_connection_call_site_declares_a_work_class` source-pin
+/// keeps a defaulted or wrapper call site from sneaking in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkClass {
     External,
@@ -881,16 +888,28 @@ impl DaemonState {
     /// Injectable-clock variant so tests drive a synthetic `now_secs`. Active
     /// (connection in flight, or activity within 60s) takes priority over
     /// I/O pressure so tests can distinguish the two defer reasons.
+    ///
+    /// Gates on `WorkClass::External` signals only (ADR daemon-rework-002):
+    /// internal housekeeping (watcher batches, boot catch-up, the maintenance
+    /// tick itself) never defers maintenance, so a busy watcher can no longer
+    /// starve compaction the way the shared aggregate clock did.
     fn maintenance_defer_reason_at(
         &self,
         probe: &dyn IoPressureProbe,
         now_secs: u64,
     ) -> Option<DeferReason> {
-        if self.inner.active_connections.load(Ordering::SeqCst) != 0 {
+        if self
+            .inner
+            .active_external_connections
+            .load(Ordering::SeqCst)
+            != 0
+        {
             return Some(DeferReason::Active);
         }
         if !is_idle(
-            self.inner.last_activity_secs.load(Ordering::Relaxed),
+            self.inner
+                .external_last_activity_secs
+                .load(Ordering::Relaxed),
             now_secs,
             60,
         ) {
@@ -905,6 +924,11 @@ impl DaemonState {
     /// Idle-exit predicate against the real clock: enabled, zero active
     /// connections, activity clock quiet for at least `idle_secs`.
     /// `idle_secs == 0` disables idle-exit.
+    ///
+    /// Reads the aggregate counter/clock, which every `WorkClass` stamps, so
+    /// idle-exit gates on BOTH classes (ADR daemon-rework-002 preserving ADR
+    /// daemon-idle-exit-003): housekeeping in flight defers teardown exactly
+    /// like an external request -- never drop the flock mid-write.
     pub(crate) fn should_idle_exit(&self, idle_secs: u64) -> bool {
         self.should_idle_exit_at(idle_secs, monotonic_secs())
     }
@@ -947,12 +971,19 @@ impl DaemonState {
         self.inner.last_activity_secs.load(Ordering::Relaxed)
     }
 
-    /// Force the activity clock to an arbitrary value. Test-only: lets a
-    /// cross-module test (e.g. watch.rs's batch-processing regression test)
-    /// simulate a long-idle daemon without a real sleep.
+    /// Force every activity clock (aggregate plus both per-class clocks) to
+    /// an arbitrary value. Test-only: lets a cross-module test (e.g.
+    /// watch.rs's batch-processing regression test) simulate a long-idle
+    /// daemon without a real sleep.
     #[cfg(test)]
     pub(crate) fn set_last_activity_secs_for_test(&self, secs: u64) {
         self.inner.last_activity_secs.store(secs, Ordering::Relaxed);
+        self.inner
+            .external_last_activity_secs
+            .store(secs, Ordering::Relaxed);
+        self.inner
+            .internal_last_activity_secs
+            .store(secs, Ordering::Relaxed);
     }
 
     /// A freshly-constructed format-handler [`HandlerRegistry`] over the
@@ -1410,6 +1441,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_connection_defers_idle_exit_even_when_clock_is_idle() {
+        // ADR-003 via ADR daemon-rework-002: idle-exit gates on BOTH work
+        // classes. A live Internal guard (e.g. a LanceDB write inside a
+        // watcher batch) must block teardown just like an External request.
+        let state = test_state().await;
+        let last = state.last_activity_secs();
+        let guard = state.enter_connection(WorkClass::Internal);
+        assert!(
+            !state.should_idle_exit_at(300, last + 10_000),
+            "an active Internal connection must defer idle-exit even when long idle",
+        );
+        drop(guard);
+        assert!(
+            state.should_idle_exit_at(300, last + 10_000),
+            "once the Internal guard drops, idle-exit fires",
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_touch_activity_defers_idle_exit() {
+        // Idle-exit gates on both classes: Internal activity (the watcher's
+        // clock stamp after a batch) must reset the idle window even though it
+        // no longer defers maintenance.
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(1);
+        assert!(
+            state.should_idle_exit_at(300, 1000),
+            "clock stale at 1 s; now=1000 is well past idle",
+        );
+        state.touch_activity(WorkClass::Internal);
+        assert!(
+            !state.should_idle_exit_at(300, state.last_activity_secs() + 1),
+            "Internal activity must stamp the idle clock (both classes gate idle-exit)",
+        );
+    }
+
+    #[tokio::test]
     async fn maintenance_tick_emits_correlated_structured_lifecycle() {
         let capture = EventCapture::default();
         let subscriber = Registry::default().with(capture.clone());
@@ -1744,6 +1812,57 @@ mod tests {
 
         // Existing predicate (aggregate-based) must be unaffected by class split.
         assert!(!state.should_idle_exit_at(300, baseline + 1));
+    }
+
+    /// Source-pin (ADR daemon-rework-002): every `enter_connection` call site
+    /// must name its `WorkClass` with an explicit literal. Misclassifying (or
+    /// defaulting) a caller re-opens the maintenance-starvation incident this
+    /// split fixed, so a future zero-arg wrapper or `impl Default for
+    /// WorkClass` cannot sneak past review: this scan fails the build instead.
+    #[test]
+    fn every_enter_connection_call_site_declares_a_work_class() {
+        fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir under src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+
+        let needle = ".enter_connection";
+        let mut call_sites = 0usize;
+        for path in files {
+            let text =
+                std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            let mut start = 0;
+            while let Some(found) = text[start..].find(needle) {
+                let after = &text[start + found + needle.len()..];
+                start += found + needle.len();
+                // Only method calls count; prose mentions have no `(`.
+                let Some(args) = after.trim_start().strip_prefix('(') else {
+                    continue;
+                };
+                call_sites += 1;
+                assert!(
+                    args.trim_start().starts_with("WorkClass::"),
+                    "{path:?}: `enter_connection` call site must pass an explicit \
+                     `WorkClass::` literal (ADR daemon-rework-002); found: {:?}",
+                    after.chars().take(40).collect::<String>(),
+                );
+            }
+        }
+        assert!(
+            call_sites >= 4,
+            "expected at least the four production call sites (server, watcher, \
+             boot catch-up, maintenance tick); scan found {call_sites} -- did the \
+             scan root move?",
+        );
     }
 
     #[tokio::test]
@@ -2153,10 +2272,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defer_reason_active_connection_defers_as_active() {
+    async fn defer_reason_external_connection_defers_as_active() {
         let state = test_state().await;
         state.set_last_activity_secs_for_test(0);
-        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let _conn = state.enter_connection(WorkClass::External);
         let probe = TestProbe::new(false);
         assert_eq!(
             state.maintenance_defer_reason_at(&probe, 1000),
@@ -2172,6 +2291,100 @@ mod tests {
         assert_eq!(
             state.maintenance_defer_reason_at(&probe, 1000),
             Some(DeferReason::Active),
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_reason_external_activity_defers_as_active() {
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        state
+            .inner
+            .external_last_activity_secs
+            .store(970, Ordering::Relaxed);
+        state.inner.last_activity_secs.store(970, Ordering::Relaxed);
+        let probe = TestProbe::new(false);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 1000),
+            Some(DeferReason::Active),
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_reason_internal_connection_does_not_defer_maintenance() {
+        // ADR daemon-rework-002: housekeeping never defers housekeeping. An
+        // in-flight Internal guard (watcher batch, boot catch-up, maintenance
+        // tick) must leave the daemon maintenance-eligible.
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let _conn = state.enter_connection(WorkClass::Internal);
+        let probe = TestProbe::new(false);
+        assert_eq!(state.maintenance_defer_reason_at(&probe, 1000), None);
+    }
+
+    #[tokio::test]
+    async fn defer_reason_internal_connection_with_io_pressure_defers_as_io_pressure() {
+        // With the class split, internal work must not mask the real defer
+        // reason: an Internal guard plus elevated PSI reads as IoPressure
+        // (pre-split it misread as Active), so the ladder and logs see why
+        // maintenance actually waited.
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let _conn = state.enter_connection(WorkClass::Internal);
+        let probe = TestProbe::new(true);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 1000),
+            Some(DeferReason::IoPressure),
+        );
+    }
+
+    #[tokio::test]
+    async fn defer_reason_internal_activity_does_not_defer_maintenance() {
+        // The 2026-07-17 incident: the watcher stamping the shared clock kept
+        // the daemon permanently "Active" and starved maintenance. Internal
+        // activity alone must not read as Active.
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        state
+            .inner
+            .internal_last_activity_secs
+            .store(970, Ordering::Relaxed);
+        state.inner.last_activity_secs.store(970, Ordering::Relaxed);
+        let probe = TestProbe::new(false);
+        assert_eq!(state.maintenance_defer_reason_at(&probe, 1000), None);
+    }
+
+    #[tokio::test]
+    async fn internal_housekeeping_alone_is_maintenance_eligible_but_defers_idle_exit() {
+        // Acceptance (daemon-rework curd 5): when internal housekeeping is the
+        // only activity, the daemon is maintenance-eligible while idle-exit
+        // still waits for the housekeeping to finish (ADR-003 preserved).
+        let state = test_state().await;
+        state.set_last_activity_secs_for_test(0);
+        let conn = state.enter_connection(WorkClass::Internal);
+        state
+            .inner
+            .internal_last_activity_secs
+            .store(970, Ordering::Relaxed);
+        state.inner.last_activity_secs.store(970, Ordering::Relaxed);
+        let probe = TestProbe::new(false);
+        assert_eq!(
+            state.maintenance_defer_reason_at(&probe, 1000),
+            None,
+            "internal-only housekeeping must leave maintenance eligible",
+        );
+        assert!(
+            !state.should_idle_exit_at(300, 100_000),
+            "an in-flight Internal guard must defer idle-exit",
+        );
+        drop(conn);
+        assert!(
+            !state.should_idle_exit_at(300, 1000),
+            "recent Internal activity (clock at 970) must defer idle-exit at now=1000",
+        );
+        assert!(
+            state.should_idle_exit_at(300, 970 + 300),
+            "once housekeeping completes and the window elapses, idle-exit fires",
         );
     }
 
@@ -2192,7 +2405,7 @@ mod tests {
     async fn defer_reason_active_takes_priority_over_io_pressure() {
         let state = test_state().await;
         state.set_last_activity_secs_for_test(0);
-        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let _conn = state.enter_connection(WorkClass::External);
         let probe = TestProbe::new(true);
         assert_eq!(
             state.maintenance_defer_reason_at(&probe, 1000),
@@ -2238,8 +2451,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn maintenance_loop_warns_after_eleven_consecutive_defers() {
+        // Shared OBSERVED slot: an ambient Hard recorded by a concurrent
+        // test would skip the defer path this test asserts on.
+        let _coord = crate::daemon::debt::OBSERVED_HARD_COORD.read().await;
         let state = test_state().await;
-        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let _conn = state.enter_connection(WorkClass::External);
         let capture = EventCapture::default();
         let subscriber = Registry::default().with(capture.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -2309,7 +2525,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn maintenance_loop_shuts_down_promptly_during_recheck_sleep() {
         let state = test_state().await;
-        state.inner.active_connections.store(1, Ordering::SeqCst);
+        let _conn = state.enter_connection(WorkClass::External);
         let cancel = CancellationToken::new();
         let task = tokio::spawn(maintenance_loop(
             state.clone(),

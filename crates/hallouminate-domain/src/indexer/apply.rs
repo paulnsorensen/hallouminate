@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use crate::common::{CorpusConfig, FileRef, Result, canonicalize_or_passthrough, expand_tilde};
+use crate::common::{
+    CorpusConfig, FileRef, Mtime, Result, canonicalize_or_passthrough, expand_tilde,
+};
 use crate::corpus::blake3_file;
 use crate::indexer::chunk::PreparedFile;
 use crate::indexer::store::ChunkStore;
@@ -64,6 +66,22 @@ struct RunCtx<'a> {
 /// does not specify one. Bounds peak memory and embedder call width.
 pub const DEFAULT_BATCH_SIZE: usize = 16;
 
+/// Guards against git's racy-clean problem: if a file is indexed and
+/// rewritten within the same mtime millisecond, the stored mtime equals the
+/// rewrite's mtime and mtime-equality gates (watcher stage-1
+/// `mtime_matches_last_index` in watch.rs, and bulk `plan()`) would treat the
+/// rewrite as already-indexed and skip it. Recording `mtime - 1` for any
+/// mtime observed at or after `now_ms` forces those gates to fall through to
+/// a content-hash check for racily-recorded files; the next reindex lands
+/// strictly after this ms and records the true mtime, so gating converges.
+fn smudge_racy_mtime(mtime: Mtime, now_ms: i64) -> Mtime {
+    if mtime.0 >= now_ms {
+        Mtime(mtime.0 - 1)
+    } else {
+        mtime
+    }
+}
+
 pub async fn apply(
     plan: IndexPlan,
     store: &dyn ChunkStore,
@@ -90,7 +108,7 @@ pub async fn apply(
         upsert_reqs.push(WriteRequest {
             corpus,
             file: &u.file,
-            mtime: u.mtime,
+            mtime: smudge_racy_mtime(u.mtime, indexed_at_ms),
         });
     }
     run_in_batches(
@@ -114,7 +132,11 @@ pub async fn apply(
         };
         if new_hash == cand.snap.content_hash {
             store
-                .touch_mtime(&cand.snap.corpus, &cand.snap.file_ref, cand.new_mtime.0)
+                .touch_mtime(
+                    &cand.snap.corpus,
+                    &cand.snap.file_ref,
+                    smudge_racy_mtime(cand.new_mtime, indexed_at_ms).0,
+                )
                 .await?;
             stats.files_touched += 1;
         } else {
@@ -126,7 +148,7 @@ pub async fn apply(
         fallthrough_reqs.push(WriteRequest {
             corpus,
             file: &c.file,
-            mtime: c.new_mtime,
+            mtime: smudge_racy_mtime(c.new_mtime, indexed_at_ms),
         });
     }
     run_in_batches(
@@ -391,5 +413,24 @@ mod tests {
             *store.deleted.lock().expect("deleted mutex"),
             vec![gone.to_string_lossy().into_owned()]
         );
+    }
+
+    // -- smudge_racy_mtime: git-style racy-clean handling --
+
+    #[test]
+    fn smudge_racy_mtime_backdates_an_mtime_recorded_within_the_same_ms_as_indexing() {
+        // The file's mtime lands in the same millisecond apply() observed as
+        // "now" -- a later same-ms rewrite would carry an identical mtime and
+        // be invisible to mtime-equality gates. Backdating by 1ms forces those
+        // gates to fall through to a content-hash check instead.
+        assert_eq!(smudge_racy_mtime(Mtime(1_000), 1_000), Mtime(999));
+    }
+
+    #[test]
+    fn smudge_racy_mtime_leaves_a_strictly_past_mtime_unchanged() {
+        // No race is possible once the file's mtime is strictly before the
+        // indexing timestamp -- a later rewrite necessarily bumps the mtime,
+        // so equality gates already see it correctly.
+        assert_eq!(smudge_racy_mtime(Mtime(999), 1_000), Mtime(999));
     }
 }
