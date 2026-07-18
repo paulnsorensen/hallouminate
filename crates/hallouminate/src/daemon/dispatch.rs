@@ -440,6 +440,18 @@ async fn handle_ground(
     DaemonResponse::ok(&GroundResult { outline, response })
 }
 
+/// Map a mutation-guard acquisition failure onto the wire. The Hard-debt
+/// bounded-wait expiry is the one retryable case (curd 2's backpressure gate
+/// emits exactly `RETRYABLE_HARD_DEBT`); everything else stays `Internal`.
+fn mutation_guard_err(msg: impl Into<String>) -> DaemonResponse {
+    let msg = msg.into();
+    if msg == super::backpressure::RETRYABLE_HARD_DEBT {
+        DaemonResponse::retryable(msg)
+    } else {
+        DaemonResponse::internal(msg)
+    }
+}
+
 async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> DaemonResponse {
     // Reject ad-hoc paths_from unconditionally: the daemon protocol does not
     // accept it yet, and silently ignoring the field when a corpus is also
@@ -483,7 +495,7 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
     for corpus in selected {
         let guard = match state.acquire_mutation_guard(&corpus.name).await {
             Ok(g) => g,
-            Err(msg) => return DaemonResponse::internal(msg),
+            Err(msg) => return mutation_guard_err(msg),
         };
         ensure_paths_exist(&corpus).await;
         let missing = hallouminate_domain::corpus::missing_roots(&corpus);
@@ -638,7 +650,7 @@ async fn handle_add_markdown(
     // clobber the first silently — the classic lost-update bug.
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
-        Err(msg) => return DaemonResponse::internal(msg),
+        Err(msg) => return mutation_guard_err(msg),
     };
 
     let res = match state.resources_for(cfg).await {
@@ -1052,7 +1064,7 @@ async fn handle_delete_markdown(
 
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
-        Err(msg) => return DaemonResponse::internal(msg),
+        Err(msg) => return mutation_guard_err(msg),
     };
 
     // Best-effort UX pre-check only: the `symlink_metadata` lookup produces
@@ -1384,6 +1396,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
                 error = %e, "boot catch-up: reindex failed; skipped"),
         }
     }
+    state.heartbeat().bump(super::heartbeat::TaskName::CatchUp);
 }
 
 /// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed

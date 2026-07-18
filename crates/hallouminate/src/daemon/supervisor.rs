@@ -5,8 +5,9 @@
 //! exponential backoff; restarts are counted against an OTP-style
 //! intensity cap (`restart_intensity_cap` per `restart_intensity_window`),
 //! and exceeding the cap escalates through the seeded [`Ladder`] to the
-//! escalation hook instead of killing the daemon. Wiring the five
-//! `server.rs` loops through this supervisor is a later task (W1).
+//! escalation hook instead of killing the daemon. All five `server.rs`
+//! loops (`Maintenance`, `CatchUp`, `WatcherPump`, `IdleExit`, `Signal`)
+//! are wired through this supervisor's `spawn`.
 //!
 //! Restart visibility: the supervisor keeps per-task restart counters
 //! (`restart_count`) for status reporting. It deliberately does not bump
@@ -31,11 +32,13 @@ const BACKOFF_FLOOR: Duration = Duration::from_secs(1);
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
 /// Called when a task's restart intensity has crossed the ladder's
-/// `act_at` threshold. Wiring (W1) maps the action to a real remediation.
+/// `act_at` threshold. Only `LadderAction::WatchdogTrip` is seeded today
+/// (`DaemonState::new`); the hook records the trip and logs — it does not
+/// itself abort or restart beyond the supervisor's normal backoff (real
+/// stall-triggered aborts are `watchdog.rs`'s separate stall detector).
 /// Contract: the hook is called from the monitor task and must not panic
 /// (a panicking hook kills supervision) and must not block (signal, don't
 /// remediate inline).
-#[allow(dead_code)]
 pub(crate) type EscalationHook = Arc<dyn Fn(TaskName, LadderAction) + Send + Sync>;
 
 const TASK_COUNT: usize = 5;
@@ -66,7 +69,6 @@ impl Default for RestartCounters {
 
 /// Supervises long-lived daemon tasks: restart-on-panic with backoff,
 /// intensity-capped, ladder-escalated past the cap.
-#[allow(dead_code)]
 pub(crate) struct Supervisor {
     restart_intensity_cap: u32,
     restart_intensity_window: Duration,
@@ -81,7 +83,6 @@ impl Supervisor {
     /// `DaemonConfig`; `shutdown` is the daemon's shutdown token
     /// (`DaemonState::shutdown_token`). `escalate` receives the ladder's
     /// action when a task exceeds the cap persistently.
-    #[allow(dead_code)]
     pub(crate) fn new(
         restart_intensity_cap: u32,
         restart_intensity_window: Duration,
@@ -111,7 +112,6 @@ impl Supervisor {
     /// panicking factory kills the monitor. The returned handle is the monitor's:
     /// it resolves when the task exits normally, is cancelled, or the
     /// shutdown token fires — never because of a task panic.
-    #[allow(dead_code)]
     pub(crate) fn spawn<F, Fut>(&self, name: TaskName, mut factory: F) -> JoinHandle<()>
     where
         F: FnMut() -> Fut + Send + 'static,

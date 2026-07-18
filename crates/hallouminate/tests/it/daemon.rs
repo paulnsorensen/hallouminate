@@ -1992,13 +1992,39 @@ async fn status_reports_running_then_not_running_across_shutdown() {
     }
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
 
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok while running"),
-        hallouminate::daemon::DaemonStatus::Running,
-        "status must be Running against a live daemon"
-    );
+    // End-to-end acceptance (curd 9): the Status IPC round trip must carry
+    // the full report — per-task states, debt, defer count, watcher counters
+    // including noop_reindexes, and trip state — from DaemonState storage.
+    // A fresh daemon has recorded nothing, so every field is default-shaped.
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok while running")
+    {
+        hallouminate::daemon::DaemonStatus::Running(report) => {
+            assert_eq!(
+                report.per_task.len(),
+                5,
+                "W1 wiring lists every task name in per_task, got {:?}",
+                report.per_task,
+            );
+            // debt::level() is a process-wide last-observation static; a
+            // parallel test may have observed Soft/Hard — assert presence,
+            // not a pinned value (the unit tests cover the mapping).
+            let _ = report.debt;
+            assert_eq!(report.defer_count, 0);
+            assert_eq!(
+                report.watcher,
+                hallouminate::daemon::WatcherCounters::default()
+            );
+            match report.trips {
+                hallouminate::daemon::TripState::None => {}
+                other => panic!("fresh daemon must report no ladder trip, got {other:?}"),
+            }
+        }
+        hallouminate::daemon::DaemonStatus::NotRunning => {
+            panic!("status must be Running against a live daemon")
+        }
+    }
 
     // Drive a graceful shutdown via the IPC path, then assert NotRunning.
     let client = connect_at(&socket).await.expect("connect");
@@ -2014,13 +2040,13 @@ async fn status_reports_running_then_not_running_across_shutdown() {
         .expect("join ok");
     served.expect("serve Ok on shutdown");
 
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok while stopped"),
-        hallouminate::daemon::DaemonStatus::NotRunning,
-        "status must be NotRunning once the socket is gone"
-    );
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok while stopped")
+    {
+        hallouminate::daemon::DaemonStatus::NotRunning => {}
+        other => panic!("status must be NotRunning once the socket is gone, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2039,6 +2065,50 @@ async fn stop_is_a_noop_against_an_already_stopped_daemon() {
     assert!(
         !socket.exists(),
         "stop must not create the socket it never connected to"
+    );
+}
+
+#[tokio::test]
+async fn status_surfaces_daemon_error_response_as_err_not_not_running() {
+    // Curd 9 deferred gap: a daemon that ANSWERS the Status RPC but returns a
+    // `DaemonResponse::Err` envelope IS running — `status()` must surface that
+    // as `Err`, never fold it into `NotRunning` (which callers read as "safe
+    // to spawn another daemon"). Bind a stub server that replies to any
+    // request with an internal-error envelope and assert the error (with the
+    // daemon's message preserved) comes back.
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join("erroring.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind stub socket");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                // The wire shape of `DaemonResponse::internal(...)` (ipc.rs:
+                // tag = "status", snake_case kinds).
+                let _ = write_half
+                    .write_all(
+                        b"{\"status\":\"err\",\"kind\":\"internal\",\"message\":\"status assembly failed\"}\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
+
+    let err = hallouminate::daemon::status().await.expect_err(
+        "an answering daemon that returns an error envelope must surface Err, not NotRunning",
+    );
+    assert!(
+        format!("{err:#}").contains("status assembly failed"),
+        "the daemon's error message must be preserved for the operator: {err:#}"
     );
 }
 
@@ -2094,13 +2164,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     // First daemon up and reachable.
     let first = spawn_serve(cfg.clone(), &socket).await;
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok while first daemon runs"),
-        hallouminate::daemon::DaemonStatus::Running,
-        "the first daemon must be reachable before restart",
-    );
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok while first daemon runs")
+    {
+        hallouminate::daemon::DaemonStatus::Running(_) => {}
+        other => panic!("the first daemon must be reachable before restart, got {other:?}"),
+    }
 
     // Restart: stop() takes the first daemon down (its serve future returns),
     // then the injected respawn brings a fresh in-process daemon up. The
@@ -2113,13 +2183,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     let stash = second_handle.clone();
     hallouminate::daemon::restart_with(|| async move {
         // After restart's stop(), nothing must answer on the socket.
-        assert_eq!(
-            hallouminate::daemon::status()
-                .await
-                .expect("status ok between stop and respawn"),
-            hallouminate::daemon::DaemonStatus::NotRunning,
-            "restart must stop the old daemon before respawning",
-        );
+        match hallouminate::daemon::status()
+            .await
+            .expect("status ok between stop and respawn")
+        {
+            hallouminate::daemon::DaemonStatus::NotRunning => {}
+            other => panic!("restart must stop the old daemon before respawning, got {other:?}"),
+        }
         let handle = spawn_serve(restarted_cfg, &restart_socket).await;
         *stash.lock().expect("stash lock") = Some(handle);
         Ok(())
@@ -2135,13 +2205,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     first_result.expect("first serve returns Ok on shutdown");
 
     // The freshly respawned daemon must be reachable.
-    assert_eq!(
-        hallouminate::daemon::status()
-            .await
-            .expect("status ok after restart"),
-        hallouminate::daemon::DaemonStatus::Running,
-        "restart must leave a fresh, reachable daemon up",
-    );
+    match hallouminate::daemon::status()
+        .await
+        .expect("status ok after restart")
+    {
+        hallouminate::daemon::DaemonStatus::Running(_) => {}
+        other => panic!("restart must leave a fresh, reachable daemon up, got {other:?}"),
+    }
 
     // Tear down the second daemon so the test leaves no listener behind.
     let second = second_handle

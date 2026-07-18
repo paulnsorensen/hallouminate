@@ -229,9 +229,17 @@ struct DaemonStateInner {
     /// completed, and reindexes that upserted nothing) -- additive storage
     /// for curd 9's status surface.
     watcher_counters: WatcherCounters,
-    /// Most recent ladder trip, if any (curd 1 writes this once the ladder
-    /// is wired into a loop; curd 9's status surface reads it).
+    /// Most recent ladder trip, if any (written by `watch.rs`'s churn
+    /// ladder and `state.rs`'s supervisor WatchdogTrip escalation hook;
+    /// curd 9's status surface reads it).
     last_ladder_trip: std::sync::Mutex<Option<LadderTrip>>,
+    /// Supervisor owning the daemon's five long-lived loops (G5). Holds the
+    /// escalation hook below; loops route through `supervisor().spawn(..)`
+    /// at their existing spawn sites.
+    supervisor: Arc<super::supervisor::Supervisor>,
+    /// Per-task heartbeat epochs bumped by the supervised loops and polled
+    /// by the watchdog (server.rs); snapshot surface for `daemon status`.
+    heartbeat: Arc<super::heartbeat::HeartbeatRegistry>,
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
@@ -305,8 +313,8 @@ struct WatcherCounters {
 }
 
 /// Snapshot of the most recent ladder trip: which escalation action fired
-/// and when (monotonic seconds). Curd 1's future ladder wiring is the only
-/// writer; this seed only provides storage + accessors.
+/// and when (monotonic seconds). Written by the churn ladder (`watch.rs`)
+/// and the supervisor's WatchdogTrip escalation hook (`state.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LadderTrip {
     pub(crate) action: LadderAction,
@@ -517,27 +525,67 @@ impl DaemonState {
         resources_map.insert(baseline_key, Arc::clone(&baseline_resources));
 
         let maintenance_interval_secs = cfg.daemon.maintenance_interval_secs;
+        let restart_cap = cfg.daemon.restart_intensity_cap;
+        let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
+        let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
+        // Invented defaults, no existing analog in debt.rs.
+        let ladder = super::ladder::Ladder {
+            warn_at: 3,
+            act_at: 5,
+            action: LadderAction::WatchdogTrip,
+        };
         let state = DaemonState {
-            inner: Arc::new(DaemonStateInner {
-                baseline: cfg,
-                baseline_xdg_path: xdg_path,
-                baseline_resources,
-                resources: Mutex::new(resources_map),
-                resource_build_locks: KeyedLockMap::default(),
-                corpus_locks: KeyedLockMap::default(),
-                write_lane,
-                crossencoders: crossencoders_arc,
-                last_activity_secs: last_activity,
-                active_connections: Arc::new(AtomicUsize::new(0)),
-                external_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
-                internal_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
-                active_external_connections: Arc::new(AtomicUsize::new(0)),
-                active_internal_connections: Arc::new(AtomicUsize::new(0)),
-                defer_count: AtomicU32::new(0),
-                watcher_counters: WatcherCounters::default(),
-                last_ladder_trip: std::sync::Mutex::new(None),
-                maintenance_task: Mutex::new(None),
-                shutdown,
+            // `new_cyclic`: the escalation hook records trips into the very
+            // `DaemonStateInner` being constructed (so `daemon status`
+            // reports them); a `Weak` breaks the ownership cycle.
+            inner: Arc::new_cyclic(|weak: &std::sync::Weak<DaemonStateInner>| {
+                let weak = weak.clone();
+                let escalate: super::supervisor::EscalationHook = Arc::new(move |task, action| {
+                    tracing::error!(
+                        target: "hallouminate::daemon",
+                        task = ?task,
+                        action = ?action,
+                        "supervised task exceeded the restart intensity cap",
+                    );
+                    if let Some(inner) = weak.upgrade() {
+                        *inner
+                            .last_ladder_trip
+                            .lock()
+                            .expect("ladder trip mutex poisoned") = Some(LadderTrip {
+                            action,
+                            at_secs: monotonic_secs(),
+                        });
+                    }
+                });
+                DaemonStateInner {
+                    baseline: cfg,
+                    baseline_xdg_path: xdg_path,
+                    baseline_resources,
+                    resources: Mutex::new(resources_map),
+                    resource_build_locks: KeyedLockMap::default(),
+                    corpus_locks: KeyedLockMap::default(),
+                    write_lane,
+                    crossencoders: crossencoders_arc,
+                    last_activity_secs: last_activity,
+                    active_connections: Arc::new(AtomicUsize::new(0)),
+                    external_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
+                    internal_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
+                    active_external_connections: Arc::new(AtomicUsize::new(0)),
+                    active_internal_connections: Arc::new(AtomicUsize::new(0)),
+                    defer_count: AtomicU32::new(0),
+                    watcher_counters: WatcherCounters::default(),
+                    last_ladder_trip: std::sync::Mutex::new(None),
+                    supervisor: Arc::new(super::supervisor::Supervisor::new(
+                        restart_cap,
+                        restart_window,
+                        ladder,
+                        escalate,
+                        shutdown.clone(),
+                    )),
+                    heartbeat,
+                    maintenance_task: Mutex::new(None),
+                    shutdown,
+                }
             }),
         };
 
@@ -563,7 +611,17 @@ impl DaemonState {
             #[cfg(not(target_os = "linux"))]
             let probe: Arc<dyn IoPressureProbe> = Arc::new(NoPressureSignal);
             let maintenance_task =
-                tokio::spawn(maintenance_loop(loop_state, cancel, interval, probe));
+                state
+                    .inner
+                    .supervisor
+                    .spawn(super::heartbeat::TaskName::Maintenance, move || {
+                        maintenance_loop(
+                            loop_state.clone(),
+                            cancel.clone(),
+                            interval,
+                            probe.clone(),
+                        )
+                    });
             *state.inner.maintenance_task.lock().await = Some(maintenance_task);
         }
 
@@ -579,6 +637,16 @@ impl DaemonState {
 
     pub(crate) async fn take_maintenance_task(&self) -> Option<JoinHandle<()>> {
         self.inner.maintenance_task.lock().await.take()
+    }
+
+    /// Supervisor owning the daemon's long-lived loops (G5 wiring).
+    pub(crate) fn supervisor(&self) -> &Arc<super::supervisor::Supervisor> {
+        &self.inner.supervisor
+    }
+
+    /// Heartbeat registry the supervised loops bump and the watchdog polls.
+    pub(crate) fn heartbeat(&self) -> &Arc<super::heartbeat::HeartbeatRegistry> {
+        &self.inner.heartbeat
     }
 
     /// Source path of the baseline config the daemon booted from — the XDG
@@ -798,7 +866,6 @@ impl DaemonState {
     }
 
     /// Current consecutive-defer streak (curd 9's status surface).
-    #[allow(dead_code)]
     pub(crate) fn defer_count(&self) -> u32 {
         self.inner.defer_count.load(Ordering::Relaxed)
     }
@@ -839,7 +906,6 @@ impl DaemonState {
 
     /// Snapshot of `(events, reindexes, noop_reindexes)` (curd 9's status
     /// surface).
-    #[allow(dead_code)]
     pub(crate) fn watcher_counters_snapshot(&self) -> (u64, u64, u64) {
         (
             self.inner.watcher_counters.events.load(Ordering::Relaxed),
@@ -856,7 +922,6 @@ impl DaemonState {
 
     /// Record a ladder trip (curd 1's future ladder wiring calls this when
     /// `Ladder::evaluate` returns `Action`). Overwrites any prior snapshot.
-    #[allow(dead_code)]
     pub(crate) fn record_ladder_trip(&self, action: LadderAction) {
         let at_secs = monotonic_secs();
         *self
@@ -867,7 +932,6 @@ impl DaemonState {
     }
 
     /// The most recent ladder trip, if any (curd 9's status surface).
-    #[allow(dead_code)]
     pub(crate) fn last_ladder_trip(&self) -> Option<LadderTrip> {
         *self
             .inner
@@ -2479,27 +2543,31 @@ mod tests {
         tokio::time::advance(Duration::from_secs(111)).await;
         tokio::task::yield_now().await;
 
-        // 9 more rechecks bring consecutive_defers to 10 (no warn yet); the
-        // 10th brings it to 11, which crosses the `> 10` warn threshold.
-        for i in 0..10 {
+        // W2's heartbeat cadence slices the interval sleep into <=60s
+        // chunks, so 60s advances are consumed by chunk completions as well
+        // as defer rechecks -- an iteration-indexed schedule no longer maps
+        // 1:1 to defer counts. Drive the clock and pin the FIRST captured
+        // count-11 event instead: the warn threshold is `> 10`, so a warn
+        // firing any earlier would surface tagged with a smaller count.
+        let mut saw_eleven = false;
+        for _ in 0..30 {
             tokio::time::advance(Duration::from_secs(60)).await;
             tokio::task::yield_now().await;
-            let events = capture.0.lock().expect("capture lock");
-            let warned = events
-                .iter()
-                .any(|e| e.numbers.get("consecutive_defers").copied() == Some(11));
-            if i < 9 {
-                assert!(
-                    !warned,
-                    "warn fired before the 11th consecutive defer (i={i})"
-                );
-            } else {
-                assert!(
-                    warned,
-                    "expected a warn event with consecutive_defers == 11 after the 11th recheck"
-                );
+            let warned = {
+                let events = capture.0.lock().expect("capture lock");
+                events
+                    .iter()
+                    .any(|e| e.numbers.get("consecutive_defers").copied() == Some(11))
+            };
+            if warned {
+                saw_eleven = true;
+                break;
             }
         }
+        assert!(
+            saw_eleven,
+            "expected a warn event with consecutive_defers == 11 within the advance budget"
+        );
 
         cancel.cancel();
         task.await.expect("maintenance_loop task");

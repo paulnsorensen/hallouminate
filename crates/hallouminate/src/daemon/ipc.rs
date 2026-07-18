@@ -198,6 +198,13 @@ impl DaemonResponse {
             message: msg.into(),
         }
     }
+
+    pub fn retryable(msg: impl Into<String>) -> Self {
+        DaemonResponse::Err {
+            kind: ErrorKind::Retryable,
+            message: msg.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,9 +212,11 @@ impl DaemonResponse {
 pub enum ErrorKind {
     InvalidParams,
     Internal,
-    /// A mutation was blocked (e.g. `DebtLevel::Hard`'s bounded wait expired)
-    /// and the caller should retry -- distinct from `Internal` so a client
-    /// can safely retry without risking a non-idempotent operation twice.
+    /// The daemon refused or timed out without completing the operation from
+    /// the caller's perspective (e.g. `DebtLevel::Hard`'s bounded wait
+    /// expired, or a client-side RPC deadline fired) -- retry with backoff.
+    /// A client-side timeout may leave the original attempt still running
+    /// server-side, so retries must tolerate the first attempt having landed.
     Retryable,
 }
 

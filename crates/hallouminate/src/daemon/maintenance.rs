@@ -220,6 +220,25 @@ impl Drop for MaintenanceLifecycle {
     }
 }
 
+/// Sleeps `total`, bumping the Maintenance heartbeat every <= 60s so the
+/// self-armed watchdog's stall window can't trip while a single long
+/// interval sleep is in flight.
+async fn sleep_with_heartbeat(state: &DaemonState, total: Duration) {
+    const CHUNK: Duration = Duration::from_secs(60);
+    let mut remaining = total;
+    while remaining > CHUNK {
+        tokio::time::sleep(CHUNK).await;
+        state
+            .heartbeat()
+            .bump(super::heartbeat::TaskName::Maintenance);
+        if debt::level() == DebtLevel::Hard {
+            return;
+        }
+        remaining -= CHUNK;
+    }
+    tokio::time::sleep(remaining).await;
+}
+
 /// Background task: sleeps `interval` (plus jitter), then runs a maintenance
 /// pass once the daemon is idle and I/O pressure is not elevated --
 /// deferring and rechecking every 60s otherwise (ADR-003). Exits promptly on
@@ -234,31 +253,38 @@ pub(super) async fn maintenance_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(Duration::from_secs(jittered_sleep_secs(interval.as_secs()))) => {}
+            _ = sleep_with_heartbeat(&state, Duration::from_secs(jittered_sleep_secs(interval.as_secs()))) => {}
         }
         let due_since = tokio::time::Instant::now();
         let defer_bound = Duration::from_secs(state.baseline().daemon.defer_bound_secs);
         let mut pace = Pace::Full;
+        state.reset_defer_count();
         // ADR daemon-rework-001: Hard debt forces the pass past both the
-        // Active and IoPressure defer gates below. Inert while `debt::level()`
-        // is stubbed to `Ok` -- dispatch B wires the real fragment/version
-        // thresholds that can report `Hard`.
-        let hard_forced = debt::level() == DebtLevel::Hard;
-        if !hard_forced {
-            state.reset_defer_count();
+        // Active and IoPressure defer gates below, re-sampled at tick start,
+        // at every defer recheck, and during the interval sleep itself, so a
+        // Hard onset is caught within one recheck/chunk rather than waiting
+        // out the full defer bound or sleep interval.
+        let mut hard_forced = false;
+        if debt::level() == DebtLevel::Hard {
+            hard_forced = true;
+            pace = forced_pace(probe.elevated(), &state.baseline().daemon);
+        } else {
             while let Some(reason) = state.maintenance_defer_reason(probe.as_ref()) {
                 let deferred_for = due_since.elapsed();
-                if deferred_for >= defer_bound {
+                let hard_onset = debt::level() == DebtLevel::Hard;
+                if deferred_for >= defer_bound || hard_onset {
                     // The bound is real, not merely counted (the 2026-07-17
                     // incident deferred 1000 consecutive times with only a
                     // WARN): the due pass now runs despite the standing
-                    // defer reason.
+                    // defer reason, or immediately on a Hard debt onset.
+                    hard_forced = hard_onset;
                     pace = forced_pace(probe.elevated(), &state.baseline().daemon);
                     tracing::warn!(
                         target: "hallouminate::daemon",
                         ?reason,
                         deferred_secs = deferred_for.as_secs(),
                         defer_bound_secs = defer_bound.as_secs(),
+                        hard_onset,
                         paced = match pace {
                             Pace::Paced { .. } => true,
                             Pace::Full => false,
@@ -291,6 +317,9 @@ pub(super) async fn maintenance_loop(
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(recheck) => {}
                 }
+                state
+                    .heartbeat()
+                    .bump(super::heartbeat::TaskName::Maintenance);
             }
         }
         // A Hard-forced pass stays `Pace::Full` even under elevated PSI --
@@ -300,6 +329,9 @@ pub(super) async fn maintenance_loop(
             Pace::Full => state.run_maintenance_tick().await,
             Pace::Paced { .. } => state.run_maintenance_pass(pace).await,
         };
+        state
+            .heartbeat()
+            .bump(super::heartbeat::TaskName::Maintenance);
         if hard_forced {
             // The forced pass just ran off a possibly-stale Hard reading;
             // re-read + classify real debt so a write-idle-but-read-active
@@ -423,11 +455,15 @@ impl DaemonState {
         lifecycle.write_lane_acquired();
         let maintenance = maintain(lifecycle.maintenance_id);
         tokio::pin!(maintenance);
-        let (result, shutdown_requested) = tokio::select! {
-            biased;
-            result = &mut maintenance => (result, false),
-            _ = shutdown.cancelled() => {
-                (maintenance.await, true)
+        let mut bump_interval = tokio::time::interval(Duration::from_secs(60));
+        let (result, shutdown_requested) = loop {
+            tokio::select! {
+                biased;
+                result = &mut maintenance => break (result, false),
+                _ = shutdown.cancelled() => break (maintenance.await, true),
+                _ = bump_interval.tick() => {
+                    self.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+                }
             }
         };
         if shutdown_requested {
@@ -583,7 +619,9 @@ mod tests {
         tokio::task::yield_now().await;
 
         // Past interval + max jitter: the pass becomes due and defers.
-        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(51)).await;
         tokio::task::yield_now().await;
         // Two full 60s rechecks (120s deferred), then one second short of
         // the 150s bound: still deferred.
@@ -645,7 +683,9 @@ mod tests {
         ));
         tokio::task::yield_now().await;
 
-        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(51)).await;
         tokio::task::yield_now().await;
         for _ in 0..2 {
             tokio::time::advance(Duration::from_secs(60)).await;
@@ -691,7 +731,9 @@ mod tests {
         ));
         tokio::task::yield_now().await;
 
-        tokio::time::advance(Duration::from_secs(111)).await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(51)).await;
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
@@ -907,5 +949,217 @@ mod tests {
         // Unmeasurable progress must not slice forever.
         assert_eq!(tick, MaintenanceTick::Continue);
         assert_eq!(calls.lock().expect("calls lock").len(), 1);
+    }
+
+    /// A self-armed watchdog polls at stall/4; a naive single sleep for the
+    /// whole jittered interval would starve it of any bump for up to the
+    /// full interval. The interval sleep must be chunked so the epoch
+    /// advances at least every 60s even mid-sleep.
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_epoch_advances_at_least_every_60s_during_a_long_interval_sleep() {
+        // Shared OBSERVED slot: an ambient Hard recorded by a concurrent
+        // test would interrupt the interval sleep this test asserts on.
+        let _coord = debt::OBSERVED_HARD_COORD.read().await;
+        let (state, _ground) = test_state(|cfg| cfg.daemon.defer_bound_secs = 0).await;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(maintenance_loop(
+            state.clone(),
+            cancel.clone(),
+            Duration::from_secs(3600),
+            Arc::new(TestProbe::new(false)),
+        ));
+        tokio::task::yield_now().await;
+
+        let mut previous = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::Maintenance);
+        // Advance in 60s steps through most of the hour-long interval sleep;
+        // the epoch must move on every step, never stalling for a full 60s.
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let current = state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::Maintenance);
+            assert!(
+                current > previous,
+                "Maintenance epoch must advance at least every 60s during the interval sleep"
+            );
+            previous = current;
+        }
+
+        cancel.cancel();
+        task.await.expect("maintenance_loop task");
+    }
+
+    /// HIGH-3 (mid-pass gap): `maintain` itself can run past
+    /// `watchdog_stall_secs` (e.g. a slow compaction). The tick must keep
+    /// bumping the epoch while `maintain` is in flight, not just around it.
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_epoch_advances_at_least_every_60s_during_a_long_pass() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .run_maintenance_tick_with(|_id| async {
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                        Ok(stats(Some(0)))
+                    })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let mut previous = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::Maintenance);
+        for _ in 0..9 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let current = state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::Maintenance);
+            assert!(
+                current > previous,
+                "Maintenance epoch must advance at least every 60s during a long pass"
+            );
+            previous = current;
+        }
+
+        let tick = task.await.expect("maintenance tick task");
+        assert_eq!(tick, MaintenanceTick::Continue);
+    }
+
+    /// RAII guard for `debt::set_test_level`: resets to `None` on drop so
+    /// the override never leaks into the next test scheduled on the same
+    /// OS thread (Rust's default harness reuses threads across sequential
+    /// tests).
+    struct DebtLevelGuard;
+
+    impl DebtLevelGuard {
+        fn set(level: DebtLevel) -> Self {
+            debt::set_test_level(Some(level));
+            Self
+        }
+    }
+
+    impl Drop for DebtLevelGuard {
+        fn drop(&mut self) {
+            debt::set_test_level(None);
+        }
+    }
+
+    /// HIGH-2 (mid-sleep gap): a Hard debt onset during the interval sleep
+    /// must wake `sleep_with_heartbeat` within one 60s chunk instead of
+    /// waiting out the full jittered interval.
+    #[tokio::test(start_paused = true)]
+    async fn hard_debt_onset_during_interval_sleep_forces_pass_within_one_chunk() {
+        // Shared OBSERVED slot: an ambient Hard recorded by a concurrent test
+        // would fire maintenance before this test sets its own Hard onset.
+        let _coord = debt::OBSERVED_HARD_COORD.read().await;
+        let (state, _ground) = test_state(|cfg| cfg.daemon.defer_bound_secs = 0).await;
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(maintenance_loop(
+            state.clone(),
+            cancel.clone(),
+            Duration::from_secs(3600),
+            Arc::new(TestProbe::new(false)),
+        ));
+        tokio::task::yield_now().await;
+
+        // Two ordinary 60s chunks with debt still Ok: no maintenance yet.
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !capture.maintenance_started(),
+            "maintenance must not start before the interval elapses"
+        );
+
+        // Debt turns Hard mid-sleep; the very next chunk must wake it.
+        let _debt = DebtLevelGuard::set(DebtLevel::Hard);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            capture.maintenance_started(),
+            "a Hard debt onset mid-sleep must force the pass within one 60s chunk, \
+             not wait out the full 3600s interval"
+        );
+
+        cancel.cancel();
+        task.await.expect("maintenance_loop task");
+    }
+
+    /// HIGH-2 (mid-defer-loop gap): a Hard debt onset while a due pass is
+    /// deferring must force the pass within one `DEFER_RECHECK`, not wait
+    /// for `defer_bound_secs` to elapse.
+    #[tokio::test(start_paused = true)]
+    async fn hard_debt_onset_during_defer_loop_forces_pass_within_one_recheck() {
+        // Shared OBSERVED slot: an ambient Hard recorded by a concurrent test
+        // would fire maintenance before this test sets its own Hard onset.
+        let _coord = debt::OBSERVED_HARD_COORD.read().await;
+        let (state, _ground) = test_state(|cfg| cfg.daemon.defer_bound_secs = 600).await;
+        // Continuous external activity keeps the pass deferred until forced.
+        let _active = state.enter_connection(WorkClass::External);
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(maintenance_loop(
+            state.clone(),
+            cancel.clone(),
+            Duration::from_secs(100),
+            Arc::new(TestProbe::new(false)),
+        ));
+        tokio::task::yield_now().await;
+
+        // Past interval + max jitter: the pass becomes due and defers.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(51)).await;
+        tokio::task::yield_now().await;
+        // One full recheck deferred with debt still Ok.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !capture.maintenance_started(),
+            "must stay deferred while debt is Ok and well short of the bound"
+        );
+
+        // Debt turns Hard; the next recheck must force the pass immediately,
+        // long before the 600s defer bound.
+        let _debt = DebtLevelGuard::set(DebtLevel::Hard);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            capture.maintenance_started(),
+            "a Hard debt onset during the defer loop must force the pass on the next recheck"
+        );
+        let forced = capture.forced_event().expect("forced-pass warn event");
+        assert_eq!(
+            forced.strings.get("hard_onset").map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            forced
+                .numbers
+                .get("deferred_secs")
+                .is_some_and(|&secs| secs < 600),
+            "must fire well before the 600s defer bound, via the Hard onset, not the bound"
+        );
+
+        cancel.cancel();
+        task.await.expect("maintenance_loop task");
     }
 }

@@ -319,7 +319,9 @@ pub async fn dispatch(cli: Cli, startup: crate::config::Config) -> anyhow::Resul
                 }
                 DaemonAction::Status => {
                     match crate::daemon::status().await? {
-                        crate::daemon::DaemonStatus::Running => println!("running"),
+                        crate::daemon::DaemonStatus::Running(report) => {
+                            print!("{}", render_status_report(&report));
+                        }
                         crate::daemon::DaemonStatus::NotRunning => println!("not running"),
                     }
                     Ok(())
@@ -327,6 +329,64 @@ pub async fn dispatch(cli: Cli, startup: crate::config::Config) -> anyhow::Resul
             }
         }
     }
+}
+
+/// Render a daemon [`StatusReport`](crate::daemon::StatusReport) for
+/// `daemon status`: one line per fact, every wire field represented —
+/// per-task states, debt level, defer count, watcher counters (including
+/// noop_reindexes), and the last ladder trip. Names match the wire's
+/// snake_case so log greps and the JSON payload agree.
+fn render_status_report(report: &crate::daemon::StatusReport) -> String {
+    use crate::daemon::{DebtLevel, LadderAction, TaskName, TaskState, TripState};
+    use std::fmt::Write as _;
+
+    fn task_name(task: TaskName) -> &'static str {
+        match task {
+            TaskName::Maintenance => "maintenance",
+            TaskName::CatchUp => "catch_up",
+            TaskName::WatcherPump => "watcher_pump",
+            TaskName::IdleExit => "idle_exit",
+            TaskName::Signal => "signal",
+        }
+    }
+
+    let mut out = String::from("running\n");
+    if report.per_task.is_empty() {
+        out.push_str("tasks: none reported\n");
+    } else {
+        out.push_str("tasks:\n");
+        for entry in &report.per_task {
+            let state = match entry.state {
+                TaskState::Alive => "alive",
+                TaskState::Stalled => "stalled",
+            };
+            let _ = writeln!(out, "  {}: {state}", task_name(entry.task));
+        }
+    }
+    let debt = match report.debt {
+        DebtLevel::Ok => "ok",
+        DebtLevel::Soft => "soft",
+        DebtLevel::Hard => "hard",
+    };
+    let _ = writeln!(out, "debt: {debt}");
+    let _ = writeln!(out, "deferred maintenance passes: {}", report.defer_count);
+    let _ = writeln!(
+        out,
+        "watcher: events={} reindexes={} noop_reindexes={}",
+        report.watcher.events, report.watcher.reindexes, report.watcher.noop_reindexes,
+    );
+    match &report.trips {
+        TripState::None => out.push_str("last ladder trip: none\n"),
+        TripState::Tripped { action, at_secs } => {
+            let action = match action {
+                LadderAction::ForceMaintenance => "force_maintenance".to_string(),
+                LadderAction::RestartTask(task) => format!("restart_task({})", task_name(*task)),
+                LadderAction::WatchdogTrip => "watchdog_trip".to_string(),
+            };
+            let _ = writeln!(out, "last ladder trip: {action} at {at_secs}s uptime");
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -703,5 +763,84 @@ mod tests {
                 "daemon {lifecycle_arg} must not consult the foreground --config override"
             );
         }
+    }
+
+    #[test]
+    fn daemon_status_render_covers_every_report_field() {
+        // WHY: the acceptance criterion is that `daemon status` reports
+        // per-task states, debt, defer count, watcher counters (including
+        // noop_reindexes), and trip state — a field silently dropped by the
+        // renderer would pass type-check but break the criterion.
+        use crate::daemon::{
+            DebtLevel, LadderAction, StatusReport, TaskName, TaskState, TaskStatus, TripState,
+            WatcherCounters,
+        };
+        let report = StatusReport {
+            per_task: vec![
+                TaskStatus {
+                    task: TaskName::Maintenance,
+                    state: TaskState::Alive,
+                },
+                TaskStatus {
+                    task: TaskName::WatcherPump,
+                    state: TaskState::Stalled,
+                },
+            ],
+            debt: DebtLevel::Soft,
+            defer_count: 4,
+            watcher: WatcherCounters {
+                events: 12,
+                reindexes: 5,
+                noop_reindexes: 2,
+            },
+            trips: TripState::Tripped {
+                action: LadderAction::RestartTask(TaskName::WatcherPump),
+                at_secs: 321,
+            },
+        };
+        let rendered = render_status_report(&report);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "running",
+                "tasks:",
+                "  maintenance: alive",
+                "  watcher_pump: stalled",
+                "debt: soft",
+                "deferred maintenance passes: 4",
+                "watcher: events=12 reindexes=5 noop_reindexes=2",
+                "last ladder trip: restart_task(watcher_pump) at 321s uptime",
+            ],
+        );
+    }
+
+    #[test]
+    fn daemon_status_render_handles_empty_tasks_and_no_trip() {
+        // WHY: until wiring W1 plumbs the heartbeat registry, per_task is
+        // empty and no trip has been recorded — the renderer must say so
+        // explicitly rather than omit the sections (silent omission would be
+        // indistinguishable from a rendering bug).
+        use crate::daemon::{DebtLevel, StatusReport, TripState, WatcherCounters};
+        let report = StatusReport {
+            per_task: Vec::new(),
+            debt: DebtLevel::Ok,
+            defer_count: 0,
+            watcher: WatcherCounters::default(),
+            trips: TripState::None,
+        };
+        let rendered = render_status_report(&report);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "running",
+                "tasks: none reported",
+                "debt: ok",
+                "deferred maintenance passes: 0",
+                "watcher: events=0 reindexes=0 noop_reindexes=0",
+                "last ladder trip: none",
+            ],
+        );
     }
 }

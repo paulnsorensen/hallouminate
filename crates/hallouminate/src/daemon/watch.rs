@@ -27,7 +27,9 @@ use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
 use hallouminate_domain::corpus::ensure_corpus_allows_file;
 
+use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
+use super::ladder::LadderOutcome;
 use super::state::{DaemonState, WorkClass};
 
 /// One watched location: the directory handed to `notify`, the corpus that
@@ -172,6 +174,15 @@ pub struct WatcherHandle {
     _debouncer: Box<dyn std::any::Any + Send>,
 }
 
+impl WatcherHandle {
+    /// Await the pump task; used by the supervisor factory so a watcher
+    /// restart rebuilds the whole debouncer + pump pair. Holds `self` (and
+    /// so the debouncer) alive until the pump future completes.
+    pub(crate) async fn join(self) {
+        let _ = self._task.await;
+    }
+}
+
 /// Watch the baseline corpora roots and spawn a task that reindexes changed
 /// markdown files (debounced by `cfg.watch.debounce_ms`). Returns `None` when
 /// there are no watchable roots or the watcher backend fails to initialize —
@@ -268,25 +279,43 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         }
     }
 
+    let churn_warn_at = cfg.daemon.churn_warn_at;
+    let churn_act_at = cfg.daemon.churn_act_at;
     let state = state.clone();
     let shutdown = state.shutdown_token().clone();
     let task = tokio::spawn(async move {
         // Bridge the std mpsc receiver into the async runtime via
         // spawn_blocking-style recv with cancellation. We poll the channel on
         // a blocking thread per wake; simplest correct shape that respects
-        // the shutdown token.
+        // the shutdown token. `recv_timeout` (rather than a third `select!`
+        // arm racing a `tokio::time::sleep`) keeps the blocking task itself
+        // bounded to 60s, so a quiet pump never leaves an orphaned blocking
+        // task holding the `Arc<Mutex<Receiver>>` lock past its own wake wait.
         let wake_rx = std::sync::Arc::new(std::sync::Mutex::new(wake_rx));
         let mut failures = FailureCoalescer::new(failure_reminder, MAX_FAILURE_SIGNATURES);
+        let mut churn = ChurnTracker::new(churn_warn_at, churn_act_at);
         loop {
             let wake_rx_recv = wake_rx.clone();
             let next = tokio::select! {
                 _ = shutdown.cancelled() => break,
                 got = tokio::task::spawn_blocking(move || {
-                    wake_rx_recv.lock().expect("watch wake-rx mutex").recv()
+                    wake_rx_recv
+                        .lock()
+                        .expect("watch wake-rx mutex")
+                        .recv_timeout(Duration::from_secs(60))
                 }) => got,
             };
             match next {
                 Ok(Ok(())) => {}
+                Ok(Err(std::sync::mpsc::RecvTimeoutError::Timeout)) => {
+                    // Quiet pump: no wake arrived within the heartbeat window.
+                    // Bump the watchdog and go back to waiting instead of
+                    // spawning a fresh blocking task every 60s.
+                    state
+                        .heartbeat()
+                        .bump(super::heartbeat::TaskName::WatcherPump);
+                    continue;
+                }
                 // Channel disconnected: the debouncer (and its `wake_tx`) was
                 // dropped, so nothing more will ever arrive. Distinct from the
                 // `shutdown.cancelled()` branch above, which is an expected,
@@ -294,7 +323,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                 // still meant to be serving is worth structured error context
                 // so it shows up in telemetry instead of auto-reindex just
                 // going quiet.
-                Ok(Err(_recv_err)) => {
+                Ok(Err(std::sync::mpsc::RecvTimeoutError::Disconnected)) => {
                     tracing::warn!(
                         target: "hallouminate::daemon",
                         "watcher: event channel disconnected unexpectedly; auto-reindex pump stopping",
@@ -310,12 +339,15 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                     break;
                 }
             }
+            state
+                .heartbeat()
+                .bump(super::heartbeat::TaskName::WatcherPump);
             let paths: Vec<PathBuf> = {
                 let mut set = pending.lock().expect("watch pending-paths mutex");
                 set.drain().collect()
             };
             if !paths.is_empty() {
-                process_change_batch(&state, &roots, paths, &mut failures).await;
+                process_change_batch(&state, &roots, paths, &mut failures, &mut churn).await;
             }
         }
     });
@@ -425,10 +457,11 @@ async fn process_change_batch(
     roots: &[WatchRoot],
     paths: Vec<PathBuf>,
     failures: &mut FailureCoalescer,
+    churn: &mut ChurnTracker,
 ) {
     let _conn = state.enter_connection(WorkClass::Internal);
     for path in &paths {
-        handle_changed_path(state, roots, path, failures).await;
+        handle_changed_path(state, roots, path, failures, churn).await;
     }
     state.touch_activity(WorkClass::Internal);
 }
@@ -440,6 +473,7 @@ async fn handle_changed_path(
     roots: &[WatchRoot],
     path: &Path,
     failures: &mut FailureCoalescer,
+    churn: &mut ChurnTracker,
 ) {
     let Some(owner) = owning_corpus(roots, path) else {
         return;
@@ -495,7 +529,21 @@ async fn handle_changed_path(
         let registry = state.make_registry();
         match index_single_file_with_content(&store, &registry, corpus, path, &bytes, mtime).await {
             Ok(stats) => {
-                state.record_watcher_reindex(stats.files_upserted == 0);
+                let noop = stats.files_upserted == 0;
+                state.record_watcher_reindex(noop);
+                let effect = if noop {
+                    ReindexEffect::NoOp
+                } else {
+                    ReindexEffect::Upserted
+                };
+                if let LadderOutcome::Action(action) = churn.record_reindex(effect, path) {
+                    state.record_ladder_trip(action);
+                    // ForceMaintenance reconciles index state without killing the watcher.
+                    let s = state.clone();
+                    tokio::spawn(async move {
+                        let _ = s.run_maintenance_tick().await;
+                    });
+                }
                 tracing::debug!(
                     target: "hallouminate::daemon",
                     corpus = %corpus.name,
@@ -687,6 +735,12 @@ mod tests {
 
     fn disabled_coalescer() -> FailureCoalescer {
         FailureCoalescer::new(Duration::ZERO, MAX_FAILURE_SIGNATURES)
+    }
+
+    /// High thresholds so tests using this helper never cross warn/act by
+    /// accident; use `ChurnTracker::new` directly to test escalation itself.
+    fn disabled_churn() -> ChurnTracker {
+        ChurnTracker::new(u32::MAX, u32::MAX)
     }
 
     /// Set `path`'s modified time exactly (nanosecond precision), for tests
@@ -927,7 +981,8 @@ mod tests {
         let deleted = corpus_dir.join("gone.md");
 
         let mut failures = disabled_coalescer();
-        process_change_batch(&state, &roots, vec![deleted], &mut failures).await;
+        let mut churn = disabled_churn();
+        process_change_batch(&state, &roots, vec![deleted], &mut failures, &mut churn).await;
         assert_ne!(
             state.last_activity_secs(),
             u64::MAX,
@@ -956,8 +1011,9 @@ mod tests {
             None,
         )];
         let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
 
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 1, 0),
@@ -967,7 +1023,7 @@ mod tests {
         // Same file, unchanged content and mtime: the stage-1 mtime gate
         // (ADR daemon-rework-003) sheds the event before any read — a skip,
         // not a reindex, so no counter moves.
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 1, 0),
@@ -984,11 +1040,113 @@ mod tests {
             .expect("note mtime")
             + Duration::from_millis(10);
         set_mtime(&note, bumped);
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         assert_eq!(
             state.watcher_counters_snapshot(),
             (0, 2, 1),
             "reindexing unchanged content must count as a noop reindex",
+        );
+    }
+
+    /// Churn wiring (G7, wiring task W3): consecutive zero-upsert reindexes
+    /// driven through `handle_changed_path` must trip the act-tier ladder —
+    /// recorded via `state.record_ladder_trip` as `ForceMaintenance` — and a
+    /// real upsert must reset the streak. Once-per-streak refire suppression
+    /// is pinned at unit level in churn.rs; this pins the wiring: config
+    /// thresholds → tracker → `LadderOutcome::Action` arm → trip snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn consecutive_noop_reindexes_trip_force_maintenance_and_reset_on_upsert() {
+        use super::super::ladder::LadderAction;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = crate::config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        cfg.daemon.churn_warn_at = 2;
+        cfg.daemon.churn_act_at = 3;
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let note = corpus_dir.join("note.md");
+        std::fs::write(&note, "# Note\n\nbody\n").expect("write note");
+
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        let mut failures = disabled_coalescer();
+        // Mirrors the pump construction in `spawn_corpus_watcher`: thresholds
+        // come from the baseline daemon config, not test-local constants.
+        let baseline = state.baseline();
+        let mut churn =
+            ChurnTracker::new(baseline.daemon.churn_warn_at, baseline.daemon.churn_act_at);
+
+        // A noop reindex = mtime moved (passes the stage-1 gate) but content
+        // unchanged (indexer hash fast path upserts nothing).
+        let bump_mtime = |path: &Path| {
+            let bumped = std::fs::metadata(path)
+                .expect("stat")
+                .modified()
+                .expect("mtime")
+                + Duration::from_millis(10);
+            set_mtime(path, bumped);
+        };
+
+        // Initial index: a real upsert; no trip.
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        assert_eq!(
+            state.last_ladder_trip(),
+            None,
+            "a real upsert must not trip the ladder",
+        );
+
+        // Two noops: streak 2 < act_at 3 — warn tier at most, no trip.
+        for _ in 0..2 {
+            bump_mtime(&note);
+            handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        }
+        assert_eq!(
+            state.last_ladder_trip(),
+            None,
+            "a noop streak below act_at must not trip the ladder",
+        );
+
+        // A real upsert (content rewritten) must reset the streak...
+        std::fs::write(&note, "# Note\n\nrewritten body\n").expect("rewrite note");
+        bump_mtime(&note);
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+
+        // ...so two more noops stay below the threshold. Without the reset
+        // the streak would be 4 >= act_at 3 here and this assertion fails.
+        for _ in 0..2 {
+            bump_mtime(&note);
+            handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        }
+        assert_eq!(
+            state.last_ladder_trip(),
+            None,
+            "a real upsert must reset the noop streak; a trip here means reset-on-upsert is broken",
+        );
+
+        // Third consecutive noop reaches act_at: the act-tier trip is
+        // recorded as ForceMaintenance.
+        bump_mtime(&note);
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        let trip = state
+            .last_ladder_trip()
+            .expect("act threshold reached: the trip must be recorded on state");
+        match trip.action {
+            LadderAction::ForceMaintenance => {}
+            other => panic!("churn escalation must force maintenance, got {other:?}"),
+        }
+        assert_eq!(
+            state.watcher_counters_snapshot(),
+            (0, 7, 5),
+            "2 real + 5 noop reindexes must be counted (events stay 0: driven \
+             directly, not through the pump)",
         );
     }
 
@@ -1022,7 +1180,8 @@ mod tests {
             None,
         )];
         let mut failures = disabled_coalescer();
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        let mut churn = disabled_churn();
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
 
         let file_ref = canonicalize_or_passthrough(&note)
             .as_path()
@@ -1042,7 +1201,7 @@ mod tests {
             .expect("rewrite note");
         set_mtime(&note, indexed_mtime);
 
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
 
         assert_eq!(
             state.watcher_counters_snapshot(),
@@ -1107,7 +1266,8 @@ mod tests {
 
         // Baseline: the real file indexes and lands a snapshot row.
         let mut failures = disabled_coalescer();
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        let mut churn = disabled_churn();
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         let good = state
             .store()
             .get_file_snapshot("wiki", &file_ref)
@@ -1124,7 +1284,7 @@ mod tests {
         std::fs::remove_file(&note).expect("rm note");
         std::os::unix::fs::symlink(&secret, &note).expect("symlink note -> secret");
 
-        handle_changed_path(&state, &roots, &note, &mut failures).await;
+        handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
 
         // The reindex through the symlink must have been rejected. Vulnerable
         // code would `canonicalize` the in-corpus path (following the symlink)

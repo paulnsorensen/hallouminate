@@ -101,5 +101,25 @@ pub(super) static OBSERVED_HARD_COORD: tokio::sync::RwLock<()> = tokio::sync::Rw
 /// matters: debt only grows through mutations, and every mutation refreshes
 /// the observation via `backpressure`.
 pub(super) fn level() -> DebtLevel {
+    #[cfg(test)]
+    if let Some(level) = TEST_LEVEL.with(std::cell::Cell::get) {
+        return level;
+    }
     OBSERVED.level()
+}
+
+// Test-only override for `level()`, isolated per OS thread since Rust's
+// default test harness reuses threads across sequential tests. Callers
+// MUST reset to `None` (an RAII guard, mirroring `maintenance.rs`'s test
+// module) so the override doesn't leak into the next test scheduled on the
+// same thread. `None` (the default) falls through to `OBSERVED.level()`
+// unchanged, so existing tests that never call this are unaffected.
+#[cfg(test)]
+thread_local! {
+    static TEST_LEVEL: std::cell::Cell<Option<DebtLevel>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn set_test_level(level: Option<DebtLevel>) {
+    TEST_LEVEL.with(|cell| cell.set(level));
 }
