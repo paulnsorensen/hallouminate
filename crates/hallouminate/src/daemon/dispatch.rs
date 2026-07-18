@@ -2808,8 +2808,9 @@ mod tests {
 
         let store_dir = tempfile::tempdir().unwrap();
         let corpus_dir = tempfile::tempdir().unwrap();
-        let file = corpus_dir.path().join("note.md");
-        let corpus = md_corpus_at(corpus_dir.path());
+        let corpus_dir = corpus_dir.path().canonicalize().unwrap();
+        let file = corpus_dir.join("note.md");
+        let corpus = md_corpus_at(&corpus_dir);
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
         let file_ref = canonicalize_or_passthrough(&file)
@@ -2870,8 +2871,9 @@ mod tests {
 
         let store_dir = tempfile::tempdir().unwrap();
         let corpus_dir = tempfile::tempdir().unwrap();
-        let file = corpus_dir.path().join("note.md");
-        let corpus = md_corpus_at(corpus_dir.path());
+        let corpus_dir = corpus_dir.path().canonicalize().unwrap();
+        let file = corpus_dir.join("note.md");
+        let corpus = md_corpus_at(&corpus_dir);
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
         let file_ref = canonicalize_or_passthrough(&file)
