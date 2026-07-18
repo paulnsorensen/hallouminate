@@ -254,11 +254,14 @@ impl Supervisor {
 }
 
 /// Backoff for the nth consecutive quick panic: floor doubling to the cap.
+/// Thin `Duration` adapter over the shared [`super::backoff`] curve, pinned to
+/// this module's `BACKOFF_FLOOR`/`BACKOFF_CAP`.
 fn backoff_for(consecutive: u32) -> Duration {
-    let exponent = consecutive.saturating_sub(1).min(6);
-    BACKOFF_FLOOR
-        .saturating_mul(1u32 << exponent)
-        .min(BACKOFF_CAP)
+    Duration::from_secs(super::backoff::exponential_backoff_secs(
+        BACKOFF_FLOOR.as_secs(),
+        BACKOFF_CAP.as_secs(),
+        consecutive,
+    ))
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
