@@ -455,11 +455,15 @@ impl DaemonState {
         lifecycle.write_lane_acquired();
         let maintenance = maintain(lifecycle.maintenance_id);
         tokio::pin!(maintenance);
-        let (result, shutdown_requested) = tokio::select! {
-            biased;
-            result = &mut maintenance => (result, false),
-            _ = shutdown.cancelled() => {
-                (maintenance.await, true)
+        let mut bump_interval = tokio::time::interval(Duration::from_secs(60));
+        let (result, shutdown_requested) = loop {
+            tokio::select! {
+                biased;
+                result = &mut maintenance => break (result, false),
+                _ = shutdown.cancelled() => break (maintenance.await, true),
+                _ = bump_interval.tick() => {
+                    self.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+                }
             }
         };
         if shutdown_requested {
@@ -983,6 +987,45 @@ mod tests {
 
         cancel.cancel();
         task.await.expect("maintenance_loop task");
+    }
+
+    /// HIGH-3 (mid-pass gap): `maintain` itself can run past
+    /// `watchdog_stall_secs` (e.g. a slow compaction). The tick must keep
+    /// bumping the epoch while `maintain` is in flight, not just around it.
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_epoch_advances_at_least_every_60s_during_a_long_pass() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                state
+                    .run_maintenance_tick_with(|_id| async {
+                        tokio::time::sleep(Duration::from_secs(600)).await;
+                        Ok(stats(Some(0)))
+                    })
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let mut previous = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::Maintenance);
+        for _ in 0..9 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let current = state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::Maintenance);
+            assert!(
+                current > previous,
+                "Maintenance epoch must advance at least every 60s during a long pass"
+            );
+            previous = current;
+        }
+
+        let tick = task.await.expect("maintenance tick task");
+        assert_eq!(tick, MaintenanceTick::Continue);
     }
 
     /// RAII guard for `debt::set_test_level`: resets to `None` on drop so

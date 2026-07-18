@@ -222,22 +222,38 @@ fn spawn_idle_exit(state: &DaemonState, idle_exit_secs: u64) {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(secs)) => {
-                        state.heartbeat().bump(TaskName::IdleExit);
-                        if state.should_idle_exit(idle_exit_secs) {
-                            tracing::info!(
-                                target: "hallouminate::daemon",
-                                idle_secs = idle_exit_secs,
-                                "daemon idle-exit; exiting so the OS reclaims all memory",
-                            );
-                            state.shutdown_token().cancel();
-                            break;
-                        }
-                    }
+                    _ = sleep_with_idle_heartbeat(&state, Duration::from_secs(secs)) => {}
+                }
+                state.heartbeat().bump(TaskName::IdleExit);
+                if state.should_idle_exit(idle_exit_secs) {
+                    tracing::info!(
+                        target: "hallouminate::daemon",
+                        idle_secs = idle_exit_secs,
+                        "daemon idle-exit; exiting so the OS reclaims all memory",
+                    );
+                    state.shutdown_token().cancel();
+                    break;
                 }
             }
         }
     });
+}
+
+/// Chunks the IdleExit sleep in ≤60s steps, bumping the heartbeat between
+/// chunks so an active daemon's IdleExit epoch stays well inside the
+/// default 300s watchdog stall window even at the default 900s
+/// `idle_exit_secs` -- otherwise a busy daemon that never idle-exits would
+/// self-abort ~`watchdog_stall_secs` after the watchdog arms. Mirrors
+/// `sleep_with_heartbeat` (maintenance.rs).
+async fn sleep_with_idle_heartbeat(state: &DaemonState, total: Duration) {
+    const CHUNK: Duration = Duration::from_secs(60);
+    let mut remaining = total;
+    while remaining > CHUNK {
+        tokio::time::sleep(CHUNK).await;
+        state.heartbeat().bump(TaskName::IdleExit);
+        remaining -= CHUNK;
+    }
+    tokio::time::sleep(remaining).await;
 }
 
 /// Self-arming watchdog start (ADR daemon-rework-005). A task joins the
@@ -252,9 +268,10 @@ fn spawn_idle_exit(state: &DaemonState, idle_exit_secs: u64) {
 /// keyed on periodic heartbeats would always false-trip them.
 /// Fire-and-forget, tied to the daemon shutdown token, so it never blocks
 /// socket accept and tears down cleanly even mid-arming.
-/// Known accepted gap: a fully-idle WatcherPump (no filesystem events for
-/// the stall window) still looks identical to "stalled" once armed; the
-/// wiring cadence pass (W2/W3) closes this before release.
+/// WatcherPump's `recv_timeout(60s)` (watch.rs) and IdleExit's chunked
+/// sleep (`sleep_with_idle_heartbeat`, above) both bump their heartbeat well
+/// inside the default 300s stall window even on a fully-idle/active daemon,
+/// so neither false-trips once armed.
 fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) {
     let daemon = &state.baseline().daemon;
     let stall_secs = daemon.watchdog_stall_secs;
@@ -920,5 +937,42 @@ mod tests {
         // lock never becomes acquirable and exhausts the budget below.
         let replacement = acquire_released_lock(&lock_path);
         drop(replacement);
+    }
+
+    /// PR #270 cure (correctness:blocker): on an active daemon that never
+    /// idle-exits, `secs_until_idle` returns up to `idle_exit_secs` (900s
+    /// default) every iteration, so a single unchunked sleep would starve
+    /// IdleExit's heartbeat well past `watchdog_stall_secs` (300s default)
+    /// and the watchdog would `abort()` a healthy daemon. The chunked sleep
+    /// must keep the epoch moving at least every 60s regardless.
+    #[tokio::test(start_paused = true)]
+    async fn idle_exit_epoch_advances_at_least_every_60s_during_a_long_sleep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let sleep_task = tokio::spawn({
+            let state = state.clone();
+            async move {
+                sleep_with_idle_heartbeat(&state, Duration::from_secs(900)).await;
+            }
+        });
+        tokio::task::yield_now().await;
+
+        let mut previous = state.heartbeat().epoch(TaskName::IdleExit);
+        for _ in 0..14 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            tokio::task::yield_now().await;
+            let current = state.heartbeat().epoch(TaskName::IdleExit);
+            assert!(
+                current > previous,
+                "IdleExit epoch must advance at least every 60s during a long idle-exit sleep"
+            );
+            previous = current;
+        }
+
+        sleep_task.await.expect("idle-exit sleep task");
     }
 }
