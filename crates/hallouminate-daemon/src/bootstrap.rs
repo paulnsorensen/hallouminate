@@ -1,7 +1,7 @@
 //! Daemon auto-spawn for the MCP `serve` command.
 //!
 //! `ground` / `index` / etc. deliberately fail loudly when the daemon is
-//! unreachable (see `mod.rs`) — interactive users get a clear "start the
+//! unreachable (see `lib.rs`) — interactive users get a clear "start the
 //! daemon" hint. The MCP transport (`hallouminate serve`) is non-interactive:
 //! the caller is Claude Code or another MCP host, and the user does not see
 //! daemon-bootstrap errors. So `serve` auto-spawns a daemon on first launch.

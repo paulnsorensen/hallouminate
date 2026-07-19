@@ -1,9 +1,10 @@
 # Publishes the workspace crates to crates.io on a version tag.
 # Runs alongside release.yml (dist), which builds the GitHub Release binaries.
 #
-# Normal releases use crates.io Trusted Publishing (OIDC). The two library
-# crates must exist before crates.io can attach trusted publishers; use the
-# manual bootstrap job once, as documented in docs/src/releasing.md.
+# Normal releases use crates.io Trusted Publishing (OIDC). A library crate
+# must exist before crates.io can attach a trusted publisher; bootstrap each
+# not-yet-published crate once via the manual job, as documented in
+# docs/src/releasing.md.
 name: publish-crates
 
 on:
@@ -13,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       bootstrap:
-        description: "Publish the first hallouminate-domain/adapters releases with CRATES_IO_TOKEN"
+        description: "Publish first releases of not-yet-published library crates (currently config/daemon) with CRATES_IO_TOKEN"
         required: true
         type: boolean
         default: false
@@ -63,6 +64,10 @@ jobs:
           publish_if_missing hallouminate-domain https://index.crates.io/ha/ll/hallouminate-domain
           wait_for_index hallouminate-domain https://index.crates.io/ha/ll/hallouminate-domain
           publish_if_missing hallouminate-adapters https://index.crates.io/ha/ll/hallouminate-adapters
+          wait_for_index hallouminate-adapters https://index.crates.io/ha/ll/hallouminate-adapters
+          publish_if_missing hallouminate-config https://index.crates.io/ha/ll/hallouminate-config
+          wait_for_index hallouminate-config https://index.crates.io/ha/ll/hallouminate-config
+          publish_if_missing hallouminate-daemon https://index.crates.io/ha/ll/hallouminate-daemon
 
   publish:
     if: github.event_name == 'push'
@@ -114,4 +119,8 @@ jobs:
           wait_for_index hallouminate-domain https://index.crates.io/ha/ll/hallouminate-domain
           publish_if_missing hallouminate-adapters https://index.crates.io/ha/ll/hallouminate-adapters
           wait_for_index hallouminate-adapters https://index.crates.io/ha/ll/hallouminate-adapters
+          publish_if_missing hallouminate-config https://index.crates.io/ha/ll/hallouminate-config
+          wait_for_index hallouminate-config https://index.crates.io/ha/ll/hallouminate-config
+          publish_if_missing hallouminate-daemon https://index.crates.io/ha/ll/hallouminate-daemon
+          wait_for_index hallouminate-daemon https://index.crates.io/ha/ll/hallouminate-daemon
           publish_if_missing hallouminate https://index.crates.io/ha/ll/hallouminate

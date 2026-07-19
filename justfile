@@ -82,7 +82,7 @@ prepare-release version:
         if in_workspace_package and not version_set and line.startswith("version = "):
             lines[index] = f'version = "{version}"'
             version_set = True
-        if re.match(r"hallouminate-(domain|adapters) = ", line):
+        if re.match(r"hallouminate-(domain|adapters|config|daemon) = ", line):
             lines[index] = re.sub(r'version = "[^"]*"', f'version = "{version}"', line)
     if not version_set:
         raise SystemExit("Cargo.toml [workspace.package].version not found")
