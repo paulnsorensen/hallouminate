@@ -15,8 +15,8 @@ use super::debt::{self, DebtLevel};
 use super::pressure::IoPressureProbe;
 use super::state::DaemonState;
 use super::state::WorkClass;
-use crate::config::DaemonConfig;
 use hallouminate_adapters::{MaintenanceOptions, MaintenanceStats};
+use hallouminate_config::DaemonConfig;
 use hallouminate_domain::common::HallouminateError;
 
 /// Grace window for `maintain`'s prune cutoff: versions younger than this
@@ -481,7 +481,7 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use hallouminate_config::Config;
     use std::collections::HashMap;
     use std::fmt;
     use std::sync::Mutex;

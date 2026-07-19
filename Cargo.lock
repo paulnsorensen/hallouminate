@@ -2867,13 +2867,11 @@ dependencies = [
  "chrono",
  "clap",
  "directories",
- "fastrand",
  "file-rotate",
  "hallouminate-adapters",
+ "hallouminate-config",
+ "hallouminate-daemon",
  "hallouminate-domain",
- "libc",
- "notify",
- "notify-debouncer-full",
  "rmcp",
  "rust_xlsxwriter",
  "rustix",
@@ -2881,11 +2879,9 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml_ng",
- "shellexpand",
  "tempfile",
  "text-splitter",
  "tokio",
- "tokio-util",
  "toml",
  "tracing",
  "tracing-appender",
@@ -2913,6 +2909,43 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "hallouminate-config"
+version = "0.4.1"
+dependencies = [
+ "hallouminate-domain",
+ "serde",
+ "shellexpand",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
+name = "hallouminate-daemon"
+version = "0.4.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "fastrand",
+ "hallouminate-adapters",
+ "hallouminate-config",
+ "hallouminate-domain",
+ "libc",
+ "notify",
+ "notify-debouncer-full",
+ "rustix",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tempfile",
+ "text-splitter",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

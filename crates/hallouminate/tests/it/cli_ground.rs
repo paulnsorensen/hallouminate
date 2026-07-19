@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use hallouminate::cli::{GroundArgs, IndexArgs, cmd_index, run_ground};
-use hallouminate::config::Config;
-use hallouminate::daemon::{
+use hallouminate_config::Config;
+use hallouminate_daemon::{
     CorpusEntry, DaemonRequest, DaemonRequestPayload, DaemonResponse, ListCorporaResult, connect_at,
 };
 
@@ -273,7 +273,7 @@ globs = ["**/*.md"]
 /// `cwd` so the dispatcher can run repo-config discovery against the chosen
 /// directory. Pulls the typed payload out of `DaemonResponse::Ok`.
 async fn list_corpora_at(
-    client: &hallouminate::daemon::DaemonClient,
+    client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
 ) -> ListCorporaResult {
     let resp = client

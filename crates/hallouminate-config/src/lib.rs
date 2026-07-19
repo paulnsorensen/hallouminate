@@ -1,3 +1,4 @@
+pub mod xdg;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};

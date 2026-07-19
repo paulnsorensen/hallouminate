@@ -8,7 +8,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::config::DaemonConfig;
+use hallouminate_config::DaemonConfig;
 
 /// Real debt signals behind a `DebtLevel` classification, read from
 /// `LanceStore::debt()` by `backpressure`'s mutation gate.

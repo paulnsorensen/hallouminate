@@ -34,8 +34,8 @@ use super::pressure::NoPressureSignal;
 #[cfg(target_os = "linux")]
 use super::pressure::PsiProbe;
 
-use crate::config::Config;
 use hallouminate_adapters::{EmbedBatch, Embedder, FastembedCrossencoder, LanceStore};
+use hallouminate_config::Config;
 use hallouminate_domain::common::{HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
@@ -499,7 +499,7 @@ impl DaemonState {
         // field still parses; warn when it was set to a non-default value so
         // operators migrate to `[daemon].idle_exit_secs`.
         if cfg.embeddings.idle_evict_secs
-            != crate::config::EmbeddingsConfig::default().idle_evict_secs
+            != hallouminate_config::EmbeddingsConfig::default().idle_evict_secs
         {
             tracing::warn!(
                 target: "hallouminate::daemon",
@@ -2517,7 +2517,7 @@ mod tests {
     async fn maintenance_loop_warns_after_eleven_consecutive_defers() {
         // Shared OBSERVED slot: an ambient Hard recorded by a concurrent
         // test would skip the defer path this test asserts on.
-        let _coord = crate::daemon::debt::OBSERVED_HARD_COORD.read().await;
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
         let state = test_state().await;
         let _conn = state.enter_connection(WorkClass::External);
         let capture = EventCapture::default();

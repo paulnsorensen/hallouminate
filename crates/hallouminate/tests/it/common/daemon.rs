@@ -11,8 +11,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hallouminate::config::Config;
-use hallouminate::daemon::{
+use hallouminate_config::Config;
+use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, DaemonState, IDLE_READ_TIMEOUT, connect_at,
     serve_with_idle_timeout,
 };

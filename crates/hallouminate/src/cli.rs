@@ -13,10 +13,9 @@ pub use config::{
     cmd_config_init, cmd_config_show, cmd_config_validate,
 };
 pub use ground::{GroundArgs, cmd_ground, run_ground};
+pub use hallouminate_daemon::{CorpusReport, IndexReport};
 pub use hook::{HookArgs, cmd_hook_install, cmd_hook_uninstall};
-pub use index::{
-    AD_HOC_CORPUS_NAME, CorpusReport, IndexArgs, IndexReport, cmd_index, run_index, select_corpora,
-};
+pub use index::{AD_HOC_CORPUS_NAME, IndexArgs, cmd_index, run_index, select_corpora};
 pub use init_repo::{InitRepoArgs, cmd_init_repo};
 
 /// CLI surface for output format selection. Mirrors `domain::ground::Format`
@@ -131,7 +130,7 @@ pub enum DaemonAction {
     Status,
 }
 
-impl From<DaemonCli> for crate::daemon::DaemonArgs {
+impl From<DaemonCli> for hallouminate_daemon::DaemonArgs {
     fn from(cli: DaemonCli) -> Self {
         Self { config: cli.config }
     }
@@ -282,7 +281,7 @@ pub enum ConfigAction {
     },
 }
 
-pub async fn dispatch(cli: Cli, startup: crate::config::Config) -> anyhow::Result<()> {
+pub async fn dispatch(cli: Cli, startup: hallouminate_config::Config) -> anyhow::Result<()> {
     match cli.command {
         Command::Index(args) => cmd_index(args.into()).await,
         Command::Ground(args) => cmd_ground(args.into()).await,
@@ -300,29 +299,29 @@ pub async fn dispatch(cli: Cli, startup: crate::config::Config) -> anyhow::Resul
             }
         },
         Command::Serve => {
-            crate::daemon::ensure_daemon_running().await?;
+            hallouminate_daemon::ensure_daemon_running().await?;
             crate::mcp::serve_stdio().await
         }
         Command::Daemon(args) => {
             let action = args.action.clone().unwrap_or(DaemonAction::Run);
             match action {
-                DaemonAction::Run => crate::daemon::run_daemon(startup, args.into()).await,
+                DaemonAction::Run => hallouminate_daemon::run_daemon(startup, args.into()).await,
                 DaemonAction::Stop => {
-                    crate::daemon::stop().await?;
+                    hallouminate_daemon::stop().await?;
                     println!("daemon stopped");
                     Ok(())
                 }
                 DaemonAction::Restart => {
-                    crate::daemon::restart().await?;
+                    hallouminate_daemon::restart().await?;
                     println!("daemon restarted");
                     Ok(())
                 }
                 DaemonAction::Status => {
-                    match crate::daemon::status().await? {
-                        crate::daemon::DaemonStatus::Running(report) => {
+                    match hallouminate_daemon::status().await? {
+                        hallouminate_daemon::DaemonStatus::Running(report) => {
                             print!("{}", render_status_report(&report));
                         }
-                        crate::daemon::DaemonStatus::NotRunning => println!("not running"),
+                        hallouminate_daemon::DaemonStatus::NotRunning => println!("not running"),
                     }
                     Ok(())
                 }
@@ -331,13 +330,13 @@ pub async fn dispatch(cli: Cli, startup: crate::config::Config) -> anyhow::Resul
     }
 }
 
-/// Render a daemon [`StatusReport`](crate::daemon::StatusReport) for
+/// Render a daemon [`StatusReport`](hallouminate_daemon::StatusReport) for
 /// `daemon status`: one line per fact, every wire field represented —
 /// per-task states, debt level, defer count, watcher counters (including
 /// noop_reindexes), and the last ladder trip. Names match the wire's
 /// snake_case so log greps and the JSON payload agree.
-fn render_status_report(report: &crate::daemon::StatusReport) -> String {
-    use crate::daemon::{DebtLevel, LadderAction, TaskName, TaskState, TripState};
+fn render_status_report(report: &hallouminate_daemon::StatusReport) -> String {
+    use hallouminate_daemon::{DebtLevel, LadderAction, TaskName, TaskState, TripState};
     use std::fmt::Write as _;
 
     fn task_name(task: TaskName) -> &'static str {
@@ -535,7 +534,7 @@ mod tests {
         match cli.command {
             Command::Daemon(args) => {
                 assert!(args.config.is_none(), "--config defaults to None");
-                let inner: crate::daemon::DaemonArgs = args.into();
+                let inner: hallouminate_daemon::DaemonArgs = args.into();
                 assert!(inner.config.is_none());
             }
             _ => panic!("wrong variant"),
@@ -771,7 +770,7 @@ mod tests {
         // per-task states, debt, defer count, watcher counters (including
         // noop_reindexes), and trip state — a field silently dropped by the
         // renderer would pass type-check but break the criterion.
-        use crate::daemon::{
+        use hallouminate_daemon::{
             DebtLevel, LadderAction, StatusReport, TaskName, TaskState, TaskStatus, TripState,
             WatcherCounters,
         };
@@ -821,7 +820,7 @@ mod tests {
         // empty and no trip has been recorded — the renderer must say so
         // explicitly rather than omit the sections (silent omission would be
         // indistinguishable from a rendering bug).
-        use crate::daemon::{DebtLevel, StatusReport, TripState, WatcherCounters};
+        use hallouminate_daemon::{DebtLevel, StatusReport, TripState, WatcherCounters};
         let report = StatusReport {
             per_task: Vec::new(),
             debt: DebtLevel::Ok,

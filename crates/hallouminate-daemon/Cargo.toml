@@ -1,0 +1,33 @@
+[package]
+name = "hallouminate-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Daemon layer for hallouminate."
+
+[dependencies]
+hallouminate-domain.workspace = true
+hallouminate-adapters.workspace = true
+hallouminate-config.workspace = true
+tokio.workspace = true
+tokio-util = "0.7"
+notify = "8"
+notify-debouncer-full = "0.7"
+rustix.workspace = true
+libc = "0.2"
+fastrand = "2"
+shellexpand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing = "0.1"
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util"] }
+text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

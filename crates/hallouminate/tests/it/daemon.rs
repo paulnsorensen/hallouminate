@@ -15,8 +15,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hallouminate::config::Config;
-use hallouminate::daemon::{
+use hallouminate_config::Config;
+use hallouminate_daemon::{
     AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest, DaemonRequestPayload,
     DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult,
     IndexRequest, LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest,
@@ -1307,7 +1307,7 @@ ground_dir = "{g}"
     let response = client
         .call_raw(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(hallouminate::daemon::IndexRequest {
+            payload: DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
                 strict: false,
@@ -1815,7 +1815,7 @@ async fn client_for_default_socket_respawns_exactly_once_then_fails_loudly() {
 
     let respawns = Arc::new(AtomicUsize::new(0));
     let respawns_ref = Arc::clone(&respawns);
-    let result = hallouminate::daemon::client_for_with(None, || {
+    let result = hallouminate_daemon::client_for_with(None, || {
         respawns_ref.fetch_add(1, Ordering::SeqCst);
         async { anyhow::Ok(()) }
     })
@@ -1859,7 +1859,7 @@ async fn client_for_default_socket_respawns_then_returns_the_reconnected_client(
     let holder_ref = Arc::clone(&listener_holder);
     let sock_ref = sock.clone();
 
-    let result = hallouminate::daemon::client_for_with(None, move || async move {
+    let result = hallouminate_daemon::client_for_with(None, move || async move {
         respawns_ref.fetch_add(1, Ordering::SeqCst);
         let listener = tokio::net::UnixListener::bind(&sock_ref)?;
         *holder_ref.lock().unwrap() = Some(listener);
@@ -1996,11 +1996,11 @@ async fn status_reports_running_then_not_running_across_shutdown() {
     // the full report — per-task states, debt, defer count, watcher counters
     // including noop_reindexes, and trip state — from DaemonState storage.
     // A fresh daemon has recorded nothing, so every field is default-shaped.
-    match hallouminate::daemon::status()
+    match hallouminate_daemon::status()
         .await
         .expect("status ok while running")
     {
-        hallouminate::daemon::DaemonStatus::Running(report) => {
+        hallouminate_daemon::DaemonStatus::Running(report) => {
             assert_eq!(
                 report.per_task.len(),
                 5,
@@ -2014,14 +2014,14 @@ async fn status_reports_running_then_not_running_across_shutdown() {
             assert_eq!(report.defer_count, 0);
             assert_eq!(
                 report.watcher,
-                hallouminate::daemon::WatcherCounters::default()
+                hallouminate_daemon::WatcherCounters::default()
             );
             match report.trips {
-                hallouminate::daemon::TripState::None => {}
+                hallouminate_daemon::TripState::None => {}
                 other => panic!("fresh daemon must report no ladder trip, got {other:?}"),
             }
         }
-        hallouminate::daemon::DaemonStatus::NotRunning => {
+        hallouminate_daemon::DaemonStatus::NotRunning => {
             panic!("status must be Running against a live daemon")
         }
     }
@@ -2040,11 +2040,11 @@ async fn status_reports_running_then_not_running_across_shutdown() {
         .expect("join ok");
     served.expect("serve Ok on shutdown");
 
-    match hallouminate::daemon::status()
+    match hallouminate_daemon::status()
         .await
         .expect("status ok while stopped")
     {
-        hallouminate::daemon::DaemonStatus::NotRunning => {}
+        hallouminate_daemon::DaemonStatus::NotRunning => {}
         other => panic!("status must be NotRunning once the socket is gone, got {other:?}"),
     }
 }
@@ -2059,7 +2059,7 @@ async fn stop_is_a_noop_against_an_already_stopped_daemon() {
     let socket = tmp.path().join("never-bound.sock");
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
 
-    hallouminate::daemon::stop()
+    hallouminate_daemon::stop()
         .await
         .expect("stop against a stopped daemon must be Ok");
     assert!(
@@ -2103,7 +2103,7 @@ async fn status_surfaces_daemon_error_response_as_err_not_not_running() {
     });
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
 
-    let err = hallouminate::daemon::status().await.expect_err(
+    let err = hallouminate_daemon::status().await.expect_err(
         "an answering daemon that returns an error envelope must surface Err, not NotRunning",
     );
     assert!(
@@ -2164,11 +2164,11 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     // First daemon up and reachable.
     let first = spawn_serve(cfg.clone(), &socket).await;
     unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &socket) };
-    match hallouminate::daemon::status()
+    match hallouminate_daemon::status()
         .await
         .expect("status ok while first daemon runs")
     {
-        hallouminate::daemon::DaemonStatus::Running(_) => {}
+        hallouminate_daemon::DaemonStatus::Running(_) => {}
         other => panic!("the first daemon must be reachable before restart, got {other:?}"),
     }
 
@@ -2181,13 +2181,13 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
         std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let stash = second_handle.clone();
-    hallouminate::daemon::restart_with(|| async move {
+    hallouminate_daemon::restart_with(|| async move {
         // After restart's stop(), nothing must answer on the socket.
-        match hallouminate::daemon::status()
+        match hallouminate_daemon::status()
             .await
             .expect("status ok between stop and respawn")
         {
-            hallouminate::daemon::DaemonStatus::NotRunning => {}
+            hallouminate_daemon::DaemonStatus::NotRunning => {}
             other => panic!("restart must stop the old daemon before respawning, got {other:?}"),
         }
         let handle = spawn_serve(restarted_cfg, &restart_socket).await;
@@ -2205,11 +2205,11 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
     first_result.expect("first serve returns Ok on shutdown");
 
     // The freshly respawned daemon must be reachable.
-    match hallouminate::daemon::status()
+    match hallouminate_daemon::status()
         .await
         .expect("status ok after restart")
     {
-        hallouminate::daemon::DaemonStatus::Running(_) => {}
+        hallouminate_daemon::DaemonStatus::Running(_) => {}
         other => panic!("restart must leave a fresh, reachable daemon up, got {other:?}"),
     }
 
@@ -2257,7 +2257,7 @@ async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
         std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<()>>>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let stash_inner = stash.clone();
-    hallouminate::daemon::restart_with(|| async move {
+    hallouminate_daemon::restart_with(|| async move {
         let handle = spawn_serve(restarted_cfg, &restart_socket).await;
         *stash_inner.lock().expect("stash lock") = Some(handle);
         Ok(())
@@ -2368,11 +2368,11 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     )
     .expect("write watched file");
 
-    let ground_hits = |client: hallouminate::daemon::DaemonClient, cwd: PathBuf| async move {
-        let res: hallouminate::daemon::GroundResult = client
+    let ground_hits = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let res: hallouminate_daemon::GroundResult = client
             .call(DaemonRequest {
                 cwd,
-                payload: DaemonRequestPayload::Ground(hallouminate::daemon::GroundRequest {
+                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
                     query: "rarespiceword".into(),
                     corpus: Some("docs".into()),
                     top_files: None,
@@ -2691,7 +2691,7 @@ async fn index_skips_missing_corpus_root_and_indexes_the_rest() {
     let resp = client
         .call_raw(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(hallouminate::daemon::IndexRequest {
+            payload: DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
                 corpus: None,
                 paths_from: None,
                 strict: false,
@@ -2753,7 +2753,7 @@ async fn index_strict_aborts_on_missing_corpus_root() {
     let resp = client
         .call_raw(DaemonRequest {
             cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(hallouminate::daemon::IndexRequest {
+            payload: DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
                 corpus: None,
                 paths_from: None,
                 strict: true,
@@ -3811,7 +3811,7 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
     // sends its request line stays "in-flight" (blocked on `read_line`)
     // until the per-connection idle timeout elapses, giving us a real
     // in-flight handler without any test-only injection seam.
-    use hallouminate::daemon::serve_with_idle_timeout;
+    use hallouminate_daemon::serve_with_idle_timeout;
     use tokio::net::UnixStream;
 
     let tmp = tempfile::tempdir().expect("tempdir");

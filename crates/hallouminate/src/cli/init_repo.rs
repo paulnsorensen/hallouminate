@@ -77,7 +77,7 @@ pub fn cmd_init_repo(args: InitRepoArgs) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    use crate::config::{Config, resolve_for_cwd};
+    use hallouminate_config::{Config, resolve_for_cwd};
 
     fn init(name: &str, root: &std::path::Path, force: bool) -> anyhow::Result<()> {
         cmd_init_repo(InitRepoArgs {

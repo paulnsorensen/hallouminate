@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 
-use crate::config::{self, Config, ResolvedLayers, xdg_config_path};
 use hallouminate_adapters::{Embedder, FastembedCrossencoder};
+use hallouminate_config::{self, Config, ResolvedLayers, xdg_config_path};
 use hallouminate_domain::common::{canonicalize_or_passthrough, expand_tilde};
 use hallouminate_domain::corpus::load_tokenizer;
 
@@ -107,17 +107,16 @@ pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
 }
 
 pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
-    let baseline = config::load_xdg(args.config.as_deref())?;
+    let baseline = hallouminate_config::load_xdg(args.config.as_deref())?;
     let baseline_src = baseline_source_path(args.config.as_deref());
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let (effective, layers) =
-        config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref())).map_err(
-            |e| {
+        hallouminate_config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref()))
+            .map_err(|e| {
                 // Repo-config discovery failure: format the same "baseline: ... / repo: not found"
                 // header before the error so `show` and `validate` produce a consistent failure mode.
                 anyhow!(format_no_repo_error(&baseline_src, &cwd, &e))
-            },
-        )?;
+            })?;
     print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
     if let Some(advisory) = layers
@@ -134,7 +133,7 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
 }
 
 pub fn cmd_config_download(args: ConfigDownloadArgs) -> anyhow::Result<()> {
-    let cfg = config::load(args.config.as_deref())?;
+    let cfg = hallouminate_config::load(args.config.as_deref())?;
     let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
     // The tokenizer is always needed (chunking uses it regardless of mode).
     let _tokenizer = load_tokenizer(&cfg.embeddings.model)
@@ -171,18 +170,21 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(anyhow!("read {}: {e}", resolved.display())),
     };
-    let baseline = config::load_xdg(args.config.as_deref())
+    let baseline = hallouminate_config::load_xdg(args.config.as_deref())
         .with_context(|| format!("parse {}", resolved.display()))?;
 
     let baseline_src = baseline_source_path(args.config.as_deref());
     let cwd = resolve_cwd(args.cwd.as_deref())?;
-    let (effective, layers) =
-        match config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref())) {
-            Ok(out) => out,
-            Err(e) => {
-                return Err(anyhow!(format_no_repo_error(&baseline_src, &cwd, &e)));
-            }
-        };
+    let (effective, layers) = match hallouminate_config::resolve_for_cwd(
+        &baseline,
+        &cwd,
+        Some(baseline_src.path.as_ref()),
+    ) {
+        Ok(out) => out,
+        Err(e) => {
+            return Err(anyhow!(format_no_repo_error(&baseline_src, &cwd, &e)));
+        }
+    };
 
     print_layered_header(&baseline_src, &layers);
     println!();
@@ -865,8 +867,9 @@ mod tests {
         write_repo_config(&cwd, "[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n");
 
         // Re-load the same way `show` does and assert the merged corpora.
-        let baseline = config::load_xdg(Some(&xdg_path)).expect("load baseline");
-        let (effective, _) = config::resolve_for_cwd(&baseline, &cwd, None).expect("resolve");
+        let baseline = hallouminate_config::load_xdg(Some(&xdg_path)).expect("load baseline");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&baseline, &cwd, None).expect("resolve");
         let names: Vec<&str> = effective.corpora.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["global", "local"]);
 

@@ -79,7 +79,7 @@ mod tests {
     use super::super::ipc;
     use super::super::{heartbeat, ladder};
     use super::*;
-    use crate::config::Config;
+    use hallouminate_config::Config;
 
     async fn test_state() -> DaemonState {
         let tmp = tempfile::tempdir().expect("tempdir");

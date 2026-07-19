@@ -31,6 +31,7 @@ mod ladder;
 mod lifecycle;
 mod maintenance;
 mod pressure;
+mod report;
 mod server;
 mod socket;
 mod state;
@@ -38,7 +39,6 @@ mod status;
 mod supervisor;
 mod watch;
 mod watchdog;
-
 pub use bootstrap::ensure_daemon_running;
 pub use client::{
     DaemonClient, DaemonRpcError, client_for, client_for_with, connect_at, daemon_client,
@@ -56,6 +56,7 @@ pub use ipc::{
     WatcherCounters,
 };
 pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
+pub use report::{CorpusReport, IndexReport};
 pub use server::{
     DaemonArgs, IDLE_READ_TIMEOUT, run_daemon, serve, serve_with_idle_timeout,
     spawn_signal_handlers,
