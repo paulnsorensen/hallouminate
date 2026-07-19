@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::Path;
 
-use hallouminate::config::Config;
-use hallouminate::daemon::DaemonState;
 use hallouminate_adapters::LanceStore;
+use hallouminate_config::Config;
+use hallouminate_daemon::DaemonState;
 
 use crate::common::LANCE_WRITE_LOCK;
 

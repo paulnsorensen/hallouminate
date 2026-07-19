@@ -19,7 +19,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use hallouminate::config::Config;
+use hallouminate_config::Config;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -1754,7 +1754,7 @@ path = "{}"
 
     // Baseline daemon config: just needs a ground dir; corpora are derived
     // from the repository config the daemon discovers via req.cwd.
-    let mut baseline = hallouminate::config::Config::default();
+    let mut baseline = hallouminate_config::Config::default();
     baseline.storage.ground_dir = xdg.path().join("ground").to_string_lossy().into_owned();
     let harness = DaemonHarness::spawn(baseline).await;
 

@@ -16,7 +16,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::config::{self, Config};
+use hallouminate_config::{self, Config};
 
 use super::dispatch::dispatch;
 use super::heartbeat::TaskName;
@@ -66,7 +66,10 @@ pub async fn run_daemon(cfg: Config, args: DaemonArgs) -> anyhow::Result<()> {
     // scalar-conflict diagnostics (AC #7). When the user passed
     // `--config PATH`, that path *is* the baseline; otherwise the XDG path
     // is what `load_startup` (via `load_xdg`) consulted.
-    let xdg_path = args.config.clone().unwrap_or_else(config::xdg_config_path);
+    let xdg_path = args
+        .config
+        .clone()
+        .unwrap_or_else(hallouminate_config::xdg_config_path);
     let socket_path = daemon_socket_path();
     serve_with_config(cfg, Some(xdg_path), &socket_path).await
 }

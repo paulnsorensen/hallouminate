@@ -2,8 +2,10 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 
-use crate::config::{self, Config};
-use crate::daemon::{DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for};
+use hallouminate_config::{self, Config};
+use hallouminate_daemon::{
+    DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for,
+};
 use hallouminate_domain::common::expand_tilde;
 use hallouminate_domain::ground::{Format, GroundResponse, RenderOpts, render};
 
@@ -51,9 +53,9 @@ pub async fn cmd_ground(args: GroundArgs) -> anyhow::Result<()> {
 /// failure) degrades to `None` rather than propagating — the strip is
 /// purely visual and the real diagnostic surfaces in the daemon roundtrip.
 fn resolve_effective_prefix_strip(args: &GroundArgs) -> Option<String> {
-    let baseline = config::load_xdg(args.config.as_deref()).ok()?;
+    let baseline = hallouminate_config::load_xdg(args.config.as_deref()).ok()?;
     let cwd = std::env::current_dir().ok()?;
-    let (effective, _layers) = config::resolve_for_cwd(&baseline, &cwd, None).ok()?;
+    let (effective, _layers) = hallouminate_config::resolve_for_cwd(&baseline, &cwd, None).ok()?;
     resolve_path_prefix_strip(&effective, args.corpus.as_deref())
 }
 

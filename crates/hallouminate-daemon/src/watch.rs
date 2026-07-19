@@ -960,7 +960,7 @@ mod tests {
     #[tokio::test]
     async fn process_change_batch_touches_activity_after_a_stale_clock() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
@@ -994,7 +994,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handle_changed_path_records_watcher_reindex_counters() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
@@ -1059,7 +1059,7 @@ mod tests {
         use super::super::ladder::LadderAction;
 
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
         cfg.daemon.churn_warn_at = 2;
@@ -1159,7 +1159,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unchanged_mtime_event_skips_without_reading_content() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");
@@ -1239,7 +1239,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn watcher_never_indexes_content_through_a_symlink_out_of_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut cfg = crate::config::Config::default();
+        let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open");

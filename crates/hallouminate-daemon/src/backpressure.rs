@@ -203,7 +203,7 @@ mod tests {
 
     use super::debt::DebtCache;
     use super::*;
-    use crate::config::{Config, DaemonConfig};
+    use hallouminate_config::{Config, DaemonConfig};
 
     const SOFT_DELAY: Duration = Duration::from_millis(250);
     const HARD_WAIT: Duration = Duration::from_secs(30);

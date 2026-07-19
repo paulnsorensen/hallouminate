@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cli::IndexReport;
+use crate::report::IndexReport;
 use hallouminate_domain::corpus::{FileEntry, TreeNode};
 use hallouminate_domain::ground::GroundResponse;
 

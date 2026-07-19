@@ -2,11 +2,11 @@ use std::fs;
 use std::path::Path;
 
 use hallouminate::cli::{IndexArgs, IndexReport, cmd_index, run_index};
-use hallouminate::config::Config;
-use hallouminate::daemon::{
+use hallouminate_adapters::LanceStore;
+use hallouminate_config::Config;
+use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest, connect_at,
 };
-use hallouminate_adapters::LanceStore;
 
 use crate::common::LANCE_WRITE_LOCK;
 use crate::common::daemon::DaemonHarness;

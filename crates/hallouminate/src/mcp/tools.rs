@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::daemon::{
+use hallouminate_daemon::{
     AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusStatsResult,
     DaemonClient, DaemonRequest, DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest,
     DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
@@ -617,7 +617,8 @@ impl HallouminateTools {
                 strict: false,
             }),
         };
-        let report: crate::cli::IndexReport = client.call(req).await.map_err(map_daemon_err)?;
+        let report: hallouminate_daemon::IndexReport =
+            client.call(req).await.map_err(map_daemon_err)?;
         let summary = report
             .corpora
             .iter()

@@ -28,7 +28,7 @@ const DEFAULT_FILTER: &str = "hallouminate=info";
 /// Install the global tracing subscriber. Returns a guard that must be held
 /// while logging is active. Dropping the guard drains and flushes queued records
 /// before joining the background writer.
-pub fn init(config: &crate::config::LoggingConfig) -> anyhow::Result<WorkerGuard> {
+pub fn init(config: &hallouminate_config::LoggingConfig) -> anyhow::Result<WorkerGuard> {
     let (non_blocking, guard) = log_writer(&state_dir(), config)?;
 
     let filter = EnvFilter::try_from_env("HALLOUMINATE_LOG")
@@ -46,9 +46,9 @@ pub fn init(config: &crate::config::LoggingConfig) -> anyhow::Result<WorkerGuard
 
 fn log_writer(
     dir: &Path,
-    config: &crate::config::LoggingConfig,
+    config: &hallouminate_config::LoggingConfig,
 ) -> anyhow::Result<(NonBlocking, WorkerGuard)> {
-    let crate::config::LoggingConfig {
+    let hallouminate_config::LoggingConfig {
         max_file_bytes,
         max_total_bytes,
     } = *config;
@@ -74,7 +74,7 @@ fn log_writer(
 }
 
 fn state_dir() -> PathBuf {
-    crate::xdg::xdg_path("XDG_STATE_HOME", "~/.local/state", &["hallouminate"])
+    hallouminate_config::xdg::xdg_path("XDG_STATE_HOME", "~/.local/state", &["hallouminate"])
 }
 
 #[cfg(test)]
@@ -102,7 +102,7 @@ mod tests {
         const SENTINEL: &[u8] = b"drain-complete\n";
 
         let dir = tempfile::tempdir()?;
-        let config = crate::config::LoggingConfig {
+        let config = hallouminate_config::LoggingConfig {
             max_file_bytes: MAX_FILE_BYTES,
             max_total_bytes: MAX_TOTAL_BYTES,
         };
@@ -186,7 +186,7 @@ mod tests {
         const BLOCK: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 
         let dir = tempfile::tempdir()?;
-        let config = crate::config::LoggingConfig {
+        let config = hallouminate_config::LoggingConfig {
             max_file_bytes: MAX_FILE_BYTES,
             max_total_bytes: MAX_FILE_BYTES,
         };

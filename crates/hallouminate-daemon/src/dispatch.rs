@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
-use crate::cli::{CorpusReport, IndexReport};
-use crate::config::{Config, ResolvedLayers, resolve_for_cwd};
+use crate::report::{CorpusReport, IndexReport};
 use hallouminate_adapters::LanceStore;
+use hallouminate_config::{Config, ResolvedLayers, resolve_for_cwd};
 use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
 #[cfg(test)]
 use hallouminate_domain::corpus::FileEntry;
@@ -1941,7 +1941,7 @@ mod tests {
 
     use std::path::Path;
 
-    use crate::daemon::ErrorKind;
+    use crate::ErrorKind;
 
     /// Build a `DaemonState` with a baseline `Config` that points its
     /// ground_dir at a tempdir-local subdir. Embedder load is tolerated
