@@ -4,7 +4,7 @@ Why stored file mtimes are sometimes deliberately off by one millisecond, and wh
 
 ## The race
 
-Two equality gates trust `stored mtime_ms == on-disk mtime_ms` to mean "content unchanged": the watcher's stage-1 gate (`crates/hallouminate/src/daemon/watch.rs` `mtime_matches_last_index`, which sheds events *without reading content*) and the bulk planner (`crates/hallouminate-domain/src/indexer/plan.rs` `plan()`, which hash-verifies on equality). If a file is rewritten within the same millisecond as its recorded mtime (mtime preserved), equality can't see the change — git calls this the racy-clean problem. The bulk planner self-heals (it re-hashes on equality), but the watcher path served stale content until the next bulk index.
+Two equality gates trust `stored mtime_ms == on-disk mtime_ms` to mean "content unchanged": the watcher's stage-1 gate (`crates/hallouminate-daemon/src/watch.rs` `mtime_matches_last_index`, which sheds events *without reading content*) and the bulk planner (`crates/hallouminate-domain/src/indexer/plan.rs` `plan()`, which hash-verifies on equality). If a file is rewritten within the same millisecond as its recorded mtime (mtime preserved), equality can't see the change — git calls this the racy-clean problem. The bulk planner self-heals (it re-hashes on equality), but the watcher path served stale content until the next bulk index.
 
 ## The fix — smudge at the single write seam
 

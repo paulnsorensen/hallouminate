@@ -63,7 +63,7 @@ markers is preserved verbatim; files without markers are left alone
 
 Params: `corpus`, `path`, `content`, `overwrite` (default `false`).
 Symlinks and parent-dir escapes are rejected by the sandbox at
-`src/domain/corpus/sandbox.rs`.
+`crates/hallouminate-domain/src/corpus/sandbox.rs`.
 
 ### `read_markdown`
 

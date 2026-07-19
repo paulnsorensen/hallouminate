@@ -1,6 +1,6 @@
 # debt::OBSERVED test isolation — the Hard-recording coordination lock
 
-`debt::OBSERVED` (`crates/hallouminate/src/daemon/debt.rs`) is a process-wide static `DebtCache` feeding both the backpressure mutation gate and `maintenance_loop`'s Hard→forced-run branch. Because the whole `cargo test` binary shares it across parallel tests, **any test that records `DebtLevel::Hard` into it silently breaks every concurrently running maintenance-defer test**: the loop reads `debt::level() == Hard`, skips the defer path, and the defer/forced-warn assertions fail. The failures look flaky and land in *other* files (`maintenance.rs`, `state.rs`) than the offending test.
+`debt::OBSERVED` (`crates/hallouminate-daemon/src/debt.rs`) is a process-wide static `DebtCache` feeding both the backpressure mutation gate and `maintenance_loop`'s Hard→forced-run branch. Because the whole `cargo test` binary shares it across parallel tests, **any test that records `DebtLevel::Hard` into it silently breaks every concurrently running maintenance-defer test**: the loop reads `debt::level() == Hard`, skips the defer path, and the defer/forced-warn assertions fail. The failures look flaky and land in *other* files (`maintenance.rs`, `state.rs`) than the offending test.
 
 ## The rule
 

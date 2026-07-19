@@ -2,7 +2,7 @@
 
 You — the LLM writing wiki entries via `add_markdown` — are bound by a
 few conventions hallouminate counts on. They are echoed from
-`SERVER_INSTRUCTIONS` in `src/app/mcp/tools.rs` plus practical
+`SERVER_INSTRUCTIONS` in `crates/hallouminate/src/mcp/tools.rs` plus practical
 extensions.
 
 ## One topic per file
@@ -181,7 +181,7 @@ auto-index only touches the marker block.
 ## Style
 
 - Lead with the conclusion. Don't bury what the file is about under preamble.
-- Cite files and line ranges by path: `src/domain/corpus/walker.rs::root_is_gitignored`.
+- Cite files and line ranges by path: `crates/hallouminate-domain/src/corpus/walker.rs::root_is_gitignored`.
 - Cite commits by SHA when behavior depends on history (e.g. `f5c5224` introduced gitignore-aware walking).
 - Prefer concrete examples to abstract description.
 - Keep entries short — a wiki page is not a tutorial. ~50-150 lines is the right band.
