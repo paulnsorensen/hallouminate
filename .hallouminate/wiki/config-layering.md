@@ -40,7 +40,7 @@ file is enough to satisfy the check.
 
 ### Relative paths resolve against the repo root
 
-`load_repo_layer` (`src/app/config.rs::load_repo_layer` →
+`load_repo_layer` (`crates/hallouminate-config/src/lib.rs::load_repo_layer` →
 `resolve_repo_path`) rewrites relative paths in the repo layer against
 the **repo root** — the parent of `.hallouminate/`, not `.hallouminate/`
 itself. Absolute and `~`-prefixed paths pass through untouched. So a
@@ -68,7 +68,7 @@ exists once a `[[repository]]` (baseline or repo layer) declares it.
 
 ## Merge semantics
 
-Implemented in `src/app/config.rs::merge_layers`. Rules:
+Implemented in `crates/hallouminate-config/src/lib.rs::merge_layers`. Rules:
 
 - Arrays (`[[corpus]]`, `[[repository]]`) — repo entries are appended after baseline entries. Duplicate names error.
 - Scalars (`top_files_default`, etc.) — repo wins if it sets a non-default value; otherwise baseline. Conflicting non-default values error with both source paths named.

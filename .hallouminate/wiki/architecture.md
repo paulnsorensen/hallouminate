@@ -1,25 +1,38 @@
 # Architecture
 
-Hallouminate is a three-crate ports-and-adapters workspace with Sliced Bread
+Hallouminate is a five-crate ports-and-adapters workspace with Sliced Bread
 applied inside the core: business-capability modules expose crust facades, while
 the workspace crates enforce dependency direction. It is not a crate-per-feature
-layout.[^1]
+layout. The daemon and config layers were extracted from the application crate
+into their own crates by commit `ce37b46` (PR #273).[^1]
 
 ## `crates/hallouminate/` — application and driving adapters
 
 The application crate owns process orchestration and inbound transports:
 
 - `cli.rs` and `cli/` — clap commands and user-facing command handlers
-- `daemon/` — the long-lived local RPC daemon, request dispatch, lifecycle,
-  filesystem watching, and application resource composition
 - `mcp.rs` and `mcp/` — the rmcp stdio server; MCP drives application use
   cases, so it belongs beside the CLI rather than among driven adapters
-- `config.rs` — XDG baseline parsing plus repository-layer merge
-- `logging.rs` and `xdg.rs` — process-wide runtime wiring
+- `logging.rs` — process-wide logging wiring
 - `input_error.rs` — caller-input error marker
 
 `src/lib.rs` is the crate root and exports `run()`; `src/main.rs` is the
 thin binary entry point.[^2]
+
+## `crates/hallouminate-daemon/` — long-lived local RPC daemon
+
+The daemon crate owns the single-owner background process: request dispatch,
+lifecycle and supervision (watchdog, backoff, heartbeat), filesystem watching,
+the Unix-socket protocol, maintenance/backpressure, and per-request resource
+composition (`RequestResources`, `DaemonState`). It depends on the domain,
+adapters, and config crates. Interactive CLI subcommands and the MCP `serve`
+transport in the application crate become clients of this daemon.
+
+## `crates/hallouminate-config/` — configuration layer
+
+XDG baseline parsing plus repository-layer merge (`load_repo_layer`,
+`merge_layers`, `worktree_main_root`) and the `xdg.rs` path helpers. It depends
+only on the domain crate for shared config types.
 
 ## `crates/hallouminate-domain/` — application core
 
@@ -57,14 +70,16 @@ Adapters depend on domain ports and types, never on the application crate.[^5]
 ## Dependency direction
 
 ```text
-hallouminate-adapters -> hallouminate-domain <- hallouminate
-                                              |
-                                              -> hallouminate-adapters
+hallouminate (app) -> hallouminate-daemon -> hallouminate-adapters -> hallouminate-domain
+       |                     |                                             ^
+       |                     +-> hallouminate-config ----------------------+
+       +-> hallouminate-domain, hallouminate-adapters, hallouminate-config
 ```
 
 Cargo workspace metadata enforces this direction: the application depends on
-both lower crates, adapters depend on domain, and domain has no workspace-crate
-dependency.[^6]
+the domain, adapters, config, and daemon crates; the daemon depends on domain,
+adapters, and config; adapters and config depend only on domain; and domain has
+no workspace-crate dependency.[^6]
 
 ## Closed boundary seams
 
@@ -89,7 +104,7 @@ module per concern.[^9]
 [^3]: `crates/hallouminate-domain/src/corpus.rs:1-60`; `crates/hallouminate-domain/src/indexer.rs:1-14`; commit `64669f9` (PR #239).
 [^4]: `crates/hallouminate-domain/src/corpus/sandbox.rs:1-46`; `crates/hallouminate-domain/src/search/ripgrep.rs:1-64`.
 [^5]: `crates/hallouminate-adapters/src/lib.rs:1-13`; `crates/hallouminate-adapters/src/lance.rs:17-23`.
-[^6]: `crates/hallouminate/Cargo.toml:15-17`; `crates/hallouminate-adapters/Cargo.toml:10-12`; `crates/hallouminate-domain/Cargo.toml:10-51`.
-[^7]: `crates/hallouminate-domain/src/corpus/chunker.rs:10-13`; `crates/hallouminate/src/daemon/state.rs:151-156`.
-[^8]: `crates/hallouminate-adapters/src/lance.rs:39-51,754-782`; `crates/hallouminate/src/daemon/state.rs:500-529`; `crates/hallouminate/Cargo.toml:15-58`.
+[^6]: `crates/hallouminate/Cargo.toml:15-19`; `crates/hallouminate-daemon/Cargo.toml:11-13`; `crates/hallouminate-adapters/Cargo.toml`; `crates/hallouminate-config/Cargo.toml`; `crates/hallouminate-domain/Cargo.toml`.
+[^7]: `crates/hallouminate-domain/src/corpus/chunker.rs:10-13`; `crates/hallouminate-daemon/src/state.rs:141-145`.
+[^8]: `crates/hallouminate-adapters/src/lance.rs:43-56,854`; `crates/hallouminate-daemon/src/maintenance.rs:368`; `crates/hallouminate/Cargo.toml`.
 [^9]: `crates/hallouminate/tests/it/main.rs:1-16`.

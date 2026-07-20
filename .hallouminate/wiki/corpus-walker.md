@@ -2,7 +2,7 @@
 
 The walker turns a `CorpusConfig` (paths + include globs + exclude
 globs) into a list of `(FileRef, Mtime)` pairs. Lives at
-`src/domain/corpus/walker.rs`. As of commit `f5c5224` (with a follow-up
+`crates/hallouminate-domain/src/corpus/walker.rs`. As of commit `f5c5224` (with a follow-up
 fix in `39c3908`), it's built on BurntSushi's `ignore` crate — the
 same gitignore-aware walker ripgrep uses — instead of `walkdir`.
 

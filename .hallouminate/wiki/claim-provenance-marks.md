@@ -5,7 +5,7 @@ status, as inline HTML comments parsed at index time. They are a separate
 construct from page-level frontmatter (see [wiki-conventions](wiki-conventions.md)
 § Optional frontmatter) and from footnotes. Introduced for issue #88 (PR #126),
 building on the page-level lifecycle work (#89). The vocabulary lives in
-`src/domain/corpus/claim_marks.rs`, a deliberate twin of `frontmatter.rs`.
+`crates/hallouminate-domain/src/corpus/claim_marks.rs`, a deliberate twin of `frontmatter.rs`.
 
 Syntax — an HTML comment at the end of the claim it annotates:
 
@@ -38,9 +38,9 @@ This is the one structural difference from frontmatter. Frontmatter is
 page-level — the same JSON is denormalized identically onto every chunk row of a
 file. Claim marks are **positional**: each mark belongs to the single chunk whose
 line range contains the mark's line. `prepare_file`
-(`src/domain/indexer/writer.rs`) extracts all marks once per body, then buckets
+(`crates/hallouminate-domain/src/indexer/writer.rs`) extracts all marks once per body, then buckets
 them per chunk by line range; the per-chunk JSON payload is the `claim_marks`
-column. On read, `decode_claim_marks` (`src/adapters/lance.rs`) parses the column
+column. On read, `decode_claim_marks` (`crates/hallouminate-adapters/src/lance.rs`) parses the column
 back into `Vec<ClaimMark>`, which flows through `bucket.rs` into
 `ChunkProvenance.claim_marks` and out of `ground`. Malformed stored JSON degrades
 to an empty vec with a `warn` log rather than failing the query.
@@ -76,10 +76,10 @@ the mark.
 ## Schema, lint, read_markdown
 
 - **Schema** — adding the column bumped the Lance schema version **2 → 3**
-  (`default_schema_version` in `src/adapters/lance.rs`). A v2 store reindexes
+  (`default_schema_version` in `crates/hallouminate-adapters/src/lance.rs`). A v2 store reindexes
   cleanly through the existing version-mismatch delete+reindex path.
 - **Lint** — `lint_claim_marks` joins the existing `add_markdown` advisory chain
-  (`src/app/daemon/dispatch.rs`) alongside `lint_frontmatter` / `lint_markdown`.
+  (`crates/hallouminate-daemon/src/dispatch.rs`) alongside `lint_frontmatter` / `lint_markdown`.
   It warns on malformed marks and on `superseded`/`contradicted` marks missing a
   `ref=`. Advisory only: it rides back in `AddMarkdownResult.warnings` and never
   blocks the write. There is no `lint` CLI/MCP command.
