@@ -14,19 +14,46 @@
 
 > _"The wiki must flow."_
 
-A markdown corpus indexer for LLMs to build and query their own per-repo
-wikis. Hallouminate stores markdown verbatim on disk, embeds it with
-fastembed, indexes the embeddings in LanceDB, and exposes a small MCP
-surface (`add_markdown` / `read_markdown` / `delete_markdown` / `ground`)
-so an LLM can author and search a per-repo knowledge base without
-leaving its agent loop.
+![hallouminate demo — ground a question against the repo wiki](docs/assets/demo.gif)
 
-The filesystem is the source of truth; LanceDB rows are derived and
-refreshed automatically when an LLM writes via `add_markdown`, or in
-bulk via `hallouminate index`. Code files (`.rs`, `.toml`, …) can also
-be indexed as text for semantic search, but hallouminate does no
-structural analysis — it's a wiki indexer that happens to tolerate
-code, not a code intelligence tool.
+**What it is**
+
+- A markdown corpus indexer for LLMs to build and query their own per-repo wikis.
+- Stores markdown verbatim on disk — the filesystem is the source of truth.
+- Embeds content with fastembed and indexes the embeddings in LanceDB, refreshed automatically on write (`add_markdown`) or in bulk (`hallouminate index`).
+- Exposes a small MCP surface (`add_markdown` / `read_markdown` / `delete_markdown` / `ground`) so an LLM can author and search a per-repo knowledge base without leaving its agent loop.
+- Can index code files (`.rs`, `.toml`, …) as text for semantic search too.
+
+**What it is not**
+
+- Not a code intelligence tool — no structural analysis of code, even when code files are indexed; it's a wiki indexer that happens to tolerate code.
+
+## How it compares
+
+| Tool | Stores knowledge as | Human-readable + git-committable | Local by default | MCP | Scope | License |
+| --- | --- | --- | --- | --- | --- | --- |
+| **hallouminate** | Markdown files, embedded (fastembed) and indexed in LanceDB | Yes | Yes | Native MCP server | Per-repo wiki (`repo:<name>:wiki`), plus cross-repo union search | MIT |
+| **Basic Memory** | Markdown files, indexed via local SQLite (optional Postgres for cloud sync) | Yes | Yes | Native MCP server | Per-project, with multi-project management | AGPL-3.0 |
+| **mem0** | Vector DB (Qdrant by default) + optional graph store | No | No — cloud by default (OpenAI models) | MCP support via a self-hosted server; not one canonical native binary | Multi-tier (User/Session/Agent), not repo-scoped | Apache-2.0 |
+| **claude-mem** | SQLite (FTS5) + Chroma vector DB | No | Yes (no cloud API key required for compression) | Not a standalone MCP server — a Claude Code plugin exposing 4 MCP tools | Per-session, surfaced cross-session | Apache-2.0 |
+| **Letta** | Markdown + YAML frontmatter, git-committed memory filesystem (MemFS) | Yes | Not required — local (Ollama/LM Studio/llama.cpp) or cloud | — [1] | Per-agent (MemFS scoped to `$MEMORY_DIR`) | Apache-2.0 (legacy repo) [1] |
+| **@modelcontextprotocol/server-memory** | Single JSONL file holding a JSON entity/relation graph | Yes (diffable JSONL, not prose) | Yes — no embeddings, no LLM call | Official reference native MCP server | Global/user-level by convention, no repo scoping concept | MIT |
+| **Graphiti** | Temporal knowledge graph (Neo4j / FalkorDB / Amazon Neptune) | No | Defaults to OpenAI, but supports local LLMs (Ollama, vLLM, llama.cpp) | Native MCP server, ships in-repo | Per-entity/per-user context graphs, not repo-scoped | Apache-2.0 |
+
+Basic Memory is the closest analog — both store markdown on disk as the
+source of truth and ship a native MCP server. hallouminate's differences:
+local vector search (fastembed + LanceDB) instead of Basic Memory's SQLite
+full-text/graph index, MIT instead of AGPL-3.0, and a Rust single binary
+with a background daemon instead of a Python package.
+
+[1] Letta's native MCP exposure is unconfirmed — the dedicated MCP doc page
+404'd at research time. Apache-2.0 is confirmed for the legacy `letta-ai/letta`
+repo; the current `letta-ai/letta-code` repo's license was not independently
+checked.
+
+Sources: [basicmachines-co/basic-memory](https://github.com/basicmachines-co/basic-memory),
+[modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers/tree/main/src/memory),
+[getzep/graphiti](https://github.com/getzep/graphiti)
 
 A long-lived local daemon owns the LanceDB ground directory, per-corpus
 mutation locks, and config resolution. The CLI and the stdio MCP server
