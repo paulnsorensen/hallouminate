@@ -9,9 +9,9 @@ prebuilt platform binary from the matching GitHub release.
 npx hallouminate --help
 ```
 
-Supported platforms: macOS (x64 / arm64), Linux (x64 / arm64, glibc).
-For Windows, musl Linux, or other targets, install from source with
-`cargo install hallouminate`.
+Supported platforms: macOS (Apple Silicon, arm64), Linux (x64 / arm64,
+glibc). For Intel macOS, Windows, musl Linux, or other targets, install
+from source with `cargo install hallouminate`.
 
 See the [repository](https://github.com/paulnsorensen/hallouminate) for
 documentation, configuration, and MCP integration.
