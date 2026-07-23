@@ -49,9 +49,13 @@ aarch64 Linux (glibc ≥ 2.39). Re-run the one-liner any time to upgrade.
 Alternatives, in cascade order:
 
 ```sh
+npx hallouminate --help              # npm shim — postinstall downloads the same prebuilt
 cargo binstall hallouminate          # same prebuilts, via dist-manifest.json
 cargo install hallouminate --locked  # source build — needs Rust + protoc
 ```
+
+The npm package is a thin shim: `postinstall` fetches the matching prebuilt
+for your platform from the GitHub release and verifies its SHA-256.
 
 Source builds need `protoc` (the `lancedb` build dependency:
 `brew install protobuf` / `apt install protobuf-compiler`); from a git
@@ -98,19 +102,6 @@ none is running) — this is what an MCP client launches:
 ```sh
 hallouminate serve
 ```
-
-## Install
-
-```sh
-# Prebuilt binary, no Rust toolchain required:
-npx hallouminate --help
-
-# Or from crates.io:
-cargo install hallouminate
-```
-
-The npm package is a thin shim — its postinstall step downloads the
-matching prebuilt binary for your platform from the GitHub release.
 
 From a source checkout, run subcommands through cargo:
 
