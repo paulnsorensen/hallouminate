@@ -26,9 +26,10 @@ The `install` skill walks you from zero to a working wiki:
 
 1. **Platform check** — prebuilt targets, with loud fallbacks for Intel macOS
    (source build) and Windows (unsupported, #48).
-2. **Install** — prebuilt-binary cascade: `hallouminate-installer.sh` →
-   `cargo binstall` → `cargo install --locked` source fallback. No Rust
-   toolchain or `protoc` needed on supported targets.
+2. **Install** — prebuilt-binary cascade: `npm install -g hallouminate`
+   (preferred) → `hallouminate-installer.sh` → `cargo binstall` →
+   `cargo install --locked` source fallback. No Rust toolchain or `protoc`
+   needed on supported targets.
 3. **MCP** — the bundled `.mcp.json` registers `hallouminate serve`
    declaratively; `claude mcp add --scope user` survives as the user-scope
    fallback.
