@@ -1,12 +1,26 @@
 # Installation
 
-The fastest path is the prebuilt-binary installer — no Rust toolchain, no
+The preferred path is npm — a prebuilt binary with no Rust toolchain, no
 `protoc`, no compile. Build from source with cargo only if your platform has no
 prebuilt, or you want a development checkout.
 
-## Prebuilt binary (recommended)
+## npm (recommended)
 
-Downloads a prebuilt `hallouminate` for your platform and adds it to your PATH:
+The npm package is a thin shim: its postinstall downloads the prebuilt
+`hallouminate` binary for your platform from the matching GitHub release.
+
+```sh
+npm install -g hallouminate   # persistent — puts `hallouminate` on PATH
+npx hallouminate --version    # or one-off, no global install
+```
+
+An MCP client can also launch the server as `npx -y hallouminate serve`
+without any global install — the first run pays the binary download.
+
+## Prebuilt-binary installer
+
+Same prebuilts without npm — downloads `hallouminate` for your platform and
+adds it to your PATH:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.sh | sh
@@ -62,8 +76,14 @@ The binary lands in `target/release/hallouminate`.
 
 ## Install for your harness
 
-Every integration launches the same `hallouminate serve` stdio server. The
-plugin routes also install the bundled skills:
+Every integration launches the same `hallouminate serve` stdio server.
+
+### Plugin (recommended)
+
+The plugin pack is the preferred integration: one install registers the MCP
+server (bundled `.mcp.json`) **and** the wiki skills
+(`/hallouminate:install`, wiki authoring workflows). Install it through the
+harness-native route:
 
 | Harness | Install the plugin / skills | MCP registration |
 | --- | --- | --- |
@@ -74,6 +94,22 @@ plugin routes also install the bundled skills:
 | **Cursor** | Teams/Enterprise: import `https://github.com/paulnsorensen/hallouminate` under **Plugins → Team Marketplaces**. Local: clone, copy or symlink `plugins/hallouminate` to `~/.cursor/plugins/local/hallouminate`, then reload/restart Cursor. | Bundled `.mcp.json` through the Cursor manifest |
 | **Gemini CLI** | From a checkout: `gemini extensions install ./plugins/hallouminate --consent`. From an extracted release archive: `gemini extensions install ./hallouminate-skills-<version>/plugins/hallouminate --consent`. | Inline in `gemini-extension.json`; bundled skills are auto-discovered |
 | **opencode** | Copy `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` | Add `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` to `opencode.json` |
+
+### Without the plugin: skills + MCP by hand
+
+The plugin is a convenience wrapper — both halves can be wired manually:
+
+- **MCP** — register the stdio server directly:
+  - Claude Code: `claude mcp add hallouminate --scope user -- hallouminate serve`
+  - opencode: the `opencode.json` snippet from the table above
+  - Any other MCP client: launch `hallouminate serve` over stdio — or
+    `npx -y hallouminate serve` to skip the PATH install entirely (first run
+    pays the binary download)
+- **Skills** — copy
+  [`plugins/hallouminate/skills/`](https://github.com/paulnsorensen/hallouminate/tree/main/plugins/hallouminate/skills)
+  into your harness's skills directory (Claude Code: `~/.claude/skills/`;
+  opencode: `~/.config/opencode/skills/`). Skills are optional — the MCP
+  tools work without them.
 
 `hallouminate serve` auto-spawns the daemon if none is running, so there is no
 separate process to manage.

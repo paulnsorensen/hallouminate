@@ -37,21 +37,26 @@ LanceDB races.
 
 ## Install
 
-The default install is a prebuilt binary — no Rust toolchain, no `protoc`:
+The preferred install is via npm — the package is a thin shim whose
+postinstall downloads the matching prebuilt binary from the GitHub release.
+No Rust toolchain, no `protoc`:
+
+```sh
+npm install -g hallouminate   # persistent — puts `hallouminate` on PATH
+npx hallouminate --version    # or one-off, no global install
+```
+
+Alternatives that fetch the same prebuilts, in cascade order:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.sh | sh
-```
-
-Prebuilts cover Apple-silicon macOS (`aarch64-apple-darwin`) and x86_64 /
-aarch64 Linux (glibc ≥ 2.39). Re-run the one-liner any time to upgrade.
-Alternatives, in cascade order:
-
-```sh
 cargo binstall hallouminate          # same prebuilts, via dist-manifest.json
 cargo install hallouminate --locked  # source build — needs Rust + protoc
 ```
+
+Prebuilts cover Apple-silicon macOS (`aarch64-apple-darwin`) and x86_64 /
+aarch64 Linux (glibc ≥ 2.39). Re-run the install command any time to upgrade.
 
 Source builds need `protoc` (the `lancedb` build dependency:
 `brew install protobuf` / `apt install protobuf-compiler`); from a git
@@ -65,10 +70,12 @@ see [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
 
 Verify with `hallouminate --version`.
 
-### Per-harness setup
+### Plugin setup (recommended)
 
-The MCP server is always `hallouminate serve` over stdio. Install the shared
-plugin pack through the harness-native route:
+The plugin pack is the preferred integration: one install registers the MCP
+server (bundled `.mcp.json` launching `hallouminate serve`) **and** the wiki
+skills (`/hallouminate:install`, wiki authoring workflows). Install it through
+the harness-native route:
 
 | Harness | Install the plugin / skills | MCP registration |
 | --- | --- | --- |
@@ -79,6 +86,21 @@ plugin pack through the harness-native route:
 | **Cursor** | Teams/Enterprise: import `https://github.com/paulnsorensen/hallouminate` under **Plugins → Team Marketplaces**. Local: clone, copy or symlink `plugins/hallouminate` to `~/.cursor/plugins/local/hallouminate`, then reload/restart Cursor. | Bundled `.mcp.json` through the Cursor manifest |
 | **Gemini CLI** | From a checkout: `gemini extensions install ./plugins/hallouminate --consent`. From an extracted release archive: `gemini extensions install ./hallouminate-skills-<version>/plugins/hallouminate --consent`. | Inline in `gemini-extension.json`; bundled skills are auto-discovered |
 | **opencode** | Copy `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` | Add `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` to `opencode.json` |
+
+### Without the plugin: skills + MCP by hand
+
+The plugin is a convenience wrapper — both halves can be wired manually:
+
+- **MCP** — register the stdio server directly:
+  - Claude Code: `claude mcp add hallouminate --scope user -- hallouminate serve`
+  - opencode: the `opencode.json` snippet from the table above
+  - Any other MCP client: launch `hallouminate serve` over stdio — or
+    `npx -y hallouminate serve` to skip the PATH install entirely (first run
+    pays the binary download)
+- **Skills** — copy [`plugins/hallouminate/skills/`](plugins/hallouminate/skills)
+  into your harness's skills directory (Claude Code: `~/.claude/skills/`;
+  opencode: `~/.config/opencode/skills/`). Skills are optional — the MCP
+  tools work without them.
 
 ### First run
 
@@ -98,19 +120,6 @@ none is running) — this is what an MCP client launches:
 ```sh
 hallouminate serve
 ```
-
-## Install
-
-```sh
-# Prebuilt binary, no Rust toolchain required:
-npx hallouminate --help
-
-# Or from crates.io:
-cargo install hallouminate
-```
-
-The npm package is a thin shim — its postinstall step downloads the
-matching prebuilt binary for your platform from the GitHub release.
 
 From a source checkout, run subcommands through cargo:
 
@@ -260,7 +269,7 @@ hallouminate and authoring wikis, plus MCP registration for each supported
 plugin format. Claude Code and OMP use `.claude-plugin/marketplace.json`,
 Codex uses `.agents/plugins/marketplace.json`, Copilot CLI uses the payload's
 root `plugin.json`, Cursor uses `.cursor-plugin/`, and Gemini CLI uses
-`gemini-extension.json` — see the [install matrix](#per-harness-setup).
+`gemini-extension.json` — see the [install matrix](#plugin-setup-recommended).
 `tests/plugin_manifests.rs` pins every manifest to the crate version, and the
 `release-skills` workflow publishes versioned plugin-pack archives on every
 `v*` release tag.
