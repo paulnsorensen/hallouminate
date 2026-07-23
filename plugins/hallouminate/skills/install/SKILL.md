@@ -2,7 +2,7 @@
 name: install
 description: Install hallouminate and bootstrap the user's first LLM-authored per-repo wiki. Use when the user runs /install from the hallouminate skill pack, or asks to "install hallouminate", "set up hallouminate", "get hallouminate working", or "start a hallouminate wiki" on a machine without a working install. Do NOT use when the binary already works — route a brand-new wiki to wiki-init and new content to wiki-ingest.
 argument-hint: "[target repo path]"
-allowed-tools: AskUserQuestion, Read, Write, Edit, Bash(curl:*), Bash(sh:*), Bash(uname:*), Bash(cargo:*), Bash(rustup:*), Bash(hallouminate:*), Bash(git:*), Bash(claude:*), Bash(codex:*), Bash(copilot:*), Bash(gemini:*), Bash(which:*), Bash(command:*), Bash(protoc:*)
+allowed-tools: AskUserQuestion, Read, Write, Edit, Bash(npm:*), Bash(curl:*), Bash(sh:*), Bash(uname:*), Bash(cargo:*), Bash(rustup:*), Bash(hallouminate:*), Bash(git:*), Bash(claude:*), Bash(codex:*), Bash(copilot:*), Bash(gemini:*), Bash(which:*), Bash(command:*), Bash(protoc:*)
 ---
 
 # Install hallouminate & start your first wiki
@@ -34,7 +34,7 @@ fall through:
 
 - **Intel macOS (`Darwin x86_64`)**: no prebuilt — the `ort` (ONNX Runtime)
   dependency ships no x86_64-darwin binary. Say so loudly and go straight to
-  the source build (Phase 2, step 3), which needs Rust and `protoc`.
+  the source build (Phase 2, step 4), which needs Rust and `protoc`.
 - **Windows**: unsupported entirely (prebuilt *and* source) — the daemon is
   Unix-only (Unix domain socket + `flock`). Point at
   <https://github.com/paulnsorensen/hallouminate/issues/48> and stop.
@@ -43,9 +43,19 @@ fall through:
 
 Try each step in order and stop at the first that leaves `hallouminate
 --version` working. No Rust toolchain or `protoc` is needed unless you reach
-step 3.
+step 4.
 
-1. **Prebuilt installer (default):**
+1. **npm (preferred, when `npm` is available):**
+
+   ```sh
+   npm install -g hallouminate
+   ```
+
+   The package is a thin shim — its postinstall downloads the prebuilt for the
+   detected platform from the matching GitHub release and the global install
+   puts `hallouminate` on PATH.
+
+2. **Prebuilt installer (no node needed):**
 
    ```sh
    curl --proto '=https' --tlsv1.2 -LsSf \
@@ -56,10 +66,10 @@ step 3.
    where it installed (typically `~/.cargo/bin` if you have one, else
    `~/.local/bin`). Make sure that directory is on PATH.
 
-2. **cargo binstall (if already installed):** `cargo binstall hallouminate`
+3. **cargo binstall (if already installed):** `cargo binstall hallouminate`
    — fetches the same prebuilt via the Release's `dist-manifest.json`.
 
-3. **Source build (fallback; required on Intel macOS):** needs `cargo`
+4. **Source build (fallback; required on Intel macOS):** needs `cargo`
    (<https://rustup.rs>) and `protoc` (`brew install protobuf` on macOS,
    `sudo apt-get install -y protobuf-compiler` on Debian/Ubuntu). Then:
 
