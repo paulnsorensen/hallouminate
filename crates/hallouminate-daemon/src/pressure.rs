@@ -5,21 +5,28 @@
 //! any parse failure) pressure is treated as not elevated — fail-open, since
 //! pressure can never block maintenance where it cannot be measured.
 
+#[cfg(any(target_os = "linux", test))]
 use std::fs;
+#[cfg(any(target_os = "linux", test))]
 use std::path::Path;
+#[cfg(any(target_os = "linux", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Threshold (percent) above which PSI `some avg10` counts as elevated I/O
 /// pressure. Starting value, uncalibrated against production data.
+#[cfg(any(target_os = "linux", test))]
 const PSI_ELEVATED_THRESHOLD: f64 = 10.0;
 
 /// Kernel PSI file the Linux probe reads.
+#[cfg(target_os = "linux")]
 const PSI_PATH: &str = "/proc/pressure/io";
 
 /// Guards the fail-open debug logs so each distinct fail reason (missing
 /// file vs. unparseable contents) is reported once, not on every
 /// maintenance cycle.
+#[cfg(any(target_os = "linux", test))]
 static PSI_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+#[cfg(any(target_os = "linux", test))]
 static PSI_UNPARSEABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Host I/O pressure signal, injected into the maintenance loop so tests can
@@ -45,6 +52,7 @@ impl IoPressureProbe for PsiProbe {
 /// threshold. Fail-open: a missing or unparseable file is not elevated, and the
 /// condition is logged once at debug. Path-parameterized so tests can point at
 /// a synthetic or absent file.
+#[cfg(any(target_os = "linux", test))]
 fn psi_elevated_at(path: &Path) -> bool {
     match fs::read_to_string(path) {
         Ok(contents) => match parse_some_avg10(&contents) {
@@ -69,6 +77,7 @@ fn psi_elevated_at(path: &Path) -> bool {
 
 /// Emits a fail-open condition at debug exactly once per process per `guard`,
 /// so a persistently absent/unparseable PSI file does not log every cycle.
+#[cfg(any(target_os = "linux", test))]
 fn log_fail_open(guard: &'static AtomicBool, message: &'static str) {
     if !guard.swap(true, Ordering::Relaxed) {
         tracing::debug!(target: "hallouminate::daemon", "{message}");
@@ -77,6 +86,7 @@ fn log_fail_open(guard: &'static AtomicBool, message: &'static str) {
 
 /// Parses the "some avg10=<value>" field out of `/proc/pressure/io`'s
 /// contents, e.g. `some avg10=12.34 avg60=8.01 avg300=3.20 total=123456`.
+#[cfg(any(target_os = "linux", test))]
 fn parse_some_avg10(contents: &str) -> Option<f64> {
     contents
         .lines()
