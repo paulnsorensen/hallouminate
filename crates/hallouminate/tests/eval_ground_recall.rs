@@ -32,6 +32,7 @@ const JINA_ID: &str = "fusion-with-jina-reranker-v1-turbo-en";
 const JINA_MODEL: &str = "jina-reranker-v1-turbo-en";
 const CHUNK_BUDGET_TOKENS: usize = 384;
 const GROUND_RPC_GRACE_MS: u64 = 60_000;
+const EVALUATION_RERANK_TIMEOUT_MS: u64 = 5_000;
 const FOOTNOTE_INVERSION_ID: &str = "footnote-inversion";
 const MODEL_LOAD_MARKER: &str = "cold model load failed";
 const RERANK_TIMEOUT_MARKER: &str = "rerank timeout";
@@ -409,9 +410,17 @@ fn validate_fixture_labels_with_production_tokenizer(queries: &[LabelledQuery]) 
     validate_fixture_labels(queries, tokenizer)
 }
 
+fn rerank_timeout_ms(arm: ArmSpec<'_>) -> u64 {
+    match arm.model {
+        Some(_) => EVALUATION_RERANK_TIMEOUT_MS,
+        None => SearchConfig::default().rerank_timeout_ms,
+    }
+}
+
 fn build_config(arm: ArmSpec<'_>, ground_dir: &Path) -> Config {
     let search = SearchConfig {
         crossencoder: arm.model.map(|model| model.to_string()),
+        rerank_timeout_ms: rerank_timeout_ms(arm),
         ..Default::default()
     };
     Config {
@@ -500,17 +509,14 @@ async fn index_fixture(
     Ok(())
 }
 
-fn ground_rpc_timeout() -> Duration {
-    Duration::from_millis(
-        SearchConfig::default()
-            .rerank_timeout_ms
-            .saturating_add(GROUND_RPC_GRACE_MS),
-    )
+fn ground_rpc_timeout(arm: ArmSpec<'_>) -> Duration {
+    Duration::from_millis(rerank_timeout_ms(arm).saturating_add(GROUND_RPC_GRACE_MS))
 }
 
 async fn ground_query(
     client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
+    arm: ArmSpec<'_>,
     query: &LabelledQuery,
 ) -> Result<GroundResponse> {
     let response = client
@@ -526,7 +532,7 @@ async fn ground_query(
                     snippet_chars: None,
                 }),
             },
-            ground_rpc_timeout(),
+            ground_rpc_timeout(arm),
         )
         .await
         .with_context(|| format!("ground query {}", query.id))?;
@@ -601,7 +607,7 @@ async fn run_sweep(
 ) -> Result<Vec<QueryMeasurement>> {
     let mut measurements = Vec::with_capacity(queries.len());
     for query in queries {
-        let response = ground_query(client, cwd, query).await?;
+        let response = ground_query(client, cwd, arm, query).await?;
         let rerank_completed = rerank_completion(&response, arm, &query.id)?;
         let ranked = ranked_docs(&response.docs);
         let rank = rank_of_expected(&ranked, &query.expected_chunk.file);
@@ -1265,19 +1271,25 @@ fn evaluation_arms_derive_from_production_defaults() {
     let candidate = build_config(JINA_ARM, temp.path());
     let expected_search = SearchConfig {
         crossencoder: Some(JINA_MODEL.to_string()),
+        rerank_timeout_ms: EVALUATION_RERANK_TIMEOUT_MS,
         ..Default::default()
     };
     assert_eq!(candidate.embeddings, embeddings);
     assert_eq!(candidate.search, expected_search);
+    assert!(
+        candidate.search.rerank_timeout_ms > SearchConfig::default().rerank_timeout_ms,
+        "the Jina measurement needs its own bounded timeout so a slow valid inference does not become a fallback"
+    );
 
     assert_eq!(baseline_arms(), [BASELINE_ARM]);
     assert_eq!(diagnostic_arms(), [BASELINE_ARM, JINA_ARM]);
 }
 
 #[test]
-fn ground_rpc_deadline_exceeds_production_rerank_timeout() {
-    let search = SearchConfig::default();
-    assert!(ground_rpc_timeout() > Duration::from_millis(search.rerank_timeout_ms));
+fn ground_rpc_deadline_exceeds_each_arm_rerank_timeout() {
+    for arm in [BASELINE_ARM, JINA_ARM] {
+        assert!(ground_rpc_timeout(arm) > Duration::from_millis(rerank_timeout_ms(arm)));
+    }
 }
 
 fn synthetic_identity(file: &str) -> ChunkIdentity {
