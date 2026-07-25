@@ -1,85 +1,107 @@
-# Ground retrieval eval (#150)
+# Ground retrieval evaluation (#288)
 
-A fixed, small-scale eval harness for `hallouminate ground`'s retrieval
-quality, used to gate #149's z-score threshold decision.
+This model-backed integration target measures the production daemon ground path
+before a reranker default may change.
 
-## Corpus: `fixtures/wiki/`
+## Corpus and queries
 
-A frozen snapshot of this repo's own `.hallouminate/wiki/` at commit
-`3d466ca` (16 pages, ~9.6k words). Frozen rather than pointed at the live
-wiki so the eval is reproducible — the live wiki keeps changing as new pages
-land, which would silently shift recall/MRR between runs for reasons
-unrelated to the retrieval code under test. Copied verbatim (`cp -R`), never
-hand-edited.
+`fixtures/wiki/` is a deliberate frozen corpus. Issue #288 refreshes only the
+files needed by the new cases: live `architecture.md` (including the citation
+definitions after `## Testing`) and `worktree-corpus-identity.md`. Do not copy
+`ground-search-evaluation.md`: it contains the literal eval query and would be a
+meta-distractor rather than user knowledge.
 
-To refresh the snapshot after a deliberate wiki restructure:
+`queries.json` labels every query with one exact expected chunk:
+`{file, heading_path, line_start}`. Before any model-backed variant starts, the
+engine prepares the frozen Markdown through the production handler and BGE
+chunker and rejects any label that is not an actual prepared chunk. The set
+includes footnote inversion, worktree isolation, paraphrase, and
+lexical-distractor cases. Every measured variant records the expected and actual
+top identity plus pass/fail. Only the locked `footnote-inversion` case must pass
+every variant; requiring every query to pass every variant would force MRR to
+1.0 and erase the comparison signal.
 
+## Variants and measurement
+
+The reporting matrix contains ten variants:
+
+- `lexical-without-rerank`
+- one `lexical-with-{model}` variant for each of the four models below
+- `fusion-without-rerank`
+- one `fusion-with-{model}` variant for each of the four models below
+
+The candidate inventory remains exactly `SUPPORTED_CROSSENCODER_MODELS` from the
+pinned fastembed dependency:
+
+- `bge-reranker-base` — 1,112,459,588 weight bytes
+- `bge-reranker-v2-m3` — 2,271,197,135 weight bytes
+- `jina-reranker-v1-turbo-en` — 151,296,975 weight bytes
+- `jina-reranker-v2-base-multiligual` — 1,114,040,223 weight bytes
+
+Each variant indexes once, runs and discards one complete warm-up sweep, then
+measures the identical query sweep. Per-query latency comes from
+`GroundResponse.took_ms`. Reranked queries must carry a non-null rerank signal;
+a timeout fallback makes the measurement incomplete. Both retrieval modes use
+the same persistent model cache, while their fixed embedding configurations
+require separate daemon runs.
+
+The artifact records Recall@5, MRR, every file rank and top-chunk assertion,
+warmed per-query latency, and warmed p50. p50 is nearest-rank after sorting,
+using zero-based index `(n - 1) / 2`; an even sweep therefore uses its lower
+middle. Reporting deltas compare each reranked variant to the no-rerank baseline
+for the same retrieval mode.
+
+Only the four `fusion-with-{model}` variants participate in qualification and
+deterministic selection against `fusion-without-rerank`. A fusion candidate
+qualifies at MRR gain `>= 0.05` and added p50 `<= 500 ms`; comparison order is
+added p50, weight bytes, then stable model identifier. Lexical variants remain
+reporting-only even when their metrics cross those thresholds. Measurement
+records the inputs and qualification results; it does not choose or change the
+runtime default.
+
+## Committed decision
+
+The first complete sweep selected `none-qualified`, so `search.crossencoder`
+remains opt-in. `fusion-without-rerank` measured MRR `0.8917` at p50 `46 ms`.
+The fusion candidates measured:
+
+| Model | MRR | Gain | p50 | Added p50 | Qualifies |
+|---|---:|---:|---:|---:|---|
+| `bge-reranker-base` | 0.9375 | +0.0458 | 2,678 ms | 2,632 ms | no |
+| `bge-reranker-v2-m3` | 0.9167 | +0.0250 | 8,403 ms | 8,357 ms | no |
+| `jina-reranker-v1-turbo-en` | 0.8611 | -0.0306 | 1,054 ms | 1,008 ms | no |
+| `jina-reranker-v2-base-multiligual` | 0.9583 | +0.0667 | 3,318 ms | 3,272 ms | no |
+
+The committed measurements and decision are in `baseline.json`.
+
+## Commands
+
+```sh
+just eval-measure
+just eval
 ```
-rm -rf eval/fixtures/wiki && cp -R .hallouminate/wiki eval/fixtures/wiki
-```
 
-and update this file's pinned commit hash + `eval/queries.json` if page
-names or content moved.
+`just eval-measure` writes only the requested artifact through
+`HALLOUMINATE_EVAL_OUTPUT`. Relative output paths resolve from the repository
+root, so the default lands at `.context/issue-288-eval-results.json` regardless
+of Cargo's test working directory. The command rejects any normalized or
+canonical alias of `eval/baseline.json` and verifies that the baseline bytes did
+not change. It does not check runtime default agreement.
 
-## Query set: `queries.json`
+`just eval` reads the committed baseline, reruns the production matrix, and
+fails on missing variants or results, query-set digest drift, Recall@5/MRR floor
+regressions, committed top-chunk pass-to-fail changes, invalid qualification
+calculations, or runtime defaults that disagree with the recorded decision.
+Every reporting variant is subject to floors and regression enforcement. A
+selected decision must agree with `SearchConfig::default()`, the domain default
+model constant, and the active CLI template value. A none-qualified decision
+requires reranking to remain disabled in `SearchConfig` and the CLI template,
+with the domain constant retained as the single commented opt-in model. Latency
+remains the locked qualification contract; there is no separate latency-jitter
+failure policy.
 
-26 labelled queries, `{id, query, expected: [filename]}`. Two queries per
-richer page (9 pages), aimed at distinct sections/paragraphs of that page so
-a single query can't get lucky on page-level keyword density; one query per
-shorter page or log-style page (7 pages: `index.md`, `log.md`, and similar).
-Queries are short natural-language phrases lifted from the page's own
-terminology (e.g. "claim mark HTML comment syntax confirmed superseded
-contradicted" for `claim-provenance-marks.md`) — this makes them easy for
-lexical/BM25 search by construction. See **Caveat** below.
-
-`expected` is a list (usually length 1) of filenames under `fixtures/wiki/`;
-a hit is scored the moment any ranked result's absolute path ends with one
-of the expected filenames.
-
-## Running it
-
-```
-cargo test --test eval_ground_recall -- --ignored --nocapture
-```
-
-`#[ignore]`d like `tests/cli_ground.rs`'s model-dependent test: needs network
-for the crossencoder model download (~147MB, first run only) and takes
-several minutes (four full daemon-index-query cycles).
-
-## Metrics
-
-For each of 4 configs (lexical-only, fusion-only, lexical+rerank,
-fusion+rerank) and each query: rank of the first result whose path matches
-`expected` (1-indexed, `None` if absent after the top-10 file cap, drawn
-from a 50-chunk candidate pool).
-
-- **Recall@5** — fraction of queries where that rank is `<= 5`.
-- **MRR** — mean of `1/rank` (`0` when absent).
-
-The fusion+rerank run additionally sweeps z-score thresholds
-`[-2, -1, -0.5, 0, 0.5, 1, 2]` against the top-1 result's `z_score`, showing
-how many queries a given cutoff would keep vs. drop, and how many of those
-kept are actually correct at rank 1 — this is the #149 calibration input.
-
-## Embedding model substitution
-
-The config's default embedding model (`snowflake/snowflake-arctic-embed-s`) has no
-cached ONNX weight blob in `~/.cache/hallouminate/fastembed` on this
-machine (only tokenizer/config files) — using it would trigger a second
-model download. The eval pins `BAAI/bge-small-en-v1.5` (quantized) instead,
-which is already fully cached. This means the eval does not measure the
-config-default embedding model; treat the fusion-variant numbers as
-representative of "a small bge-family embedding model", not the shipped
-default specifically.
-
-## Caveat: this query set does not discriminate between configs
-
-All 4 configs scored Recall@5 = 1.000 on this query set (MRR 0.981-1.000,
-see `.cheese/research/ground-retrieval-eval/findings.md`). The queries were
-constructed by lifting distinctive terminology directly from each target
-page, which makes them easy hits for lexical/BM25 search alone — the
-fusion and rerank variants have no low-recall queries left to improve on.
-A query set built this way over a 16-page corpus cannot show whether
-embeddings or reranking earn their cost; a harder eval (paraphrased queries,
-no shared vocabulary with the target page, or a much larger corpus with more
-lexical distractors) would be needed to answer that question.
+Both entry points are ignored tests because first use downloads multiple large
+ONNX artifacts and the full CPU sweep is expensive. Ordinary tests still run
+the prepared-label, p50, candidate and matrix, qualification-ordering,
+default-agreement, comparator, artifact-isolation, and authoring-guidance checks
+without loading models.

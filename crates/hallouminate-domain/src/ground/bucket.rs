@@ -168,6 +168,7 @@ mod tests {
     fn hit(file_ref: &str, ord: usize, score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#{ord}"),
+            corpus_key: crate::common::CorpusKey::from_configured_root("docs", "/"),
             file_ref: file_ref.into(),
             heading_path: vec!["section".into()],
             line_start: ord + 1,
@@ -360,6 +361,7 @@ mod tests {
     fn hit_with_score(score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("c#{score}"),
+            corpus_key: crate::common::CorpusKey::from_configured_root("docs", "/"),
             file_ref: "/f.md".into(),
             heading_path: vec![],
             line_start: 1,

@@ -217,8 +217,8 @@ pub fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>
     let mut entries: Vec<FileEntry> = scan(corpus)
         .map_err(anyhow::Error::from)?
         .into_iter()
-        .map(|(file, _)| {
-            let absolute = file.into_path_buf();
+        .map(|scanned| {
+            let absolute = scanned.file.into_path_buf();
             let relative = roots
                 .iter()
                 .find_map(|r| absolute.strip_prefix(r).ok())

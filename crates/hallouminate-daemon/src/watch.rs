@@ -24,7 +24,9 @@ use notify::RecursiveMode;
 use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 
 use hallouminate_adapters::LanceStore;
-use hallouminate_domain::common::{CorpusConfig, canonicalize_or_passthrough, expand_tilde};
+use hallouminate_domain::common::{
+    CorpusConfig, CorpusKey, canonicalize_or_passthrough, expand_tilde,
+};
 use hallouminate_domain::corpus::ensure_corpus_allows_file;
 
 use super::churn::{ChurnTracker, ReindexEffect};
@@ -485,7 +487,7 @@ async fn handle_changed_path(
     // snapshot before taking any lock or reading any bytes. Equal means the
     // event is a no-op (e.g. the access-event feedback loop that burned 200%
     // CPU) and is shed for the price of one stat + one snapshot row read.
-    if mtime_matches_last_index(&store, &corpus.name, path).await {
+    if mtime_matches_last_index(&store, corpus, path).await {
         tracing::debug!(
             target: "hallouminate::daemon",
             corpus = %corpus.name,
@@ -581,9 +583,17 @@ async fn handle_changed_path(
         // resolving the symlink). Rebuild the key from the root we canonicalized
         // at setup (`canonical_watched`) joined with the path's tail under the
         // watched dir, so the prune matches regardless of symlinked ancestors.
+        let canonical_root = match &owner.canonical_file_root {
+            Some(file_root) => file_root,
+            None => &owner.canonical_watched,
+        };
+        let corpus_key = CorpusKey {
+            name: corpus.name.clone(),
+            canonical_root: canonical_root.clone(),
+        };
         let file_ref = delete_file_ref(owner, path);
         if let Some(file_ref_str) = file_ref.as_path().to_str()
-            && let Err(e) = store.delete_file(&corpus.name, file_ref_str).await
+            && let Err(e) = store.delete_file(&corpus_key, file_ref_str).await
         {
             tracing::warn!(
                 target: "hallouminate::daemon",
@@ -608,7 +618,7 @@ async fn handle_changed_path(
 /// `false`: the gate only skips work it can prove redundant; anything
 /// unprovable proceeds to the full read-and-index path, which owns the loud
 /// error handling.
-async fn mtime_matches_last_index(store: &LanceStore, corpus: &str, path: &Path) -> bool {
+async fn mtime_matches_last_index(store: &LanceStore, corpus: &CorpusConfig, path: &Path) -> bool {
     let Ok(meta) = path.symlink_metadata() else {
         return false;
     };
@@ -628,7 +638,13 @@ async fn mtime_matches_last_index(store: &LanceStore, corpus: &str, path: &Path)
     let Some(file_ref) = file_ref.as_path().to_str() else {
         return false;
     };
-    match store.get_file_snapshot(corpus, file_ref).await {
+    let Some(corpus_key) = corpus
+        .corpus_key_for_path(path)
+        .or_else(|| corpus.primary_corpus_key())
+    else {
+        return false;
+    };
+    match store.get_file_snapshot(&corpus_key, file_ref).await {
         Ok(Some(snap)) => snap.mtime_ms == mtime_ms,
         Ok(None) => false,
         Err(e) => {
@@ -643,9 +659,9 @@ async fn mtime_matches_last_index(store: &LanceStore, corpus: &str, path: &Path)
     }
 }
 
-/// Find the baseline corpus that owns `path`: the deepest watched root that is
-/// a prefix of `path` and whose membership rule accepts it. Deepest-first so a
-/// nested corpus root wins over a parent root.
+/// Find the baseline corpus that owns `path`: the deepest configured root that
+/// is a prefix of `path` and whose membership rule accepts it. Deepest-first so
+/// a nested file or directory corpus root wins over its watched parent root.
 ///
 /// Membership mirrors `walker::scan`: a directory root accepts any descendant
 /// the corpus' globs/exclude allow, while a **file-path** root (watched at its
@@ -673,7 +689,11 @@ fn owning_corpus<'r>(roots: &'r [WatchRoot], path: &Path) -> Option<&'r WatchRoo
             None if ensure_corpus_allows_file(&root.corpus, path).is_err() => continue,
             _ => {}
         }
-        let depth = root.canonical_watched.components().count();
+        let configured_root = root
+            .canonical_file_root
+            .as_ref()
+            .unwrap_or(&root.canonical_watched);
+        let depth = configured_root.components().count();
         if best.as_ref().is_none_or(|(d, _)| depth > *d) {
             best = Some((depth, root));
         }
@@ -951,6 +971,178 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_root_deletion_prunes_the_exact_declared_file_key() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let file = tmp.path().join("CLAUDE.md");
+        std::fs::write(&file, "# Config\n\nbody\n").expect("write file root");
+        let corpus = corpus("config", file.to_str().unwrap(), &["**/*.md"]);
+        let owner = build_watch_root(&corpus, file.to_str().unwrap()).expect("file watch root");
+        let event_path = owner
+            .canonical_file_root
+            .clone()
+            .expect("file root keeps the declared file identity");
+        let corpus_key = corpus.primary_corpus_key().expect("file corpus key");
+        assert_eq!(corpus_key.canonical_root, event_path);
+        let roots = vec![owner];
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+
+        handle_changed_path(&state, &roots, &event_path, &mut failures, &mut churn).await;
+        let file_ref = event_path.to_str().expect("UTF-8 file root");
+        let indexed = state
+            .store()
+            .get_file_snapshot(&corpus_key, file_ref)
+            .await
+            .expect("snapshot query")
+            .expect("file root must be indexed under its exact declared key");
+        assert_eq!(indexed.corpus_key, corpus_key);
+
+        std::fs::remove_file(&event_path).expect("remove file root");
+        handle_changed_path(&state, &roots, &event_path, &mut failures, &mut churn).await;
+        assert!(
+            state
+                .store()
+                .get_file_snapshot(&corpus_key, file_ref)
+                .await
+                .expect("snapshot query after delete")
+                .is_none(),
+            "file-root deletion must prune the exact declared-file identity",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn overlapping_directory_and_file_roots_choose_and_prune_the_file_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let directory = tmp.path().join("config");
+        std::fs::create_dir_all(&directory).expect("mkdir config");
+        let directory = directory.canonicalize().expect("canonicalize config");
+        let file = directory.join("CLAUDE.md");
+        std::fs::write(&file, "# Config\n\nbody\n").expect("write file root");
+
+        let directory_corpus = corpus("directory", directory.to_str().unwrap(), &["**/*.md"]);
+        let file_corpus = corpus("file", file.to_str().unwrap(), &["**/*.md"]);
+        let directory_owner = build_watch_root(&directory_corpus, directory.to_str().unwrap())
+            .expect("directory watch root");
+        let file_owner =
+            build_watch_root(&file_corpus, file.to_str().unwrap()).expect("file watch root");
+        let event_path = file_owner
+            .canonical_file_root
+            .clone()
+            .expect("file root keeps the declared file identity");
+        let directory_key = directory_corpus
+            .primary_corpus_key()
+            .expect("directory corpus key");
+        let file_key = file_corpus.primary_corpus_key().expect("file corpus key");
+        let roots = vec![directory_owner, file_owner];
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+
+        assert_eq!(
+            name_of(owning_corpus(&roots, &event_path)).as_deref(),
+            Some("file"),
+            "the deepest configured root must win even when its watcher uses the parent directory",
+        );
+        handle_changed_path(&state, &roots, &event_path, &mut failures, &mut churn).await;
+        let file_ref = event_path.to_str().expect("UTF-8 file root");
+        let indexed = state
+            .store()
+            .get_file_snapshot(&file_key, file_ref)
+            .await
+            .expect("file-root snapshot query")
+            .expect("overlapping roots must index under the file-root identity");
+        assert_eq!(indexed.corpus_key, file_key);
+        assert!(
+            state
+                .store()
+                .get_file_snapshot(&directory_key, file_ref)
+                .await
+                .expect("directory-root snapshot query")
+                .is_none(),
+            "configured order must not make the shallower directory own the file",
+        );
+
+        std::fs::remove_file(&event_path).expect("remove file root");
+        assert_eq!(
+            name_of(owning_corpus(&roots, &event_path)).as_deref(),
+            Some("file"),
+            "the absent file must still resolve to the deepest configured root for pruning",
+        );
+        handle_changed_path(&state, &roots, &event_path, &mut failures, &mut churn).await;
+        assert!(
+            state
+                .store()
+                .get_file_snapshot(&file_key, file_ref)
+                .await
+                .expect("file-root snapshot query after delete")
+                .is_none(),
+            "overlapping-root deletion must not leave a stale file-root row",
+        );
+        assert!(
+            state
+                .store()
+                .get_file_snapshot(&directory_key, file_ref)
+                .await
+                .expect("directory-root snapshot query after delete")
+                .is_none(),
+            "overlapping-root deletion must not create or retain a directory-root row",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_root_deletion_keeps_the_directory_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir corpus");
+        let root = root.canonicalize().expect("canonicalize corpus");
+        let file = root.join("note.md");
+        std::fs::write(&file, "# Note\n\nbody\n").expect("write note");
+        let corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        let owner =
+            build_watch_root(&corpus, root.to_str().unwrap()).expect("directory watch root");
+        let corpus_key = corpus.primary_corpus_key().expect("directory corpus key");
+        assert_eq!(corpus_key.canonical_root, owner.canonical_watched);
+        let roots = vec![owner];
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+
+        handle_changed_path(&state, &roots, &file, &mut failures, &mut churn).await;
+        let file_ref = file.to_str().expect("UTF-8 file");
+        assert!(
+            state
+                .store()
+                .get_file_snapshot(&corpus_key, file_ref)
+                .await
+                .expect("snapshot query")
+                .is_some(),
+            "directory-root indexing must use the directory identity",
+        );
+
+        std::fs::remove_file(&file).expect("remove note");
+        handle_changed_path(&state, &roots, &file, &mut failures, &mut churn).await;
+        assert!(
+            state
+                .store()
+                .get_file_snapshot(&corpus_key, file_ref)
+                .await
+                .expect("snapshot query after delete")
+                .is_none(),
+            "directory-root deletion must keep pruning by directory identity",
+        );
+    }
+
     /// ADR-003 regression: the delete/prune branch of `handle_changed_path`
     /// acquired no connection guard and never touched the activity clock, so
     /// idle-exit could tear down the daemon (and release the single-instance
@@ -1179,6 +1371,10 @@ mod tests {
             corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
             None,
         )];
+        let corpus_key = roots[0]
+            .corpus
+            .primary_corpus_key()
+            .expect("wiki corpus key");
         let mut failures = disabled_coalescer();
         let mut churn = disabled_churn();
         handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
@@ -1190,7 +1386,7 @@ mod tests {
             .to_string();
         let indexed = state
             .store()
-            .get_file_snapshot("wiki", &file_ref)
+            .get_file_snapshot(&corpus_key, &file_ref)
             .await
             .expect("snapshot query")
             .expect("initial index must store a snapshot");
@@ -1210,7 +1406,7 @@ mod tests {
         );
         let after = state
             .store()
-            .get_file_snapshot("wiki", &file_ref)
+            .get_file_snapshot(&corpus_key, &file_ref)
             .await
             .expect("snapshot query")
             .expect("snapshot must survive the skip");
@@ -1258,6 +1454,10 @@ mod tests {
             corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
             None,
         )];
+        let corpus_key = roots[0]
+            .corpus
+            .primary_corpus_key()
+            .expect("wiki corpus key");
         let file_ref = canonicalize_or_passthrough(&note)
             .as_path()
             .to_str()
@@ -1270,7 +1470,7 @@ mod tests {
         handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
         let good = state
             .store()
-            .get_file_snapshot("wiki", &file_ref)
+            .get_file_snapshot(&corpus_key, &file_ref)
             .await
             .expect("snapshot query")
             .expect("a real in-root file must be indexed");
@@ -1300,7 +1500,7 @@ mod tests {
         assert!(
             state
                 .store()
-                .get_file_snapshot("wiki", &secret_ref)
+                .get_file_snapshot(&corpus_key, &secret_ref)
                 .await
                 .expect("snapshot query")
                 .is_none(),
@@ -1313,7 +1513,7 @@ mod tests {
         // untouched by the rejected reindex.
         let after = state
             .store()
-            .get_file_snapshot("wiki", &file_ref)
+            .get_file_snapshot(&corpus_key, &file_ref)
             .await
             .expect("snapshot query")
             .expect("the snapshot must survive a rejected symlink reindex");

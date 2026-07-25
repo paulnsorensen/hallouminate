@@ -41,8 +41,8 @@ use hallouminate_domain::ground::{
 };
 use hallouminate_domain::indexer::HandlerRegistry;
 use hallouminate_domain::indexer::{
-    ApplyStats, ChunkStore, DEFAULT_BATCH_SIZE, FileSnapshot, IndexPlan, MtimeCandidate, apply,
-    index_corpus, plan,
+    ApplyStats, ChunkStore, DEFAULT_BATCH_SIZE, IndexPlan, MtimeCandidate, apply, index_corpus,
+    plan,
 };
 #[cfg(test)]
 use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
@@ -296,32 +296,42 @@ async fn handle_corpus_stats(
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
     let store = &res.store;
-    let chunk_stats = match store.corpus_chunk_stats(&corpus_cfg.name).await {
-        Ok(s) => s,
-        Err(e) => return DaemonResponse::internal(e.to_string()),
-    };
-    // Ensure wiki dir exists so an unindexed wiki corpus doesn't error
-    // out on a missing root — mirrors handle_list_files.
+    let mut indexed_files = 0;
+    let mut total_chunks = 0;
+    let mut last_indexed_ms = None;
+    let mut indexed_paths = std::collections::HashSet::new();
+    for corpus_key in corpus_cfg.corpus_keys() {
+        let chunk_stats = match store.corpus_chunk_stats(&corpus_key).await {
+            Ok(s) => s,
+            Err(e) => return DaemonResponse::internal(e.to_string()),
+        };
+        indexed_files += chunk_stats.indexed_files;
+        total_chunks += chunk_stats.total_chunks;
+        last_indexed_ms = last_indexed_ms.max(chunk_stats.last_indexed_ms);
+        let snapshots = match store.list_files(&corpus_key).await {
+            Ok(m) => m,
+            Err(e) => return DaemonResponse::internal(e.to_string()),
+        };
+        for snapshot in snapshots {
+            indexed_paths.insert(snapshot.file_ref);
+        }
+    }
     ensure_paths_exist(&corpus_cfg).await;
     let disk_files = match list_corpus_files(&corpus_cfg) {
         Ok(f) => f,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    let indexed_files = match store.list_files(&corpus_cfg.name).await {
-        Ok(m) => m,
-        Err(e) => return DaemonResponse::internal(e.to_string()),
-    };
-    let indexed_paths: std::collections::HashSet<String> =
-        indexed_files.into_iter().map(|s| s.file_ref).collect();
-    let unindexed_files = disk_files
-        .iter()
-        .filter(|e| !indexed_paths.contains(&e.absolute_path))
-        .count() as u64;
+    let mut unindexed_files = 0;
+    for entry in disk_files {
+        if !indexed_paths.contains(&entry.absolute_path) {
+            unindexed_files += 1;
+        }
+    }
     DaemonResponse::ok(&CorpusStatsResult {
         corpus: corpus_cfg.name,
-        indexed_files: chunk_stats.indexed_files,
-        total_chunks: chunk_stats.total_chunks,
-        last_indexed_ms: chunk_stats.last_indexed_ms,
+        indexed_files,
+        total_chunks,
+        last_indexed_ms,
         unindexed_files,
     })
 }
@@ -389,21 +399,9 @@ async fn handle_ground(
         crossencoder.map(|g| Box::new(g) as Box<dyn hallouminate_domain::search::Crossencoder>);
 
     let response = if let Some(corpus) = &single_corpus {
-        ground(
-            &req.query,
-            &corpus.name,
-            &corpus.paths,
-            store.as_ref(),
-            crossencoder_box,
-            opts,
-        )
-        .await
+        ground(&req.query, corpus, store.as_ref(), crossencoder_box, opts).await
     } else {
-        let targets: Vec<(String, Vec<String>)> = corpora
-            .iter()
-            .map(|c| (c.name.clone(), c.paths.clone()))
-            .collect();
-        ground_union(&req.query, &targets, store.as_ref(), crossencoder_box, opts).await
+        ground_union(&req.query, &corpora, store.as_ref(), crossencoder_box, opts).await
     };
     let mut response = match response {
         Ok(r) => r,
@@ -826,8 +824,12 @@ async fn handle_add_markdown(
             let file_ref = canonicalize_or_passthrough(&dest);
             if let Some(file_ref_str) = file_ref.as_path().to_str() {
                 let store = &res.store;
-                match store.get_file_snapshot(&corpus.name, file_ref_str).await {
-                    Ok(Some(_)) => match store.delete_file(&corpus.name, file_ref_str).await {
+                let corpus_key = corpus
+                    .corpus_key_for_path(file_ref.as_path())
+                    .or_else(|| corpus.primary_corpus_key())
+                    .expect("validated corpus has at least one root");
+                match store.get_file_snapshot(&corpus_key, file_ref_str).await {
+                    Ok(Some(_)) => match store.delete_file(&corpus_key, file_ref_str).await {
                         Ok(()) => stats.files_deleted = 1,
                         Err(e) => return DaemonResponse::internal(e.to_string()),
                     },
@@ -1138,7 +1140,11 @@ async fn handle_delete_markdown(
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    if let Err(e) = res.store.delete_file(&corpus.name, &file_ref_str).await {
+    let corpus_key = corpus
+        .corpus_key_for_path(Path::new(&file_ref_str))
+        .or_else(|| corpus.primary_corpus_key())
+        .expect("validated corpus has at least one root");
+    if let Err(e) = res.store.delete_file(&corpus_key, &file_ref_str).await {
         return DaemonResponse::internal(e.to_string());
     }
 
@@ -1285,7 +1291,11 @@ pub(super) async fn index_single_file_with_content(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-utf8 path: {}", file_ref.as_path().display()))?
         .to_string();
-    let existing = store.get_file_snapshot(&corpus.name, &file_ref_str).await?;
+    let corpus_key = corpus
+        .corpus_key_for_path(file_ref.as_path())
+        .or_else(|| corpus.primary_corpus_key())
+        .expect("validated corpus has at least one root");
+    let existing = store.get_file_snapshot(&corpus_key, &file_ref_str).await?;
     // Truncate-to-empty eviction (files_skipped_empty > 0 for a file that HAD
     // a snapshot) is handled inside `apply`'s mtime-fallthrough batch — see
     // `EmptyFilePolicy::Evict` in `src/domain/indexer/apply.rs` — so both this
@@ -1406,20 +1416,35 @@ async fn catch_up_corpus(
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
 ) -> anyhow::Result<Option<hallouminate_domain::indexer::ApplyStats>> {
-    let disk = scan(corpus)?;
-    let db: HashMap<FileRef, FileSnapshot> = res
-        .store
-        .list_files(&corpus.name)
-        .await?
-        .into_iter()
-        .map(|s| (FileRef::new(std::path::PathBuf::from(&s.file_ref)), s))
-        .collect();
-    let p = plan(disk, db);
-    if p.upserts.is_empty() && p.mtime_touches.is_empty() && p.deletes.is_empty() {
+    let mut disk_by_key = HashMap::new();
+    for scanned in scan(corpus)? {
+        disk_by_key
+            .entry(scanned.corpus_key.clone())
+            .or_insert_with(Vec::new)
+            .push(scanned);
+    }
+
+    let mut combined = IndexPlan::default();
+    for corpus_key in corpus.corpus_keys() {
+        let disk = disk_by_key.remove(&corpus_key).unwrap_or_default();
+        let mut db = HashMap::new();
+        for snapshot in res.store.list_files(&corpus_key).await? {
+            let file = FileRef::new(std::path::PathBuf::from(&snapshot.file_ref));
+            db.insert(file, snapshot);
+        }
+        let mut root_plan = plan(disk, db);
+        combined.upserts.append(&mut root_plan.upserts);
+        combined.mtime_touches.append(&mut root_plan.mtime_touches);
+        combined.deletes.append(&mut root_plan.deletes);
+    }
+    if combined.upserts.is_empty()
+        && combined.mtime_touches.is_empty()
+        && combined.deletes.is_empty()
+    {
         return Ok(None);
     }
     let stats = apply(
-        p,
+        combined,
         res.store.as_ref(),
         registry,
         corpus,
@@ -1965,29 +1990,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catch_up_reindexes_changed_corpus_and_skips_unchanged() {
-        // AC #6: a corpus edited during the daemon's down-window is picked up
-        // by the boot catch-up sweep; a second pass over an unchanged corpus
-        // does no work (Ok(None)) and loads no model. Embeddings OFF keeps it
-        // hermetic.
+    async fn catch_up_indexes_and_deletes_across_multiple_roots_then_skips_no_work() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("docs_src");
-        std::fs::create_dir_all(&root).expect("mkdir docs_src");
+        let root_a = tmp.path().join("docs_a");
+        let root_b = tmp.path().join("docs_b");
+        std::fs::create_dir_all(&root_a).expect("mkdir docs_a");
+        std::fs::create_dir_all(&root_b).expect("mkdir docs_b");
         let ground = tmp.path().join("ground");
         let baseline = format!(
-            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n[embeddings]\nenabled = false\n",
-            root.display(),
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\", \"{}\"]\nglobs = [\"**/*.md\"]\n[embeddings]\nenabled = false\n",
+            root_a.display(),
+            root_b.display(),
         );
         let state = state_with_ground(&ground, &baseline).await;
-        std::fs::write(root.join("a.md"), "# Title\n\nbody\n").expect("write a.md");
+        std::fs::write(root_a.join("a.md"), "# Root A\n\nbody a\n").expect("write a.md");
+        let secondary = root_b.join("b.md");
+        std::fs::write(&secondary, "# Root B\n\nbody b\n").expect("write b.md");
 
         catch_up_index(state.clone()).await;
-        assert_eq!(
-            state.store().list_files("docs").await.expect("list").len(),
-            1,
-            "boot catch-up must index the file created during the down-window",
-        );
-
         let corpus = state
             .baseline()
             .effective_corpora()
@@ -1995,16 +2015,62 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "docs")
             .expect("docs corpus present");
+        let corpus_keys = corpus.corpus_keys();
+        assert_eq!(
+            corpus_keys.len(),
+            2,
+            "both configured roots need exact keys"
+        );
+        let root_a_files = state
+            .store()
+            .list_files(&corpus_keys[0])
+            .await
+            .expect("list root a");
+        let root_b_files = state
+            .store()
+            .list_files(&corpus_keys[1])
+            .await
+            .expect("list root b");
+        assert_eq!(root_a_files.len(), 1, "root A must be caught up");
+        assert_eq!(root_b_files.len(), 1, "root B must be caught up");
+        assert_eq!(root_a_files[0].corpus_key, corpus_keys[0]);
+        assert_eq!(root_b_files[0].corpus_key, corpus_keys[1]);
+
+        std::fs::remove_file(&secondary).expect("remove secondary file");
         let res = state
             .resources_for(state.baseline())
             .await
             .expect("resources_for");
+        let stats = catch_up_corpus(&res, &state.make_registry(), &corpus)
+            .await
+            .expect("catch_up_corpus")
+            .expect("secondary-root deletion needs work");
+        assert_eq!(stats.files_deleted, 1, "secondary root row must be pruned");
+        assert_eq!(
+            state
+                .store()
+                .list_files(&corpus_keys[0])
+                .await
+                .expect("list root a after delete")
+                .len(),
+            1,
+            "root A must survive root B deletion",
+        );
+        assert!(
+            state
+                .store()
+                .list_files(&corpus_keys[1])
+                .await
+                .expect("list root b after delete")
+                .is_empty(),
+            "root B deletion must remove only its exact rows",
+        );
         assert!(
             catch_up_corpus(&res, &state.make_registry(), &corpus)
                 .await
-                .expect("catch_up_corpus")
+                .expect("no-work catch_up_corpus")
                 .is_none(),
-            "an unchanged corpus must produce no work (Ok(None)) and load no model",
+            "an unchanged multi-root corpus must produce Ok(None)",
         );
     }
 
@@ -2334,22 +2400,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn corpus_stats_counts_indexed_and_unindexed_files() {
+    async fn corpus_stats_aggregate_multiple_exact_roots_without_exposing_identity() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let corpus_dir = tmp.path().join("wiki");
-        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        let root_a = tmp.path().join("wiki-a");
+        let root_b = tmp.path().join("wiki-b");
+        std::fs::create_dir_all(&root_a).expect("mkdir wiki-a");
+        std::fs::create_dir_all(&root_b).expect("mkdir wiki-b");
         let ground = tmp.path().join("ground");
-
+        let corpus = CorpusConfig {
+            name: "test".into(),
+            paths: vec![
+                root_a.to_string_lossy().into_owned(),
+                root_a.to_string_lossy().into_owned(),
+                root_b.to_string_lossy().into_owned(),
+            ],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        };
         let repo_config = format!(
-            "[[corpus]]\nname = \"test\"\npaths = [\"{}\"]\n",
-            corpus_dir.display()
+            "[[corpus]]\nname = \"test\"\npaths = [\"{}\", \"{}\", \"{}\"]\nglobs = [\"**/*.md\"]\n",
+            root_a.display(),
+            root_a.display(),
+            root_b.display(),
         );
         write_repo_layer(tmp.path(), &repo_config);
         let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
-
-        // Write 2 files and index them.
-        std::fs::write(corpus_dir.join("a.md"), "# Doc A\n\nContent A.\n").expect("write a");
-        std::fs::write(corpus_dir.join("b.md"), "# Doc B\n\nContent B.\n").expect("write b");
+        std::fs::write(root_a.join("a.md"), "# Doc A\n\nContent A.\n").expect("write a");
+        let root_b_file = root_b.join("b.md");
+        std::fs::write(&root_b_file, "# Doc B\n\nContent B.\n").expect("write b");
 
         let index_resp = dispatch(
             &state,
@@ -2365,30 +2444,111 @@ mod tests {
         .await;
         assert!(
             matches!(index_resp, DaemonResponse::Ok { .. }),
-            "index must succeed: {index_resp:?}"
+            "index must succeed: {index_resp:?}",
         );
 
-        // Add a third file without re-indexing — this becomes the unindexed count.
-        std::fs::write(corpus_dir.join("c.md"), "# Doc C\n\nUnindexed.\n").expect("write c");
+        let corpus_keys = corpus.corpus_keys();
+        assert_eq!(
+            corpus_keys.len(),
+            2,
+            "identical configured roots must deduplicate",
+        );
+        let root_a_before = state
+            .store()
+            .corpus_chunk_stats(&corpus_keys[0])
+            .await
+            .expect("root a stats before root b reindex");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        std::fs::write(&root_b_file, "# Doc B\n\nContent B updated.\n").expect("rewrite b");
+        let reindex_resp = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("test".to_string()),
+                    paths_from: None,
+                    strict: false,
+                }),
+            },
+        )
+        .await;
+        assert!(
+            matches!(reindex_resp, DaemonResponse::Ok { .. }),
+            "root b reindex must succeed: {reindex_resp:?}",
+        );
 
+        let root_a_stats = state
+            .store()
+            .corpus_chunk_stats(&corpus_keys[0])
+            .await
+            .expect("root a stats");
+        let root_b_stats = state
+            .store()
+            .corpus_chunk_stats(&corpus_keys[1])
+            .await
+            .expect("root b stats");
+        assert_eq!(root_a_stats.indexed_files, 1);
+        assert_eq!(root_b_stats.indexed_files, 1);
+        assert_eq!(
+            root_a_stats.last_indexed_ms, root_a_before.last_indexed_ms,
+            "reindexing root B must not advance root A's timestamp",
+        );
+        let root_a_last = root_a_stats
+            .last_indexed_ms
+            .expect("root a has an indexed timestamp");
+        let root_b_last = root_b_stats
+            .last_indexed_ms
+            .expect("root b has an indexed timestamp");
+        assert!(
+            root_b_last > root_a_last,
+            "root B's later reindex must produce a newer timestamp",
+        );
+
+        std::fs::write(root_b.join("c.md"), "# Doc C\n\nUnindexed.\n").expect("write c");
         let resp = dispatch(
             &state,
             DaemonRequest {
                 cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::CorpusStats { corpus: None },
+                payload: DaemonRequestPayload::CorpusStats {
+                    corpus: Some("test".to_string()),
+                },
             },
         )
         .await;
         let DaemonResponse::Ok { result } = resp else {
             panic!("corpus_stats must succeed: {resp:?}");
         };
+        let mut result_keys = result
+            .as_object()
+            .expect("corpus_stats result must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        result_keys.sort_unstable();
+        assert_eq!(
+            result_keys,
+            vec![
+                "corpus",
+                "indexed_files",
+                "last_indexed_ms",
+                "total_chunks",
+                "unindexed_files",
+            ],
+            "public stats must contain only the stable root-free IPC fields",
+        );
         let stats: CorpusStatsResult =
             serde_json::from_value(result).expect("parse CorpusStatsResult");
-        assert_eq!(stats.indexed_files, 2, "two files were indexed");
-        assert_eq!(stats.unindexed_files, 1, "one file added without re-index");
-        assert!(
-            stats.last_indexed_ms.is_some(),
-            "indexed corpus must carry a timestamp"
+        assert_eq!(stats.indexed_files, 2, "both roots must be aggregated once");
+        assert_eq!(
+            stats.total_chunks,
+            root_a_stats.total_chunks + root_b_stats.total_chunks,
+            "chunk totals must aggregate exact root stats",
+        );
+        assert_eq!(stats.unindexed_files, 1, "disk comparison spans both roots");
+        assert_eq!(
+            stats.last_indexed_ms,
+            Some(root_b_last),
+            "aggregate timestamp must be the genuinely newer exact-root timestamp",
         );
         assert_eq!(stats.corpus, "test");
     }
@@ -2548,6 +2708,7 @@ mod tests {
         let corpus_dir = tempfile::tempdir().unwrap();
         let file = corpus_dir.path().join("data.csv");
         let corpus = spreadsheet_corpus_at(corpus_dir.path());
+        let corpus_key = corpus.primary_corpus_key().expect("docs corpus key");
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
 
@@ -2566,7 +2727,7 @@ mod tests {
             .await
             .expect("first index of a valid file must succeed");
         assert_eq!(s1.files_upserted, 1, "valid CSV indexes");
-        let after_good = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        let after_good = store.corpus_chunk_stats(&corpus_key).await.unwrap();
         assert!(
             after_good.total_chunks > 0,
             "the valid CSV must produce indexed rows"
@@ -2590,14 +2751,14 @@ mod tests {
             s2.files_deleted, 0,
             "a present-but-unreadable file must NOT be evicted from the index"
         );
-        let after_corrupt = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        let after_corrupt = store.corpus_chunk_stats(&corpus_key).await.unwrap();
         assert_eq!(
             after_corrupt.total_chunks, after_good.total_chunks,
             "last-good rows must survive a transient parse failure"
         );
         assert!(
             store
-                .get_file_snapshot(&corpus.name, &file_ref)
+                .get_file_snapshot(&corpus_key, &file_ref)
                 .await
                 .unwrap()
                 .is_some(),
@@ -2621,6 +2782,7 @@ mod tests {
             exclude: vec![],
             global: false,
         };
+        let corpus_key = corpus.primary_corpus_key().expect("docs corpus key");
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
         let file_ref = canonicalize_or_passthrough(&file)
@@ -2635,7 +2797,7 @@ mod tests {
             .expect("first index must succeed");
         assert!(
             store
-                .corpus_chunk_stats(&corpus.name)
+                .corpus_chunk_stats(&corpus_key)
                 .await
                 .unwrap()
                 .total_chunks
@@ -2658,7 +2820,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .corpus_chunk_stats(&corpus.name)
+                .corpus_chunk_stats(&corpus_key)
                 .await
                 .unwrap()
                 .total_chunks,
@@ -2667,7 +2829,7 @@ mod tests {
         );
         assert!(
             store
-                .get_file_snapshot(&corpus.name, &file_ref)
+                .get_file_snapshot(&corpus_key, &file_ref)
                 .await
                 .unwrap()
                 .is_none(),
@@ -2689,6 +2851,7 @@ mod tests {
             exclude: vec![],
             global: false,
         };
+        let corpus_key = corpus.primary_corpus_key().expect("docs corpus key");
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
         let file_ref = canonicalize_or_passthrough(&file)
@@ -2703,7 +2866,7 @@ mod tests {
             .expect("first index must succeed");
         assert!(
             store
-                .corpus_chunk_stats(&corpus.name)
+                .corpus_chunk_stats(&corpus_key)
                 .await
                 .unwrap()
                 .total_chunks
@@ -2735,7 +2898,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .corpus_chunk_stats(&corpus.name)
+                .corpus_chunk_stats(&corpus_key)
                 .await
                 .unwrap()
                 .total_chunks,
@@ -2744,7 +2907,7 @@ mod tests {
         );
         assert!(
             store
-                .get_file_snapshot(&corpus.name, &file_ref)
+                .get_file_snapshot(&corpus_key, &file_ref)
                 .await
                 .unwrap()
                 .is_none(),
@@ -2777,6 +2940,7 @@ mod tests {
         let corpus_dir = tempfile::tempdir().unwrap();
         let file = corpus_dir.path().join("note.md");
         let corpus = md_corpus_at(corpus_dir.path());
+        let corpus_key = corpus.primary_corpus_key().expect("docs corpus key");
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
 
@@ -2786,7 +2950,7 @@ mod tests {
         index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("first index must succeed");
-        let baseline = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        let baseline = store.corpus_chunk_stats(&corpus_key).await.unwrap();
         assert!(baseline.total_chunks > 0, "first index must produce rows");
 
         // Swap the DISK content after the (simulated) no-follow read: the
@@ -2804,7 +2968,7 @@ mod tests {
         assert_eq!(stats.files_touched, 0, "identical mtime needs no touch");
         assert_eq!(
             store
-                .corpus_chunk_stats(&corpus.name)
+                .corpus_chunk_stats(&corpus_key)
                 .await
                 .unwrap()
                 .total_chunks,
@@ -2822,6 +2986,7 @@ mod tests {
         let corpus_dir = corpus_dir.path().canonicalize().unwrap();
         let file = corpus_dir.join("note.md");
         let corpus = md_corpus_at(&corpus_dir);
+        let corpus_key = corpus.primary_corpus_key().expect("docs corpus key");
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
         let file_ref = canonicalize_or_passthrough(&file)
@@ -2846,7 +3011,7 @@ mod tests {
         index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("first index must succeed");
-        let baseline = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        let baseline = store.corpus_chunk_stats(&corpus_key).await.unwrap();
 
         // Remove the file from disk entirely: a hash-equal gate that only
         // needs a stored-mtime bump must not read the disk at all.
@@ -2873,7 +3038,7 @@ mod tests {
             "moved mtime takes the touch fast path"
         );
         let snap = store
-            .get_file_snapshot(&corpus.name, &file_ref)
+            .get_file_snapshot(&corpus_key, &file_ref)
             .await
             .unwrap()
             .expect("snapshot must survive a touch");
@@ -2883,7 +3048,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .corpus_chunk_stats(&corpus.name)
+                .corpus_chunk_stats(&corpus_key)
                 .await
                 .unwrap()
                 .total_chunks,
@@ -2901,6 +3066,7 @@ mod tests {
         let corpus_dir = corpus_dir.path().canonicalize().unwrap();
         let file = corpus_dir.join("note.md");
         let corpus = md_corpus_at(&corpus_dir);
+        let corpus_key = corpus.primary_corpus_key().expect("docs corpus key");
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
         let file_ref = canonicalize_or_passthrough(&file)
@@ -2944,7 +3110,7 @@ mod tests {
             "changed content must re-index in full"
         );
         let snap = store
-            .get_file_snapshot(&corpus.name, &file_ref)
+            .get_file_snapshot(&corpus_key, &file_ref)
             .await
             .unwrap()
             .expect("snapshot must exist after re-index");
@@ -2971,6 +3137,7 @@ mod tests {
         let corpus_dir = tempfile::tempdir().unwrap();
         let file = corpus_dir.path().join("note.md");
         let corpus = md_corpus_at(corpus_dir.path());
+        let corpus_key = corpus.primary_corpus_key().expect("docs corpus key");
         let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
 
@@ -2978,7 +3145,7 @@ mod tests {
         index_single_file(&store, &registry, &corpus, &file)
             .await
             .expect("first index must succeed");
-        let baseline = store.corpus_chunk_stats(&corpus.name).await.unwrap();
+        let baseline = store.corpus_chunk_stats(&corpus_key).await.unwrap();
 
         let stats = index_single_file(&store, &registry, &corpus, &file)
             .await
@@ -2990,7 +3157,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .corpus_chunk_stats(&corpus.name)
+                .corpus_chunk_stats(&corpus_key)
                 .await
                 .unwrap()
                 .total_chunks,

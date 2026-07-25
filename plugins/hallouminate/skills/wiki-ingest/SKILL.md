@@ -140,6 +140,7 @@ Apply each decision through the safe update loop:
 - **New page:** draft one-topic entry (H1 first line, kebab slug, lead-first,
   ~50–150 lines, code cited as `path:line`, shaped on the pack's
   `../../templates/wiki-entry.md`) → `add_markdown { overwrite: false }`.
+- **Chunk context:** Every H2/H3 section must open self-contained: give enough subject and purpose for the section to remain clear when retrieved without surrounding sections. Name the domain concept in the opening sentence; do not make a heading, pronoun, or parent page carry all context. Breadcrumbs and file summaries may supplement this authored context, but do not generate index-time or per-chunk LLM context; issue #284 remains deferred.
 - **Local links:** if merged or new content links a local file outside the corpus
   (absolute path, `~`, or a relative path escaping the corpus root — the ingest
   source itself is the common case), copy that file into the corpus first

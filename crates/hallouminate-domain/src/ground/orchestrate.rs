@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use crate::common::{HallouminateError, Result};
+use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
 use crate::indexer::{ChunkStore, SearchHit};
 use crate::search::{Crossencoder, search_with_ripgrep};
 
@@ -108,118 +108,49 @@ impl Default for GroundOpts {
 
 pub async fn ground(
     query: &str,
-    corpus: &str,
-    corpus_paths: &[String],
+    corpus: &CorpusConfig,
     store: &dyn ChunkStore,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
-    let started = Instant::now();
-    let mut hits = search_corpus(query, corpus, corpus_paths, store, opts.limit).await?;
-    if let Some(rerank) = crossencoder {
-        // The crossencoder is the most expensive step; skip it on empty
-        // hit lists so a no-match query doesn't pay the model latency.
-        if !hits.is_empty() {
-            let (reranked, applied) =
-                rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await?;
-            hits = reranked;
-            if applied {
-                // RRF-mode guard (decision 4): z only when the cross-encoder ran.
-                // Full-pool scope (decision 2): computed before build_docs truncates.
-                let zs = normalize_scores(&hits);
-                for (hit, z) in hits.iter_mut().zip(zs) {
-                    hit.z_score = z;
-                }
-            }
-        }
-    }
-    let stats = Stats { hits: hits.len() };
-    let mut docs = build_docs(&hits, opts.top_files, opts.chunks_per_file)?;
-    for (abs_path, doc) in docs.iter_mut() {
-        doc.corpus = corpus.to_string();
-        doc.path = relative_path_for(abs_path, corpus_paths);
-        for chunk in &mut doc.chunks {
-            chunk.provenance.corpus = corpus.to_string();
-        }
-    }
-    Ok(GroundResponse {
-        query: query.to_string(),
-        took_ms: started.elapsed().as_millis() as u64,
-        stats,
-        docs,
-        code: BTreeMap::new(),
-        warnings: vec![],
-    })
+    ground_union(
+        query,
+        std::slice::from_ref(corpus),
+        store,
+        crossencoder,
+        opts,
+    )
+    .await
 }
 
-/// Search one corpus, returning its un-reranked hits.
-///
-/// The crossencoder rerank is the caller's concern — `ground` reranks per
-/// corpus, `ground_union` hoists the single rerank past the cross-corpus
-/// merge (#106).
+/// Searches one root-aware corpus identity, returning its un-reranked hits.
 async fn search_corpus(
     query: &str,
-    corpus: &str,
-    corpus_paths: &[String],
+    corpus_key: &CorpusKey,
     store: &dyn ChunkStore,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    search_with_ripgrep(store, corpus, corpus_paths, query, limit).await
+    search_with_ripgrep(store, corpus_key, query, limit).await
 }
 
-/// Fan one query across every effective corpus and merge into a single,
-/// globally-ranked `GroundResponse` (#106).
-///
-/// Each corpus is searched independently (un-reranked), the hits are tagged
-/// with their source corpus and merged, then a **single** crossencoder pass
-/// runs over the merged set so the final ranking is globally coherent rather
-/// than per-corpus-then-concatenated. Docs are built per corpus (so each
-/// carries its `corpus` attribution and per-chunk provenance), unioned by
-/// path-unique key, and truncated to the global `top_files`. `stats.hits`
-/// sums the raw hit counts across corpora.
-///
-/// The shared single embedder means per-corpus scores are on the same scale,
-/// so the merged crossencoder pass produces a coherent ordering without
-/// per-corpus normalization (YAGNI until heterogeneous models exist).
+/// Fans one query across every effective corpus root and globally reranks it.
 pub async fn ground_union(
     query: &str,
-    corpora: &[(String, Vec<String>)],
+    corpora: &[CorpusConfig],
     store: &dyn ChunkStore,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-
-    // Search each corpus independently, tagging every hit with its source so
-    // the per-corpus partition survives the shared rerank's reshuffle.
-    let mut tagged: Vec<(SearchHit, String)> = Vec::new();
-    for (name, paths) in corpora {
-        let hits = search_corpus(query, name, paths, store, opts.limit).await?;
-        for hit in hits {
-            tagged.push((hit, name.clone()));
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for corpus in corpora {
+        for corpus_key in corpus.corpus_keys() {
+            let mut root_hits = search_corpus(query, &corpus_key, store, opts.limit).await?;
+            hits.append(&mut root_hits);
         }
     }
+    let stats = Stats { hits: hits.len() };
 
-    let stats = Stats { hits: tagged.len() };
-
-    // One crossencoder pass over the MERGED set. The trait contract guarantees
-    // rerank only reshuffles (no inserts/deletes), so the corpus tags stay
-    // valid; rebuild the corpus lookup from the reordered hit list afterward.
-    // Use a FIFO queue per chunk_id so cross-corpus chunk_id collisions survive
-    // — two corpora indexing the same file path produce the same chunk_id, but
-    // both attributions must be preserved (same content, different corpus).
-    // Build the queue from borrowed chunk_id/corpus-name first, then MOVE (not
-    // clone) each hit into `hits` — cloning duplicates the full text and
-    // summary just to key a lookup that only needs two strings.
-    let mut corpus_queues: std::collections::HashMap<String, std::collections::VecDeque<String>> =
-        std::collections::HashMap::new();
-    for (h, name) in &tagged {
-        corpus_queues
-            .entry(h.chunk_id.clone())
-            .or_default()
-            .push_back(name.clone());
-    }
-    let mut hits: Vec<SearchHit> = tagged.into_iter().map(|(h, _)| h).collect();
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
@@ -227,62 +158,39 @@ pub async fn ground_union(
             rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await?;
         hits = reranked;
         if applied {
-            let zs = normalize_scores(&hits);
-            for (hit, z) in hits.iter_mut().zip(zs) {
-                hit.z_score = z;
+            let z_scores = normalize_scores(&hits);
+            for (hit, z_score) in hits.iter_mut().zip(z_scores) {
+                hit.z_score = z_score;
             }
         }
     }
 
-    // Build docs per corpus partition so each doc + chunk carries its source
-    // corpus. Build with an unbounded per-corpus `top_files` and apply the
-    // global truncation after the union, so `top_files` bounds the merged set.
-    let mut by_corpus: std::collections::HashMap<String, Vec<SearchHit>> =
-        std::collections::HashMap::new();
+    let mut by_key: BTreeMap<CorpusKey, Vec<SearchHit>> = BTreeMap::new();
     for hit in hits {
-        let corpus = corpus_queues
-            .get_mut(&hit.chunk_id)
-            .and_then(|q| q.pop_front())
-            .unwrap_or_default();
-        by_corpus.entry(corpus).or_default().push(hit);
+        by_key.entry(hit.corpus_key.clone()).or_default().push(hit);
     }
-
-    // Build a name→roots lookup for relative-path stamping below.
-    let corpus_roots_by_name: std::collections::HashMap<&str, &[String]> = corpora
-        .iter()
-        .map(|(n, paths)| (n.as_str(), paths.as_slice()))
-        .collect();
 
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
-    for (corpus, corpus_hits) in by_corpus {
-        let corpus_roots = corpus_roots_by_name
-            .get(corpus.as_str())
-            .copied()
-            .unwrap_or(&[]);
+    for (corpus_key, corpus_hits) in by_key {
         let mut built = build_docs(&corpus_hits, usize::MAX, opts.chunks_per_file)?;
-        for (abs_path, doc) in built.iter_mut() {
-            doc.corpus = corpus.clone();
-            doc.path = relative_path_for(abs_path, corpus_roots);
+        let root = corpus_key.canonical_root.to_string_lossy().into_owned();
+        for (absolute_path, doc) in built.iter_mut() {
+            doc.corpus = corpus_key.name.clone();
+            doc.path = relative_path_for(absolute_path, std::slice::from_ref(&root));
             for chunk in &mut doc.chunks {
-                chunk.provenance.corpus = corpus.clone();
+                chunk.provenance.corpus = corpus_key.name.clone();
             }
         }
-        // When two corpora index the same absolute path the file_ref keys
-        // collide. Disambiguate by appending the corpus to the key so both
-        // docs survive the union; the doc's `corpus` field still names the
-        // true source. The common case (unique paths) is unchanged.
         for (path, doc) in built {
-            let key = if docs.contains_key(&path) {
-                format!("{path} [{corpus}]")
+            let doc_key = if docs.contains_key(&path) {
+                format!("{path} [{}]", corpus_key.name)
             } else {
                 path
             };
-            docs.insert(key, doc);
+            docs.insert(doc_key, doc);
         }
     }
 
-    // Global top-N truncation over the merged docs, by doc score descending
-    // (path tiebreak for determinism).
     if docs.len() > opts.top_files {
         let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
         ranked.sort_by(|a, b| {
@@ -323,29 +231,50 @@ mod tests {
 
     #[async_trait]
     impl ChunkStore for FakeChunkStore {
-        async fn list_files(&self, _corpus: &str) -> Result<Vec<FileSnapshot>> {
+        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
             Ok(Vec::new())
         }
 
         async fn hybrid_search(
             &self,
-            _corpus: &str,
+            corpus_key: &CorpusKey,
             _query: &str,
             limit: usize,
         ) -> Result<Vec<SearchHit>> {
-            Ok(self.hits.iter().take(limit).cloned().collect())
+            Ok(self
+                .hits
+                .iter()
+                .filter(|hit| hit.corpus_key == *corpus_key)
+                .take(limit)
+                .cloned()
+                .collect())
         }
 
-        async fn touch_mtime(&self, _corpus: &str, _file_ref: &str, _mtime_ms: i64) -> Result<()> {
+        async fn touch_mtime(
+            &self,
+            _corpus_key: &CorpusKey,
+            _file_ref: &str,
+            _mtime_ms: i64,
+        ) -> Result<()> {
             Ok(())
         }
 
-        async fn delete_file(&self, _corpus: &str, _file_ref: &str) -> Result<()> {
+        async fn delete_file(&self, _corpus_key: &CorpusKey, _file_ref: &str) -> Result<()> {
             Ok(())
         }
 
         async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
             Ok(BatchWriteStats::default())
+        }
+    }
+
+    fn fixture_corpus() -> CorpusConfig {
+        CorpusConfig {
+            name: "fixtures".into(),
+            paths: vec!["/".into()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
         }
     }
 
@@ -360,16 +289,10 @@ mod tests {
     #[tokio::test]
     async fn ground_off_mode_returns_lexical_response_without_a_crossencoder() {
         let store = FakeChunkStore::default();
-        let resp = ground(
-            "spice",
-            "fixtures",
-            &[],
-            &store,
-            None,
-            GroundOpts::default(),
-        )
-        .await
-        .expect("OFF-mode ground must succeed on an empty store");
+        let corpus = fixture_corpus();
+        let resp = ground("spice", &corpus, &store, None, GroundOpts::default())
+            .await
+            .expect("OFF-mode ground must succeed on an empty store");
         assert_eq!(resp.query, "spice");
         assert_eq!(resp.stats.hits, 0, "empty store yields no hits");
         assert!(resp.docs.is_empty());
@@ -434,6 +357,7 @@ mod tests {
     fn hit_for_timeout_test(file_ref: &str, score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#0"),
+            corpus_key: CorpusKey::from_configured_root("fixtures", "/"),
             file_ref: file_ref.into(),
             heading_path: vec![],
             line_start: 1,
@@ -577,7 +501,7 @@ mod tests {
         };
         let resp = ground_union(
             "spice",
-            &[("fixtures".to_string(), vec![])],
+            &[fixture_corpus()],
             &store,
             Some(Box::new(ScoringCrossencoder)),
             opts,
@@ -620,7 +544,7 @@ mod tests {
         };
         let resp = ground_union(
             "spice",
-            &[("fixtures".to_string(), vec![])],
+            &[fixture_corpus()],
             &store,
             Some(Box::new(SleepingCrossencoder)),
             opts,
@@ -657,10 +581,10 @@ mod tests {
             rerank_timeout: Duration::from_millis(20),
             ..GroundOpts::default()
         };
+        let corpus = fixture_corpus();
         let resp = ground(
             "spice",
-            "fixtures",
-            &[],
+            &corpus,
             &store,
             Some(Box::new(SleepingCrossencoder)),
             opts,
@@ -681,6 +605,66 @@ mod tests {
              configured timeout was ignored"
         );
     }
+    #[tokio::test]
+    async fn same_name_root_identity_survives_union_rerank_and_provenance() {
+        struct ReversingCrossencoder;
+        impl Crossencoder for ReversingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                hits.reverse();
+                Ok(())
+            }
+        }
+
+        let root_a = tempfile::tempdir().expect("root a");
+        let root_b = tempfile::tempdir().expect("root b");
+        let key_a = CorpusKey::from_configured_root("docs", &root_a.path().to_string_lossy());
+        let key_b = CorpusKey::from_configured_root("docs", &root_b.path().to_string_lossy());
+        let file_a = key_a.canonical_root.join("page.md");
+        let file_b = key_b.canonical_root.join("page.md");
+        let mut hit_a = hit_for_timeout_test(&file_a.to_string_lossy(), 0.1);
+        hit_a.corpus_key = key_a.clone();
+        let mut hit_b = hit_for_timeout_test(&file_b.to_string_lossy(), 0.2);
+        hit_b.corpus_key = key_b.clone();
+        let store = FakeChunkStore {
+            hits: vec![hit_a, hit_b],
+        };
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![
+                root_a.path().to_string_lossy().into_owned(),
+                root_b.path().to_string_lossy().into_owned(),
+            ],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let response = ground(
+            "identity",
+            &corpus,
+            &store,
+            Some(Box::new(ReversingCrossencoder)),
+            GroundOpts::default(),
+        )
+        .await
+        .expect("ground");
+
+        assert_eq!(response.stats.hits, 2);
+        for file in [file_a, file_b] {
+            let doc = response
+                .docs
+                .get(&file.to_string_lossy().into_owned())
+                .expect("root-specific doc survives rerank");
+            assert_eq!(doc.corpus, "docs");
+            assert_eq!(doc.path.as_deref(), Some("page.md"));
+            assert!(
+                doc.chunks
+                    .iter()
+                    .all(|chunk| chunk.provenance.corpus == "docs")
+            );
+        }
+    }
+
     #[tokio::test]
     async fn rerank_with_timeout_zero_duration_falls_back_without_panic() {
         // Boundary (#139): rerank_timeout_ms = 0 must degrade gracefully to

@@ -19,14 +19,21 @@ use file_format::FileFormat;
 use text_splitter::{ChunkConfig, ChunkSizer, TextSplitter};
 
 use super::chunk::{PreparedChunk, PreparedFile};
-use crate::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
+use crate::common::{CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::{
     ClaimMark, CorpusChunker, Frontmatter, build_line_starts, byte_to_line, extract_claim_marks,
     extract_keywords, extract_summary, marks_to_canonical_json, split_frontmatter,
     strip_claim_marks,
 };
+use crate::footnotes::{FootnoteMode, apply_footnote_mode};
 
 use super::writer::file_ref_string;
+
+fn build_search_text(heading_path: &[String], summary: &str, text: &str) -> String {
+    let breadcrumb = heading_path.join(" > ");
+    let body = apply_footnote_mode(text, FootnoteMode::Exclude);
+    format!("{breadcrumb}\n{summary}\n{body}")
+}
 
 /// The set of formats Phase 1 can ingest. Extended in later phases (PDF,
 /// office-prose, code-aware).
@@ -94,7 +101,7 @@ fn detect_by_magic(bytes: &[u8]) -> Option<Format> {
 /// bytes (read once by the dispatcher), the precomputed content hash, and the
 /// per-run metadata frame.
 pub struct PrepareCtx<'a> {
-    pub corpus: &'a CorpusConfig,
+    pub corpus_key: &'a CorpusKey,
     pub file: &'a FileRef,
     pub mtime: Mtime,
     pub bytes: &'a [u8],
@@ -177,22 +184,21 @@ impl FormatHandler for MarkdownHandler {
                     ..m.clone()
                 })
                 .collect();
+            let text = strip_claim_marks(&c.text);
+            let search_text = build_search_text(&c.heading_path, &summary, &text);
             chunks.push(PreparedChunk {
                 ord: c.ord,
                 heading_path: c.heading_path,
                 line_start: c.line_start + fm_lines,
                 line_end: c.line_end + fm_lines,
-                // Strip claim comments from the retrieval text. This single edit
-                // cleans both the embedding input and the stored snippet (they
-                // share `PreparedChunk.text`); strip preserves line count so the
-                // chunk's line numbers and the per-chunk mark filter stay aligned.
-                text: strip_claim_marks(&c.text),
+                text,
+                search_text,
                 claim_marks: marks_to_canonical_json(&chunk_marks),
             });
         }
         Ok(PreparedFile {
             file_ref: file_ref_str,
-            corpus: ctx.corpus.name.clone(),
+            corpus_key: ctx.corpus_key.clone(),
             mtime_ms: ctx.mtime.0,
             content_hash: ctx.content_hash.clone(),
             summary,
@@ -232,6 +238,11 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
         let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
             HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
         })?;
+        let fallback = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let summary = extract_summary(body, &fallback);
         let line_starts = build_line_starts(body);
         let mut chunks: Vec<PreparedChunk> = Vec::new();
         for (byte_off, slice) in self.splitter.chunk_indices(body) {
@@ -245,25 +256,23 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
             } else {
                 byte_to_line(end_byte - 1, &line_starts)
             };
+            let heading_path = Vec::new();
             chunks.push(PreparedChunk {
                 ord: chunks.len(),
-                heading_path: Vec::new(),
+                search_text: build_search_text(&heading_path, &summary, slice),
+                heading_path,
                 line_start,
                 line_end,
                 text: slice.to_string(),
                 claim_marks: None,
             });
         }
-        let fallback = path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
         Ok(PreparedFile {
             file_ref: file_ref_string(ctx.file)?,
-            corpus: ctx.corpus.name.clone(),
+            corpus_key: ctx.corpus_key.clone(),
             mtime_ms: ctx.mtime.0,
             content_hash: ctx.content_hash.clone(),
-            summary: extract_summary(body, &fallback),
+            summary,
             keywords: extract_keywords(body),
             frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
@@ -287,7 +296,7 @@ impl FormatHandler for SpreadsheetHandler {
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase());
-        let chunks = match ext.as_deref() {
+        let mut chunks = match ext.as_deref() {
             Some("csv") => csv_chunks(ctx.bytes, path)?,
             _ => workbook_chunks(ctx.bytes, path)?,
         };
@@ -302,13 +311,18 @@ impl FormatHandler for SpreadsheetHandler {
             .map(|c| c.text.as_str())
             .collect::<Vec<_>>()
             .join("\n");
+        let summary = extract_summary(&joined, &fallback);
+        let keywords = extract_keywords(&joined);
+        for chunk in &mut chunks {
+            chunk.search_text = build_search_text(&chunk.heading_path, &summary, &chunk.text);
+        }
         Ok(PreparedFile {
             file_ref: file_ref_string(ctx.file)?,
-            corpus: ctx.corpus.name.clone(),
+            corpus_key: ctx.corpus_key.clone(),
             mtime_ms: ctx.mtime.0,
             content_hash: ctx.content_hash.clone(),
-            summary: extract_summary(&joined, &fallback),
-            keywords: extract_keywords(&joined),
+            summary,
+            keywords,
             frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
@@ -401,12 +415,6 @@ fn row_text(headers: &[String], cells: &[String]) -> String {
     lines.join("\n")
 }
 
-/// Push one row as a chunk. `row` is the 1-based per-sheet data-row ordinal
-/// used in the breadcrumb; `line` is the value surfaced as `line_range`.
-///
-/// For CSV `line` is the true on-disk line (header row + 1-based data lines).
-/// For binary xlsx/ods there is no on-disk line concept, so `line_range` is the
-/// per-sheet row ordinal rather than a file line.
 fn push_row_chunk(
     chunks: &mut Vec<PreparedChunk>,
     sheet: &str,
@@ -421,6 +429,7 @@ fn push_row_chunk(
         line_start: line,
         line_end: line,
         text,
+        search_text: String::new(),
         claim_marks: None,
     });
 }
@@ -484,6 +493,56 @@ impl HandlerRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct WholeDocumentChunker;
+
+    impl CorpusChunker for WholeDocumentChunker {
+        fn chunk_text(&self, text: &str) -> Vec<crate::corpus::Chunk> {
+            vec![crate::corpus::Chunk {
+                ord: 0,
+                heading_path: vec!["Topic".into()],
+                line_start: 1,
+                line_end: text.lines().count().max(1),
+                text: text.to_string(),
+            }]
+        }
+    }
+
+    #[test]
+    fn search_text_composes_breadcrumb_summary_and_body_in_order() {
+        let heading_path = vec!["Guide".into(), "Install".into()];
+
+        let search_text = build_search_text(&heading_path, "File summary.", "Display body.");
+
+        assert_eq!(search_text, "Guide > Install\nFile summary.\nDisplay body.");
+    }
+
+    #[test]
+    fn markdown_search_text_excludes_footnotes_without_changing_display_text() {
+        let bytes =
+            b"# Topic\nClaim[^source] stays. <!--claim:confirmed-->\n\n[^source]: Citation.\n";
+        let corpus_key = CorpusKey::from_configured_root("docs", "/tmp/docs");
+        let file = FileRef::new(std::path::PathBuf::from("topic.md"));
+        let ctx = PrepareCtx {
+            corpus_key: &corpus_key,
+            file: &file,
+            mtime: Mtime(1),
+            bytes,
+            content_hash: "hash".into(),
+            indexed_at_ms: 2,
+        };
+        let handler = MarkdownHandler::new(Box::new(WholeDocumentChunker));
+
+        let prepared = handler.prepare(&ctx).expect("prepare markdown");
+        let chunk = &prepared.chunks[0];
+
+        assert!(chunk.text.contains("Claim[^source] stays."));
+        assert!(chunk.text.contains("[^source]: Citation."));
+        assert!(!chunk.text.contains("<!--claim:confirmed-->"));
+        assert!(!chunk.search_text.contains("[^source]"));
+        assert!(!chunk.search_text.contains("Citation."));
+        assert!(!chunk.search_text.contains("<!--claim:confirmed-->"));
+    }
 
     #[test]
     fn csv_line_range_tracks_physical_lines_across_quoted_newlines() {

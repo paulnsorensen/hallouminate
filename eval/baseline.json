@@ -1,0 +1,2836 @@
+{
+  "schema_version": 1,
+  "query_set_digest": "f4a8f1537a7567f8ad767ce72f5197d4f6ee2f6e216da2a5f1b90ae1af595676",
+  "thresholds": {
+    "min_mrr_gain": 0.05,
+    "max_added_p50_ms": 500
+  },
+  "candidates": [
+    {
+      "id": "bge-reranker-base",
+      "weight_bytes": 1112459588
+    },
+    {
+      "id": "bge-reranker-v2-m3",
+      "weight_bytes": 2271197135
+    },
+    {
+      "id": "jina-reranker-v1-turbo-en",
+      "weight_bytes": 151296975
+    },
+    {
+      "id": "jina-reranker-v2-base-multiligual",
+      "weight_bytes": 1114040223
+    }
+  ],
+  "variants": [
+    {
+      "id": "fusion-without-rerank",
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.8916666666666666,
+        "p50_ms": 46
+      },
+      "qualifies": false,
+      "mrr_gain": 0,
+      "added_p50_ms": 0,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 45,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 46,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 44,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 43,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 47,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 44,
+          "rank": 2,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "design-rationale.md",
+            "heading_path": [
+              "Design rationale & non-goals",
+              "Filesystem is the source of truth; LanceDB is derived"
+            ],
+            "line_start": 28
+          },
+          "top_chunk_pass": false
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 46,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 43,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 47,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 46,
+          "rank": 5,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "code-aware-chunking.md",
+            "heading_path": [
+              "Code-aware ingestion (tree-sitter)",
+              "Why AST chunking, not a separator list"
+            ],
+            "line_start": 57
+          },
+          "top_chunk_pass": false
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 47,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 47,
+          "rank": 1,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "top_chunk_pass": true
+        }
+      ]
+    },
+    {
+      "id": "lexical-without-rerank",
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.8472222222222222,
+        "p50_ms": 18
+      },
+      "qualifies": false,
+      "mrr_gain": 0,
+      "added_p50_ms": 0,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 17,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 19,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 19,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 16,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 18,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 18,
+          "rank": 3,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": false
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 17,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 18,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 18,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 20,
+          "rank": 3,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "code-aware-chunking.md",
+            "heading_path": [
+              "Code-aware ingestion (tree-sitter)",
+              "Why AST chunking, not a separator list"
+            ],
+            "line_start": 57
+          },
+          "top_chunk_pass": false
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 17,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 19,
+          "rank": 2,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "office-prose-extraction.md",
+            "heading_path": [
+              "Office prose documents (.docx / .pptx / .odt)"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false
+        }
+      ]
+    },
+    {
+      "id": "lexical-with-bge-reranker-base",
+      "model": "bge-reranker-base",
+      "weight_bytes": 1112459588,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.9375,
+        "p50_ms": 3205
+      },
+      "qualifies": false,
+      "mrr_gain": 0.09027777777777779,
+      "added_p50_ms": 3187,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 4371,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.0678340877171935
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 3720,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.964445962733115
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 3293,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.576754161688597
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 3289,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.917057553676899
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 3184,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.472794184238511
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 3453,
+          "rank": 4,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.234166739173931
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 3537,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.556132851591113
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 3205,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.17937703345104
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 3062,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.572898910169894
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 2727,
+          "rank": 1,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.5248751655650845
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 2844,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.56290517379406
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 2956,
+          "rank": 1,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.5212697158490793
+        }
+      ]
+    },
+    {
+      "id": "fusion-with-bge-reranker-base",
+      "model": "bge-reranker-base",
+      "weight_bytes": 1112459588,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.9375,
+        "p50_ms": 2678
+      },
+      "qualifies": false,
+      "mrr_gain": 0.04583333333333339,
+      "added_p50_ms": 2632,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 3022,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.020729081226741
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 2810,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.964445937459323
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 2744,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.5767541103078964
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 2598,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.917057553676899
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 2792,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.476858166097392
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 2678,
+          "rank": 4,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.227120060287342
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 2619,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.5561327892572963
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 2637,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.1793770200923026
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 2477,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.572898910169894
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 2616,
+          "rank": 1,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.5248751655650845
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 2821,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.56290517379406
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 2758,
+          "rank": 1,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.5212697158490793
+        }
+      ]
+    },
+    {
+      "id": "lexical-with-bge-reranker-v2-m3",
+      "model": "bge-reranker-v2-m3",
+      "weight_bytes": 2271197135,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.9166666666666666,
+        "p50_ms": 9345
+      },
+      "qualifies": false,
+      "mrr_gain": 0.06944444444444442,
+      "added_p50_ms": 9327,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 9345,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.5951381619375713
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 10767,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.031140347015644
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 10893,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.383392965119217
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 12551,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.038950707005511
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 11357,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.505610548504415
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 9762,
+          "rank": 2,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.3709900797499297
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 9421,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.691685869474485
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 8270,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.1506455638382533
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 7880,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.486505454767951
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 8239,
+          "rank": 2,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "log.md",
+            "heading_path": [
+              "Ingest Log",
+              "Log"
+            ],
+            "line_start": 6
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.725185753389066
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 8950,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.2077281326235143
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 8843,
+          "rank": 1,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.7133939664965827
+        }
+      ]
+    },
+    {
+      "id": "fusion-with-bge-reranker-v2-m3",
+      "model": "bge-reranker-v2-m3",
+      "weight_bytes": 2271197135,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.9166666666666666,
+        "p50_ms": 8403
+      },
+      "qualifies": false,
+      "mrr_gain": 0.025000000000000022,
+      "added_p50_ms": 8357,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 8469,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.5628287432258907
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 8528,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.03114036882321
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 8566,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.3833932196931045
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 8076,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.039128919189955
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 8520,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.5056105161525504
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 8194,
+          "rank": 2,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.370990590570451
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 7957,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.691685901498297
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 8466,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.150645546723862
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 7943,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.486505434651254
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 8352,
+          "rank": 2,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "log.md",
+            "heading_path": [
+              "Ingest Log",
+              "Log"
+            ],
+            "line_start": 6
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.7251857569867504
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 8542,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.2077281326235143
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 8403,
+          "rank": 1,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.7133939664965827
+        }
+      ]
+    },
+    {
+      "id": "lexical-with-jina-reranker-v1-turbo-en",
+      "model": "jina-reranker-v1-turbo-en",
+      "weight_bytes": 151296975,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.861111111111111,
+        "p50_ms": 618
+      },
+      "qualifies": false,
+      "mrr_gain": 0.01388888888888884,
+      "added_p50_ms": 600,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 687,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.766134145539514
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 618,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.440690724366162
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 601,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.965630883995527
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 618,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.880988657462547
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 632,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.8392539558975223
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 596,
+          "rank": 3,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 1.9298868997902985
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 603,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.3473429098832597
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 598,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.844991952137853
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 580,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.919582226075263
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 630,
+          "rank": 2,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "design-rationale.md",
+            "heading_path": [
+              "Design rationale & non-goals"
+            ],
+            "line_start": 7
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.740308853031193
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 623,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.65811246522106
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 624,
+          "rank": 2,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "office-prose-extraction.md",
+            "heading_path": [
+              "Office prose documents (.docx / .pptx / .odt)"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.3418601076532584
+        }
+      ]
+    },
+    {
+      "id": "fusion-with-jina-reranker-v1-turbo-en",
+      "model": "jina-reranker-v1-turbo-en",
+      "weight_bytes": 151296975,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.861111111111111,
+        "p50_ms": 1054
+      },
+      "qualifies": false,
+      "mrr_gain": -0.030555555555555558,
+      "added_p50_ms": 1008,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 973,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.759217982880476
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 1075,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.440690718803972
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 892,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.965630883995527
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 880,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.8750283996575328
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 975,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.8392539558975223
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 1158,
+          "rank": 3,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 1.9298868997902985
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 1079,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.3473429129549968
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 1012,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.844991883105348
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 1089,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 5.919582257962456
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 1054,
+          "rank": 2,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "design-rationale.md",
+            "heading_path": [
+              "Design rationale & non-goals"
+            ],
+            "line_start": 7
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.740308715836856
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 1121,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.65811246522106
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 1718,
+          "rank": 2,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "office-prose-extraction.md",
+            "heading_path": [
+              "Office prose documents (.docx / .pptx / .odt)"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 2.3418601076532584
+        }
+      ]
+    },
+    {
+      "id": "lexical-with-jina-reranker-v2-base-multiligual",
+      "model": "jina-reranker-v2-base-multiligual",
+      "weight_bytes": 1114040223,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.9583333333333334,
+        "p50_ms": 4055
+      },
+      "qualifies": false,
+      "mrr_gain": 0.11111111111111116,
+      "added_p50_ms": 4037,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 4453,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.5314796017653776
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 5029,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.90183949775433
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 4589,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.9739830836349705
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 3968,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.01882022505009
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 4055,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.7700944954614672
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 3774,
+          "rank": 1,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.2851188250504872
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 4427,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.488894858128452
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 3653,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.992629367645961
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 3963,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.794196360971756
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 4199,
+          "rank": 2,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "design-rationale.md",
+            "heading_path": [
+              "Design rationale & non-goals"
+            ],
+            "line_start": 7
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 3.619455114803891
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 4648,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.623272377170656
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 3996,
+          "rank": 1,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.830372225392416
+        }
+      ]
+    },
+    {
+      "id": "fusion-with-jina-reranker-v2-base-multiligual",
+      "model": "jina-reranker-v2-base-multiligual",
+      "weight_bytes": 1114040223,
+      "metrics": {
+        "recall_at_5": 1,
+        "mrr": 0.9583333333333334,
+        "p50_ms": 3318
+      },
+      "qualifies": false,
+      "mrr_gain": 0.06666666666666676,
+      "added_p50_ms": 3272,
+      "queries": [
+        {
+          "id": "footnote-inversion",
+          "latency_ms": 3879,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.5314796017653776
+        },
+        {
+          "id": "worktree-isolation",
+          "latency_ms": 3460,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.9018394839055155
+        },
+        {
+          "id": "paraphrase-app-boundary",
+          "latency_ms": 3346,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.973983092935347
+        },
+        {
+          "id": "lexical-distractor",
+          "latency_ms": 3189,
+          "rank": 1,
+          "expected_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "actual_top": {
+            "file": "architecture.md",
+            "heading_path": [
+              "Architecture",
+              "crates/hallouminate-adapters/ — driven external systems"
+            ],
+            "line_start": 62
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.022227065844707
+        },
+        {
+          "id": "multi-root-union",
+          "latency_ms": 3210,
+          "rank": 1,
+          "expected_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.770094402873878
+        },
+        {
+          "id": "daemon-rationale",
+          "latency_ms": 3202,
+          "rank": 1,
+          "expected_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "daemon-and-cli.md",
+            "heading_path": [
+              "Daemon and CLI"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.285118899433141
+        },
+        {
+          "id": "explicit-root-opt-in",
+          "latency_ms": 3190,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Explicit-root opt-in"
+            ],
+            "line_start": 19
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.488894879098932
+        },
+        {
+          "id": "relative-config-path",
+          "latency_ms": 3635,
+          "rank": 1,
+          "expected_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "config-layering.md",
+            "heading_path": [
+              "Config layering",
+              "Repo layer",
+              "Relative paths resolve against the repo root"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.9926293710161405
+        },
+        {
+          "id": "ort-retention-mechanism",
+          "latency_ms": 3041,
+          "rank": 1,
+          "expected_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "The mechanism"
+            ],
+            "line_start": 18
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 4.794196360971756
+        },
+        {
+          "id": "one-topic-chunking",
+          "latency_ms": 3441,
+          "rank": 2,
+          "expected_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors"
+            ],
+            "line_start": 1
+          },
+          "actual_top": {
+            "file": "design-rationale.md",
+            "heading_path": [
+              "Design rationale & non-goals"
+            ],
+            "line_start": 7
+          },
+          "top_chunk_pass": false,
+          "rerank_signal": 3.619455098831013
+        },
+        {
+          "id": "claim-single-owner",
+          "latency_ms": 3318,
+          "rank": 1,
+          "expected_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "actual_top": {
+            "file": "claim-provenance-marks.md",
+            "heading_path": [
+              "Claim-level provenance marks",
+              "Each mark belongs to exactly one chunk"
+            ],
+            "line_start": 59
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 3.623272377170656
+        },
+        {
+          "id": "ocr-separate-engine",
+          "latency_ms": 3417,
+          "rank": 1,
+          "expected_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "actual_top": {
+            "file": "pdf-ocr-ingestion.md",
+            "heading_path": [
+              "PDF and OCR ingestion",
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+            ],
+            "line_start": 58
+          },
+          "top_chunk_pass": true,
+          "rerank_signal": 2.830372225392416
+        }
+      ]
+    }
+  ],
+  "decision": {
+    "outcome": "none-qualified",
+    "selected_model": null,
+    "default_crossencoder": null
+  }
+}

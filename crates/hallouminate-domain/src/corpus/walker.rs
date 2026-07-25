@@ -6,25 +6,83 @@ use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
 
 use crate::common::{
-    CorpusConfig, FileRef, HallouminateError, Mtime, Result, canonicalize_or_passthrough,
-    expand_tilde,
+    CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result, expand_tilde,
 };
 
-pub fn scan(corpus: &CorpusConfig) -> Result<Vec<(FileRef, Mtime)>> {
+/// One scanned file paired with the canonical corpus root that owns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScannedFile {
+    /// Root-aware corpus identity selected during scanning.
+    pub corpus_key: CorpusKey,
+    /// Canonical path of the file on disk.
+    pub file: FileRef,
+    /// Current file modification time.
+    pub mtime: Mtime,
+}
+
+#[derive(Debug)]
+struct ScanRoot {
+    corpus_key: CorpusKey,
+    configured_path: PathBuf,
+}
+
+fn configured_roots(corpus: &CorpusConfig) -> Vec<ScanRoot> {
+    let mut roots: Vec<ScanRoot> = Vec::new();
+    for configured_root in &corpus.paths {
+        let corpus_key = CorpusKey::from_configured_root(&corpus.name, configured_root);
+        let mut duplicate = false;
+        for root in &roots {
+            if root.corpus_key == corpus_key {
+                duplicate = true;
+                break;
+            }
+        }
+        if duplicate {
+            continue;
+        }
+        roots.push(ScanRoot {
+            corpus_key,
+            configured_path: expand_tilde(configured_root),
+        });
+    }
+    roots
+}
+
+fn owning_root<'a>(file: &Path, roots: &'a [ScanRoot]) -> Option<&'a ScanRoot> {
+    let mut owner: Option<&ScanRoot> = None;
+    for root in roots {
+        if !file.starts_with(&root.corpus_key.canonical_root) {
+            continue;
+        }
+        let specificity = root.corpus_key.canonical_root.components().count();
+        match owner {
+            None => owner = Some(root),
+            Some(current) => {
+                let current_specificity = current.corpus_key.canonical_root.components().count();
+                if specificity > current_specificity {
+                    owner = Some(root);
+                }
+            }
+        }
+    }
+    owner
+}
+pub fn scan(corpus: &CorpusConfig) -> Result<Vec<ScannedFile>> {
     let include = build_globset(&corpus.globs)?;
     let exclude = build_globset(&corpus.exclude)?;
+    let roots = configured_roots(corpus);
     let mut out = Vec::new();
-    for raw in &corpus.paths {
-        let root = expand_tilde(raw);
+    for root in &roots {
         // "Auto-skip gitignored, unless explicitly included": if the corpus
         // root itself is gitignored by some ancestor `.gitignore`, the user
         // pointed at it on purpose — treat that as explicit opt-in and walk
         // it without applying gitignore filters. Otherwise honor `.gitignore`,
         // `.ignore`, `.git/info/exclude`, and the global gitignore as ripgrep
         // does.
-        let explicit_opt_in = root_is_gitignored(&root);
+        let explicit_opt_in = root_is_gitignored(&root.configured_path);
         walk_root(
-            &root,
+            root,
+            &roots,
             include.as_ref(),
             exclude.as_ref(),
             explicit_opt_in,
@@ -55,13 +113,14 @@ pub fn missing_roots(corpus: &CorpusConfig) -> Vec<PathBuf> {
 }
 
 fn walk_root(
-    root: &Path,
+    root: &ScanRoot,
+    roots: &[ScanRoot],
     include: Option<&GlobSet>,
     exclude: Option<&GlobSet>,
     explicit_opt_in: bool,
-    out: &mut Vec<(FileRef, Mtime)>,
+    out: &mut Vec<ScannedFile>,
 ) -> Result<()> {
-    let mut builder = WalkBuilder::new(root);
+    let mut builder = WalkBuilder::new(&root.configured_path);
     builder
         .standard_filters(true)
         // Dotfiles are content too — only skip them when gitignore says so.
@@ -77,27 +136,38 @@ fn walk_root(
     }
     for entry in builder.build() {
         let entry = entry.map_err(|e| HallouminateError::Indexer(format!("walk error: {e}")))?;
-        let Some(ft) = entry.file_type() else {
+        let Some(file_type) = entry.file_type() else {
             continue;
         };
-        if !ft.is_file() {
+        if !file_type.is_file() {
             continue;
         }
         let path = entry.path();
         // Prune ahead of include-match so caller-supplied excludes can mask
         // even paths the include glob would otherwise pull in.
-        if let Some(ex) = exclude
-            && ex.is_match(path)
+        if let Some(exclude) = exclude
+            && exclude.is_match(path)
         {
             continue;
         }
-        if let Some(inc) = include
-            && !inc.is_match(path)
+        if let Some(include) = include
+            && !include.is_match(path)
         {
             continue;
         }
-        let mtime = entry_mtime_ms(&entry)?;
-        out.push((canonicalize_or_passthrough(path), Mtime(mtime)));
+        let file = crate::common::canonicalize_or_passthrough(path);
+        let Some(owner) = owning_root(file.as_path(), roots) else {
+            continue;
+        };
+        if owner.corpus_key != root.corpus_key {
+            continue;
+        }
+        let mtime = Mtime(entry_mtime_ms(&entry)?);
+        out.push(ScannedFile {
+            corpus_key: root.corpus_key.clone(),
+            file,
+            mtime,
+        });
     }
     Ok(())
 }
@@ -190,17 +260,20 @@ mod tests {
         }
     }
 
-    fn file_names(scan_out: &[(FileRef, Mtime)]) -> Vec<String> {
-        scan_out
-            .iter()
-            .map(|(f, _)| {
-                f.as_path()
+    fn file_names(scan_out: &[ScannedFile]) -> Vec<String> {
+        let mut names = Vec::with_capacity(scan_out.len());
+        for scanned in scan_out {
+            names.push(
+                scanned
+                    .file
+                    .as_path()
                     .file_name()
-                    .unwrap()
+                    .expect("scanned file name")
                     .to_string_lossy()
-                    .into_owned()
-            })
-            .collect()
+                    .into_owned(),
+            );
+        }
+        names
     }
 
     #[test]
@@ -276,11 +349,47 @@ mod tests {
             global: false,
         };
         let result = scan(&corpus).expect("scan");
-        let (_, Mtime(ms)) = &result[0];
-        assert!(
-            *ms > 1_500_000_000_000,
-            "expected post-2017 mtime, got {ms}"
-        );
+        let Mtime(ms) = result[0].mtime;
+        assert!(ms > 1_500_000_000_000, "expected post-2017 mtime, got {ms}");
+    }
+
+    #[test]
+    fn scan_assigns_overlapping_files_to_the_longest_canonical_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path();
+        let child = parent.join("nested");
+        fs::create_dir_all(&child).expect("create child root");
+        fs::write(parent.join("parent.md"), "parent").expect("write parent file");
+        fs::write(child.join("child.md"), "child").expect("write child file");
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![
+                parent.to_string_lossy().into_owned(),
+                child.to_string_lossy().into_owned(),
+                child.to_string_lossy().into_owned(),
+            ],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        };
+
+        let scanned = scan(&corpus).expect("scan overlapping roots");
+        assert_eq!(scanned.len(), 2, "identical roots must deduplicate");
+        let parent_root = std::fs::canonicalize(parent).expect("canonical parent");
+        let child_root = std::fs::canonicalize(&child).expect("canonical child");
+        for file in scanned {
+            let name = file
+                .file
+                .as_path()
+                .file_name()
+                .expect("file name")
+                .to_string_lossy();
+            match name.as_ref() {
+                "parent.md" => assert_eq!(file.corpus_key.canonical_root, parent_root),
+                "child.md" => assert_eq!(file.corpus_key.canonical_root, child_root),
+                other => panic!("unexpected scanned file {other}"),
+            }
+        }
     }
 
     #[test]

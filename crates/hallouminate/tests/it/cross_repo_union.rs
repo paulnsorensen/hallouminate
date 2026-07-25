@@ -90,10 +90,7 @@ async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
     }
 
     // Curd 3: one no-corpus union ground across all effective corpora.
-    let targets: Vec<(String, Vec<String>)> = corpora
-        .iter()
-        .map(|c| (c.name.clone(), c.paths.clone()))
-        .collect();
+    let targets = corpora;
     let resp = ground_union(
         "distinctive token wiki",
         &targets,
@@ -210,12 +207,7 @@ impl Crossencoder for ReversingCrossencoder {
     }
 }
 
-/// Boot a store and index each `(corpus_name, repo_root)` pair's wiki into its
-/// own corpus, returning the `(name, paths)` targets `ground_union` consumes.
-async fn index_wikis(
-    store: &LanceStore,
-    repos: &[std::path::PathBuf],
-) -> Vec<(String, Vec<String>)> {
+async fn index_wikis(store: &LanceStore, repos: &[std::path::PathBuf]) -> Vec<CorpusConfig> {
     let discovered: Vec<RepositoryConfig> = repos
         .iter()
         .filter_map(|r| repository_for_discovered_wiki(r))
@@ -228,7 +220,7 @@ async fn index_wikis(
         index_corpus(&corpus, store, &registry)
             .await
             .unwrap_or_else(|e| panic!("index {}: {e}", corpus.name));
-        targets.push((corpus.name.clone(), corpus.paths.clone()));
+        targets.push(corpus);
     }
     targets
 }
@@ -398,10 +390,13 @@ async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
     // indexed rows — exactly what a discovered-but-never-indexed sub-repo wiki
     // looks like in the live union: the corpus filter matches zero LanceDB rows.
     let mut targets = index_wikis(&store, &[full]).await;
-    targets.push((
-        "repo:empty:wiki".to_string(),
-        vec![empty_wiki.to_string_lossy().into_owned()],
-    ));
+    targets.push(CorpusConfig {
+        name: "repo:empty:wiki".to_string(),
+        paths: vec![empty_wiki.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".to_string()],
+        exclude: Vec::new(),
+        global: false,
+    });
     assert_eq!(targets.len(), 2, "both corpora present in the union set");
 
     let resp = ground_union(
@@ -488,12 +483,11 @@ async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpu
     .await
     .expect("open store");
     let targets = index_wikis(&store, &[only]).await;
-    let (corpus_name, corpus_paths) = &targets[0];
+    let corpus = &targets[0];
 
     let resp: GroundResponse = ground(
         "distinctive token wiki",
-        corpus_name,
-        corpus_paths,
+        corpus,
         &store,
         None,
         GroundOpts::default(),
@@ -504,12 +498,12 @@ async fn single_corpus_ground_stamps_provenance_with_exactly_the_requested_corpu
     assert!(!resp.docs.is_empty(), "requested corpus must return hits");
     for (path, doc) in &resp.docs {
         assert_eq!(
-            &doc.corpus, corpus_name,
+            &doc.corpus, &corpus.name,
             "single-corpus ground must attribute {path} to the requested corpus"
         );
         for chunk in &doc.chunks {
             assert_eq!(
-                &chunk.provenance.corpus, corpus_name,
+                &chunk.provenance.corpus, &corpus.name,
                 "provenance.corpus must equal the requested corpus, not empty or another"
             );
         }
@@ -571,10 +565,7 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
         .await
         .expect("index beta");
 
-    let targets = vec![
-        (corpus_a.name.clone(), corpus_a.paths.clone()),
-        (corpus_b.name.clone(), corpus_b.paths.clone()),
-    ];
+    let targets = vec![corpus_a, corpus_b];
     let resp = ground_union(
         "distinctive token",
         &targets,

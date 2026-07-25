@@ -1,13 +1,13 @@
 use std::fs;
 
 use super::chunk::PreparedFile;
-use crate::common::{CorpusConfig, FileRef, HallouminateError, Mtime, Result};
+use crate::common::{CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::blake3_bytes;
 
 use super::format::{HandlerRegistry, PrepareCtx, detect_format, format_from_extension};
 
 pub(super) struct WriteRequest<'a> {
-    pub corpus: &'a CorpusConfig,
+    pub corpus_key: CorpusKey,
     pub file: &'a FileRef,
     pub mtime: Mtime,
 }
@@ -64,7 +64,7 @@ pub(super) fn prepare_file(
     };
 
     let ctx = PrepareCtx {
-        corpus: req.corpus,
+        corpus_key: &req.corpus_key,
         file: req.file,
         mtime: req.mtime,
         bytes,
@@ -109,11 +109,8 @@ mod tests {
     use super::*;
     use crate::indexer::HandlerRegistry;
 
-    fn corpus() -> CorpusConfig {
-        CorpusConfig {
-            name: "docs".into(),
-            ..Default::default()
-        }
+    fn corpus_key() -> CorpusKey {
+        CorpusKey::from_configured_root("docs", "/tmp")
     }
 
     fn registry(budget: usize) -> HandlerRegistry {
@@ -126,7 +123,7 @@ mod tests {
         let file = FileRef::new(PathBuf::from(path));
         prepare_file(
             WriteRequest {
-                corpus: &corpus(),
+                corpus_key: corpus_key(),
                 file: &file,
                 mtime: Mtime(mtime),
             },
@@ -144,7 +141,7 @@ mod tests {
         let path = dir.path().join("hello.md");
         fs::write(&path, "# Hello\n\nspice melange harvested on Arrakis\n").unwrap();
         let pf = prep(&path, &registry(2000), 42, 1234);
-        assert_eq!(pf.corpus, "docs");
+        assert_eq!(pf.corpus_key, corpus_key());
         assert_eq!(pf.mtime_ms, 42);
         assert_eq!(pf.indexed_at_ms, 1234);
         assert!(pf.file_ref.ends_with("hello.md"));
@@ -172,7 +169,7 @@ mod tests {
         let file = FileRef::new(PathBuf::from(&path));
         let out = prepare_file(
             WriteRequest {
-                corpus: &corpus(),
+                corpus_key: corpus_key(),
                 file: &file,
                 mtime: Mtime(0),
             },

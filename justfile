@@ -22,6 +22,14 @@ ci:
 llm:
     just verify --fix
 
+# Measure every pinned reranker without modifying the committed eval decision.
+eval-measure:
+    HALLOUMINATE_EVAL_OUTPUT=.context/issue-288-eval-results.json just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_measure -- --ignored --nocapture --exact
+
+# Enforce the committed retrieval metrics, chunk assertions, and runtime decision.
+eval:
+    just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_enforce -- --ignored --nocapture --exact
+
 # Prepare a new release bump PR: crate version, lockfile, and plugin manifests.
 prepare-release version:
     #!/usr/bin/env bash

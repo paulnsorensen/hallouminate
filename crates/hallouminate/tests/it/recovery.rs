@@ -35,6 +35,14 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let store_dir = tempfile::tempdir().expect("tempdir store");
     let corpus_dir = tempfile::tempdir().expect("tempdir corpus");
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+        global: false,
+    };
+    let persisted_key = corpus.primary_corpus_key().expect("corpus root");
 
     // Phase 1: successfully apply file A
     {
@@ -47,7 +55,7 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
         )
         .await
         .expect("open initial");
-        let pf_a = placeholder_prepared_file("/tmp/a.md", 3);
+        let pf_a = placeholder_prepared_file("/tmp/a.md", &persisted_key, 3);
         store.apply_batch(vec![pf_a]).await.expect("apply A");
         assert_eq!(store.count_rows().await.unwrap(), 3);
         // store dropped at end of scope
@@ -55,13 +63,6 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
 
     // Phase 2: simulate a crashing apply via panicking embedder
     fs::write(corpus_dir.path().join("b.md"), "# B\n\nbody of b\n").unwrap();
-    let corpus = CorpusConfig {
-        name: "docs".into(),
-        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
-        globs: vec!["**/*.md".into()],
-        exclude: vec![],
-        global: false,
-    };
 
     let store_path = store_dir.path().to_path_buf();
     let corpus_clone = corpus.clone();
@@ -88,7 +89,7 @@ async fn crash_in_embedder_leaves_store_at_pre_crash_state() {
     let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
         .await
         .expect("reopen after crash");
-    let snaps = store.list_files("docs").await.expect("list_files");
+    let snaps = store.list_files(&persisted_key).await.expect("list_files");
     assert!(
         snaps.iter().any(|s| s.file_ref == "/tmp/a.md"),
         "file A must survive the crash"
@@ -112,6 +113,13 @@ async fn re_run_after_crash_converges_to_correct_state() {
         .join("a.md")
         .to_string_lossy()
         .into_owned();
+    let corpus = CorpusConfig {
+        name: "docs".into(),
+        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        exclude: vec![],
+        global: false,
+    };
 
     // Pre-crash: index file A
     {
@@ -124,19 +132,16 @@ async fn re_run_after_crash_converges_to_correct_state() {
         )
         .await
         .expect("open");
-        let pf_a = placeholder_prepared_file(&file_a, 2);
+        let pf_a = placeholder_prepared_file(
+            &file_a,
+            &corpus.primary_corpus_key().expect("corpus root"),
+            2,
+        );
         store.apply_batch(vec![pf_a]).await.expect("apply A");
     }
 
     // Crash attempting to add B
     fs::write(corpus_dir.path().join("b.md"), "# B\n\nbeta body\n").unwrap();
-    let corpus = CorpusConfig {
-        name: "docs".into(),
-        paths: vec![corpus_dir.path().to_string_lossy().into_owned()],
-        globs: vec!["**/*.md".into()],
-        exclude: vec![],
-        global: false,
-    };
     let store_path = store_dir.path().to_path_buf();
     let corpus_clone = corpus.clone();
     let crashed = tokio::task::spawn(async move {
@@ -177,7 +182,10 @@ async fn re_run_after_crash_converges_to_correct_state() {
     assert!(stats.files_upserted >= 1, "B must upsert");
     assert!(stats.files_deleted >= 1, "A must be deleted (not on disk)");
 
-    let snaps = store.list_files("docs").await.expect("list_files");
+    let snaps = store
+        .list_files(&corpus.primary_corpus_key().expect("corpus root"))
+        .await
+        .expect("list_files");
     assert!(snaps.iter().any(|s| s.file_ref.ends_with("b.md")));
     assert!(!snaps.iter().any(|s| s.file_ref == file_a));
 }
@@ -188,6 +196,7 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
     // Sanity check: every successful apply_batch must survive a reopen.
     let store_dir = tempfile::tempdir().expect("tempdir store");
 
+    let corpus_key = hallouminate_domain::common::CorpusKey::from_configured_root("docs", "/tmp");
     let cycles: &[&str] = &["/tmp/x.md", "/tmp/y.md", "/tmp/z.md"];
     for (i, file_ref) in cycles.iter().enumerate() {
         let store = LanceStore::open_or_create(
@@ -200,7 +209,7 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
         .await
         .expect("reopen cycle");
         let n_chunks = i + 1;
-        let pf = placeholder_prepared_file(file_ref, n_chunks);
+        let pf = placeholder_prepared_file(file_ref, &corpus_key, n_chunks);
         store.apply_batch(vec![pf]).await.expect("apply cycle");
         // explicit drop via scope end
     }
@@ -210,6 +219,6 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
         .expect("final reopen");
     let total = store.count_rows().await.unwrap();
     assert_eq!(total, 1 + 2 + 3, "all three batches must have persisted");
-    let snaps = store.list_files("docs").await.expect("list");
+    let snaps = store.list_files(&corpus_key).await.expect("list");
     assert_eq!(snaps.len(), 3, "all three files snapshotted");
 }

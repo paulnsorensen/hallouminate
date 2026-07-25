@@ -153,9 +153,14 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
     ];
 
     for (query, expected_file) in oracles {
-        let hits = search_with_ripgrep(&store, "docs", &corpus.paths, query, 5)
-            .await
-            .expect("hybrid_search");
+        let hits = search_with_ripgrep(
+            &store,
+            &corpus.primary_corpus_key().expect("corpus root"),
+            query,
+            5,
+        )
+        .await
+        .expect("hybrid_search");
         assert!(
             !hits.is_empty(),
             "no hits for oracle query {query:?} (expected file {expected_file})"
@@ -262,9 +267,14 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
     assert!(stats.files_deleted >= 1, "must report at least 1 deletion");
 
     // Verify the grail oracle no longer hits its source
-    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "caerbannog", 5)
-        .await
-        .expect("search after delete");
+    let hits = search_with_ripgrep(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "caerbannog",
+        5,
+    )
+    .await
+    .expect("search after delete");
     assert!(
         !hits.iter().any(|h| h.file_ref.ends_with("grail.md")),
         "grail.md must no longer appear in results"
@@ -352,9 +362,14 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         "vanishing.md must produce at least one row"
     );
 
-    let hits_before = search_with_ripgrep(&store, "docs", &corpus.paths, "melange", 5)
-        .await
-        .expect("search before truncation");
+    let hits_before = search_with_ripgrep(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "melange",
+        5,
+    )
+    .await
+    .expect("search before truncation");
     assert!(
         hits_before
             .iter()
@@ -384,9 +399,14 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         "stale rows for the truncated file must be evicted, not left behind"
     );
 
-    let hits_after = search_with_ripgrep(&store, "docs", &corpus.paths, "melange", 5)
-        .await
-        .expect("search after truncation");
+    let hits_after = search_with_ripgrep(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "melange",
+        5,
+    )
+    .await
+    .expect("search after truncation");
     assert!(
         hits_after.is_empty(),
         "truncated file must no longer be searchable: {hits_after:?}"
@@ -432,7 +452,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
         hallouminate_domain::common::FileRef,
         hallouminate_domain::indexer::FileSnapshot,
     > = store
-        .list_files("docs")
+        .list_files(&corpus.primary_corpus_key().expect("corpus root"))
         .await
         .expect("list")
         .into_iter()
@@ -502,16 +522,9 @@ async fn off_mode_index_and_ground_round_trip_returns_lexical_hits() {
     );
 
     // Lexical-only ground: no embedder, distinctive token resolves to grail.md.
-    let resp = ground(
-        "caerbannog",
-        &corpus.name,
-        &corpus.paths,
-        &store,
-        None,
-        GroundOpts::default(),
-    )
-    .await
-    .expect("OFF-mode ground");
+    let resp = ground("caerbannog", &corpus, &store, None, GroundOpts::default())
+        .await
+        .expect("OFF-mode ground");
     assert!(resp.stats.hits > 0, "FTS must return at least one hit");
     // `docs` is keyed by file_ref. The top-scoring doc for a distinctive
     // token must be grail.md.
@@ -641,9 +654,14 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
         .expect("index_corpus");
     assert_eq!(stats.files_upserted, 2, "both pages indexed");
 
-    let hits = search_with_ripgrep(&store, "docs", &corpus.paths, "zphyxnort", 5)
-        .await
-        .expect("hybrid_search fm");
+    let hits = search_with_ripgrep(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "zphyxnort",
+        5,
+    )
+    .await
+    .expect("hybrid_search fm");
     let hit = hits
         .iter()
         .find(|h| h.file_ref.ends_with("fm.md"))
@@ -687,9 +705,14 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
     );
 
     // The plain page (no frontmatter) still grounds normally.
-    let hits2 = search_with_ripgrep(&store, "docs", &corpus.paths, "qwobblefrotz", 5)
-        .await
-        .expect("hybrid_search plain");
+    let hits2 = search_with_ripgrep(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "qwobblefrotz",
+        5,
+    )
+    .await
+    .expect("hybrid_search plain");
     assert!(
         hits2.iter().any(|h| h.file_ref.ends_with("plain.md")),
         "plain page must ground: {:?}",
@@ -752,16 +775,9 @@ A note about epsilonmelange with an ordinary comment.<!-- ordinary note -->\n";
     assert_eq!(stats.files_upserted, 1, "the claims page indexed");
 
     // Ground on a distinctive body token so the claims page is the top hit.
-    let resp = ground(
-        "alphamelange",
-        &corpus.name,
-        &corpus.paths,
-        &store,
-        None,
-        GroundOpts::default(),
-    )
-    .await
-    .expect("ground");
+    let resp = ground("alphamelange", &corpus, &store, None, GroundOpts::default())
+        .await
+        .expect("ground");
 
     let doc = resp
         .docs

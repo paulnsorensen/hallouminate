@@ -8,10 +8,15 @@ use crate::common::{
     LANCE_WRITE_LOCK, StubEmbedder, placeholder_prepared_file, prepared_file_with_chunks,
 };
 use hallouminate_adapters::{LanceStore, chunk_id_for};
+use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
 use hallouminate_domain::search::search_with_ripgrep;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
+
+fn corpus_key(name: &str) -> CorpusKey {
+    CorpusKey::from_configured_root(name, "/tmp")
+}
 
 async fn fresh_store() -> (tempfile::TempDir, LanceStore) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -28,12 +33,13 @@ async fn fresh_store() -> (tempfile::TempDir, LanceStore) {
 async fn re_index_with_fewer_chunks_drops_orphaned_ords() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
 
-    let five = placeholder_prepared_file("/tmp/a.md", 5);
+    let five = placeholder_prepared_file("/tmp/a.md", &corpus_key, 5);
     store.apply_batch(vec![five]).await.expect("apply 5 chunks");
     assert_eq!(store.count_rows().await.unwrap(), 5);
 
-    let three = placeholder_prepared_file("/tmp/a.md", 3);
+    let three = placeholder_prepared_file("/tmp/a.md", &corpus_key, 3);
     store
         .apply_batch(vec![three])
         .await
@@ -51,14 +57,15 @@ async fn re_index_with_fewer_chunks_drops_orphaned_ords() {
 async fn delete_file_removes_all_chunks_for_that_file_only() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
 
-    let a = placeholder_prepared_file("/tmp/a.md", 3);
-    let b = placeholder_prepared_file("/tmp/b.md", 2);
+    let a = placeholder_prepared_file("/tmp/a.md", &corpus_key, 3);
+    let b = placeholder_prepared_file("/tmp/b.md", &corpus_key, 2);
     store.apply_batch(vec![a, b]).await.expect("apply both");
     assert_eq!(store.count_rows().await.unwrap(), 5);
 
     store
-        .delete_file("docs", "/tmp/a.md")
+        .delete_file(&corpus_key, "/tmp/a.md")
         .await
         .expect("delete /tmp/a.md");
     assert_eq!(
@@ -67,7 +74,7 @@ async fn delete_file_removes_all_chunks_for_that_file_only() {
         "only /tmp/b.md should remain"
     );
 
-    let snaps = store.list_files("docs").await.expect("list_files");
+    let snaps = store.list_files(&corpus_key).await.expect("list_files");
     assert!(
         !snaps.iter().any(|s| s.file_ref == "/tmp/a.md"),
         "a.md must be gone"
@@ -84,19 +91,21 @@ async fn delete_file_removes_all_chunks_for_that_file_only() {
 async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let alpha = corpus_key("alpha");
+    let beta = corpus_key("beta");
 
     // Same distinctive token in two corpora; apply_batch requires one corpus
     // per call, so seed them separately.
     let a = prepared_file_with_chunks(
         "/tmp/a.md",
-        "alpha",
+        &alpha,
         100,
         "ha",
         vec!["zebrafish distinctive marker token"],
     );
     let b = prepared_file_with_chunks(
         "/tmp/b.md",
-        "beta",
+        &beta,
         100,
         "hb",
         vec!["zebrafish distinctive marker token"],
@@ -105,7 +114,7 @@ async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
     store.apply_batch(vec![b]).await.expect("apply beta");
 
     let hits = store
-        .hybrid_search("alpha", "zebrafish", 10)
+        .hybrid_search(&alpha, "zebrafish", 10)
         .await
         .expect("hybrid_search");
     assert!(!hits.is_empty(), "must find the token in corpus alpha");
@@ -120,8 +129,9 @@ async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
 async fn fts_search_on_empty_store_returns_no_hits() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
     let hits = store
-        .hybrid_search("docs", "anything", 10)
+        .hybrid_search(&corpus_key, "anything", 10)
         .await
         .expect("hybrid_search on empty store");
     assert!(hits.is_empty(), "empty store must yield zero FTS hits");
@@ -133,10 +143,11 @@ async fn fts_search_on_empty_store_returns_no_hits() {
 async fn touch_mtime_updates_only_mtime_column() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
 
     let pf = prepared_file_with_chunks(
         "/tmp/touch.md",
-        "docs",
+        &corpus_key,
         100,
         "hash-v1",
         vec!["text-one", "text-two"],
@@ -147,14 +158,14 @@ async fn touch_mtime_updates_only_mtime_column() {
     assert_eq!(before, 2);
 
     store
-        .touch_mtime("docs", "/tmp/touch.md", 999)
+        .touch_mtime(&corpus_key, "/tmp/touch.md", 999)
         .await
         .expect("touch_mtime");
 
     let after = store.count_rows().await.unwrap();
     assert_eq!(after, 2, "touch must not insert or remove rows");
 
-    let snaps = store.list_files("docs").await.expect("list_files");
+    let snaps = store.list_files(&corpus_key).await.expect("list_files");
     let snap = snaps
         .iter()
         .find(|s| s.file_ref == "/tmp/touch.md")
@@ -172,10 +183,11 @@ async fn touch_mtime_updates_only_mtime_column() {
 async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
 
     let pf = prepared_file_with_chunks(
         "/tmp/melange.md",
-        "docs",
+        &corpus_key,
         1,
         "h1",
         vec!["the spice melange flows on Arrakis"],
@@ -183,7 +195,7 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
     store.apply_batch(vec![pf]).await.expect("apply");
 
     // Use the stub embedder to compute a query vector deterministically.
-    let hits = search_with_ripgrep(&store, "docs", &[], "spice", 5)
+    let hits = search_with_ripgrep(&store, &corpus_key, "spice", 5)
         .await
         .expect("hybrid_search");
     assert!(
@@ -202,7 +214,8 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
 async fn hybrid_search_on_empty_corpus_returns_empty_vec() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
-    let hits = search_with_ripgrep(&store, "docs", &[], "anything", 5)
+    let corpus_key = corpus_key("docs");
+    let hits = search_with_ripgrep(&store, &corpus_key, "anything", 5)
         .await
         .expect("empty corpus must yield Ok, not error");
     assert!(hits.is_empty(), "empty corpus must yield zero hits");
@@ -214,17 +227,18 @@ async fn hybrid_search_on_empty_corpus_returns_empty_vec() {
 async fn single_file_corpus_top_hit_is_that_file() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
 
     let pf = prepared_file_with_chunks(
         "/tmp/only.md",
-        "docs",
+        &corpus_key,
         1,
         "h1",
         vec!["unique_token_witness_me on the fury road"],
     );
     store.apply_batch(vec![pf]).await.expect("apply");
 
-    let hits = search_with_ripgrep(&store, "docs", &[], "unique_token_witness_me", 5)
+    let hits = search_with_ripgrep(&store, &corpus_key, "unique_token_witness_me", 5)
         .await
         .expect("hybrid_search");
     assert!(!hits.is_empty(), "expected at least one hit");
@@ -240,19 +254,20 @@ async fn single_file_corpus_top_hit_is_that_file() {
 async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
     let weird = "/tmp/o'brien's notes.md";
-    let pf = placeholder_prepared_file(weird, 2);
+    let pf = placeholder_prepared_file(weird, &corpus_key, 2);
     store.apply_batch(vec![pf]).await.expect("apply weird name");
     assert_eq!(store.count_rows().await.unwrap(), 2);
 
-    let snaps = store.list_files("docs").await.unwrap();
+    let snaps = store.list_files(&corpus_key).await.unwrap();
     assert!(snaps.iter().any(|s| s.file_ref == weird));
 
     store
-        .touch_mtime("docs", weird, 4242)
+        .touch_mtime(&corpus_key, weird, 4242)
         .await
         .expect("touch weird");
-    let snaps2 = store.list_files("docs").await.unwrap();
+    let snaps2 = store.list_files(&corpus_key).await.unwrap();
     assert_eq!(
         snaps2
             .iter()
@@ -263,7 +278,7 @@ async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
     );
 
     store
-        .delete_file("docs", weird)
+        .delete_file(&corpus_key, weird)
         .await
         .expect("delete weird");
     assert_eq!(store.count_rows().await.unwrap(), 0);
@@ -275,16 +290,16 @@ async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
 async fn list_files_returns_only_the_requested_corpus() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let alpha_key = corpus_key("alpha");
+    let beta_key = corpus_key("beta");
 
-    let mut a = placeholder_prepared_file("/tmp/a.md", 2);
-    a.corpus = "alpha".into();
-    let mut b = placeholder_prepared_file("/tmp/b.md", 2);
-    b.corpus = "beta".into();
+    let a = placeholder_prepared_file("/tmp/a.md", &alpha_key, 2);
+    let b = placeholder_prepared_file("/tmp/b.md", &beta_key, 2);
     store.apply_batch(vec![a]).await.expect("apply alpha");
     store.apply_batch(vec![b]).await.expect("apply beta");
 
-    let alpha = store.list_files("alpha").await.unwrap();
-    let beta = store.list_files("beta").await.unwrap();
+    let alpha = store.list_files(&alpha_key).await.unwrap();
+    let beta = store.list_files(&beta_key).await.unwrap();
 
     assert_eq!(alpha.len(), 1, "alpha should see only its own file");
     assert_eq!(beta.len(), 1, "beta should see only its own file");
@@ -298,10 +313,10 @@ async fn list_files_returns_only_the_requested_corpus() {
 async fn apply_batch_rejects_mixed_corpus_batches() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
-    let mut a = placeholder_prepared_file("/tmp/a.md", 1);
-    a.corpus = "alpha".into();
-    let mut b = placeholder_prepared_file("/tmp/b.md", 1);
-    b.corpus = "beta".into();
+    let alpha = corpus_key("alpha");
+    let beta = corpus_key("beta");
+    let a = placeholder_prepared_file("/tmp/a.md", &alpha, 1);
+    let b = placeholder_prepared_file("/tmp/b.md", &beta, 1);
     let err = store
         .apply_batch(vec![a, b])
         .await
@@ -318,12 +333,12 @@ async fn apply_batch_rejects_mixed_corpus_batches() {
 async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let alpha = corpus_key("alpha");
+    let beta = corpus_key("beta");
     let shared = "/tmp/shared.md";
 
-    let mut a = prepared_file_with_chunks("docs", "alpha", 1, "h1", vec!["alpha-only token"]);
-    a.file_ref = shared.into();
-    let mut b = prepared_file_with_chunks("docs", "beta", 1, "h1", vec!["beta-only token"]);
-    b.file_ref = shared.into();
+    let a = prepared_file_with_chunks(shared, &alpha, 1, "h1", vec!["alpha-only token"]);
+    let b = prepared_file_with_chunks(shared, &beta, 1, "h1", vec!["beta-only token"]);
 
     store.apply_batch(vec![a]).await.expect("apply alpha");
     store.apply_batch(vec![b]).await.expect("apply beta");
@@ -334,11 +349,11 @@ async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
 
     // Deleting from `alpha` must not touch `beta`'s row.
     store
-        .delete_file("alpha", shared)
+        .delete_file(&alpha, shared)
         .await
         .expect("delete alpha row");
     assert_eq!(store.count_rows().await.unwrap(), 1);
-    let beta = store.list_files("beta").await.unwrap();
+    let beta = store.list_files(&beta).await.unwrap();
     assert!(beta.iter().any(|s| s.file_ref == shared));
 }
 
@@ -348,30 +363,30 @@ async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
 async fn hybrid_search_returns_only_hits_from_requested_corpus() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let alpha = corpus_key("alpha");
+    let beta = corpus_key("beta");
 
-    let mut a = prepared_file_with_chunks(
+    let a = prepared_file_with_chunks(
         "/tmp/alpha.md",
-        "alpha",
+        &alpha,
         1,
         "h1",
         vec!["unique_alpha_marker on the sand"],
     );
-    a.corpus = "alpha".into();
-    let mut b = prepared_file_with_chunks(
+    let b = prepared_file_with_chunks(
         "/tmp/beta.md",
-        "beta",
+        &beta,
         1,
         "h1",
         vec!["unique_alpha_marker on the road"],
     );
-    b.corpus = "beta".into();
     store.apply_batch(vec![a]).await.expect("apply alpha");
     store.apply_batch(vec![b]).await.expect("apply beta");
 
-    let hits_alpha = search_with_ripgrep(&store, "alpha", &[], "unique_alpha_marker", 5)
+    let hits_alpha = search_with_ripgrep(&store, &alpha, "unique_alpha_marker", 5)
         .await
         .expect("alpha search");
-    let hits_beta = search_with_ripgrep(&store, "beta", &[], "unique_alpha_marker", 5)
+    let hits_beta = search_with_ripgrep(&store, &beta, "unique_alpha_marker", 5)
         .await
         .expect("beta search");
 
@@ -387,18 +402,215 @@ async fn hybrid_search_returns_only_hits_from_requested_corpus() {
     );
 }
 
+#[tokio::test]
+async fn same_name_roots_are_isolated_through_public_lance_api() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store) = fresh_store().await;
+    let root_a = tempfile::tempdir().expect("root a");
+    let root_b = tempfile::tempdir().expect("root b");
+    let key_a =
+        CorpusKey::from_configured_root("docs", root_a.path().to_str().expect("UTF-8 root a"));
+    let key_b =
+        CorpusKey::from_configured_root("docs", root_b.path().to_str().expect("UTF-8 root b"));
+    let file_ref = "/virtual/shared/page.md";
+
+    let a = prepared_file_with_chunks(
+        file_ref,
+        &key_a,
+        10,
+        "a-v1",
+        vec!["sharedquery root-a-one", "sharedquery root-a-two"],
+    );
+    let b = prepared_file_with_chunks(
+        file_ref,
+        &key_b,
+        20,
+        "b-v1",
+        vec!["sharedquery root-b-one", "sharedquery root-b-two"],
+    );
+    store.apply_batch(vec![a]).await.expect("apply root a");
+    store.apply_batch(vec![b]).await.expect("apply root b");
+
+    let files_a = store.list_files(&key_a).await.expect("list root a");
+    let files_b = store.list_files(&key_b).await.expect("list root b");
+    assert_eq!(files_a.len(), 1);
+    assert_eq!(files_b.len(), 1);
+    assert_eq!(files_a[0].corpus_key, key_a);
+    assert_eq!(files_a[0].file_ref, file_ref);
+    assert_eq!(files_b[0].corpus_key, key_b);
+    assert_eq!(files_b[0].file_ref, file_ref);
+
+    let hits_a = store
+        .hybrid_search(&key_a, "sharedquery", 10)
+        .await
+        .expect("search root a");
+    let hits_b = store
+        .hybrid_search(&key_b, "sharedquery", 10)
+        .await
+        .expect("search root b");
+    assert_eq!(hits_a.len(), 2);
+    for hit in &hits_a {
+        assert_eq!(hit.corpus_key, key_a);
+        assert_eq!(hit.file_ref, file_ref);
+        assert!(hit.text.starts_with("sharedquery root-a-"));
+    }
+    assert_eq!(hits_b.len(), 2);
+    for hit in &hits_b {
+        assert_eq!(hit.corpus_key, key_b);
+        assert_eq!(hit.file_ref, file_ref);
+        assert!(hit.text.starts_with("sharedquery root-b-"));
+    }
+
+    store
+        .touch_mtime(&key_a, file_ref, 99)
+        .await
+        .expect("touch root a");
+    assert_eq!(store.list_files(&key_a).await.unwrap()[0].mtime_ms, 99);
+    let files_b = store
+        .list_files(&key_b)
+        .await
+        .expect("list root b after touch");
+    assert_eq!(files_b.len(), 1);
+    assert_eq!(files_b[0].corpus_key, key_b);
+    assert_eq!(files_b[0].file_ref, file_ref);
+    assert_eq!(files_b[0].mtime_ms, 20);
+    assert_eq!(files_b[0].content_hash, "b-v1");
+    let hits_b = store
+        .hybrid_search(&key_b, "sharedquery", 10)
+        .await
+        .expect("search root b after touch");
+    assert_eq!(hits_b.len(), 2);
+    for hit in &hits_b {
+        assert_eq!(hit.corpus_key, key_b);
+        assert_eq!(hit.file_ref, file_ref);
+        assert!(hit.text.starts_with("sharedquery root-b-"));
+    }
+    let stats_a = store
+        .corpus_chunk_stats(&key_a)
+        .await
+        .expect("stats root a after touch");
+    let stats_b = store
+        .corpus_chunk_stats(&key_b)
+        .await
+        .expect("stats root b after touch");
+    assert_eq!((stats_a.indexed_files, stats_a.total_chunks), (1, 2));
+    assert_eq!((stats_b.indexed_files, stats_b.total_chunks), (1, 2));
+
+    let replacement = prepared_file_with_chunks(
+        file_ref,
+        &key_a,
+        100,
+        "a-v2",
+        vec!["sharedquery root-a-replacement"],
+    );
+    store
+        .apply_batch(vec![replacement])
+        .await
+        .expect("replace root a");
+    let files_a = store
+        .list_files(&key_a)
+        .await
+        .expect("list root a after replacement");
+    assert_eq!(files_a.len(), 1);
+    assert_eq!(files_a[0].corpus_key, key_a);
+    assert_eq!(files_a[0].file_ref, file_ref);
+    assert_eq!(files_a[0].content_hash, "a-v2");
+    let hits_a = store
+        .hybrid_search(&key_a, "sharedquery", 10)
+        .await
+        .expect("search root a after replacement");
+    assert_eq!(hits_a.len(), 1);
+    assert_eq!(hits_a[0].corpus_key, key_a);
+    assert_eq!(hits_a[0].file_ref, file_ref);
+    assert_eq!(hits_a[0].text, "sharedquery root-a-replacement");
+    let stats_a = store
+        .corpus_chunk_stats(&key_a)
+        .await
+        .expect("stats root a after replacement");
+    assert_eq!((stats_a.indexed_files, stats_a.total_chunks), (1, 1));
+
+    let files_b = store
+        .list_files(&key_b)
+        .await
+        .expect("list root b after replacement");
+    assert_eq!(files_b.len(), 1);
+    assert_eq!(files_b[0].corpus_key, key_b);
+    assert_eq!(files_b[0].file_ref, file_ref);
+    assert_eq!(files_b[0].mtime_ms, 20);
+    assert_eq!(files_b[0].content_hash, "b-v1");
+    let hits_b = store
+        .hybrid_search(&key_b, "sharedquery", 10)
+        .await
+        .expect("search root b after replacement");
+    assert_eq!(hits_b.len(), 2);
+    for hit in &hits_b {
+        assert_eq!(hit.corpus_key, key_b);
+        assert_eq!(hit.file_ref, file_ref);
+        assert!(hit.text.starts_with("sharedquery root-b-"));
+    }
+    let stats_b = store
+        .corpus_chunk_stats(&key_b)
+        .await
+        .expect("stats root b after replacement");
+    assert_eq!((stats_b.indexed_files, stats_b.total_chunks), (1, 2));
+
+    store
+        .delete_file(&key_a, file_ref)
+        .await
+        .expect("delete root a");
+    assert!(store.list_files(&key_a).await.unwrap().is_empty());
+    assert!(
+        store
+            .hybrid_search(&key_a, "sharedquery", 10)
+            .await
+            .expect("search root a after deletion")
+            .is_empty()
+    );
+    let stats_a = store
+        .corpus_chunk_stats(&key_a)
+        .await
+        .expect("stats root a after deletion");
+    assert_eq!((stats_a.indexed_files, stats_a.total_chunks), (0, 0));
+
+    let files_b = store
+        .list_files(&key_b)
+        .await
+        .expect("list root b after deletion");
+    assert_eq!(files_b.len(), 1);
+    assert_eq!(files_b[0].corpus_key, key_b);
+    assert_eq!(files_b[0].file_ref, file_ref);
+    assert_eq!(files_b[0].mtime_ms, 20);
+    assert_eq!(files_b[0].content_hash, "b-v1");
+    let hits_b = store
+        .hybrid_search(&key_b, "sharedquery", 10)
+        .await
+        .expect("search root b after deletion");
+    assert_eq!(hits_b.len(), 2);
+    for hit in &hits_b {
+        assert_eq!(hit.corpus_key, key_b);
+        assert_eq!(hit.file_ref, file_ref);
+        assert!(hit.text.starts_with("sharedquery root-b-"));
+    }
+    let stats_b = store
+        .corpus_chunk_stats(&key_b)
+        .await
+        .expect("stats root b after deletion");
+    assert_eq!((stats_b.indexed_files, stats_b.total_chunks), (1, 2));
+}
+
 // ── Bonus: chunk_id determinism end-to-end through apply_batch ──────────
 
 #[tokio::test]
 async fn apply_batch_uses_deterministic_chunk_ids_so_reapply_is_idempotent() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
+    let corpus_key = corpus_key("docs");
 
-    let pf = placeholder_prepared_file("/tmp/idem.md", 4);
+    let pf = placeholder_prepared_file("/tmp/idem.md", &corpus_key, 4);
     store.apply_batch(vec![pf]).await.expect("first apply");
     assert_eq!(store.count_rows().await.unwrap(), 4);
 
-    let pf2 = placeholder_prepared_file("/tmp/idem.md", 4);
+    let pf2 = placeholder_prepared_file("/tmp/idem.md", &corpus_key, 4);
     store
         .apply_batch(vec![pf2])
         .await

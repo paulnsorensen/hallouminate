@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use hallouminate_adapters::LanceStore;
 use hallouminate_config::Config;
 use hallouminate_daemon::{
     AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest, DaemonRequestPayload,
@@ -22,6 +23,8 @@ use hallouminate_daemon::{
     IndexRequest, LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest,
     connect_at, serve, spawn_signal_handlers,
 };
+use hallouminate_domain::common::CorpusKey;
+use hallouminate_domain::indexer::ChunkStore;
 use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
 use tokio::time::timeout;
 
@@ -1927,10 +1930,18 @@ async fn open_does_not_warn_when_idle_evict_secs_is_default() {
 }
 
 /// Run `f` with a thread-local tracing subscriber that captures WARN-level
-/// output into a string, so a test can assert which warnings a code path emits.
+/// output, so a test can assert which warnings a code path emits.
 /// `#[tokio::test]` uses a current-thread runtime, so the thread-local default
 /// holds across the awaits inside `f`.
-async fn capture_daemon_warnings<F, Fut>(f: F) -> String
+async fn capture_daemon_warnings<F, Fut>(f: F) -> CapturedLogs
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    capture_daemon_logs(tracing::Level::WARN, f).await
+}
+
+async fn capture_daemon_logs<F, Fut>(max_level: tracing::Level, f: F) -> CapturedLogs
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
@@ -1940,20 +1951,77 @@ where
     let subscriber = tracing_subscriber::fmt()
         .with_writer(move || CaptureWriter(std::sync::Arc::clone(&writer_buf)))
         .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
+        .without_time()
+        .with_max_level(max_level)
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
     f().await;
     drop(guard);
     let bytes = buf.lock().unwrap().clone();
-    String::from_utf8(bytes).expect("captured logs are utf8")
+    CapturedLogs::from_rendered(String::from_utf8(bytes).expect("captured logs are utf8"))
+}
+
+#[derive(Debug)]
+struct CapturedLogs {
+    rendered: String,
+    events: Vec<CapturedLogEvent>,
+}
+
+#[derive(Debug)]
+struct CapturedLogEvent {
+    level: tracing::Level,
+    rendered: String,
+}
+
+impl CapturedLogs {
+    fn from_rendered(rendered: String) -> Self {
+        let events = rendered
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let rendered = line.trim_start().to_owned();
+                let level = match rendered.split_whitespace().next() {
+                    Some("ERROR") => tracing::Level::ERROR,
+                    Some("WARN") => tracing::Level::WARN,
+                    Some("INFO") => tracing::Level::INFO,
+                    Some("DEBUG") => tracing::Level::DEBUG,
+                    Some("TRACE") => tracing::Level::TRACE,
+                    Some(other) => {
+                        panic!("captured formatter emitted unknown level {other}: {line}")
+                    }
+                    None => unreachable!("empty formatter lines were filtered"),
+                };
+                CapturedLogEvent { level, rendered }
+            })
+            .collect();
+        Self { rendered, events }
+    }
+
+    fn contains(&self, needle: &str) -> bool {
+        self.rendered.contains(needle)
+    }
+
+    fn contains_event(&self, level: tracing::Level, needles: &[&str]) -> bool {
+        self.events.iter().any(|event| {
+            event.level == level && needles.iter().all(|needle| event.rendered.contains(needle))
+        })
+    }
+}
+
+impl std::fmt::Display for CapturedLogs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.rendered)
+    }
 }
 
 struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
 impl std::io::Write for CaptureWriter {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(data);
+        const MAX_CAPTURED_LOG_BYTES: usize = 64 * 1024;
+        let mut buf = self.0.lock().unwrap();
+        let remaining = MAX_CAPTURED_LOG_BYTES.saturating_sub(buf.len());
+        buf.extend_from_slice(&data[..data.len().min(remaining)]);
         Ok(data.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2438,6 +2506,323 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
 
 // ─── Curd B: multi-root corpus read/mutate split ─────────────────────────
 
+fn cfg_request_scoped_corpora(ground: &Path) -> Config {
+    let toml = format!(
+        "[storage]\nground_dir = \"{g}\"\n\n\
+         [embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+        g = ground.display(),
+    );
+    toml::from_str(&toml).expect("request-scoped corpus baseline parses")
+}
+
+fn repo_corpus_cwd(cwd: &Path, root: &Path) -> PathBuf {
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{root}\"]\nglobs = [\"**/*.md\"]\n",
+        root = root.display(),
+    );
+    repo_override_cwd(cwd, &toml)
+}
+
+fn daemon_ok_payload(response: DaemonResponse, context: &str) -> serde_json::Value {
+    match response {
+        DaemonResponse::Ok { result } => result,
+        DaemonResponse::Err { kind, message } => {
+            panic!("{context} returned {kind:?}: {message}")
+        }
+    }
+}
+
+async fn index_corpus_through_ipc(
+    client: &hallouminate_daemon::DaemonClient,
+    cwd: &Path,
+    corpus: &str,
+) -> (hallouminate_daemon::IndexReport, serde_json::Value) {
+    let wire = daemon_ok_payload(
+        client
+            .call_raw(DaemonRequest {
+                cwd: cwd.to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some(corpus.into()),
+                    paths_from: None,
+                    strict: false,
+                }),
+            })
+            .await
+            .expect("index through daemon IPC"),
+        "index",
+    );
+    let decoded = serde_json::from_value(wire.clone()).expect("decode index report");
+    (decoded, wire)
+}
+
+async fn ground_through_ipc(
+    client: &hallouminate_daemon::DaemonClient,
+    cwd: &Path,
+    corpus: &str,
+    query: &str,
+) -> (GroundResult, serde_json::Value) {
+    let wire = daemon_ok_payload(
+        client
+            .call_raw(DaemonRequest {
+                cwd: cwd.to_path_buf(),
+                payload: DaemonRequestPayload::Ground(GroundRequest {
+                    query: query.into(),
+                    corpus: Some(corpus.into()),
+                    top_files: Some(10),
+                    chunks_per_file: Some(3),
+                    limit: Some(50),
+                    snippet_chars: None,
+                }),
+            })
+            .await
+            .expect("ground through daemon IPC"),
+        "ground",
+    );
+    let decoded = serde_json::from_value(wire.clone()).expect("decode ground result");
+    (decoded, wire)
+}
+
+fn assert_exact_object_keys(value: &serde_json::Value, expected: &[&str], context: &str) {
+    let fields = value
+        .as_object()
+        .unwrap_or_else(|| panic!("{context} must be an object: {value}"));
+    let actual: std::collections::BTreeSet<&str> = fields.keys().map(String::as_str).collect();
+    let expected: std::collections::BTreeSet<&str> = expected.iter().copied().collect();
+    assert_eq!(actual, expected, "unexpected {context} wire keys: {value}");
+}
+
+fn assert_index_report_wire_shape(value: &serde_json::Value) {
+    assert_exact_object_keys(value, &["corpora"], "index report");
+    let corpora = value["corpora"]
+        .as_array()
+        .expect("index report corpora must be an array");
+    for corpus in corpora {
+        assert_exact_object_keys(
+            corpus,
+            &[
+                "chunks_inserted",
+                "embeddings_inserted",
+                "files_deleted",
+                "files_skipped_empty",
+                "files_skipped_unreadable",
+                "files_touched",
+                "files_upserted",
+                "name",
+            ],
+            "index corpus report",
+        );
+    }
+}
+
+fn assert_ground_warning_wire_shape(value: &serde_json::Value) {
+    assert_exact_object_keys(value, &["code", "message"], "ground warning");
+}
+
+fn assert_ground_result_wire_shape(value: &serde_json::Value) {
+    assert_exact_object_keys(value, &["outline", "response"], "ground result");
+    let response = &value["response"];
+    assert_exact_object_keys(
+        response,
+        &["code", "docs", "query", "stats", "took_ms", "warnings"],
+        "ground response",
+    );
+    assert_exact_object_keys(&response["stats"], &["hits"], "ground stats");
+
+    let docs = response["docs"]
+        .as_object()
+        .expect("ground docs must be an object");
+    for doc in docs.values() {
+        assert_exact_object_keys(
+            doc,
+            &[
+                "chunks", "corpus", "keywords", "mtime", "path", "score", "stale", "summary",
+                "z_score",
+            ],
+            "ground document",
+        );
+        let chunks = doc["chunks"]
+            .as_array()
+            .expect("ground document chunks must be an array");
+        for chunk in chunks {
+            assert_exact_object_keys(
+                chunk,
+                &[
+                    "chunk_id",
+                    "heading_path",
+                    "line_range",
+                    "provenance",
+                    "score",
+                    "snippet",
+                    "z_score",
+                ],
+                "ground chunk",
+            );
+            let provenance = &chunk["provenance"];
+            assert_exact_object_keys(
+                provenance,
+                &["claim_marks", "corpus"],
+                "ground chunk provenance",
+            );
+            let claim_marks = provenance["claim_marks"]
+                .as_array()
+                .expect("ground claim_marks must be an array");
+            for claim_mark in claim_marks {
+                assert_exact_object_keys(
+                    claim_mark,
+                    &["line", "note", "reference", "status"],
+                    "ground claim mark",
+                );
+            }
+        }
+    }
+
+    let code = response["code"]
+        .as_object()
+        .expect("ground code must be an object");
+    assert!(
+        code.is_empty(),
+        "test corpus must not emit code results: {code:?}"
+    );
+    let warnings = response["warnings"]
+        .as_array()
+        .expect("ground warnings must be an array");
+    for warning in warnings {
+        assert_ground_warning_wire_shape(warning);
+    }
+}
+
+fn assert_corpus_stats_wire_shape(value: &serde_json::Value) {
+    assert_exact_object_keys(
+        value,
+        &[
+            "corpus",
+            "indexed_files",
+            "last_indexed_ms",
+            "total_chunks",
+            "unindexed_files",
+        ],
+        "corpus stats",
+    );
+}
+
+#[test]
+fn ground_warning_production_type_serializes_exact_populated_wire_shape() {
+    let warning = hallouminate_domain::ground::Warning {
+        code: "cross-repo-union".into(),
+        message: "repository name collision".into(),
+    };
+    let wire = serde_json::to_value(warning).expect("serialize production ground warning");
+    assert_eq!(wire["code"], "cross-repo-union");
+    assert_eq!(wire["message"], "repository name collision");
+    assert_ground_warning_wire_shape(&wire);
+}
+
+#[tokio::test]
+async fn daemon_ground_isolates_same_name_corpus_by_request_cwd_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let cwd_a = tmp.path().join("worktree-a");
+    let cwd_b = tmp.path().join("worktree-b");
+    let root_a = cwd_a.join("docs");
+    let root_b = cwd_b.join("docs");
+    std::fs::create_dir_all(&root_a).expect("mkdir worktree A corpus");
+    std::fs::create_dir_all(&root_b).expect("mkdir worktree B corpus");
+    let file_a = root_a.join("shared.md");
+    let file_b = root_b.join("shared.md");
+    std::fs::write(
+        &file_a,
+        "# Shared retrieval\n\nsharedworktreeisolation sharedworktreeisolation marker-a-camembert.<!--claim:confirmed-->\n",
+    )
+    .expect("write worktree A document");
+    std::fs::write(
+        &file_b,
+        "# Shared retrieval\n\nsharedworktreeisolation sharedworktreeisolation marker-b-stilton\n",
+    )
+    .expect("write worktree B document");
+    let cwd_a = repo_corpus_cwd(&cwd_a, &root_a);
+    let cwd_b = repo_corpus_cwd(&cwd_b, &root_b);
+
+    let harness = DaemonHarness::spawn(cfg_request_scoped_corpora(&ground)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let (report_a, report_a_wire) = index_corpus_through_ipc(&client, &cwd_a, "docs").await;
+    let (report_b, report_b_wire) = index_corpus_through_ipc(&client, &cwd_b, "docs").await;
+    assert_eq!(report_a.corpora.len(), 1, "{report_a:#?}");
+    assert_eq!(report_a.corpora[0].files_upserted, 1, "{report_a:#?}");
+    assert_eq!(report_b.corpora.len(), 1, "{report_b:#?}");
+    assert_eq!(report_b.corpora[0].files_upserted, 1, "{report_b:#?}");
+    assert_index_report_wire_shape(&report_a_wire);
+    assert_index_report_wire_shape(&report_b_wire);
+
+    let (result_a, result_a_wire) =
+        ground_through_ipc(&client, &cwd_a, "docs", "sharedworktreeisolation").await;
+    let (result_b, result_b_wire) =
+        ground_through_ipc(&client, &cwd_b, "docs", "sharedworktreeisolation").await;
+    let path_a = std::fs::canonicalize(&file_a)
+        .expect("canonical worktree A document")
+        .to_string_lossy()
+        .into_owned();
+    let path_b = std::fs::canonicalize(&file_b)
+        .expect("canonical worktree B document")
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(
+        result_a.response.docs.len(),
+        1,
+        "{:#?}",
+        result_a.response.docs
+    );
+    let doc_a = result_a
+        .response
+        .docs
+        .get(&path_a)
+        .expect("worktree A result must contain its own document");
+    assert!(!result_a.response.docs.contains_key(&path_b));
+    assert_eq!(doc_a.corpus, "docs");
+    assert_eq!(doc_a.path.as_deref(), Some("shared.md"));
+    let mut snippets_a = String::new();
+    for chunk in &doc_a.chunks {
+        snippets_a.push_str(&chunk.snippet);
+        assert_eq!(chunk.provenance.corpus, "docs");
+    }
+    let claim_marks_a = doc_a
+        .chunks
+        .iter()
+        .flat_map(|chunk| &chunk.provenance.claim_marks)
+        .count();
+    assert!(
+        claim_marks_a > 0,
+        "worktree A ground result must carry its indexed claim mark"
+    );
+    assert!(snippets_a.contains("marker-a-camembert"));
+    assert!(!snippets_a.contains("marker-b-stilton"));
+
+    assert_eq!(
+        result_b.response.docs.len(),
+        1,
+        "{:#?}",
+        result_b.response.docs
+    );
+    let doc_b = result_b
+        .response
+        .docs
+        .get(&path_b)
+        .expect("worktree B result must contain its own document");
+    assert!(!result_b.response.docs.contains_key(&path_a));
+    assert_eq!(doc_b.corpus, "docs");
+    assert_eq!(doc_b.path.as_deref(), Some("shared.md"));
+    let mut snippets_b = String::new();
+    for chunk in &doc_b.chunks {
+        snippets_b.push_str(&chunk.snippet);
+        assert_eq!(chunk.provenance.corpus, "docs");
+    }
+    assert!(snippets_b.contains("marker-b-stilton"));
+    assert!(!snippets_b.contains("marker-a-camembert"));
+
+    assert_ground_result_wire_shape(&result_a_wire);
+    assert_ground_result_wire_shape(&result_b_wire);
+}
+
 /// Build a daemon config with one explicit corpus that has TWO roots, plus a
 /// ground dir. Mirrors the `SPEC_EXAMPLE` multi-root shape (a single
 /// `[[corpus]]` aggregating several paths) that `ground`/`list_files` already
@@ -2461,6 +2846,110 @@ enabled = false
         g = ground.display(),
     );
     toml::from_str(&toml).expect("two-root corpus toml parses")
+}
+
+#[tokio::test]
+async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).expect("mkdir root A");
+    std::fs::create_dir_all(&root_b).expect("mkdir root B");
+    let file_a = root_a.join("alpha.md");
+    let file_b = root_b.join("beta.md");
+    std::fs::write(
+        &file_a,
+        "# Alpha\n\nmultirootuniontoken relevant alpha marker\n",
+    )
+    .expect("write root A document");
+    std::fs::write(
+        &file_b,
+        "# Beta\n\nmultirootuniontoken relevant beta marker\n",
+    )
+    .expect("write root B document");
+    let cfg = cfg_two_root_corpus(&ground, &root_a, &root_b);
+    let model = cfg.embeddings.model.clone();
+    let quantized = cfg.embeddings.quantized;
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let (report, report_wire) = index_corpus_through_ipc(&client, harness.cwd(), "multi").await;
+    assert_eq!(report.corpora.len(), 1, "{report:#?}");
+    assert_eq!(report.corpora[0].files_upserted, 2, "{report:#?}");
+    assert_eq!(report.corpora[0].chunks_inserted, 2, "{report:#?}");
+    assert_index_report_wire_shape(&report_wire);
+
+    let (result, result_wire) =
+        ground_through_ipc(&client, harness.cwd(), "multi", "multirootuniontoken").await;
+    let path_a = std::fs::canonicalize(&file_a)
+        .expect("canonical root A document")
+        .to_string_lossy()
+        .into_owned();
+    let path_b = std::fs::canonicalize(&file_b)
+        .expect("canonical root B document")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(result.response.docs.len(), 2, "{:#?}", result.response.docs);
+    for (absolute_path, relative_path) in [(&path_a, "alpha.md"), (&path_b, "beta.md")] {
+        let doc = result
+            .response
+            .docs
+            .get(absolute_path)
+            .unwrap_or_else(|| panic!("missing multi-root result {absolute_path}"));
+        assert_eq!(doc.path.as_deref(), Some(relative_path));
+        assert_eq!(doc.corpus, "multi");
+        assert!(!doc.chunks.is_empty());
+        for chunk in &doc.chunks {
+            assert_eq!(chunk.provenance.corpus, "multi");
+        }
+    }
+
+    let stats_wire = daemon_ok_payload(
+        client
+            .call_raw(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::CorpusStats {
+                    corpus: Some("multi".into()),
+                },
+            })
+            .await
+            .expect("multi-root stats through daemon IPC"),
+        "corpus stats",
+    );
+    let stats: CorpusStatsResult =
+        serde_json::from_value(stats_wire.clone()).expect("decode multi-root corpus stats");
+    assert_eq!(stats.corpus, "multi");
+    assert_eq!(stats.indexed_files, 2);
+    assert_eq!(stats.total_chunks, 2);
+    assert_eq!(stats.unindexed_files, 0);
+    assert!(stats.last_indexed_ms.is_some());
+    assert_ground_result_wire_shape(&result_wire);
+    assert_corpus_stats_wire_shape(&stats_wire);
+
+    drop(client);
+    harness
+        .shutdown()
+        .await
+        .expect("shut down daemon before exact provenance inspection");
+    let store = LanceStore::open_or_create(&ground, &model, quantized, false, None)
+        .await
+        .expect("reopen daemon store for exact provenance inspection");
+    let root_a_text = root_a.to_str().expect("UTF-8 root A");
+    let root_b_text = root_b.to_str().expect("UTF-8 root B");
+    let key_a = CorpusKey::from_configured_root("multi", root_a_text);
+    let key_b = CorpusKey::from_configured_root("multi", root_b_text);
+    let files_a = store.list_files(&key_a).await.expect("list exact root A");
+    let files_b = store.list_files(&key_b).await.expect("list exact root B");
+    let [snapshot_a] = files_a.as_slice() else {
+        panic!("exact root A must own one file: {files_a:#?}");
+    };
+    let [snapshot_b] = files_b.as_slice() else {
+        panic!("exact root B must own one file: {files_b:#?}");
+    };
+    assert_eq!(snapshot_a.corpus_key, key_a);
+    assert_eq!(snapshot_a.file_ref, path_a);
+    assert_eq!(snapshot_b.corpus_key, key_b);
+    assert_eq!(snapshot_b.file_ref, path_b);
 }
 
 #[tokio::test]
@@ -3600,42 +4089,79 @@ async fn matching_version_store_is_untouched() {
 
 // T4: rebuild reproduces content (lexical, no embeddings needed)
 #[tokio::test]
-async fn stale_rebuild_reproduces_corpus_content() {
-    // After a stale-store auto-rebuild, list_files returns the seeded file.
+async fn stale_v3_daemon_startup_rebuilds_without_touching_markdown_and_logs_progress() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let seeded = corpus_root.join("doc.md");
-    std::fs::write(&seeded, "# Doc\n\ncontent here\n").expect("seed doc");
-
+    let markdown = b"# Doc\n\nstalev3rebuildretrievaltoken content here\n";
+    std::fs::write(&seeded, markdown).expect("seed doc");
+    let original = std::fs::read(&seeded).expect("read source before rebuild");
     let current = hallouminate_adapters::default_schema_version_pub();
-    write_stale_meta(&ground, current - 1);
+    write_stale_meta(&ground, 3);
 
     let cfg = cfg_with_corpus(&ground, &corpus_root);
-    let harness = DaemonHarness::spawn(cfg).await;
+    let logs = capture_daemon_logs(tracing::Level::INFO, || async move {
+        let harness = DaemonHarness::spawn(cfg).await;
+        let client = connect_at(harness.socket()).await.expect("connect");
+        let result: ListFilesResult = client
+            .call(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
+                    corpus: Some("docs".into()),
+                }),
+            })
+            .await
+            .expect("list_files after daemon startup rebuild");
+        assert_eq!(result.len(), 1, "{result:#?}");
+        assert_eq!(result[0].path, "doc.md");
 
-    // list_files for the rebuilt corpus must return the seeded file.
-    let client = connect_at(harness.socket()).await.expect("connect");
-    let result: ListFilesResult = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
-                corpus: Some("docs".into()),
-            }),
-        })
-        .await
-        .expect("list_files ok");
+        let (grounded, _) = ground_through_ipc(
+            &client,
+            harness.cwd(),
+            "docs",
+            "stalev3rebuildretrievaltoken",
+        )
+        .await;
+        assert_eq!(grounded.response.docs.len(), 1, "{grounded:#?}");
+        let rebuilt = grounded
+            .response
+            .docs
+            .values()
+            .next()
+            .expect("rebuilt document must be grounded");
+        assert_eq!(rebuilt.path.as_deref(), Some("doc.md"));
+        let snippets = rebuilt
+            .chunks
+            .iter()
+            .map(|chunk| chunk.snippet.as_str())
+            .collect::<String>();
+        assert!(
+            snippets.contains("stalev3rebuildretrievaltoken content here"),
+            "grounded rebuild must contain the seeded body: {snippets}"
+        );
+    })
+    .await;
 
-    assert!(
-        !result.is_empty(),
-        "rebuilt corpus must contain the seeded file; list_files was empty"
+    assert_eq!(
+        std::fs::read(&seeded).expect("read source after rebuild"),
+        original,
+        "schema rebuild must not alter source Markdown bytes"
     );
-    // The seeded file's path must appear in the results.
-    let paths: Vec<&str> = result.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(read_schema_version(&ground), current);
+    let backup = ground.with_file_name("ground.bak-v3");
+    assert!(backup.exists(), "v3 store backup must remain recoverable");
+    assert_eq!(read_schema_version(&backup), 3);
+    let rebuild_announcement =
+        format!("ground store schema v3 < expected v{current}; rebuilding from source");
     assert!(
-        paths.iter().any(|p| p.contains("doc.md")),
-        "seeded doc.md must appear in list_files after rebuild; got: {paths:?}"
+        logs.contains_event(tracing::Level::WARN, &[&rebuild_announcement]),
+        "startup must WARN before rebuilding stale v3: {logs}"
+    );
+    assert!(
+        logs.contains_event(tracing::Level::INFO, &["rebuild: reindexed", "corpus=docs"]),
+        "startup rebuild progress must be INFO: {logs}"
     );
 }
 
@@ -3675,21 +4201,17 @@ async fn stale_rebuild_overwrites_prior_backup() {
 
 // T6: rebuild failure — Err returned, backup preserved
 #[tokio::test]
-async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
-    // Use a corpus with an invalid glob so scan() returns Err and the rebuild
-    // fails. DaemonState::open must return Err (not panic), and the stale
-    // store must still be recoverable at the backup path.
+async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
-    std::fs::write(corpus_root.join("doc.md"), "# Doc\n\ncontent\n").expect("seed");
+    let seeded = corpus_root.join("doc.md");
+    let markdown = b"# Doc\n\ncontent\n";
+    std::fs::write(&seeded, markdown).expect("seed doc");
+    let original = std::fs::read(&seeded).expect("read source before failed rebuild");
+    write_stale_meta(&ground, 3);
 
-    let current = hallouminate_adapters::default_schema_version_pub();
-    let stale = current - 1;
-    write_stale_meta(&ground, stale);
-
-    // Corpus config with an invalid glob pattern so scan() fails.
     let toml = format!(
         "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"[invalid\"]\n\n\
          [storage]\nground_dir = \"{g}\"\n\n\
@@ -3698,23 +4220,45 @@ async fn stale_rebuild_failure_returns_err_and_preserves_backup() {
         g = ground.display(),
     );
     let cfg: Config = toml::from_str(&toml).expect("toml parses");
+    let logs = capture_daemon_warnings(|| async move {
+        let err = DaemonState::open(cfg, None)
+            .await
+            .expect_err("rebuild with scan error must fail daemon startup");
+        assert!(
+            err.to_string().contains("rebuild"),
+            "error must mention rebuild: {err}"
+        );
+    })
+    .await;
 
-    let err = DaemonState::open(cfg, None)
-        .await
-        .expect_err("rebuild with scan error must fail");
     assert!(
-        err.to_string().contains("rebuild"),
-        "error must mention rebuild: {err}"
+        logs.contains_event(
+            tracing::Level::WARN,
+            &["ground store schema v3", "rebuilding from source"]
+        ),
+        "startup must WARN before rebuilding stale v3: {logs}"
     );
-
-    // Backup must still exist so the old data is recoverable.
-    let bak = ground.with_file_name(format!("ground.bak-v{stale}"));
     assert!(
-        bak.exists(),
+        logs.contains_event(
+            tracing::Level::WARN,
+            &[
+                "rebuild failed; removed partial ground dir",
+                "Backup preserved",
+            ]
+        ),
+        "cleanup and backup preservation must be one WARN event: {logs}"
+    );
+    assert_eq!(
+        std::fs::read(&seeded).expect("read source after failed rebuild"),
+        original,
+        "failed schema rebuild must not alter source Markdown bytes"
+    );
+    let backup = ground.with_file_name("ground.bak-v3");
+    assert!(
+        backup.exists(),
         "stale store backup must be preserved after failed rebuild"
     );
-    // Fresh ground dir must be removed so next boot retries rebuild instead
-    // of booting with an empty-but-schema-valid store.
+    assert_eq!(read_schema_version(&backup), 3);
     assert!(
         !ground.exists(),
         "partial fresh ground dir must be removed on rebuild failure"

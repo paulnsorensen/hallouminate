@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::common::Result;
+use crate::common::{CorpusKey, Result};
 use crate::indexer::chunk::{PreparedFile, SearchHit};
 use crate::indexer::plan::FileSnapshot;
 
@@ -10,18 +10,23 @@ use crate::indexer::plan::FileSnapshot;
 /// of `hybrid_search` and `apply_batch`. Domain callers never see a vector.
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
-    async fn list_files(&self, corpus: &str) -> Result<Vec<FileSnapshot>>;
+    async fn list_files(&self, corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>>;
 
     async fn hybrid_search(
         &self,
-        corpus: &str,
+        corpus_key: &CorpusKey,
         query: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>>;
 
-    async fn touch_mtime(&self, corpus: &str, file_ref: &str, mtime_ms: i64) -> Result<()>;
+    async fn touch_mtime(
+        &self,
+        corpus_key: &CorpusKey,
+        file_ref: &str,
+        mtime_ms: i64,
+    ) -> Result<()>;
 
-    async fn delete_file(&self, corpus: &str, file_ref: &str) -> Result<()>;
+    async fn delete_file(&self, corpus_key: &CorpusKey, file_ref: &str) -> Result<()>;
 
     async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats>;
 }
