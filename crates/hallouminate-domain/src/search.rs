@@ -93,6 +93,7 @@ mod tests {
             line_start: 1,
             line_end: 2,
             text: String::new(),
+            search_text: String::new(),
             summary: String::new(),
             keywords: vec![],
             score,

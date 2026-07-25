@@ -5,19 +5,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use hallouminate_adapters::{Embedder, FastembedCrossencoder};
 use hallouminate_config::{Config, EmbeddingsConfig, SearchConfig, StorageConfig};
 use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, DaemonResponse, GroundRequest, GroundResult, IndexReport,
     IndexRequest, connect_at,
 };
-use hallouminate_domain::common::CorpusConfig;
+use hallouminate_domain::common::{CorpusConfig, expand_tilde};
 use hallouminate_domain::corpus::{blake3_bytes, load_tokenizer, scan};
-use hallouminate_domain::ground::{DocFile, GroundResponse};
+use hallouminate_domain::ground::{DocFile, GroundResponse, Warning};
 use hallouminate_domain::indexer::{Format, HandlerRegistry, PrepareCtx};
-use hallouminate_domain::search::{DEFAULT_CROSSENCODER_MODEL, SUPPORTED_CROSSENCODER_MODELS};
 use serde::{Deserialize, Serialize};
 use text_splitter::{Characters, ChunkSizer};
 
@@ -25,48 +25,57 @@ use text_splitter::{Characters, ChunkSizer};
 mod common;
 use common::daemon::DaemonHarness;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 3;
 const CORPUS_NAME: &str = "eval-wiki";
-const LEXICAL_BASELINE_ID: &str = "lexical-without-rerank";
 const BASELINE_ID: &str = "fusion-without-rerank";
-const EMBEDDING_MODEL: &str = "BAAI/bge-small-en-v1.5";
+const JINA_ID: &str = "fusion-with-jina-reranker-v1-turbo-en";
+const JINA_MODEL: &str = "jina-reranker-v1-turbo-en";
 const CHUNK_BUDGET_TOKENS: usize = 384;
-const REAL_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
-const RERANK_TIMEOUT_MS: u64 = 300_000;
-const GROUND_RPC_TIMEOUT_MS: u64 = RERANK_TIMEOUT_MS + 60_000;
-const MIN_MRR_GAIN: f64 = 0.05;
-const MAX_ADDED_P50_MS: i64 = 500;
+const GROUND_RPC_GRACE_MS: u64 = 60_000;
 const FOOTNOTE_INVERSION_ID: &str = "footnote-inversion";
+const MODEL_LOAD_MARKER: &str = "cold model load failed";
+const RERANK_TIMEOUT_MARKER: &str = "rerank timeout";
+const CROSSENCODER_UNAVAILABLE_MARKER: &str = "crossencoder unavailable";
 
-#[derive(Debug, Clone, Copy)]
-struct CandidateDefinition {
-    id: &'static str,
-    weight_bytes: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ArmSpec<'a> {
+    id: &'a str,
+    model: Option<&'a str>,
 }
 
-const CANDIDATE_DEFINITIONS: &[CandidateDefinition] = &[
-    CandidateDefinition {
-        id: "bge-reranker-base",
-        weight_bytes: 1_112_459_588,
-    },
-    CandidateDefinition {
-        id: "bge-reranker-v2-m3",
-        weight_bytes: 2_271_197_135,
-    },
-    CandidateDefinition {
-        id: "jina-reranker-v1-turbo-en",
-        weight_bytes: 151_296_975,
-    },
-    CandidateDefinition {
-        id: "jina-reranker-v2-base-multiligual",
-        weight_bytes: 1_114_040_223,
-    },
-];
+const BASELINE_ARM: ArmSpec<'static> = ArmSpec {
+    id: BASELINE_ID,
+    model: None,
+};
+const JINA_ARM: ArmSpec<'static> = ArmSpec {
+    id: JINA_ID,
+    model: Some(JINA_MODEL),
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CandidateSpec {
+struct ArmDescriptor {
     id: String,
-    weight_bytes: u64,
+    model: Option<String>,
+}
+
+impl ArmDescriptor {
+    fn from_spec(spec: ArmSpec<'_>) -> Self {
+        let model = match spec.model {
+            Some(model) => Some(model.to_string()),
+            None => None,
+        };
+        Self {
+            id: spec.id.to_string(),
+            model,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct EmbeddingConfiguration {
+    model: String,
+    quantized: bool,
+    cache_dir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,10 +93,16 @@ struct LabelledQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Metrics {
+struct QualityMetrics {
     recall_at_5: f64,
     mrr: f64,
-    p50_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LatencyMetrics {
+    cold_load_ms: u64,
+    warm_p50_ms: u64,
+    warm_p95_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -98,84 +113,78 @@ struct QueryMeasurement {
     expected_top: ChunkIdentity,
     actual_top: Option<ChunkIdentity>,
     top_chunk_pass: bool,
+    rerank_completed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     rerank_signal: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct VariantMeasurement {
+struct ArmMeasurement {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    weight_bytes: Option<u64>,
-    metrics: Metrics,
-    qualifies: bool,
-    mrr_gain: f64,
-    added_p50_ms: i64,
+    quality: QualityMetrics,
+    latency: LatencyMetrics,
     queries: Vec<QueryMeasurement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-enum DecisionOutcome {
-    Selected,
-    NoneQualified,
+enum ChangeDisposition {
+    Improved,
+    Unchanged,
+    Regressed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct QueryChange {
+    id: String,
+    baseline_rank: Option<usize>,
+    candidate_rank: Option<usize>,
+    rank_delta: Option<i64>,
+    rank_disposition: ChangeDisposition,
+    baseline_top: Option<ChunkIdentity>,
+    candidate_top: Option<ChunkIdentity>,
+    top_chunk_changed: bool,
+    top_chunk_assertion: ChangeDisposition,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ChangeCounts {
+    improved: usize,
+    unchanged: usize,
+    regressed: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct ArmComparison {
+    baseline_id: String,
+    candidate_id: String,
+    counts: ChangeCounts,
+    queries: Vec<QueryChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Decision {
-    outcome: DecisionOutcome,
-    selected_model: Option<String>,
-    default_crossencoder: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-struct Thresholds {
-    min_mrr_gain: f64,
-    max_added_p50_ms: i64,
+struct FailureDiagnostic {
+    arm_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_id: Option<String>,
+    message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct EvalArtifact {
     schema_version: u32,
     query_set_digest: String,
-    thresholds: Thresholds,
-    candidates: Vec<CandidateSpec>,
-    variants: Vec<VariantMeasurement>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    decision: Option<Decision>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetrievalMode {
-    Lexical,
-    Fusion,
-}
-
-impl RetrievalMode {
-    fn baseline_id(self) -> &'static str {
-        match self {
-            Self::Lexical => LEXICAL_BASELINE_ID,
-            Self::Fusion => BASELINE_ID,
-        }
-    }
-
-    fn embeddings_enabled(self) -> bool {
-        match self {
-            Self::Lexical => false,
-            Self::Fusion => true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct VariantSpec<'a> {
-    id: &'a str,
-    model: Option<&'a str>,
-    weight_bytes: Option<u64>,
-    mode: RetrievalMode,
-    selection_candidate: bool,
+    embedding: EmbeddingConfiguration,
+    requested_arms: Vec<ArmDescriptor>,
+    measurements: Vec<ArmMeasurement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    comparison: Option<ArmComparison>,
+    timeout_count: usize,
+    timeouts: Vec<FailureDiagnostic>,
+    model_load_failures: Vec<FailureDiagnostic>,
+    errors: Vec<FailureDiagnostic>,
 }
 
 fn repo_root() -> PathBuf {
@@ -212,93 +221,40 @@ fn measurement_output_path(output: &Path) -> PathBuf {
     }
 }
 
-fn candidate_specs() -> Vec<CandidateSpec> {
-    CANDIDATE_DEFINITIONS
-        .iter()
-        .map(|candidate| CandidateSpec {
-            id: candidate.id.to_string(),
-            weight_bytes: candidate.weight_bytes,
-        })
-        .collect()
+fn baseline_arms() -> Vec<ArmSpec<'static>> {
+    vec![BASELINE_ARM]
 }
 
-fn variant_specs() -> Vec<VariantSpec<'static>> {
-    vec![
-        VariantSpec {
-            id: BASELINE_ID,
-            model: None,
-            weight_bytes: None,
-            mode: RetrievalMode::Fusion,
-            selection_candidate: false,
-        },
-        VariantSpec {
-            id: LEXICAL_BASELINE_ID,
-            model: None,
-            weight_bytes: None,
-            mode: RetrievalMode::Lexical,
-            selection_candidate: false,
-        },
-        VariantSpec {
-            id: "lexical-with-bge-reranker-base",
-            model: Some("bge-reranker-base"),
-            weight_bytes: Some(1_112_459_588),
-            mode: RetrievalMode::Lexical,
-            selection_candidate: false,
-        },
-        VariantSpec {
-            id: "fusion-with-bge-reranker-base",
-            model: Some("bge-reranker-base"),
-            weight_bytes: Some(1_112_459_588),
-            mode: RetrievalMode::Fusion,
-            selection_candidate: true,
-        },
-        VariantSpec {
-            id: "lexical-with-bge-reranker-v2-m3",
-            model: Some("bge-reranker-v2-m3"),
-            weight_bytes: Some(2_271_197_135),
-            mode: RetrievalMode::Lexical,
-            selection_candidate: false,
-        },
-        VariantSpec {
-            id: "fusion-with-bge-reranker-v2-m3",
-            model: Some("bge-reranker-v2-m3"),
-            weight_bytes: Some(2_271_197_135),
-            mode: RetrievalMode::Fusion,
-            selection_candidate: true,
-        },
-        VariantSpec {
-            id: "lexical-with-jina-reranker-v1-turbo-en",
-            model: Some("jina-reranker-v1-turbo-en"),
-            weight_bytes: Some(151_296_975),
-            mode: RetrievalMode::Lexical,
-            selection_candidate: false,
-        },
-        VariantSpec {
-            id: "fusion-with-jina-reranker-v1-turbo-en",
-            model: Some("jina-reranker-v1-turbo-en"),
-            weight_bytes: Some(151_296_975),
-            mode: RetrievalMode::Fusion,
-            selection_candidate: true,
-        },
-        VariantSpec {
-            id: "lexical-with-jina-reranker-v2-base-multiligual",
-            model: Some("jina-reranker-v2-base-multiligual"),
-            weight_bytes: Some(1_114_040_223),
-            mode: RetrievalMode::Lexical,
-            selection_candidate: false,
-        },
-        VariantSpec {
-            id: "fusion-with-jina-reranker-v2-base-multiligual",
-            model: Some("jina-reranker-v2-base-multiligual"),
-            weight_bytes: Some(1_114_040_223),
-            mode: RetrievalMode::Fusion,
-            selection_candidate: true,
-        },
-    ]
+fn diagnostic_arms() -> Vec<ArmSpec<'static>> {
+    vec![BASELINE_ARM, JINA_ARM]
 }
 
-fn variant_spec(id: &str) -> Option<VariantSpec<'static>> {
-    variant_specs().into_iter().find(|spec| spec.id == id)
+fn embedding_configuration() -> EmbeddingConfiguration {
+    let embeddings = EmbeddingsConfig::default();
+    EmbeddingConfiguration {
+        model: embeddings.model,
+        quantized: embeddings.quantized,
+        cache_dir: embeddings.cache_dir,
+    }
+}
+
+fn new_artifact(query_set_digest: String, arms: &[ArmSpec<'_>]) -> EvalArtifact {
+    let mut requested_arms = Vec::with_capacity(arms.len());
+    for arm in arms {
+        requested_arms.push(ArmDescriptor::from_spec(*arm));
+    }
+    EvalArtifact {
+        schema_version: SCHEMA_VERSION,
+        query_set_digest,
+        embedding: embedding_configuration(),
+        requested_arms,
+        measurements: Vec::new(),
+        comparison: None,
+        timeout_count: 0,
+        timeouts: Vec::new(),
+        model_load_failures: Vec::new(),
+        errors: Vec::new(),
+    }
 }
 
 fn load_queries() -> Result<(Vec<LabelledQuery>, String)> {
@@ -361,10 +317,16 @@ fn validate_labels(queries: &[LabelledQuery]) -> Result<()> {
         );
     }
 
-    let footnote = queries
-        .iter()
-        .find(|query| query.id == FOOTNOTE_INVERSION_ID)
-        .expect("required id checked above");
+    let mut footnote = None;
+    for query in queries {
+        if query.id == FOOTNOTE_INVERSION_ID {
+            footnote = Some(query);
+            break;
+        }
+    }
+    let Some(footnote) = footnote else {
+        return Err(anyhow::anyhow!("required footnote query disappeared"));
+    };
     ensure!(footnote.expected_chunk.file == "architecture.md");
     ensure!(footnote.expected_chunk.heading_path == ["Architecture"]);
     ensure!(footnote.expected_chunk.line_start == 1);
@@ -382,13 +344,24 @@ where
     for scanned in scan(&corpus)? {
         let path = scanned.file.as_path();
         let bytes = fs::read(path).with_context(|| format!("read fixture {}", path.display()))?;
-        let format = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .filter(|extension| extension.eq_ignore_ascii_case("md"))
-            .map(|_| Format::Markdown)
-            .with_context(|| format!("fixture is not markdown: {}", path.display()))?;
-        let prepared = registry.handler(format).prepare(&PrepareCtx {
+        let Some(extension) = path.extension() else {
+            return Err(anyhow::anyhow!(
+                "fixture has no extension: {}",
+                path.display()
+            ));
+        };
+        let Some(extension) = extension.to_str() else {
+            return Err(anyhow::anyhow!(
+                "fixture extension is not UTF-8: {}",
+                path.display()
+            ));
+        };
+        ensure!(
+            extension.eq_ignore_ascii_case("md"),
+            "fixture is not markdown: {}",
+            path.display()
+        );
+        let prepared = registry.handler(Format::Markdown).prepare(&PrepareCtx {
             corpus_key: &scanned.corpus_key,
             file: &scanned.file,
             mtime: scanned.mtime,
@@ -433,26 +406,22 @@ where
 }
 
 fn validate_fixture_labels_with_production_tokenizer(queries: &[LabelledQuery]) -> Result<()> {
-    let tokenizer = load_tokenizer(EMBEDDING_MODEL)
-        .with_context(|| format!("load {EMBEDDING_MODEL} tokenizer for label preflight"))?;
+    let model = EmbeddingsConfig::default().model;
+    let tokenizer = load_tokenizer(&model)
+        .with_context(|| format!("load {model} tokenizer for label preflight"))?;
     validate_fixture_labels(queries, tokenizer)
 }
 
-fn build_config(variant: VariantSpec<'_>, ground_dir: &Path) -> Config {
+fn build_config(arm: ArmSpec<'_>, ground_dir: &Path) -> Config {
+    let mut search = SearchConfig::default();
+    search.crossencoder = match arm.model {
+        Some(model) => Some(model.to_string()),
+        None => None,
+    };
     Config {
         corpora: vec![fixture_corpus()],
-        search: SearchConfig {
-            crossencoder: variant.model.map(str::to_string),
-            rerank_timeout_ms: RERANK_TIMEOUT_MS,
-            ..Default::default()
-        },
-        embeddings: EmbeddingsConfig {
-            enabled: variant.mode.embeddings_enabled(),
-            model: EMBEDDING_MODEL.into(),
-            quantized: true,
-            cache_dir: REAL_EMBED_CACHE.into(),
-            ..Default::default()
-        },
+        search,
+        embeddings: EmbeddingsConfig::default(),
         storage: StorageConfig {
             ground_dir: ground_dir.to_string_lossy().into_owned(),
         },
@@ -462,33 +431,45 @@ fn build_config(variant: VariantSpec<'_>, ground_dir: &Path) -> Config {
 
 fn ranked_docs(docs: &BTreeMap<String, DocFile>) -> Vec<(&String, &DocFile)> {
     let mut ranked: Vec<_> = docs.iter().collect();
-    ranked.sort_by(|a, b| {
-        b.1.score
-            .partial_cmp(&a.1.score)
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .score
+            .partial_cmp(&left.1.score)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| a.0.cmp(b.0))
+            .then_with(|| left.0.cmp(right.0))
     });
     ranked
 }
 
 fn rank_of_expected(ranked: &[(&String, &DocFile)], expected_file: &str) -> Option<usize> {
-    ranked
-        .iter()
-        .position(|(absolute_path, doc)| {
-            doc.path.as_deref() == Some(expected_file) || absolute_path.ends_with(expected_file)
-        })
-        .map(|index| index + 1)
+    for (index, (absolute_path, doc)) in ranked.iter().enumerate() {
+        if doc.path.as_deref() == Some(expected_file) || absolute_path.ends_with(expected_file) {
+            return Some(index + 1);
+        }
+    }
+    None
 }
 
 fn top_identity(ranked: &[(&String, &DocFile)]) -> Option<ChunkIdentity> {
-    let (absolute_path, doc) = ranked.first()?;
-    let chunk = doc.chunks.first()?;
-    let file = doc.path.clone().or_else(|| {
-        Path::new(absolute_path.as_str())
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_string)
-    })?;
+    let Some((absolute_path, doc)) = ranked.first().copied() else {
+        return None;
+    };
+    let Some(chunk) = doc.chunks.first() else {
+        return None;
+    };
+    let file = match &doc.path {
+        Some(path) => path.clone(),
+        None => {
+            let Some(name) = Path::new(absolute_path).file_name() else {
+                return None;
+            };
+            let Some(name) = name.to_str() else {
+                return None;
+            };
+            name.to_string()
+        }
+    };
     Some(ChunkIdentity {
         file,
         heading_path: chunk.heading_path.clone(),
@@ -496,10 +477,36 @@ fn top_identity(ranked: &[(&String, &DocFile)]) -> Option<ChunkIdentity> {
     })
 }
 
+async fn cold_load_models(arm: ArmSpec<'_>) -> Result<u64> {
+    let embeddings = EmbeddingsConfig::default();
+    let model = embeddings.model;
+    let quantized = embeddings.quantized;
+    let cache_dir = expand_tilde(&embeddings.cache_dir);
+    let crossencoder = match arm.model {
+        Some(model) => Some(model.to_string()),
+        None => None,
+    };
+    let started = Instant::now();
+    let loaded = tokio::task::spawn_blocking(move || -> Result<()> {
+        let _embedder = Embedder::try_new(&model, quantized, &cache_dir)?;
+        match crossencoder {
+            Some(model) => {
+                let _crossencoder = FastembedCrossencoder::try_new(&model, &cache_dir)?;
+            }
+            None => {}
+        }
+        Ok(())
+    })
+    .await
+    .with_context(|| format!("{MODEL_LOAD_MARKER} for {}: loader task failed", arm.id))?;
+    loaded.with_context(|| format!("{MODEL_LOAD_MARKER} for {}", arm.id))?;
+    Ok(started.elapsed().as_millis() as u64)
+}
+
 async fn index_fixture(
     client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
-    variant: VariantSpec<'_>,
+    arm: ArmSpec<'_>,
 ) -> Result<()> {
     let _: IndexReport = client
         .call(DaemonRequest {
@@ -511,8 +518,16 @@ async fn index_fixture(
             }),
         })
         .await
-        .with_context(|| format!("index fixture for {}", variant.id))?;
+        .with_context(|| format!("index fixture for {}", arm.id))?;
     Ok(())
+}
+
+fn ground_rpc_timeout() -> Duration {
+    Duration::from_millis(
+        SearchConfig::default()
+            .rerank_timeout_ms
+            .saturating_add(GROUND_RPC_GRACE_MS),
+    )
 }
 
 async fn ground_query(
@@ -533,7 +548,7 @@ async fn ground_query(
                     snippet_chars: None,
                 }),
             },
-            Duration::from_millis(GROUND_RPC_TIMEOUT_MS),
+            ground_rpc_timeout(),
         )
         .await
         .with_context(|| format!("ground query {}", query.id))?;
@@ -550,29 +565,71 @@ async fn ground_query(
     Ok(result.response)
 }
 
+fn top_rerank_signal(ranked: &[(&String, &DocFile)]) -> Option<f64> {
+    for (_, doc) in ranked {
+        if let Some(signal) = doc.z_score {
+            return Some(signal);
+        }
+        if let Some(chunk) = doc.chunks.first()
+            && let Some(signal) = chunk.z_score
+        {
+            return Some(signal);
+        }
+    }
+    None
+}
+
+fn rerank_completion(response: &GroundResponse, arm: ArmSpec<'_>, query_id: &str) -> Result<bool> {
+    let mut timed_out = false;
+    let mut unavailable = false;
+    for warning in &response.warnings {
+        if warning.code == "rerank-timeout" {
+            timed_out = true;
+        }
+        if warning.code == "crossencoder-unavailable" {
+            unavailable = true;
+        }
+    }
+
+    match arm.model {
+        Some(model) => {
+            ensure!(
+                !timed_out,
+                "{RERANK_TIMEOUT_MARKER} for query {query_id} in {} ({model}); fusion fallback is not a measurement",
+                arm.id
+            );
+            ensure!(
+                !unavailable,
+                "{CROSSENCODER_UNAVAILABLE_MARKER} for query {query_id} in {} ({model}); fusion fallback is not a measurement",
+                arm.id
+            );
+            Ok(true)
+        }
+        None => {
+            ensure!(
+                !timed_out && !unavailable,
+                "baseline query {query_id} unexpectedly used a rerank fallback"
+            );
+            Ok(false)
+        }
+    }
+}
+
 async fn run_sweep(
     client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
-    variant: VariantSpec<'_>,
+    arm: ArmSpec<'_>,
     queries: &[LabelledQuery],
 ) -> Result<Vec<QueryMeasurement>> {
     let mut measurements = Vec::with_capacity(queries.len());
     for query in queries {
         let response = ground_query(client, cwd, query).await?;
+        let rerank_completed = rerank_completion(&response, arm, &query.id)?;
         let ranked = ranked_docs(&response.docs);
         let rank = rank_of_expected(&ranked, &query.expected_chunk.file);
         let actual_top = top_identity(&ranked);
-        let rerank_signal = ranked
-            .first()
-            .and_then(|(_, doc)| doc.z_score.or_else(|| doc.chunks.first()?.z_score));
-        if variant.model.is_some() {
-            ensure!(
-                rerank_signal.is_some(),
-                "{} query {} has no rerank signal; timeout fallback is an incomplete measurement",
-                variant.id,
-                query.id
-            );
-        } else {
+        let rerank_signal = top_rerank_signal(&ranked);
+        if arm.model.is_none() {
             ensure!(
                 rerank_signal.is_none(),
                 "baseline query {} unexpectedly has a rerank signal",
@@ -587,172 +644,249 @@ async fn run_sweep(
             expected_top: query.expected_chunk.clone(),
             actual_top,
             top_chunk_pass,
+            rerank_completed,
             rerank_signal,
         });
     }
     Ok(measurements)
 }
 
-async fn run_variant(
-    variant: VariantSpec<'_>,
-    queries: &[LabelledQuery],
-) -> Result<VariantMeasurement> {
-    let tmp = tempfile::tempdir().context("create variant tempdir")?;
+fn nearest_rank_percentile(values: &[u64], percentile: usize) -> Result<u64> {
+    ensure!(
+        !values.is_empty(),
+        "cannot compute percentile of an empty sweep"
+    );
+    ensure!(
+        (1..=100).contains(&percentile),
+        "percentile must be between 1 and 100"
+    );
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let rank = (sorted.len() * percentile).div_ceil(100);
+    Ok(sorted[rank - 1])
+}
+
+fn quality_for(queries: &[QueryMeasurement]) -> Result<QualityMetrics> {
+    ensure!(!queries.is_empty(), "arm has no query measurements");
+    let mut recall_hits = 0;
+    let mut reciprocal_sum = 0.0;
+    for measurement in queries {
+        match measurement.rank {
+            Some(rank) => {
+                if rank <= 5 {
+                    recall_hits += 1;
+                }
+                reciprocal_sum += 1.0 / rank as f64;
+            }
+            None => {}
+        }
+    }
+    Ok(QualityMetrics {
+        recall_at_5: recall_hits as f64 / queries.len() as f64,
+        mrr: reciprocal_sum / queries.len() as f64,
+    })
+}
+
+fn latency_for(cold_load_ms: u64, queries: &[QueryMeasurement]) -> Result<LatencyMetrics> {
+    let mut latencies = Vec::with_capacity(queries.len());
+    for query in queries {
+        latencies.push(query.latency_ms);
+    }
+    Ok(LatencyMetrics {
+        cold_load_ms,
+        warm_p50_ms: nearest_rank_percentile(&latencies, 50)?,
+        warm_p95_ms: nearest_rank_percentile(&latencies, 95)?,
+    })
+}
+
+async fn run_arm(arm: ArmSpec<'_>, queries: &[LabelledQuery]) -> Result<ArmMeasurement> {
+    let cold_load_ms = cold_load_models(arm).await?;
+    let tmp = tempfile::tempdir().context("create arm tempdir")?;
     let ground_dir = tmp.path().join("ground");
-    let harness = DaemonHarness::spawn(build_config(variant, &ground_dir)).await;
+    let harness = DaemonHarness::spawn(build_config(arm, &ground_dir)).await;
     let client = connect_at(harness.socket())
         .await
-        .with_context(|| format!("connect eval daemon for {}", variant.id))?;
-    index_fixture(&client, harness.cwd(), variant).await?;
+        .with_context(|| format!("connect eval daemon for {}", arm.id))?;
+    index_fixture(&client, harness.cwd(), arm).await?;
 
-    let _warmup = run_sweep(&client, harness.cwd(), variant, queries).await?;
-    let measured = run_sweep(&client, harness.cwd(), variant, queries).await?;
+    let _warmup = run_sweep(&client, harness.cwd(), arm, queries).await?;
+    let measured = run_sweep(&client, harness.cwd(), arm, queries).await?;
     drop(client);
     harness.shutdown().await.context("shutdown eval daemon")?;
 
-    let metrics = metrics_for(&measured)?;
-    Ok(VariantMeasurement {
-        id: variant.id.to_string(),
-        model: variant.model.map(str::to_string),
-        weight_bytes: variant.weight_bytes,
-        metrics,
-        qualifies: false,
-        mrr_gain: 0.0,
-        added_p50_ms: 0,
+    let model = match arm.model {
+        Some(model) => Some(model.to_string()),
+        None => None,
+    };
+    Ok(ArmMeasurement {
+        id: arm.id.to_string(),
+        model,
+        quality: quality_for(&measured)?,
+        latency: latency_for(cold_load_ms, &measured)?,
         queries: measured,
     })
 }
 
-async fn measure_all(queries: &[LabelledQuery], query_set_digest: String) -> Result<EvalArtifact> {
-    validate_fixture_labels_with_production_tokenizer(queries)?;
-
-    let mut variants = Vec::new();
-    for variant in variant_specs() {
-        variants.push(run_variant(variant, queries).await?);
-    }
-    apply_baseline_deltas(&mut variants)?;
-    let artifact = EvalArtifact {
-        schema_version: SCHEMA_VERSION,
-        query_set_digest,
-        thresholds: locked_thresholds(),
-        candidates: candidate_specs(),
-        variants,
-        decision: None,
-    };
-    validate_artifact(&artifact)?;
-    Ok(artifact)
-}
-
-fn locked_thresholds() -> Thresholds {
-    Thresholds {
-        min_mrr_gain: MIN_MRR_GAIN,
-        max_added_p50_ms: MAX_ADDED_P50_MS,
+fn rank_disposition(baseline: Option<usize>, candidate: Option<usize>) -> ChangeDisposition {
+    match (baseline, candidate) {
+        (Some(baseline), Some(candidate)) if candidate < baseline => ChangeDisposition::Improved,
+        (Some(baseline), Some(candidate)) if candidate == baseline => ChangeDisposition::Unchanged,
+        (Some(_baseline), Some(_candidate)) => ChangeDisposition::Regressed,
+        (None, Some(_candidate)) => ChangeDisposition::Improved,
+        (None, None) => ChangeDisposition::Unchanged,
+        (Some(_baseline), None) => ChangeDisposition::Regressed,
     }
 }
 
-fn nearest_rank_p50(latencies: &[u64]) -> Result<u64> {
+fn assertion_disposition(baseline: bool, candidate: bool) -> ChangeDisposition {
+    match (baseline, candidate) {
+        (false, true) => ChangeDisposition::Improved,
+        (false, false) => ChangeDisposition::Unchanged,
+        (true, true) => ChangeDisposition::Unchanged,
+        (true, false) => ChangeDisposition::Regressed,
+    }
+}
+
+fn increment_counts(counts: &mut ChangeCounts, disposition: ChangeDisposition) {
+    match disposition {
+        ChangeDisposition::Improved => counts.improved += 1,
+        ChangeDisposition::Unchanged => counts.unchanged += 1,
+        ChangeDisposition::Regressed => counts.regressed += 1,
+    }
+}
+
+fn query_by_id<'a>(queries: &'a [QueryMeasurement], id: &str) -> Option<&'a QueryMeasurement> {
+    for query in queries {
+        if query.id == id {
+            return Some(query);
+        }
+    }
+    None
+}
+
+fn build_comparison(
+    baseline: &ArmMeasurement,
+    candidate: &ArmMeasurement,
+) -> Result<ArmComparison> {
+    let mut counts = ChangeCounts::default();
+    let mut queries = Vec::with_capacity(baseline.queries.len());
+    for baseline_query in &baseline.queries {
+        let candidate_query = query_by_id(&candidate.queries, &baseline_query.id)
+            .with_context(|| format!("{} is missing query {}", candidate.id, baseline_query.id))?;
+        let disposition = rank_disposition(baseline_query.rank, candidate_query.rank);
+        increment_counts(&mut counts, disposition);
+        let rank_delta = match (baseline_query.rank, candidate_query.rank) {
+            (Some(baseline), Some(candidate)) => {
+                let baseline = i64::try_from(baseline).context("baseline rank exceeds i64")?;
+                let candidate = i64::try_from(candidate).context("candidate rank exceeds i64")?;
+                Some(baseline - candidate)
+            }
+            (Some(_baseline), None) => None,
+            (None, Some(_candidate)) => None,
+            (None, None) => None,
+        };
+        queries.push(QueryChange {
+            id: baseline_query.id.clone(),
+            baseline_rank: baseline_query.rank,
+            candidate_rank: candidate_query.rank,
+            rank_delta,
+            rank_disposition: disposition,
+            baseline_top: baseline_query.actual_top.clone(),
+            candidate_top: candidate_query.actual_top.clone(),
+            top_chunk_changed: baseline_query.actual_top != candidate_query.actual_top,
+            top_chunk_assertion: assertion_disposition(
+                baseline_query.top_chunk_pass,
+                candidate_query.top_chunk_pass,
+            ),
+        });
+    }
     ensure!(
-        !latencies.is_empty(),
-        "cannot compute p50 of an empty sweep"
+        candidate.queries.len() == baseline.queries.len(),
+        "{} has an unexpected query count",
+        candidate.id
     );
-    let mut sorted = latencies.to_vec();
-    sorted.sort_unstable();
-    Ok(sorted[(sorted.len() - 1) / 2])
-}
-
-fn metrics_for(queries: &[QueryMeasurement]) -> Result<Metrics> {
-    ensure!(!queries.is_empty(), "variant has no query measurements");
-    let recall_hits = queries
-        .iter()
-        .filter(|measurement| measurement.rank.is_some_and(|rank| rank <= 5))
-        .count();
-    let reciprocal_sum: f64 = queries
-        .iter()
-        .map(|measurement| {
-            measurement
-                .rank
-                .map(|rank| 1.0 / rank as f64)
-                .unwrap_or(0.0)
-        })
-        .sum();
-    let latencies: Vec<u64> = queries
-        .iter()
-        .map(|measurement| measurement.latency_ms)
-        .collect();
-    Ok(Metrics {
-        recall_at_5: recall_hits as f64 / queries.len() as f64,
-        mrr: reciprocal_sum / queries.len() as f64,
-        p50_ms: nearest_rank_p50(&latencies)?,
+    Ok(ArmComparison {
+        baseline_id: baseline.id.clone(),
+        candidate_id: candidate.id.clone(),
+        counts,
+        queries,
     })
 }
 
-fn added_p50(candidate: u64, baseline: u64) -> Result<i64> {
-    let candidate = i64::try_from(candidate).context("candidate p50 exceeds i64")?;
-    let baseline = i64::try_from(baseline).context("baseline p50 exceeds i64")?;
-    Ok(candidate - baseline)
+fn requested_descriptors(arms: &[ArmSpec<'_>]) -> Vec<ArmDescriptor> {
+    let mut descriptors = Vec::with_capacity(arms.len());
+    for arm in arms {
+        descriptors.push(ArmDescriptor::from_spec(*arm));
+    }
+    descriptors
 }
 
-fn candidate_qualifies(mrr_gain: f64, added_p50_ms: i64) -> bool {
-    mrr_gain >= MIN_MRR_GAIN && added_p50_ms <= MAX_ADDED_P50_MS
-}
-
-fn apply_baseline_deltas(variants: &mut [VariantMeasurement]) -> Result<()> {
-    let baselines: BTreeMap<&str, Metrics> = [LEXICAL_BASELINE_ID, BASELINE_ID]
-        .into_iter()
-        .map(|id| {
-            let metrics = variants
-                .iter()
-                .find(|variant| variant.id == id)
-                .with_context(|| format!("missing {id} baseline"))?
-                .metrics
-                .clone();
-            Ok((id, metrics))
-        })
-        .collect::<Result<_>>()?;
-
-    for variant in variants {
-        let spec =
-            variant_spec(&variant.id).with_context(|| format!("unknown variant {}", variant.id))?;
-        let baseline_id = spec.mode.baseline_id();
-        if variant.id == baseline_id {
-            variant.mrr_gain = 0.0;
-            variant.added_p50_ms = 0;
-            variant.qualifies = false;
-            continue;
+fn arm_for_descriptor(descriptor: &ArmDescriptor) -> Option<ArmSpec<'static>> {
+    for arm in diagnostic_arms() {
+        if descriptor == &ArmDescriptor::from_spec(arm) {
+            return Some(arm);
         }
-        let baseline = baselines
-            .get(baseline_id)
-            .with_context(|| format!("missing {baseline_id} metrics"))?;
-        variant.mrr_gain = variant.metrics.mrr - baseline.mrr;
-        variant.added_p50_ms = added_p50(variant.metrics.p50_ms, baseline.p50_ms)?;
-        variant.qualifies =
-            spec.selection_candidate && candidate_qualifies(variant.mrr_gain, variant.added_p50_ms);
+    }
+    None
+}
+
+fn validate_measurement(measurement: &ArmMeasurement, arm: ArmSpec<'_>) -> Result<()> {
+    ensure!(measurement.id == arm.id, "arm id mismatch");
+    ensure!(
+        measurement.model.as_deref() == arm.model,
+        "arm model mismatch"
+    );
+    ensure!(
+        measurement.quality.recall_at_5.is_finite()
+            && (0.0..=1.0).contains(&measurement.quality.recall_at_5),
+        "{} has invalid Recall@5",
+        arm.id
+    );
+    ensure!(
+        measurement.quality.mrr.is_finite() && (0.0..=1.0).contains(&measurement.quality.mrr),
+        "{} has invalid MRR",
+        arm.id
+    );
+    ensure!(
+        measurement.latency.warm_p50_ms <= measurement.latency.warm_p95_ms,
+        "{} has p50 above p95",
+        arm.id
+    );
+    ensure!(!measurement.queries.is_empty(), "{} has no queries", arm.id);
+    let mut ids = BTreeSet::new();
+    for query in &measurement.queries {
+        ensure!(
+            ids.insert(query.id.as_str()),
+            "duplicate query {}",
+            query.id
+        );
+        match arm.model {
+            Some(_model) => ensure!(
+                query.rerank_completed,
+                "{} query {} did not complete reranking",
+                arm.id,
+                query.id
+            ),
+            None => {
+                ensure!(
+                    !query.rerank_completed,
+                    "{} query {} unexpectedly completed reranking",
+                    arm.id,
+                    query.id
+                );
+                ensure!(
+                    query.rerank_signal.is_none(),
+                    "{} query {} has an unexpected rerank signal",
+                    arm.id,
+                    query.id
+                );
+            }
+        }
     }
     Ok(())
 }
 
-fn validate_candidate_inventory(candidates: &[CandidateSpec]) -> Result<()> {
-    ensure!(
-        candidates == candidate_specs(),
-        "candidate inventory or weight bytes changed"
-    );
-    let actual: BTreeSet<&str> = candidates
-        .iter()
-        .map(|candidate| candidate.id.as_str())
-        .collect();
-    let supported: BTreeSet<&str> = SUPPORTED_CROSSENCODER_MODELS.iter().copied().collect();
-    ensure!(
-        actual == supported,
-        "candidate inventory does not exactly match pinned fastembed support"
-    );
-    ensure!(
-        actual.len() == candidates.len(),
-        "candidate inventory contains duplicates"
-    );
-    Ok(())
-}
-
-fn validate_artifact(artifact: &EvalArtifact) -> Result<()> {
+fn validate_artifact_common(artifact: &EvalArtifact) -> Result<()> {
     ensure!(
         artifact.schema_version == SCHEMA_VERSION,
         "unsupported eval schema"
@@ -762,349 +896,223 @@ fn validate_artifact(artifact: &EvalArtifact) -> Result<()> {
         "missing query-set digest"
     );
     ensure!(
-        artifact.thresholds == locked_thresholds(),
-        "qualification thresholds changed"
+        artifact.embedding == embedding_configuration(),
+        "evaluation does not use production embedding defaults"
     );
-    validate_candidate_inventory(&artifact.candidates)?;
-
-    let specs = variant_specs();
+    ensure!(!artifact.requested_arms.is_empty(), "no requested arms");
     ensure!(
-        artifact.variants.len() == specs.len(),
-        "missing or extra variant results"
+        artifact.timeout_count == artifact.timeouts.len(),
+        "timeout count does not match timeout diagnostics"
     );
-    let mut seen_variants = BTreeSet::new();
-    let baseline = artifact
-        .variants
-        .iter()
-        .find(|variant| variant.id == BASELINE_ID)
-        .context("missing fusion-without-rerank results")?;
-    let baseline_query_ids: BTreeSet<&str> = baseline
-        .queries
-        .iter()
-        .map(|measurement| measurement.id.as_str())
-        .collect();
-    ensure!(
-        baseline_query_ids.len() == baseline.queries.len(),
-        "duplicate baseline query results"
-    );
-    let baseline_labels: BTreeMap<&str, ChunkIdentity> = baseline
-        .queries
-        .iter()
-        .map(|measurement| (measurement.id.as_str(), measurement.expected_top.clone()))
-        .collect();
-
-    for spec in specs {
-        let variant = artifact
-            .variants
-            .iter()
-            .find(|variant| variant.id == spec.id)
-            .with_context(|| format!("missing variant {}", spec.id))?;
+    let mut requested = BTreeSet::new();
+    for descriptor in &artifact.requested_arms {
         ensure!(
-            seen_variants.insert(variant.id.as_str()),
-            "duplicate variant {}",
-            variant.id
+            requested.insert(descriptor.id.as_str()),
+            "duplicate requested arm"
         );
         ensure!(
-            variant.model.as_deref() == spec.model,
-            "variant {} model mismatch",
-            variant.id
+            arm_for_descriptor(descriptor).is_some(),
+            "unsupported requested arm {}",
+            descriptor.id
         );
+    }
+    let mut measured = BTreeSet::new();
+    for measurement in &artifact.measurements {
         ensure!(
-            variant.weight_bytes == spec.weight_bytes,
-            "variant {} weight bytes mismatch",
-            variant.id
+            measured.insert(measurement.id.as_str()),
+            "duplicate measurement"
         );
-        let query_ids: BTreeSet<&str> = variant
-            .queries
-            .iter()
-            .map(|measurement| measurement.id.as_str())
-            .collect();
-        ensure!(
-            query_ids.len() == variant.queries.len(),
-            "variant {} has duplicate queries",
-            variant.id
-        );
-        ensure!(
-            query_ids == baseline_query_ids,
-            "variant {} has missing or extra query results",
-            variant.id
-        );
-        for measurement in &variant.queries {
-            ensure!(
-                baseline_labels.get(measurement.id.as_str()) == Some(&measurement.expected_top),
-                "variant {} query {} has a different expected chunk",
-                variant.id,
+        let descriptor = ArmDescriptor {
+            id: measurement.id.clone(),
+            model: measurement.model.clone(),
+        };
+        let Some(arm) = arm_for_descriptor(&descriptor) else {
+            return Err(anyhow::anyhow!(
+                "unsupported measurement {}",
                 measurement.id
-            );
-            ensure!(
-                measurement.top_chunk_pass
-                    == (measurement.actual_top.as_ref() == Some(&measurement.expected_top)),
-                "variant {} query {} has an inconsistent top-chunk result",
-                variant.id,
-                measurement.id
-            );
-        }
+            ));
+        };
         ensure!(
-            variant.metrics == metrics_for(&variant.queries)?,
-            "variant {} metrics do not match query results",
-            variant.id
+            artifact.requested_arms.contains(&descriptor),
+            "measurement {} was not requested",
+            measurement.id
         );
-
-        let footnote = variant
-            .queries
-            .iter()
-            .find(|measurement| measurement.id == FOOTNOTE_INVERSION_ID)
-            .with_context(|| format!("variant {} is missing footnote-inversion", variant.id))?;
-        ensure!(
-            footnote.expected_top
-                == (ChunkIdentity {
-                    file: "architecture.md".into(),
-                    heading_path: vec!["Architecture".into()],
-                    line_start: 1,
-                }),
-            "variant {} has the wrong footnote-inversion label",
-            variant.id
-        );
-        ensure!(
-            footnote.top_chunk_pass,
-            "variant {} failed footnote-inversion",
-            variant.id
-        );
-
-        if spec.model.is_some() {
-            ensure!(
-                variant
-                    .queries
-                    .iter()
-                    .all(|measurement| measurement.rerank_signal.is_some()),
-                "variant {} has an incomplete rerank sweep",
-                variant.id
-            );
-            let mode_baseline = artifact
-                .variants
-                .iter()
-                .find(|candidate| candidate.id == spec.mode.baseline_id())
-                .with_context(|| format!("missing {} results", spec.mode.baseline_id()))?;
-            let expected_gain = variant.metrics.mrr - mode_baseline.metrics.mrr;
-            let expected_added = added_p50(variant.metrics.p50_ms, mode_baseline.metrics.p50_ms)?;
-            ensure!(
-                (variant.mrr_gain - expected_gain).abs() < f64::EPSILON,
-                "variant {} has an invalid MRR gain",
-                variant.id
-            );
-            ensure!(
-                variant.added_p50_ms == expected_added,
-                "variant {} has invalid added p50",
-                variant.id
-            );
-            let expected_qualification =
-                spec.selection_candidate && candidate_qualifies(expected_gain, expected_added);
-            ensure!(
-                variant.qualifies == expected_qualification,
-                "variant {} has an invalid qualification result",
-                variant.id
-            );
-        } else {
-            ensure!(
-                variant
-                    .queries
-                    .iter()
-                    .all(|measurement| measurement.rerank_signal.is_none()),
-                "baseline {} has a rerank signal",
-                variant.id
-            );
-            ensure!(
-                variant.id == spec.mode.baseline_id(),
-                "non-reranked variant {} is not its mode baseline",
-                variant.id
-            );
-            ensure!(!variant.qualifies && variant.mrr_gain == 0.0 && variant.added_p50_ms == 0);
-        }
+        validate_measurement(measurement, arm)?;
     }
     Ok(())
 }
 
-fn compare_candidate_order(left: &VariantMeasurement, right: &VariantMeasurement) -> Ordering {
-    left.added_p50_ms
-        .cmp(&right.added_p50_ms)
-        .then_with(|| left.weight_bytes.cmp(&right.weight_bytes))
-        .then_with(|| left.id.cmp(&right.id))
+fn validate_baseline_artifact(artifact: &EvalArtifact) -> Result<()> {
+    validate_artifact_common(artifact)?;
+    ensure!(
+        artifact.requested_arms == requested_descriptors(&baseline_arms()),
+        "baseline must request only production fusion without a reranker"
+    );
+    ensure!(
+        artifact.measurements.len() == 1,
+        "baseline must contain one measurement"
+    );
+    ensure!(
+        artifact.measurements[0].id == BASELINE_ID,
+        "baseline arm is missing"
+    );
+    ensure!(
+        artifact.comparison.is_none(),
+        "baseline must not contain a comparison"
+    );
+    ensure!(artifact.timeouts.is_empty(), "baseline contains timeouts");
+    ensure!(
+        artifact.model_load_failures.is_empty(),
+        "baseline contains model-load failures"
+    );
+    ensure!(artifact.errors.is_empty(), "baseline contains errors");
+    Ok(())
 }
 
-fn ordered_qualified_candidates(artifact: &EvalArtifact) -> Vec<&VariantMeasurement> {
-    let mut candidates: Vec<_> = artifact
-        .variants
-        .iter()
-        .filter(|variant| {
-            variant.qualifies
-                && variant_spec(&variant.id).is_some_and(|spec| spec.selection_candidate)
-        })
-        .collect();
-    candidates.sort_by(|left, right| compare_candidate_order(left, right));
-    candidates
+fn validate_diagnostic_artifact(artifact: &EvalArtifact, complete: bool) -> Result<()> {
+    validate_artifact_common(artifact)?;
+    ensure!(
+        artifact.requested_arms == requested_descriptors(&diagnostic_arms()),
+        "diagnostic must request exactly production fusion and Jina v1"
+    );
+    ensure!(
+        artifact.measurements.len() <= 2,
+        "diagnostic has too many measurements"
+    );
+    if complete {
+        ensure!(artifact.measurements.len() == 2, "diagnostic is incomplete");
+        ensure!(
+            artifact.timeouts.is_empty(),
+            "complete diagnostic has timeouts"
+        );
+        ensure!(
+            artifact.model_load_failures.is_empty(),
+            "complete diagnostic has model-load failures"
+        );
+        ensure!(artifact.errors.is_empty(), "complete diagnostic has errors");
+        let comparison = artifact
+            .comparison
+            .as_ref()
+            .context("complete diagnostic has no comparison")?;
+        let expected = build_comparison(&artifact.measurements[0], &artifact.measurements[1])?;
+        ensure!(
+            comparison == &expected,
+            "diagnostic comparison is inconsistent"
+        );
+    } else {
+        ensure!(
+            !artifact.timeouts.is_empty()
+                || !artifact.model_load_failures.is_empty()
+                || !artifact.errors.is_empty(),
+            "partial diagnostic has no failure"
+        );
+        ensure!(
+            artifact.comparison.is_none(),
+            "partial diagnostic has a comparison"
+        );
+    }
+    Ok(())
+}
+
+fn failure_query_id(message: &str) -> Option<String> {
+    let marker = "for query ";
+    let index = message.find(marker)?;
+    let tail = &message[index + marker.len()..];
+    let id = tail.split_whitespace().next()?;
+    Some(id.to_string())
+}
+
+fn record_failure(artifact: &mut EvalArtifact, arm: ArmSpec<'_>, error: &anyhow::Error) {
+    let message = format!("{error:#}");
+    let diagnostic = FailureDiagnostic {
+        arm_id: arm.id.to_string(),
+        query_id: failure_query_id(&message),
+        message: message.clone(),
+    };
+    if message.contains(MODEL_LOAD_MARKER) {
+        artifact.model_load_failures.push(diagnostic);
+    } else if message.contains(CROSSENCODER_UNAVAILABLE_MARKER) {
+        artifact.model_load_failures.push(diagnostic);
+    } else if message.contains(RERANK_TIMEOUT_MARKER) {
+        artifact.timeouts.push(diagnostic);
+        artifact.timeout_count += 1;
+    } else {
+        artifact.errors.push(diagnostic);
+    }
+}
+
+async fn measure_diagnostic(
+    queries: &[LabelledQuery],
+    query_set_digest: String,
+    output: &Path,
+    baseline: &Path,
+) -> Result<EvalArtifact> {
+    validate_fixture_labels_with_production_tokenizer(queries)?;
+    let arms = diagnostic_arms();
+    let mut artifact = new_artifact(query_set_digest, &arms);
+    for arm in arms {
+        match run_arm(arm, queries).await {
+            Ok(measurement) => artifact.measurements.push(measurement),
+            Err(error) => {
+                record_failure(&mut artifact, arm, &error);
+                validate_diagnostic_artifact(&artifact, false)?;
+                write_measurement_artifact(output, baseline, &artifact)
+                    .context("persist partial diagnostic artifact")?;
+                return Err(error);
+            }
+        }
+    }
+    artifact.comparison = Some(build_comparison(
+        &artifact.measurements[0],
+        &artifact.measurements[1],
+    )?);
+    validate_diagnostic_artifact(&artifact, true)?;
+    Ok(artifact)
+}
+
+async fn measure_baseline(
+    queries: &[LabelledQuery],
+    query_set_digest: String,
+) -> Result<EvalArtifact> {
+    validate_fixture_labels_with_production_tokenizer(queries)?;
+    let arms = baseline_arms();
+    let mut artifact = new_artifact(query_set_digest, &arms);
+    artifact
+        .measurements
+        .push(run_arm(BASELINE_ARM, queries).await?);
+    validate_baseline_artifact(&artifact)?;
+    Ok(artifact)
 }
 
 fn compare_against_baseline(committed: &EvalArtifact, current: &EvalArtifact) -> Result<()> {
-    validate_artifact(committed).context("committed baseline is invalid")?;
-    validate_artifact(current).context("current measurement is invalid")?;
+    validate_baseline_artifact(committed).context("committed baseline is invalid")?;
+    validate_baseline_artifact(current).context("current baseline measurement is invalid")?;
     ensure!(
         committed.query_set_digest == current.query_set_digest,
         "query-set digest changed; remeasure and explicitly update the baseline"
     );
+    let committed = &committed.measurements[0];
+    let current = &current.measurements[0];
     ensure!(
-        committed.candidates == current.candidates,
-        "candidate inventory changed"
+        current.quality.recall_at_5 + f64::EPSILON >= committed.quality.recall_at_5,
+        "Recall@5 regressed from {} to {}",
+        committed.quality.recall_at_5,
+        current.quality.recall_at_5
     );
     ensure!(
-        committed.thresholds == current.thresholds,
-        "qualification contract changed"
+        current.quality.mrr + f64::EPSILON >= committed.quality.mrr,
+        "MRR regressed from {} to {}",
+        committed.quality.mrr,
+        current.quality.mrr
     );
-
-    for committed_variant in &committed.variants {
-        let current_variant = current
-            .variants
-            .iter()
-            .find(|variant| variant.id == committed_variant.id)
-            .with_context(|| format!("current run is missing {}", committed_variant.id))?;
+    for committed_query in &committed.queries {
+        let current_query = query_by_id(&current.queries, &committed_query.id)
+            .with_context(|| format!("current run is missing query {}", committed_query.id))?;
         ensure!(
-            current_variant.metrics.recall_at_5 + f64::EPSILON
-                >= committed_variant.metrics.recall_at_5,
-            "{} Recall@5 regressed from {} to {}",
-            committed_variant.id,
-            committed_variant.metrics.recall_at_5,
-            current_variant.metrics.recall_at_5
+            !committed_query.top_chunk_pass || current_query.top_chunk_pass,
+            "query {} regressed from top-chunk pass to fail",
+            current_query.id
         );
-        ensure!(
-            current_variant.metrics.mrr + f64::EPSILON >= committed_variant.metrics.mrr,
-            "{} MRR regressed from {} to {}",
-            committed_variant.id,
-            committed_variant.metrics.mrr,
-            current_variant.metrics.mrr
-        );
-        for committed_query in &committed_variant.queries {
-            let current_query = current_variant
-                .queries
-                .iter()
-                .find(|measurement| measurement.id == committed_query.id)
-                .with_context(|| {
-                    format!(
-                        "{} is missing query {}",
-                        current_variant.id, committed_query.id
-                    )
-                })?;
-            ensure!(
-                !committed_query.top_chunk_pass || current_query.top_chunk_pass,
-                "{} query {} regressed from top-chunk pass to fail",
-                current_variant.id,
-                current_query.id
-            );
-        }
-    }
-    Ok(())
-}
-
-fn cli_template_crossencoder_settings() -> Result<(Option<String>, Vec<String>)> {
-    let path = repo_root().join("crates/hallouminate/src/cli/config-default.toml");
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("read CLI config template {}", path.display()))?;
-    let parsed: toml::Value = toml::from_str(&text).context("parse CLI config template")?;
-    let active = parsed
-        .get("search")
-        .and_then(|search| search.get("crossencoder"))
-        .map(|value| {
-            value
-                .as_str()
-                .context("active CLI crossencoder default is not a string")
-                .map(str::to_string)
-        })
-        .transpose()?;
-
-    let mut commented = Vec::new();
-    for line in text.lines() {
-        let Some(comment) = line.trim_start().strip_prefix('#') else {
-            continue;
-        };
-        let assignment = comment.trim();
-        let Some((key, _)) = assignment.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "crossencoder" {
-            continue;
-        }
-        let value: toml::Value = toml::from_str(&format!("[search]\n{assignment}"))
-            .context("parse commented CLI crossencoder opt-in")?;
-        let model = value
-            .get("search")
-            .and_then(|search| search.get("crossencoder"))
-            .and_then(toml::Value::as_str)
-            .context("commented CLI crossencoder opt-in is not a string")?;
-        commented.push(model.to_string());
-    }
-    Ok((active, commented))
-}
-
-fn validate_recorded_decision(baseline: &EvalArtifact) -> Result<()> {
-    let decision = baseline
-        .decision
-        .as_ref()
-        .context("baseline has no recorded decision")?;
-    let qualified = ordered_qualified_candidates(baseline);
-    let runtime_default = SearchConfig::default().crossencoder;
-    let (template_active, template_commented) = cli_template_crossencoder_settings()?;
-    match decision.outcome {
-        DecisionOutcome::Selected => {
-            let selected = decision
-                .selected_model
-                .as_deref()
-                .context("selected decision has no model")?;
-            ensure!(
-                decision.default_crossencoder.as_deref() == Some(selected),
-                "selected decision default disagrees with its model"
-            );
-            let winner = qualified
-                .first()
-                .context("selected decision has no qualifying candidate")?;
-            ensure!(
-                winner.model.as_deref() == Some(selected),
-                "recorded selection is not the deterministic fusion winner"
-            );
-            ensure!(
-                runtime_default.as_deref() == Some(selected),
-                "SearchConfig default disagrees with selected model"
-            );
-            ensure!(
-                DEFAULT_CROSSENCODER_MODEL == selected,
-                "domain default model disagrees with selected model"
-            );
-            ensure!(
-                template_active.as_deref() == Some(selected),
-                "active CLI template default disagrees with selected model"
-            );
-        }
-        DecisionOutcome::NoneQualified => {
-            ensure!(
-                qualified.is_empty(),
-                "none-qualified decision has qualifying fusion candidates"
-            );
-            ensure!(decision.selected_model.is_none());
-            ensure!(decision.default_crossencoder.is_none());
-            ensure!(
-                runtime_default.is_none(),
-                "SearchConfig must keep reranking disabled by default"
-            );
-            ensure!(
-                template_active.is_none(),
-                "CLI template must not activate a crossencoder default"
-            );
-            ensure!(
-                SUPPORTED_CROSSENCODER_MODELS.contains(&DEFAULT_CROSSENCODER_MODEL),
-                "domain opt-in default is not a supported model"
-            );
-            ensure!(
-                template_commented == [DEFAULT_CROSSENCODER_MODEL.to_string()],
-                "CLI template must document only the domain opt-in model as commented"
-            );
-        }
     }
     Ok(())
 }
@@ -1176,13 +1184,20 @@ fn write_measurement_artifact(
 }
 
 fn write_artifact(path: &Path, artifact: &EvalArtifact) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create output directory {}", parent.display()))?;
-    }
+    let Some(parent) = path.parent() else {
+        return Err(anyhow::anyhow!("output path has no parent"));
+    };
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create output directory {}", parent.display()))?;
     let mut bytes = serde_json::to_vec_pretty(artifact).context("serialize eval artifact")?;
     bytes.push(b'\n');
-    fs::write(path, bytes).with_context(|| format!("write {}", path.display()))
+
+    let temp = tempfile::NamedTempFile::new_in(parent).context("create temporary artifact")?;
+    fs::write(temp.path(), bytes)
+        .with_context(|| format!("write temporary artifact in {}", parent.display()))?;
+    temp.persist(path)
+        .with_context(|| format!("rename temporary artifact to {}", path.display()))?;
+    Ok(())
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1194,15 +1209,16 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 #[test]
-fn wiki_authoring_guidance_is_chunk_contextual() {
+fn wiki_authoring_guidance_has_context_and_retrieval_policy() {
     let root = repo_root();
-    let paths = [
-        root.join("plugins/hallouminate/skills/wiki-ingest/SKILL.md"),
-        root.join(".hallouminate/wiki/wiki-conventions.md"),
-    ];
-    for path in paths {
-        let text = fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let skill_path = root.join("plugins/hallouminate/skills/wiki-ingest/SKILL.md");
+    let conventions_path = root.join(".hallouminate/wiki/wiki-conventions.md");
+    let skill = fs::read_to_string(&skill_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", skill_path.display()));
+    let conventions = fs::read_to_string(&conventions_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", conventions_path.display()));
+
+    for (path, text) in [(&skill_path, &skill), (&conventions_path, &conventions)] {
         assert!(
             text.contains("Every H2/H3 section must open self-contained"),
             "{} lacks the H2/H3 self-contained opening rule",
@@ -1212,6 +1228,25 @@ fn wiki_authoring_guidance_is_chunk_contextual() {
             text.contains("do not generate index-time or per-chunk LLM context"),
             "{} permits generated retrieval context",
             path.display()
+        );
+    }
+
+    for required in [
+        "`sources/<slug>.md` page",
+        "search the corpus for both the canonical URL and",
+        "The exact title, publisher or author, source type, date, contribution, and canonical URL",
+        "During claim decomposition, before any drafting, freeze the retrieval probes",
+        "Before journaling, verify the complete topic-and-source write set with the frozen probes",
+        "require the intended page at rank 1",
+        "require it within the top 3",
+        "revise only the H1, lead, headings, or section opening once",
+        "restore every overwritten page from its preimage",
+        "`written-with-retrieval-warning`",
+        "observed top three",
+    ] {
+        assert!(
+            skill.contains(required),
+            "wiki-ingest lacks policy: {required}"
         );
     }
 }
@@ -1240,219 +1275,220 @@ fn prepared_chunk_validation_rejects_misspelled_heading_and_line() {
 }
 
 #[test]
-fn nearest_rank_p50_uses_lower_middle_for_even_sweeps() {
-    assert_eq!(nearest_rank_p50(&[40, 10, 30, 20]).expect("p50"), 20);
-    assert_eq!(nearest_rank_p50(&[30, 10, 20]).expect("p50"), 20);
-    assert!(nearest_rank_p50(&[]).is_err());
-}
-
-#[test]
-fn ground_rpc_deadline_exceeds_rerank_timeout() {
-    assert!(GROUND_RPC_TIMEOUT_MS > RERANK_TIMEOUT_MS);
-}
-#[test]
-fn candidate_inventory_exactly_matches_pinned_fastembed() {
-    validate_candidate_inventory(&candidate_specs()).expect("candidate inventory");
-    assert_eq!(candidate_specs()[0].weight_bytes, 1_112_459_588);
-    assert_eq!(candidate_specs()[1].weight_bytes, 2_271_197_135);
-    assert_eq!(candidate_specs()[2].weight_bytes, 151_296_975);
-    assert_eq!(candidate_specs()[3].weight_bytes, 1_114_040_223);
-}
-
-#[test]
-fn reporting_matrix_has_exact_lexical_and_fusion_variants() {
-    let specs = variant_specs();
-    let ids: Vec<&str> = specs.iter().map(|spec| spec.id).collect();
+fn nearest_rank_percentiles_cover_p50_and_p95() {
+    let even = [40, 10, 30, 20];
+    assert_eq!(nearest_rank_percentile(&even, 50).expect("p50"), 20);
+    assert_eq!(nearest_rank_percentile(&even, 95).expect("p95"), 40);
     assert_eq!(
-        ids,
-        [
-            "fusion-without-rerank",
-            "lexical-without-rerank",
-            "lexical-with-bge-reranker-base",
-            "fusion-with-bge-reranker-base",
-            "lexical-with-bge-reranker-v2-m3",
-            "fusion-with-bge-reranker-v2-m3",
-            "lexical-with-jina-reranker-v1-turbo-en",
-            "fusion-with-jina-reranker-v1-turbo-en",
-            "lexical-with-jina-reranker-v2-base-multiligual",
-            "fusion-with-jina-reranker-v2-base-multiligual",
-        ]
+        nearest_rank_percentile(&[30, 10, 20], 50).expect("odd p50"),
+        20
     );
-    assert_eq!(
-        specs.iter().filter(|spec| spec.selection_candidate).count(),
-        4
-    );
-    for spec in specs {
-        if spec.selection_candidate {
-            assert_eq!(spec.mode, RetrievalMode::Fusion);
-            assert!(spec.model.is_some());
-        } else if spec.mode == RetrievalMode::Lexical {
-            assert!(!spec.selection_candidate);
-        }
-    }
-}
-
-fn ordering_fixture(id: &str, added_p50_ms: i64, weight_bytes: u64) -> VariantMeasurement {
-    VariantMeasurement {
-        id: id.into(),
-        model: Some(id.into()),
-        weight_bytes: Some(weight_bytes),
-        metrics: Metrics {
-            recall_at_5: 1.0,
-            mrr: 1.0,
-            p50_ms: 1,
-        },
-        qualifies: true,
-        mrr_gain: MIN_MRR_GAIN,
-        added_p50_ms,
-        queries: Vec::new(),
-    }
+    assert!(nearest_rank_percentile(&[], 50).is_err());
+    assert!(nearest_rank_percentile(&[1], 0).is_err());
+    assert!(nearest_rank_percentile(&[1], 101).is_err());
 }
 
 #[test]
-fn qualification_thresholds_and_ordering_are_deterministic() {
-    assert!(candidate_qualifies(0.05, 500));
-    assert!(!candidate_qualifies(0.049, 500));
-    assert!(!candidate_qualifies(0.05, 501));
+fn evaluation_arms_derive_from_production_defaults() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let embeddings = EmbeddingsConfig::default();
+    assert_eq!(embeddings.model, "snowflake/snowflake-arctic-embed-s");
+    assert!(!embeddings.quantized);
+    assert_eq!(embeddings.cache_dir, "~/.cache/hallouminate/fastembed");
 
-    let mut variants = vec![
-        ordering_fixture("z-model", 100, 20),
-        ordering_fixture("a-model", 100, 20),
-        ordering_fixture("slow-small", 101, 1),
-        ordering_fixture("fast-large", 99, 1_000),
-    ];
-    variants.sort_by(compare_candidate_order);
-    let ids: Vec<&str> = variants.iter().map(|variant| variant.id.as_str()).collect();
-    assert_eq!(ids, ["fast-large", "a-model", "z-model", "slow-small"]);
+    let baseline = build_config(BASELINE_ARM, temp.path());
+    assert_eq!(baseline.embeddings, embeddings);
+    assert_eq!(baseline.search, SearchConfig::default());
 
-    let mut artifact = synthetic_artifact();
-    for id in [LEXICAL_BASELINE_ID, BASELINE_ID] {
-        artifact
-            .variants
-            .iter_mut()
-            .find(|variant| variant.id == id)
-            .expect("mode baseline")
-            .metrics
-            .mrr = 0.5;
-    }
-    for id in [
-        "lexical-with-bge-reranker-base",
-        "fusion-with-bge-reranker-base",
-    ] {
-        artifact
-            .variants
-            .iter_mut()
-            .find(|variant| variant.id == id)
-            .expect("reranked variant")
-            .metrics
-            .mrr = 0.6;
-    }
-    apply_baseline_deltas(&mut artifact.variants).expect("apply mode deltas");
-    let lexical = artifact
-        .variants
-        .iter()
-        .find(|variant| variant.id == "lexical-with-bge-reranker-base")
-        .expect("lexical variant");
-    let fusion = artifact
-        .variants
-        .iter()
-        .find(|variant| variant.id == "fusion-with-bge-reranker-base")
-        .expect("fusion variant");
-    assert!(!lexical.qualifies);
-    assert!(fusion.qualifies);
+    let candidate = build_config(JINA_ARM, temp.path());
+    let mut expected_search = SearchConfig::default();
+    expected_search.crossencoder = Some(JINA_MODEL.to_string());
+    assert_eq!(candidate.embeddings, embeddings);
+    assert_eq!(candidate.search, expected_search);
+
+    assert_eq!(baseline_arms(), [BASELINE_ARM]);
+    assert_eq!(diagnostic_arms(), [BASELINE_ARM, JINA_ARM]);
 }
 
-fn synthetic_query(id: &str, rerank_signal: Option<f64>) -> QueryMeasurement {
-    let expected = if id == FOOTNOTE_INVERSION_ID {
-        ChunkIdentity {
-            file: "architecture.md".into(),
-            heading_path: vec!["Architecture".into()],
-            line_start: 1,
-        }
-    } else {
-        ChunkIdentity {
-            file: "other.md".into(),
-            heading_path: vec!["Other".into()],
-            line_start: 1,
-        }
+#[test]
+fn ground_rpc_deadline_exceeds_production_rerank_timeout() {
+    let search = SearchConfig::default();
+    assert!(ground_rpc_timeout() > Duration::from_millis(search.rerank_timeout_ms));
+}
+
+fn synthetic_identity(file: &str) -> ChunkIdentity {
+    ChunkIdentity {
+        file: file.into(),
+        heading_path: vec![file.into()],
+        line_start: 1,
+    }
+}
+
+fn synthetic_query(
+    id: &str,
+    expected_file: &str,
+    rank: Option<usize>,
+    actual_file: Option<&str>,
+    rerank_signal: Option<f64>,
+) -> QueryMeasurement {
+    let expected_top = synthetic_identity(expected_file);
+    let actual_top = match actual_file {
+        Some(file) => Some(synthetic_identity(file)),
+        None => None,
     };
+    let top_chunk_pass = actual_top.as_ref() == Some(&expected_top);
     QueryMeasurement {
         id: id.into(),
         latency_ms: 10,
-        rank: Some(1),
-        expected_top: expected.clone(),
-        actual_top: Some(expected),
-        top_chunk_pass: true,
+        rank,
+        expected_top,
+        actual_top,
+        top_chunk_pass,
+        rerank_completed: false,
         rerank_signal,
     }
 }
 
-fn synthetic_artifact() -> EvalArtifact {
-    let mut variants: Vec<VariantMeasurement> = variant_specs()
-        .into_iter()
-        .map(|spec| {
-            let signal = spec.model.map(|_| 2.0);
-            let queries = vec![
-                synthetic_query(FOOTNOTE_INVERSION_ID, signal),
-                synthetic_query("other", signal),
-            ];
-            VariantMeasurement {
-                id: spec.id.into(),
-                model: spec.model.map(str::to_string),
-                weight_bytes: spec.weight_bytes,
-                metrics: metrics_for(&queries).expect("metrics"),
-                qualifies: false,
-                mrr_gain: 0.0,
-                added_p50_ms: 0,
-                queries,
-            }
-        })
-        .collect();
-    apply_baseline_deltas(&mut variants).expect("deltas");
-    EvalArtifact {
-        schema_version: SCHEMA_VERSION,
-        query_set_digest: "digest".into(),
-        thresholds: locked_thresholds(),
-        candidates: candidate_specs(),
-        variants,
-        decision: None,
+fn synthetic_measurement(arm: ArmSpec<'_>, mut queries: Vec<QueryMeasurement>) -> ArmMeasurement {
+    let rerank_completed = arm.model.is_some();
+    for query in &mut queries {
+        query.rerank_completed = rerank_completed;
+    }
+    let model = match arm.model {
+        Some(model) => Some(model.to_string()),
+        None => None,
+    };
+    ArmMeasurement {
+        id: arm.id.into(),
+        model,
+        quality: quality_for(&queries).expect("quality"),
+        latency: latency_for(5, &queries).expect("latency"),
+        queries,
+    }
+}
+
+fn synthetic_baseline_artifact() -> EvalArtifact {
+    let mut artifact = new_artifact("digest".into(), &baseline_arms());
+    artifact.measurements.push(synthetic_measurement(
+        BASELINE_ARM,
+        vec![
+            synthetic_query("first", "first.md", Some(1), Some("first.md"), None),
+            synthetic_query("second", "second.md", Some(2), Some("other.md"), None),
+        ],
+    ));
+    validate_baseline_artifact(&artifact).expect("synthetic baseline");
+    artifact
+}
+
+fn synthetic_diagnostic_artifact() -> EvalArtifact {
+    let mut artifact = new_artifact("digest".into(), &diagnostic_arms());
+    artifact.measurements.push(synthetic_measurement(
+        BASELINE_ARM,
+        vec![
+            synthetic_query("first", "first.md", Some(2), Some("first.md"), None),
+            synthetic_query("second", "second.md", None, Some("other.md"), None),
+            synthetic_query("third", "third.md", Some(1), Some("third.md"), None),
+        ],
+    ));
+    artifact.measurements.push(synthetic_measurement(
+        JINA_ARM,
+        vec![
+            synthetic_query("first", "first.md", Some(1), Some("first.md"), Some(2.0)),
+            synthetic_query("second", "second.md", None, Some("second.md"), Some(2.0)),
+            synthetic_query("third", "third.md", None, Some("other.md"), Some(2.0)),
+        ],
+    ));
+    artifact.comparison = Some(
+        build_comparison(&artifact.measurements[0], &artifact.measurements[1]).expect("comparison"),
+    );
+    validate_diagnostic_artifact(&artifact, true).expect("synthetic diagnostic");
+    artifact
+}
+
+#[test]
+fn diagnostic_artifact_has_two_arms_counts_and_no_decision_fields() {
+    let artifact = synthetic_diagnostic_artifact();
+    let comparison = artifact.comparison.as_ref().expect("comparison");
+    assert_eq!(comparison.counts.improved, 1);
+    assert_eq!(comparison.counts.unchanged, 1);
+    assert_eq!(comparison.counts.regressed, 1);
+    assert_eq!(comparison.queries.len(), 3);
+
+    let json = serde_json::to_string(&artifact).expect("serialize diagnostic");
+    assert!(!json.contains("qualified"));
+    assert!(!json.contains("selected"));
+    assert!(json.contains("recall_at_5"));
+    assert!(json.contains("warm_p50_ms"));
+    assert!(json.contains("warm_p95_ms"));
+    assert!(json.contains("timeout_count"));
+    assert!(json.contains("model_load_failures"));
+}
+
+#[test]
+fn partial_diagnostic_records_timeout_before_validation() {
+    let mut artifact = new_artifact("digest".into(), &diagnostic_arms());
+    let error = anyhow::anyhow!("{RERANK_TIMEOUT_MARKER} for query first in {JINA_ID}");
+    record_failure(&mut artifact, JINA_ARM, &error);
+    validate_diagnostic_artifact(&artifact, false).expect("partial diagnostic");
+    assert_eq!(artifact.timeout_count, 1);
+    assert_eq!(artifact.timeouts[0].query_id.as_deref(), Some("first"));
+}
+
+#[test]
+fn diagnostic_rejects_rerank_fallback_warnings() {
+    for code in ["rerank-timeout", "crossencoder-unavailable"] {
+        let response = GroundResponse {
+            query: "query".into(),
+            took_ms: 1,
+            stats: Default::default(),
+            docs: BTreeMap::new(),
+            code: BTreeMap::new(),
+            warnings: vec![Warning {
+                code: code.into(),
+                message: "fallback".into(),
+            }],
+        };
+        let error = rerank_completion(&response, JINA_ARM, "first")
+            .expect_err("diagnostic must reject fallback warning");
+        assert!(
+            error
+                .to_string()
+                .contains("fusion fallback is not a measurement"),
+            "unexpected error: {error}"
+        );
     }
 }
 
 #[test]
-fn none_qualified_decision_matches_runtime_and_cli_opt_in_defaults() {
-    let mut baseline = synthetic_artifact();
-    baseline.decision = Some(Decision {
-        outcome: DecisionOutcome::NoneQualified,
-        selected_model: None,
-        default_crossencoder: None,
-    });
-    validate_recorded_decision(&baseline).expect("none-qualified defaults agree");
+fn completed_rerank_is_not_inferred_from_z_score() {
+    let measurement = synthetic_measurement(
+        JINA_ARM,
+        vec![synthetic_query(
+            "degenerate",
+            "file.md",
+            Some(1),
+            Some("file.md"),
+            None,
+        )],
+    );
+    assert!(measurement.queries[0].rerank_completed);
+    assert!(measurement.queries[0].rerank_signal.is_none());
+    validate_measurement(&measurement, JINA_ARM).expect("degenerate z-score remains completed");
 }
 
 #[test]
 fn comparator_rejects_metric_and_top_chunk_regressions() {
-    let committed = synthetic_artifact();
+    let committed = synthetic_baseline_artifact();
 
     let mut metric_regression = committed.clone();
-    let candidate = metric_regression
-        .variants
-        .iter_mut()
-        .find(|variant| variant.id == "fusion-with-bge-reranker-base")
-        .expect("candidate");
-    candidate.queries[1].rank = None;
-    candidate.metrics = metrics_for(&candidate.queries).expect("metrics");
-    apply_baseline_deltas(&mut metric_regression.variants).expect("deltas");
+    metric_regression.measurements[0].queries[1].rank = None;
+    metric_regression.measurements[0].quality =
+        quality_for(&metric_regression.measurements[0].queries).expect("quality");
     assert!(compare_against_baseline(&committed, &metric_regression).is_err());
 
     let mut chunk_regression = committed.clone();
-    let candidate = chunk_regression
-        .variants
-        .iter_mut()
-        .find(|variant| variant.id == "fusion-with-bge-reranker-base")
-        .expect("candidate");
-    candidate.queries[1].actual_top = None;
-    candidate.queries[1].top_chunk_pass = false;
+    chunk_regression.measurements[0].queries[0].actual_top = None;
+    chunk_regression.measurements[0].queries[0].top_chunk_pass = false;
     assert!(compare_against_baseline(&committed, &chunk_regression).is_err());
 }
 
@@ -1465,14 +1501,16 @@ fn artifact_write_isolated_to_requested_output() {
     fs::write(&baseline, b"committed baseline sentinel").expect("write baseline");
     let before = fs::read(&baseline).expect("read baseline before");
 
-    write_artifact(&output, &synthetic_artifact()).expect("write output");
+    write_artifact(&output, &synthetic_diagnostic_artifact()).expect("write output");
 
     assert_eq!(fs::read(&baseline).expect("read baseline after"), before);
     assert!(output.is_file());
-    let entries: Vec<_> = fs::read_dir(temp.path().join(".context"))
-        .expect("read output dir")
-        .collect();
-    assert_eq!(entries.len(), 1);
+    let mut entry_count = 0;
+    for entry in fs::read_dir(temp.path().join(".context")).expect("read output dir") {
+        entry.expect("output entry");
+        entry_count += 1;
+    }
+    assert_eq!(entry_count, 1);
 }
 
 #[test]
@@ -1485,7 +1523,7 @@ fn measurement_output_alias_cannot_overwrite_baseline() {
     let before = fs::read(&baseline).expect("read baseline before");
     let alias = eval.join("../eval/baseline.json");
 
-    let error = write_measurement_artifact(&alias, &baseline, &synthetic_artifact())
+    let error = write_measurement_artifact(&alias, &baseline, &synthetic_diagnostic_artifact())
         .expect_err("baseline alias must be rejected");
 
     assert!(
@@ -1497,28 +1535,42 @@ fn measurement_output_alias_cannot_overwrite_baseline() {
 }
 
 #[test]
+fn hard_link_measurement_output_preserves_baseline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let eval = temp.path().join("eval");
+    let baseline = eval.join("baseline.json");
+    let output = temp.path().join(".context/result.json");
+    fs::create_dir_all(&eval).expect("mkdir eval");
+    fs::write(&baseline, b"committed baseline sentinel").expect("write baseline");
+    fs::create_dir_all(output.parent().expect("output parent")).expect("mkdir context");
+    fs::hard_link(&baseline, &output).expect("create hard-link output");
+    let before = fs::read(&baseline).expect("read baseline before");
+
+    write_measurement_artifact(&output, &baseline, &synthetic_diagnostic_artifact())
+        .expect("write output through hard link");
+
+    assert_eq!(fs::read(&baseline).expect("read baseline after"), before);
+    assert_ne!(fs::read(&output).expect("read output after"), before);
+}
+
+#[test]
 fn relative_measurement_output_resolves_against_repo_root() {
     let output = measurement_output_path(Path::new(".context/result.json"));
     let expected = repo_root().join(".context/result.json");
-
     assert_eq!(output, expected);
 }
 
 #[tokio::test]
-#[ignore = "downloads and measures every pinned fastembed reranker"]
+#[ignore = "loads production embeddings and the Jina v1 reranker"]
 async fn eval_ground_recall_measure() -> Result<()> {
     let output = env::var_os("HALLOUMINATE_EVAL_OUTPUT")
-        .context("HALLOUMINATE_EVAL_OUTPUT must name the proposed measurement artifact")?;
+        .context("HALLOUMINATE_EVAL_OUTPUT must name the diagnostic artifact")?;
     let output = measurement_output_path(Path::new(&output));
     let baseline = baseline_path();
     ensure_measurement_output_is_not_baseline(&output, &baseline)?;
     let baseline_before = read_optional(&baseline)?;
     let (queries, query_set_digest) = load_queries()?;
-    let artifact = measure_all(&queries, query_set_digest).await?;
-    ensure!(
-        artifact.decision.is_none(),
-        "measurement must not record a decision"
-    );
+    let artifact = measure_diagnostic(&queries, query_set_digest, &output, &baseline).await?;
     write_measurement_artifact(&output, &baseline, &artifact)?;
     let baseline_after = read_optional(&baseline)?;
     ensure!(
@@ -1530,20 +1582,19 @@ async fn eval_ground_recall_measure() -> Result<()> {
 }
 
 #[tokio::test]
-#[ignore = "downloads rerankers and enforces the committed retrieval baseline"]
+#[ignore = "loads production embeddings and enforces the committed baseline"]
 async fn eval_ground_recall_enforce() -> Result<()> {
     let baseline_bytes = fs::read(baseline_path()).context("read eval/baseline.json")?;
     let baseline: EvalArtifact =
         serde_json::from_slice(&baseline_bytes).context("parse eval/baseline.json")?;
-    validate_artifact(&baseline).context("validate eval/baseline.json")?;
-    validate_recorded_decision(&baseline)?;
+    validate_baseline_artifact(&baseline).context("validate eval/baseline.json")?;
 
     let (queries, query_set_digest) = load_queries()?;
     ensure!(
         query_set_digest == baseline.query_set_digest,
         "query-set digest disagrees with eval/baseline.json"
     );
-    let current = measure_all(&queries, query_set_digest).await?;
+    let current = measure_baseline(&queries, query_set_digest).await?;
     compare_against_baseline(&baseline, &current)?;
     println!("{}", serde_json::to_string_pretty(&current)?);
     Ok(())

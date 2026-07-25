@@ -6,7 +6,7 @@ use crate::indexer::{ChunkStore, SearchHit};
 use crate::search::{Crossencoder, search_with_ripgrep};
 
 use super::bucket::{build_docs, normalize_scores};
-use super::types::{DocFile, GroundResponse, Stats};
+use super::types::{DocFile, GroundResponse, Stats, Warning};
 
 /// Run `crossencoder.rerank(query, &mut hits)` on a blocking-pool thread and
 /// bound it with `timeout`. `Crossencoder::rerank` is synchronous CPU-bound
@@ -150,6 +150,7 @@ pub async fn ground_union(
         }
     }
     let stats = Stats { hits: hits.len() };
+    let mut warnings = Vec::new();
 
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
@@ -162,6 +163,14 @@ pub async fn ground_union(
             for (hit, z_score) in hits.iter_mut().zip(z_scores) {
                 hit.z_score = z_score;
             }
+        } else {
+            warnings.push(Warning {
+                code: "rerank-timeout".to_string(),
+                message: format!(
+                    "crossencoder rerank timed out after {} ms; falling back to fusion order",
+                    opts.rerank_timeout.as_millis()
+                ),
+            });
         }
     }
 
@@ -209,7 +218,7 @@ pub async fn ground_union(
         stats,
         docs,
         code: BTreeMap::new(),
-        warnings: vec![],
+        warnings,
     })
 }
 
@@ -363,6 +372,7 @@ mod tests {
             line_start: 1,
             line_end: 2,
             text: String::new(),
+            search_text: String::new(),
             summary: String::new(),
             keywords: vec![],
             score,
@@ -524,16 +534,6 @@ mod tests {
 
     #[tokio::test]
     async fn ground_union_honors_opts_rerank_timeout() {
-        // Proves the knob is actually wired through GroundOpts into
-        // ground_union, not just present on the struct: a tiny
-        // opts.rerank_timeout must trigger the timeout fallback path on a
-        // POPULATED store, so the crossencoder branch actually runs. If
-        // ground_union ignored opts.rerank_timeout (e.g. a hardcoded 2s),
-        // the 200ms sleep would finish well inside 2s, `applied` would be
-        // true, and the spread scores assigned by SleepingCrossencoder
-        // would yield Some z_scores over >=5 hits, failing the assertion
-        // below (positive control:
-        // ground_union_applies_z_scores_when_rerank_finishes_in_time).
         let store = FakeChunkStore {
             hits: fixture_hits(),
         };
@@ -554,15 +554,18 @@ mod tests {
 
         assert!(
             resp.stats.hits >= 5,
-            "fixture corpus must yield >= MIN_N (5) hits so the z_score assertion is \
-             falsifiable, got {}",
+            "fixture corpus must yield >= MIN_N (5) hits so the z_score assertion is              falsifiable, got {}",
             resp.stats.hits
         );
         assert!(
             resp.docs.values().all(|d| d.z_score.is_none()),
-            "a 20ms opts.rerank_timeout must time out the 200ms-sleeping crossencoder, \
-             leaving z_score unset (applied == false); a Some z_score means the \
-             configured timeout was ignored"
+            "a 20ms opts.rerank_timeout must time out the 200ms-sleeping crossencoder,              leaving z_score unset (applied == false); a Some z_score means the              configured timeout was ignored"
+        );
+        assert!(
+            resp.warnings
+                .iter()
+                .any(|warning| warning.code == "rerank-timeout"),
+            "timeout fallback must be observable through GroundResponse warnings"
         );
     }
 

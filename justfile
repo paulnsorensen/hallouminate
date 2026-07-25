@@ -22,11 +22,11 @@ ci:
 llm:
     just verify --fix
 
-# Measure every pinned reranker without modifying the committed eval decision.
+# Measure the production fusion baseline against the Jina-v1 diagnostic arm.
 eval-measure:
     HALLOUMINATE_EVAL_OUTPUT=.context/issue-288-eval-results.json just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_measure -- --ignored --nocapture --exact
 
-# Enforce the committed retrieval metrics, chunk assertions, and runtime decision.
+# Enforce the committed production fusion baseline without a crossencoder.
 eval:
     just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_enforce -- --ignored --nocapture --exact
 

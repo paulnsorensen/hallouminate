@@ -56,6 +56,8 @@ pub struct SearchHit {
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
+    /// Deterministic retrieval text used by every ranking stage.
+    pub search_text: String,
     pub summary: String,
     pub keywords: Vec<String>,
     pub score: f32,

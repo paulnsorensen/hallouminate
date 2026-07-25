@@ -83,6 +83,7 @@ mod tests {
             line_start: 1,
             line_end: 2,
             text: text.into(),
+            search_text: text.into(),
             summary: String::new(),
             keywords: vec![],
             score,

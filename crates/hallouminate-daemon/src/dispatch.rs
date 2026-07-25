@@ -382,9 +382,11 @@ async fn handle_ground(
     // load (e.g. model file vanished), log and ground without it
     // rather than refusing the request. Unconfigured paths return
     // Ok(None) and the rerank step is skipped entirely.
+    let mut crossencoder_unavailable = false;
     let crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()).await {
         Ok(g) => g,
         Err(e) => {
+            crossencoder_unavailable = true;
             tracing::warn!(
                 target: "hallouminate::daemon",
                 error = %e,
@@ -407,6 +409,12 @@ async fn handle_ground(
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
+    if crossencoder_unavailable {
+        response.warnings.push(Warning {
+            code: "crossencoder-unavailable".to_string(),
+            message: "crossencoder unavailable; falling back to fusion-only ranking".to_string(),
+        });
+    }
 
     // #135: stale-index detection.
     mark_stale(&mut response).await;

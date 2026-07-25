@@ -480,6 +480,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     let file_ref = string_col(rb, "file_ref")?;
     let summary = string_col(rb, "summary")?;
     let text = string_col(rb, "text")?;
+    let search_text = string_col(rb, "search_text")?;
     let line_start = int64_col(rb, "line_start")?;
     let line_end = int64_col(rb, "line_end")?;
     let mtime_ms = int64_col(rb, "mtime_ms")?;
@@ -504,6 +505,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
             line_start: line_start.value(i) as usize,
             line_end: line_end.value(i) as usize,
             text: text.value(i).to_string(),
+            search_text: search_text.value(i).to_string(),
             summary: summary.value(i).to_string(),
             keywords: decode_list(keywords, i),
             score: s,
@@ -3188,6 +3190,7 @@ schema_version = 1
             .expect("search indexed text");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "displaycontracttoken");
+        assert_eq!(hits[0].search_text, "retrievalcontracttoken");
 
         let display_hits = store
             .hybrid_search(&docs_key(), "displaycontracttoken", 10)
@@ -3359,6 +3362,8 @@ schema_version = 1
 
         assert_eq!(hit_a.text, "display a contains lowercase word");
         assert_eq!(hit_b.text, "display b contains uppercase Word");
+        assert_eq!(hit_a.search_text, "Word is here now filler pad pad pad");
+        assert_eq!(hit_b.search_text, "word is here now filler pad pad pad");
         assert_eq!(hits[0].file_ref, "/tmp/b.md");
         let expected_delta = CONTAINS_WEIGHT / weighted_rrf::K;
         assert!(
