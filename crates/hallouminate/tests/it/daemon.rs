@@ -1946,6 +1946,14 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    // Keep callsite-interest caches permissive while parallel tests install
+    // scoped subscribers. Without this, a logging call can be skipped while
+    // the global cache rebuilds between subscribers.
+    static GLOBAL: std::sync::Once = std::sync::Once::new();
+    GLOBAL.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let writer_buf = std::sync::Arc::clone(&buf);
     let subscriber = tracing_subscriber::fmt()
