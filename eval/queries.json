@@ -4,7 +4,9 @@
     "query": "why are Hallouminate's daemon and config layers separate from the application crate",
     "expected_chunk": {
       "file": "architecture.md",
-      "heading_path": ["Architecture"],
+      "heading_path": [
+        "Architecture"
+      ],
       "line_start": 1
     }
   },
@@ -13,7 +15,9 @@
     "query": "why can a query in one git checkout see stale knowledge from a sibling branch",
     "expected_chunk": {
       "file": "worktree-corpus-identity.md",
-      "heading_path": ["Worktree corpus identity"],
+      "heading_path": [
+        "Worktree corpus identity"
+      ],
       "line_start": 9
     }
   },
@@ -22,7 +26,9 @@
     "query": "which layer receives commands and transports while keeping core capabilities separate",
     "expected_chunk": {
       "file": "architecture.md",
-      "heading_path": ["Architecture"],
+      "heading_path": [
+        "Architecture"
+      ],
       "line_start": 1
     }
   },
@@ -31,7 +37,10 @@
     "query": "who enforces dependency direction across workspace crates and adapters",
     "expected_chunk": {
       "file": "architecture.md",
-      "heading_path": ["Architecture", "crates/hallouminate-adapters/ — driven external systems"],
+      "heading_path": [
+        "Architecture",
+        "crates/hallouminate-adapters/ \u2014 driven external systems"
+      ],
       "line_start": 62
     }
   },
@@ -40,7 +49,10 @@
     "query": "how can one configured corpus intentionally search multiple canonical roots without mixing their identities",
     "expected_chunk": {
       "file": "worktree-corpus-identity.md",
-      "heading_path": ["Worktree corpus identity", "Remaining search defect"],
+      "heading_path": [
+        "Worktree corpus identity",
+        "Remaining search defect"
+      ],
       "line_start": 25
     }
   },
@@ -49,7 +61,9 @@
     "query": "why does hallouminate keep one long lived owner for database writes",
     "expected_chunk": {
       "file": "daemon-and-cli.md",
-      "heading_path": ["Daemon and CLI"],
+      "heading_path": [
+        "Daemon and CLI"
+      ],
       "line_start": 1
     }
   },
@@ -58,7 +72,10 @@
     "query": "how does pointing directly at ignored content change filesystem walking",
     "expected_chunk": {
       "file": "corpus-walker.md",
-      "heading_path": ["Corpus walker", "Explicit-root opt-in"],
+      "heading_path": [
+        "Corpus walker",
+        "Explicit-root opt-in"
+      ],
       "line_start": 19
     }
   },
@@ -67,7 +84,11 @@
     "query": "what directory anchors a relative repository path in the local configuration layer",
     "expected_chunk": {
       "file": "config-layering.md",
-      "heading_path": ["Config layering", "Repo layer", "Relative paths resolve against the repo root"],
+      "heading_path": [
+        "Config layering",
+        "Repo layer",
+        "Relative paths resolve against the repo root"
+      ],
       "line_start": 41
     }
   },
@@ -76,7 +97,10 @@
     "query": "why does releasing an inference session fail to return its allocation arena to the operating system",
     "expected_chunk": {
       "file": "ort-arena-retention.md",
-      "heading_path": ["ORT BFCArena retention — why session eviction never reclaimed memory", "The mechanism"],
+      "heading_path": [
+        "ORT BFCArena retention \u2014 why session eviction never reclaimed memory",
+        "The mechanism"
+      ],
       "line_start": 18
     }
   },
@@ -85,7 +109,9 @@
     "query": "why should unrelated durable knowledge be split into separate pages for retrieval",
     "expected_chunk": {
       "file": "wiki-conventions.md",
-      "heading_path": ["Wiki conventions for LLM authors"],
+      "heading_path": [
+        "Wiki conventions for LLM authors"
+      ],
       "line_start": 1
     }
   },
@@ -94,7 +120,10 @@
     "query": "which chunk owns a provenance marker when two bounded slices overlap on one source line",
     "expected_chunk": {
       "file": "claim-provenance-marks.md",
-      "heading_path": ["Claim-level provenance marks", "Each mark belongs to exactly one chunk"],
+      "heading_path": [
+        "Claim-level provenance marks",
+        "Each mark belongs to exactly one chunk"
+      ],
       "line_start": 59
     }
   },
@@ -103,8 +132,726 @@
     "query": "why can't a different text extraction crate recover words from an image-only document",
     "expected_chunk": {
       "file": "pdf-ocr-ingestion.md",
-      "heading_path": ["PDF and OCR ingestion", "Scanned PDFs / OCR — a separate engine, explicitly out of scope"],
+      "heading_path": [
+        "PDF and OCR ingestion",
+        "Scanned PDFs / OCR \u2014 a separate engine, explicitly out of scope"
+      ],
       "line_start": 58
+    }
+  },
+  {
+    "id": "arctic-embed-default",
+    "query": "which sentence embedding model is the default and how many dimensions does it produce",
+    "expected_chunk": {
+      "file": "embedding-model-selection.md",
+      "heading_path": [
+        "Embedding model selection"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "precision-mismatch-incompatible",
+    "query": "why can rows written under one numeric format not be compared against rows written under another",
+    "expected_chunk": {
+      "file": "embedding-model-selection.md",
+      "heading_path": [
+        "Embedding model selection",
+        "Full-precision vs quantized"
+      ],
+      "line_start": 30
+    }
+  },
+  {
+    "id": "model-is-not-the-product",
+    "query": "why is swapping the vector encoder considered a cheap reversible decision rather than a foundational one",
+    "expected_chunk": {
+      "file": "embedding-model-selection.md",
+      "heading_path": [
+        "Embedding model selection",
+        "Why the model is not the product"
+      ],
+      "line_start": 52
+    }
+  },
+  {
+    "id": "idle-exit-supersedes-eviction",
+    "query": "why did dropping the embedder on a timer never actually give memory back",
+    "expected_chunk": {
+      "file": "daemon-idle-exit.md",
+      "heading_path": [
+        "Daemon idle exit"
+      ],
+      "line_start": 10
+    }
+  },
+  {
+    "id": "clean-shutdown-inflight-writes",
+    "query": "what does the process do about partially applied storage mutations before it stops",
+    "expected_chunk": {
+      "file": "daemon-idle-exit.md",
+      "heading_path": [
+        "Daemon idle exit",
+        "What idle-exit does instead"
+      ],
+      "line_start": 20
+    }
+  },
+  {
+    "id": "cold-start-price",
+    "query": "what does the system pay the next time a caller arrives after it has shut itself down",
+    "expected_chunk": {
+      "file": "daemon-idle-exit.md",
+      "heading_path": [
+        "Daemon idle exit",
+        "The cold-start cost this buys"
+      ],
+      "line_start": 26
+    }
+  },
+  {
+    "id": "deprecated-evict-knob",
+    "query": "is the old idle_evict_secs setting still honoured or is it a no-op",
+    "expected_chunk": {
+      "file": "daemon-idle-exit.md",
+      "heading_path": [
+        "Daemon idle exit",
+        "Deprecated config"
+      ],
+      "line_start": 32
+    }
+  },
+  {
+    "id": "tracing-target-namespacing",
+    "query": "how are structured log targets named so one concern can be isolated",
+    "expected_chunk": {
+      "file": "observability-and-tracing.md",
+      "heading_path": [
+        "Observability and tracing"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "warn-vs-debug",
+    "query": "which severity should an operator notice without being told to go looking",
+    "expected_chunk": {
+      "file": "observability-and-tracing.md",
+      "heading_path": [
+        "Observability and tracing",
+        "Warn versus debug"
+      ],
+      "line_start": 17
+    }
+  },
+  {
+    "id": "where-to-look-first",
+    "query": "the answers coming back look wrong \u2014 what should be inspected before anything else",
+    "expected_chunk": {
+      "file": "observability-and-tracing.md",
+      "heading_path": [
+        "Observability and tracing",
+        "Where an operator should look first"
+      ],
+      "line_start": 25
+    }
+  },
+  {
+    "id": "incremental-skip-reembed",
+    "query": "how does re-indexing avoid recomputing vectors for files that have not changed",
+    "expected_chunk": {
+      "file": "index-incremental-diff.md",
+      "heading_path": [
+        "Incremental index diffing"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "sibling-worktree-delete-guard",
+    "query": "what stops an index run in one checkout from deleting rows belonging to another checkout",
+    "expected_chunk": {
+      "file": "index-incremental-diff.md",
+      "heading_path": [
+        "Incremental index diffing",
+        "Root-scoped deletes"
+      ],
+      "line_start": 41
+    }
+  },
+  {
+    "id": "json-lines-framing",
+    "query": "what wire format do callers use to reach the background process",
+    "expected_chunk": {
+      "file": "socket-protocol.md",
+      "heading_path": [
+        "Socket protocol"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "request-envelope-shape",
+    "query": "what does a request object carry besides the operation being requested",
+    "expected_chunk": {
+      "file": "socket-protocol.md",
+      "heading_path": [
+        "Socket protocol",
+        "Request and response shape"
+      ],
+      "line_start": 19
+    }
+  },
+  {
+    "id": "client-gives-up",
+    "query": "what happens on the calling side when the server never answers",
+    "expected_chunk": {
+      "file": "socket-protocol.md",
+      "heading_path": [
+        "Socket protocol",
+        "Request deadlines"
+      ],
+      "line_start": 38
+    }
+  },
+  {
+    "id": "cli-mcp-same-transport",
+    "query": "do the command line and the tool surface share one path to the storage layer",
+    "expected_chunk": {
+      "file": "socket-protocol.md",
+      "heading_path": [
+        "Socket protocol",
+        "CLI and MCP are both just clients"
+      ],
+      "line_start": 42
+    }
+  },
+  {
+    "id": "frontmatter-keys",
+    "query": "which lifecycle and provenance keys may open a page",
+    "expected_chunk": {
+      "file": "frontmatter-conventions.md",
+      "heading_path": [
+        "Frontmatter conventions"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "frontmatter-stripped-before-chunking",
+    "query": "is the leading metadata block indexed as searchable body text",
+    "expected_chunk": {
+      "file": "frontmatter-conventions.md",
+      "heading_path": [
+        "Frontmatter conventions",
+        "Page-level, not enforced"
+      ],
+      "line_start": 17
+    }
+  },
+  {
+    "id": "page-vs-claim-scope",
+    "query": "how do you record that one sentence has gone stale while the rest of the document is still good",
+    "expected_chunk": {
+      "file": "frontmatter-conventions.md",
+      "heading_path": [
+        "Frontmatter conventions",
+        "How it differs from inline per-claim marks"
+      ],
+      "line_start": 37
+    }
+  },
+  {
+    "id": "repository-vs-corpus-entry",
+    "query": "what is the difference between the two kinds of entry that declare a searchable collection",
+    "expected_chunk": {
+      "file": "corpus-registration.md",
+      "heading_path": [
+        "Corpus registration: [[repository]] vs [[corpus]]"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "what-a-repository-derives",
+    "query": "which collections come into being automatically from a declared git project",
+    "expected_chunk": {
+      "file": "corpus-registration.md",
+      "heading_path": [
+        "Corpus registration: [[repository]] vs [[corpus]]",
+        "What a [[repository]] derives"
+      ],
+      "line_start": 19
+    }
+  },
+  {
+    "id": "deepest-ancestor-default",
+    "query": "when a call names no target, how is one chosen from where the caller happens to be",
+    "expected_chunk": {
+      "file": "corpus-registration.md",
+      "heading_path": [
+        "Corpus registration: [[repository]] vs [[corpus]]",
+        "Resolving the default corpus from cwd"
+      ],
+      "line_start": 40
+    }
+  },
+  {
+    "id": "ambiguous-target-rejected",
+    "query": "why is a bare call refused outright when several possibilities are reachable",
+    "expected_chunk": {
+      "file": "corpus-registration.md",
+      "heading_path": [
+        "Corpus registration: [[repository]] vs [[corpus]]",
+        "Why an explicit corpus is required beyond one"
+      ],
+      "line_start": 50
+    }
+  },
+  {
+    "id": "error-variants",
+    "query": "what are the six error variants that cross every fallible operation",
+    "expected_chunk": {
+      "file": "error-taxonomy.md",
+      "heading_path": [
+        "Error taxonomy"
+      ],
+      "line_start": 10
+    }
+  },
+  {
+    "id": "two-jsonrpc-codes",
+    "query": "how does the tool adapter narrow many internal failure kinds into just two protocol codes",
+    "expected_chunk": {
+      "file": "error-taxonomy.md",
+      "heading_path": [
+        "Error taxonomy",
+        "MCP-layer mapping"
+      ],
+      "line_start": 34
+    }
+  },
+  {
+    "id": "degrade-not-fail",
+    "query": "when an optional second-pass scoring step runs out of time, does the whole request fail",
+    "expected_chunk": {
+      "file": "error-taxonomy.md",
+      "heading_path": [
+        "Error taxonomy",
+        "Recoverable degradation vs. a hard error"
+      ],
+      "line_start": 46
+    }
+  },
+  {
+    "id": "supervisor-deadline",
+    "query": "why is a long walk-and-write cycle wrapped in something holding its own deadline",
+    "expected_chunk": {
+      "file": "concurrency-and-supervision.md",
+      "heading_path": [
+        "Concurrency and supervision"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "lock-held-forever",
+    "query": "what would go wrong if one stuck operation kept its exclusive claim indefinitely",
+    "expected_chunk": {
+      "file": "concurrency-and-supervision.md",
+      "heading_path": [
+        "Concurrency and supervision",
+        "Why a stalled scan must not wedge the daemon"
+      ],
+      "line_start": 17
+    }
+  },
+  {
+    "id": "kill-vs-partial",
+    "query": "is an overrunning scan terminated, or left running while partial state is returned",
+    "expected_chunk": {
+      "file": "concurrency-and-supervision.md",
+      "heading_path": [
+        "Concurrency and supervision",
+        "Killing a slow scan vs. returning partial results"
+      ],
+      "line_start": 21
+    }
+  },
+  {
+    "id": "two-different-deadlines",
+    "query": "which timeout bounds the server side as opposed to the caller side",
+    "expected_chunk": {
+      "file": "concurrency-and-supervision.md",
+      "heading_path": [
+        "Concurrency and supervision",
+        "What the deadline does not cover"
+      ],
+      "line_start": 27
+    }
+  },
+  {
+    "id": "footnote-raw-bytes",
+    "query": "are citations parsed from raw source or from a rendered document tree",
+    "expected_chunk": {
+      "file": "footnote-extraction.md",
+      "heading_path": [
+        "Footnote extraction and resolution"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "footnote-whole-page",
+    "query": "why is a citation resolved against the entire file rather than the fragment that cites it",
+    "expected_chunk": {
+      "file": "footnote-extraction.md",
+      "heading_path": [
+        "Footnote extraction and resolution",
+        "Why extraction happens against the whole page, not a chunk"
+      ],
+      "line_start": 20
+    }
+  },
+  {
+    "id": "footnote-modes",
+    "query": "what are the three ways citation blocks can be included or withheld from a response",
+    "expected_chunk": {
+      "file": "footnote-extraction.md",
+      "heading_path": [
+        "Footnote extraction and resolution",
+        "What Only and Exclude modes are for"
+      ],
+      "line_start": 38
+    }
+  },
+  {
+    "id": "code-span-false-positive",
+    "query": "why is a bracketed marker inside a fenced block left alone instead of being treated as real",
+    "expected_chunk": {
+      "file": "footnote-extraction.md",
+      "heading_path": [
+        "Footnote extraction and resolution",
+        "Parser-based, not regex-based"
+      ],
+      "line_start": 54
+    }
+  },
+  {
+    "id": "symlink-rejected",
+    "query": "are symbolic links followed or refused when reading and writing corpus files",
+    "expected_chunk": {
+      "file": "path-safety.md",
+      "heading_path": [
+        "Path safety"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "atomic-rename-write",
+    "query": "how does a writer avoid ever exposing a half-written file to a concurrent reader",
+    "expected_chunk": {
+      "file": "path-safety.md",
+      "heading_path": [
+        "Path safety",
+        "Atomic replacement on write"
+      ],
+      "line_start": 17
+    }
+  },
+  {
+    "id": "traversal-escape-class",
+    "query": "which category of escape do the combined filesystem checks close off",
+    "expected_chunk": {
+      "file": "path-safety.md",
+      "heading_path": [
+        "Path safety",
+        "What class of escape this closes"
+      ],
+      "line_start": 25
+    }
+  },
+  {
+    "id": "workspace-root-discovery",
+    "query": "how does the server learn which directory the connected caller treats as its workspace",
+    "expected_chunk": {
+      "file": "sandbox-and-workspace-roots.md",
+      "heading_path": [
+        "Sandbox boundaries and workspace root discovery",
+        "Discovering the workspace root from the client"
+      ],
+      "line_start": 14
+    }
+  },
+  {
+    "id": "outside-root-refused",
+    "query": "is a path that falls under no configured root indexed anyway or turned away",
+    "expected_chunk": {
+      "file": "sandbox-and-workspace-roots.md",
+      "heading_path": [
+        "Sandbox boundaries and workspace root discovery",
+        "A path outside every configured root is refused, not indexed"
+      ],
+      "line_start": 20
+    }
+  },
+  {
+    "id": "dotdot-rejected",
+    "query": "why are parent-directory components refused rather than normalised away",
+    "expected_chunk": {
+      "file": "sandbox-and-workspace-roots.md",
+      "heading_path": [
+        "Sandbox boundaries and workspace root discovery",
+        "Why .. in a relative path is rejected outright"
+      ],
+      "line_start": 26
+    }
+  },
+  {
+    "id": "ignored-tests-recipes",
+    "query": "why are the model-backed checks skipped during an ordinary run",
+    "expected_chunk": {
+      "file": "testing-strategy.md",
+      "heading_path": [
+        "Testing strategy: cheap gate, expensive recipes"
+      ],
+      "line_start": 12
+    }
+  },
+  {
+    "id": "named-recipes-not-blanket-flag",
+    "query": "why invoke specific heavy targets by name instead of one flag that turns everything on",
+    "expected_chunk": {
+      "file": "testing-strategy.md",
+      "heading_path": [
+        "Testing strategy: cheap gate, expensive recipes",
+        "Explicit recipes, not a blanket flag"
+      ],
+      "line_start": 22
+    }
+  },
+  {
+    "id": "test-must-be-able-to-fail",
+    "query": "what earns a check its place in the suite at all",
+    "expected_chunk": {
+      "file": "testing-strategy.md",
+      "heading_path": [
+        "Testing strategy: cheap gate, expensive recipes",
+        "The principle behind the gate"
+      ],
+      "line_start": 30
+    }
+  },
+  {
+    "id": "prebuilt-binary-npm",
+    "query": "does installing from the package registry compile anything locally",
+    "expected_chunk": {
+      "file": "release-and-packaging.md",
+      "heading_path": [
+        "Release and packaging",
+        "Distributed, not built from source"
+      ],
+      "line_start": 21
+    }
+  },
+  {
+    "id": "nightly-channel",
+    "query": "what is the rolling experimental distribution built off the main branch",
+    "expected_chunk": {
+      "file": "release-and-packaging.md",
+      "heading_path": [
+        "Release and packaging",
+        "Two npm packages: stable and nightly"
+      ],
+      "line_start": 27
+    }
+  },
+  {
+    "id": "pre-1-0-no-guarantee",
+    "query": "what compatibility is promised across a minor bump at the current version",
+    "expected_chunk": {
+      "file": "release-and-packaging.md",
+      "heading_path": [
+        "Release and packaging",
+        "What a release does not promise before 1.0"
+      ],
+      "line_start": 31
+    }
+  },
+  {
+    "id": "gitignored-root-optin",
+    "query": "if the folder I pointed at is excluded by my own ignore rules, does it still get indexed",
+    "expected_chunk": {
+      "file": "gitignore-and-explicit-roots.md",
+      "heading_path": [
+        "Gitignore-aware walking and the explicit-root escape hatch"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "notes-folder-surprise",
+    "query": "which user would silently end up with nothing indexed and no explanation",
+    "expected_chunk": {
+      "file": "gitignore-and-explicit-roots.md",
+      "heading_path": [
+        "Gitignore-aware walking and the explicit-root escape hatch",
+        "The surprise this default would otherwise cause"
+      ],
+      "line_start": 17
+    }
+  },
+  {
+    "id": "ignore-failure-safe-default",
+    "query": "when the exclusion rules cannot be assembled, does the walk end up covering more or less",
+    "expected_chunk": {
+      "file": "gitignore-and-explicit-roots.md",
+      "heading_path": [
+        "Gitignore-aware walking and the explicit-root escape hatch",
+        "Failure modes default to honouring gitignore"
+      ],
+      "line_start": 27
+    }
+  },
+  {
+    "id": "schema-rebuild-old-store",
+    "query": "what happens when the derived store was written by an earlier build",
+    "expected_chunk": {
+      "file": "lance-schema-versioning.md",
+      "heading_path": [
+        "Lance schema versioning"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "newer-store-fatal",
+    "query": "why refuse to open storage from a later build rather than attempting to cope with it",
+    "expected_chunk": {
+      "file": "lance-schema-versioning.md",
+      "heading_path": [
+        "Lance schema versioning",
+        "Why newer is fatal, not a downgrade"
+      ],
+      "line_start": 32
+    }
+  },
+  {
+    "id": "rebuild-cost-in-practice",
+    "query": "how expensive is a full regeneration for the size of collection this targets",
+    "expected_chunk": {
+      "file": "lance-schema-versioning.md",
+      "heading_path": [
+        "Lance schema versioning",
+        "Cost in practice"
+      ],
+      "line_start": 55
+    }
+  },
+  {
+    "id": "token-budget-choice",
+    "query": "why is passage size measured with the model's own tokenizer rather than by counting characters",
+    "expected_chunk": {
+      "file": "chunk-budget-and-tokenizer.md",
+      "heading_path": [
+        "Chunk budget and tokenizer"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "heading-path-identity",
+    "query": "why are two passages with identical prose but different section nesting treated as distinct",
+    "expected_chunk": {
+      "file": "chunk-budget-and-tokenizer.md",
+      "heading_path": [
+        "Chunk budget and tokenizer",
+        "Heading paths as chunk identity"
+      ],
+      "line_start": 31
+    }
+  },
+  {
+    "id": "split-at-boundaries-first",
+    "query": "why does a passage rarely end mid-sentence despite a hard upper limit existing",
+    "expected_chunk": {
+      "file": "chunk-budget-and-tokenizer.md",
+      "heading_path": [
+        "Chunk budget and tokenizer",
+        "What happens at the boundary"
+      ],
+      "line_start": 57
+    }
+  },
+  {
+    "id": "rerank-off-by-default",
+    "query": "why is the additional scoring model disabled unless a corpus explicitly asks for it",
+    "expected_chunk": {
+      "file": "crossencoder-reranking.md",
+      "heading_path": [
+        "Crossencoder reranking"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "rerank-timeout-fallback",
+    "query": "what ordering is used when the second-stage model does not return in time",
+    "expected_chunk": {
+      "file": "crossencoder-reranking.md",
+      "heading_path": [
+        "Crossencoder reranking",
+        "The 2000ms budget and fallback"
+      ],
+      "line_start": 41
+    }
+  },
+  {
+    "id": "supported-rerank-models",
+    "query": "which two reranking models are available through the same port",
+    "expected_chunk": {
+      "file": "crossencoder-reranking.md",
+      "heading_path": [
+        "Crossencoder reranking",
+        "Supported models"
+      ],
+      "line_start": 53
+    }
+  },
+  {
+    "id": "wikilink-not-markdown",
+    "query": "why does double-bracket syntax need a dedicated extraction pass of its own",
+    "expected_chunk": {
+      "file": "backlinks-and-wikilinks.md",
+      "heading_path": [
+        "Backlinks and [[wikilink]] maintenance"
+      ],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "index-refresh-on-write",
+    "query": "why are parent table-of-contents pages rewritten whenever a page is saved",
+    "expected_chunk": {
+      "file": "backlinks-and-wikilinks.md",
+      "heading_path": [
+        "Backlinks and [[wikilink]] maintenance",
+        "Why ancestor index.md files refresh on every write"
+      ],
+      "line_start": 30
+    }
+  },
+  {
+    "id": "backlinks-vs-semantic",
+    "query": "which pages point at this one, as opposed to which ones merely resemble it",
+    "expected_chunk": {
+      "file": "backlinks-and-wikilinks.md",
+      "heading_path": [
+        "Backlinks and [[wikilink]] maintenance",
+        "What backlinks are for"
+      ],
+      "line_start": 47
     }
   }
 ]

@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "query_set_digest": "f4a8f1537a7567f8ad767ce72f5197d4f6ee2f6e216da2a5f1b90ae1af595676",
+  "query_set_digest": "62a269c954400ecec05a6369fe1d0013113109f3b404b8746c20c5382fd8d117",
   "embedding": {
     "model": "snowflake/snowflake-arctic-embed-s",
     "quantized": false,
@@ -16,18 +16,18 @@
     {
       "id": "fusion-without-rerank",
       "quality": {
-        "recall_at_5": 0.9166666666666666,
-        "mrr": 0.8333333333333331
+        "recall_at_5": 0.958904109589041,
+        "mrr": 0.8214611872146119
       },
       "latency": {
-        "cold_load_ms": 289,
-        "warm_p50_ms": 94,
-        "warm_p95_ms": 137
+        "cold_load_ms": 194,
+        "warm_p50_ms": 41,
+        "warm_p95_ms": 60
       },
       "queries": [
         {
           "id": "footnote-inversion",
-          "latency_ms": 94,
+          "latency_ms": 44,
           "rank": 1,
           "expected_top": {
             "file": "architecture.md",
@@ -48,7 +48,7 @@
         },
         {
           "id": "worktree-isolation",
-          "latency_ms": 131,
+          "latency_ms": 42,
           "rank": 1,
           "expected_top": {
             "file": "worktree-corpus-identity.md",
@@ -69,7 +69,7 @@
         },
         {
           "id": "paraphrase-app-boundary",
-          "latency_ms": 96,
+          "latency_ms": 39,
           "rank": 1,
           "expected_top": {
             "file": "architecture.md",
@@ -90,13 +90,13 @@
         },
         {
           "id": "lexical-distractor",
-          "latency_ms": 80,
+          "latency_ms": 40,
           "rank": 1,
           "expected_top": {
             "file": "architecture.md",
             "heading_path": [
               "Architecture",
-              "crates/hallouminate-adapters/ — driven external systems"
+              "crates/hallouminate-adapters/ \u2014 driven external systems"
             ],
             "line_start": 62
           },
@@ -104,7 +104,7 @@
             "file": "architecture.md",
             "heading_path": [
               "Architecture",
-              "crates/hallouminate-adapters/ — driven external systems"
+              "crates/hallouminate-adapters/ \u2014 driven external systems"
             ],
             "line_start": 62
           },
@@ -113,7 +113,7 @@
         },
         {
           "id": "multi-root-union",
-          "latency_ms": 74,
+          "latency_ms": 41,
           "rank": 1,
           "expected_top": {
             "file": "worktree-corpus-identity.md",
@@ -136,8 +136,8 @@
         },
         {
           "id": "daemon-rationale",
-          "latency_ms": 103,
-          "rank": 3,
+          "latency_ms": 41,
+          "rank": 2,
           "expected_top": {
             "file": "daemon-and-cli.md",
             "heading_path": [
@@ -158,8 +158,8 @@
         },
         {
           "id": "explicit-root-opt-in",
-          "latency_ms": 64,
-          "rank": 1,
+          "latency_ms": 39,
+          "rank": 3,
           "expected_top": {
             "file": "corpus-walker.md",
             "heading_path": [
@@ -169,19 +169,18 @@
             "line_start": 19
           },
           "actual_top": {
-            "file": "corpus-walker.md",
+            "file": "gitignore-and-explicit-roots.md",
             "heading_path": [
-              "Corpus walker",
-              "Explicit-root opt-in"
+              "Gitignore-aware walking and the explicit-root escape hatch"
             ],
-            "line_start": 19
+            "line_start": 9
           },
-          "top_chunk_pass": true,
+          "top_chunk_pass": false,
           "rerank_completed": false
         },
         {
           "id": "relative-config-path",
-          "latency_ms": 83,
+          "latency_ms": 39,
           "rank": 1,
           "expected_top": {
             "file": "config-layering.md",
@@ -206,12 +205,12 @@
         },
         {
           "id": "ort-retention-mechanism",
-          "latency_ms": 134,
+          "latency_ms": 40,
           "rank": 1,
           "expected_top": {
             "file": "ort-arena-retention.md",
             "heading_path": [
-              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "ORT BFCArena retention \u2014 why session eviction never reclaimed memory",
               "The mechanism"
             ],
             "line_start": 18
@@ -219,7 +218,7 @@
           "actual_top": {
             "file": "ort-arena-retention.md",
             "heading_path": [
-              "ORT BFCArena retention — why session eviction never reclaimed memory",
+              "ORT BFCArena retention \u2014 why session eviction never reclaimed memory",
               "The mechanism"
             ],
             "line_start": 18
@@ -229,8 +228,8 @@
         },
         {
           "id": "one-topic-chunking",
-          "latency_ms": 137,
-          "rank": 6,
+          "latency_ms": 40,
+          "rank": null,
           "expected_top": {
             "file": "wiki-conventions.md",
             "heading_path": [
@@ -250,7 +249,7 @@
         },
         {
           "id": "claim-single-owner",
-          "latency_ms": 96,
+          "latency_ms": 40,
           "rank": 1,
           "expected_top": {
             "file": "claim-provenance-marks.md",
@@ -273,13 +272,13 @@
         },
         {
           "id": "ocr-separate-engine",
-          "latency_ms": 85,
-          "rank": 2,
+          "latency_ms": 44,
+          "rank": 3,
           "expected_top": {
             "file": "pdf-ocr-ingestion.md",
             "heading_path": [
               "PDF and OCR ingestion",
-              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
+              "Scanned PDFs / OCR \u2014 a separate engine, explicitly out of scope"
             ],
             "line_start": 58
           },
@@ -289,6 +288,1372 @@
               "Office prose documents (.docx / .pptx / .odt)"
             ],
             "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "arctic-embed-default",
+          "latency_ms": 39,
+          "rank": 1,
+          "expected_top": {
+            "file": "embedding-model-selection.md",
+            "heading_path": [
+              "Embedding model selection"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "embedding-model-selection.md",
+            "heading_path": [
+              "Embedding model selection"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "precision-mismatch-incompatible",
+          "latency_ms": 42,
+          "rank": null,
+          "expected_top": {
+            "file": "embedding-model-selection.md",
+            "heading_path": [
+              "Embedding model selection",
+              "Full-precision vs quantized"
+            ],
+            "line_start": 30
+          },
+          "actual_top": {
+            "file": "office-prose-extraction.md",
+            "heading_path": [
+              "Office prose documents (.docx / .pptx / .odt)",
+              "Tabular office data is not on this page"
+            ],
+            "line_start": 54
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "model-is-not-the-product",
+          "latency_ms": 49,
+          "rank": 3,
+          "expected_top": {
+            "file": "embedding-model-selection.md",
+            "heading_path": [
+              "Embedding model selection",
+              "Why the model is not the product"
+            ],
+            "line_start": 52
+          },
+          "actual_top": {
+            "file": "crossencoder-reranking.md",
+            "heading_path": [
+              "Crossencoder reranking"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "idle-exit-supersedes-eviction",
+          "latency_ms": 66,
+          "rank": 2,
+          "expected_top": {
+            "file": "daemon-idle-exit.md",
+            "heading_path": [
+              "Daemon idle exit"
+            ],
+            "line_start": 10
+          },
+          "actual_top": {
+            "file": "ort-arena-retention.md",
+            "heading_path": [
+              "ORT BFCArena retention \u2014 why session eviction never reclaimed memory"
+            ],
+            "line_start": 10
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "clean-shutdown-inflight-writes",
+          "latency_ms": 40,
+          "rank": 10,
+          "expected_top": {
+            "file": "daemon-idle-exit.md",
+            "heading_path": [
+              "Daemon idle exit",
+              "What idle-exit does instead"
+            ],
+            "line_start": 20
+          },
+          "actual_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision",
+              "Killing a slow scan vs. returning partial results"
+            ],
+            "line_start": 21
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "cold-start-price",
+          "latency_ms": 45,
+          "rank": 1,
+          "expected_top": {
+            "file": "daemon-idle-exit.md",
+            "heading_path": [
+              "Daemon idle exit",
+              "The cold-start cost this buys"
+            ],
+            "line_start": 26
+          },
+          "actual_top": {
+            "file": "daemon-idle-exit.md",
+            "heading_path": [
+              "Daemon idle exit",
+              "The cold-start cost this buys"
+            ],
+            "line_start": 26
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "deprecated-evict-knob",
+          "latency_ms": 42,
+          "rank": 1,
+          "expected_top": {
+            "file": "daemon-idle-exit.md",
+            "heading_path": [
+              "Daemon idle exit",
+              "Deprecated config"
+            ],
+            "line_start": 32
+          },
+          "actual_top": {
+            "file": "daemon-idle-exit.md",
+            "heading_path": [
+              "Daemon idle exit",
+              "Deprecated config"
+            ],
+            "line_start": 32
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "tracing-target-namespacing",
+          "latency_ms": 46,
+          "rank": 1,
+          "expected_top": {
+            "file": "observability-and-tracing.md",
+            "heading_path": [
+              "Observability and tracing"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "observability-and-tracing.md",
+            "heading_path": [
+              "Observability and tracing"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "warn-vs-debug",
+          "latency_ms": 39,
+          "rank": 1,
+          "expected_top": {
+            "file": "observability-and-tracing.md",
+            "heading_path": [
+              "Observability and tracing",
+              "Warn versus debug"
+            ],
+            "line_start": 17
+          },
+          "actual_top": {
+            "file": "observability-and-tracing.md",
+            "heading_path": [
+              "Observability and tracing",
+              "Warn versus debug"
+            ],
+            "line_start": 17
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "where-to-look-first",
+          "latency_ms": 42,
+          "rank": 1,
+          "expected_top": {
+            "file": "observability-and-tracing.md",
+            "heading_path": [
+              "Observability and tracing",
+              "Where an operator should look first"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "observability-and-tracing.md",
+            "heading_path": [
+              "Observability and tracing",
+              "Where an operator should look first"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "incremental-skip-reembed",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "index-incremental-diff.md",
+            "heading_path": [
+              "Incremental index diffing"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "index-incremental-diff.md",
+            "heading_path": [
+              "Incremental index diffing"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "sibling-worktree-delete-guard",
+          "latency_ms": 50,
+          "rank": 1,
+          "expected_top": {
+            "file": "index-incremental-diff.md",
+            "heading_path": [
+              "Incremental index diffing",
+              "Root-scoped deletes"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "index-incremental-diff.md",
+            "heading_path": [
+              "Incremental index diffing",
+              "Root-scoped deletes"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "json-lines-framing",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "request-envelope-shape",
+          "latency_ms": 43,
+          "rank": 1,
+          "expected_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol",
+              "Request and response shape"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol",
+              "Request deadlines"
+            ],
+            "line_start": 38
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "client-gives-up",
+          "latency_ms": 39,
+          "rank": 3,
+          "expected_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol",
+              "Request deadlines"
+            ],
+            "line_start": 38
+          },
+          "actual_top": {
+            "file": "mcp-surface.md",
+            "heading_path": [
+              "MCP surface"
+            ],
+            "line_start": 1
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "cli-mcp-same-transport",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol",
+              "CLI and MCP are both just clients"
+            ],
+            "line_start": 42
+          },
+          "actual_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol",
+              "CLI and MCP are both just clients"
+            ],
+            "line_start": 42
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "frontmatter-keys",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "frontmatter-stripped-before-chunking",
+          "latency_ms": 38,
+          "rank": 1,
+          "expected_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions",
+              "Page-level, not enforced"
+            ],
+            "line_start": 17
+          },
+          "actual_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions",
+              "Page-level, not enforced"
+            ],
+            "line_start": 17
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "page-vs-claim-scope",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions",
+              "How it differs from inline per-claim marks"
+            ],
+            "line_start": 37
+          },
+          "actual_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions",
+              "How it differs from inline per-claim marks"
+            ],
+            "line_start": 37
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "repository-vs-corpus-entry",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "corpus-registration.md",
+            "heading_path": [
+              "Corpus registration: [[repository]] vs [[corpus]]"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "corpus-registration.md",
+            "heading_path": [
+              "Corpus registration: [[repository]] vs [[corpus]]"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "what-a-repository-derives",
+          "latency_ms": 39,
+          "rank": 2,
+          "expected_top": {
+            "file": "corpus-registration.md",
+            "heading_path": [
+              "Corpus registration: [[repository]] vs [[corpus]]",
+              "What a [[repository]] derives"
+            ],
+            "line_start": 19
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Implementation sketch"
+            ],
+            "line_start": 39
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "deepest-ancestor-default",
+          "latency_ms": 40,
+          "rank": 5,
+          "expected_top": {
+            "file": "corpus-registration.md",
+            "heading_path": [
+              "Corpus registration: [[repository]] vs [[corpus]]",
+              "Resolving the default corpus from cwd"
+            ],
+            "line_start": 40
+          },
+          "actual_top": {
+            "file": "observability-and-tracing.md",
+            "heading_path": [
+              "Observability and tracing",
+              "Why a degraded auxiliary pass logs rather than fails"
+            ],
+            "line_start": 21
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "ambiguous-target-rejected",
+          "latency_ms": 40,
+          "rank": 2,
+          "expected_top": {
+            "file": "corpus-registration.md",
+            "heading_path": [
+              "Corpus registration: [[repository]] vs [[corpus]]",
+              "Why an explicit corpus is required beyond one"
+            ],
+            "line_start": 50
+          },
+          "actual_top": {
+            "file": "sandbox-and-workspace-roots.md",
+            "heading_path": [
+              "Sandbox boundaries and workspace root discovery"
+            ],
+            "line_start": 10
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "error-variants",
+          "latency_ms": 39,
+          "rank": 1,
+          "expected_top": {
+            "file": "error-taxonomy.md",
+            "heading_path": [
+              "Error taxonomy"
+            ],
+            "line_start": 10
+          },
+          "actual_top": {
+            "file": "error-taxonomy.md",
+            "heading_path": [
+              "Error taxonomy"
+            ],
+            "line_start": 10
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "two-jsonrpc-codes",
+          "latency_ms": 39,
+          "rank": 1,
+          "expected_top": {
+            "file": "error-taxonomy.md",
+            "heading_path": [
+              "Error taxonomy",
+              "MCP-layer mapping"
+            ],
+            "line_start": 34
+          },
+          "actual_top": {
+            "file": "error-taxonomy.md",
+            "heading_path": [
+              "Error taxonomy",
+              "MCP-layer mapping"
+            ],
+            "line_start": 34
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "degrade-not-fail",
+          "latency_ms": 53,
+          "rank": 1,
+          "expected_top": {
+            "file": "error-taxonomy.md",
+            "heading_path": [
+              "Error taxonomy",
+              "Recoverable degradation vs. a hard error"
+            ],
+            "line_start": 46
+          },
+          "actual_top": {
+            "file": "error-taxonomy.md",
+            "heading_path": [
+              "Error taxonomy",
+              "Recoverable degradation vs. a hard error"
+            ],
+            "line_start": 46
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "supervisor-deadline",
+          "latency_ms": 42,
+          "rank": 1,
+          "expected_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "lock-held-forever",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision",
+              "Why a stalled scan must not wedge the daemon"
+            ],
+            "line_start": 17
+          },
+          "actual_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision",
+              "Why a stalled scan must not wedge the daemon"
+            ],
+            "line_start": 17
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "kill-vs-partial",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision",
+              "Killing a slow scan vs. returning partial results"
+            ],
+            "line_start": 21
+          },
+          "actual_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision",
+              "Killing a slow scan vs. returning partial results"
+            ],
+            "line_start": 21
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "two-different-deadlines",
+          "latency_ms": 48,
+          "rank": 2,
+          "expected_top": {
+            "file": "concurrency-and-supervision.md",
+            "heading_path": [
+              "Concurrency and supervision",
+              "What the deadline does not cover"
+            ],
+            "line_start": 27
+          },
+          "actual_top": {
+            "file": "socket-protocol.md",
+            "heading_path": [
+              "Socket protocol",
+              "Request deadlines"
+            ],
+            "line_start": 38
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "footnote-raw-bytes",
+          "latency_ms": 57,
+          "rank": 1,
+          "expected_top": {
+            "file": "footnote-extraction.md",
+            "heading_path": [
+              "Footnote extraction and resolution"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "footnote-extraction.md",
+            "heading_path": [
+              "Footnote extraction and resolution"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "footnote-whole-page",
+          "latency_ms": 55,
+          "rank": 1,
+          "expected_top": {
+            "file": "footnote-extraction.md",
+            "heading_path": [
+              "Footnote extraction and resolution",
+              "Why extraction happens against the whole page, not a chunk"
+            ],
+            "line_start": 20
+          },
+          "actual_top": {
+            "file": "footnote-extraction.md",
+            "heading_path": [
+              "Footnote extraction and resolution",
+              "Why extraction happens against the whole page, not a chunk"
+            ],
+            "line_start": 20
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "footnote-modes",
+          "latency_ms": 38,
+          "rank": 2,
+          "expected_top": {
+            "file": "footnote-extraction.md",
+            "heading_path": [
+              "Footnote extraction and resolution",
+              "What Only and Exclude modes are for"
+            ],
+            "line_start": 38
+          },
+          "actual_top": {
+            "file": "wiki-conventions.md",
+            "heading_path": [
+              "Wiki conventions for LLM authors",
+              "Optional frontmatter (lifecycle + provenance)"
+            ],
+            "line_start": 34
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "code-span-false-positive",
+          "latency_ms": 55,
+          "rank": 2,
+          "expected_top": {
+            "file": "footnote-extraction.md",
+            "heading_path": [
+              "Footnote extraction and resolution",
+              "Parser-based, not regex-based"
+            ],
+            "line_start": 54
+          },
+          "actual_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions",
+              "Page-level, not enforced"
+            ],
+            "line_start": 17
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "symlink-rejected",
+          "latency_ms": 48,
+          "rank": 1,
+          "expected_top": {
+            "file": "path-safety.md",
+            "heading_path": [
+              "Path safety"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "path-safety.md",
+            "heading_path": [
+              "Path safety"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "atomic-rename-write",
+          "latency_ms": 42,
+          "rank": 1,
+          "expected_top": {
+            "file": "path-safety.md",
+            "heading_path": [
+              "Path safety",
+              "Atomic replacement on write"
+            ],
+            "line_start": 17
+          },
+          "actual_top": {
+            "file": "path-safety.md",
+            "heading_path": [
+              "Path safety",
+              "Atomic replacement on write"
+            ],
+            "line_start": 17
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "traversal-escape-class",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "path-safety.md",
+            "heading_path": [
+              "Path safety",
+              "What class of escape this closes"
+            ],
+            "line_start": 25
+          },
+          "actual_top": {
+            "file": "path-safety.md",
+            "heading_path": [
+              "Path safety",
+              "What class of escape this closes"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "workspace-root-discovery",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "sandbox-and-workspace-roots.md",
+            "heading_path": [
+              "Sandbox boundaries and workspace root discovery",
+              "Discovering the workspace root from the client"
+            ],
+            "line_start": 14
+          },
+          "actual_top": {
+            "file": "sandbox-and-workspace-roots.md",
+            "heading_path": [
+              "Sandbox boundaries and workspace root discovery",
+              "Discovering the workspace root from the client"
+            ],
+            "line_start": 14
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "outside-root-refused",
+          "latency_ms": 54,
+          "rank": 2,
+          "expected_top": {
+            "file": "sandbox-and-workspace-roots.md",
+            "heading_path": [
+              "Sandbox boundaries and workspace root discovery",
+              "A path outside every configured root is refused, not indexed"
+            ],
+            "line_start": 20
+          },
+          "actual_top": {
+            "file": "index-incremental-diff.md",
+            "heading_path": [
+              "Incremental index diffing",
+              "Root-scoped deletes"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "dotdot-rejected",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "sandbox-and-workspace-roots.md",
+            "heading_path": [
+              "Sandbox boundaries and workspace root discovery",
+              "Why .. in a relative path is rejected outright"
+            ],
+            "line_start": 26
+          },
+          "actual_top": {
+            "file": "sandbox-and-workspace-roots.md",
+            "heading_path": [
+              "Sandbox boundaries and workspace root discovery",
+              "A path outside every configured root is refused, not indexed"
+            ],
+            "line_start": 20
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "ignored-tests-recipes",
+          "latency_ms": 39,
+          "rank": 1,
+          "expected_top": {
+            "file": "testing-strategy.md",
+            "heading_path": [
+              "Testing strategy: cheap gate, expensive recipes"
+            ],
+            "line_start": 12
+          },
+          "actual_top": {
+            "file": "testing-strategy.md",
+            "heading_path": [
+              "Testing strategy: cheap gate, expensive recipes",
+              "Explicit recipes, not a blanket flag"
+            ],
+            "line_start": 22
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "named-recipes-not-blanket-flag",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "testing-strategy.md",
+            "heading_path": [
+              "Testing strategy: cheap gate, expensive recipes",
+              "Explicit recipes, not a blanket flag"
+            ],
+            "line_start": 22
+          },
+          "actual_top": {
+            "file": "testing-strategy.md",
+            "heading_path": [
+              "Testing strategy: cheap gate, expensive recipes",
+              "Explicit recipes, not a blanket flag"
+            ],
+            "line_start": 22
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "test-must-be-able-to-fail",
+          "latency_ms": 48,
+          "rank": 1,
+          "expected_top": {
+            "file": "testing-strategy.md",
+            "heading_path": [
+              "Testing strategy: cheap gate, expensive recipes",
+              "The principle behind the gate"
+            ],
+            "line_start": 30
+          },
+          "actual_top": {
+            "file": "testing-strategy.md",
+            "heading_path": [
+              "Testing strategy: cheap gate, expensive recipes",
+              "The principle behind the gate"
+            ],
+            "line_start": 30
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "prebuilt-binary-npm",
+          "latency_ms": 50,
+          "rank": 1,
+          "expected_top": {
+            "file": "release-and-packaging.md",
+            "heading_path": [
+              "Release and packaging",
+              "Distributed, not built from source"
+            ],
+            "line_start": 21
+          },
+          "actual_top": {
+            "file": "release-and-packaging.md",
+            "heading_path": [
+              "Release and packaging",
+              "Distributed, not built from source"
+            ],
+            "line_start": 21
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "nightly-channel",
+          "latency_ms": 40,
+          "rank": 3,
+          "expected_top": {
+            "file": "release-and-packaging.md",
+            "heading_path": [
+              "Release and packaging",
+              "Two npm packages: stable and nightly"
+            ],
+            "line_start": 27
+          },
+          "actual_top": {
+            "file": "corpus-walker.md",
+            "heading_path": [
+              "Corpus walker",
+              "Implementation sketch"
+            ],
+            "line_start": 60
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "pre-1-0-no-guarantee",
+          "latency_ms": 39,
+          "rank": 1,
+          "expected_top": {
+            "file": "release-and-packaging.md",
+            "heading_path": [
+              "Release and packaging",
+              "What a release does not promise before 1.0"
+            ],
+            "line_start": 31
+          },
+          "actual_top": {
+            "file": "release-and-packaging.md",
+            "heading_path": [
+              "Release and packaging",
+              "What a release does not promise before 1.0"
+            ],
+            "line_start": 31
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "gitignored-root-optin",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "gitignore-and-explicit-roots.md",
+            "heading_path": [
+              "Gitignore-aware walking and the explicit-root escape hatch"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "gitignore-and-explicit-roots.md",
+            "heading_path": [
+              "Gitignore-aware walking and the explicit-root escape hatch"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "notes-folder-surprise",
+          "latency_ms": 57,
+          "rank": 1,
+          "expected_top": {
+            "file": "gitignore-and-explicit-roots.md",
+            "heading_path": [
+              "Gitignore-aware walking and the explicit-root escape hatch",
+              "The surprise this default would otherwise cause"
+            ],
+            "line_start": 17
+          },
+          "actual_top": {
+            "file": "gitignore-and-explicit-roots.md",
+            "heading_path": [
+              "Gitignore-aware walking and the explicit-root escape hatch",
+              "The surprise this default would otherwise cause"
+            ],
+            "line_start": 17
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "ignore-failure-safe-default",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "gitignore-and-explicit-roots.md",
+            "heading_path": [
+              "Gitignore-aware walking and the explicit-root escape hatch",
+              "Failure modes default to honouring gitignore"
+            ],
+            "line_start": 27
+          },
+          "actual_top": {
+            "file": "gitignore-and-explicit-roots.md",
+            "heading_path": [
+              "Gitignore-aware walking and the explicit-root escape hatch"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "schema-rebuild-old-store",
+          "latency_ms": 38,
+          "rank": 1,
+          "expected_top": {
+            "file": "lance-schema-versioning.md",
+            "heading_path": [
+              "Lance schema versioning"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "lance-schema-versioning.md",
+            "heading_path": [
+              "Lance schema versioning",
+              "Why newer is fatal, not a downgrade"
+            ],
+            "line_start": 32
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "newer-store-fatal",
+          "latency_ms": 50,
+          "rank": 1,
+          "expected_top": {
+            "file": "lance-schema-versioning.md",
+            "heading_path": [
+              "Lance schema versioning",
+              "Why newer is fatal, not a downgrade"
+            ],
+            "line_start": 32
+          },
+          "actual_top": {
+            "file": "lance-schema-versioning.md",
+            "heading_path": [
+              "Lance schema versioning",
+              "Why newer is fatal, not a downgrade"
+            ],
+            "line_start": 32
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "rebuild-cost-in-practice",
+          "latency_ms": 45,
+          "rank": 2,
+          "expected_top": {
+            "file": "lance-schema-versioning.md",
+            "heading_path": [
+              "Lance schema versioning",
+              "Cost in practice"
+            ],
+            "line_start": 55
+          },
+          "actual_top": {
+            "file": "chunk-budget-and-tokenizer.md",
+            "heading_path": [
+              "Chunk budget and tokenizer"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "token-budget-choice",
+          "latency_ms": 60,
+          "rank": 1,
+          "expected_top": {
+            "file": "chunk-budget-and-tokenizer.md",
+            "heading_path": [
+              "Chunk budget and tokenizer"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "chunk-budget-and-tokenizer.md",
+            "heading_path": [
+              "Chunk budget and tokenizer"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "heading-path-identity",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "chunk-budget-and-tokenizer.md",
+            "heading_path": [
+              "Chunk budget and tokenizer",
+              "Heading paths as chunk identity"
+            ],
+            "line_start": 31
+          },
+          "actual_top": {
+            "file": "chunk-budget-and-tokenizer.md",
+            "heading_path": [
+              "Chunk budget and tokenizer",
+              "Heading paths as chunk identity"
+            ],
+            "line_start": 31
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "split-at-boundaries-first",
+          "latency_ms": 41,
+          "rank": 1,
+          "expected_top": {
+            "file": "chunk-budget-and-tokenizer.md",
+            "heading_path": [
+              "Chunk budget and tokenizer",
+              "What happens at the boundary"
+            ],
+            "line_start": 57
+          },
+          "actual_top": {
+            "file": "chunk-budget-and-tokenizer.md",
+            "heading_path": [
+              "Chunk budget and tokenizer",
+              "What happens at the boundary"
+            ],
+            "line_start": 57
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "rerank-off-by-default",
+          "latency_ms": 40,
+          "rank": 1,
+          "expected_top": {
+            "file": "crossencoder-reranking.md",
+            "heading_path": [
+              "Crossencoder reranking"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "crossencoder-reranking.md",
+            "heading_path": [
+              "Crossencoder reranking"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "rerank-timeout-fallback",
+          "latency_ms": 42,
+          "rank": 1,
+          "expected_top": {
+            "file": "crossencoder-reranking.md",
+            "heading_path": [
+              "Crossencoder reranking",
+              "The 2000ms budget and fallback"
+            ],
+            "line_start": 41
+          },
+          "actual_top": {
+            "file": "crossencoder-reranking.md",
+            "heading_path": [
+              "Crossencoder reranking",
+              "The 2000ms budget and fallback"
+            ],
+            "line_start": 41
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "supported-rerank-models",
+          "latency_ms": 39,
+          "rank": 1,
+          "expected_top": {
+            "file": "crossencoder-reranking.md",
+            "heading_path": [
+              "Crossencoder reranking",
+              "Supported models"
+            ],
+            "line_start": 53
+          },
+          "actual_top": {
+            "file": "crossencoder-reranking.md",
+            "heading_path": [
+              "Crossencoder reranking",
+              "Supported models"
+            ],
+            "line_start": 53
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "wikilink-not-markdown",
+          "latency_ms": 48,
+          "rank": 1,
+          "expected_top": {
+            "file": "backlinks-and-wikilinks.md",
+            "heading_path": [
+              "Backlinks and [[wikilink]] maintenance"
+            ],
+            "line_start": 9
+          },
+          "actual_top": {
+            "file": "backlinks-and-wikilinks.md",
+            "heading_path": [
+              "Backlinks and [[wikilink]] maintenance"
+            ],
+            "line_start": 9
+          },
+          "top_chunk_pass": true,
+          "rerank_completed": false
+        },
+        {
+          "id": "index-refresh-on-write",
+          "latency_ms": 62,
+          "rank": 4,
+          "expected_top": {
+            "file": "backlinks-and-wikilinks.md",
+            "heading_path": [
+              "Backlinks and [[wikilink]] maintenance",
+              "Why ancestor index.md files refresh on every write"
+            ],
+            "line_start": 30
+          },
+          "actual_top": {
+            "file": "worktree-corpus-identity.md",
+            "heading_path": [
+              "Worktree corpus identity",
+              "Remaining search defect"
+            ],
+            "line_start": 25
+          },
+          "top_chunk_pass": false,
+          "rerank_completed": false
+        },
+        {
+          "id": "backlinks-vs-semantic",
+          "latency_ms": 60,
+          "rank": 4,
+          "expected_top": {
+            "file": "backlinks-and-wikilinks.md",
+            "heading_path": [
+              "Backlinks and [[wikilink]] maintenance",
+              "What backlinks are for"
+            ],
+            "line_start": 47
+          },
+          "actual_top": {
+            "file": "frontmatter-conventions.md",
+            "heading_path": [
+              "Frontmatter conventions",
+              "How it differs from inline per-claim marks"
+            ],
+            "line_start": 37
           },
           "top_chunk_pass": false,
           "rerank_completed": false
