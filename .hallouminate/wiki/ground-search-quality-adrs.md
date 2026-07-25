@@ -12,7 +12,7 @@ sources:
 ---
 # Ground search quality ADRs
 
-These five decisions define the proposed issue #288 design; none records shipped behavior yet.[^spec]
+These five decisions define the proposed issue #288 design; PR #290 implements the retrieval/display and evaluation portions while retaining proposed status for future ranking policy.[^spec]
 
 ## ADR-001 — Index search_text, display text
 
@@ -74,6 +74,8 @@ Rejected: raw-body indexing loses document context; LLM context changes product 
 
 Consequences: all signals gain stable context without credentials; [ground-search-evaluation](ground-search-evaluation.md) must detect any new summary-density bias.
 
+Implementation note: the diagnostic keeps rerank completion separate from z-score presence because small or zero-spread pools validly omit z-scores. Ground exposes existing `rerank-timeout` and `crossencoder-unavailable` warnings so the evaluator rejects production fallbacks, and artifact writes use temporary-file-plus-rename so a hard-linked output cannot alter the committed baseline.[^implementation]
+
 ## Shared constraints
 
 - Display text is the evidence/rendering authority; search_text and Lance rows are derived.
@@ -90,5 +92,6 @@ Consequences: all signals gain stable context without credentials; [ground-searc
 [^worktree]: [worktree-corpus-identity](worktree-corpus-identity.md); [issue #215](https://github.com/paulnsorensen/hallouminate/issues/215).
 [^filesystem]: [design-rationale](design-rationale.md), “Filesystem is the source of truth; LanceDB is derived.”
 [^eval]: eval/README.md:75-85; [ground-search-evaluation](ground-search-evaluation.md).
+[^implementation]: crates/hallouminate/tests/eval_ground_recall.rs:582-646,1124-1147; crates/hallouminate-domain/src/ground/orchestrate.rs:155-174; crates/hallouminate-daemon/src/dispatch.rs:385-417.
 
 _Source: issue #288 plus research comments 1–4 and Anthropic's Introducing Contextual Retrieval · Updated: 2026-07-24 · Supersedes: —_
