@@ -57,4 +57,4 @@ pub use summary::extract_summary;
 pub use validate::{
     SlugResolution, find_wikilinks, lint_markdown, lint_wikilinks, normalize_slug, resolve_slug,
 };
-pub use walker::{missing_roots, scan};
+pub use walker::{ScannedFile, missing_roots, scan};

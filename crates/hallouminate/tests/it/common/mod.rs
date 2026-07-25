@@ -17,7 +17,7 @@ pub mod daemon;
 pub static LANCE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
-use hallouminate_domain::common::Result;
+use hallouminate_domain::common::{CorpusKey, Result};
 use hallouminate_domain::indexer::{PreparedChunk, PreparedFile};
 
 pub struct StubEmbedder;
@@ -65,7 +65,7 @@ impl EmbedBatch for ZeroEmbedder {
 /// Build a `PreparedFile` with N chunks, each carrying the given body text.
 pub fn prepared_file_with_chunks(
     file_ref: &str,
-    corpus: &str,
+    corpus_key: &CorpusKey,
     mtime_ms: i64,
     content_hash: &str,
     chunk_texts: Vec<&str>,
@@ -79,12 +79,13 @@ pub fn prepared_file_with_chunks(
             line_start: i + 1,
             line_end: i + 1,
             text: t.to_string(),
+            search_text: t.to_string(),
             claim_marks: None,
         })
         .collect();
     PreparedFile {
         file_ref: file_ref.to_string(),
-        corpus: corpus.to_string(),
+        corpus_key: corpus_key.clone(),
         mtime_ms,
         content_hash: content_hash.to_string(),
         summary: format!("summary of {file_ref}"),
@@ -97,7 +98,11 @@ pub fn prepared_file_with_chunks(
 
 /// Build a `PreparedFile` whose chunks are placeholder lorem text. Useful when
 /// the test only cares about chunk count, not search behavior.
-pub fn placeholder_prepared_file(file_ref: &str, n_chunks: usize) -> PreparedFile {
+pub fn placeholder_prepared_file(
+    file_ref: &str,
+    corpus_key: &CorpusKey,
+    n_chunks: usize,
+) -> PreparedFile {
     let texts: Vec<&str> = (0..n_chunks)
         .map(|i| match i % 4 {
             0 => "alpha bravo charlie",
@@ -106,5 +111,5 @@ pub fn placeholder_prepared_file(file_ref: &str, n_chunks: usize) -> PreparedFil
             _ => "juliet kilo lima",
         })
         .collect();
-    prepared_file_with_chunks(file_ref, "docs", 100, "deadbeef", texts)
+    prepared_file_with_chunks(file_ref, corpus_key, 100, "deadbeef", texts)
 }

@@ -1,85 +1,72 @@
-# Ground retrieval eval (#150)
+# Ground retrieval evaluation (#288)
 
-A fixed, small-scale eval harness for `hallouminate ground`'s retrieval
-quality, used to gate #149's z-score threshold decision.
+This model-backed integration target measures the production Ground path without
+changing the runtime crossencoder default.
 
-## Corpus: `fixtures/wiki/`
+## Corpus and queries
 
-A frozen snapshot of this repo's own `.hallouminate/wiki/` at commit
-`3d466ca` (16 pages, ~9.6k words). Frozen rather than pointed at the live
-wiki so the eval is reproducible — the live wiki keeps changing as new pages
-land, which would silently shift recall/MRR between runs for reasons
-unrelated to the retrieval code under test. Copied verbatim (`cp -R`), never
-hand-edited.
+`fixtures/wiki/` is a deliberate frozen corpus. Issue #288 refreshes only the
+files needed by the new cases: live `architecture.md` (including the citation
+definitions after `## Testing`) and `worktree-corpus-identity.md`. Do not copy
+`ground-search-evaluation.md`: it contains the literal eval query and would be a
+meta-distractor rather than user knowledge.
 
-To refresh the snapshot after a deliberate wiki restructure:
+`queries.json` labels every query with one exact expected chunk:
+`{file, heading_path, line_start}`. Before any model-backed arm starts, the
+engine prepares the frozen Markdown through the production handler and production
+tokenizer and rejects any label that is not an actual prepared chunk. The set
+includes footnote inversion, worktree isolation, paraphrase, and
+lexical-distractor cases. Every measured arm records the expected and actual top
+identity plus pass/fail.
 
+## Production evaluation arms
+
+The production embedding configuration comes from `EmbeddingsConfig::default()`:
+full-precision Snowflake Arctic-S embeddings and the production cache directory.
+No evaluation arm changes the runtime default crossencoder.
+
+`just eval` runs exactly one arm:
+
+- `fusion-without-rerank`
+
+It compares Recall@5, MRR, and committed top-chunk assertions with
+`eval/baseline.json`. A regression fails the scheduled evaluation.
+
+`just eval-measure` runs exactly two otherwise-identical arms:
+
+1. `fusion-without-rerank`;
+2. `fusion-with-jina-reranker-v1-turbo-en`.
+
+The Jina arm is a diagnostic comparison only. It is not qualified, selected, or
+written into runtime configuration.
+
+## Diagnostic artifact
+
+`just eval-measure` writes
+`.context/issue-288-eval-results.json`. The artifact contains:
+
+- production embedding configuration and requested arm descriptors;
+- Recall@5 and MRR for each arm;
+- cold model-load time plus warm p50 and p95 latency;
+- every query's rank, top chunk, latency, and reranker signal;
+- per-query rank and top-chunk changes between the baseline and Jina arms;
+- improved, unchanged, and regressed counts;
+- timeout, model-load-failure, and other error diagnostics.
+
+Both arms must complete for a successful measurement. A timeout or model-load
+failure is recorded in a structurally valid partial artifact before the command
+returns nonzero. The measurement never falls back silently and never declares a
+winner. It cannot overwrite `eval/baseline.json`.
+
+## Commands
+
+```sh
+just eval-measure
+just eval
 ```
-rm -rf eval/fixtures/wiki && cp -R .hallouminate/wiki eval/fixtures/wiki
-```
 
-and update this file's pinned commit hash + `eval/queries.json` if page
-names or content moved.
-
-## Query set: `queries.json`
-
-26 labelled queries, `{id, query, expected: [filename]}`. Two queries per
-richer page (9 pages), aimed at distinct sections/paragraphs of that page so
-a single query can't get lucky on page-level keyword density; one query per
-shorter page or log-style page (7 pages: `index.md`, `log.md`, and similar).
-Queries are short natural-language phrases lifted from the page's own
-terminology (e.g. "claim mark HTML comment syntax confirmed superseded
-contradicted" for `claim-provenance-marks.md`) — this makes them easy for
-lexical/BM25 search by construction. See **Caveat** below.
-
-`expected` is a list (usually length 1) of filenames under `fixtures/wiki/`;
-a hit is scored the moment any ranked result's absolute path ends with one
-of the expected filenames.
-
-## Running it
-
-```
-cargo test --test eval_ground_recall -- --ignored --nocapture
-```
-
-`#[ignore]`d like `tests/cli_ground.rs`'s model-dependent test: needs network
-for the crossencoder model download (~147MB, first run only) and takes
-several minutes (four full daemon-index-query cycles).
-
-## Metrics
-
-For each of 4 configs (lexical-only, fusion-only, lexical+rerank,
-fusion+rerank) and each query: rank of the first result whose path matches
-`expected` (1-indexed, `None` if absent after the top-10 file cap, drawn
-from a 50-chunk candidate pool).
-
-- **Recall@5** — fraction of queries where that rank is `<= 5`.
-- **MRR** — mean of `1/rank` (`0` when absent).
-
-The fusion+rerank run additionally sweeps z-score thresholds
-`[-2, -1, -0.5, 0, 0.5, 1, 2]` against the top-1 result's `z_score`, showing
-how many queries a given cutoff would keep vs. drop, and how many of those
-kept are actually correct at rank 1 — this is the #149 calibration input.
-
-## Embedding model substitution
-
-The config's default embedding model (`snowflake/snowflake-arctic-embed-s`) has no
-cached ONNX weight blob in `~/.cache/hallouminate/fastembed` on this
-machine (only tokenizer/config files) — using it would trigger a second
-model download. The eval pins `BAAI/bge-small-en-v1.5` (quantized) instead,
-which is already fully cached. This means the eval does not measure the
-config-default embedding model; treat the fusion-variant numbers as
-representative of "a small bge-family embedding model", not the shipped
-default specifically.
-
-## Caveat: this query set does not discriminate between configs
-
-All 4 configs scored Recall@5 = 1.000 on this query set (MRR 0.981-1.000,
-see `.cheese/research/ground-retrieval-eval/findings.md`). The queries were
-constructed by lifting distinctive terminology directly from each target
-page, which makes them easy hits for lexical/BM25 search alone — the
-fusion and rerank variants have no low-recall queries left to improve on.
-A query set built this way over a 16-page corpus cannot show whether
-embeddings or reranking earn their cost; a harder eval (paraphrased queries,
-no shared vocabulary with the target page, or a much larger corpus with more
-lexical distractors) would be needed to answer that question.
+Both entry points are ignored tests because first use downloads production
+embedding and reranker artifacts and the full query sweep is expensive. Ordinary
+tests validate the production arm definitions, query labels, percentile helpers,
+diagnostic schema, failure persistence policy, baseline comparison, artifact
+isolation, and authoring guidance without loading models.

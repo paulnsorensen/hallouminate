@@ -1,3 +1,4 @@
+use crate::common::CorpusKey;
 use crate::corpus::ClaimMark;
 
 // TEMPORARY (Stage 2b bridge, removed in Stage 2c when PreparedFile.embeddings
@@ -12,6 +13,9 @@ pub struct PreparedChunk {
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
+    /// Deterministic retrieval text: heading breadcrumb, file summary, then
+    /// display body with footnote markers and definition blocks removed.
+    pub search_text: String,
     /// Canonical JSON of the claim marks anchored within this chunk's line
     /// range, or `None` when the chunk has no marks. Per-chunk (positional),
     /// unlike the page-level `frontmatter` denormalized identically onto every
@@ -26,7 +30,7 @@ pub struct PreparedChunk {
 #[derive(Debug, Clone)]
 pub struct PreparedFile {
     pub file_ref: String,
-    pub corpus: String,
+    pub corpus_key: CorpusKey,
     pub mtime_ms: i64,
     pub content_hash: String,
     pub summary: String,
@@ -46,11 +50,14 @@ pub struct PreparedFile {
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub chunk_id: String,
+    pub corpus_key: CorpusKey,
     pub file_ref: String,
     pub heading_path: Vec<String>,
     pub line_start: usize,
     pub line_end: usize,
     pub text: String,
+    /// Deterministic retrieval text used by every ranking stage.
+    pub search_text: String,
     pub summary: String,
     pub keywords: Vec<String>,
     pub score: f32,

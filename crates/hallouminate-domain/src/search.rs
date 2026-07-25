@@ -12,7 +12,7 @@ pub mod ripgrep;
 
 use std::collections::HashMap;
 
-use crate::common::Result;
+use crate::common::{CorpusKey, Result};
 use crate::indexer::{ChunkStore, SearchHit};
 
 pub use crossencoder::Noop as NoopCrossencoder;
@@ -33,19 +33,20 @@ const RRF_K: f32 = 60.0;
 
 pub async fn search_with_ripgrep(
     store: &dyn ChunkStore,
-    corpus: &str,
-    corpus_paths: &[String],
+    corpus_key: &CorpusKey,
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    let search_fut = store.hybrid_search(corpus, query, limit);
-    let rg_fut = ripgrep::run(corpus_paths, query, limit);
+    let root = corpus_key.canonical_root.to_string_lossy().into_owned();
+    let roots = [root];
+    let search_fut = store.hybrid_search(corpus_key, query, limit);
+    let rg_fut = ripgrep::run(&roots, query, limit);
     let (search_res, rg_res) = tokio::join!(search_fut, rg_fut);
     let mut hits = search_res?;
     let rg_hits = match rg_res {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(target: "hallouminate::search", err = %e, "ripgrep pass failed; returning search-only results");
+        Ok(hits) => hits,
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; returning search-only results");
             Vec::new()
         }
     };
@@ -86,11 +87,13 @@ mod tests {
     fn hit(file_ref: &str, chunk_ord: usize, score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#{chunk_ord}"),
+            corpus_key: CorpusKey::from_configured_root("docs", "/"),
             file_ref: file_ref.into(),
             heading_path: vec![],
             line_start: 1,
             line_end: 2,
             text: String::new(),
+            search_text: String::new(),
             summary: String::new(),
             keywords: vec![],
             score,

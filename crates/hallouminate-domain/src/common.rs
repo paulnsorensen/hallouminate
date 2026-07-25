@@ -39,6 +39,36 @@ impl From<PathBuf> for FileRef {
         Self(path)
     }
 }
+
+/// Identifies one configured corpus root after filesystem canonicalization.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CorpusKey {
+    /// Configured corpus name.
+    pub name: String,
+    /// Canonical filesystem root owned by this corpus identity.
+    pub canonical_root: PathBuf,
+}
+
+impl CorpusKey {
+    /// Creates an identity from a configured corpus name and root.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hallouminate_domain::common::CorpusKey;
+    ///
+    /// let key = CorpusKey::from_configured_root("docs", "/tmp");
+    /// assert_eq!(key.name, "docs");
+    /// ```
+    pub fn from_configured_root(name: impl Into<String>, configured_root: &str) -> Self {
+        let root = expand_tilde(configured_root);
+        let canonical_root = canonicalize_or_passthrough(&root).into_path_buf();
+        Self {
+            name: name.into(),
+            canonical_root,
+        }
+    }
+}
 /// A file's modification time, in milliseconds since the Unix epoch.
 ///
 /// Used to detect whether an on-disk file has changed since it was last
@@ -59,6 +89,47 @@ pub struct CorpusConfig {
     /// marker only — config validation rejects more than one such corpus.
     #[serde(default)]
     pub global: bool,
+}
+
+impl CorpusConfig {
+    /// Returns the distinct root-aware identities in configured order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use hallouminate_domain::common::CorpusConfig;
+    ///
+    /// let config = CorpusConfig {
+    ///     name: "docs".into(),
+    ///     paths: vec!["/tmp/docs".into(), "/tmp/docs".into()],
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(config.corpus_keys().len(), 1);
+    /// ```
+    pub fn corpus_keys(&self) -> Vec<CorpusKey> {
+        let mut keys = Vec::new();
+        for path in &self.paths {
+            let key = CorpusKey::from_configured_root(&self.name, path);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// Returns the first configured root identity.
+    pub fn primary_corpus_key(&self) -> Option<CorpusKey> {
+        self.corpus_keys().into_iter().next()
+    }
+
+    /// Returns the most specific configured root that owns `path`.
+    pub fn corpus_key_for_path(&self, path: &Path) -> Option<CorpusKey> {
+        let path = canonicalize_or_passthrough(path);
+        self.corpus_keys()
+            .into_iter()
+            .filter(|key| path.as_path().starts_with(&key.canonical_root))
+            .max_by_key(|key| key.canonical_root.components().count())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

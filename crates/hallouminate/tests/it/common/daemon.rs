@@ -55,9 +55,14 @@ impl DaemonHarness {
         let (tx, rx) = oneshot::channel();
         let socket_clone = socket.clone();
         let handle = tokio::spawn(async move {
+            let server = serve_with_idle_timeout(&state, &socket_clone, idle_timeout);
+            tokio::pin!(server);
             tokio::select! {
-                res = serve_with_idle_timeout(&state, &socket_clone, idle_timeout) => res,
-                _ = rx => Ok(()),
+                res = &mut server => res,
+                _ = rx => {
+                    state.shutdown_token().cancel();
+                    server.await
+                },
             }
         });
         // Wait for a successful Ping round-trip, not just socket-path
@@ -90,6 +95,30 @@ impl DaemonHarness {
             handle: Some(handle),
             shutdown: Some(tx),
         }
+    }
+
+    /// Stops the daemon and waits for its task to release owned resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when shutdown exceeds five seconds, the task panics,
+    /// or serving fails.
+    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        if let Some(tx) = self.shutdown.take() {
+            let _ = tx.send(());
+        }
+        let Some(mut handle) = self.handle.take() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(Duration::from_secs(5), &mut handle).await {
+            Ok(result) => result??,
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                anyhow::bail!("daemon harness shutdown timed out after five seconds");
+            }
+        }
+        Ok(())
     }
 
     pub fn socket(&self) -> &Path {

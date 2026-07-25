@@ -1,16 +1,43 @@
 use std::collections::HashMap;
 
-use crate::common::{FileRef, Mtime};
-use crate::corpus::blake3_file;
+use crate::common::{CorpusKey, FileRef, Mtime};
+use crate::corpus::{ScannedFile, blake3_file};
+
+/// Converts disk observations into the planner's root-aware input shape.
+///
+/// Bulk scans carry a [`CorpusKey`]. Tuple inputs remain supported for focused
+/// single-file planning until those callers resolve their root explicitly.
+pub trait IntoPlanInput {
+    /// Splits one observation into file, mtime, and optional corpus identity.
+    fn into_plan_parts(self) -> (FileRef, Mtime, Option<CorpusKey>);
+}
+
+impl IntoPlanInput for ScannedFile {
+    fn into_plan_parts(self) -> (FileRef, Mtime, Option<CorpusKey>) {
+        let ScannedFile {
+            corpus_key,
+            file,
+            mtime,
+        } = self;
+        (file, mtime, Some(corpus_key))
+    }
+}
+
+impl IntoPlanInput for (FileRef, Mtime) {
+    fn into_plan_parts(self) -> (FileRef, Mtime, Option<CorpusKey>) {
+        let (file, mtime) = self;
+        (file, mtime, None)
+    }
+}
 
 /// Storage-agnostic view of a previously-indexed file. Built from the
 /// denormalized columns of the chunks table by `LanceStore::list_files`.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSnapshot {
     /// Stored path key of the file, as written to the chunks table.
     pub file_ref: String,
-    /// Corpus the file belongs to.
-    pub corpus: String,
+    /// Root-aware identity the file belongs to.
+    pub corpus_key: CorpusKey,
     /// Last-modified time recorded at the previous index, in epoch millis.
     pub mtime_ms: i64,
     /// blake3 hex digest of the file's content at the previous index.
@@ -41,6 +68,9 @@ pub struct Upsert {
     pub file: FileRef,
     /// Current mtime to record for the file.
     pub mtime: Mtime,
+    /// Canonical root identity assigned by a bulk scan. Tuple-based focused
+    /// planning leaves this absent until its caller resolves the owning root.
+    pub corpus_key: Option<CorpusKey>,
 }
 
 /// A file whose mtime moved since the last index. Carries the prior `snap` so
@@ -61,41 +91,45 @@ pub struct MtimeCandidate {
     pub known_hash: Option<String>,
 }
 
-pub fn plan(disk: Vec<(FileRef, Mtime)>, mut db: HashMap<FileRef, FileSnapshot>) -> IndexPlan {
-    // Dedup by FileRef: overlapping CorpusConfig.paths can yield the same file
-    // twice. Last occurrence wins (preserves the most recent mtime observation).
-    let disk: HashMap<FileRef, Mtime> = disk.into_iter().collect();
+pub fn plan<T: IntoPlanInput>(disk: Vec<T>, mut db: HashMap<FileRef, FileSnapshot>) -> IndexPlan {
+    let mut disk_by_file: HashMap<FileRef, (Mtime, Option<CorpusKey>)> = HashMap::new();
+    for input in disk {
+        let (file, mtime, corpus_key) = input.into_plan_parts();
+        disk_by_file.insert(file, (mtime, corpus_key));
+    }
     let mut out = IndexPlan::default();
-    for (file, mtime) in disk {
+    for (file, (mtime, corpus_key)) in disk_by_file {
         match db.remove(&file) {
-            None => out.upserts.push(Upsert { file, mtime }),
-            Some(snap) if snap.mtime_ms == mtime.0 => {
-                // Millisecond mtime resolution can hide a real content change
-                // (same-mtime edit, clock skew): verify with a content hash
-                // before declaring the file unchanged, mirroring the
-                // single-file reroute's hash check in dispatch.rs. A hash
-                // read failure means the file is transiently unreadable —
-                // log and keep the existing snapshot (pre-hash-verify
-                // behavior), rather than routing to apply() where its own
-                // re-hash would abort the whole corpus index.
-                match blake3_file(file.as_path()) {
-                    Ok(hash) if hash == snap.content_hash => continue,
-                    Ok(hash) => out.mtime_touches.push(MtimeCandidate {
-                        file,
-                        snap,
-                        new_mtime: mtime,
-                        known_hash: Some(hash),
-                    }),
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "hallouminate::indexer",
-                            file = %file.as_path().display(),
-                            error = %e,
-                            "skipping hash verification: file unreadable, keeping existing snapshot"
-                        );
-                    }
+            None => out.upserts.push(Upsert {
+                file,
+                mtime,
+                corpus_key,
+            }),
+            // Millisecond mtime resolution can hide a real content change
+            // (same-mtime edit, clock skew): verify with a content hash
+            // before declaring the file unchanged, mirroring the
+            // single-file reroute's hash check in dispatch.rs. A hash
+            // read failure means the file is transiently unreadable —
+            // log and keep the existing snapshot (pre-hash-verify
+            // behavior), rather than routing to apply() where its own
+            // re-hash would abort the whole corpus index.
+            Some(snap) if snap.mtime_ms == mtime.0 => match blake3_file(file.as_path()) {
+                Ok(hash) if hash == snap.content_hash => continue,
+                Ok(hash) => out.mtime_touches.push(MtimeCandidate {
+                    file,
+                    snap,
+                    new_mtime: mtime,
+                    known_hash: Some(hash),
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "hallouminate::indexer",
+                        file = %file.as_path().display(),
+                        error = %error,
+                        "skipping hash verification: file unreadable, keeping existing snapshot"
+                    );
                 }
-            }
+            },
             Some(snap) => out.mtime_touches.push(MtimeCandidate {
                 file,
                 snap,
@@ -123,7 +157,7 @@ mod tests {
     fn snap(file_ref: &str, mtime_ms: i64, hash: &str) -> FileSnapshot {
         FileSnapshot {
             file_ref: file_ref.to_string(),
-            corpus: "docs".to_string(),
+            corpus_key: CorpusKey::from_configured_root("docs", "/tmp"),
             mtime_ms,
             content_hash: hash.to_string(),
         }
@@ -148,6 +182,24 @@ mod tests {
         assert_eq!(p.upserts[0].mtime, Mtime(42));
         assert!(p.mtime_touches.is_empty());
         assert!(p.deletes.is_empty());
+    }
+
+    #[test]
+    fn plan_preserves_scanned_file_corpus_key() {
+        let corpus_key = CorpusKey {
+            name: "docs".into(),
+            canonical_root: PathBuf::from("/tmp/docs"),
+        };
+        let disk = vec![ScannedFile {
+            corpus_key: corpus_key.clone(),
+            file: fref("/tmp/docs/new.md"),
+            mtime: Mtime(42),
+        }];
+
+        let planned = plan(disk, HashMap::new());
+
+        assert_eq!(planned.upserts.len(), 1);
+        assert_eq!(planned.upserts[0].corpus_key, Some(corpus_key));
     }
 
     #[test]

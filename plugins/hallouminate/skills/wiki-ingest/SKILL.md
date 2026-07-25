@@ -33,6 +33,39 @@ unvetted one.
   H1 first line, kebab slug).
 - Pick the corpus (`repo:{name}:wiki` or ask).
 
+### Source pages and frozen retrieval probes
+
+When an atomic claim comes from durable external research, create or reuse one corpus-local
+`sources/<slug>.md` page. Before creating it, search the corpus for both the canonical URL and
+exact source title, then read likely matches; either match reuses the canonical page instead of
+creating a duplicate. The source page keeps this indexed retrieval spine in normal body text,
+with source-appropriate evidence sections after it:
+
+```markdown
+# <Exact source title>
+
+<Publisher/author>'s <source type>, published or last verified <date>,
+supports <one-sentence contribution>.
+Canonical source: [<exact title>](<URL>)
+
+## <Source-appropriate heading>
+<Supported claims, project relevance, and limitations>
+
+_Source: <canonical URL> · Updated: <date>_
+```
+
+The exact title, publisher or author, source type, date, contribution, and canonical URL must all
+be indexed body text. Frontmatter and footnotes may repeat them but cannot be their only location.
+Every dependent topic page must also name the source and relevant claim in indexed prose and link
+the corpus-local source page.
+
+During claim decomposition, before any drafting, freeze the retrieval probes for every page that
+may change: the exact topic identity; two to four natural questions derived from the atomic claim
+and source; the exact external-source title for a source page; and the source's central claim for
+the dependent topic page. Record the exact query strings, expected corpus-relative page, and
+required rank. Drafting and the repair pass must use these unchanged probes; do not generate them
+from the finished prose.
+
 ## Phase 2 — Locate (haiku, parallel)
 
 Spawn one haiku sub-agent per atomic claim, **in a single message**, each with this
@@ -140,6 +173,7 @@ Apply each decision through the safe update loop:
 - **New page:** draft one-topic entry (H1 first line, kebab slug, lead-first,
   ~50–150 lines, code cited as `path:line`, shaped on the pack's
   `../../templates/wiki-entry.md`) → `add_markdown { overwrite: false }`.
+- **Chunk context:** Every H2/H3 section must open self-contained: give enough subject and purpose for the section to remain clear when retrieved without surrounding sections. Name the domain concept in the opening sentence; do not make a heading, pronoun, or parent page carry all context. Breadcrumbs and file summaries may supplement this authored context, but do not generate index-time or per-chunk LLM context; issue #284 remains deferred.
 - **Local links:** if merged or new content links a local file outside the corpus
   (absolute path, `~`, or a relative path escaping the corpus root — the ingest
   source itself is the common case), copy that file into the corpus first
@@ -150,12 +184,27 @@ Apply each decision through the safe update loop:
   `_Source: <where this came from> · Updated: <date> · Supersedes: <if any>_`
   Freshness is a first-class signal — stale pages produce confident-wrong answers.
 
+Before journaling, verify the complete topic-and-source write set with the frozen probes:
+
+1. After every `add_markdown` write has reindexed, run every unchanged probe with `ground`.
+   Exact topic-identity and source-title probes require the intended page at rank 1. Natural
+   questions and central-claim probes require it within the top 3.
+2. If any probe fails, revise only the H1, lead, headings, or section opening once. Do not add
+   keyword lists. Rerun the identical frozen probes after that single bounded revision.
+3. If an exact probe still fails, restore every overwritten page from its preimage, delete every
+   new page from the write set, return `blocked`, and do not append a journal row for the rolled-back
+   writes.
+4. If only natural or central-claim probes still fail, preserve the valid pages and return
+   `written-with-retrieval-warning`. Report each failed query, expected page, observed top three,
+   and actual rank (including absent). Journal the final warning disposition only after reporting
+   data is complete.
+
 Then **journal the decision** in `log.md` (append-only, never rewritten):
 
 > `add_markdown { corpus, path: "log.md", under_heading: "Log", position: "append", content: <row> }`
 
 where `<row>` is one log row `<date> · <source-hash> · <action> · <target path|—> · <summary>`
-and `action ∈ {skipped-duplicate-hash, skipped-near-duplicate, merged, new-page, conflict-flagged}`.
+and `action ∈ {skipped-duplicate-hash, skipped-near-duplicate, merged, new-page, conflict-flagged, retrieval-warning}`.
 Log **every** decision — including Layer-1 hash skips (the row *is* the ledger Layer 1 scans) and
 **every** flagged contradiction. If `log.md` is absent, scaffold it once with
 `add_markdown { corpus, path: "log.md", content: "# Ingest Log\n\n## Log\n", overwrite: false }`, then append.
@@ -169,10 +218,10 @@ markers (see Phase 2). For edits made **outside** these tools, run `index` to re
 
 ## Phase 5 — Report (root / opus)
 
-Summarize per claim: **skipped / merged into `path` / new `path` / conflict flagged**.
-Surface every flagged contradiction to the user by name — those are the ones that
-need a human call. Note any page that's now large enough to split (one-topic-per-file
-drift).
+Summarize per claim: **skipped / merged into `path` / new `path` / conflict flagged /
+written-with-retrieval-warning / blocked**. For retrieval warnings, include the query, expected
+page, observed top three, and actual rank. Surface every flagged contradiction to the user by
+name. Note any page that's now large enough to split (one-topic-per-file drift).
 
 ## Rules
 
@@ -190,3 +239,6 @@ drift).
 - Log every dedup decision in `log.md` — skips included. The Layer-1 hash ledger only works if skips are recorded.
 - Never rewrite `log.md`; it is append-only (`under_heading: "Log", position: "append"`), and never a routing target.
 - Never hand-edit inside the `index.md` `<!-- HALLOUMINATE:INDEX-START -->` / `INDEX-END` markers — the daemon owns that block.
+- Durable external research uses one deduplicated corpus-local source page with the indexed retrieval spine.
+- Freeze exact and natural probes before drafting; run them after the full write set and before journaling.
+- Revise at most once with unchanged probes; exact failures roll back to `blocked`, natural failures remain `written-with-retrieval-warning` with rank diagnostics.

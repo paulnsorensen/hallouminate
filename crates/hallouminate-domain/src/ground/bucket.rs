@@ -168,11 +168,13 @@ mod tests {
     fn hit(file_ref: &str, ord: usize, score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#{ord}"),
+            corpus_key: crate::common::CorpusKey::from_configured_root("docs", "/"),
             file_ref: file_ref.into(),
             heading_path: vec!["section".into()],
             line_start: ord + 1,
             line_end: ord + 5,
             text: format!("body of {file_ref}#{ord}"),
+            search_text: format!("retrieval text for {file_ref}#{ord}"),
             summary: format!("summary of {file_ref}"),
             keywords: vec!["docs".into(), "test".into()],
             score,
@@ -198,6 +200,17 @@ mod tests {
         assert!(a.chunks[0].score >= a.chunks[1].score);
         assert_eq!(a.summary.as_deref(), Some("summary of /a.md"));
         assert_eq!(a.keywords, vec!["docs".to_string(), "test".into()]);
+    }
+
+    #[test]
+    fn snippets_preserve_display_text_instead_of_retrieval_text() {
+        let mut poisoned = hit("/display.md", 0, 0.9);
+        poisoned.text = "display evidence".into();
+        poisoned.search_text = "retrieval poison".into();
+
+        let docs = build_docs(&[poisoned], 1, 1).expect("build docs");
+        let chunk = &docs.get("/display.md").expect("display doc").chunks[0];
+        assert_eq!(chunk.snippet, "display evidence");
     }
 
     #[test]
@@ -360,11 +373,13 @@ mod tests {
     fn hit_with_score(score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("c#{score}"),
+            corpus_key: crate::common::CorpusKey::from_configured_root("docs", "/"),
             file_ref: "/f.md".into(),
             heading_path: vec![],
             line_start: 1,
             line_end: 2,
             text: String::new(),
+            search_text: String::new(),
             summary: String::new(),
             keywords: vec![],
             score,

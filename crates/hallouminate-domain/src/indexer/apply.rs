@@ -1,8 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 
-use crate::common::{
-    CorpusConfig, FileRef, Mtime, Result, canonicalize_or_passthrough, expand_tilde,
-};
+use crate::common::{CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::blake3_file;
 use crate::indexer::chunk::PreparedFile;
 use crate::indexer::store::ChunkStore;
@@ -82,6 +80,32 @@ fn smudge_racy_mtime(mtime: Mtime, now_ms: i64) -> Mtime {
     }
 }
 
+fn corpus_key_for_file(corpus: &CorpusConfig, file: &FileRef) -> Result<CorpusKey> {
+    let file = crate::common::canonicalize_or_passthrough(file.as_path());
+    let mut owner: Option<CorpusKey> = None;
+    for key in corpus.corpus_keys() {
+        if !file.as_path().starts_with(&key.canonical_root) {
+            continue;
+        }
+        match &owner {
+            None => owner = Some(key),
+            Some(current) => {
+                let specificity = key.canonical_root.components().count();
+                let current_specificity = current.canonical_root.components().count();
+                if specificity > current_specificity {
+                    owner = Some(key);
+                }
+            }
+        }
+    }
+    owner.ok_or_else(|| {
+        HallouminateError::Indexer(format!(
+            "file is outside configured corpus roots: {}",
+            file.as_path().display()
+        ))
+    })
+}
+
 pub async fn apply(
     plan: IndexPlan,
     store: &dyn ChunkStore,
@@ -92,8 +116,6 @@ pub async fn apply(
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
     let batch_size = batch_size.max(1);
-    // Captured once so every file written by this run shares a single
-    // `indexed_at_ms`, regardless of how many batches it spans.
     let indexed_at_ms = chrono::Utc::now().timestamp_millis();
     let run = RunCtx {
         store,
@@ -102,13 +124,16 @@ pub async fn apply(
         batch_size,
     };
 
-    // Upserts: build write requests and run them in batches.
     let mut upsert_reqs: Vec<WriteRequest<'_>> = Vec::with_capacity(plan.upserts.len());
-    for u in &plan.upserts {
+    for upsert in &plan.upserts {
+        let corpus_key = match &upsert.corpus_key {
+            Some(key) => key.clone(),
+            None => corpus_key_for_file(corpus, &upsert.file)?,
+        };
         upsert_reqs.push(WriteRequest {
-            corpus,
-            file: &u.file,
-            mtime: smudge_racy_mtime(u.mtime, indexed_at_ms),
+            corpus_key,
+            file: &upsert.file,
+            mtime: smudge_racy_mtime(upsert.mtime, indexed_at_ms),
         });
     }
     run_in_batches(
@@ -120,35 +145,31 @@ pub async fn apply(
     )
     .await?;
 
-    // Mtime touches: hash-check each. If hash unchanged, just bump mtime.
-    // Otherwise re-index (deferred into the upsert path). Skip the re-hash
-    // when the caller already computed it (`known_hash` — see the
-    // single-file reroute in `dispatch.rs`).
     let mut fallthrough: Vec<MtimeCandidate> = Vec::new();
-    for cand in plan.mtime_touches {
-        let new_hash = match &cand.known_hash {
-            Some(h) => h.clone(),
-            None => blake3_file(cand.file.as_path())?,
+    for candidate in plan.mtime_touches {
+        let new_hash = match &candidate.known_hash {
+            Some(hash) => hash.clone(),
+            None => blake3_file(candidate.file.as_path())?,
         };
-        if new_hash == cand.snap.content_hash {
+        if new_hash == candidate.snap.content_hash {
             store
                 .touch_mtime(
-                    &cand.snap.corpus,
-                    &cand.snap.file_ref,
-                    smudge_racy_mtime(cand.new_mtime, indexed_at_ms).0,
+                    &candidate.snap.corpus_key,
+                    &candidate.snap.file_ref,
+                    smudge_racy_mtime(candidate.new_mtime, indexed_at_ms).0,
                 )
                 .await?;
             stats.files_touched += 1;
         } else {
-            fallthrough.push(cand);
+            fallthrough.push(candidate);
         }
     }
     let mut fallthrough_reqs: Vec<WriteRequest<'_>> = Vec::with_capacity(fallthrough.len());
-    for c in &fallthrough {
+    for candidate in &fallthrough {
         fallthrough_reqs.push(WriteRequest {
-            corpus,
-            file: &c.file,
-            mtime: smudge_racy_mtime(c.new_mtime, indexed_at_ms),
+            corpus_key: candidate.snap.corpus_key.clone(),
+            file: &candidate.file,
+            mtime: smudge_racy_mtime(candidate.new_mtime, indexed_at_ms),
         });
     }
     run_in_batches(
@@ -160,29 +181,20 @@ pub async fn apply(
     )
     .await?;
 
-    // A corpus name can span several roots. `list_files` therefore feeds the
-    // planner snapshots from sibling roots too; only delete snapshots that
-    // belong to a root covered by this invocation. Roots are tilde-expanded
-    // before canonicalizing: `corpus.paths` carry literal `~` until consumption
-    // (the walker expands them too), and stored `file_ref`s are already
-    // canonical absolute paths — so an unexpanded `~/…` root would never match,
-    // and every in-scope delete under it would be silently skipped (#215).
-    let roots: Vec<PathBuf> = corpus
-        .paths
-        .iter()
-        .map(|root| canonicalize_or_passthrough(&expand_tilde(root)).into_path_buf())
-        .collect();
-    for snap in plan.deletes {
-        let file = canonicalize_or_passthrough(Path::new(&snap.file_ref));
-        if roots.iter().any(|root| file.as_path().starts_with(root)) {
-            store.delete_file(&snap.corpus, &snap.file_ref).await?;
+    let configured_keys = corpus.corpus_keys();
+    for snapshot in plan.deletes {
+        if configured_keys.contains(&snapshot.corpus_key) {
+            store
+                .delete_file(&snapshot.corpus_key, &snapshot.file_ref)
+                .await?;
             stats.files_deleted += 1;
         } else {
             tracing::debug!(
                 target: "hallouminate::indexer",
-                file_ref = %snap.file_ref,
-                corpus = %snap.corpus,
-                "skipping delete: file_ref outside this request's configured roots"
+                file_ref = %snapshot.file_ref,
+                corpus = %snapshot.corpus_key.name,
+                root = %snapshot.corpus_key.canonical_root.display(),
+                "skipping delete: corpus key outside this request's configured roots"
             );
         }
     }
@@ -202,132 +214,144 @@ async fn run_in_batches(
     empty_file_policy: EmptyFilePolicy,
     precomputed: Option<(&FileRef, &[u8])>,
 ) -> Result<()> {
-    if reqs.is_empty() {
-        return Ok(());
+    let mut by_key: BTreeMap<CorpusKey, Vec<WriteRequest<'_>>> = BTreeMap::new();
+    for req in reqs {
+        by_key.entry(req.corpus_key.clone()).or_default().push(req);
     }
-    for chunk_of_reqs in reqs.chunks(run.batch_size) {
-        let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
-        for req in chunk_of_reqs {
-            // A real IO failure (file read) is a hard error — fail fast rather
-            // than silently dropping a file. An unsupported type or a handler
-            // extraction failure returns `Ok(None)`: prepare_file already logged
-            // the skip, so just account it and move on.
-            let bytes_override = precomputed.and_then(|(f, b)| (req.file == f).then_some(b));
-            let pf = prepare_file(
-                WriteRequest {
-                    corpus: req.corpus,
-                    file: req.file,
-                    mtime: req.mtime,
-                },
-                run.registry,
-                run.indexed_at_ms,
-                bytes_override,
-            )?;
-            let Some(pf) = pf else {
-                // Unsupported type or extraction failure — already logged by
-                // prepare_file. Counted distinctly from truncate-to-empty so a
-                // present-but-unreadable file does not evict its last-good rows
-                // on the single-file path.
-                stats.files_skipped_unreadable += 1;
-                continue;
-            };
-            if pf.chunks.is_empty() {
-                // Empty file → no rows would land in the chunks table, which
-                // makes list_files unable to track this file and the next
-                // run would re-attempt the same upsert. Skip and account.
-                tracing::warn!(
-                    target: "hallouminate::indexer",
-                    file = %req.file.as_path().display(),
-                    "skipping empty file (no chunks generated)"
-                );
-                stats.files_skipped_empty += 1;
-                if empty_file_policy == EmptyFilePolicy::Evict {
-                    // This batch's files all had a store snapshot (see the
-                    // `Evict` doc comment), so stale rows may exist — evict
-                    // them so the filesystem stays the source of truth.
-                    let file_ref_str = file_ref_string(req.file)?;
-                    tracing::info!(
-                        target: "hallouminate::indexer",
-                        corpus = %req.corpus.name,
-                        file = %file_ref_str,
-                        "evicting indexed file from search: re-index produced an empty file",
+    for key_reqs in by_key.into_values() {
+        for chunk_of_reqs in key_reqs.chunks(run.batch_size) {
+            let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
+            for req in chunk_of_reqs {
+                let bytes_override =
+                    precomputed.and_then(
+                        |(file, bytes)| {
+                            if req.file == file { Some(bytes) } else { None }
+                        },
                     );
-                    run.store
-                        .delete_file(&req.corpus.name, &file_ref_str)
-                        .await?;
-                    stats.files_deleted += 1;
+                let prepared_file = prepare_file(
+                    WriteRequest {
+                        corpus_key: req.corpus_key.clone(),
+                        file: req.file,
+                        mtime: req.mtime,
+                    },
+                    run.registry,
+                    run.indexed_at_ms,
+                    bytes_override,
+                )?;
+                let Some(prepared_file) = prepared_file else {
+                    stats.files_skipped_unreadable += 1;
+                    continue;
+                };
+                if prepared_file.chunks.is_empty() {
+                    tracing::warn!(
+                        target: "hallouminate::indexer",
+                        file = %req.file.as_path().display(),
+                        "skipping empty file (no chunks generated)"
+                    );
+                    stats.files_skipped_empty += 1;
+                    if empty_file_policy == EmptyFilePolicy::Evict {
+                        let file_ref = file_ref_string(req.file)?;
+                        tracing::info!(
+                            target: "hallouminate::indexer",
+                            corpus = %req.corpus_key.name,
+                            root = %req.corpus_key.canonical_root.display(),
+                            file = %file_ref,
+                            "evicting indexed file from search: re-index produced an empty file",
+                        );
+                        run.store.delete_file(&req.corpus_key, &file_ref).await?;
+                        stats.files_deleted += 1;
+                    }
+                    continue;
                 }
+                prepared.push(prepared_file);
+            }
+            if prepared.is_empty() {
                 continue;
             }
-            prepared.push(pf);
+            let file_count = prepared.len();
+            let write_stats = run.store.apply_batch(prepared).await?;
+            stats.chunks_inserted += write_stats.chunks_written;
+            stats.embeddings_inserted += write_stats.embeddings_written;
+            stats.files_upserted += file_count;
         }
-        if prepared.is_empty() {
-            continue;
-        }
-        let n = prepared.len();
-        // Embedding happens inside the store (US-002: embeddings are
-        // adapter-owned), so this just hands the batch off and folds the
-        // returned counts into the run's stats.
-        let write_stats = run.store.apply_batch(prepared).await?;
-        stats.chunks_inserted += write_stats.chunks_written;
-        stats.embeddings_inserted += write_stats.embeddings_written;
-        stats.files_upserted += n;
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Mutex;
 
     use async_trait::async_trait;
     use text_splitter::Characters;
 
     use super::*;
-    use crate::common::HallouminateError;
-    use crate::indexer::{BatchWriteStats, FileSnapshot, SearchHit};
+    use crate::common::{HallouminateError, canonicalize_or_passthrough, expand_tilde};
+    use crate::indexer::{BatchWriteStats, FileSnapshot, SearchHit, Upsert};
 
     #[derive(Default)]
     struct RecordingStore {
-        deleted: Mutex<Vec<String>>,
+        deleted: Mutex<Vec<(CorpusKey, String)>>,
+        batches: Mutex<Vec<CorpusKey>>,
     }
 
     #[async_trait]
     impl ChunkStore for RecordingStore {
-        async fn list_files(&self, _corpus: &str) -> Result<Vec<FileSnapshot>> {
+        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
             Ok(Vec::new())
         }
 
         async fn hybrid_search(
             &self,
-            _corpus: &str,
+            _corpus_key: &CorpusKey,
             _query: &str,
             _limit: usize,
         ) -> Result<Vec<SearchHit>> {
             Ok(Vec::new())
         }
 
-        async fn touch_mtime(&self, _corpus: &str, _file_ref: &str, _mtime_ms: i64) -> Result<()> {
+        async fn touch_mtime(
+            &self,
+            _corpus_key: &CorpusKey,
+            _file_ref: &str,
+            _mtime_ms: i64,
+        ) -> Result<()> {
             Ok(())
         }
 
-        async fn delete_file(&self, _corpus: &str, file_ref: &str) -> Result<()> {
+        async fn delete_file(&self, corpus_key: &CorpusKey, file_ref: &str) -> Result<()> {
             self.deleted
                 .lock()
                 .map_err(|_| HallouminateError::Indexer("deleted mutex poisoned".into()))?
-                .push(file_ref.to_string());
+                .push((corpus_key.clone(), file_ref.to_string()));
             Ok(())
         }
 
-        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
-            Ok(BatchWriteStats::default())
+        async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
+            let Some(first) = files.first() else {
+                return Ok(BatchWriteStats::default());
+            };
+            if files.iter().any(|file| file.corpus_key != first.corpus_key) {
+                return Err(HallouminateError::Indexer(
+                    "recording store received a mixed corpus-key batch".into(),
+                ));
+            }
+            self.batches
+                .lock()
+                .map_err(|_| HallouminateError::Indexer("batches mutex poisoned".into()))?
+                .push(first.corpus_key.clone());
+            Ok(BatchWriteStats {
+                chunks_written: files.iter().map(|file| file.chunks.len()).sum(),
+                embeddings_written: 0,
+            })
         }
     }
 
-    fn snapshot(path: &Path) -> FileSnapshot {
+    fn snapshot(corpus_key: &CorpusKey, path: &Path) -> FileSnapshot {
         FileSnapshot {
             file_ref: path.to_string_lossy().into_owned(),
-            corpus: "docs".into(),
+            corpus_key: corpus_key.clone(),
             mtime_ms: 0,
             content_hash: String::new(),
         }
@@ -346,10 +370,15 @@ mod tests {
         let sibling_file = canonicalize_or_passthrough(&sibling)
             .into_path_buf()
             .join("keep.md");
+        let selected_key = CorpusKey::from_configured_root("docs", &selected.to_string_lossy());
+        let sibling_key = CorpusKey::from_configured_root("docs", &sibling.to_string_lossy());
         let plan = IndexPlan {
             upserts: Vec::new(),
             mtime_touches: Vec::new(),
-            deletes: vec![snapshot(&selected_file), snapshot(&sibling_file)],
+            deletes: vec![
+                snapshot(&selected_key, &selected_file),
+                snapshot(&sibling_key, &sibling_file),
+            ],
         };
         let corpus = CorpusConfig {
             name: "docs".into(),
@@ -368,7 +397,7 @@ mod tests {
         assert_eq!(stats.files_deleted, 1);
         assert_eq!(
             *store.deleted.lock().expect("deleted mutex"),
-            vec![selected_file.to_string_lossy().into_owned()]
+            vec![(selected_key, selected_file.to_string_lossy().into_owned())]
         );
     }
 
@@ -386,10 +415,11 @@ mod tests {
         // logic, so no files on disk are needed.
         let raw_root = "~/.hallouminate-affinage-236-tilde-scope-test";
         let gone = expand_tilde(raw_root).join("gone.md");
+        let corpus_key = CorpusKey::from_configured_root("docs", raw_root);
         let plan = IndexPlan {
             upserts: Vec::new(),
             mtime_touches: Vec::new(),
-            deletes: vec![snapshot(&gone)],
+            deletes: vec![snapshot(&corpus_key, &gone)],
         };
         let corpus = CorpusConfig {
             name: "docs".into(),
@@ -411,7 +441,62 @@ mod tests {
         );
         assert_eq!(
             *store.deleted.lock().expect("deleted mutex"),
-            vec![gone.to_string_lossy().into_owned()]
+            vec![(corpus_key, gone.to_string_lossy().into_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_splits_mixed_root_upserts_into_deterministic_batches() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let root_a = parent.path().join("a");
+        let root_b = parent.path().join("b");
+        std::fs::create_dir_all(&root_a).expect("create root a");
+        std::fs::create_dir_all(&root_b).expect("create root b");
+        let file_a = root_a.join("a.md");
+        let file_b = root_b.join("b.md");
+        std::fs::write(&file_a, "# A\n\nalpha\n").expect("write a");
+        std::fs::write(&file_b, "# B\n\nbeta\n").expect("write b");
+        let key_a = CorpusKey::from_configured_root("docs", &root_a.to_string_lossy());
+        let key_b = CorpusKey::from_configured_root("docs", &root_b.to_string_lossy());
+        let plan = IndexPlan {
+            upserts: vec![
+                Upsert {
+                    file: FileRef::new(file_b),
+                    mtime: Mtime(1),
+                    corpus_key: Some(key_b.clone()),
+                },
+                Upsert {
+                    file: FileRef::new(file_a),
+                    mtime: Mtime(1),
+                    corpus_key: Some(key_a.clone()),
+                },
+            ],
+            mtime_touches: Vec::new(),
+            deletes: Vec::new(),
+        };
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![
+                root_b.to_string_lossy().into_owned(),
+                root_a.to_string_lossy().into_owned(),
+            ],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let store = RecordingStore::default();
+        let registry = HandlerRegistry::new(Characters, 384);
+
+        apply(plan, &store, &registry, &corpus, 16, None)
+            .await
+            .expect("apply");
+
+        let mut expected = vec![key_a, key_b];
+        expected.sort();
+        assert_eq!(
+            *store.batches.lock().expect("batches mutex"),
+            expected,
+            "one deterministic write batch per corpus root"
         );
     }
 

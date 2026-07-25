@@ -1,11 +1,12 @@
 ---
 status: reviewed
-last_verified: 2026-07-07
+last_verified: 2026-07-24
 confidence: high
 sources:
   - https://github.com/microsoft/onnxruntime/issues/26831
   - https://github.com/microsoft/onnxruntime/issues/11627
   - https://github.com/microsoft/onnxruntime/issues/23339
+  - https://github.com/paulnsorensen/hallouminate/issues/288
 ---
 # ORT BFCArena retention — why session eviction never reclaimed memory
 
@@ -56,13 +57,14 @@ rationale in `docs/adr/daemon-idle-exit-001..003.md`).
 - **Smaller high-water mark.** Capping the embed batch
   (`embed(texts, Some(32))` instead of `None`) shrinks the arena
   peak roughly proportionally — a separate mitigation, not a fix.
-  **Gap (#221):** the crossencoder rerank path never got this cap —
-  `rerank(query, &docs, false, None)`
-  (`src/domain/search/crossencoder.rs:115`) with a default 50-doc pool
-  (`crossencoder.rs:6`), so each rerank call's arena scratch high-water
-  is unbounded by config. Reranks do serialize daemon-wide behind a
-  whole-map mutex (`src/app/daemon/state.rs:724-738`), so it's one
-  arena, but sized by the uncapped joint batch.
+  **Historical gap (#221, now fixed):** the crossencoder path once
+  called `rerank(query, &docs, false, None)`, leaving its joint batch
+  uncapped. Current adapter code passes `Some(RERANK_BATCH_SIZE)` with
+  `RERANK_BATCH_SIZE = 32`
+  (`crates/hallouminate-adapters/src/crossencoder.rs:56-66`), so the
+  present rerank path has the same bounded-batch mitigation. Reranks
+  still serialize daemon-wide behind a whole-map mutex; issue #285
+  owns the remaining stale-page audit.
 
 ## For future agents
 
@@ -70,4 +72,4 @@ rationale in `docs/adr/daemon-idle-exit-001..003.md`).
   `daemon-idle-exit` lands; the config warns and does nothing.
 - Full cited diagnosis: `.cheese/research/fastembed-ort-arena-leak/`.
 
-_Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-13 · Supersedes: —_
+_Source: multi-instance concurrency audit plus issue #288 verification · Updated: 2026-07-24 · Supersedes: the stale claim that crossencoder reranking remained uncapped_

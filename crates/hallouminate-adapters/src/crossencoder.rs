@@ -55,12 +55,19 @@ impl FastembedCrossencoder {
 /// embedder's `EMBED_BATCH_SIZE` mitigation.
 const RERANK_BATCH_SIZE: usize = 32;
 
+fn rerank_documents(hits: &[SearchHit]) -> Vec<&str> {
+    let mut documents = Vec::with_capacity(hits.len());
+    for hit in hits {
+        documents.push(hit.search_text.as_str());
+    }
+    documents
+}
 impl Crossencoder for FastembedCrossencoder {
     fn rerank(&mut self, query: &str, hits: &mut [SearchHit]) -> Result<()> {
         if hits.is_empty() {
             return Ok(());
         }
-        let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+        let docs = rerank_documents(hits);
         let scored = self
             .inner
             .rerank(query, &docs, false, Some(RERANK_BATCH_SIZE))
@@ -126,11 +133,13 @@ mod tests {
     fn hit(file_ref: &str, ord: usize, score: f32, text: &str) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#{ord}"),
+            corpus_key: hallouminate_domain::common::CorpusKey::from_configured_root("docs", "/"),
             file_ref: file_ref.into(),
             heading_path: vec![],
             line_start: 1,
             line_end: 2,
             text: text.into(),
+            search_text: text.into(),
             summary: String::new(),
             keywords: vec![],
             score,
@@ -151,6 +160,14 @@ mod tests {
         apply_permutation(&mut hits, &[2, 1, 0]);
         let ids: Vec<&str> = hits.iter().map(|h| h.chunk_id.as_str()).collect();
         assert_eq!(ids, vec!["/c.md#0", "/b.md#0", "/a.md#0"]);
+    }
+
+    #[test]
+    fn rerank_documents_use_retrieval_text_not_display_text() {
+        let mut poisoned = hit("/poisoned.md", 0, 0.5, "display poison");
+        poisoned.search_text = "retrieval evidence".into();
+
+        assert_eq!(rerank_documents(&[poisoned]), ["retrieval evidence"]);
     }
 
     #[test]

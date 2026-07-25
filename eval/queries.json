@@ -1,28 +1,110 @@
 [
-  {"id": "q01", "query": "why does hallouminate run a daemon process", "expected": ["daemon-and-cli.md"]},
-  {"id": "q02", "query": "LanceDB does not support concurrent writer processes", "expected": ["daemon-and-cli.md"]},
-  {"id": "q03", "query": "socket location resolution order for the daemon", "expected": ["daemon-and-cli.md"]},
-  {"id": "q04", "query": "gitignore aware corpus walking hidden dotfiles", "expected": ["corpus-walker.md"]},
-  {"id": "q05", "query": "explicit root opt-in escape hatch for the walker", "expected": ["corpus-walker.md"]},
-  {"id": "q06", "query": "claim mark HTML comment syntax confirmed superseded contradicted", "expected": ["claim-provenance-marks.md"]},
-  {"id": "q07", "query": "claim marks schema lint read_markdown one mark per chunk", "expected": ["claim-provenance-marks.md"]},
-  {"id": "q08", "query": "tree-sitter code chunking deferred status future phase", "expected": ["code-aware-chunking.md"]},
-  {"id": "q09", "query": "cAST code breadcrumb open gap grammar version pinning", "expected": ["code-aware-chunking.md"]},
-  {"id": "q10", "query": "XDG baseline and repo layer config merge semantics", "expected": ["config-layering.md"]},
-  {"id": "q11", "query": "relative paths resolve against the repo root in config", "expected": ["config-layering.md"]},
-  {"id": "q12", "query": "sliced bread layout app domain adapters vertical slices", "expected": ["architecture.md"]},
-  {"id": "q13", "query": "dependency direction and entry points in the codebase", "expected": ["architecture.md"]},
-  {"id": "q14", "query": "compiled memory layer not a RAG dump positioning", "expected": ["design-rationale.md"]},
-  {"id": "q15", "query": "filesystem is the source of truth LanceDB is derived", "expected": ["design-rationale.md"]},
-  {"id": "q16", "query": "MCP tools list_corpora list_files list_tree", "expected": ["mcp-surface.md"]},
-  {"id": "q17", "query": "default corpus resolution when cwd is under a repository", "expected": ["mcp-surface.md"]},
-  {"id": "q18", "query": "why hallouminate is markdown only today per-format dispatch", "expected": ["multi-format-ingestion.md"]},
-  {"id": "q19", "query": "docx pptx odt office document crate landscape heading aware", "expected": ["office-prose-extraction.md"]},
-  {"id": "q20", "query": "ORT BFCArena memory retention onnxruntime session eviction", "expected": ["ort-arena-retention.md"]},
-  {"id": "q21", "query": "PDF text layer crate choice versus scanned OCR engine decision", "expected": ["pdf-ocr-ingestion.md"]},
-  {"id": "q22", "query": "one topic per file wiki convention heading chunk boundaries", "expected": ["wiki-conventions.md"]},
-  {"id": "q23", "query": "tilth edits land in the parent repo not the worktree", "expected": ["worktree-dev-gotchas.md"]},
-  {"id": "q24", "query": "tmp scratch build fails disk quota cargo wrapper exit 134", "expected": ["worktree-dev-gotchas.md"]},
-  {"id": "q25", "query": "what corpora does the hallouminate wiki index separate from source code", "expected": ["index.md"]},
-  {"id": "q26", "query": "ingest log skipped near duplicate entries", "expected": ["log.md"]}
+  {
+    "id": "footnote-inversion",
+    "query": "why are Hallouminate's daemon and config layers separate from the application crate",
+    "expected_chunk": {
+      "file": "architecture.md",
+      "heading_path": ["Architecture"],
+      "line_start": 1
+    }
+  },
+  {
+    "id": "worktree-isolation",
+    "query": "why can a query in one git checkout see stale knowledge from a sibling branch",
+    "expected_chunk": {
+      "file": "worktree-corpus-identity.md",
+      "heading_path": ["Worktree corpus identity"],
+      "line_start": 9
+    }
+  },
+  {
+    "id": "paraphrase-app-boundary",
+    "query": "which layer receives commands and transports while keeping core capabilities separate",
+    "expected_chunk": {
+      "file": "architecture.md",
+      "heading_path": ["Architecture"],
+      "line_start": 1
+    }
+  },
+  {
+    "id": "lexical-distractor",
+    "query": "who enforces dependency direction across workspace crates and adapters",
+    "expected_chunk": {
+      "file": "architecture.md",
+      "heading_path": ["Architecture", "crates/hallouminate-adapters/ — driven external systems"],
+      "line_start": 62
+    }
+  },
+  {
+    "id": "multi-root-union",
+    "query": "how can one configured corpus intentionally search multiple canonical roots without mixing their identities",
+    "expected_chunk": {
+      "file": "worktree-corpus-identity.md",
+      "heading_path": ["Worktree corpus identity", "Remaining search defect"],
+      "line_start": 25
+    }
+  },
+  {
+    "id": "daemon-rationale",
+    "query": "why does hallouminate keep one long lived owner for database writes",
+    "expected_chunk": {
+      "file": "daemon-and-cli.md",
+      "heading_path": ["Daemon and CLI"],
+      "line_start": 1
+    }
+  },
+  {
+    "id": "explicit-root-opt-in",
+    "query": "how does pointing directly at ignored content change filesystem walking",
+    "expected_chunk": {
+      "file": "corpus-walker.md",
+      "heading_path": ["Corpus walker", "Explicit-root opt-in"],
+      "line_start": 19
+    }
+  },
+  {
+    "id": "relative-config-path",
+    "query": "what directory anchors a relative repository path in the local configuration layer",
+    "expected_chunk": {
+      "file": "config-layering.md",
+      "heading_path": ["Config layering", "Repo layer", "Relative paths resolve against the repo root"],
+      "line_start": 41
+    }
+  },
+  {
+    "id": "ort-retention-mechanism",
+    "query": "why does releasing an inference session fail to return its allocation arena to the operating system",
+    "expected_chunk": {
+      "file": "ort-arena-retention.md",
+      "heading_path": ["ORT BFCArena retention — why session eviction never reclaimed memory", "The mechanism"],
+      "line_start": 18
+    }
+  },
+  {
+    "id": "one-topic-chunking",
+    "query": "why should unrelated durable knowledge be split into separate pages for retrieval",
+    "expected_chunk": {
+      "file": "wiki-conventions.md",
+      "heading_path": ["Wiki conventions for LLM authors"],
+      "line_start": 1
+    }
+  },
+  {
+    "id": "claim-single-owner",
+    "query": "which chunk owns a provenance marker when two bounded slices overlap on one source line",
+    "expected_chunk": {
+      "file": "claim-provenance-marks.md",
+      "heading_path": ["Claim-level provenance marks", "Each mark belongs to exactly one chunk"],
+      "line_start": 59
+    }
+  },
+  {
+    "id": "ocr-separate-engine",
+    "query": "why can't a different text extraction crate recover words from an image-only document",
+    "expected_chunk": {
+      "file": "pdf-ocr-ingestion.md",
+      "heading_path": ["PDF and OCR ingestion", "Scanned PDFs / OCR — a separate engine, explicitly out of scope"],
+      "line_start": 58
+    }
+  }
 ]
