@@ -60,10 +60,7 @@ struct ArmDescriptor {
 
 impl ArmDescriptor {
     fn from_spec(spec: ArmSpec<'_>) -> Self {
-        let model = match spec.model {
-            Some(model) => Some(model.to_string()),
-            None => None,
-        };
+        let model = spec.model.map(|model| model.to_string());
         Self {
             id: spec.id.to_string(),
             model,
@@ -413,10 +410,9 @@ fn validate_fixture_labels_with_production_tokenizer(queries: &[LabelledQuery]) 
 }
 
 fn build_config(arm: ArmSpec<'_>, ground_dir: &Path) -> Config {
-    let mut search = SearchConfig::default();
-    search.crossencoder = match arm.model {
-        Some(model) => Some(model.to_string()),
-        None => None,
+    let search = SearchConfig {
+        crossencoder: arm.model.map(|model| model.to_string()),
+        ..Default::default()
     };
     Config {
         corpora: vec![fixture_corpus()],
@@ -452,23 +448,11 @@ fn rank_of_expected(ranked: &[(&String, &DocFile)], expected_file: &str) -> Opti
 }
 
 fn top_identity(ranked: &[(&String, &DocFile)]) -> Option<ChunkIdentity> {
-    let Some((absolute_path, doc)) = ranked.first().copied() else {
-        return None;
-    };
-    let Some(chunk) = doc.chunks.first() else {
-        return None;
-    };
+    let (absolute_path, doc) = ranked.first().copied()?;
+    let chunk = doc.chunks.first()?;
     let file = match &doc.path {
         Some(path) => path.clone(),
-        None => {
-            let Some(name) = Path::new(absolute_path).file_name() else {
-                return None;
-            };
-            let Some(name) = name.to_str() else {
-                return None;
-            };
-            name.to_string()
-        }
+        None => Path::new(absolute_path).file_name()?.to_str()?.to_string(),
     };
     Some(ChunkIdentity {
         file,
@@ -482,18 +466,12 @@ async fn cold_load_models(arm: ArmSpec<'_>) -> Result<u64> {
     let model = embeddings.model;
     let quantized = embeddings.quantized;
     let cache_dir = expand_tilde(&embeddings.cache_dir);
-    let crossencoder = match arm.model {
-        Some(model) => Some(model.to_string()),
-        None => None,
-    };
+    let crossencoder = arm.model.map(|model| model.to_string());
     let started = Instant::now();
     let loaded = tokio::task::spawn_blocking(move || -> Result<()> {
         let _embedder = Embedder::try_new(&model, quantized, &cache_dir)?;
-        match crossencoder {
-            Some(model) => {
-                let _crossencoder = FastembedCrossencoder::try_new(&model, &cache_dir)?;
-            }
-            None => {}
+        if let Some(model) = crossencoder {
+            let _crossencoder = FastembedCrossencoder::try_new(&model, &cache_dir)?;
         }
         Ok(())
     })
@@ -671,14 +649,11 @@ fn quality_for(queries: &[QueryMeasurement]) -> Result<QualityMetrics> {
     let mut recall_hits = 0;
     let mut reciprocal_sum = 0.0;
     for measurement in queries {
-        match measurement.rank {
-            Some(rank) => {
-                if rank <= 5 {
-                    recall_hits += 1;
-                }
-                reciprocal_sum += 1.0 / rank as f64;
+        if let Some(rank) = measurement.rank {
+            if rank <= 5 {
+                recall_hits += 1;
             }
-            None => {}
+            reciprocal_sum += 1.0 / rank as f64;
         }
     }
     Ok(QualityMetrics {
@@ -714,10 +689,7 @@ async fn run_arm(arm: ArmSpec<'_>, queries: &[LabelledQuery]) -> Result<ArmMeasu
     drop(client);
     harness.shutdown().await.context("shutdown eval daemon")?;
 
-    let model = match arm.model {
-        Some(model) => Some(model.to_string()),
-        None => None,
-    };
+    let model = arm.model.map(|model| model.to_string());
     Ok(ArmMeasurement {
         id: arm.id.to_string(),
         model,
@@ -756,12 +728,7 @@ fn increment_counts(counts: &mut ChangeCounts, disposition: ChangeDisposition) {
 }
 
 fn query_by_id<'a>(queries: &'a [QueryMeasurement], id: &str) -> Option<&'a QueryMeasurement> {
-    for query in queries {
-        if query.id == id {
-            return Some(query);
-        }
-    }
-    None
+    queries.iter().find(|query| query.id == id)
 }
 
 fn build_comparison(
@@ -822,12 +789,9 @@ fn requested_descriptors(arms: &[ArmSpec<'_>]) -> Vec<ArmDescriptor> {
 }
 
 fn arm_for_descriptor(descriptor: &ArmDescriptor) -> Option<ArmSpec<'static>> {
-    for arm in diagnostic_arms() {
-        if descriptor == &ArmDescriptor::from_spec(arm) {
-            return Some(arm);
-        }
-    }
-    None
+    diagnostic_arms()
+        .into_iter()
+        .find(|arm| descriptor == &ArmDescriptor::from_spec(*arm))
 }
 
 fn validate_measurement(measurement: &ArmMeasurement, arm: ArmSpec<'_>) -> Result<()> {
@@ -1029,9 +993,7 @@ fn record_failure(artifact: &mut EvalArtifact, arm: ArmSpec<'_>, error: &anyhow:
         query_id: failure_query_id(&message),
         message: message.clone(),
     };
-    if message.contains(MODEL_LOAD_MARKER) {
-        artifact.model_load_failures.push(diagnostic);
-    } else if message.contains(CROSSENCODER_UNAVAILABLE_MARKER) {
+    if message.contains(MODEL_LOAD_MARKER) || message.contains(CROSSENCODER_UNAVAILABLE_MARKER) {
         artifact.model_load_failures.push(diagnostic);
     } else if message.contains(RERANK_TIMEOUT_MARKER) {
         artifact.timeouts.push(diagnostic);
@@ -1301,8 +1263,10 @@ fn evaluation_arms_derive_from_production_defaults() {
     assert_eq!(baseline.search, SearchConfig::default());
 
     let candidate = build_config(JINA_ARM, temp.path());
-    let mut expected_search = SearchConfig::default();
-    expected_search.crossencoder = Some(JINA_MODEL.to_string());
+    let expected_search = SearchConfig {
+        crossencoder: Some(JINA_MODEL.to_string()),
+        ..Default::default()
+    };
     assert_eq!(candidate.embeddings, embeddings);
     assert_eq!(candidate.search, expected_search);
 
@@ -1332,10 +1296,7 @@ fn synthetic_query(
     rerank_signal: Option<f64>,
 ) -> QueryMeasurement {
     let expected_top = synthetic_identity(expected_file);
-    let actual_top = match actual_file {
-        Some(file) => Some(synthetic_identity(file)),
-        None => None,
-    };
+    let actual_top = actual_file.map(synthetic_identity);
     let top_chunk_pass = actual_top.as_ref() == Some(&expected_top);
     QueryMeasurement {
         id: id.into(),
@@ -1354,10 +1315,7 @@ fn synthetic_measurement(arm: ArmSpec<'_>, mut queries: Vec<QueryMeasurement>) -
     for query in &mut queries {
         query.rerank_completed = rerank_completed;
     }
-    let model = match arm.model {
-        Some(model) => Some(model.to_string()),
-        None => None,
-    };
+    let model = arm.model.map(|model| model.to_string());
     ArmMeasurement {
         id: arm.id.into(),
         model,

@@ -99,7 +99,18 @@ The current walker returns only `(FileRef, Mtime)` and planning deduplicates by 
 - Footnote block: existing `extract_footnotes` / `FootnoteMode`; only search input changes.
 - File summary: existing `PreparedFile.summary`; proposed as document context on each chunk.
 - Eval harness: existing `ground_recall_and_mrr_across_variants`; labels gain heading-prefix expectations and latency.
-- Crossencoder config: existing `SearchConfig.crossencoder`; default changes only after thresholds pass.[^spec]
+- Crossencoder config: existing `SearchConfig.crossencoder`; the default remains `None`, while `just eval-measure` compares the production baseline with the documented Jina-v1 opt-in without selecting a winner.[^loop]
+
+## Approved follow-on search reliability terms
+
+The approved `search-reliability-loop` spec adds four proposed terms without claiming they are shipped:
+
+- **Source page** — a corpus-local evidence page whose indexed lead contains exact source identity and whose flexible body records supported claims, project relevance, and limitations.
+- **Retrieval probe** — a query frozen before drafting and rerun after a write to verify exact page identity or natural discoverability.
+- **Production baseline** — the scheduled fusion/no-crossencoder measurement derived from production embedding defaults.
+- **Reranker diagnostic** — an explicit two-arm comparison between the production baseline and Jina v1 that reports evidence without selecting a winner.
+
+The same approved design extends `SearchHit` with stored `search_text`, feeds that representation to the crossencoder, and continues building public Ground snippets from display `text`. This aligns every ranking stage on retrieval text without changing the Ground wire response.[^loop]
 
 ## Excluded concepts
 
@@ -112,4 +123,6 @@ LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), co
 [^f001]: [Issue #284 — opt-in LLM context](https://github.com/paulnsorensen/hallouminate/issues/284).
 [^f003]: [Issue #286 — orphan-row garbage collection](https://github.com/paulnsorensen/hallouminate/issues/286).
 
-_Source: issue #288 entity bindings grounded against current domain code · Updated: 2026-07-24 · Supersedes: —_
+[^loop]: [Search reliability loop ADRs](search-reliability-loop-001.md), [production evaluation](search-reliability-loop-002.md), and [reranker representation](search-reliability-loop-003.md).
+
+_Source: issue #288 entity bindings and the approved search-reliability-loop spec · Updated: 2026-07-24 · Supersedes: —_
