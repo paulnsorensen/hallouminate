@@ -32,13 +32,14 @@ No evaluation arm changes the runtime default crossencoder.
 It compares Recall@5, MRR, and committed top-chunk assertions with
 `eval/baseline.json`. A regression fails the scheduled evaluation.
 
-`just eval-measure` runs exactly two otherwise-identical arms:
+`just eval-measure` runs exactly two arms:
 
 1. `fusion-without-rerank`;
 2. `fusion-with-jina-reranker-v1-turbo-en`.
 
-The Jina arm is a diagnostic comparison only. It is not qualified, selected, or
-written into runtime configuration.
+The Jina arm uses a bounded 5s evaluation-only rerank timeout so a slow valid
+inference is measured rather than reported as the production 2s fallback. It
+does not change the runtime crossencoder default.
 
 ## Diagnostic artifact
 
