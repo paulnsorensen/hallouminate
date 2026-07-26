@@ -336,6 +336,19 @@ async fn handle_corpus_stats(
     })
 }
 
+/// Resolve per-request ground options, falling back to configured defaults
+/// for anything the request leaves unset.
+fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
+    GroundOpts {
+        top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
+        chunks_per_file: req
+            .chunks_per_file
+            .unwrap_or(cfg.search.chunks_per_file_default),
+        limit: req.limit.unwrap_or(cfg.search.limit_default),
+        rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
+    }
+}
+
 async fn handle_ground(
     state: &DaemonState,
     cfg: &Config,
@@ -352,14 +365,7 @@ async fn handle_ground(
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
     let store = &res.store;
-    let opts = GroundOpts {
-        top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
-        chunks_per_file: req
-            .chunks_per_file
-            .unwrap_or(cfg.search.chunks_per_file_default),
-        limit: req.limit.unwrap_or(cfg.search.limit_default),
-        rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
-    };
+    let opts = ground_opts(cfg, &req);
 
     // Union ground (#106): a no-corpus request from above all repos fans the
     // query across EVERY effective corpus and merges into one re-ranked set.
@@ -1777,6 +1783,40 @@ mod tests {
     //! helpers (`derived_corpus_name`, `pong_value`).
 
     use super::*;
+
+    fn ground_request() -> GroundRequest {
+        serde_json::from_value(serde_json::json!({ "query": "q" })).expect("minimal ground request")
+    }
+
+    /// The candidate pool must come from configuration, not a hardcoded
+    /// constant. A fixed 50 is a large share of a small corpus and a
+    /// vanishing share of a large one, which is why it is tunable per
+    /// corpus.
+    #[test]
+    fn ground_opts_take_the_candidate_pool_from_config_when_the_request_omits_it() {
+        let mut cfg = Config::default();
+        cfg.search.limit_default = 200;
+        let opts = ground_opts(&cfg, &ground_request());
+        assert_eq!(opts.limit, 200, "configured pool must reach GroundOpts");
+    }
+
+    #[test]
+    fn an_explicit_request_limit_overrides_the_configured_pool() {
+        let mut cfg = Config::default();
+        cfg.search.limit_default = 200;
+        let mut req = ground_request();
+        req.limit = Some(7);
+        assert_eq!(ground_opts(&cfg, &req).limit, 7);
+    }
+
+    #[test]
+    fn ground_opts_default_pool_is_fifty() {
+        let opts = ground_opts(&Config::default(), &ground_request());
+        assert_eq!(
+            opts.limit, 50,
+            "omitting the config key must preserve the historical pool size"
+        );
+    }
 
     #[test]
     fn derived_corpus_name_emits_canonical_string_for_valid_inputs() {

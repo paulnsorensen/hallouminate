@@ -285,6 +285,54 @@ mod tests {
         assert_eq!(hits[0].matched, vec!["caerbannog".to_string()]);
     }
 
+    /// A multi-word natural-language question must produce hits when its
+    /// individual terms appear in the corpus, even though the question
+    /// itself appears nowhere.
+    ///
+    /// This is the defect the per-term pass exists to fix. Passing the raw
+    /// query as one literal returned zero files for every one of the
+    /// original twelve evaluation queries, so the signal cost a subprocess
+    /// spawn on every request and contributed nothing. The assertion on the
+    /// whole-query form is what makes this test meaningful: without it, a
+    /// regression to whole-query matching would still find the fixture via
+    /// some other term and the test would pass.
+    #[tokio::test]
+    async fn natural_language_query_matches_per_term_though_the_phrase_does_not() {
+        if which("rg").is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("melange.md"),
+            "# Navigation\n\nGuild navigators fold space using melange.\n",
+        )
+        .expect("write fixture");
+        let roots = [dir.path().to_string_lossy().into_owned()];
+        let question = "why is the spice melange important to navigation";
+
+        let terms = crate::search::terms::split_terms(question);
+        let hits = run(&roots, &terms, 10).await.expect("per-term run");
+        assert!(
+            !hits.is_empty(),
+            "per-term matching must find the fixture for a natural-language question"
+        );
+        assert!(
+            hits.iter().any(|h| h.matched.contains(&"melange".into())),
+            "the matching term must be reported so the caller can rank by term coverage"
+        );
+
+        // The whole question as a single literal matches nothing — which is
+        // exactly the behaviour that made this signal dead weight.
+        let whole = run(&roots, &[question.to_string()], 10)
+            .await
+            .expect("whole-query run");
+        assert!(
+            whole.is_empty(),
+            "the raw question appears nowhere in the corpus; got {} hits",
+            whole.len()
+        );
+    }
+
     /// Repeated runs over the same tree must return the same hits in the
     /// same order, including when `max_hits` truncates.
     ///

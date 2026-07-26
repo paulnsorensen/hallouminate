@@ -3332,6 +3332,107 @@ schema_version = 1
         );
     }
 
+    /// The count is the number of DISTINCT query terms a chunk contains,
+    /// which is the key the literal signal ranks by. A chunk covering more
+    /// of the query must outrank one covering less, so counting terms
+    /// rather than occurrences is the whole point: a chunk repeating one
+    /// term must not beat a chunk covering several.
+    #[tokio::test]
+    async fn contains_term_counts_counts_distinct_terms_not_occurrences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let key = corpus_key("docs", "/tmp");
+
+        // Covers two of the three terms.
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/broad.md",
+                1,
+                "alpha and beta appear here",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed broad");
+        // Repeats one term many times but covers only that one.
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/narrow.md",
+                1,
+                "alpha alpha alpha alpha alpha",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed narrow");
+        // Covers none of them.
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/absent.md",
+                1,
+                "nothing relevant in this chunk",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed absent");
+
+        let broad = chunk_id_for("/tmp/broad.md", 0);
+        let narrow = chunk_id_for("/tmp/narrow.md", 0);
+        let absent = chunk_id_for("/tmp/absent.md", 0);
+        let terms = ["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let counts = store
+            .contains_term_counts(
+                &key,
+                &terms,
+                &[broad.clone(), narrow.clone(), absent.clone()],
+            )
+            .await
+            .expect("term counts");
+
+        assert_eq!(counts.get(&broad), Some(&2), "alpha and beta, not gamma");
+        assert_eq!(
+            counts.get(&narrow),
+            Some(&1),
+            "five occurrences of one term is still one distinct term"
+        );
+        assert_eq!(
+            counts.get(&absent),
+            None,
+            "a chunk matching no term must be absent, not present with zero"
+        );
+    }
+
+    #[tokio::test]
+    async fn contains_term_counts_short_circuits_on_empty_input() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let key = corpus_key("docs", "/tmp");
+        assert!(
+            store
+                .contains_term_counts(&key, &[], &["x#0".to_string()])
+                .await
+                .expect("empty terms")
+                .is_empty()
+        );
+        assert!(
+            store
+                .contains_term_counts(&key, &["alpha".to_string()], &[])
+                .await
+                .expect("empty pool")
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn same_name_roots_isolate_contains_term_counts_when_chunk_ids_collide() {
         let dir = tempfile::tempdir().expect("tempdir");
