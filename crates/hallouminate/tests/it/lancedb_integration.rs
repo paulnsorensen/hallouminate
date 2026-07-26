@@ -113,15 +113,23 @@ async fn fts_search_returns_lexical_hits_scoped_to_one_corpus() {
     store.apply_batch(vec![a]).await.expect("apply alpha");
     store.apply_batch(vec![b]).await.expect("apply beta");
 
-    let hits = store
-        .hybrid_search(&alpha, "zebrafish", 10)
+    let signals = store
+        .retrieve_signals(&alpha, "zebrafish", 10)
         .await
-        .expect("hybrid_search");
-    assert!(!hits.is_empty(), "must find the token in corpus alpha");
+        .expect("retrieve_signals");
     assert!(
-        hits.iter().all(|h| h.file_ref == "/tmp/a.md"),
+        !signals.fts.is_empty(),
+        "must find the token in corpus alpha"
+    );
+    let file_refs: Vec<&String> = signals
+        .fts
+        .iter()
+        .map(|id| &signals.hits.get(id).expect("hit for ranked chunk").file_ref)
+        .collect();
+    assert!(
+        file_refs.iter().all(|f| f.as_str() == "/tmp/a.md"),
         "fts_search must not leak rows from corpus beta: {:?}",
-        hits.iter().map(|h| &h.file_ref).collect::<Vec<_>>()
+        file_refs
     );
 }
 
@@ -130,11 +138,15 @@ async fn fts_search_on_empty_store_returns_no_hits() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let corpus_key = corpus_key("docs");
-    let hits = store
-        .hybrid_search(&corpus_key, "anything", 10)
+    let signals = store
+        .retrieve_signals(&corpus_key, "anything", 10)
         .await
-        .expect("hybrid_search on empty store");
-    assert!(hits.is_empty(), "empty store must yield zero FTS hits");
+        .expect("retrieve_signals on empty store");
+    assert!(
+        signals.fts.is_empty(),
+        "empty store must yield zero FTS hits"
+    );
+    assert!(signals.hits.is_empty(), "empty store must yield zero hits");
 }
 
 // ── Spec §8.1 #4: Mtime-touch leaves chunks/embeddings alone ─────────────
@@ -440,22 +452,22 @@ async fn same_name_roots_are_isolated_through_public_lance_api() {
     assert_eq!(files_b[0].corpus_key, key_b);
     assert_eq!(files_b[0].file_ref, file_ref);
 
-    let hits_a = store
-        .hybrid_search(&key_a, "sharedquery", 10)
+    let signals_a = store
+        .retrieve_signals(&key_a, "sharedquery", 10)
         .await
         .expect("search root a");
-    let hits_b = store
-        .hybrid_search(&key_b, "sharedquery", 10)
+    let signals_b = store
+        .retrieve_signals(&key_b, "sharedquery", 10)
         .await
         .expect("search root b");
-    assert_eq!(hits_a.len(), 2);
-    for hit in &hits_a {
+    assert_eq!(signals_a.hits.len(), 2);
+    for hit in signals_a.hits.values() {
         assert_eq!(hit.corpus_key, key_a);
         assert_eq!(hit.file_ref, file_ref);
         assert!(hit.text.starts_with("sharedquery root-a-"));
     }
-    assert_eq!(hits_b.len(), 2);
-    for hit in &hits_b {
+    assert_eq!(signals_b.hits.len(), 2);
+    for hit in signals_b.hits.values() {
         assert_eq!(hit.corpus_key, key_b);
         assert_eq!(hit.file_ref, file_ref);
         assert!(hit.text.starts_with("sharedquery root-b-"));
@@ -475,12 +487,12 @@ async fn same_name_roots_are_isolated_through_public_lance_api() {
     assert_eq!(files_b[0].file_ref, file_ref);
     assert_eq!(files_b[0].mtime_ms, 20);
     assert_eq!(files_b[0].content_hash, "b-v1");
-    let hits_b = store
-        .hybrid_search(&key_b, "sharedquery", 10)
+    let signals_b = store
+        .retrieve_signals(&key_b, "sharedquery", 10)
         .await
         .expect("search root b after touch");
-    assert_eq!(hits_b.len(), 2);
-    for hit in &hits_b {
+    assert_eq!(signals_b.hits.len(), 2);
+    for hit in signals_b.hits.values() {
         assert_eq!(hit.corpus_key, key_b);
         assert_eq!(hit.file_ref, file_ref);
         assert!(hit.text.starts_with("sharedquery root-b-"));
@@ -515,14 +527,15 @@ async fn same_name_roots_are_isolated_through_public_lance_api() {
     assert_eq!(files_a[0].corpus_key, key_a);
     assert_eq!(files_a[0].file_ref, file_ref);
     assert_eq!(files_a[0].content_hash, "a-v2");
-    let hits_a = store
-        .hybrid_search(&key_a, "sharedquery", 10)
+    let signals_a = store
+        .retrieve_signals(&key_a, "sharedquery", 10)
         .await
         .expect("search root a after replacement");
-    assert_eq!(hits_a.len(), 1);
-    assert_eq!(hits_a[0].corpus_key, key_a);
-    assert_eq!(hits_a[0].file_ref, file_ref);
-    assert_eq!(hits_a[0].text, "sharedquery root-a-replacement");
+    assert_eq!(signals_a.hits.len(), 1);
+    let hit_a = signals_a.hits.values().next().expect("single hit");
+    assert_eq!(hit_a.corpus_key, key_a);
+    assert_eq!(hit_a.file_ref, file_ref);
+    assert_eq!(hit_a.text, "sharedquery root-a-replacement");
     let stats_a = store
         .corpus_chunk_stats(&key_a)
         .await
@@ -538,12 +551,12 @@ async fn same_name_roots_are_isolated_through_public_lance_api() {
     assert_eq!(files_b[0].file_ref, file_ref);
     assert_eq!(files_b[0].mtime_ms, 20);
     assert_eq!(files_b[0].content_hash, "b-v1");
-    let hits_b = store
-        .hybrid_search(&key_b, "sharedquery", 10)
+    let signals_b = store
+        .retrieve_signals(&key_b, "sharedquery", 10)
         .await
         .expect("search root b after replacement");
-    assert_eq!(hits_b.len(), 2);
-    for hit in &hits_b {
+    assert_eq!(signals_b.hits.len(), 2);
+    for hit in signals_b.hits.values() {
         assert_eq!(hit.corpus_key, key_b);
         assert_eq!(hit.file_ref, file_ref);
         assert!(hit.text.starts_with("sharedquery root-b-"));
@@ -559,13 +572,12 @@ async fn same_name_roots_are_isolated_through_public_lance_api() {
         .await
         .expect("delete root a");
     assert!(store.list_files(&key_a).await.unwrap().is_empty());
-    assert!(
-        store
-            .hybrid_search(&key_a, "sharedquery", 10)
-            .await
-            .expect("search root a after deletion")
-            .is_empty()
-    );
+    let signals_a = store
+        .retrieve_signals(&key_a, "sharedquery", 10)
+        .await
+        .expect("search root a after deletion");
+    assert!(signals_a.fts.is_empty());
+    assert!(signals_a.hits.is_empty());
     let stats_a = store
         .corpus_chunk_stats(&key_a)
         .await
@@ -581,12 +593,12 @@ async fn same_name_roots_are_isolated_through_public_lance_api() {
     assert_eq!(files_b[0].file_ref, file_ref);
     assert_eq!(files_b[0].mtime_ms, 20);
     assert_eq!(files_b[0].content_hash, "b-v1");
-    let hits_b = store
-        .hybrid_search(&key_b, "sharedquery", 10)
+    let signals_b = store
+        .retrieve_signals(&key_b, "sharedquery", 10)
         .await
         .expect("search root b after deletion");
-    assert_eq!(hits_b.len(), 2);
-    for hit in &hits_b {
+    assert_eq!(signals_b.hits.len(), 2);
+    for hit in signals_b.hits.values() {
         assert_eq!(hit.corpus_key, key_b);
         assert_eq!(hit.file_ref, file_ref);
         assert!(hit.text.starts_with("sharedquery root-b-"));

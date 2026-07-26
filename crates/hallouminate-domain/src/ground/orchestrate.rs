@@ -227,10 +227,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::indexer::{BatchWriteStats, FileSnapshot, PreparedFile};
+    use crate::indexer::{BatchWriteStats, FileSnapshot, PreparedFile, SignalLists};
 
-    /// In-memory `ChunkStore` test double for orchestration/rerank tests:
-    /// `hybrid_search` returns a canned, pre-seeded hit list; writes are
+    /// `retrieve_signals` returns a canned, pre-seeded hit list; writes are
     /// no-ops. Keeps these tests off the real Lance/embedder adapter stack
     /// (US-002: embedding is adapter-owned, invisible to domain code).
     #[derive(Default)]
@@ -244,19 +243,33 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn hybrid_search(
+        async fn retrieve_signals(
             &self,
             corpus_key: &CorpusKey,
             _query: &str,
             limit: usize,
-        ) -> Result<Vec<SearchHit>> {
-            Ok(self
+        ) -> Result<SignalLists> {
+            let hits: Vec<SearchHit> = self
                 .hits
                 .iter()
                 .filter(|hit| hit.corpus_key == *corpus_key)
                 .take(limit)
                 .cloned()
-                .collect())
+                .collect();
+            Ok(SignalLists {
+                fts: hits.iter().map(|h| h.chunk_id.clone()).collect(),
+                vector: Vec::new(),
+                hits: hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect(),
+            })
+        }
+
+        async fn contains_term_counts(
+            &self,
+            _corpus_key: &CorpusKey,
+            _terms: &[String],
+            _chunk_ids: &[String],
+        ) -> Result<std::collections::HashMap<String, usize>> {
+            Ok(std::collections::HashMap::new())
         }
 
         async fn touch_mtime(
@@ -277,10 +290,23 @@ mod tests {
         }
     }
 
+    /// An empty directory standing in for a corpus root, shared by every
+    /// fixture in this module.
+    ///
+    /// The root must be a real, *small* directory rather than `/`. `ground`
+    /// runs a ripgrep pass over the corpus root, so rooting a fixture at `/`
+    /// makes these tests crawl the entire filesystem — fast only while the
+    /// literal pass happens to match nothing.
+    fn fixture_root() -> &'static std::path::Path {
+        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| tempfile::tempdir().expect("fixture corpus root"))
+            .path()
+    }
+
     fn fixture_corpus() -> CorpusConfig {
         CorpusConfig {
             name: "fixtures".into(),
-            paths: vec!["/".into()],
+            paths: vec![fixture_root().to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: Vec::new(),
             global: false,
@@ -366,7 +392,10 @@ mod tests {
     fn hit_for_timeout_test(file_ref: &str, score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#0"),
-            corpus_key: CorpusKey::from_configured_root("fixtures", "/"),
+            corpus_key: CorpusKey::from_configured_root(
+                "fixtures",
+                &fixture_root().to_string_lossy(),
+            ),
             file_ref: file_ref.into(),
             heading_path: vec![],
             line_start: 1,
@@ -461,7 +490,10 @@ mod tests {
     /// all-None unconditionally.
     fn fixture_hits() -> Vec<SearchHit> {
         (0..5)
-            .map(|i| hit_for_timeout_test(&format!("/spice{i}.md"), i as f32))
+            .map(|i| {
+                let file_ref = fixture_root().join(format!("spice{i}.md"));
+                hit_for_timeout_test(&file_ref.to_string_lossy(), i as f32)
+            })
             .collect()
     }
 

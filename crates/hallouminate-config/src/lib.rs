@@ -13,6 +13,10 @@ use hallouminate_domain::repository::{
 
 const DEFAULT_TOP_FILES: usize = 10;
 const DEFAULT_CHUNKS_PER_FILE: usize = 3;
+// Candidate pool retrieved per signal before fusion. 50 is a fixed count, so
+// it is a large share of a small corpus and a small share of a large one —
+// which is why it is configurable per corpus rather than hardcoded.
+const DEFAULT_LIMIT: usize = 50;
 const DEFAULT_DEBOUNCE_MS: u64 = 500;
 const DEFAULT_FAILURE_REMINDER_SECS: u64 = 60;
 const DEFAULT_MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -33,6 +37,10 @@ pub struct SearchConfig {
     /// Number of chunks shown per file by default (default `3`).
     #[serde(default = "default_chunks_per_file")]
     pub chunks_per_file_default: usize,
+    /// Candidate pool size retrieved per signal before fusion, used when a
+    /// query does not set its own limit (default `50`).
+    #[serde(default = "default_limit")]
+    pub limit_default: usize,
     /// Crossencoder model identifier (e.g. `"jina-reranker-v1-turbo-en"`).
     /// `None` (the default) disables the rerank step entirely; the
     /// FTS+vector+rg fusion result is returned as-is. Names map to
@@ -51,6 +59,7 @@ impl Default for SearchConfig {
         Self {
             top_files_default: DEFAULT_TOP_FILES,
             chunks_per_file_default: DEFAULT_CHUNKS_PER_FILE,
+            limit_default: DEFAULT_LIMIT,
             crossencoder: None,
             rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
         }
@@ -659,6 +668,14 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        limit_default: merge_scalar(
+            "search.limit_default",
+            baseline.search.limit_default,
+            repo.search.limit_default,
+            defaults.search.limit_default,
+            baseline_path,
+            repo_path,
+        )?,
         crossencoder: merge_scalar(
             "search.crossencoder",
             baseline.search.crossencoder.clone(),
@@ -1181,6 +1198,9 @@ fn default_top_files() -> usize {
 }
 fn default_chunks_per_file() -> usize {
     DEFAULT_CHUNKS_PER_FILE
+}
+fn default_limit() -> usize {
+    DEFAULT_LIMIT
 }
 fn default_rerank_timeout_ms() -> u64 {
     DEFAULT_RERANK_TIMEOUT_MS
@@ -1770,6 +1790,18 @@ boot_backoff_cap_secs = 600
             cfg.search.rerank_timeout_ms, DEFAULT_RERANK_TIMEOUT_MS,
             "omitted rerank_timeout_ms must default to 2000ms (#139)"
         );
+        assert_eq!(
+            cfg.search.limit_default, DEFAULT_LIMIT,
+            "omitted limit_default must keep the historical 50-candidate pool"
+        );
+    }
+
+    #[test]
+    fn parse_limit_default_custom_value() {
+        // The pool is configurable so a large corpus can retrieve deeper than
+        // the fixed 50 that suits a small one.
+        let cfg = parse("[search]\nlimit_default = 200\n", None).expect("parses");
+        assert_eq!(cfg.search.limit_default, 200);
     }
 
     #[test]
@@ -1975,6 +2007,7 @@ rrf_k                   = 60
             SearchConfig {
                 top_files_default: 7,
                 chunks_per_file_default: 2,
+                limit_default: DEFAULT_LIMIT,
                 crossencoder: None,
                 rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
             },

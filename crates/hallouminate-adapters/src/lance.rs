@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use hallouminate_domain::common::{CorpusKey, HallouminateError, Result};
 use hallouminate_domain::corpus::ClaimMark;
 use hallouminate_domain::embeddings::canonical_model_name;
 use hallouminate_domain::indexer::{
-    BatchWriteStats, ChunkStore, FileSnapshot, PreparedFile, SearchHit,
+    BatchWriteStats, ChunkStore, FileSnapshot, PreparedFile, SearchHit, SignalLists,
 };
 
 const TABLE_NAME: &str = "chunks";
@@ -490,6 +490,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     let score = rb
         .column_by_name("_relevance_score")
         .or_else(|| rb.column_by_name("_score"))
+        .or_else(|| rb.column_by_name("_distance"))
         .cloned();
     for i in 0..rb.num_rows() {
         let s = score
@@ -1437,182 +1438,173 @@ impl LanceStore {
         Ok(out)
     }
 
-    /// Hybrid BM25 + vector search reranked with a `WeightedRRFReranker`
-    /// biased toward FTS (see `weighted_rrf::FTS_WEIGHT` /
-    /// `VECTOR_WEIGHT`) when this store owns an [`Embedder`]; falls back to
-    /// BM25-only search otherwise. Scoped to one exact corpus key. Returns an
-    /// empty `Vec` for an empty key or when no rows match its name-and-root
-    /// filter.
+    /// Retrieve the FTS and vector ranked lists separately, unfused. Runs
+    /// both signals concurrently; the vector list is empty when this store
+    /// has no embedder. Scoped to one exact corpus key. Returns empty lists
+    /// for an empty key or when no rows match its name-and-root filter.
     ///
     /// # Errors
     ///
-    /// Returns an error if embedding the query fails, or if the LanceDB
-    /// search, rerank, or row decode fails.
-    async fn hybrid_search(
+    /// Returns an error if embedding the query fails, or if either LanceDB
+    /// scan or row decode fails.
+    async fn retrieve_signals(
         &self,
         corpus_key: &CorpusKey,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<SearchHit>> {
+    ) -> Result<SignalLists> {
         if !self.has_text_index().await? {
-            return Ok(Vec::new());
+            return Ok(SignalLists::default());
         }
         let corpus_filter = corpus_key_filter(corpus_key)?;
-        let mut out: Vec<SearchHit> = Vec::new();
-        if self.embeddings_enabled {
-            let vectors = run_embedding_blocking(
-                Arc::clone(&self.embedder),
-                vec![query.to_string()],
-                EmbedRole::Query,
-            )
-            .await?;
-            let query_vec = vectors.into_iter().next().ok_or_else(|| {
-                HallouminateError::Embed("embed_batch returned no vector for query".into())
-            })?;
-            let reranker = Arc::new(weighted_rrf::WeightedRRFReranker::default());
-            let table = self.table.clone();
-            let fts_query = query.to_string();
-            let batches = supervise_scan("hybrid_search", async move {
-                let stream = table
-                    .query()
-                    .only_if(corpus_filter)
-                    .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
-                    .nearest_to(&query_vec[..])
-                    .map_err(map_lance_err)?
-                    .limit(limit)
-                    .rerank(reranker)
-                    .execute()
-                    .await
-                    .map_err(map_lance_err)?;
-                let batches: Vec<RecordBatch> =
-                    stream.try_collect().await.map_err(map_lance_err)?;
-                Ok(batches)
-            })
-            .await?;
-            for rb in batches {
-                decode_hits(&rb, corpus_key, &mut out)?;
-            }
-        } else {
-            let table = self.table.clone();
-            let fts_query = query.to_string();
-            let batches = supervise_scan("fts_search", async move {
-                let stream = table
-                    .query()
-                    .only_if(corpus_filter)
-                    .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
-                    .limit(limit)
-                    .execute()
-                    .await
-                    .map_err(map_lance_err)?;
-                let batches: Vec<RecordBatch> =
-                    stream.try_collect().await.map_err(map_lance_err)?;
-                Ok(batches)
-            })
-            .await?;
-            for rb in batches {
-                decode_hits(&rb, corpus_key, &mut out)?;
-            }
-        }
-        if out.is_empty() {
-            return Ok(out);
-        }
-        let chunk_ids: Vec<String> = out.iter().map(|h| h.chunk_id.clone()).collect();
-        let matched = match self.contains_matches(corpus_key, query, &chunk_ids).await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(
-                    target: "hallouminate::lance",
-                    error = %e,
-                    "FM-Index contains() query failed; returning FTS+vector-only results"
-                );
-                HashSet::new()
-            }
-        };
-        apply_contains_boost(&mut out, &matched, CONTAINS_WEIGHT, weighted_rrf::K);
-        Ok(out)
-    }
 
-    /// Runs the FM-Index `contains()` substring filter against `search_text`,
-    /// scoped to one exact corpus key and to the chunk IDs already present in
-    /// `out` through a `chunk_id IN (...)` clause. Every chunk this can boost
-    /// is already in that set, so the query is bounded to at most
-    /// `chunk_ids.len()` rows and every matching output hit is boosted. Returns
-    /// the empty set without querying when `query` or `chunk_ids` is empty.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the LanceDB query or row decode fails; the caller
-    /// in `hybrid_search` treats this as non-fatal (logs and falls back to an
-    /// empty match set) rather than failing the whole search.
-    async fn contains_matches(
-        &self,
-        corpus_key: &CorpusKey,
-        query: &str,
-        chunk_ids: &[String],
-    ) -> Result<HashSet<String>> {
-        if query.is_empty() || chunk_ids.is_empty() {
-            return Ok(HashSet::new());
-        }
-        let quoted: Vec<String> = chunk_ids
-            .iter()
-            .map(|c| format!("'{}'", escape_sql_str(c)))
-            .collect();
-        let predicate = format!(
-            "{} AND contains(search_text, '{}') AND chunk_id IN ({})",
-            corpus_key_filter(corpus_key)?,
-            escape_sql_str(query),
-            quoted.join(", ")
-        );
         let table = self.table.clone();
-        let batches = supervise_scan("contains_matches", async move {
+        let fts_query = query.to_string();
+        let fts_filter = corpus_filter.clone();
+        let fts_fut = supervise_scan("fts_search", async move {
             let stream = table
                 .query()
-                .only_if(predicate)
-                .select(lancedb::query::Select::columns(&["chunk_id"]))
+                .only_if(fts_filter)
+                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
+                .limit(limit)
                 .execute()
                 .await
                 .map_err(map_lance_err)?;
             let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
             Ok(batches)
-        })
-        .await?;
-        let mut matched = HashSet::new();
-        for rb in &batches {
-            if rb.num_rows() == 0 {
-                continue;
+        });
+
+        let embeddings_enabled = self.embeddings_enabled;
+        let embedder = Arc::clone(&self.embedder);
+        let vector_table = self.table.clone();
+        let vector_query = query.to_string();
+        let vector_filter = corpus_filter;
+        let vector_fut = async move {
+            if !embeddings_enabled {
+                return Ok(Vec::new());
             }
-            let chunk_id = string_col(rb, "chunk_id")?;
-            for i in 0..rb.num_rows() {
-                matched.insert(chunk_id.value(i).to_string());
+            let vectors =
+                run_embedding_blocking(embedder, vec![vector_query], EmbedRole::Query).await?;
+            let query_vec = vectors.into_iter().next().ok_or_else(|| {
+                HallouminateError::Embed("embed_batch returned no vector for query".into())
+            })?;
+            supervise_scan("vector_search", async move {
+                let stream = vector_table
+                    .query()
+                    .only_if(vector_filter)
+                    .nearest_to(&query_vec[..])
+                    .map_err(map_lance_err)?
+                    .limit(limit)
+                    .execute()
+                    .await
+                    .map_err(map_lance_err)?;
+                let batches: Vec<RecordBatch> =
+                    stream.try_collect().await.map_err(map_lance_err)?;
+                Ok(batches)
+            })
+            .await
+        };
+
+        let (fts_batches, vector_batches) = tokio::try_join!(fts_fut, vector_fut)?;
+
+        let mut fts_hits: Vec<SearchHit> = Vec::new();
+        for rb in &fts_batches {
+            decode_hits(rb, corpus_key, &mut fts_hits)?;
+        }
+        let mut vector_hits: Vec<SearchHit> = Vec::new();
+        for rb in &vector_batches {
+            decode_hits(rb, corpus_key, &mut vector_hits)?;
+        }
+
+        let mut hits: HashMap<String, SearchHit> = HashMap::new();
+        let mut fts: Vec<String> = Vec::new();
+        let mut seen_fts: HashSet<String> = HashSet::new();
+        for hit in fts_hits {
+            if seen_fts.insert(hit.chunk_id.clone()) {
+                fts.push(hit.chunk_id.clone());
+            }
+            hits.entry(hit.chunk_id.clone()).or_insert(hit);
+        }
+        let mut vector: Vec<String> = Vec::new();
+        let mut seen_vector: HashSet<String> = HashSet::new();
+        for hit in vector_hits {
+            if seen_vector.insert(hit.chunk_id.clone()) {
+                vector.push(hit.chunk_id.clone());
+            }
+            hits.entry(hit.chunk_id.clone()).or_insert(hit);
+        }
+
+        Ok(SignalLists { fts, vector, hits })
+    }
+
+    /// For each of `chunk_ids`, how many DISTINCT `terms` its `search_text`
+    /// contains. Chunks matching no term are absent from the map. Runs one
+    /// FM-Index `contains()` query per term, concurrently, each scoped to
+    /// one exact corpus key and to `chunk_ids` through a `chunk_id IN (...)`
+    /// clause. Returns the empty map without querying when `terms` or
+    /// `chunk_ids` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any LanceDB query or row decode fails.
+    async fn contains_term_counts(
+        &self,
+        corpus_key: &CorpusKey,
+        terms: &[String],
+        chunk_ids: &[String],
+    ) -> Result<HashMap<String, usize>> {
+        if terms.is_empty() || chunk_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let quoted: Vec<String> = chunk_ids
+            .iter()
+            .map(|c| format!("'{}'", escape_sql_str(c)))
+            .collect();
+        let chunk_id_in = format!("chunk_id IN ({})", quoted.join(", "));
+        let corpus_filter = corpus_key_filter(corpus_key)?;
+
+        let queries = terms.iter().map(|term| {
+            let predicate = format!(
+                "{} AND contains(search_text, '{}') AND {}",
+                corpus_filter,
+                escape_sql_str(term),
+                chunk_id_in
+            );
+            let table = self.table.clone();
+            supervise_scan("contains_term", async move {
+                let stream = table
+                    .query()
+                    .only_if(predicate)
+                    .select(lancedb::query::Select::columns(&["chunk_id"]))
+                    .execute()
+                    .await
+                    .map_err(map_lance_err)?;
+                let batches: Vec<RecordBatch> =
+                    stream.try_collect().await.map_err(map_lance_err)?;
+                Ok(batches)
+            })
+        });
+        let per_term_batches: Vec<Vec<RecordBatch>> =
+            futures::future::try_join_all(queries).await?;
+
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for batches in per_term_batches {
+            let mut matched_this_term: HashSet<String> = HashSet::new();
+            for rb in &batches {
+                if rb.num_rows() == 0 {
+                    continue;
+                }
+                let chunk_id = string_col(rb, "chunk_id")?;
+                for i in 0..rb.num_rows() {
+                    matched_this_term.insert(chunk_id.value(i).to_string());
+                }
+            }
+            for chunk_id in matched_this_term {
+                *counts.entry(chunk_id).or_insert(0) += 1;
             }
         }
-        Ok(matched)
+        Ok(counts)
     }
-}
-
-/// Boost weight for an FM-Index `contains()` match in [`apply_contains_boost`],
-/// matching `hallouminate_domain::search::RIPGREP_WEIGHT`'s value.
-const CONTAINS_WEIGHT: f32 = 1.0;
-
-/// Flat per-chunk boost for an FM-Index `contains()` match — deliberately not
-/// rank-based like `apply_rg_boost` (`hallouminate_domain::search`), since a
-/// `contains()` filter carries no positional/ranking meaning, unlike `rg`'s
-/// first-occurrence-in-file rank. Unlike `apply_rg_boost`, this always
-/// re-sorts even when `matched` is empty: not just a skipped optimization,
-/// but deliberate — the sort's `chunk_id` tie-break keeps ranking
-/// deterministic regardless of whether any chunk was boosted.
-fn apply_contains_boost(hits: &mut [SearchHit], matched: &HashSet<String>, weight: f32, k: f32) {
-    for hit in hits.iter_mut() {
-        if matched.contains(&hit.chunk_id) {
-            hit.score += weight / k;
-        }
-    }
-    hits.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.chunk_id.cmp(&b.chunk_id))
-    });
 }
 
 async fn open_or_create_table(connection: &lancedb::Connection) -> Result<lancedb::Table> {
@@ -1645,13 +1637,22 @@ impl ChunkStore for LanceStore {
         LanceStore::list_files(self, corpus_key).await
     }
 
-    async fn hybrid_search(
+    async fn retrieve_signals(
         &self,
         corpus_key: &CorpusKey,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<SearchHit>> {
-        LanceStore::hybrid_search(self, corpus_key, query, limit).await
+    ) -> Result<SignalLists> {
+        LanceStore::retrieve_signals(self, corpus_key, query, limit).await
+    }
+
+    async fn contains_term_counts(
+        &self,
+        corpus_key: &CorpusKey,
+        terms: &[String],
+        chunk_ids: &[String],
+    ) -> Result<HashMap<String, usize>> {
+        LanceStore::contains_term_counts(self, corpus_key, terms, chunk_ids).await
     }
 
     async fn touch_mtime(
@@ -1894,7 +1895,7 @@ mod tests {
         );
 
         let query_error = store
-            .hybrid_search(&docs_key(), "seed", 10)
+            .retrieve_signals(&docs_key(), "seed", 10)
             .await
             .expect_err("enabled queries must not degrade to lexical-only search");
         assert!(
@@ -2963,12 +2964,12 @@ schema_version = 1
             "the OFF-mode latch must remain closed across later batches"
         );
 
-        let hits = store
-            .hybrid_search(&docs_key(), "chunk-0", 10)
+        let signals = store
+            .retrieve_signals(&docs_key(), "chunk-0", 10)
             .await
             .expect("fts search after re-index");
         assert!(
-            !hits.is_empty(),
+            !signals.fts.is_empty(),
             "FTS must still return results after a multi-batch re-index"
         );
     }
@@ -3005,12 +3006,12 @@ schema_version = 1
             "cached-path batch must still write its rows"
         );
 
-        let hits = store
-            .hybrid_search(&docs_key(), "chunk-1", 10)
+        let signals = store
+            .retrieve_signals(&docs_key(), "chunk-1", 10)
             .await
             .expect("fts search after cached re-index");
         assert!(
-            !hits.is_empty(),
+            !signals.fts.is_empty(),
             "FTS must still return results after the cached-path batch"
         );
     }
@@ -3051,14 +3052,14 @@ schema_version = 1
         // path is covered here; ON-mode zero-row decoding is covered by
         // `build_record_batch_off_mode_writes_null_embeddings_for_every_chunk`
         // and friends at the row-encode layer.
-        let hits = store
-            .hybrid_search(&corpus_key("repo:empty:wiki", "/tmp/empty"), "chunk", 10)
+        let signals = store
+            .retrieve_signals(&corpus_key("repo:empty:wiki", "/tmp/empty"), "chunk", 10)
             .await
-            .expect("hybrid search on an empty corpus must not error");
+            .expect("retrieve_signals on an empty corpus must not error");
         assert!(
-            hits.is_empty(),
+            signals.fts.is_empty(),
             "a zero-row corpus must yield no hits, got {}",
-            hits.len()
+            signals.fts.len()
         );
     }
 
@@ -3184,19 +3185,23 @@ schema_version = 1
         file.chunks[0].search_text = "retrievalcontracttoken".into();
         store.apply_batch(vec![file]).await.expect("apply batch");
 
-        let hits = store
-            .hybrid_search(&docs_key(), "retrievalcontracttoken", 10)
+        let signals = store
+            .retrieve_signals(&docs_key(), "retrievalcontracttoken", 10)
             .await
             .expect("search indexed text");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].text, "displaycontracttoken");
-        assert_eq!(hits[0].search_text, "retrievalcontracttoken");
+        assert_eq!(signals.fts.len(), 1);
+        let hit = signals
+            .hits
+            .get(&signals.fts[0])
+            .expect("hit for ranked chunk_id");
+        assert_eq!(hit.text, "displaycontracttoken");
+        assert_eq!(hit.search_text, "retrievalcontracttoken");
 
-        let display_hits = store
-            .hybrid_search(&docs_key(), "displaycontracttoken", 10)
+        let display_signals = store
+            .retrieve_signals(&docs_key(), "displaycontracttoken", 10)
             .await
             .expect("search display-only token");
-        assert!(display_hits.is_empty());
+        assert!(display_signals.fts.is_empty());
     }
 
     #[tokio::test]
@@ -3217,13 +3222,17 @@ schema_version = 1
             .await
             .expect("append later batch");
 
-        let hits = store
-            .hybrid_search(&docs_key(), "laterbatchdisjointtoken", 10)
+        let signals = store
+            .retrieve_signals(&docs_key(), "laterbatchdisjointtoken", 10)
             .await
             .expect("search later batch token");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].file_ref, "/tmp/later.md");
-        assert_eq!(hits[0].chunk_id, chunk_id_for("/tmp/later.md", 0));
+        assert_eq!(signals.fts.len(), 1);
+        let hit = signals
+            .hits
+            .get(&signals.fts[0])
+            .expect("hit for ranked chunk_id");
+        assert_eq!(hit.file_ref, "/tmp/later.md");
+        assert_eq!(hit.chunk_id, chunk_id_for("/tmp/later.md", 0));
     }
 
     #[tokio::test]
@@ -3281,175 +3290,50 @@ schema_version = 1
             .await
             .expect("append root B after reopen");
 
-        let hits_b = store
-            .hybrid_search(&key_b, "reopenedrootbuniquetoken", 10)
+        let signals_b = store
+            .retrieve_signals(&key_b, "reopenedrootbuniquetoken", 10)
             .await
             .expect("search root B token in root B");
-        assert_eq!(hits_b.len(), 1);
-        assert_eq!(hits_b[0].corpus_key, key_b);
-        assert_eq!(hits_b[0].file_ref, "/tmp/reopen-b.md");
-        assert_eq!(hits_b[0].chunk_id, chunk_id_for("/tmp/reopen-b.md", 0));
+        assert_eq!(signals_b.fts.len(), 1);
+        let hit_b = signals_b
+            .hits
+            .get(&signals_b.fts[0])
+            .expect("hit for ranked chunk_id");
+        assert_eq!(hit_b.corpus_key, key_b);
+        assert_eq!(hit_b.file_ref, "/tmp/reopen-b.md");
+        assert_eq!(hit_b.chunk_id, chunk_id_for("/tmp/reopen-b.md", 0));
         assert!(
             store
-                .hybrid_search(&key_a, "reopenedrootbuniquetoken", 10)
+                .retrieve_signals(&key_a, "reopenedrootbuniquetoken", 10)
                 .await
                 .expect("search root B token in root A")
+                .fts
                 .is_empty()
         );
 
-        let hits_a = store
-            .hybrid_search(&key_a, "persistedrootatoken", 10)
+        let signals_a = store
+            .retrieve_signals(&key_a, "persistedrootatoken", 10)
             .await
             .expect("search persisted root A token in root A");
-        assert_eq!(hits_a.len(), 1);
-        assert_eq!(hits_a[0].corpus_key, key_a);
-        assert_eq!(hits_a[0].file_ref, "/tmp/reopen-a.md");
+        assert_eq!(signals_a.fts.len(), 1);
+        let hit_a = signals_a
+            .hits
+            .get(&signals_a.fts[0])
+            .expect("hit for ranked chunk_id");
+        assert_eq!(hit_a.corpus_key, key_a);
+        assert_eq!(hit_a.file_ref, "/tmp/reopen-a.md");
         assert!(
             store
-                .hybrid_search(&key_b, "persistedrootatoken", 10)
+                .retrieve_signals(&key_b, "persistedrootatoken", 10)
                 .await
                 .expect("search root A token in root B")
+                .fts
                 .is_empty()
         );
     }
 
     #[tokio::test]
-    async fn contains_boost_uses_search_text_and_hits_decode_display_text() {
-        let dir = tempfile::tempdir().unwrap();
-        let store =
-            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
-                .await
-                .expect("open store");
-
-        let mut file_a = synthetic_prepared("/tmp/a.md", 0);
-        file_a.chunks.push(PreparedChunk {
-            ord: 0,
-            heading_path: vec!["H".into()],
-            line_start: 1,
-            line_end: 2,
-            text: "display a contains lowercase word".into(),
-            search_text: "Word is here now filler pad pad pad".into(),
-            claim_marks: None,
-        });
-        let mut file_b = synthetic_prepared("/tmp/b.md", 0);
-        file_b.chunks.push(PreparedChunk {
-            ord: 0,
-            heading_path: vec!["H".into()],
-            line_start: 1,
-            line_end: 2,
-            text: "display b contains uppercase Word".into(),
-            search_text: "word is here now filler pad pad pad".into(),
-            claim_marks: None,
-        });
-        store
-            .apply_batch(vec![file_a, file_b])
-            .await
-            .expect("seed tied corpus");
-
-        let hits = store
-            .hybrid_search(&docs_key(), "word", 10)
-            .await
-            .expect("hybrid search");
-        assert_eq!(hits.len(), 2);
-        let hit_a = hits
-            .iter()
-            .find(|hit| hit.file_ref == "/tmp/a.md")
-            .expect("chunk a present");
-        let hit_b = hits
-            .iter()
-            .find(|hit| hit.file_ref == "/tmp/b.md")
-            .expect("chunk b present");
-
-        assert_eq!(hit_a.text, "display a contains lowercase word");
-        assert_eq!(hit_b.text, "display b contains uppercase Word");
-        assert_eq!(hit_a.search_text, "Word is here now filler pad pad pad");
-        assert_eq!(hit_b.search_text, "word is here now filler pad pad pad");
-        assert_eq!(hits[0].file_ref, "/tmp/b.md");
-        let expected_delta = CONTAINS_WEIGHT / weighted_rrf::K;
-        assert!(
-            (hit_b.score - hit_a.score - expected_delta).abs() < 1e-6,
-            "expected search_text contains boost {expected_delta}, got {}",
-            hit_b.score - hit_a.score
-        );
-    }
-
-    /// Non-regression: when `contains()` matches nothing for the query (here,
-    /// because the case-sensitive substring never appears literally even
-    /// though the case-insensitive FTS tokenizer matches both chunks), the
-    /// boost must be a no-op — scores stay FTS-tied and the tie-break order
-    /// is unaffected by the FM-Index signal.
-    #[tokio::test]
-    async fn no_substring_match_leaves_fts_ranking_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let store =
-            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
-                .await
-                .expect("open store");
-
-        let mut pf_a = synthetic_prepared("/tmp/a.md", 0);
-        pf_a.chunks.push(PreparedChunk {
-            ord: 0,
-            heading_path: vec!["H".into()],
-            line_start: 1,
-            line_end: 2,
-            text: "Word is here now filler pad pad pad".into(),
-            search_text: "Word is here now filler pad pad pad".into(),
-            claim_marks: None,
-        });
-        let mut pf_b = synthetic_prepared("/tmp/b.md", 0);
-        pf_b.chunks.push(PreparedChunk {
-            ord: 0,
-            heading_path: vec!["H".into()],
-            line_start: 1,
-            line_end: 2,
-            text: "word is here now filler pad pad pad".into(),
-            search_text: "word is here now filler pad pad pad".into(),
-            claim_marks: None,
-        });
-        store
-            .apply_batch(vec![pf_a, pf_b])
-            .await
-            .expect("seed tied corpus");
-
-        // Uppercase query: FTS tokenizer still matches both (case-insensitive),
-        // but the literal substring "WORD" appears in neither `search_text`, so
-        // contains() matches zero rows and the boost is a no-op.
-        let hits = store
-            .hybrid_search(&docs_key(), "WORD", 10)
-            .await
-            .expect("hybrid search");
-        assert_eq!(
-            hits.len(),
-            2,
-            "expected both chunks to still match FTS on `WORD`, got: {hits:?}"
-        );
-        let a = hits
-            .iter()
-            .find(|h| h.file_ref == "/tmp/a.md")
-            .expect("chunk a present");
-        let b = hits
-            .iter()
-            .find(|h| h.file_ref == "/tmp/b.md")
-            .expect("chunk b present");
-        assert_eq!(
-            a.score, b.score,
-            "no contains() match must leave the FTS tie unbroken, got a={} b={}",
-            a.score, b.score
-        );
-        let expected_order = {
-            let mut ids = vec![chunk_id_for("/tmp/a.md", 0), chunk_id_for("/tmp/b.md", 0)];
-            ids.sort();
-            ids
-        };
-        let actual_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
-        assert_eq!(
-            actual_order, expected_order,
-            "with tied scores, order must follow the chunk_id tie-break exactly"
-        );
-    }
-
-    #[tokio::test]
-    async fn same_name_roots_isolate_contains_matches_when_chunk_ids_collide() {
+    async fn same_name_roots_isolate_contains_term_counts_when_chunk_ids_collide() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store =
             LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
@@ -3483,16 +3367,16 @@ schema_version = 1
             .expect("seed sibling root");
 
         let shared_chunk_id = chunk_id_for(file_ref, 0);
-        let matches = store
-            .contains_matches(
+        let counts = store
+            .contains_term_counts(
                 &requested_key,
-                "SiblingRootExactCaseNeedle",
+                &["SiblingRootExactCaseNeedle".to_string()],
                 &[shared_chunk_id],
             )
             .await
             .expect("check requested root exact matches");
 
-        assert!(matches.is_empty());
+        assert!(counts.is_empty());
     }
 
     #[tokio::test]
@@ -3544,19 +3428,21 @@ schema_version = 1
             .expect("seed root B");
         assert_eq!(store.count_rows().await.expect("count both roots"), 4);
 
-        let hits_a = store
-            .hybrid_search(&key_a, "lexicalrootatokenunique", 10)
+        let signals_a = store
+            .retrieve_signals(&key_a, "lexicalrootatokenunique", 10)
             .await
             .expect("lexical search root A");
-        assert_eq!(hits_a.len(), 2);
-        for hit in &hits_a {
+        assert_eq!(signals_a.fts.len(), 2);
+        for chunk_id in &signals_a.fts {
+            let hit = signals_a.hits.get(chunk_id).expect("hit for ranked chunk");
             assert_eq!(hit.corpus_key, key_a);
         }
-        let cross_root_hits = store
-            .hybrid_search(&key_b, "lexicalrootatokenunique", 10)
+        let cross_root = store
+            .retrieve_signals(&key_b, "lexicalrootatokenunique", 10)
             .await
             .expect("lexical search root B for root A token");
-        assert!(cross_root_hits.is_empty());
+        assert!(cross_root.fts.is_empty());
+        assert!(cross_root.hits.is_empty());
 
         let snapshots_a = store.list_files(&key_a).await.expect("list root A");
         let snapshots_b = store.list_files(&key_b).await.expect("list root B");
@@ -3622,11 +3508,11 @@ schema_version = 1
         assert_eq!(stats_a.last_indexed_ms, Some(300));
         assert_eq!(stats_b.total_chunks, 2);
         assert_eq!(stats_b.last_indexed_ms, Some(200));
-        let hits_b = store
-            .hybrid_search(&key_b, "lexicalrootbtokenunique", 10)
+        let signals_b = store
+            .retrieve_signals(&key_b, "lexicalrootbtokenunique", 10)
             .await
             .expect("root B remains searchable after root A replacement");
-        assert_eq!(hits_b.len(), 2);
+        assert_eq!(signals_b.fts.len(), 2);
         assert_eq!(
             store.count_rows().await.expect("count after replacement"),
             3
@@ -3663,15 +3549,15 @@ schema_version = 1
                 .total_chunks,
             2
         );
-        let hits_b = store
-            .hybrid_search(&key_b, "lexicalrootbtokenunique", 10)
+        let signals_b = store
+            .retrieve_signals(&key_b, "lexicalrootbtokenunique", 10)
             .await
             .expect("root B remains searchable after root A delete");
-        assert_eq!(hits_b.len(), 2);
+        assert_eq!(signals_b.fts.len(), 2);
     }
 
     #[tokio::test]
-    async fn same_name_roots_isolate_hybrid_search() {
+    async fn same_name_roots_isolate_retrieve_signals() {
         let dir = tempfile::tempdir().expect("tempdir");
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let store = LanceStore::open_or_create(
@@ -3711,21 +3597,33 @@ schema_version = 1
             .await
             .expect("seed hybrid root B");
 
-        let hits_a = store
-            .hybrid_search(&key_a, "shared-hybrid-token", 10)
+        let signals_a = store
+            .retrieve_signals(&key_a, "shared-hybrid-token", 10)
             .await
-            .expect("hybrid search root A");
-        assert_eq!(hits_a.len(), 1);
-        assert_eq!(hits_a[0].corpus_key, key_a);
-        assert_eq!(hits_a[0].file_ref, "/tmp/hybrid-a.md");
+            .expect("retrieve signals root A");
+        assert_eq!(signals_a.hits.len(), 1);
+        let hit_a = signals_a
+            .hits
+            .values()
+            .next()
+            .expect("root A hit")
+            .to_owned();
+        assert_eq!(hit_a.corpus_key, key_a);
+        assert_eq!(hit_a.file_ref, "/tmp/hybrid-a.md");
 
-        let hits_b = store
-            .hybrid_search(&key_b, "shared-hybrid-token", 10)
+        let signals_b = store
+            .retrieve_signals(&key_b, "shared-hybrid-token", 10)
             .await
-            .expect("hybrid search root B");
-        assert_eq!(hits_b.len(), 1);
-        assert_eq!(hits_b[0].corpus_key, key_b);
-        assert_eq!(hits_b[0].file_ref, "/tmp/hybrid-b.md");
+            .expect("retrieve signals root B");
+        assert_eq!(signals_b.hits.len(), 1);
+        let hit_b = signals_b
+            .hits
+            .values()
+            .next()
+            .expect("root B hit")
+            .to_owned();
+        assert_eq!(hit_b.corpus_key, key_b);
+        assert_eq!(hit_b.file_ref, "/tmp/hybrid-b.md");
 
         let calls = calls.lock().expect("recording lock");
         let mut query_calls = 0;
@@ -3788,220 +3686,5 @@ schema_version = 1
             .expect("FM-Index must exist on search_text");
         assert_ne!(fts_index.name, fm_index.name);
         assert_eq!(fm_index.name, "search_text_fm_idx");
-    }
-}
-
-/// Weighted Reciprocal Rank Fusion reranker for hybrid (BM25 + vector)
-/// search. Identical to LanceDB's stock `RRFReranker` except each ranked
-/// list contributes a per-source multiplier on top of the standard
-/// `1 / (k + rank)` term, letting us bias fusion toward FTS when the
-/// embedding model is generic and the corpus is keyword-heavy.
-mod weighted_rrf {
-    use std::collections::BTreeMap;
-    use std::sync::Arc;
-
-    use arrow::array::downcast_array;
-    use arrow::array::{Float32Array, RecordBatch, UInt64Array};
-    use arrow::compute::{SortOptions, sort_to_indices, take};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use async_trait::async_trait;
-    use lancedb::rerankers::Reranker;
-
-    /// Matches `lance::dataset::ROW_ID` — hardcoded so we don't pull
-    /// `lance-core` into our dep graph just for one `&str` constant.
-    const ROW_ID: &str = "_rowid";
-    /// Column name LanceDB's hybrid pipeline requires the reranker to
-    /// emit. Mirrors `lancedb::rerankers::RELEVANCE_SCORE`, which is
-    /// private; if LanceDB ever renames it, `check_reranker_result`
-    /// raises a `Schema` error and tests fail loudly.
-    const RELEVANCE_SCORE: &str = "_relevance_score";
-
-    /// FTS rank gets twice the weight of vector rank in the fused score.
-    /// Picked because BM25 over our short markdown chunks beats the
-    /// generic `bge-small-en-v1.5` embeddings on distinctive-token
-    /// queries (the e2e oracles in `tests/fixture_e2e.rs` rely entirely
-    /// on the FTS path under the stub embedder).
-    pub const FTS_WEIGHT: f32 = 2.0;
-    /// Baseline weight for the vector (ANN) ranked list; FTS is biased above
-    /// it via [`FTS_WEIGHT`].
-    pub const VECTOR_WEIGHT: f32 = 1.0;
-    /// RRF dampening constant; 60 matches Cormack et al. and LanceDB's
-    /// stock default.
-    pub const K: f32 = 60.0;
-
-    #[derive(Debug)]
-    pub struct WeightedRRFReranker {
-        k: f32,
-        fts_weight: f32,
-        vector_weight: f32,
-    }
-
-    impl Default for WeightedRRFReranker {
-        fn default() -> Self {
-            Self {
-                k: K,
-                fts_weight: FTS_WEIGHT,
-                vector_weight: VECTOR_WEIGHT,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl Reranker for WeightedRRFReranker {
-        async fn rerank_hybrid(
-            &self,
-            _query: &str,
-            vector_results: RecordBatch,
-            fts_results: RecordBatch,
-        ) -> lancedb::Result<RecordBatch> {
-            let vector_ids: UInt64Array = downcast_array(
-                vector_results
-                    .column_by_name(ROW_ID)
-                    .ok_or_else(|| missing_row_id("vector_results", &vector_results))?,
-            );
-            let fts_ids: UInt64Array = downcast_array(
-                fts_results
-                    .column_by_name(ROW_ID)
-                    .ok_or_else(|| missing_row_id("fts_results", &fts_results))?,
-            );
-
-            let mut scores: BTreeMap<u64, f32> = BTreeMap::new();
-            accumulate(&mut scores, &vector_ids, self.vector_weight, self.k);
-            accumulate(&mut scores, &fts_ids, self.fts_weight, self.k);
-
-            let combined = self.merge_results(vector_results, fts_results)?;
-            let combined_row_ids: UInt64Array = downcast_array(
-                combined
-                    .column_by_name(ROW_ID)
-                    .ok_or_else(|| missing_row_id("merged results", &combined))?,
-            );
-
-            let relevance_scores = Float32Array::from_iter_values(
-                combined_row_ids
-                    .values()
-                    .iter()
-                    .map(|row_id| *scores.get(row_id).unwrap_or(&0.0)),
-            );
-
-            let sort_indices = sort_to_indices(
-                &relevance_scores,
-                Some(SortOptions {
-                    descending: true,
-                    ..Default::default()
-                }),
-                None,
-            )?;
-
-            let mut columns: Vec<Arc<dyn arrow::array::Array>> = combined.columns().to_vec();
-            columns.push(Arc::new(relevance_scores));
-            let columns: Vec<Arc<dyn arrow::array::Array>> = columns
-                .iter()
-                .map(|c| take(c, &sort_indices, None))
-                .collect::<arrow::error::Result<_>>()?;
-
-            let mut fields = combined.schema().fields().to_vec();
-            fields.push(Arc::new(Field::new(
-                RELEVANCE_SCORE,
-                DataType::Float32,
-                false,
-            )));
-            let schema = Schema::new(fields);
-
-            Ok(RecordBatch::try_new(Arc::new(schema), columns)?)
-        }
-    }
-
-    fn accumulate(scores: &mut BTreeMap<u64, f32>, ids: &UInt64Array, weight: f32, k: f32) {
-        for (rank, row_id) in ids.values().iter().enumerate() {
-            let contribution = weight / (rank as f32 + k);
-            scores
-                .entry(*row_id)
-                .and_modify(|s| *s += contribution)
-                .or_insert(contribution);
-        }
-    }
-
-    fn missing_row_id(which: &str, batch: &RecordBatch) -> lancedb::Error {
-        let schema = batch.schema();
-        let cols: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-        lancedb::Error::InvalidInput {
-            message: format!("expected column {ROW_ID} not found in {which}; found {cols:?}"),
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use arrow::array::StringArray;
-
-        fn batch(ids: &[u64], names: &[&str]) -> RecordBatch {
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("name", DataType::Utf8, false),
-                Field::new(ROW_ID, DataType::UInt64, false),
-            ]));
-            RecordBatch::try_new(
-                schema,
-                vec![
-                    Arc::new(StringArray::from(names.to_vec())),
-                    Arc::new(UInt64Array::from(ids.to_vec())),
-                ],
-            )
-            .unwrap()
-        }
-
-        /// FTS-only hit at rank 0 must beat a vector-only hit at rank 0
-        /// once the weight bias is applied. With equal weights the two
-        /// would tie; with FTS_WEIGHT > VECTOR_WEIGHT the FTS row wins.
-        #[tokio::test]
-        async fn fts_only_hit_outranks_vector_only_hit_at_same_rank() {
-            let vec_results = batch(&[1], &["vec_only"]);
-            let fts_results = batch(&[2], &["fts_only"]);
-            let reranker = WeightedRRFReranker::default();
-            let out = reranker
-                .rerank_hybrid("q", vec_results, fts_results)
-                .await
-                .unwrap();
-            let names: StringArray = downcast_array(out.column(0));
-            let names: Vec<&str> = names.iter().map(|n| n.unwrap()).collect();
-            assert_eq!(
-                names[0], "fts_only",
-                "FTS-weighted RRF must rank fts_only first"
-            );
-            assert_eq!(names[1], "vec_only");
-        }
-
-        /// Row in both lists must beat either list's solo top hit (the
-        /// weight bias must not invert RRF's core property of rewarding
-        /// agreement).
-        #[tokio::test]
-        async fn row_in_both_lists_beats_solo_hits() {
-            let vec_results = batch(&[1, 2], &["solo_vec", "shared"]);
-            let fts_results = batch(&[3, 2], &["solo_fts", "shared"]);
-            let reranker = WeightedRRFReranker::default();
-            let out = reranker
-                .rerank_hybrid("q", vec_results, fts_results)
-                .await
-                .unwrap();
-            let names: StringArray = downcast_array(out.column(0));
-            let names: Vec<&str> = names.iter().map(|n| n.unwrap()).collect();
-            assert_eq!(names[0], "shared");
-        }
-
-        /// Output must carry the `_relevance_score` column LanceDB's
-        /// hybrid pipeline validates via `check_reranker_result`.
-        #[tokio::test]
-        async fn output_includes_relevance_score_column() {
-            let vec_results = batch(&[1], &["a"]);
-            let fts_results = batch(&[1], &["a"]);
-            let reranker = WeightedRRFReranker::default();
-            let out = reranker
-                .rerank_hybrid("q", vec_results, fts_results)
-                .await
-                .unwrap();
-            assert!(
-                out.schema().column_with_name(RELEVANCE_SCORE).is_some(),
-                "schema must expose {RELEVANCE_SCORE}"
-            );
-        }
     }
 }

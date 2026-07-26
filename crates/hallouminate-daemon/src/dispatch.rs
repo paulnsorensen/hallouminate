@@ -357,7 +357,7 @@ async fn handle_ground(
         chunks_per_file: req
             .chunks_per_file
             .unwrap_or(cfg.search.chunks_per_file_default),
-        limit: req.limit.unwrap_or(50),
+        limit: req.limit.unwrap_or(cfg.search.limit_default),
         rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
     };
 

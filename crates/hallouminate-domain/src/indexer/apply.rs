@@ -288,7 +288,7 @@ mod tests {
 
     use super::*;
     use crate::common::{HallouminateError, canonicalize_or_passthrough, expand_tilde};
-    use crate::indexer::{BatchWriteStats, FileSnapshot, SearchHit, Upsert};
+    use crate::indexer::{BatchWriteStats, FileSnapshot, SignalLists, Upsert};
 
     #[derive(Default)]
     struct RecordingStore {
@@ -302,13 +302,22 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn hybrid_search(
+        async fn retrieve_signals(
             &self,
             _corpus_key: &CorpusKey,
             _query: &str,
             _limit: usize,
-        ) -> Result<Vec<SearchHit>> {
-            Ok(Vec::new())
+        ) -> Result<SignalLists> {
+            Ok(SignalLists::default())
+        }
+
+        async fn contains_term_counts(
+            &self,
+            _corpus_key: &CorpusKey,
+            _terms: &[String],
+            _chunk_ids: &[String],
+        ) -> Result<std::collections::HashMap<String, usize>> {
+            Ok(std::collections::HashMap::new())
         }
 
         async fn touch_mtime(
