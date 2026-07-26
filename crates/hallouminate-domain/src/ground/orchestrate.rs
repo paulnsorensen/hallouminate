@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
-use crate::indexer::{ChunkStore, SearchHit};
-use crate::search::{Crossencoder, FusedSearch, search_fused};
+use crate::indexer::SearchHit;
+use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
 
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats, Warning};
@@ -109,7 +109,7 @@ impl Default for GroundOpts {
 pub async fn ground(
     query: &str,
     corpus: &CorpusConfig,
-    store: &dyn ChunkStore,
+    store: &dyn ChunkRetrieval,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
@@ -128,7 +128,7 @@ pub async fn ground(
 async fn search_corpus(
     query: &str,
     corpus_key: &CorpusKey,
-    store: &dyn ChunkStore,
+    store: &dyn ChunkRetrieval,
     limit: usize,
 ) -> Result<FusedSearch> {
     search_fused(store, corpus_key, query, limit).await
@@ -138,7 +138,7 @@ async fn search_corpus(
 pub async fn ground_union(
     query: &str,
     corpora: &[CorpusConfig],
-    store: &dyn ChunkStore,
+    store: &dyn ChunkRetrieval,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
@@ -234,7 +234,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::indexer::{BatchWriteStats, FileSnapshot, PreparedFile, SignalLists};
+    use crate::indexer::SignalLists;
 
     /// `retrieve_signals` returns a canned, pre-seeded hit list; writes are
     /// no-ops. Keeps these tests off the real Lance/embedder adapter stack
@@ -245,11 +245,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl ChunkStore for FakeChunkStore {
-        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
-            Ok(Vec::new())
-        }
-
+    impl ChunkRetrieval for FakeChunkStore {
         async fn retrieve_signals(
             &self,
             corpus_key: &CorpusKey,
@@ -268,23 +264,6 @@ mod tests {
                 vector: Vec::new(),
                 hits: hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect(),
             })
-        }
-
-        async fn touch_mtime(
-            &self,
-            _corpus_key: &CorpusKey,
-            _file_ref: &str,
-            _mtime_ms: i64,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        async fn delete_file(&self, _corpus_key: &CorpusKey, _file_ref: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
-            Ok(BatchWriteStats::default())
         }
     }
 
@@ -344,11 +323,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl ChunkStore for SleepyChunkStore {
-        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
-            Ok(Vec::new())
-        }
-
+    impl ChunkRetrieval for SleepyChunkStore {
         async fn retrieve_signals(
             &self,
             _corpus_key: &CorpusKey,
@@ -358,23 +333,6 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             Ok(SignalLists::default())
-        }
-
-        async fn touch_mtime(
-            &self,
-            _corpus_key: &CorpusKey,
-            _file_ref: &str,
-            _mtime_ms: i64,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        async fn delete_file(&self, _corpus_key: &CorpusKey, _file_ref: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
-            Ok(BatchWriteStats::default())
         }
     }
 

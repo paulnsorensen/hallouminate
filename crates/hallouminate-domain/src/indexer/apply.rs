@@ -288,7 +288,7 @@ mod tests {
 
     use super::*;
     use crate::common::{HallouminateError, canonicalize_or_passthrough, expand_tilde};
-    use crate::indexer::{BatchWriteStats, FileSnapshot, SignalLists, Upsert};
+    use crate::indexer::{BatchWriteStats, FileSnapshot, Upsert};
 
     #[derive(Default)]
     struct RecordingStore {
@@ -300,15 +300,6 @@ mod tests {
     impl ChunkStore for RecordingStore {
         async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
             Ok(Vec::new())
-        }
-
-        async fn retrieve_signals(
-            &self,
-            _corpus_key: &CorpusKey,
-            _query: &str,
-            _limit: usize,
-        ) -> Result<SignalLists> {
-            Ok(SignalLists::default())
         }
 
         async fn touch_mtime(

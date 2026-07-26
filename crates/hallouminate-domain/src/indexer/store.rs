@@ -6,21 +6,13 @@ use crate::common::{CorpusKey, Result};
 use crate::indexer::chunk::{PreparedFile, SearchHit};
 use crate::indexer::plan::FileSnapshot;
 
-/// Storage-agnostic port for chunk retrieval and persistence.
+/// Storage-agnostic port for chunk persistence (index-time writes).
 ///
-/// Text in, hits out: embedding is an adapter-internal implementation detail
-/// of `retrieve_signals` and `apply_batch`. Domain callers never see a vector.
+/// Text in: embedding is an adapter-internal implementation detail of
+/// `apply_batch`. Domain callers never see a vector.
 #[async_trait]
 pub trait ChunkStore: Send + Sync {
     async fn list_files(&self, corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>>;
-
-    /// Retrieve the FTS and vector ranked lists separately, unfused.
-    async fn retrieve_signals(
-        &self,
-        corpus_key: &CorpusKey,
-        query: &str,
-        limit: usize,
-    ) -> Result<SignalLists>;
 
     async fn touch_mtime(
         &self,

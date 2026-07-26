@@ -32,7 +32,8 @@ use std::collections::HashMap;
 
 use crate::common::{CorpusKey, Result};
 use crate::ground::Warning;
-use crate::indexer::{ChunkStore, SearchHit};
+use crate::indexer::{SearchHit, SignalLists};
+use async_trait::async_trait;
 use fuse::{RankedList, fuse};
 use terms::split_terms;
 
@@ -67,6 +68,21 @@ pub const RIPGREP_WEIGHT: f32 = 0.5;
 /// literal signals are weighted together and for the same reason.
 pub const CONTAINS_WEIGHT: f32 = 0.5;
 
+/// Storage-agnostic port for chunk retrieval (ranking-time reads).
+///
+/// Split from `ChunkStore` so the ranking path can depend on retrieval
+/// alone and never reach the write path.
+#[async_trait]
+pub trait ChunkRetrieval: Send + Sync {
+    /// Retrieve the FTS and vector ranked lists separately, unfused.
+    async fn retrieve_signals(
+        &self,
+        corpus_key: &CorpusKey,
+        query: &str,
+        limit: usize,
+    ) -> Result<SignalLists>;
+}
+
 /// Outcome of [`search_fused`]: the fused hits plus any warnings raised
 /// while assembling the four signals (e.g. a degraded ripgrep pass).
 pub struct FusedSearch {
@@ -83,7 +99,7 @@ pub struct FusedSearch {
 /// rank `signals.hits` — the pool `store.retrieve_signals` returned —
 /// so a chunk outside that FTS/vector pool is invisible to both.
 pub async fn search_fused(
-    store: &dyn ChunkStore,
+    store: &dyn ChunkRetrieval,
     corpus_key: &CorpusKey,
     query: &str,
     limit: usize,
@@ -349,7 +365,7 @@ fn ranked_by_term_count(counts: HashMap<String, usize>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::indexer::{BatchWriteStats, FileSnapshot, PreparedFile, SignalLists};
+    use crate::indexer::SignalLists;
     use async_trait::async_trait;
     use std::path::PathBuf;
 
@@ -624,11 +640,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl ChunkStore for FakeFusionStore {
-        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
-            Ok(Vec::new())
-        }
-
+    impl ChunkRetrieval for FakeFusionStore {
         async fn retrieve_signals(
             &self,
             _corpus_key: &CorpusKey,
@@ -640,23 +652,6 @@ mod tests {
                 vector: self.vector.clone(),
                 hits: self.hits.clone(),
             })
-        }
-
-        async fn touch_mtime(
-            &self,
-            _corpus_key: &CorpusKey,
-            _file_ref: &str,
-            _mtime_ms: i64,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        async fn delete_file(&self, _corpus_key: &CorpusKey, _file_ref: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
-            Ok(BatchWriteStats::default())
         }
     }
 

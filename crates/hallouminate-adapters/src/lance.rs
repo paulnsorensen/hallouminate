@@ -24,6 +24,7 @@ use hallouminate_domain::embeddings::canonical_model_name;
 use hallouminate_domain::indexer::{
     BatchWriteStats, ChunkStore, FileSnapshot, PreparedFile, SearchHit, SignalLists,
 };
+use hallouminate_domain::search::ChunkRetrieval;
 
 const TABLE_NAME: &str = "chunks";
 const META_FILENAME: &str = "meta.toml";
@@ -1581,14 +1582,6 @@ impl ChunkStore for LanceStore {
         LanceStore::list_files(self, corpus_key).await
     }
 
-    async fn retrieve_signals(
-        &self,
-        corpus_key: &CorpusKey,
-        query: &str,
-        limit: usize,
-    ) -> Result<SignalLists> {
-        LanceStore::retrieve_signals(self, corpus_key, query, limit).await
-    }
     async fn touch_mtime(
         &self,
         corpus_key: &CorpusKey,
@@ -1604,6 +1597,18 @@ impl ChunkStore for LanceStore {
 
     async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
         LanceStore::apply_batch(self, files).await
+    }
+}
+
+#[async_trait]
+impl ChunkRetrieval for LanceStore {
+    async fn retrieve_signals(
+        &self,
+        corpus_key: &CorpusKey,
+        query: &str,
+        limit: usize,
+    ) -> Result<SignalLists> {
+        LanceStore::retrieve_signals(self, corpus_key, query, limit).await
     }
 }
 

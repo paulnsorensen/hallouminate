@@ -10,7 +10,7 @@ use crate::common::{
 use hallouminate_adapters::{LanceStore, chunk_id_for};
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
-use hallouminate_domain::search::search_fused;
+use hallouminate_domain::search::{ChunkRetrieval, search_fused};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
