@@ -196,10 +196,16 @@ fn resolve_rg_hits_to_chunks(
 /// Matches `search_text`, not `text` — `search_text` is the
 /// footnote-stripped derived field; matching `text` would leak footnote
 /// content into literal matching.
-fn contains_term_counts(hits: &HashMap<String, SearchHit>, terms: &[String]) -> HashMap<String, usize> {
+fn contains_term_counts(
+    hits: &HashMap<String, SearchHit>,
+    terms: &[String],
+) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for (chunk_id, hit) in hits {
-        let n = terms.iter().filter(|t| hit.search_text.contains(t.as_str())).count();
+        let n = terms
+            .iter()
+            .filter(|t| hit.search_text.contains(t.as_str()))
+            .count();
         if n > 0 {
             counts.insert(chunk_id.clone(), n);
         }
@@ -336,10 +342,17 @@ mod tests {
 
     #[test]
     fn contains_term_counts_counts_distinct_terms_not_occurrences() {
-        let hits = pool(vec![hit_with_search_text("a", "alpha alpha alpha alpha alpha")]);
+        let hits = pool(vec![hit_with_search_text(
+            "a",
+            "alpha alpha alpha alpha alpha",
+        )]);
         let terms = vec!["alpha".to_string()];
         let counts = contains_term_counts(&hits, &terms);
-        assert_eq!(counts.get("a"), Some(&1), "five occurrences of one term is one distinct match");
+        assert_eq!(
+            counts.get("a"),
+            Some(&1),
+            "five occurrences of one term is one distinct match"
+        );
     }
 
     #[test]
@@ -347,7 +360,11 @@ mod tests {
         let hits = pool(vec![hit_with_search_text("a", "alpha beta")]);
         let terms = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
         let counts = contains_term_counts(&hits, &terms);
-        assert_eq!(counts.get("a"), Some(&2), "two of three query terms matched");
+        assert_eq!(
+            counts.get("a"),
+            Some(&2),
+            "two of three query terms matched"
+        );
     }
 
     #[test]

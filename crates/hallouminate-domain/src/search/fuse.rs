@@ -126,81 +126,98 @@ mod tests {
         assert!(score_of(&fused, "broad") > score_of(&fused, "narrow"));
     }
 
-    /// The fusion invariant: a chunk ranked first by a single signal and
-    /// last by every other signal must not outrank a chunk ranked first by
-    /// two or more signals.
+    /// Criterion 2 (chunk led by one signal must not outrank one led by two
+    /// or more) holds only when `max_weight <= sum of the two smallest
+    /// weights` — a general property of weighted RRF, not specific to this
+    /// fusion. This test builds the tightest realizable configuration from
+    /// the live `search::{FTS_WEIGHT, VECTOR_WEIGHT, RIPGREP_WEIGHT,
+    /// CONTAINS_WEIGHT}` constants (max-weight signal leads the
+    /// single-signal chunk; the two smallest-weight signals jointly lead the
+    /// dual-signal chunk) and asserts whichever outcome that condition
+    /// predicts, so it tracks whatever weights ship rather than a hardcoded
+    /// configuration.
     ///
-    /// This is the case the additive-bonus scheme got wrong, where one
-    /// literal substring hit could lift the worst-ranked chunk in the pool
-    /// above the best-ranked one.
-    ///
-    /// Note the two chunks cannot both occupy the last slot of the same
-    /// list, so the single-signal chunk is last (rank 49) everywhere it is
-    /// not first, and the two-signal chunk takes the next-worst slot
-    /// (rank 48) in the lists where neither leads. That is the tightest
-    /// realizable configuration, and the margin is genuinely narrow:
-    /// 8.5e-05 at these weights.
+    /// At the shipped weights (2.0 / 1.0 / 0.5 / 0.5) `max_weight` (2.0)
+    /// exceeds the two smallest' sum (0.5 + 0.5 = 1.0), so the condition is
+    /// false and the single-signal chunk measurably outranks the dual-signal
+    /// one — the accepted tradeoff recorded in ADR-006 (wiki), which kept
+    /// these weights over a 1.0/1.0 alternative that satisfies the condition
+    /// with zero margin, because 1.0/1.0 cost a measured 0.0137 Recall@5
+    /// regression.
     #[test]
-    fn single_signal_first_cannot_outrank_two_signal_first() {
+    fn criterion_2_holds_only_when_max_weight_le_sum_of_two_smallest() {
+        use crate::search::{CONTAINS_WEIGHT, FTS_WEIGHT, RIPGREP_WEIGHT, VECTOR_WEIGHT};
+
         const POOL: usize = 50;
         let filler: Vec<String> = (0..POOL).map(|i| format!("filler{i:03}")).collect();
 
-        // Build a list placing `first` at rank 0 and the named chunks at
-        // the given low ranks, padding with filler.
-        let build = |first: &str, low: &[(&str, usize)]| -> Vec<String> {
-            let mut ids: Vec<String> = filler.clone();
+        // Build a list placing `first` at rank 0 and `last` at rank 49.
+        let build = |first: &str, last: &str| -> Vec<String> {
+            let mut ids = filler.clone();
             ids[0] = first.to_string();
-            for (id, rank) in low {
-                ids[*rank] = (*id).to_string();
-            }
+            ids[POOL - 1] = last.to_string();
             ids
         };
 
         let single = "single_signal_chunk";
         let dual = "dual_signal_chunk";
 
-        // fts (weight 2.0): `single` first, `dual` last.
-        let fts = build(single, &[(dual, POOL - 1)]);
-        // vector (weight 1.0): `dual` first, `single` last.
-        let vector = build(dual, &[(single, POOL - 1)]);
-        // rg (weight 1.0): `dual` first, `single` last.
-        let rg = build(dual, &[(single, POOL - 1)]);
-        // fm (weight 1.0): neither leads. `single` is last, so `dual`
-        // takes rank 48.
-        let mut fm: Vec<String> = filler.clone();
-        fm[POOL - 1] = single.to_string();
-        fm[POOL - 2] = dual.to_string();
+        let mut weights = [
+            ("fts", FTS_WEIGHT),
+            ("vector", VECTOR_WEIGHT),
+            ("rg", RIPGREP_WEIGHT),
+            ("fm", CONTAINS_WEIGHT),
+        ];
+        weights.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let (smallest_a, smallest_b) = (weights[0], weights[1]);
+        let largest = weights[3];
+        let max_weight = largest.1;
+        let two_smallest_sum = smallest_a.1 + smallest_b.1;
 
-        let fused = fuse(
-            &[
-                RankedList {
-                    weight: 2.0,
-                    chunk_ids: fts,
-                },
-                RankedList {
-                    weight: 1.0,
-                    chunk_ids: vector,
-                },
-                RankedList {
-                    weight: 1.0,
-                    chunk_ids: rg,
-                },
-                RankedList {
-                    weight: 1.0,
-                    chunk_ids: fm,
-                },
-            ],
-            K,
-        );
+        // Max-weight signal leads `single`, last elsewhere. The two
+        // smallest-weight signals jointly lead `dual`, last elsewhere. The
+        // remaining (middle-weight) signal favours neither: `single` takes
+        // the last slot, `dual` the next-worst, since two chunks cannot both
+        // occupy the same rank in one list.
+        let list_for = |name: &str, weight: f32| -> RankedList {
+            let chunk_ids = if name == largest.0 {
+                build(single, dual)
+            } else if name == smallest_a.0 || name == smallest_b.0 {
+                build(dual, single)
+            } else {
+                let mut ids = filler.clone();
+                ids[POOL - 1] = single.to_string();
+                ids[POOL - 2] = dual.to_string();
+                ids
+            };
+            RankedList { weight, chunk_ids }
+        };
 
-        assert!(
-            position_of(&fused, dual) < position_of(&fused, single),
-            "chunk led by two signals must rank above one led by a single signal"
-        );
-        assert!(
-            score_of(&fused, dual) > score_of(&fused, single),
-            "the two-signal chunk must win on fused score, not on a tie-break"
-        );
+        let lists = vec![
+            list_for("fts", FTS_WEIGHT),
+            list_for("vector", VECTOR_WEIGHT),
+            list_for("rg", RIPGREP_WEIGHT),
+            list_for("fm", CONTAINS_WEIGHT),
+        ];
+
+        let fused = fuse(&lists, K);
+
+        if max_weight <= two_smallest_sum {
+            assert!(
+                position_of(&fused, dual) <= position_of(&fused, single),
+                "criterion 2 holds at these weights (max {max_weight} <= two smallest sum \
+                 {two_smallest_sum}): the dual-signal chunk must not rank below the \
+                 single-signal one"
+            );
+        } else {
+            assert!(
+                score_of(&fused, single) > score_of(&fused, dual),
+                "max_weight {max_weight} exceeds the two smallest weights' sum \
+                 {two_smallest_sum}, so criterion 2's original wording is known to be \
+                 violated at these weights (see ADR-006) — the single-signal chunk must \
+                 outrank the dual-signal one in the tightest realizable configuration"
+            );
+        }
     }
 
     #[test]
