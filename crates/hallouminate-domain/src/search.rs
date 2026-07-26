@@ -97,15 +97,7 @@ pub async fn search_with_ripgrep(
 
     let rg_list = ranked_by_term_count(resolve_rg_hits_to_chunks(&signals.hits, &rg_hits));
 
-    let pool: Vec<String> = signals.hits.keys().cloned().collect();
-    let fm_counts = match store.contains_term_counts(corpus_key, &terms, &pool).await {
-        Ok(counts) => counts,
-        Err(error) => {
-            tracing::warn!(target: "hallouminate::search", err = %error, "contains() pass failed; ranking without the FM-Index signal");
-            HashMap::new()
-        }
-    };
-    let fm_list = ranked_by_term_count(fm_counts);
+    let fm_list = ranked_by_term_count(contains_term_counts(&signals.hits, &terms));
 
     let fused = fuse(
         &[
@@ -192,6 +184,29 @@ fn resolve_rg_hits_to_chunks(
         .collect()
 }
 
+/// Count, per chunk, how many distinct query `terms` appear in the
+/// chunk's `search_text`.
+///
+/// Case-sensitive to match the FM-Index `contains()` predicate this
+/// replaces (`contains(search_text, '<term>')`, no `lower()` wrap) —
+/// `terms` arrive pre-lowercased from [`split_terms`] but `search_text`
+/// is not lowercased, so this is a deliberate asymmetry against the
+/// ripgrep signal (which matches case-insensitively), not a bug.
+///
+/// Matches `search_text`, not `text` — `search_text` is the
+/// footnote-stripped derived field; matching `text` would leak footnote
+/// content into literal matching.
+fn contains_term_counts(hits: &HashMap<String, SearchHit>, terms: &[String]) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for (chunk_id, hit) in hits {
+        let n = terms.iter().filter(|t| hit.search_text.contains(t.as_str())).count();
+        if n > 0 {
+            counts.insert(chunk_id.clone(), n);
+        }
+    }
+    counts
+}
+
 /// Order chunks by how many distinct query terms they matched, best
 /// first, with `chunk_id` settling ties so the list is deterministic.
 fn ranked_by_term_count(counts: HashMap<String, usize>) -> Vec<String> {
@@ -229,6 +244,13 @@ mod tests {
             mtime_ms: 0,
             claim_marks: Vec::new(),
             z_score: None,
+        }
+    }
+
+    fn hit_with_search_text(chunk_id: &str, search_text: &str) -> SearchHit {
+        SearchHit {
+            search_text: search_text.into(),
+            ..hit(chunk_id, "/repo/wiki/x.md", 1, 10)
         }
     }
 
@@ -310,5 +332,53 @@ mod tests {
         counts.insert("aaa".to_string(), 2);
         counts.insert("none".to_string(), 0);
         assert_eq!(ranked_by_term_count(counts), vec!["aaa", "zzz"]);
+    }
+
+    #[test]
+    fn contains_term_counts_counts_distinct_terms_not_occurrences() {
+        let hits = pool(vec![hit_with_search_text("a", "alpha alpha alpha alpha alpha")]);
+        let terms = vec!["alpha".to_string()];
+        let counts = contains_term_counts(&hits, &terms);
+        assert_eq!(counts.get("a"), Some(&1), "five occurrences of one term is one distinct match");
+    }
+
+    #[test]
+    fn contains_term_counts_counts_distinct_terms_matched_not_total_query_terms() {
+        let hits = pool(vec![hit_with_search_text("a", "alpha beta")]);
+        let terms = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let counts = contains_term_counts(&hits, &terms);
+        assert_eq!(counts.get("a"), Some(&2), "two of three query terms matched");
+    }
+
+    #[test]
+    fn contains_term_counts_omits_chunks_matching_no_term() {
+        let hits = pool(vec![hit_with_search_text("a", "unrelated text")]);
+        let terms = vec!["alpha".to_string()];
+        let counts = contains_term_counts(&hits, &terms);
+        assert!(
+            !counts.contains_key("a"),
+            "a chunk matching zero terms must be absent, not present with 0"
+        );
+    }
+
+    #[test]
+    fn contains_term_counts_empty_terms_yields_empty_map() {
+        let hits = pool(vec![hit_with_search_text("a", "alpha beta")]);
+        let counts = contains_term_counts(&hits, &[]);
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn contains_term_counts_reads_search_text_not_text() {
+        let mut h = hit_with_search_text("a", "the term appears here");
+        h.text = "footnote-laden text without the query word".to_string();
+        let hits = pool(vec![h]);
+        let terms = vec!["term".to_string()];
+        let counts = contains_term_counts(&hits, &terms);
+        assert_eq!(
+            counts.get("a"),
+            Some(&1),
+            "the FM pass must read search_text (footnote-stripped), not text"
+        );
     }
 }

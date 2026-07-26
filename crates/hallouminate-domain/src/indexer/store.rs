@@ -22,15 +22,6 @@ pub trait ChunkStore: Send + Sync {
         limit: usize,
     ) -> Result<SignalLists>;
 
-    /// For each of `chunk_ids`, how many DISTINCT `terms` its `search_text`
-    /// contains. Chunks matching no term are absent from the map.
-    async fn contains_term_counts(
-        &self,
-        corpus_key: &CorpusKey,
-        terms: &[String],
-        chunk_ids: &[String],
-    ) -> Result<HashMap<String, usize>>;
-
     async fn touch_mtime(
         &self,
         corpus_key: &CorpusKey,

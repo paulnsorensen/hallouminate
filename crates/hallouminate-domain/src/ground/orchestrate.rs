@@ -263,15 +263,6 @@ mod tests {
             })
         }
 
-        async fn contains_term_counts(
-            &self,
-            _corpus_key: &CorpusKey,
-            _terms: &[String],
-            _chunk_ids: &[String],
-        ) -> Result<std::collections::HashMap<String, usize>> {
-            Ok(std::collections::HashMap::new())
-        }
-
         async fn touch_mtime(
             &self,
             _corpus_key: &CorpusKey,
