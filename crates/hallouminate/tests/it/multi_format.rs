@@ -20,7 +20,7 @@ use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime};
 use hallouminate_domain::indexer::{
     Format, HandlerRegistry, PrepareCtx, detect_format, index_corpus,
 };
-use hallouminate_domain::search::search_with_ripgrep;
+use hallouminate_domain::search::search_fused;
 use text_splitter::Characters;
 
 use crate::common::LANCE_WRITE_LOCK;
@@ -73,14 +73,15 @@ async fn plain_text_corpus_indexes_and_grounds() {
     assert_eq!(stats.files_upserted, 2, "both text files indexed");
     assert!(stats.chunks_inserted >= 2);
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "xenoblat",
         5,
     )
     .await
-    .expect("search");
+    .expect("search")
+    .hits;
     assert!(
         hits.iter().any(|h| h.file_ref.ends_with("notes.txt")),
         "plain-text chunk must be retrievable: {:?}",
@@ -122,14 +123,15 @@ async fn csv_indexes_one_self_describing_chunk_per_row() {
     // Two data rows → two chunks (header row is not a chunk).
     assert_eq!(stats.chunks_inserted, 2, "one chunk per data row");
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "wozzlefruit",
         5,
     )
     .await
-    .expect("search csv");
+    .expect("search csv")
+    .hits;
     let hit = hits
         .iter()
         .find(|h| h.file_ref.ends_with("fruit.csv"))
@@ -192,14 +194,15 @@ async fn xlsx_indexes_each_sheet_row_with_sheet_and_row_metadata() {
     assert_eq!(stats.files_upserted, 1);
     assert_eq!(stats.chunks_inserted, 2, "two data rows → two chunks");
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "grobblet",
         5,
     )
     .await
-    .expect("search xlsx");
+    .expect("search xlsx")
+    .hits;
     let hit = hits
         .iter()
         .find(|h| h.file_ref.ends_with("inv.xlsx"))
@@ -262,14 +265,15 @@ async fn ods_indexes_rows_with_sheet_and_row_metadata() {
     assert_eq!(stats.files_upserted, 1);
     assert_eq!(stats.chunks_inserted, 1, "one data row → one chunk");
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "snibblet",
         5,
     )
     .await
-    .expect("search ods");
+    .expect("search ods")
+    .hits;
     let hit = hits
         .iter()
         .find(|h| h.file_ref.ends_with("cat.ods"))
@@ -319,14 +323,15 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
         "an unsupported type must not be miscounted as truncate-to-empty"
     );
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "flibberwidget",
         5,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .hits;
     assert!(hits.iter().any(|h| h.file_ref.ends_with("good.md")));
 }
 
@@ -365,14 +370,15 @@ async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
         "an extraction failure must not be miscounted as truncate-to-empty"
     );
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "zonkbolt",
         5,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .hits;
     assert!(hits.iter().any(|h| h.file_ref.ends_with("ok.csv")));
 }
 
@@ -573,14 +579,15 @@ async fn xlsx_numeric_cell_renders_as_bare_number_not_float_debug() {
         .expect("index numeric xlsx");
     assert_eq!(stats.chunks_inserted, 1);
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "numwidget",
         5,
     )
     .await
-    .expect("search numeric xlsx");
+    .expect("search numeric xlsx")
+    .hits;
     let hit = hits
         .iter()
         .find(|h| h.file_ref.ends_with("nums.xlsx"))
@@ -636,14 +643,15 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
 
     // The first data row of the SECOND sheet must carry `Beta:row-1`, proving the
     // row index resets per sheet rather than running 1,2,3 across the workbook.
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "first betathing",
         10,
     )
     .await
-    .expect("search beta sheet");
+    .expect("search beta sheet")
+    .hits;
     let beta_hit = hits
         .iter()
         .find(|h| h.text.contains("first betathing"))
@@ -654,14 +662,15 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
         "second sheet's first data row must be row-1 with the Beta breadcrumb"
     );
 
-    let ahits = search_with_ripgrep(
+    let ahits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "first alphathing",
         10,
     )
     .await
-    .expect("search alpha sheet");
+    .expect("search alpha sheet")
+    .hits;
     assert!(
         ahits
             .iter()
@@ -700,14 +709,15 @@ async fn csv_ragged_row_uses_col_n_fallback_and_omits_blank_cells() {
         .expect("index ragged csv");
     assert_eq!(stats.chunks_inserted, 1, "one data row → one chunk");
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "raggedcell",
         5,
     )
     .await
-    .expect("search ragged csv");
+    .expect("search ragged csv")
+    .hits;
     let hit = hits
         .iter()
         .find(|h| h.file_ref.ends_with("ragged.csv"))

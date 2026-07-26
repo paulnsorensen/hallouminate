@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
 use crate::indexer::{ChunkStore, SearchHit};
-use crate::search::{Crossencoder, search_with_ripgrep};
+use crate::search::{Crossencoder, FusedSearch, search_fused};
 
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats, Warning};
@@ -123,14 +123,15 @@ pub async fn ground(
     .await
 }
 
-/// Searches one root-aware corpus identity, returning its un-reranked hits.
+/// Searches one root-aware corpus identity, returning its un-reranked hits
+/// plus any warnings raised while assembling them.
 async fn search_corpus(
     query: &str,
     corpus_key: &CorpusKey,
     store: &dyn ChunkStore,
     limit: usize,
-) -> Result<Vec<SearchHit>> {
-    search_with_ripgrep(store, corpus_key, query, limit).await
+) -> Result<FusedSearch> {
+    search_fused(store, corpus_key, query, limit).await
 }
 
 /// Fans one query across every effective corpus root and globally reranks it.
@@ -149,13 +150,14 @@ pub async fn ground_union(
     let searches = corpus_keys
         .iter()
         .map(|corpus_key| search_corpus(query, corpus_key, store, opts.limit));
-    let mut hits: Vec<SearchHit> = futures_util::future::try_join_all(searches)
-        .await?
-        .into_iter()
-        .flatten()
-        .collect();
-    let stats = Stats { hits: hits.len() };
+    let search_results = futures_util::future::try_join_all(searches).await?;
+    let mut hits: Vec<SearchHit> = Vec::new();
     let mut warnings = Vec::new();
+    for result in search_results {
+        hits.extend(result.hits);
+        warnings.extend(result.warnings);
+    }
+    let stats = Stats { hits: hits.len() };
 
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
@@ -353,8 +355,7 @@ mod tests {
             _query: &str,
             _limit: usize,
         ) -> Result<SignalLists> {
-            self.calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             Ok(SignalLists::default())
         }
@@ -827,6 +828,61 @@ mod tests {
         assert_eq!(
             observed, fusion_order,
             "zero-duration timeout fallback must preserve the original fusion order"
+        );
+    }
+
+    // --- warnings: per-root degradation must survive the fan-out ---
+
+    #[tokio::test]
+    async fn ground_union_collects_ripgrep_warnings_from_every_root() {
+        // Two nonexistent roots: `search_fused`'s ripgrep pass errors on
+        // each (no such directory), so both must surface a distinct
+        // "ripgrep-failed" warning in GroundResponse.warnings. If the
+        // fan-out's warnings.extend ever regresses to overwrite-with-last
+        // or keep-only-first, this collapses to one warning and fails.
+        let root_a = "/nonexistent/hallouminate-orchestrate-test-root-a";
+        let root_b = "/nonexistent/hallouminate-orchestrate-test-root-b";
+        let key_a = CorpusKey::from_configured_root("warnings", root_a);
+        let key_b = CorpusKey::from_configured_root("warnings", root_b);
+
+        let mut hit_a = hit_for_timeout_test("a.md", 0.1);
+        hit_a.corpus_key = key_a.clone();
+        let mut hit_b = hit_for_timeout_test("b.md", 0.2);
+        hit_b.corpus_key = key_b.clone();
+        let store = FakeChunkStore {
+            hits: vec![hit_a, hit_b],
+        };
+
+        let corpus = CorpusConfig {
+            name: "warnings".into(),
+            paths: vec![root_a.into(), root_b.into()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let resp = ground_union("spice", &[corpus], &store, None, GroundOpts::default())
+            .await
+            .expect("ground_union must succeed even when every root's ripgrep pass fails");
+
+        let codes: Vec<&str> = resp.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec!["ripgrep-failed", "ripgrep-failed"],
+            "both roots must report ripgrep-failed; a dropped or overwritten root warning \
+             would shrink this to one entry: {:?}",
+            resp.warnings
+        );
+        assert!(
+            resp.warnings[0].message.contains(root_a),
+            "first warning must name its own root: {:?}",
+            resp.warnings[0]
+        );
+        assert!(
+            resp.warnings[1].message.contains(root_b),
+            "second warning must name its own root, not root_a's message \
+             (proves the second root's warning wasn't overwritten by the first): {:?}",
+            resp.warnings[1]
         );
     }
 }

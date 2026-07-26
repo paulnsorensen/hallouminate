@@ -10,7 +10,7 @@ use crate::common::{
 use hallouminate_adapters::{LanceStore, chunk_id_for};
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
-use hallouminate_domain::search::search_with_ripgrep;
+use hallouminate_domain::search::search_fused;
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -207,9 +207,10 @@ async fn retrieve_signals_returns_at_least_one_hit_for_indexed_corpus() {
     store.apply_batch(vec![pf]).await.expect("apply");
 
     // Use the stub embedder to compute a query vector deterministically.
-    let hits = search_with_ripgrep(&store, &corpus_key, "spice", 5)
+    let hits = search_fused(&store, &corpus_key, "spice", 5)
         .await
-        .expect("retrieve_signals");
+        .expect("retrieve_signals")
+        .hits;
     assert!(
         !hits.is_empty(),
         "hybrid search must return hits for indexed corpus"
@@ -227,9 +228,10 @@ async fn retrieve_signals_on_empty_corpus_returns_empty_signals() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let corpus_key = corpus_key("docs");
-    let hits = search_with_ripgrep(&store, &corpus_key, "anything", 5)
+    let hits = search_fused(&store, &corpus_key, "anything", 5)
         .await
-        .expect("empty corpus must yield Ok, not error");
+        .expect("empty corpus must yield Ok, not error")
+        .hits;
     assert!(hits.is_empty(), "empty corpus must yield zero hits");
 }
 
@@ -250,9 +252,10 @@ async fn single_file_corpus_top_hit_is_that_file() {
     );
     store.apply_batch(vec![pf]).await.expect("apply");
 
-    let hits = search_with_ripgrep(&store, &corpus_key, "unique_token_witness_me", 5)
+    let hits = search_fused(&store, &corpus_key, "unique_token_witness_me", 5)
         .await
-        .expect("retrieve_signals");
+        .expect("retrieve_signals")
+        .hits;
     assert!(!hits.is_empty(), "expected at least one hit");
     assert_eq!(
         hits[0].file_ref, "/tmp/only.md",
@@ -395,12 +398,14 @@ async fn retrieve_signals_returns_only_hits_from_requested_corpus() {
     store.apply_batch(vec![a]).await.expect("apply alpha");
     store.apply_batch(vec![b]).await.expect("apply beta");
 
-    let hits_alpha = search_with_ripgrep(&store, &alpha, "unique_alpha_marker", 5)
+    let hits_alpha = search_fused(&store, &alpha, "unique_alpha_marker", 5)
         .await
-        .expect("alpha search");
-    let hits_beta = search_with_ripgrep(&store, &beta, "unique_alpha_marker", 5)
+        .expect("alpha search")
+        .hits;
+    let hits_beta = search_fused(&store, &beta, "unique_alpha_marker", 5)
         .await
-        .expect("beta search");
+        .expect("beta search")
+        .hits;
 
     assert!(
         hits_alpha.iter().all(|h| h.file_ref == "/tmp/alpha.md"),

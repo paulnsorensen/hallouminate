@@ -19,7 +19,7 @@
 //! defect this design replaces.
 //!
 //! The two literal signals are computed over the FTS/vector candidate
-//! pool ([`search_with_ripgrep`]), not the full corpus: they reorder
+//! pool ([`search_fused`]), not the full corpus: they reorder
 //! candidates BM25 or the vector search already retrieved and cannot
 //! contribute a candidate of their own.
 
@@ -31,6 +31,7 @@ pub mod terms;
 use std::collections::HashMap;
 
 use crate::common::{CorpusKey, Result};
+use crate::ground::Warning;
 use crate::indexer::{ChunkStore, SearchHit};
 use fuse::{RankedList, fuse};
 use terms::split_terms;
@@ -66,6 +67,13 @@ pub const RIPGREP_WEIGHT: f32 = 0.5;
 /// literal signals are weighted together and for the same reason.
 pub const CONTAINS_WEIGHT: f32 = 0.5;
 
+/// Outcome of [`search_fused`]: the fused hits plus any warnings raised
+/// while assembling the four signals (e.g. a degraded ripgrep pass).
+pub struct FusedSearch {
+    pub hits: Vec<SearchHit>,
+    pub warnings: Vec<Warning>,
+}
+
 /// Retrieve, rank and return chunk hits for `query`.
 ///
 /// Every returned hit's `score` is the fused RRF score, not the
@@ -74,13 +82,14 @@ pub const CONTAINS_WEIGHT: f32 = 0.5;
 /// The ripgrep and FM-Index `contains()` passes below only filter and
 /// rank `signals.hits` — the pool `store.retrieve_signals` returned —
 /// so a chunk outside that FTS/vector pool is invisible to both.
-pub async fn search_with_ripgrep(
+pub async fn search_fused(
     store: &dyn ChunkStore,
     corpus_key: &CorpusKey,
     query: &str,
     limit: usize,
-) -> Result<Vec<SearchHit>> {
+) -> Result<FusedSearch> {
     let terms = cap_terms(split_terms(query));
+    let mut warnings = Vec::new();
     // Bound on the rg subprocess. The `max_hits` truncation only fires when
     // matches are plentiful; a sparse-or-empty match still forces rg to walk
     // the whole corpus root under `--sort path`'s single traversal thread.
@@ -100,12 +109,21 @@ pub async fn search_with_ripgrep(
 
     let signals = signals_res?;
     if signals.hits.is_empty() {
-        return Ok(Vec::new());
+        return Ok(FusedSearch {
+            hits: Vec::new(),
+            warnings,
+        });
     }
     let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) = match rg_res {
         Ok(Ok(run)) => (run.hits, run.truncated, run.elapsed_ms, run.unparseable),
         Ok(Err(error)) => {
             tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
+            warnings.push(Warning {
+                code: "ripgrep-failed".to_string(),
+                message: format!(
+                    "ripgrep pass failed ({error}); ranking without the ripgrep signal"
+                ),
+            });
             (Vec::new(), false, 0, 0)
         }
         Err(_elapsed) => {
@@ -114,6 +132,13 @@ pub async fn search_with_ripgrep(
                 timeout_ms = RIPGREP_TIMEOUT.as_millis() as u64,
                 "ripgrep pass timed out; ranking without the ripgrep signal"
             );
+            warnings.push(Warning {
+                code: "ripgrep-timeout".to_string(),
+                message: format!(
+                    "ripgrep pass timed out after {} ms; ranking without the ripgrep signal",
+                    RIPGREP_TIMEOUT.as_millis()
+                ),
+            });
             (Vec::new(), false, RIPGREP_TIMEOUT.as_millis() as u64, 0)
         }
     };
@@ -141,6 +166,14 @@ pub async fn search_with_ripgrep(
             dropped_line_out_of_range = rg_stats.dropped_line_out_of_range,
             "ripgrep signal produced hits but resolved to zero chunks"
         );
+        warnings.push(Warning {
+            code: "ripgrep-unresolved".to_string(),
+            message: format!(
+                "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}",
+                rg_hits.len(),
+                corpus_key.canonical_root.display()
+            ),
+        });
     }
 
     let fm_list = ranked_by_term_count(contains_term_counts(&signals.hits, &terms));
@@ -176,7 +209,10 @@ pub async fn search_with_ripgrep(
         hit.score = score;
         ranked.push(hit);
     }
-    Ok(ranked)
+    Ok(FusedSearch {
+        hits: ranked,
+        warnings,
+    })
 }
 
 /// Ceiling on how many query terms reach the two literal signals.
@@ -566,7 +602,7 @@ mod tests {
     }
 
     // --- Finding 1: fusion assembly. Pins the weight-to-list pairing in
-    // `search_with_ripgrep`'s `fuse(...)` call. The domain-level test
+    // `search_fused`'s `fuse(...)` call. The domain-level test
     // double in ground/orchestrate.rs always returns an empty `vector` and
     // an empty term-count map (three of four lists provably empty), so no
     // existing test can tell four-signal fusion from one-signal fusion.
@@ -625,7 +661,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_with_ripgrep_fuses_four_signals_by_the_correct_weight() {
+    async fn search_fused_weights_four_signals_against_their_own_lists() {
         let root = tempfile::tempdir().expect("empty ripgrep root");
         let corpus_key = CorpusKey {
             name: "fixtures".into(),
@@ -645,10 +681,10 @@ mod tests {
             hits: pool(vec![a, b, c, d]),
         };
 
-        let ranked = search_with_ripgrep(&store, &corpus_key, "distinctiveterm", 10)
+        let ranked = search_fused(&store, &corpus_key, "distinctiveterm", 10)
             .await
             .expect("fusion over a fake store must succeed");
-        let order: Vec<&str> = ranked.iter().map(|h| h.chunk_id.as_str()).collect();
+        let order: Vec<&str> = ranked.hits.iter().map(|h| h.chunk_id.as_str()).collect();
 
         // a: FTS rank 0 only            -> 2.0/60            = 0.033333
         // b: FTS rank 1 only             -> 2.0/61            = 0.032787
@@ -658,6 +694,43 @@ mod tests {
             order,
             vec!["a", "b", "d", "c"],
             "fused order must reflect FTS_WEIGHT/VECTOR_WEIGHT/CONTAINS_WEIGHT applied to their own lists, not swapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_ripgrep_pass_warns_the_caller_instead_of_ranking_silently() {
+        // A Ground response that claims four-signal fusion while actually
+        // ranked on fewer is the failure this warning exists to prevent: the
+        // degradation is already logged, but logs do not reach the caller.
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root: std::path::PathBuf::from(
+                "/nonexistent/hallouminate-rg-failure-fixture",
+            ),
+        };
+        let store = FakeFusionStore {
+            fts: vec!["a".into()],
+            vector: Vec::new(),
+            hits: pool(vec![hit_with_search_text("a", "unrelated")]),
+        };
+
+        let result = search_fused(&store, &corpus_key, "distinctiveterm", 10)
+            .await
+            .expect("a failed ripgrep pass must degrade the ranking, not fail the query");
+
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ripgrep-failed"],
+            "the caller must be told which signal dropped out"
+        );
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "ranking continues on the signals that did survive"
         );
     }
 }

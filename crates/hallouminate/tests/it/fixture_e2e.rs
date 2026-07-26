@@ -11,7 +11,7 @@ use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole, LanceStore};
 use hallouminate_domain::common::CorpusConfig;
 use hallouminate_domain::corpus::MarkdownChunker;
 use hallouminate_domain::indexer::{ChunkStore, HandlerRegistry, index_corpus};
-use hallouminate_domain::search::search_with_ripgrep;
+use hallouminate_domain::search::search_fused;
 use text_splitter::Characters;
 
 use crate::common::LANCE_WRITE_LOCK;
@@ -153,14 +153,15 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
     ];
 
     for (query, expected_file) in oracles {
-        let hits = search_with_ripgrep(
+        let hits = search_fused(
             &store,
             &corpus.primary_corpus_key().expect("corpus root"),
             query,
             5,
         )
         .await
-        .expect("hybrid_search");
+        .expect("hybrid_search")
+        .hits;
         assert!(
             !hits.is_empty(),
             "no hits for oracle query {query:?} (expected file {expected_file})"
@@ -267,14 +268,15 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
     assert!(stats.files_deleted >= 1, "must report at least 1 deletion");
 
     // Verify the grail oracle no longer hits its source
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "caerbannog",
         5,
     )
     .await
-    .expect("search after delete");
+    .expect("search after delete")
+    .hits;
     assert!(
         !hits.iter().any(|h| h.file_ref.ends_with("grail.md")),
         "grail.md must no longer appear in results"
@@ -362,14 +364,15 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         "vanishing.md must produce at least one row"
     );
 
-    let hits_before = search_with_ripgrep(
+    let hits_before = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "melange",
         5,
     )
     .await
-    .expect("search before truncation");
+    .expect("search before truncation")
+    .hits;
     assert!(
         hits_before
             .iter()
@@ -399,14 +402,15 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         "stale rows for the truncated file must be evicted, not left behind"
     );
 
-    let hits_after = search_with_ripgrep(
+    let hits_after = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "melange",
         5,
     )
     .await
-    .expect("search after truncation");
+    .expect("search after truncation")
+    .hits;
     assert!(
         hits_after.is_empty(),
         "truncated file must no longer be searchable: {hits_after:?}"
@@ -654,14 +658,15 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
         .expect("index_corpus");
     assert_eq!(stats.files_upserted, 2, "both pages indexed");
 
-    let hits = search_with_ripgrep(
+    let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "zphyxnort",
         5,
     )
     .await
-    .expect("hybrid_search fm");
+    .expect("hybrid_search fm")
+    .hits;
     let hit = hits
         .iter()
         .find(|h| h.file_ref.ends_with("fm.md"))
@@ -705,14 +710,15 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
     );
 
     // The plain page (no frontmatter) still grounds normally.
-    let hits2 = search_with_ripgrep(
+    let hits2 = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "qwobblefrotz",
         5,
     )
     .await
-    .expect("hybrid_search plain");
+    .expect("hybrid_search plain")
+    .hits;
     assert!(
         hits2.iter().any(|h| h.file_ref.ends_with("plain.md")),
         "plain page must ground: {:?}",
