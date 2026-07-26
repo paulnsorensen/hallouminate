@@ -142,13 +142,18 @@ pub async fn ground_union(
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-    let mut hits: Vec<SearchHit> = Vec::new();
-    for corpus in corpora {
-        for corpus_key in corpus.corpus_keys() {
-            let mut root_hits = search_corpus(query, &corpus_key, store, opts.limit).await?;
-            hits.append(&mut root_hits);
-        }
-    }
+    let corpus_keys: Vec<CorpusKey> = corpora
+        .iter()
+        .flat_map(|corpus| corpus.corpus_keys())
+        .collect();
+    let searches = corpus_keys
+        .iter()
+        .map(|corpus_key| search_corpus(query, corpus_key, store, opts.limit));
+    let mut hits: Vec<SearchHit> = futures_util::future::try_join_all(searches)
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
     let stats = Stats { hits: hits.len() };
     let mut warnings = Vec::new();
 
@@ -322,6 +327,100 @@ mod tests {
         assert_eq!(resp.query, "spice");
         assert_eq!(resp.stats.hits, 0, "empty store yields no hits");
         assert!(resp.docs.is_empty());
+    }
+
+    // --- efficiency: ground_union fans roots out concurrently ---
+
+    /// A `ChunkStore` double whose `retrieve_signals` sleeps a fixed delay
+    /// per call before returning an empty (no-hit) result. Used to prove
+    /// `ground_union` awaits per-root searches concurrently: if the roots
+    /// were still awaited sequentially, N roots would take >= N * delay;
+    /// concurrent awaits take roughly one delay regardless of N.
+    struct SleepyChunkStore {
+        delay: Duration,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChunkStore for SleepyChunkStore {
+        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
+            Ok(Vec::new())
+        }
+
+        async fn retrieve_signals(
+            &self,
+            _corpus_key: &CorpusKey,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<SignalLists> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(SignalLists::default())
+        }
+
+        async fn touch_mtime(
+            &self,
+            _corpus_key: &CorpusKey,
+            _file_ref: &str,
+            _mtime_ms: i64,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_file(&self, _corpus_key: &CorpusKey, _file_ref: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
+            Ok(BatchWriteStats::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn ground_union_searches_corpus_roots_concurrently() {
+        const ROOTS: usize = 5;
+        const DELAY: Duration = Duration::from_millis(80);
+
+        let root_dirs: Vec<tempfile::TempDir> = (0..ROOTS)
+            .map(|_| tempfile::tempdir().expect("root dir"))
+            .collect();
+        let corpus = CorpusConfig {
+            name: "concurrency".into(),
+            paths: root_dirs
+                .iter()
+                .map(|dir| dir.path().to_string_lossy().into_owned())
+                .collect(),
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let store = SleepyChunkStore {
+            delay: DELAY,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let started = Instant::now();
+        let resp = ground_union("spice", &[corpus], &store, None, GroundOpts::default())
+            .await
+            .expect("concurrent ground_union must succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            store.calls.load(std::sync::atomic::Ordering::SeqCst),
+            ROOTS,
+            "every corpus root must be searched exactly once"
+        );
+        assert!(resp.docs.is_empty(), "no-hit store yields no docs");
+        assert!(
+            elapsed < DELAY * 2,
+            "expected {ROOTS} roots x {DELAY:?} delay each to run concurrently and finish \
+             in roughly one delay; took {elapsed:?}. A sequential loop would take >= \
+             {:?} (the sum over roots) — this margin (2x one delay) is generous enough \
+             that it cannot pass by accident on a loaded machine, yet fails if the \
+             per-root loop reverts to sequential awaits.",
+            DELAY * ROOTS as u32
+        );
     }
 
     // --- #137: relative_path_for ---
