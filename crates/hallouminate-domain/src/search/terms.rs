@@ -39,10 +39,11 @@ mod tests {
 
     #[test]
     fn multi_word_natural_language_query() {
-        // The shared list (NLTK English, 198 words) drops function words
-        // like "how"/"does"/"the" but keeps content words. "work" is a
-        // content word and survives — widening the list from the old local
-        // 45-word set did not cost the literal signals any query vocabulary.
+        // The shared list is stop-words' NLTK English (198 entries), pinned
+        // explicitly in Cargo.toml — see the comment there, and note that
+        // the crate's own default (ISO, 1298 entries) would drop "work"
+        // here along with "call", "side" and "use". Function words go,
+        // content words stay.
         assert_eq!(
             split_terms("how does the search ranking work"),
             vec!["search", "ranking", "work"]

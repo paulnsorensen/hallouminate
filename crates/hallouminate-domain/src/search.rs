@@ -71,7 +71,7 @@ pub async fn search_with_ripgrep(
     query: &str,
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
-    let terms = split_terms(query);
+    let terms = cap_terms(split_terms(query));
     // Bound on the rg subprocess. The `max_hits` truncation only fires when
     // matches are plentiful; a sparse-or-empty match still forces rg to walk
     // the whole corpus root under `--sort path`'s single traversal thread.
@@ -168,6 +168,24 @@ pub async fn search_with_ripgrep(
         ranked.push(hit);
     }
     Ok(ranked)
+}
+
+/// Ceiling on how many query terms reach the two literal signals.
+///
+/// Each term becomes an `-e` pattern on the rg command line and a pass
+/// over every pooled chunk's `search_text`, and the rg budget is sized as
+/// `limit * terms.len()`, so an arbitrarily long query steers both the
+/// argument list and the amount of scanning. 32 content terms is well past
+/// any real question — the evaluation set's longest query yields 12.
+const MAX_QUERY_TERMS: usize = 32;
+
+/// Truncate to [`MAX_QUERY_TERMS`], keeping the **first** terms.
+///
+/// `split_terms` returns first-occurrence order, so the head of the list
+/// is the opening of the query — the part a reader would call the subject.
+fn cap_terms(mut terms: Vec<String>) -> Vec<String> {
+    terms.truncate(MAX_QUERY_TERMS);
+    terms
 }
 
 /// Result counters from [`resolve_rg_hits_to_chunks`], split by drop cause.
@@ -379,6 +397,27 @@ mod tests {
             "a file the pool never retrieved must bump dropped_file_not_in_pool, not dropped_line_out_of_range"
         );
         assert_eq!(stats.dropped_line_out_of_range, 0);
+    }
+
+    /// Term count sizes both the rg argument list and the rg budget, so an
+    /// arbitrarily long query must not steer either.
+    #[test]
+    fn cap_terms_truncates_an_over_long_query_keeping_the_first_terms() {
+        let terms: Vec<String> = (0..MAX_QUERY_TERMS + 20).map(|i| format!("t{i}")).collect();
+        let capped = cap_terms(terms);
+        assert_eq!(capped.len(), MAX_QUERY_TERMS);
+        assert_eq!(capped.first().map(String::as_str), Some("t0"));
+        assert_eq!(
+            capped.last().map(String::as_str),
+            Some(format!("t{}", MAX_QUERY_TERMS - 1).as_str()),
+            "truncation must keep the head of the query, not an arbitrary slice"
+        );
+    }
+
+    #[test]
+    fn cap_terms_leaves_an_ordinary_query_untouched() {
+        let terms = vec!["ranking".to_string(), "fusion".to_string()];
+        assert_eq!(cap_terms(terms.clone()), terms);
     }
 
     #[test]

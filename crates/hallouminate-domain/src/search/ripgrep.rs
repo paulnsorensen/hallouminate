@@ -53,11 +53,21 @@ pub struct RipgrepRun {
     pub unparseable: usize,
 }
 
+/// Number of files the run-wide budget is spread across before any single
+/// file may exhaust it. Under `--sort path` the walk is alphabetical, so
+/// without a per-file cap one term-dense early file consumes the whole
+/// budget and every later-sorting file gets zero evidence no matter how
+/// well it would have matched.
+const MIN_FILES_SPREAD: usize = 10;
+
 /// Run `rg` over each `path`, matching each of `terms` as its own literal
 /// (`-e`) pattern in one invocation — a multi-word query needs every term a
 /// chance to match, not just the literal whole-query string. Returns at
-/// most `max_hits` matches; rg's own `--max-count` would cap per-FILE not
-/// per-run, so we truncate after collecting.
+/// most `max_hits` matches in total, and bounds how many of those any one
+/// file may contribute via `--max-count`, so the budget reaches at least
+/// [`MIN_FILES_SPREAD`] files. The post-collection `hits.len() >= max_hits`
+/// check below stays as a run-wide backstop so the stream still terminates
+/// promptly.
 ///
 /// Failure modes:
 /// - `rg` missing on PATH → `HallouminateError::Io` (`io::ErrorKind::NotFound`)
@@ -76,6 +86,18 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
             unparseable: 0,
         });
     }
+    // Spread the budget across files instead of letting one hot file
+    // consume it all. Dividing by `terms.len()` would be useless for the
+    // case that motivates this — a single common term, where the divisor
+    // is 1 — so the spread is a fixed file count.
+    //
+    // The floor of `terms.len()` guarantees any one file can still report
+    // at least one hit per term, so a file never loses a term purely to
+    // the cap. Known limit: the cap is per *file* while ranking is per
+    // *chunk*, so a file with more matching chunks than `per_file_cap`
+    // leaves its later chunks without ripgrep evidence. That is the
+    // accepted trade for not starving the rest of the corpus.
+    let per_file_cap = max_hits.div_ceil(MIN_FILES_SPREAD).max(terms.len());
     let mut cmd = Command::new("rg");
     cmd.arg("--json")
         .arg("--no-heading")
@@ -96,7 +118,9 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
         .arg("md")
         .arg("--ignore-case")
         .arg("--max-columns")
-        .arg("512");
+        .arg("512")
+        .arg("--max-count")
+        .arg(per_file_cap.to_string());
     for term in terms {
         cmd.arg("-e").arg(term);
     }
@@ -470,6 +494,45 @@ mod tests {
                 .collect();
             assert_eq!(a, b, "truncated rg output must be reproducible");
         }
+    }
+
+    /// A single common term is the case that motivates the per-file cap:
+    /// under `--sort path` the alphabetically-first file is walked first,
+    /// and without a cap its matches alone exhaust the run-wide budget, so
+    /// every later file is ranked as though it never matched at all.
+    #[tokio::test]
+    async fn budget_spreads_across_files_instead_of_exhausting_on_the_first() {
+        if which("rg").is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        // `aaa.md` sorts first and on its own carries more matches than the
+        // whole budget allows.
+        let mut hot = String::from("# Hot\n\n");
+        for _ in 0..50 {
+            hot.push_str("shrubbery appears again.\n");
+        }
+        std::fs::write(dir.path().join("aaa.md"), hot).unwrap();
+        for name in ["bbb.md", "ccc.md", "ddd.md"] {
+            std::fs::write(dir.path().join(name), "# Page\n\nshrubbery here.\n").unwrap();
+        }
+        let hits = run(
+            &[dir.path().to_string_lossy().into_owned()],
+            &["shrubbery".to_string()],
+            6,
+        )
+        .await
+        .expect("rg run")
+        .hits;
+        let files: std::collections::HashSet<&str> = hits
+            .iter()
+            .map(|h| h.file_ref.rsplit('/').next().unwrap())
+            .collect();
+        assert!(
+            files.contains("bbb.md") && files.contains("ccc.md") && files.contains("ddd.md"),
+            "later-sorting files must still contribute evidence even though \
+             aaa.md alone could fill the budget; got {files:?}"
+        );
     }
 
     #[tokio::test]
