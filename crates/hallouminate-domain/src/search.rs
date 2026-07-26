@@ -304,6 +304,8 @@ fn ranked_by_term_count(counts: HashMap<String, usize>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::indexer::{BatchWriteStats, FileSnapshot, PreparedFile, SignalLists};
+    use async_trait::async_trait;
     use std::path::PathBuf;
 
     fn corpus_key() -> CorpusKey {
@@ -435,6 +437,48 @@ mod tests {
         assert_eq!(counts.get("a"), Some(&2));
     }
 
+    // --- Finding 2: boundary cases against chunk [10,20]. Line 15 vs
+    // [11,20]/[1,10] and line 42 vs [1,10]/[60,70] (the pre-existing cases
+    // above) never touch the containment comparison's edges, so mutating
+    // `line < start || line > end` to `<=`/`>=` left them green. These four
+    // pin the boundary itself.
+
+    #[test]
+    fn rg_hit_on_the_chunk_start_line_boundary_matches() {
+        let p = pool(vec![hit("a", "/repo/wiki/x.md", 10, 20)]);
+        let (counts, stats) =
+            resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 10, &["term"])]);
+        assert_eq!(counts.get("a"), Some(&1), "line == start must match");
+        assert_eq!(stats.dropped_line_out_of_range, 0);
+    }
+
+    #[test]
+    fn rg_hit_on_the_chunk_end_line_boundary_matches() {
+        let p = pool(vec![hit("a", "/repo/wiki/x.md", 10, 20)]);
+        let (counts, stats) =
+            resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 20, &["term"])]);
+        assert_eq!(counts.get("a"), Some(&1), "line == end must match");
+        assert_eq!(stats.dropped_line_out_of_range, 0);
+    }
+
+    #[test]
+    fn rg_hit_one_line_before_the_chunk_start_is_dropped() {
+        let p = pool(vec![hit("a", "/repo/wiki/x.md", 10, 20)]);
+        let (counts, stats) =
+            resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 9, &["term"])]);
+        assert!(counts.is_empty(), "line == start - 1 must not match");
+        assert_eq!(stats.dropped_line_out_of_range, 1);
+    }
+
+    #[test]
+    fn rg_hit_one_line_after_the_chunk_end_is_dropped() {
+        let p = pool(vec![hit("a", "/repo/wiki/x.md", 10, 20)]);
+        let (counts, stats) =
+            resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 21, &["term"])]);
+        assert!(counts.is_empty(), "line == end + 1 must not match");
+        assert_eq!(stats.dropped_line_out_of_range, 1);
+    }
+
     #[test]
     fn chunk_matching_more_distinct_terms_ranks_first() {
         let mut counts = HashMap::new();
@@ -509,6 +553,102 @@ mod tests {
             counts.get("a"),
             Some(&1),
             "the FM pass must read search_text (footnote-stripped), not text"
+        );
+    }
+
+    // --- Finding 1: fusion assembly. Pins the weight-to-list pairing in
+    // `search_with_ripgrep`'s `fuse(...)` call. The domain-level test
+    // double in ground/orchestrate.rs always returns an empty `vector` and
+    // an empty term-count map (three of four lists provably empty), so no
+    // existing test can tell four-signal fusion from one-signal fusion.
+    // This fake returns disjoint, non-empty `fts`/`vector` lists and seeds
+    // `search_text` on one hit so the FM contains() pass (computed
+    // in-domain from `signals.hits`) produces a non-empty list too.
+    //
+    // Limitation: the ripgrep list is not driven non-empty here (no real rg
+    // subprocess control from this fake) — the root is an empty tempdir, so
+    // `rg_list` stays empty regardless of RIPGREP_WEIGHT's pairing. That
+    // means a RIPGREP_WEIGHT<->CONTAINS_WEIGHT swap specifically (both are
+    // 0.5) is invisible to this test; every other weight-to-list swap
+    // (FTS<->VECTOR, FTS<->RIPGREP, FTS<->CONTAINS, VECTOR<->RIPGREP,
+    // VECTOR<->CONTAINS) changes the asserted order below.
+    struct FakeFusionStore {
+        fts: Vec<String>,
+        vector: Vec<String>,
+        hits: HashMap<String, SearchHit>,
+    }
+
+    #[async_trait]
+    impl ChunkStore for FakeFusionStore {
+        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
+            Ok(Vec::new())
+        }
+
+        async fn retrieve_signals(
+            &self,
+            _corpus_key: &CorpusKey,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<SignalLists> {
+            Ok(SignalLists {
+                fts: self.fts.clone(),
+                vector: self.vector.clone(),
+                hits: self.hits.clone(),
+            })
+        }
+
+        async fn touch_mtime(
+            &self,
+            _corpus_key: &CorpusKey,
+            _file_ref: &str,
+            _mtime_ms: i64,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_file(&self, _corpus_key: &CorpusKey, _file_ref: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
+            Ok(BatchWriteStats::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn search_with_ripgrep_fuses_four_signals_by_the_correct_weight() {
+        let root = tempfile::tempdir().expect("empty ripgrep root");
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root: root.path().to_path_buf(),
+        };
+
+        let a = hit_with_search_text("a", "unrelated");
+        let b = hit_with_search_text("b", "unrelated");
+        let c = hit_with_search_text("c", "unrelated");
+        // Only "d" contains the query term, so it is the sole contributor
+        // to the FM contains() signal.
+        let d = hit_with_search_text("d", "distinctiveterm present");
+
+        let store = FakeFusionStore {
+            fts: vec!["a".into(), "b".into()],
+            vector: vec!["c".into(), "d".into()],
+            hits: pool(vec![a, b, c, d]),
+        };
+
+        let ranked = search_with_ripgrep(&store, &corpus_key, "distinctiveterm", 10)
+            .await
+            .expect("fusion over a fake store must succeed");
+        let order: Vec<&str> = ranked.iter().map(|h| h.chunk_id.as_str()).collect();
+
+        // a: FTS rank 0 only            -> 2.0/60            = 0.033333
+        // b: FTS rank 1 only             -> 2.0/61            = 0.032787
+        // d: vector rank 1 + contains rank 0 -> 1.0/61 + 0.5/60 = 0.024726
+        // c: vector rank 0 only          -> 1.0/60            = 0.016667
+        assert_eq!(
+            order,
+            vec!["a", "b", "d", "c"],
+            "fused order must reflect FTS_WEIGHT/VECTOR_WEIGHT/CONTAINS_WEIGHT applied to their own lists, not swapped"
         );
     }
 }

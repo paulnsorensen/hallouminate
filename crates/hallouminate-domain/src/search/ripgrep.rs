@@ -371,7 +371,7 @@ mod tests {
         // rg is a hard dep for the binary; the e2e suite already
         // installs it. Skip silently if it's missing locally so this
         // doesn't break dev machines without it.
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -408,7 +408,7 @@ mod tests {
     /// some other term and the test would pass.
     #[tokio::test]
     async fn natural_language_query_matches_per_term_though_the_phrase_does_not() {
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -456,7 +456,7 @@ mod tests {
     /// added.
     #[tokio::test]
     async fn repeated_runs_return_identical_hits_even_when_truncated() {
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -502,7 +502,7 @@ mod tests {
     /// every later file is ranked as though it never matched at all.
     #[tokio::test]
     async fn budget_spreads_across_files_instead_of_exhausting_on_the_first() {
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -537,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_terms_match_different_files() {
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -564,7 +564,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_some_terms_hit() {
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -588,7 +588,7 @@ mod tests {
         // blocked writing the rest of its matches into a full pipe. Generate
         // enough matching lines to overflow the OS pipe buffer (well over the
         // 64KiB typical max) so the pre-fix code would hang forever here.
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -622,7 +622,7 @@ mod tests {
     async fn no_lexical_match_returns_empty_ok_not_error() {
         // rg exit 1 (no matches) must be a normal empty result, not an
         // error — exit 1 is rg's documented "nothing found" signal.
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
@@ -642,7 +642,7 @@ mod tests {
     #[tokio::test]
     async fn real_rg_failure_errors_with_stderr() {
         // A nonexistent search path makes rg exit 2 (real error), not 1.
-        if which("rg").is_err() {
+        if !require_rg() {
             return;
         }
         let err = run(
@@ -676,5 +676,22 @@ mod tests {
             std::io::ErrorKind::NotFound,
             format!("{bin} not on PATH"),
         ))
+    }
+
+    /// `rg` is a hard runtime dependency of this crate. On a developer
+    /// machine without it, skip with a visible notice; in CI, fail closed
+    /// instead of silently reporting green on zero executed assertions —
+    /// this guards the per-term matching and determinism regression
+    /// coverage that is the point of this file.
+    fn require_rg() -> bool {
+        if which("rg").is_ok() {
+            return true;
+        }
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "rg not found on PATH; rg is a hard runtime dependency and must be installed in CI"
+        );
+        eprintln!("SKIP: rg not found on PATH; skipping ripgrep test locally");
+        false
     }
 }
