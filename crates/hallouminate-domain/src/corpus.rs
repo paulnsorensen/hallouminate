@@ -42,6 +42,7 @@ pub use index_md::{
     compose_index_md, is_index_md,
 };
 pub use keywords::extract_keywords;
+pub(crate) use keywords::normalized_words;
 pub use sandbox::{
     FileEntry, SandboxError, TreeNode, WriteError, WriteErrorKind, atomic_write_no_follow,
     build_corpus_tree, delete_no_follow, ensure_corpus_allows_file, first_corpus_root,

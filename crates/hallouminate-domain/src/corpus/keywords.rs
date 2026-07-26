@@ -20,6 +20,15 @@ pub fn extract_keywords(text: &str) -> Vec<String> {
     rank_top(tokenize_prose(text))
 }
 
+/// Lowercase, segment into Unicode words, and drop stopwords and
+/// sub-`MIN_LEN` tokens. Shared with `search::terms::split_terms` so
+/// index-side keywords and query-side terms agree on what counts as a term.
+pub(crate) fn normalized_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.unicode_words()
+        .map(str::to_lowercase)
+        .filter(|w| w.chars().count() >= MIN_LEN && !STOPWORDS.contains(w))
+}
+
 fn tokenize_prose(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut in_code_block = false;
@@ -28,10 +37,10 @@ fn tokenize_prose(text: &str) -> Vec<String> {
             Event::Start(Tag::CodeBlock(_)) => in_code_block = true,
             Event::End(TagEnd::CodeBlock) => in_code_block = false,
             Event::Text(t) if !in_code_block => {
-                tokens.extend(t.unicode_words().map(str::to_lowercase));
+                tokens.extend(normalized_words(&t));
             }
             Event::Code(t) => {
-                tokens.extend(t.unicode_words().map(str::to_lowercase));
+                tokens.extend(normalized_words(&t));
             }
             // Tokens come from text (`Event::Text`, which includes heading and
             // list-item text) and inline code spans (`Event::Code`); fenced
@@ -48,9 +57,6 @@ fn tokenize_prose(text: &str) -> Vec<String> {
 fn rank_top(tokens: Vec<String>) -> Vec<String> {
     let mut counts: HashMap<String, (u32, usize)> = HashMap::new();
     for (i, tok) in tokens.into_iter().enumerate() {
-        if tok.chars().count() < MIN_LEN || STOPWORDS.contains(&tok) {
-            continue;
-        }
         counts.entry(tok).and_modify(|e| e.0 += 1).or_insert((1, i));
     }
     let mut entries: Vec<(String, u32, usize)> =

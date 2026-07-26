@@ -1,32 +1,22 @@
 //! Query term extraction for search ranking.
 //!
-//! Deterministic, dependency-free tokenization: lowercase, split on
-//! non-alphanumeric runs, drop stopwords, dedup.
+//! Delegates lowercasing, Unicode word segmentation, stopword filtering, and
+//! the minimum-length gate to [`crate::corpus::normalized_words`] so the
+//! query side (this module) and the index side
+//! ([`crate::corpus::extract_keywords`]) agree on what counts as a term.
 
-/// Closed-class English stopwords, sorted. Dropped because they carry no
-/// discriminative signal for term-overlap ranking.
-const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do", "does", "for", "from",
-    "how", "i", "if", "in", "into", "is", "it", "its", "of", "on", "or", "that", "the", "their",
-    "then", "there", "these", "they", "this", "to", "was", "what", "when", "where", "which", "who",
-    "why", "will", "with", "you", "your",
-];
+use crate::corpus::normalized_words;
 
-/// Lowercase, split on whitespace and punctuation, drop English stopwords.
-/// Deterministic and dependency-free.
-///
-/// Deduplicates while preserving first-occurrence order: downstream ranking
-/// counts distinct terms matched, so callers need distinct terms, not a
-/// term-frequency multiset.
+/// Split a query into terms via [`normalized_words`], then deduplicate while
+/// preserving first-occurrence order: downstream ranking counts distinct
+/// terms matched, so callers need distinct terms, not a term-frequency
+/// multiset.
 pub fn split_terms(query: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut terms = Vec::new();
-    for word in query.to_lowercase().split(|c: char| !c.is_alphanumeric()) {
-        if word.is_empty() || STOPWORDS.binary_search(&word).is_ok() {
-            continue;
-        }
-        if seen.insert(word.to_string()) {
-            terms.push(word.to_string());
+    for word in normalized_words(query) {
+        if seen.insert(word.clone()) {
+            terms.push(word);
         }
     }
     terms
@@ -37,17 +27,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stopwords_are_sorted_for_binary_search() {
-        let mut sorted = STOPWORDS.to_vec();
-        sorted.sort_unstable();
-        assert_eq!(STOPWORDS, sorted.as_slice());
+    fn agrees_with_keywords_normalization_on_shared_input() {
+        // The two sides tokenize independently but must never drift: this
+        // pins that split_terms's dedup-and-order output matches
+        // extract_keywords's frequency ranking when every term occurs once
+        // (rank order degenerates to first-occurrence order).
+        use crate::corpus::extract_keywords;
+        let text = "Worktree-Corpus, Isolation!";
+        assert_eq!(split_terms(text), extract_keywords(text));
     }
 
     #[test]
     fn multi_word_natural_language_query() {
+        // "work" is in the shared stop_words English list (unlike the old
+        // local closed-class list), so it drops along with "how"/"does"/"the".
         assert_eq!(
             split_terms("how does the search ranking work"),
-            vec!["search", "ranking", "work"]
+            vec!["search", "ranking"]
         );
     }
 
@@ -88,10 +84,22 @@ mod tests {
     }
 
     #[test]
-    fn query_with_numbers() {
+    fn unicode_word_boundaries_keep_apostrophes_inside_a_word() {
+        assert_eq!(split_terms("O'Brien fusion"), vec!["o'brien", "fusion"]);
+    }
+
+    #[test]
+    fn single_character_tokens_are_dropped() {
+        assert_eq!(split_terms("z zz q"), vec!["zz"]);
+    }
+
+    #[test]
+    fn query_with_numbers_drops_single_digit_terms() {
+        // "2.0" is one Unicode word (mid-word period), so it clears MIN_LEN
+        // and survives; bare "2"/"0" would not.
         assert_eq!(
             split_terms("rrf k60 weight 2.0"),
-            vec!["rrf", "k60", "weight", "2", "0"]
+            vec!["rrf", "k60", "weight", "2.0"]
         );
     }
 }
