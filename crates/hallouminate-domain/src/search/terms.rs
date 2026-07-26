@@ -39,11 +39,13 @@ mod tests {
 
     #[test]
     fn multi_word_natural_language_query() {
-        // "work" is in the shared stop_words English list (unlike the old
-        // local closed-class list), so it drops along with "how"/"does"/"the".
+        // The shared list (NLTK English, 198 words) drops function words
+        // like "how"/"does"/"the" but keeps content words. "work" is a
+        // content word and survives — widening the list from the old local
+        // 45-word set did not cost the literal signals any query vocabulary.
         assert_eq!(
             split_terms("how does the search ranking work"),
-            vec!["search", "ranking"]
+            vec!["search", "ranking", "work"]
         );
     }
 

@@ -72,6 +72,12 @@ pub async fn search_with_ripgrep(
     limit: usize,
 ) -> Result<Vec<SearchHit>> {
     let terms = split_terms(query);
+    // Bound on the rg subprocess. The `max_hits` truncation only fires when
+    // matches are plentiful; a sparse-or-empty match still forces rg to walk
+    // the whole corpus root under `--sort path`'s single traversal thread.
+    // This deadline caps that worst case instead of letting a rare query
+    // stall Ground on however long the corpus takes to walk exhaustively.
+    const RIPGREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
     let root = corpus_key.canonical_root.to_string_lossy().into_owned();
     let roots = [root];
     // Each term may contribute up to `limit` useful hits, so a flat
@@ -80,22 +86,53 @@ pub async fn search_with_ripgrep(
     let rg_budget = limit.saturating_mul(terms.len().max(1));
 
     let signals_fut = store.retrieve_signals(corpus_key, query, limit);
-    let rg_fut = ripgrep::run(&roots, &terms, rg_budget);
+    let rg_fut = tokio::time::timeout(RIPGREP_TIMEOUT, ripgrep::run(&roots, &terms, rg_budget));
     let (signals_res, rg_res) = tokio::join!(signals_fut, rg_fut);
 
     let signals = signals_res?;
     if signals.hits.is_empty() {
         return Ok(Vec::new());
     }
-    let rg_hits = match rg_res {
-        Ok(hits) => hits,
-        Err(error) => {
+    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) = match rg_res {
+        Ok(Ok(run)) => (run.hits, run.truncated, run.elapsed_ms, run.unparseable),
+        Ok(Err(error)) => {
             tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
-            Vec::new()
+            (Vec::new(), false, 0, 0)
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                target: "hallouminate::search",
+                timeout_ms = RIPGREP_TIMEOUT.as_millis() as u64,
+                "ripgrep pass timed out; ranking without the ripgrep signal"
+            );
+            (Vec::new(), false, RIPGREP_TIMEOUT.as_millis() as u64, 0)
         }
     };
 
-    let rg_list = ranked_by_term_count(resolve_rg_hits_to_chunks(&signals.hits, &rg_hits));
+    let (rg_chunk_counts, rg_stats) = resolve_rg_hits_to_chunks(&signals.hits, &rg_hits);
+    let resolved_chunks = rg_chunk_counts.len();
+    let rg_list = ranked_by_term_count(rg_chunk_counts);
+
+    tracing::debug!(
+        target: "hallouminate::search",
+        rg_hits = rg_hits.len(),
+        resolved_chunks,
+        dropped_file_not_in_pool = rg_stats.dropped_file_not_in_pool,
+        dropped_line_out_of_range = rg_stats.dropped_line_out_of_range,
+        truncated = rg_truncated,
+        unparseable = rg_unparseable,
+        elapsed_ms = rg_elapsed_ms,
+        "ripgrep signal resolved"
+    );
+    if !rg_hits.is_empty() && resolved_chunks == 0 {
+        tracing::warn!(
+            target: "hallouminate::search",
+            rg_hits = rg_hits.len(),
+            dropped_file_not_in_pool = rg_stats.dropped_file_not_in_pool,
+            dropped_line_out_of_range = rg_stats.dropped_line_out_of_range,
+            "ripgrep signal produced hits but resolved to zero chunks"
+        );
+    }
 
     let fm_list = ranked_by_term_count(contains_term_counts(&signals.hits, &terms));
 
@@ -133,6 +170,18 @@ pub async fn search_with_ripgrep(
     Ok(ranked)
 }
 
+/// Result counters from [`resolve_rg_hits_to_chunks`], split by drop cause.
+#[derive(Debug, Clone, Default)]
+struct RgResolveStats {
+    /// The hit's file was never retrieved by the FTS/vector pool — a known
+    /// pool-gating limitation, tracked separately from the cause below.
+    dropped_file_not_in_pool: usize,
+    /// The hit's line fell outside every retrieved chunk's range — the
+    /// silent-match-loss risk ADR-003 flags (footnote or stripped regions
+    /// swallowing most of a signal's matches).
+    dropped_line_out_of_range: usize,
+}
+
 /// Map ripgrep hits onto the chunks whose line range contains them,
 /// counting the distinct query terms each chunk matched.
 ///
@@ -143,23 +192,30 @@ pub async fn search_with_ripgrep(
 /// A hit resolving to a chunk outside the retrieved pool is also dropped:
 /// there is no `SearchHit` to return for it, so the pool bounds the
 /// result set.
+///
+/// Returns the per-chunk distinct-term counts alongside [`RgResolveStats`],
+/// which keeps the two drop causes as separate counters instead of one
+/// conflated total.
 fn resolve_rg_hits_to_chunks(
     pool: &HashMap<String, SearchHit>,
     rg_hits: &[RipgrepHit],
-) -> HashMap<String, usize> {
+) -> (HashMap<String, usize>, RgResolveStats) {
     if rg_hits.is_empty() {
-        return HashMap::new();
+        return (HashMap::new(), RgResolveStats::default());
     }
     let mut by_file: HashMap<&str, Vec<&SearchHit>> = HashMap::new();
     for hit in pool.values() {
         by_file.entry(hit.file_ref.as_str()).or_default().push(hit);
     }
 
+    let mut stats = RgResolveStats::default();
     let mut matched: HashMap<String, Vec<String>> = HashMap::new();
     for rg_hit in rg_hits {
         let Some(candidates) = by_file.get(rg_hit.file_ref.as_str()) else {
+            stats.dropped_file_not_in_pool += 1;
             continue;
         };
+        let mut attributed = false;
         for chunk in candidates {
             let (Ok(start), Ok(end)) = (
                 u64::try_from(chunk.line_start),
@@ -170,6 +226,7 @@ fn resolve_rg_hits_to_chunks(
             if rg_hit.line < start || rg_hit.line > end {
                 continue;
             }
+            attributed = true;
             let terms = matched.entry(chunk.chunk_id.clone()).or_default();
             for term in &rg_hit.matched {
                 if !terms.contains(term) {
@@ -177,11 +234,15 @@ fn resolve_rg_hits_to_chunks(
                 }
             }
         }
+        if !attributed {
+            stats.dropped_line_out_of_range += 1;
+        }
     }
-    matched
+    let counts = matched
         .into_iter()
         .map(|(chunk_id, terms)| (chunk_id, terms.len()))
-        .collect()
+        .collect();
+    (counts, stats)
 }
 
 /// Count, per chunk, how many distinct query `terms` appear in the
@@ -279,7 +340,8 @@ mod tests {
             hit("a", "/repo/wiki/x.md", 1, 10),
             hit("b", "/repo/wiki/x.md", 11, 20),
         ]);
-        let counts = resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 15, &["term"])]);
+        let (counts, _stats) =
+            resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 15, &["term"])]);
         assert_eq!(counts.get("b"), Some(&1));
         assert_eq!(
             counts.get("a"),
@@ -296,21 +358,33 @@ mod tests {
             hit("a", "/repo/wiki/x.md", 1, 10),
             hit("b", "/repo/wiki/x.md", 60, 70),
         ]);
-        let counts = resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 42, &["term"])]);
+        let (counts, stats) =
+            resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/x.md", 42, &["term"])]);
         assert!(counts.is_empty(), "hit outside every range must be dropped");
+        assert_eq!(
+            stats.dropped_line_out_of_range, 1,
+            "a gap-between-chunks miss must bump dropped_line_out_of_range, not dropped_file_not_in_pool"
+        );
+        assert_eq!(stats.dropped_file_not_in_pool, 0);
     }
 
     #[test]
     fn rg_hit_in_a_file_outside_the_pool_is_dropped() {
         let p = pool(vec![hit("a", "/repo/wiki/x.md", 1, 10)]);
-        let counts = resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/other.md", 5, &["term"])]);
+        let (counts, stats) =
+            resolve_rg_hits_to_chunks(&p, &[rg_hit("/repo/wiki/other.md", 5, &["term"])]);
         assert!(counts.is_empty());
+        assert_eq!(
+            stats.dropped_file_not_in_pool, 1,
+            "a file the pool never retrieved must bump dropped_file_not_in_pool, not dropped_line_out_of_range"
+        );
+        assert_eq!(stats.dropped_line_out_of_range, 0);
     }
 
     #[test]
     fn distinct_terms_are_counted_once_per_chunk_across_several_lines() {
         let p = pool(vec![hit("a", "/repo/wiki/x.md", 1, 20)]);
-        let counts = resolve_rg_hits_to_chunks(
+        let (counts, _stats) = resolve_rg_hits_to_chunks(
             &p,
             &[
                 rg_hit("/repo/wiki/x.md", 3, &["alpha"]),

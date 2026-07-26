@@ -34,6 +34,25 @@ pub struct RipgrepHit {
     pub matched: Vec<String>,
 }
 
+/// Outcome of one [`run`] invocation: the parsed hits plus the counters
+/// the call site needs to tell an honest "no literal matches" apart from
+/// a signal that ran and produced nothing usable (truncated, timed out,
+/// or hit an rg output shape this parser doesn't recognise).
+#[derive(Debug, Clone)]
+pub struct RipgrepRun {
+    pub hits: Vec<RipgrepHit>,
+    /// `true` when collection stopped at `max_hits` before rg finished
+    /// walking the corpus.
+    pub truncated: bool,
+    /// Wall-clock duration of the `rg` subprocess, spawn to exit.
+    pub elapsed_ms: u64,
+    /// Count of `"type":"match"` events whose fields didn't parse — the
+    /// detectable signature of an rg version bump renaming a JSON field
+    /// (e.g. `submatches`/`match`/`text`). Excludes ordinary non-match
+    /// events (begin/end/summary/context), which are expected.
+    pub unparseable: usize,
+}
+
 /// Run `rg` over each `path`, matching each of `terms` as its own literal
 /// (`-e`) pattern in one invocation — a multi-word query needs every term a
 /// chance to match, not just the literal whole-query string. Returns at
@@ -48,9 +67,14 @@ pub struct RipgrepHit {
 ///   AND nothing was emitted on stdout → `HallouminateError::Search`;
 ///   non-zero with matches already collected (e.g. one path vanished
 ///   while another matched) is tolerated.
-pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<Vec<RipgrepHit>> {
+pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<RipgrepRun> {
     if paths.is_empty() || terms.is_empty() || max_hits == 0 {
-        return Ok(Vec::new());
+        return Ok(RipgrepRun {
+            hits: Vec::new(),
+            truncated: false,
+            elapsed_ms: 0,
+            unparseable: 0,
+        });
     }
     let mut cmd = Command::new("rg");
     cmd.arg("--json")
@@ -85,6 +109,7 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
+    let started = std::time::Instant::now();
     let mut child = cmd.spawn().map_err(HallouminateError::Io)?;
     let stdout = child
         .stdout
@@ -94,14 +119,19 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
 
     let mut hits: Vec<RipgrepHit> = Vec::new();
     let mut limit_reached = false;
+    let mut unparseable = 0usize;
     while let Some(line) = reader.next_line().await.map_err(HallouminateError::Io)? {
-        if let Some(mut hit) = parse_match_line(&line) {
-            // Indexer stores file_ref as `canonicalize_or_passthrough`'d
-            // path; mirror that here so the fusion key (file_ref string
-            // equality) actually lines up.
-            let canon = canonicalize_or_passthrough(Path::new(&hit.file_ref));
-            hit.file_ref = canon.as_path().to_string_lossy().into_owned();
-            hits.push(hit);
+        match classify_line(&line) {
+            ParsedLine::Hit(mut hit) => {
+                // Indexer stores file_ref as `canonicalize_or_passthrough`'d
+                // path; mirror that here so the fusion key (file_ref string
+                // equality) actually lines up.
+                let canon = canonicalize_or_passthrough(Path::new(&hit.file_ref));
+                hit.file_ref = canon.as_path().to_string_lossy().into_owned();
+                hits.push(hit);
+            }
+            ParsedLine::Malformed => unparseable += 1,
+            ParsedLine::NotMatch => {}
         }
         // Break the instant the cap is satisfied — checking after the push
         // (rather than at the top of the next iteration) means we don't
@@ -124,6 +154,7 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
     // worst case, but a clean wait is cheaper) AND so we can inspect its
     // exit status instead of masking real failures.
     let status = child.wait().await.map_err(HallouminateError::Io)?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     // rg exit codes: 0 = matches found, 1 = no matches, >=2 = real error
     // (bad pattern, IO failure, …). Exit 1 with no hits is rg's normal
     // "nothing found" signal, not a failure — return an empty result. A
@@ -142,22 +173,42 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
             stderr_buf.trim()
         )));
     }
-    Ok(hits)
+    Ok(RipgrepRun {
+        hits,
+        truncated: limit_reached,
+        elapsed_ms,
+        unparseable,
+    })
 }
 
-/// Parse one line of `rg --json` output. Returns `Some` only for
-/// `"type":"match"` events; ignores begin/end/summary/context lines so
-/// the caller doesn't have to know rg's event taxonomy.
-///
-/// Every nested field is `Option<…>` so an unexpected shape (newer rg
-/// version, future event variants) returns `None` instead of failing
-/// the whole stream.
-fn parse_match_line(line: &str) -> Option<RipgrepHit> {
-    let evt: RgEvent = serde_json::from_str(line).ok()?;
+/// Classification of one `rg --json` stdout line, distinguishing an
+/// ordinary non-match event from a `"type":"match"` event whose fields
+/// didn't parse — the latter is what [`RipgrepRun::unparseable`] counts.
+enum ParsedLine {
+    Hit(RipgrepHit),
+    NotMatch,
+    Malformed,
+}
+
+fn classify_line(line: &str) -> ParsedLine {
+    let Ok(evt) = serde_json::from_str::<RgEvent>(line) else {
+        return ParsedLine::Malformed;
+    };
     if evt.kind != "match" {
-        return None;
+        return ParsedLine::NotMatch;
     }
-    let data = evt.data?;
+    match parse_match_hit(evt.data) {
+        Some(hit) => ParsedLine::Hit(hit),
+        None => ParsedLine::Malformed,
+    }
+}
+
+/// Extract a [`RipgrepHit`] from a `"type":"match"` event's `data`.
+/// Every nested field is `Option<…>`, deliberately so: an unexpected
+/// shape (newer rg version, future event variants) returns `None`
+/// instead of panicking on the whole stream.
+fn parse_match_hit(data: Option<RgMatchData>) -> Option<RipgrepHit> {
+    let data = data?;
     let path = data.path?.text?;
     let line_no = data.line_number?;
     let snippet = data.lines.and_then(|l| l.text).unwrap_or_default();
@@ -210,11 +261,19 @@ struct RgText {
 mod tests {
     use super::*;
 
+    fn expect_hit(line: &str) -> RipgrepHit {
+        match classify_line(line) {
+            ParsedLine::Hit(hit) => hit,
+            ParsedLine::NotMatch => panic!("match event classified as NotMatch"),
+            ParsedLine::Malformed => panic!("match event classified as Malformed"),
+        }
+    }
+
     #[test]
-    fn parse_match_line_extracts_path_and_line() {
+    fn classify_line_extracts_path_and_line() {
         // Synthetic but matches `rg --json` shape for a match event.
         let line = r#"{"type":"match","data":{"path":{"text":"/tmp/a.md"},"lines":{"text":"hello world\n"},"line_number":42,"absolute_offset":0,"submatches":[{"match":{"text":"Hello"},"start":0,"end":5}]}}"#;
-        let hit = parse_match_line(line).expect("match event yields hit");
+        let hit = expect_hit(line);
         assert_eq!(hit.file_ref, "/tmp/a.md");
         assert_eq!(hit.line, 42);
         assert_eq!(hit.snippet, "hello world\n");
@@ -222,37 +281,63 @@ mod tests {
     }
 
     #[test]
-    fn parse_match_line_dedups_matched_terms() {
+    fn classify_line_dedups_matched_terms() {
         let line = r#"{"type":"match","data":{"path":{"text":"/tmp/a.md"},"lines":{"text":"foo foo bar\n"},"line_number":1,"submatches":[{"match":{"text":"foo"}},{"match":{"text":"FOO"}},{"match":{"text":"bar"}}]}}"#;
-        let hit = parse_match_line(line).expect("match event yields hit");
+        let hit = expect_hit(line);
         assert_eq!(hit.matched, vec!["foo".to_string(), "bar".to_string()]);
     }
 
+    /// A `begin`/`end`/`summary`/`context` event is an ordinary part of the
+    /// stream, not a parse failure. It must classify as `NotMatch` so it
+    /// never inflates the `unparseable` counter that exists to detect an
+    /// rg output-format change.
     #[test]
-    fn parse_match_line_ignores_non_match_events() {
+    fn classify_line_treats_non_match_events_as_not_malformed() {
         for kind in ["begin", "end", "summary", "context"] {
             let line = format!(r#"{{"type":"{kind}","data":{{"path":{{"text":"/tmp/a.md"}}}}}}"#);
             assert!(
-                parse_match_line(&line).is_none(),
-                "{kind} events must not produce hits"
+                matches!(classify_line(&line), ParsedLine::NotMatch),
+                "{kind} events must classify as NotMatch, not Malformed"
             );
         }
     }
 
+    /// Unparseable bytes are a real signal that rg's output shape changed,
+    /// so they must be distinguishable from a routine non-match event.
     #[test]
-    fn parse_match_line_returns_none_on_garbage() {
-        assert!(parse_match_line("not json").is_none());
-        assert!(parse_match_line("").is_none());
+    fn classify_line_reports_garbage_as_malformed() {
+        assert!(matches!(classify_line("not json"), ParsedLine::Malformed));
+        assert!(matches!(classify_line(""), ParsedLine::Malformed));
+    }
+
+    #[test]
+    fn malformed_match_event_is_counted_not_ignored() {
+        // A match event missing `line_number` fails to parse into a
+        // RipgrepHit — classify_line must report this as Malformed so the
+        // caller's `unparseable` counter counts it, distinct from an
+        // ordinary non-match event which must not bump that counter.
+        let line = r#"{"type":"match","data":{"path":{"text":"/tmp/a.md"},"lines":{"text":"hello\n"},"submatches":[{"match":{"text":"hello"}}]}}"#;
+        assert!(
+            matches!(classify_line(line), ParsedLine::Malformed),
+            "a match event missing line_number must classify as Malformed"
+        );
     }
 
     #[tokio::test]
     async fn empty_inputs_short_circuit() {
-        assert!(run(&[], &["q".to_string()], 5).await.unwrap().is_empty());
-        assert!(run(&["/tmp".into()], &[], 5).await.unwrap().is_empty());
+        assert!(
+            run(&[], &["q".to_string()], 5)
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert!(run(&["/tmp".into()], &[], 5).await.unwrap().hits.is_empty());
         assert!(
             run(&["/tmp".into()], &["q".to_string()], 0)
                 .await
                 .unwrap()
+                .hits
                 .is_empty()
         );
     }
@@ -274,7 +359,8 @@ mod tests {
             5,
         )
         .await
-        .expect("rg run");
+        .expect("rg run")
+        .hits;
         assert_eq!(hits.len(), 1, "exactly one match in fixture");
         assert!(
             hits[0].file_ref.ends_with("notes.md"),
@@ -311,7 +397,7 @@ mod tests {
         let question = "why is the spice melange important to navigation";
 
         let terms = crate::search::terms::split_terms(question);
-        let hits = run(&roots, &terms, 10).await.expect("per-term run");
+        let hits = run(&roots, &terms, 10).await.expect("per-term run").hits;
         assert!(
             !hits.is_empty(),
             "per-term matching must find the fixture for a natural-language question"
@@ -325,7 +411,8 @@ mod tests {
         // exactly the behaviour that made this signal dead weight.
         let whole = run(&roots, &[question.to_string()], 10)
             .await
-            .expect("whole-query run");
+            .expect("whole-query run")
+            .hits;
         assert!(
             whole.is_empty(),
             "the raw question appears nowhere in the corpus; got {} hits",
@@ -363,14 +450,21 @@ mod tests {
         let terms = ["shrubbery".to_string(), "swallow".to_string()];
 
         let first = run(&roots, &terms, 10).await.expect("first run");
-        assert_eq!(first.len(), 10, "max_hits must actually truncate here");
+        assert_eq!(first.hits.len(), 10, "max_hits must actually truncate here");
+        assert!(
+            first.truncated,
+            "collection stopped at max_hits, so truncated must be true"
+        );
         for _ in 0..4 {
             let again = run(&roots, &terms, 10).await.expect("repeat run");
+            assert!(again.truncated, "every truncated run must report truncated");
             let a: Vec<_> = first
+                .hits
                 .iter()
                 .map(|h| (&h.file_ref, h.line, &h.matched))
                 .collect();
             let b: Vec<_> = again
+                .hits
                 .iter()
                 .map(|h| (&h.file_ref, h.line, &h.matched))
                 .collect();
@@ -392,7 +486,8 @@ mod tests {
             10,
         )
         .await
-        .expect("rg run");
+        .expect("rg run")
+        .hits;
         let files: std::collections::HashSet<&str> = hits
             .iter()
             .map(|h| h.file_ref.rsplit('/').next().unwrap())
@@ -417,7 +512,8 @@ mod tests {
             10,
         )
         .await
-        .expect("rg run");
+        .expect("rg run")
+        .hits;
         assert_eq!(hits.len(), 1, "only the matching term produces a hit");
         assert_eq!(hits[0].matched, vec!["caerbannog".to_string()]);
     }
@@ -452,7 +548,11 @@ mod tests {
         .expect("run() must return promptly instead of deadlocking on a full pipe")
         .expect("rg run");
 
-        assert_eq!(result.len(), 1, "limit of 1 must cap the returned hits");
+        assert_eq!(
+            result.hits.len(),
+            1,
+            "limit of 1 must cap the returned hits"
+        );
     }
 
     #[tokio::test]
@@ -471,7 +571,8 @@ mod tests {
             5,
         )
         .await
-        .expect("exit 1 with no hits must be Ok, not Err");
+        .expect("exit 1 with no hits must be Ok, not Err")
+        .hits;
         assert!(hits.is_empty(), "expected no hits, got {hits:?}");
     }
 
