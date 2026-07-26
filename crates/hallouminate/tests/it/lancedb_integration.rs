@@ -1,4 +1,4 @@
-//! Integration tests for `LanceStore` and `hybrid_search` against a real
+//! Integration tests for `LanceStore` and `retrieve_signals` against a real
 //! tempdir-backed LanceDB instance, using a deterministic fake embedder.
 //!
 //! Covers spec §8.1 #2, #3, #4, #6, #7, #8 from
@@ -192,7 +192,7 @@ async fn touch_mtime_updates_only_mtime_column() {
 // ── Spec §8.1 #6: Hybrid search returns results ──────────────────────────
 
 #[tokio::test]
-async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
+async fn retrieve_signals_returns_at_least_one_hit_for_indexed_corpus() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let corpus_key = corpus_key("docs");
@@ -209,7 +209,7 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
     // Use the stub embedder to compute a query vector deterministically.
     let hits = search_with_ripgrep(&store, &corpus_key, "spice", 5)
         .await
-        .expect("hybrid_search");
+        .expect("retrieve_signals");
     assert!(
         !hits.is_empty(),
         "hybrid search must return hits for indexed corpus"
@@ -220,10 +220,10 @@ async fn hybrid_search_returns_at_least_one_hit_for_indexed_corpus() {
     );
 }
 
-// ── Spec §8.1 #7: Empty corpus → empty hybrid_search result ──────────────
+// ── Spec §8.1 #7: Empty corpus → empty signal lists ───────────────────────
 
 #[tokio::test]
-async fn hybrid_search_on_empty_corpus_returns_empty_vec() {
+async fn retrieve_signals_on_empty_corpus_returns_empty_signals() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let corpus_key = corpus_key("docs");
@@ -252,7 +252,7 @@ async fn single_file_corpus_top_hit_is_that_file() {
 
     let hits = search_with_ripgrep(&store, &corpus_key, "unique_token_witness_me", 5)
         .await
-        .expect("hybrid_search");
+        .expect("retrieve_signals");
     assert!(!hits.is_empty(), "expected at least one hit");
     assert_eq!(
         hits[0].file_ref, "/tmp/only.md",
@@ -369,10 +369,10 @@ async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
     assert!(beta.iter().any(|s| s.file_ref == shared));
 }
 
-// ── Multi-corpus isolation: hybrid_search stays inside its corpus ───────
+// ── Multi-corpus isolation: retrieve_signals stays inside its corpus ────
 
 #[tokio::test]
-async fn hybrid_search_returns_only_hits_from_requested_corpus() {
+async fn retrieve_signals_returns_only_hits_from_requested_corpus() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store) = fresh_store().await;
     let alpha = corpus_key("alpha");

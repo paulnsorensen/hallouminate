@@ -43,10 +43,12 @@ pub struct PreparedFile {
     pub chunks: Vec<PreparedChunk>,
 }
 
-/// One ranked result row returned by `hybrid_search` or `fts_search`.
+/// One retrieved chunk row.
 ///
 /// Carries the chunk's text and location plus its parent file's `summary`,
-/// `keywords`, and `mtime_ms`, with `score` set by the active reranker.
+/// `keywords`, and `mtime_ms`. `score` is the fused RRF score once
+/// `domain::search` has ranked it; per-signal scores from the store are not
+/// comparable.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
     pub chunk_id: String,
@@ -60,6 +62,8 @@ pub struct SearchHit {
     pub search_text: String,
     pub summary: String,
     pub keywords: Vec<String>,
+    /// `0.0` until `domain::search` fuses this hit's per-signal ranks and
+    /// overwrites it with the RRF score. Never a raw per-signal score.
     pub score: f32,
     pub mtime_ms: i64,
     /// Claim marks decoded from the chunk's `claim_marks` JSON column. Empty

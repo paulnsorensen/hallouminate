@@ -487,17 +487,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     let heading_path = list_utf8_col(rb, "heading_path")?;
     let keywords = list_utf8_col(rb, "keywords")?;
     let claim_marks = string_col(rb, "claim_marks")?;
-    let score = rb
-        .column_by_name("_relevance_score")
-        .or_else(|| rb.column_by_name("_score"))
-        .or_else(|| rb.column_by_name("_distance"))
-        .cloned();
     for i in 0..rb.num_rows() {
-        let s = score
-            .as_ref()
-            .and_then(|arr| arr.as_any().downcast_ref::<Float32Array>())
-            .map(|f| f.value(i))
-            .unwrap_or(0.0);
         out.push(SearchHit {
             chunk_id: chunk_id.value(i).to_string(),
             corpus_key: corpus_key.clone(),
@@ -509,7 +499,13 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
             search_text: search_text.value(i).to_string(),
             summary: summary.value(i).to_string(),
             keywords: decode_list(keywords, i),
-            score: s,
+            // Per-signal scores (FTS relevance, higher-better; vector
+            // distance, lower-better) are mutually incomparable and never
+            // read pre-fusion — `domain::search` overwrites every hit's
+            // `score` with the fused RRF value before a caller sees it. Zero
+            // here rather than let either meaning cross the `ChunkStore`
+            // port under one field.
+            score: 0.0,
             mtime_ms: mtime_ms.value(i),
             claim_marks: decode_claim_marks(claim_marks, i),
             z_score: None,
@@ -1207,11 +1203,12 @@ impl LanceStore {
                 .map_err(map_lance_err)?;
         }
         // FM-Index is built unconditionally on `search_text` too (mirrors FTS,
-        // not row-gated like the ANN index below) — an additive exact-substring
-        // signal for `hybrid_search`'s `contains_matches` boost. Its
-        // `index_type` must be checked (not just the column), since an FTS
-        // index also lives on `search_text` and `columns.iter().any(...)` alone
-        // can't tell them apart.
+        // not row-gated like the ANN index below) — it backs the `contains`
+        // signal, which joins the other retrieval signals as a peer ranked
+        // list in `domain::search`'s fusion pass. Its `index_type` must be
+        // checked (not just the column), since an FTS index also lives on
+        // `search_text` and `columns.iter().any(...)` alone can't tell them
+        // apart.
         let has_fm_index = existing.iter().any(|i| {
             i.index_type == lancedb::index::IndexType::Fm
                 && i.columns.iter().any(|c| c == "search_text")
@@ -1458,54 +1455,10 @@ impl LanceStore {
         }
         let corpus_filter = corpus_key_filter(corpus_key)?;
 
-        let table = self.table.clone();
-        let fts_query = query.to_string();
-        let fts_filter = corpus_filter.clone();
-        let fts_fut = supervise_scan("fts_search", async move {
-            let stream = table
-                .query()
-                .only_if(fts_filter)
-                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(fts_query))
-                .limit(limit)
-                .execute()
-                .await
-                .map_err(map_lance_err)?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
-            Ok(batches)
-        });
-
-        let embeddings_enabled = self.embeddings_enabled;
-        let embedder = Arc::clone(&self.embedder);
-        let vector_table = self.table.clone();
-        let vector_query = query.to_string();
-        let vector_filter = corpus_filter;
-        let vector_fut = async move {
-            if !embeddings_enabled {
-                return Ok(Vec::new());
-            }
-            let vectors =
-                run_embedding_blocking(embedder, vec![vector_query], EmbedRole::Query).await?;
-            let query_vec = vectors.into_iter().next().ok_or_else(|| {
-                HallouminateError::Embed("embed_batch returned no vector for query".into())
-            })?;
-            supervise_scan("vector_search", async move {
-                let stream = vector_table
-                    .query()
-                    .only_if(vector_filter)
-                    .nearest_to(&query_vec[..])
-                    .map_err(map_lance_err)?
-                    .limit(limit)
-                    .execute()
-                    .await
-                    .map_err(map_lance_err)?;
-                let batches: Vec<RecordBatch> =
-                    stream.try_collect().await.map_err(map_lance_err)?;
-                Ok(batches)
-            })
-            .await
-        };
-
-        let (fts_batches, vector_batches) = tokio::try_join!(fts_fut, vector_fut)?;
+        let (fts_batches, vector_batches) = tokio::try_join!(
+            self.fts_scan(corpus_filter.clone(), query.to_string(), limit),
+            self.vector_scan(corpus_filter, query.to_string(), limit),
+        )?;
 
         let mut fts_hits: Vec<SearchHit> = Vec::new();
         for rb in &fts_batches {
@@ -1517,25 +1470,85 @@ impl LanceStore {
         }
 
         let mut hits: HashMap<String, SearchHit> = HashMap::new();
-        let mut fts: Vec<String> = Vec::new();
-        let mut seen_fts: HashSet<String> = HashSet::new();
-        for hit in fts_hits {
-            if seen_fts.insert(hit.chunk_id.clone()) {
-                fts.push(hit.chunk_id.clone());
-            }
-            hits.entry(hit.chunk_id.clone()).or_insert(hit);
-        }
-        let mut vector: Vec<String> = Vec::new();
-        let mut seen_vector: HashSet<String> = HashSet::new();
-        for hit in vector_hits {
-            if seen_vector.insert(hit.chunk_id.clone()) {
-                vector.push(hit.chunk_id.clone());
-            }
-            hits.entry(hit.chunk_id.clone()).or_insert(hit);
-        }
+        let fts = index_signal(fts_hits, &mut hits);
+        let vector = index_signal(vector_hits, &mut hits);
 
         Ok(SignalLists { fts, vector, hits })
     }
+
+    /// Full-text scan of `search_text` under `filter`, best `limit` hits
+    /// first. Runs concurrently with `vector_scan` under `try_join!` in
+    /// `retrieve_signals`.
+    async fn fts_scan(
+        &self,
+        filter: String,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        let table = self.table.clone();
+        supervise_scan("fts_search", async move {
+            let stream = table
+                .query()
+                .only_if(filter)
+                .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(query))
+                .limit(limit)
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await
+    }
+
+    /// Nearest-neighbour scan under `filter`, best `limit` hits first. Empty
+    /// when this store has no embedder. Runs concurrently with `fts_scan`
+    /// under `try_join!` in `retrieve_signals`.
+    async fn vector_scan(
+        &self,
+        filter: String,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<RecordBatch>> {
+        if !self.embeddings_enabled {
+            return Ok(Vec::new());
+        }
+        let embedder = Arc::clone(&self.embedder);
+        let vectors = run_embedding_blocking(embedder, vec![query], EmbedRole::Query).await?;
+        let query_vec = vectors.into_iter().next().ok_or_else(|| {
+            HallouminateError::Embed("embed_batch returned no vector for query".into())
+        })?;
+        let table = self.table.clone();
+        supervise_scan("vector_search", async move {
+            let stream = table
+                .query()
+                .only_if(filter)
+                .nearest_to(&query_vec[..])
+                .map_err(map_lance_err)?
+                .limit(limit)
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await
+    }
+}
+
+/// Index one signal's hits into the shared pool, keyed by `chunk_id`,
+/// keeping the first (best-ranked) occurrence on a duplicate. Returns the
+/// chunk_ids in rank order, deduplicated.
+fn index_signal(hits: Vec<SearchHit>, pool: &mut HashMap<String, SearchHit>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for hit in hits {
+        if seen.insert(hit.chunk_id.clone()) {
+            order.push(hit.chunk_id.clone());
+        }
+        pool.entry(hit.chunk_id.clone()).or_insert(hit);
+    }
+    order
 }
 
 async fn open_or_create_table(connection: &lancedb::Connection) -> Result<lancedb::Table> {
@@ -3560,5 +3573,35 @@ schema_version = 1
             .expect("FM-Index must exist on search_text");
         assert_ne!(fts_index.name, fm_index.name);
         assert_eq!(fm_index.name, "search_text_fm_idx");
+    }
+
+    /// decode_hits must never let a raw per-signal score (FTS relevance or
+    /// vector distance) cross the `ChunkStore` port: both are mutually
+    /// incomparable and `domain::search` always overwrites `score` with the
+    /// fused RRF value before a caller sees it, so decode_hits should hand
+    /// back `0.0` rather than either raw meaning.
+    #[tokio::test]
+    async fn retrieve_signals_hits_carry_zero_score_before_fusion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 2)])
+            .await
+            .expect("seed docs corpus");
+
+        let signals = store
+            .retrieve_signals(&docs_key(), "chunk-0", 10)
+            .await
+            .expect("fts search");
+        assert!(!signals.hits.is_empty(), "expected at least one hit");
+        for hit in signals.hits.values() {
+            assert_eq!(
+                hit.score, 0.0,
+                "decode_hits must not leak a raw per-signal score pre-fusion"
+            );
+        }
     }
 }

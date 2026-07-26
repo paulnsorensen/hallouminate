@@ -43,7 +43,7 @@ pub struct SearchConfig {
     pub limit_default: usize,
     /// Crossencoder model identifier (e.g. `"jina-reranker-v1-turbo-en"`).
     /// `None` (the default) disables the rerank step entirely; the
-    /// FTS+vector+rg fusion result is returned as-is. Names map to
+    /// four-signal (FTS+vector+ripgrep+contains) fusion result is returned as-is. Names map to
     /// `domain::search::crossencoder::canonical_crossencoder_model`.
     #[serde(default)]
     pub crossencoder: Option<String>,
