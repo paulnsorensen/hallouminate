@@ -3,7 +3,9 @@
 //! Covers the gap LanceDB's BM25 tokenizer misses: identifiers with
 //! embedded punctuation and raw substrings inside code fences. Matching
 //! is case-insensitive (`--ignore-case`), matching BM25's folded
-//! tokens.
+//! tokens. That coverage only reaches chunks the FTS/vector pool already
+//! retrieved (see `search_with_ripgrep`), so a chunk BM25 misses entirely
+//! is still invisible to this pass.
 //!
 //! Each query term is passed as its own literal pattern, and every hit
 //! reports which terms matched it, so the caller can rank chunks by how

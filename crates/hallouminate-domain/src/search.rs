@@ -17,6 +17,11 @@
 //! as ranked lists instead of as additive score bonuses. An additive
 //! bonus is not commensurate with a rank-derived score, which is the
 //! defect this design replaces.
+//!
+//! The two literal signals are computed over the FTS/vector candidate
+//! pool ([`search_with_ripgrep`]), not the full corpus: they reorder
+//! candidates BM25 or the vector search already retrieved and cannot
+//! contribute a candidate of their own.
 
 pub mod crossencoder;
 pub mod fuse;
@@ -65,6 +70,10 @@ pub const CONTAINS_WEIGHT: f32 = 0.5;
 ///
 /// Every returned hit's `score` is the fused RRF score, not the
 /// per-signal score the storage layer supplied.
+///
+/// The ripgrep and FM-Index `contains()` passes below only filter and
+/// rank `signals.hits` — the pool `store.retrieve_signals` returned —
+/// so a chunk outside that FTS/vector pool is invisible to both.
 pub async fn search_with_ripgrep(
     store: &dyn ChunkStore,
     corpus_key: &CorpusKey,
