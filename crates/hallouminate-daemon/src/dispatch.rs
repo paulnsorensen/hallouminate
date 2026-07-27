@@ -336,17 +336,16 @@ async fn handle_corpus_stats(
     })
 }
 
-/// Resolve per-request ground options, falling back to configured defaults
-/// for anything the request leaves unset.
 /// Ceiling on the candidate pool a single request may ask for.
 ///
-/// `limit` arrives unvalidated from the client and is multiplied by the
-/// query's term count to size the ripgrep budget, so an unbounded value
-/// lets one request steer how much work the daemon does. 1000 is far
-/// above any useful pool — the config default is 50 — while keeping that
-/// product bounded.
+/// `limit` arrives unvalidated from the client and sizes both the candidate
+/// pool and the ripgrep hit budget, so an unbounded value lets one request
+/// steer how much work the daemon does. 1000 is far above any useful pool --
+/// the config default is 50.
 const MAX_GROUND_LIMIT: usize = 1000;
 
+/// Resolve per-request ground options, falling back to configured defaults
+/// for anything the request leaves unset.
 fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
     GroundOpts {
         top_files: req.top_files.unwrap_or(cfg.search.top_files_default),

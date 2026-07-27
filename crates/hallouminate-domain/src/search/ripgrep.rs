@@ -4,7 +4,7 @@
 //! embedded punctuation and raw substrings inside code fences. Matching
 //! is case-insensitive (`--ignore-case`), matching BM25's folded
 //! tokens. That coverage only reaches chunks the FTS/vector pool already
-//! retrieved (see `search_with_ripgrep`), so a chunk BM25 misses entirely
+//! retrieved (see `search::search_fused`), so a chunk BM25 misses entirely
 //! is still invisible to this pass.
 //!
 //! Each query term is passed as its own literal pattern, and every hit
@@ -28,10 +28,9 @@ pub struct RipgrepHit {
     /// indexer's `canonicalize_or_passthrough` step).
     pub file_ref: String,
     pub line: u64,
-    pub snippet: String,
     /// Distinct lowercased terms matched at this line, from rg's
     /// `submatches[].match.text` — the only reliable way to know which
-    /// `-e` term hit, since substring-searching the snippet can't
+    /// `-e` term hit, since substring-searching the matched line can't
     /// disambiguate overlapping terms.
     pub matched: Vec<String>,
 }
@@ -71,6 +70,10 @@ const MIN_FILES_SPREAD: usize = 10;
 /// check below stays as a run-wide backstop so the stream still terminates
 /// promptly.
 ///
+/// `globs` filters the search to files matching any of the given glob
+/// patterns, passed through as one `--glob` argument per entry. An empty
+/// `globs` slice applies no filter — rg searches every file under `paths`.
+///
 /// Failure modes:
 /// - `rg` missing on PATH → `HallouminateError::Io` (`io::ErrorKind::NotFound`)
 /// - `rg` exits 1 with no matches → `Ok(vec![])`; this is rg's normal
@@ -79,7 +82,12 @@ const MIN_FILES_SPREAD: usize = 10;
 ///   AND nothing was emitted on stdout → `HallouminateError::Search`;
 ///   non-zero with matches already collected (e.g. one path vanished
 ///   while another matched) is tolerated.
-pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<RipgrepRun> {
+pub async fn run(
+    paths: &[String],
+    terms: &[String],
+    globs: &[String],
+    max_hits: usize,
+) -> Result<RipgrepRun> {
     if paths.is_empty() || terms.is_empty() || max_hits == 0 {
         return Ok(RipgrepRun {
             hits: Vec::new(),
@@ -116,8 +124,6 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
         // than the parallelism.
         .arg("--sort")
         .arg("path")
-        .arg("--type")
-        .arg("md")
         .arg("--ignore-case")
         .arg("--max-columns")
         .arg("512")
@@ -125,6 +131,9 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
         .arg(per_file_cap.to_string());
     for term in terms {
         cmd.arg("-e").arg(term);
+    }
+    for g in globs {
+        cmd.arg("--glob").arg(g);
     }
     cmd.arg("--");
     for p in paths {
@@ -141,7 +150,22 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
         .stdout
         .take()
         .ok_or_else(|| HallouminateError::Embed("rg child missing stdout".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| HallouminateError::Embed("rg child missing stderr".into()))?;
     let mut reader = BufReader::new(stdout).lines();
+    // Drain stderr concurrently with stdout instead of after wait(): if rg
+    // fills the ~64 KiB stderr pipe (e.g. permission-denied spam over a
+    // large root) while only stdout is being read, wait() blocks forever on
+    // the still-full stderr pipe — the same deadlock class already fixed
+    // for stdout above.
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr = stderr;
+        let mut buf = String::new();
+        let _ = stderr.read_to_string(&mut buf).await;
+        buf
+    });
 
     let mut hits: Vec<RipgrepHit> = Vec::new();
     let mut limit_reached = false;
@@ -190,10 +214,7 @@ pub async fn run(paths: &[String], terms: &[String], max_hits: usize) -> Result<
     // rather than returning an empty success that hides the error.
     let exit_code = status.code();
     if !status.success() && hits.is_empty() && exit_code != Some(1) {
-        let mut stderr_buf = String::new();
-        if let Some(mut err) = child.stderr.take() {
-            let _ = err.read_to_string(&mut stderr_buf).await;
-        }
+        let stderr_buf = stderr_task.await.unwrap_or_default();
         return Err(HallouminateError::Search(format!(
             "rg failed ({status}): {}",
             stderr_buf.trim()
@@ -237,7 +258,6 @@ fn parse_match_hit(data: Option<RgMatchData>) -> Option<RipgrepHit> {
     let data = data?;
     let path = data.path?.text?;
     let line_no = data.line_number?;
-    let snippet = data.lines.and_then(|l| l.text).unwrap_or_default();
     let mut matched = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for sub in data.submatches.unwrap_or_default() {
@@ -252,7 +272,6 @@ fn parse_match_hit(data: Option<RgMatchData>) -> Option<RipgrepHit> {
     Some(RipgrepHit {
         file_ref: path,
         line: line_no,
-        snippet,
         matched,
     })
 }
@@ -267,7 +286,6 @@ struct RgEvent {
 #[derive(Debug, Deserialize)]
 struct RgMatchData {
     path: Option<RgText>,
-    lines: Option<RgText>,
     line_number: Option<u64>,
     submatches: Option<Vec<RgSubmatch>>,
 }
@@ -302,7 +320,6 @@ mod tests {
         let hit = expect_hit(line);
         assert_eq!(hit.file_ref, "/tmp/a.md");
         assert_eq!(hit.line, 42);
-        assert_eq!(hit.snippet, "hello world\n");
         assert_eq!(hit.matched, vec!["hello".to_string()]);
     }
 
@@ -352,15 +369,21 @@ mod tests {
     #[tokio::test]
     async fn empty_inputs_short_circuit() {
         assert!(
-            run(&[], &["q".to_string()], 5)
+            run(&[], &["q".to_string()], &[], 5)
                 .await
                 .unwrap()
                 .hits
                 .is_empty()
         );
-        assert!(run(&["/tmp".into()], &[], 5).await.unwrap().hits.is_empty());
         assert!(
-            run(&["/tmp".into()], &["q".to_string()], 0)
+            run(&["/tmp".into()], &[], &[], 5)
+                .await
+                .unwrap()
+                .hits
+                .is_empty()
+        );
+        assert!(
+            run(&["/tmp".into()], &["q".to_string()], &[], 0)
                 .await
                 .unwrap()
                 .hits
@@ -382,6 +405,7 @@ mod tests {
         let hits = run(
             &[dir.path().to_string_lossy().into_owned()],
             &["caerbannog".to_string()],
+            &[],
             5,
         )
         .await
@@ -395,6 +419,51 @@ mod tests {
         );
         assert_eq!(hits[0].line, 3);
         assert_eq!(hits[0].matched, vec!["caerbannog".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn globs_filter_includes_matching_extension() {
+        if !require_rg() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "caerbannog beast here.\n").unwrap();
+        let hits = run(
+            &[dir.path().to_string_lossy().into_owned()],
+            &["caerbannog".to_string()],
+            &["**/*.txt".to_string()],
+            5,
+        )
+        .await
+        .expect("rg run")
+        .hits;
+        assert_eq!(
+            hits.len(),
+            1,
+            "glob matching the fixture's extension must find it"
+        );
+    }
+
+    #[tokio::test]
+    async fn globs_filter_excludes_non_matching_extension() {
+        if !require_rg() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("notes.txt"), "caerbannog beast here.\n").unwrap();
+        let hits = run(
+            &[dir.path().to_string_lossy().into_owned()],
+            &["caerbannog".to_string()],
+            &["**/*.md".to_string()],
+            5,
+        )
+        .await
+        .expect("rg run")
+        .hits;
+        assert!(
+            hits.is_empty(),
+            "glob not matching the fixture's extension must exclude it"
+        );
     }
 
     /// A multi-word natural-language question must produce hits when its
@@ -423,7 +492,10 @@ mod tests {
         let question = "why is the spice melange important to navigation";
 
         let terms = crate::search::terms::split_terms(question);
-        let hits = run(&roots, &terms, 10).await.expect("per-term run").hits;
+        let hits = run(&roots, &terms, &[], 10)
+            .await
+            .expect("per-term run")
+            .hits;
         assert!(
             !hits.is_empty(),
             "per-term matching must find the fixture for a natural-language question"
@@ -435,7 +507,7 @@ mod tests {
 
         // The whole question as a single literal matches nothing — which is
         // exactly the behaviour that made this signal dead weight.
-        let whole = run(&roots, &[question.to_string()], 10)
+        let whole = run(&roots, &[question.to_string()], &[], 10)
             .await
             .expect("whole-query run")
             .hits;
@@ -475,14 +547,14 @@ mod tests {
         let roots = [dir.path().to_string_lossy().into_owned()];
         let terms = ["shrubbery".to_string(), "swallow".to_string()];
 
-        let first = run(&roots, &terms, 10).await.expect("first run");
+        let first = run(&roots, &terms, &[], 10).await.expect("first run");
         assert_eq!(first.hits.len(), 10, "max_hits must actually truncate here");
         assert!(
             first.truncated,
             "collection stopped at max_hits, so truncated must be true"
         );
         for _ in 0..4 {
-            let again = run(&roots, &terms, 10).await.expect("repeat run");
+            let again = run(&roots, &terms, &[], 10).await.expect("repeat run");
             assert!(again.truncated, "every truncated run must report truncated");
             let a: Vec<_> = first
                 .hits
@@ -521,6 +593,7 @@ mod tests {
         let hits = run(
             &[dir.path().to_string_lossy().into_owned()],
             &["shrubbery".to_string()],
+            &[],
             6,
         )
         .await
@@ -548,6 +621,7 @@ mod tests {
         let hits = run(
             &[dir.path().to_string_lossy().into_owned()],
             &["caerbannog".to_string(), "ni".to_string()],
+            &[],
             10,
         )
         .await
@@ -574,6 +648,7 @@ mod tests {
         let hits = run(
             &[dir.path().to_string_lossy().into_owned()],
             &["caerbannog".to_string(), "nonexistentterm".to_string()],
+            &[],
             10,
         )
         .await
@@ -606,6 +681,7 @@ mod tests {
             run(
                 &[dir.path().to_string_lossy().into_owned()],
                 &["caerbannog".to_string()],
+                &[],
                 1,
             ),
         )
@@ -633,6 +709,7 @@ mod tests {
         let hits = run(
             &[dir.path().to_string_lossy().into_owned()],
             &["caerbannog".to_string()],
+            &[],
             5,
         )
         .await
@@ -650,6 +727,7 @@ mod tests {
         let err = run(
             &["/no/such/path/hallouminate-test".into()],
             &["q".to_string()],
+            &[],
             5,
         )
         .await

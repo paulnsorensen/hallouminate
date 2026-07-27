@@ -102,6 +102,7 @@ pub async fn search_fused(
     store: &dyn ChunkRetrieval,
     corpus_key: &CorpusKey,
     query: &str,
+    globs: &[String],
     limit: usize,
 ) -> Result<FusedSearch> {
     let terms = cap_terms(split_terms(query));
@@ -114,50 +115,34 @@ pub async fn search_fused(
     const RIPGREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
     let root = corpus_key.canonical_root.to_string_lossy().into_owned();
     let roots = [root];
-    // Each term may contribute up to `limit` useful hits, so a flat
-    // `limit` budget would truncate the stream before the later terms
-    // are ever seen.
-    let rg_budget = limit.saturating_mul(terms.len().max(1));
+    // Bound on total rg hits collected. Hits are pool-gated downstream by
+    // `resolve_rg_hits_to_chunks`, which attributes them to at most the
+    // pool's `limit` chunks -- and that mapping is lossy in both directions:
+    // many hits can land on one chunk, and hits in files outside the pool are
+    // dropped outright. So a budget far above `limit` mostly parses
+    // `RipgrepHit`s that are immediately discarded. A flat `limit` accepts
+    // some recall loss on hit-dense corpora in exchange for that waste.
+    // Note `ripgrep::run`'s per-file `--max-count` caps matching *lines*, so
+    // a term first appearing past that cap is missed regardless of this total.
+    let rg_budget = limit;
 
     let signals_fut = store.retrieve_signals(corpus_key, query, limit);
-    let rg_fut = tokio::time::timeout(RIPGREP_TIMEOUT, ripgrep::run(&roots, &terms, rg_budget));
+    let rg_fut = tokio::time::timeout(
+        RIPGREP_TIMEOUT,
+        ripgrep::run(&roots, &terms, globs, rg_budget),
+    );
     let (signals_res, rg_res) = tokio::join!(signals_fut, rg_fut);
 
     let signals = signals_res?;
     if signals.hits.is_empty() {
+        let _ = resolve_rg_run(rg_res, RIPGREP_TIMEOUT, &mut warnings);
         return Ok(FusedSearch {
             hits: Vec::new(),
             warnings,
         });
     }
-    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) = match rg_res {
-        Ok(Ok(run)) => (run.hits, run.truncated, run.elapsed_ms, run.unparseable),
-        Ok(Err(error)) => {
-            tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
-            warnings.push(Warning {
-                code: "ripgrep-failed".to_string(),
-                message: format!(
-                    "ripgrep pass failed ({error}); ranking without the ripgrep signal"
-                ),
-            });
-            (Vec::new(), false, 0, 0)
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                target: "hallouminate::search",
-                timeout_ms = RIPGREP_TIMEOUT.as_millis() as u64,
-                "ripgrep pass timed out; ranking without the ripgrep signal"
-            );
-            warnings.push(Warning {
-                code: "ripgrep-timeout".to_string(),
-                message: format!(
-                    "ripgrep pass timed out after {} ms; ranking without the ripgrep signal",
-                    RIPGREP_TIMEOUT.as_millis()
-                ),
-            });
-            (Vec::new(), false, RIPGREP_TIMEOUT.as_millis() as u64, 0)
-        }
-    };
+    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) =
+        resolve_rg_run(rg_res, RIPGREP_TIMEOUT, &mut warnings);
 
     let (rg_chunk_counts, rg_stats) = resolve_rg_hits_to_chunks(&signals.hits, &rg_hits);
     let resolved_chunks = rg_chunk_counts.len();
@@ -187,6 +172,22 @@ pub async fn search_fused(
             message: format!(
                 "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}",
                 rg_hits.len(),
+                corpus_key.canonical_root.display()
+            ),
+        });
+    }
+
+    if rg_unparseable > 0 {
+        tracing::warn!(
+            target: "hallouminate::search",
+            rg_unparseable,
+            "ripgrep produced unparseable match events; the rg output schema may have changed"
+        );
+        warnings.push(Warning {
+            code: "ripgrep-unparseable".to_string(),
+            message: format!(
+                "ripgrep produced {} unparseable match events in corpus root {}",
+                rg_unparseable,
                 corpus_key.canonical_root.display()
             ),
         });
@@ -234,10 +235,10 @@ pub async fn search_fused(
 /// Ceiling on how many query terms reach the two literal signals.
 ///
 /// Each term becomes an `-e` pattern on the rg command line and a pass
-/// over every pooled chunk's `search_text`, and the rg budget is sized as
-/// `limit * terms.len()`, so an arbitrarily long query steers both the
-/// argument list and the amount of scanning. 32 content terms is well past
-/// any real question — the evaluation set's longest query yields 12.
+/// over every pooled chunk's `search_text`, so an arbitrarily long query
+/// steers both the argument list and the amount of scanning. 32 content
+/// terms is well past any real question — the evaluation set's longest
+/// query yields 12.
 const MAX_QUERY_TERMS: usize = 32;
 
 /// Truncate to [`MAX_QUERY_TERMS`], keeping the **first** terms.
@@ -328,12 +329,12 @@ fn resolve_rg_hits_to_chunks(
 /// chunk's `search_text`.
 ///
 /// Case-sensitive to match the FM-Index `contains()` predicate this
-/// replaces (`contains(search_text, '<term>')`, no `lower()` wrap) —
+/// replaces (`contains(search_text, '<term>')`, no `lower()` wrap) --
 /// `terms` arrive pre-lowercased from [`split_terms`] but `search_text`
 /// is not lowercased, so this is a deliberate asymmetry against the
 /// ripgrep signal (which matches case-insensitively), not a bug.
 ///
-/// Matches `search_text`, not `text` — `search_text` is the
+/// Matches `search_text`, not `text` -- `search_text` is the
 /// footnote-stripped derived field; matching `text` would leak footnote
 /// content into literal matching.
 fn contains_term_counts(
@@ -351,6 +352,46 @@ fn contains_term_counts(
         }
     }
     counts
+}
+
+/// Resolve the timed rg future's outcome into hits plus run stats,
+/// pushing a `Warning` on failure or timeout so both the empty-pool
+/// early return and the normal path surface the same signal — an rg
+/// failure must not go unreported just because the FTS/vector pool was
+/// empty on that request.
+fn resolve_rg_run(
+    rg_res: std::result::Result<Result<ripgrep::RipgrepRun>, tokio::time::error::Elapsed>,
+    timeout: std::time::Duration,
+    warnings: &mut Vec<Warning>,
+) -> (Vec<RipgrepHit>, bool, u64, usize) {
+    match rg_res {
+        Ok(Ok(run)) => (run.hits, run.truncated, run.elapsed_ms, run.unparseable),
+        Ok(Err(error)) => {
+            tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
+            warnings.push(Warning {
+                code: "ripgrep-failed".to_string(),
+                message: format!(
+                    "ripgrep pass failed ({error}); ranking without the ripgrep signal"
+                ),
+            });
+            (Vec::new(), false, 0, 0)
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                target: "hallouminate::search",
+                timeout_ms = timeout.as_millis() as u64,
+                "ripgrep pass timed out; ranking without the ripgrep signal"
+            );
+            warnings.push(Warning {
+                code: "ripgrep-timeout".to_string(),
+                message: format!(
+                    "ripgrep pass timed out after {} ms; ranking without the ripgrep signal",
+                    timeout.as_millis()
+                ),
+            });
+            (Vec::new(), false, timeout.as_millis() as u64, 0)
+        }
+    }
 }
 
 /// Order chunks by how many distinct query terms they matched, best
@@ -406,7 +447,6 @@ mod tests {
         RipgrepHit {
             file_ref: file_ref.into(),
             line,
-            snippet: String::new(),
             matched: matched.iter().map(|t| (*t).to_string()).collect(),
         }
     }
@@ -676,7 +716,7 @@ mod tests {
             hits: pool(vec![a, b, c, d]),
         };
 
-        let ranked = search_fused(&store, &corpus_key, "distinctiveterm", 10)
+        let ranked = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
             .await
             .expect("fusion over a fake store must succeed");
         let order: Vec<&str> = ranked.hits.iter().map(|h| h.chunk_id.as_str()).collect();
@@ -709,7 +749,7 @@ mod tests {
             hits: pool(vec![hit_with_search_text("a", "unrelated")]),
         };
 
-        let result = search_fused(&store, &corpus_key, "distinctiveterm", 10)
+        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
             .await
             .expect("a failed ripgrep pass must degrade the ranking, not fail the query");
 
@@ -727,5 +767,37 @@ mod tests {
             1,
             "ranking continues on the signals that did survive"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_pool_early_return_still_surfaces_a_failed_ripgrep_warning() {
+        // Finding 6: the empty-pool early return used to discard rg_res
+        // outright, so a failed/timed-out rg on this path warned nobody.
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root: std::path::PathBuf::from(
+                "/nonexistent/hallouminate-rg-failure-fixture-empty-pool",
+            ),
+        };
+        let store = FakeFusionStore {
+            fts: Vec::new(),
+            vector: Vec::new(),
+            hits: HashMap::new(),
+        };
+
+        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
+            .await
+            .expect("an empty pool must not fail the query");
+
+        assert_eq!(
+            result
+                .warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ripgrep-failed"],
+            "a failed ripgrep pass must be reported even when the FTS/vector pool was empty"
+        );
+        assert!(result.hits.is_empty());
     }
 }

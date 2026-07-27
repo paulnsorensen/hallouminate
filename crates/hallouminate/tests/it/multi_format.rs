@@ -77,6 +77,7 @@ async fn plain_text_corpus_indexes_and_grounds() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "xenoblat",
+        &corpus.globs,
         5,
     )
     .await
@@ -127,6 +128,7 @@ async fn csv_indexes_one_self_describing_chunk_per_row() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "wozzlefruit",
+        &corpus.globs,
         5,
     )
     .await
@@ -198,6 +200,7 @@ async fn xlsx_indexes_each_sheet_row_with_sheet_and_row_metadata() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "grobblet",
+        &corpus.globs,
         5,
     )
     .await
@@ -269,6 +272,7 @@ async fn ods_indexes_rows_with_sheet_and_row_metadata() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "snibblet",
+        &corpus.globs,
         5,
     )
     .await
@@ -327,6 +331,7 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "flibberwidget",
+        &corpus.globs,
         5,
     )
     .await
@@ -374,6 +379,7 @@ async fn corrupt_xlsx_is_skipped_without_panic_and_indexer_continues() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "zonkbolt",
+        &corpus.globs,
         5,
     )
     .await
@@ -583,6 +589,7 @@ async fn xlsx_numeric_cell_renders_as_bare_number_not_float_debug() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "numwidget",
+        &corpus.globs,
         5,
     )
     .await
@@ -647,6 +654,7 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "first betathing",
+        &corpus.globs,
         10,
     )
     .await
@@ -666,6 +674,7 @@ async fn xlsx_multi_sheet_indexes_every_sheet_with_per_sheet_row_index() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "first alphathing",
+        &corpus.globs,
         10,
     )
     .await
@@ -713,6 +722,7 @@ async fn csv_ragged_row_uses_col_n_fallback_and_omits_blank_cells() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "raggedcell",
+        &corpus.globs,
         5,
     )
     .await

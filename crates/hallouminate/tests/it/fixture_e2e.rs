@@ -157,6 +157,7 @@ async fn fixture_corpus_indexes_and_serves_oracle_queries() {
             &store,
             &corpus.primary_corpus_key().expect("corpus root"),
             query,
+            &corpus.globs,
             5,
         )
         .await
@@ -272,6 +273,7 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "caerbannog",
+        &corpus.globs,
         5,
     )
     .await
@@ -368,6 +370,7 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "melange",
+        &corpus.globs,
         5,
     )
     .await
@@ -406,6 +409,7 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "melange",
+        &corpus.globs,
         5,
     )
     .await
@@ -662,6 +666,7 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "zphyxnort",
+        &corpus.globs,
         5,
     )
     .await
@@ -714,6 +719,7 @@ async fn frontmatter_page_and_plain_page_both_index_and_ground_cleanly() {
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),
         "qwobblefrotz",
+        &corpus.globs,
         5,
     )
     .await

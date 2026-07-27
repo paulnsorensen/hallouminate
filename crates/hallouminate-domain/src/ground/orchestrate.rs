@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use futures_util::{StreamExt, TryStreamExt};
+
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
 use crate::indexer::SearchHit;
 use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
@@ -129,10 +131,20 @@ async fn search_corpus(
     query: &str,
     corpus_key: &CorpusKey,
     store: &dyn ChunkRetrieval,
+    globs: &[String],
     limit: usize,
 ) -> Result<FusedSearch> {
-    search_fused(store, corpus_key, query, limit).await
+    search_fused(store, corpus_key, query, globs, limit).await
 }
+
+/// Cap on concurrent per-root searches fanned out by `ground_union`. Each
+/// root spawns a real `rg` subprocess (forced single-threaded by
+/// `--sort path`) plus a LanceDB scan, so an unbounded fan-out over a large
+/// global corpus set launches one `rg` process and one LanceDB scan per
+/// root simultaneously (regression from 96a2f23). 6 keeps several roots'
+/// worth of subprocess + IO-bound work in flight without saturating the
+/// process/file-descriptor budget on a modest host.
+const MAX_CONCURRENT_CORPUS_SEARCHES: usize = 6;
 
 /// Fans one query across every effective corpus root and globally reranks it.
 pub async fn ground_union(
@@ -143,14 +155,31 @@ pub async fn ground_union(
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
-    let corpus_keys: Vec<CorpusKey> = corpora
+    let corpus_keys: Vec<(CorpusKey, &[String])> = corpora
         .iter()
-        .flat_map(|corpus| corpus.corpus_keys())
+        .flat_map(|c| {
+            c.corpus_keys()
+                .into_iter()
+                .map(move |k| (k, c.globs.as_slice()))
+        })
         .collect();
-    let searches = corpus_keys
+    // Collected eagerly: a lazy `Map` iterator would bake the closure into
+    // the stream's type, and that closure is not general enough over the
+    // borrow's lifetime once this future is spawned (the daemon spawns it),
+    // so inference fails at the far-away spawn site. Futures are inert until
+    // polled, so building them up front costs nothing and `buffered` still
+    // polls at most MAX_CONCURRENT_CORPUS_SEARCHES of them at a time.
+    let searches: Vec<_> = corpus_keys
         .iter()
-        .map(|corpus_key| search_corpus(query, corpus_key, store, opts.limit));
-    let search_results = futures_util::future::try_join_all(searches).await?;
+        .map(|(corpus_key, globs)| search_corpus(query, corpus_key, store, globs, opts.limit))
+        .collect();
+    // `buffered` (not `buffer_unordered`) preserves per-root result order,
+    // which callers rely on for warning ordering; it still propagates the
+    // first `Err` like `try_join_all` did.
+    let search_results: Vec<FusedSearch> = futures_util::stream::iter(searches)
+        .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+        .try_collect()
+        .await?;
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut warnings = Vec::new();
     for result in search_results {

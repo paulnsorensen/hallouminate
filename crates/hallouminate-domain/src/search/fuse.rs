@@ -5,7 +5,7 @@
 //! of its score. That is why signals join here as ranked lists rather than
 //! as additive bonuses applied to an already-fused score.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One retrieval signal's contribution: its weight and its chunks in rank
 /// order, best first. Position in `chunk_ids` *is* the rank.
@@ -24,11 +24,11 @@ pub struct RankedList {
 pub fn fuse(lists: &[RankedList], k: f32) -> Vec<(String, f32)> {
     let mut scores: HashMap<&str, (f32, usize)> = HashMap::new();
     for list in lists {
-        let mut seen_in_list: HashMap<&str, ()> = HashMap::new();
+        let mut seen_in_list: HashSet<&str> = HashSet::new();
         for (rank, chunk_id) in list.chunk_ids.iter().enumerate() {
             // A chunk repeated within one list contributes only from its
             // best rank; a duplicate is not extra evidence.
-            if seen_in_list.insert(chunk_id.as_str(), ()).is_some() {
+            if !seen_in_list.insert(chunk_id.as_str()) {
                 continue;
             }
             let contribution = list.weight / (rank as f32 + k);
