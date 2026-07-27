@@ -39,11 +39,10 @@ pub fn lint_markdown(content: &str) -> Vec<String> {
                 if info
                     .split_whitespace()
                     .next()
-                    .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid")) =>
+                    .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+                    && collect_code_block(&mut iter).trim().is_empty() =>
             {
-                if collect_code_block(&mut iter).trim().is_empty() {
-                    warnings.push("empty ```mermaid code block".to_string());
-                }
+                warnings.push("empty ```mermaid code block".to_string());
             }
             _ => {}
         }
