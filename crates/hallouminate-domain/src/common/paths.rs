@@ -23,6 +23,51 @@ pub fn canonicalize_or_passthrough(path: &Path) -> FileRef {
     }
 }
 
+/// A root confirmed absent from the filesystem via `io::ErrorKind::NotFound`
+/// -- the entire safety proof `LanceStore::delete_root` accepts. Constructible
+/// only through `retired_roots`, so a caller cannot pass an unverified path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredRoot(PathBuf);
+
+impl RetiredRoot {
+    pub fn as_path(&self) -> &Path {
+        &self.0
+    }
+
+    pub fn into_path_buf(self) -> PathBuf {
+        self.0
+    }
+}
+
+/// Roots confirmed absent via `NotFound`. Any other stat error (permission
+/// denied, I/O error, stale/degraded mount) is treated as "cannot determine"
+/// and is NOT retired -- fail closed, since the deletion this gates is
+/// irreversible and machine-wide.
+pub fn retired_roots(known: &[PathBuf]) -> Vec<RetiredRoot> {
+    known
+        .iter()
+        .filter(|root| match std::fs::symlink_metadata(root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            Err(e) => {
+                // Not retired -- fail closed -- but a root that is
+                // permanently unstat-able (bad permissions, a persistently
+                // stale mount) would otherwise never be collected AND never
+                // be reported, silently under-delivering GC forever.
+                tracing::warn!(
+                    target: "hallouminate::lance",
+                    root = %root.display(),
+                    error = %e,
+                    "root's filesystem status could not be determined; not retiring it",
+                );
+                false
+            }
+            Ok(_) => false,
+        })
+        .cloned()
+        .map(RetiredRoot)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,5 +152,64 @@ mod tests {
             std::env::temp_dir().join(format!("hallouminate-nonexistent-{}", std::process::id()));
         let resolved = canonicalize_or_passthrough(&path);
         assert_eq!(resolved.as_path(), path.as_path());
+    }
+
+    #[test]
+    fn retired_roots_returns_only_absent_paths() {
+        let existing = tempfile::tempdir().expect("tempdir");
+        let absent = existing.path().join("gone");
+        let known = vec![existing.path().to_path_buf(), absent.clone()];
+        assert_eq!(retired_roots(&known), vec![RetiredRoot(absent)]);
+    }
+
+    #[test]
+    fn retired_roots_returns_empty_when_all_paths_exist() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let known = vec![a.path().to_path_buf(), b.path().to_path_buf()];
+        assert!(retired_roots(&known).is_empty());
+    }
+
+    // Permission-denied stat errors aren't exercised here: CI (and some
+    // local dev setups) may run as root, which bypasses permission checks
+    // entirely and would make this test flaky rather than meaningful.
+
+    #[cfg(unix)]
+    #[test]
+    fn retired_roots_does_not_retire_a_root_reachable_only_via_symlink() {
+        use std::os::unix::fs::symlink;
+        let real_target = tempfile::tempdir().expect("real target tempdir");
+        let link_parent = tempfile::tempdir().expect("link parent tempdir");
+        let link = link_parent.path().join("link-to-target");
+        symlink(real_target.path(), &link).expect("create symlink");
+
+        // The discriminating case: the link itself still exists, but its
+        // target has been removed (a "dangling" symlink). `symlink_metadata`
+        // (lstat) checks the link's own inode and never follows it, so this
+        // must NOT be retired. Under `metadata` (stat, which follows), this
+        // same setup would resolve to the missing target and report
+        // `NotFound` -- incorrectly retiring it. This is the one assertion
+        // that actually depends on `retired_roots` using `symlink_metadata`
+        // rather than `metadata`.
+        drop(real_target); // removes the target directory, leaving `link` dangling
+        assert!(
+            retired_roots(std::slice::from_ref(&link)).is_empty(),
+            "a dangling symlink (link present, target gone) must not be retired -- \
+             symlink_metadata checks the link itself, not what it points to"
+        );
+
+        // Documented limitation: roots are stored in canonical form, so once
+        // the symlink is *also* removed, the stored (canonical) path was
+        // never the link -- deleting the link changes nothing about whether
+        // the canonical root is retired. This is the fail-safe
+        // under-collection the spec's Known Limitation section describes:
+        // a symlink can be deleted without the GC pass ever noticing,
+        // because production never stores the symlink path as a root.
+        std::fs::remove_file(&link).expect("remove symlink");
+        assert_eq!(
+            retired_roots(std::slice::from_ref(&link)).len(),
+            1,
+            "once the link itself is gone, its own path (not a canonical root anyone stores) is a plain absent path"
+        );
     }
 }

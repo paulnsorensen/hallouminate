@@ -543,7 +543,8 @@ async fn handle_changed_path(
                     // ForceMaintenance reconciles index state without killing the watcher.
                     let s = state.clone();
                     tokio::spawn(async move {
-                        let _ = s.run_maintenance_tick().await;
+                        // GC only runs on the scheduled tick, not the churn-triggered path -- see orphaned-root-gc age review.
+                        let _ = s.run_maintenance_tick(false).await;
                     });
                 }
                 tracing::debug!(

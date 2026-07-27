@@ -280,14 +280,16 @@ async fn run_in_batches(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     use async_trait::async_trait;
     use text_splitter::Characters;
 
     use super::*;
-    use crate::common::{HallouminateError, canonicalize_or_passthrough, expand_tilde};
+    use crate::common::{
+        HallouminateError, RetiredRoot, canonicalize_or_passthrough, expand_tilde,
+    };
     use crate::indexer::{BatchWriteStats, FileSnapshot, Upsert};
 
     #[derive(Default)]
@@ -317,6 +319,14 @@ mod tests {
                 .map_err(|_| HallouminateError::Indexer("deleted mutex poisoned".into()))?
                 .push((corpus_key.clone(), file_ref.to_string()));
             Ok(())
+        }
+
+        async fn distinct_roots(&self) -> Result<Vec<PathBuf>> {
+            Ok(Vec::new())
+        }
+
+        async fn delete_root(&self, _root: &RetiredRoot) -> Result<u64> {
+            Ok(0)
         }
 
         async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats> {

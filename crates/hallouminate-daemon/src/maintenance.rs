@@ -18,6 +18,7 @@ use super::state::WorkClass;
 use hallouminate_adapters::{MaintenanceOptions, MaintenanceStats};
 use hallouminate_config::DaemonConfig;
 use hallouminate_domain::common::HallouminateError;
+use hallouminate_domain::indexer::ChunkStore;
 
 /// Grace window for `maintain`'s prune cutoff: versions younger than this
 /// are retained, letting in-flight queries drain before their snapshotted
@@ -133,7 +134,7 @@ impl MaintenanceLifecycle {
         );
     }
 
-    fn success(mut self, stats: MaintenanceStats) {
+    fn success(mut self, gc_ran: bool, gc_stats: GcStats, stats: MaintenanceStats) {
         let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
         tracing::info!(
             target: "hallouminate::lance",
@@ -143,6 +144,9 @@ impl MaintenanceLifecycle {
             queue_wait_ms,
             maintenance_ms,
             total_ms,
+            gc_ran,
+            roots_collected = gc_stats.roots_collected as u64,
+            rows_removed = gc_stats.rows_removed,
             fragments_removed = stats.fragments_removed,
             fragments_added = stats.fragments_added,
             old_versions_pruned = stats.old_versions_pruned,
@@ -151,7 +155,7 @@ impl MaintenanceLifecycle {
         self.finished = true;
     }
 
-    fn failure(mut self, error: &HallouminateError) {
+    fn failure(mut self, gc_ran: bool, gc_stats: GcStats, error: &HallouminateError) {
         let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
         tracing::warn!(
             target: "hallouminate::lance",
@@ -161,13 +165,16 @@ impl MaintenanceLifecycle {
             queue_wait_ms,
             maintenance_ms,
             total_ms,
+            gc_ran,
+            roots_collected = gc_stats.roots_collected as u64,
+            rows_removed = gc_stats.rows_removed,
             error = %error,
             "periodic LanceDB maintenance failed",
         );
         self.finished = true;
     }
 
-    fn shutdown(mut self) {
+    fn shutdown(mut self, gc_ran: bool, gc_stats: GcStats) {
         let (queue_wait_ms, maintenance_ms, total_ms) = self.durations();
         tracing::info!(
             target: "hallouminate::lance",
@@ -177,11 +184,13 @@ impl MaintenanceLifecycle {
             queue_wait_ms,
             maintenance_ms,
             total_ms,
+            gc_ran,
+            roots_collected = gc_stats.roots_collected as u64,
+            rows_removed = gc_stats.rows_removed,
             "periodic LanceDB maintenance stopped during shutdown",
         );
         self.finished = true;
     }
-
     fn durations(&self) -> (u64, u64, u64) {
         let finished_at = Instant::now();
         let total = finished_at.duration_since(self.started_at);
@@ -326,8 +335,8 @@ pub(super) async fn maintenance_loop(
         // unlike the defer-bound-forced path above, which calls `forced_pace`.
         // Hard already blocks writes, so fast debt recovery outranks pacing.
         let tick = match pace {
-            Pace::Full => state.run_maintenance_tick().await,
-            Pace::Paced { .. } => state.run_maintenance_pass(pace).await,
+            Pace::Full => state.run_maintenance_tick(true).await,
+            Pace::Paced { .. } => state.run_maintenance_pass(pace, true).await,
         };
         state
             .heartbeat()
@@ -346,6 +355,23 @@ pub(super) async fn maintenance_loop(
 }
 
 impl DaemonState {
+    /// Awaits `fut`, bumping the Maintenance heartbeat every 60s so a
+    /// long-running scan/delete/compaction can't trip the watchdog's stall
+    /// window while it's in flight.
+    async fn bump_while<Fut: std::future::Future>(&self, fut: Fut) -> Fut::Output {
+        tokio::pin!(fut);
+        let mut bump_interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut fut => return result,
+                _ = bump_interval.tick() => {
+                    self.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+                }
+            }
+        }
+    }
+
     /// One LanceDB maintenance pass (compaction + version prune). Holds a
     /// connection guard for the write's duration so idle-exit defers instead
     /// of tearing the process down (and releasing the single-instance flock)
@@ -353,26 +379,30 @@ impl DaemonState {
     /// and the watcher's `process_change_batch`. This pass does NOT stamp
     /// the idle-activity clock (ADR-002) -- reintroducing that stamp would
     /// bring back #222.
-    pub(super) async fn run_maintenance_tick(&self) -> MaintenanceTick {
-        self.run_maintenance_pass(Pace::Full).await
+    pub(super) async fn run_maintenance_tick(&self, allow_gc: bool) -> MaintenanceTick {
+        self.run_maintenance_pass(Pace::Full, allow_gc).await
     }
 
     /// One maintenance pass at `pace` against the real store -- the
     /// `Pace::Paced` entry for a defer-bound-forced pass under pressure.
-    async fn run_maintenance_pass(&self, pace: Pace) -> MaintenanceTick {
+    async fn run_maintenance_pass(&self, pace: Pace, allow_gc: bool) -> MaintenanceTick {
         let store = self.store();
-        self.run_maintenance_pass_with(pace, move |maintenance_id, max_fragments_per_slice| {
-            let store = Arc::clone(&store);
-            async move {
-                store
-                    .maintain(MaintenanceOptions {
-                        maintenance_id,
-                        prune_older_than: Duration::from_secs(MAINTENANCE_PRUNE_GRACE_SECS),
-                        max_fragments_per_slice,
-                    })
-                    .await
-            }
-        })
+        self.run_maintenance_pass_with(
+            pace,
+            allow_gc,
+            move |maintenance_id, max_fragments_per_slice| {
+                let store = Arc::clone(&store);
+                async move {
+                    store
+                        .maintain(MaintenanceOptions {
+                            maintenance_id,
+                            prune_older_than: Duration::from_secs(MAINTENANCE_PRUNE_GRACE_SECS),
+                            max_fragments_per_slice,
+                        })
+                        .await
+                }
+            },
+        )
         .await
     }
 
@@ -386,6 +416,7 @@ impl DaemonState {
     async fn run_maintenance_pass_with<F, Fut>(
         &self,
         pace: Pace,
+        allow_gc: bool,
         mut maintain: F,
     ) -> MaintenanceTick
     where
@@ -398,14 +429,19 @@ impl DaemonState {
         } = pace
         else {
             return self
-                .run_maintenance_tick_with(|id| maintain(id, None))
+                .run_maintenance_tick_with(allow_gc, |id| maintain(id, None))
                 .await;
         };
+        // GC is a machine-wide scan; running it once per slice would waste
+        // work and rerun the scan pointlessly under I/O pressure, since
+        // nothing new for it to collect appears mid-pass. Only the first
+        // slice runs GC, and only if the caller allows GC at all.
+        let mut run_gc = allow_gc;
         loop {
             let slice_removed: Arc<std::sync::Mutex<Option<usize>>> = Arc::default();
             let capture = Arc::clone(&slice_removed);
             let tick = self
-                .run_maintenance_tick_with(|maintenance_id| {
+                .run_maintenance_tick_with(run_gc, |maintenance_id| {
                     let slice = maintain(maintenance_id, Some(slice_budget));
                     async move {
                         let stats = slice.await?;
@@ -414,6 +450,7 @@ impl DaemonState {
                     }
                 })
                 .await;
+            run_gc = false;
             if tick == MaintenanceTick::Stop {
                 return MaintenanceTick::Stop;
             }
@@ -432,7 +469,11 @@ impl DaemonState {
         }
     }
 
-    pub(super) async fn run_maintenance_tick_with<F, Fut>(&self, maintain: F) -> MaintenanceTick
+    pub(super) async fn run_maintenance_tick_with<F, Fut>(
+        &self,
+        run_gc: bool,
+        maintain: F,
+    ) -> MaintenanceTick
     where
         F: FnOnce(u64) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<MaintenanceStats, HallouminateError>>,
@@ -440,19 +481,91 @@ impl DaemonState {
         let _conn = self.enter_connection(WorkClass::Internal);
         let shutdown = self.shutdown_token().clone();
         let mut lifecycle = MaintenanceLifecycle::start();
+        let store = self.store();
+
+        // GC's scan phase is read-only -- run it before acquiring the write
+        // lane so the machine-wide scan doesn't block every other daemon
+        // mutation for its duration. `gc_ms` sums the scan and delete
+        // phases' own durations, excluding the lane-wait gap between them,
+        // so it reports GC's real cost rather than lane contention.
+        let scan_started = Instant::now();
+        let gc_candidates = if run_gc {
+            match self
+                .gc_scan(store.as_ref(), lifecycle.maintenance_id, &shutdown)
+                .await
+            {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "hallouminate::lance",
+                        gc_event = "scan_failed",
+                        maintenance_id = lifecycle.maintenance_id,
+                        error = %error,
+                        "orphaned-root GC scan failed; continuing without collection this tick",
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let scan_ms = scan_started.elapsed();
+
         let permit = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
-                lifecycle.shutdown();
+                lifecycle.shutdown(run_gc, GcStats::default());
                 return MaintenanceTick::Stop;
             }
             permit = self.write_lane().acquire_owned() => permit,
         };
         let Ok(_permit) = permit else {
-            lifecycle.shutdown();
+            lifecycle.shutdown(run_gc, GcStats::default());
             return MaintenanceTick::Stop;
         };
         lifecycle.write_lane_acquired();
+
+        // GC is best-effort storage reclaim, layered on top of the
+        // pre-existing compaction job below: a GC failure (e.g. the
+        // `supervise_scan` panic recovery path, issue #223) must not skip
+        // compaction, or fragment debt accumulates unbounded every tick.
+        // Partial progress is always kept, never zeroed, on error.
+        let delete_started = Instant::now();
+        let (gc_stats, gc_result) = self
+            .gc_delete(
+                store.as_ref(),
+                gc_candidates,
+                lifecycle.maintenance_id,
+                &shutdown,
+            )
+            .await;
+        let gc_ms = duration_ms(scan_ms + delete_started.elapsed());
+        if let Err(error) = &gc_result {
+            tracing::warn!(
+                target: "hallouminate::lance",
+                gc_event = "delete_failed",
+                maintenance_id = lifecycle.maintenance_id,
+                gc_ms,
+                roots_collected = gc_stats.roots_collected as u64,
+                rows_removed = gc_stats.rows_removed,
+                error = %error,
+                "orphaned-root GC delete failed partway; continuing compaction with partial results",
+            );
+        }
+        if run_gc {
+            tracing::debug!(
+                target: "hallouminate::lance",
+                gc_event = "finished",
+                maintenance_id = lifecycle.maintenance_id,
+                gc_ms,
+                roots_collected = gc_stats.roots_collected as u64,
+                rows_removed = gc_stats.rows_removed,
+                "orphaned-root GC finished",
+            );
+        }
+
+        self.heartbeat()
+            .bump(super::heartbeat::TaskName::Maintenance);
         let maintenance = maintain(lifecycle.maintenance_id);
         tokio::pin!(maintenance);
         let mut bump_interval = tokio::time::interval(Duration::from_secs(60));
@@ -467,15 +580,159 @@ impl DaemonState {
             }
         };
         if shutdown_requested {
-            lifecycle.shutdown();
+            lifecycle.shutdown(run_gc, gc_stats);
             return MaintenanceTick::Stop;
         }
         match result {
-            Ok(stats) => lifecycle.success(stats),
-            Err(error) => lifecycle.failure(&error),
+            Ok(stats) => lifecycle.success(run_gc, gc_stats, stats),
+            Err(error) => lifecycle.failure(run_gc, gc_stats, &error),
         }
         MaintenanceTick::Continue
     }
+
+    /// Phase 1 of orphaned-root GC: scan for retired roots. Read-only --
+    /// does NOT require the write lane. Production code
+    /// (`run_maintenance_tick_with`) runs this BEFORE acquiring the lane so
+    /// the machine-wide scan doesn't block every other daemon mutation for
+    /// its duration. Takes `store` as the `ChunkStore` port rather than
+    /// reading `self.store()` internally, so a test can substitute a fake
+    /// store without `DaemonState` itself needing to hold a trait object.
+    async fn gc_scan(
+        &self,
+        store: &dyn ChunkStore,
+        maintenance_id: u64,
+        shutdown: &CancellationToken,
+    ) -> std::result::Result<Vec<hallouminate_domain::common::RetiredRoot>, HallouminateError> {
+        tracing::debug!(
+            target: "hallouminate::lance",
+            gc_event = "scan_started",
+            maintenance_id,
+            "orphaned-root GC scanning distinct roots",
+        );
+        // The scan runs before the write lane is acquired, so a shutdown
+        // here must not force the daemon to wait out a full machine-wide
+        // table scan before it can observe cancellation.
+        let scan = store.distinct_roots();
+        tokio::pin!(scan);
+        let mut bump_interval = tokio::time::interval(Duration::from_secs(60));
+        let known = loop {
+            tokio::select! {
+                biased;
+                result = &mut scan => break result?,
+                _ = shutdown.cancelled() => return Ok(Vec::new()),
+                _ = bump_interval.tick() => {
+                    self.heartbeat().bump(super::heartbeat::TaskName::Maintenance);
+                }
+            }
+        };
+        // Blocking `stat` calls -- run off the async runtime worker so a
+        // hung stat on a stale/degraded mount can't stall it (the spec
+        // explicitly puts network-mount timeouts in scope).
+        tokio::task::spawn_blocking(move || hallouminate_domain::common::retired_roots(&known))
+            .await
+            .map_err(|e| HallouminateError::Indexer(format!("gc scan task panicked: {e}")))
+    }
+
+    /// Phase 2 of orphaned-root GC: delete the roots `gc_scan` found. Must
+    /// run under the write lane. Rechecks each candidate's retirement
+    /// immediately before deleting it -- reusing the exact same fail-closed
+    /// `retired_roots` logic -- narrowing the TOCTOU window from the whole
+    /// scan-plus-loop duration down to a single root (a root recreated
+    /// between the batch scan and its delete is skipped, not deleted).
+    /// Always returns the stats accumulated before any error: a partial
+    /// collection's counts must never be silently zeroed just because a
+    /// later root's delete failed. Observes `shutdown` between roots.
+    async fn gc_delete(
+        &self,
+        store: &dyn ChunkStore,
+        candidates: Vec<hallouminate_domain::common::RetiredRoot>,
+        maintenance_id: u64,
+        shutdown: &CancellationToken,
+    ) -> (GcStats, std::result::Result<(), HallouminateError>) {
+        let mut stats = GcStats::default();
+        for candidate in candidates {
+            if shutdown.is_cancelled() {
+                return (stats, Ok(()));
+            }
+            let path = candidate.into_path_buf();
+            let reconfirmed = match tokio::task::spawn_blocking(move || {
+                hallouminate_domain::common::retired_roots(std::slice::from_ref(&path))
+                    .into_iter()
+                    .next()
+            })
+            .await
+            {
+                Ok(Some(root)) => root,
+                Ok(None) => continue, // recreated, or now undeterminable this tick -- skip, not delete
+                Err(e) => {
+                    return (
+                        stats,
+                        Err(HallouminateError::Indexer(format!(
+                            "gc recheck task panicked: {e}"
+                        ))),
+                    );
+                }
+            };
+            let removed = match self.bump_while(store.delete_root(&reconfirmed)).await {
+                Ok(removed) => removed,
+                Err(e) => return (stats, Err(e)),
+            };
+            stats.roots_collected += 1;
+            stats.rows_removed += removed;
+            // Unconditional per-root bump, redundant with `bump_while`'s own
+            // bump (which fires on its interval's first tick regardless of
+            // how fast the delete resolves): a doubly-safe guard against any
+            // future change to `bump_while`'s polling order, at the cost of
+            // one relaxed atomic increment.
+            self.heartbeat()
+                .bump(super::heartbeat::TaskName::Maintenance);
+            tracing::info!(
+                target: "hallouminate::lance",
+                gc_event = "root_collected",
+                maintenance_id,
+                root = %reconfirmed.as_path().display(),
+                root_rows_removed = removed,
+                "orphaned-root GC collected a retired root",
+            );
+        }
+        (stats, Ok(()))
+    }
+
+    /// Convenience wrapper combining `gc_scan` + `gc_delete` for direct
+    /// callers (tests) that don't need write-lane-hoisting. Production code
+    /// (`run_maintenance_tick_with`) calls `gc_scan`/`gc_delete` separately
+    /// so the read-only scan can run before the write lane is acquired.
+    #[cfg(test)]
+    pub(super) async fn run_gc(
+        &self,
+        maintenance_id: u64,
+    ) -> (GcStats, std::result::Result<(), HallouminateError>) {
+        let store = self.store();
+        match self
+            .gc_scan(store.as_ref(), maintenance_id, self.shutdown_token())
+            .await
+        {
+            Ok(candidates) => {
+                self.gc_delete(
+                    store.as_ref(),
+                    candidates,
+                    maintenance_id,
+                    self.shutdown_token(),
+                )
+                .await
+            }
+            Err(error) => (GcStats::default(), Err(error)),
+        }
+    }
+}
+
+/// Per-tick garbage-collection report: roots whose directories no longer
+/// exist, collected before compaction and reported alongside
+/// `MaintenanceStats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct GcStats {
+    pub(super) roots_collected: usize,
+    pub(super) rows_removed: u64,
 }
 
 #[cfg(test)]
@@ -863,7 +1120,7 @@ mod tests {
         let calls: Arc<Mutex<Vec<Option<usize>>>> = Arc::default();
         let record = Arc::clone(&calls);
         let tick = state
-            .run_maintenance_pass_with(Pace::Full, move |_, max_fragments| {
+            .run_maintenance_pass_with(Pace::Full, true, move |_, max_fragments| {
                 record.lock().expect("calls lock").push(max_fragments);
                 async move { Ok(stats(Some(1000))) }
             })
@@ -888,6 +1145,7 @@ mod tests {
                     slice_budget: 8,
                     sleep: Duration::from_millis(500),
                 },
+                true,
                 move |_, max_fragments| {
                     record.lock().expect("calls lock").push(max_fragments);
                     let removed = feed.lock().expect("script lock").remove(0);
@@ -906,6 +1164,45 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_millis(1000));
     }
 
+    /// GC's `distinct_roots` scan is machine-wide; rerunning it once per
+    /// paced compaction slice wastes the scan for no benefit (nothing new
+    /// appears for GC to collect mid-pass). Only the first slice must run
+    /// GC.
+    #[tokio::test(start_paused = true)]
+    async fn paced_pass_runs_gc_only_on_the_first_slice() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let script = Arc::new(Mutex::new(vec![Some(8usize), Some(8), Some(3)]));
+        let feed = Arc::clone(&script);
+        let tick = state
+            .run_maintenance_pass_with(
+                Pace::Paced {
+                    slice_budget: 8,
+                    sleep: Duration::from_millis(500),
+                },
+                true,
+                move |_, _max_fragments| {
+                    let removed = feed.lock().expect("script lock").remove(0);
+                    async move { Ok(stats(removed)) }
+                },
+            )
+            .await;
+        assert_eq!(tick, MaintenanceTick::Continue);
+
+        let events = capture.0.lock().expect("capture lock");
+        let gc_scans = events
+            .iter()
+            .filter(|e| e.strings.get("gc_event").map(String::as_str) == Some("scan_started"))
+            .count();
+        assert_eq!(
+            gc_scans, 1,
+            "GC must scan exactly once across all three paced slices, not once per slice"
+        );
+    }
+
     #[tokio::test]
     async fn paced_pass_stops_when_a_slice_fails() {
         let (state, _ground) = test_state(|_| {}).await;
@@ -917,6 +1214,7 @@ mod tests {
                     slice_budget: 8,
                     sleep: Duration::from_millis(500),
                 },
+                true,
                 move |_, max_fragments| {
                     record.lock().expect("calls lock").push(max_fragments);
                     async move { Err(HallouminateError::Config("slice failed".to_owned())) }
@@ -940,6 +1238,7 @@ mod tests {
                     slice_budget: 8,
                     sleep: Duration::from_millis(500),
                 },
+                true,
                 move |_, max_fragments| {
                     record.lock().expect("calls lock").push(max_fragments);
                     async move { Ok(stats(None)) }
@@ -1001,8 +1300,13 @@ mod tests {
         let task = tokio::spawn({
             let state = state.clone();
             async move {
+                // This test's subject is `maintain`'s own long-running
+                // heartbeat behaviour, not GC -- GC is disabled here so the
+                // test isn't racing GC's `spawn_blocking` round-trip (a real
+                // OS thread, not driven by this test's paused virtual clock)
+                // against a fixed synchronization point.
                 state
-                    .run_maintenance_tick_with(|_id| async {
+                    .run_maintenance_tick_with(false, |_id| async {
                         tokio::time::sleep(Duration::from_secs(600)).await;
                         Ok(stats(Some(0)))
                     })
@@ -1161,5 +1465,248 @@ mod tests {
 
         cancel.cancel();
         task.await.expect("maintenance_loop task");
+    }
+
+    fn prepared_file(
+        corpus_key: &hallouminate_domain::common::CorpusKey,
+        file_ref: &str,
+    ) -> hallouminate_domain::indexer::PreparedFile {
+        hallouminate_domain::indexer::PreparedFile {
+            file_ref: file_ref.to_string(),
+            corpus_key: corpus_key.clone(),
+            mtime_ms: 1,
+            content_hash: "deadbeef".into(),
+            summary: "summary".into(),
+            keywords: vec![],
+            frontmatter: None,
+            indexed_at_ms: 1,
+            chunks: vec![hallouminate_domain::indexer::PreparedChunk {
+                ord: 0,
+                heading_path: vec!["H".into()],
+                line_start: 1,
+                line_end: 2,
+                text: "body".into(),
+                search_text: "body".into(),
+                claim_marks: None,
+            }],
+        }
+    }
+
+    /// Acceptance: "GC executes before compaction within a single
+    /// maintenance pass." Seeds a retired root, then asserts the
+    /// `maintain` closure -- standing in for compaction -- observes zero
+    /// rows at that root by the time it runs, proving GC already ran.
+    #[tokio::test]
+    async fn gc_runs_before_compaction_within_a_maintenance_tick() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let gone = tempfile::tempdir().expect("gone root");
+        let key_gone = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:gone:corpus",
+            gone.path().to_str().expect("utf8"),
+        );
+        state
+            .store()
+            .apply_batch(vec![prepared_file(&key_gone, "/tmp/gone.md")])
+            .await
+            .expect("seed retired root");
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+        assert!(!gone_path.exists());
+
+        let store = state.store();
+        let key_for_closure = key_gone.clone();
+        let tick = state
+            .run_maintenance_tick_with(true, move |_id| {
+                let store = Arc::clone(&store);
+                let key = key_for_closure.clone();
+                async move {
+                    let stats_at_compaction = store
+                        .corpus_chunk_stats(&key)
+                        .await
+                        .expect("stats during compaction step");
+                    assert_eq!(
+                        stats_at_compaction.total_chunks, 0,
+                        "GC must have already removed the retired root's rows \
+                         before the compaction step runs"
+                    );
+                    Ok(stats(Some(0)))
+                }
+            })
+            .await;
+        assert_eq!(tick, MaintenanceTick::Continue);
+    }
+
+    /// Regression guard for the #215 sibling-wipe shape: a mutation from
+    /// `retired_roots(&known)` to `known.clone()` (i.e. "collect every
+    /// root") must fail this test. Seeds one retired root and one live
+    /// (surviving) root, asserts the survivor's rows are untouched and
+    /// `roots_collected == 1`, not 2.
+    #[tokio::test]
+    async fn run_gc_does_not_collect_a_surviving_root() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let gone = tempfile::tempdir().expect("gone root");
+        let key_gone = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:gone:corpus",
+            gone.path().to_str().expect("utf8"),
+        );
+        state
+            .store()
+            .apply_batch(vec![prepared_file(&key_gone, "/tmp/gone.md")])
+            .await
+            .expect("seed retired root");
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+        assert!(!gone_path.exists());
+
+        let survivor = tempfile::tempdir().expect("survivor root");
+        let key_survivor = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:survivor:corpus",
+            survivor.path().to_str().expect("utf8"),
+        );
+        state
+            .store()
+            .apply_batch(vec![prepared_file(&key_survivor, "/tmp/survivor.md")])
+            .await
+            .expect("seed survivor root");
+
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tick = state
+            .run_maintenance_tick_with(true, |_id| async { Ok(stats(Some(0))) })
+            .await;
+        assert_eq!(tick, MaintenanceTick::Continue);
+
+        let stats_survivor = state
+            .store()
+            .corpus_chunk_stats(&key_survivor)
+            .await
+            .expect("stats survivor");
+        assert_eq!(
+            stats_survivor.total_chunks, 1,
+            "GC must not delete a live sibling root's rows"
+        );
+
+        let events = capture.0.lock().expect("capture lock");
+        let success = events
+            .iter()
+            .find(|e| e.strings.get("outcome").map(String::as_str) == Some("success"))
+            .expect("success event");
+        assert_eq!(
+            success.numbers.get("roots_collected"),
+            Some(&1),
+            "only the retired root, not the survivor, must be collected"
+        );
+    }
+
+    /// Correctness: GC must not fire on the watcher's churn-triggered
+    /// `ForceMaintenance` path (`allow_gc = false`) -- only the scheduled
+    /// tick collects retired roots, since churn events cluster exactly
+    /// when a root is most likely to be transiently absent.
+    #[tokio::test]
+    async fn run_maintenance_tick_with_gc_disabled_does_not_collect() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let gone = tempfile::tempdir().expect("gone root");
+        let key_gone = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:gone:corpus",
+            gone.path().to_str().expect("utf8"),
+        );
+        state
+            .store()
+            .apply_batch(vec![prepared_file(&key_gone, "/tmp/gone.md")])
+            .await
+            .expect("seed retired root");
+        let gone_path = gone.path().to_path_buf();
+        drop(gone);
+        assert!(!gone_path.exists());
+
+        let tick = state.run_maintenance_tick(false).await;
+        assert_eq!(tick, MaintenanceTick::Continue);
+
+        let stats_gone = state
+            .store()
+            .corpus_chunk_stats(&key_gone)
+            .await
+            .expect("stats gone");
+        assert_eq!(
+            stats_gone.total_chunks, 1,
+            "GC must not run when allow_gc = false, even though the root is retired"
+        );
+    }
+
+    /// Acceptance: "the maintenance pass collects retired roots and reports
+    /// `roots_collected` and `rows_removed`."
+    #[tokio::test]
+    async fn maintenance_tick_reports_gc_roots_collected_and_rows_removed() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let gone = tempfile::tempdir().expect("gone root");
+        let key_gone = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:gone:corpus",
+            gone.path().to_str().expect("utf8"),
+        );
+        state
+            .store()
+            .apply_batch(vec![prepared_file(&key_gone, "/tmp/gone.md")])
+            .await
+            .expect("seed retired root");
+        drop(gone);
+
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tick = state
+            .run_maintenance_tick_with(true, |_id| async { Ok(stats(Some(0))) })
+            .await;
+        assert_eq!(tick, MaintenanceTick::Continue);
+
+        let events = capture.0.lock().expect("capture lock");
+        let success = events
+            .iter()
+            .find(|e| e.strings.get("outcome").map(String::as_str) == Some("success"))
+            .expect("success event");
+        assert_eq!(success.numbers.get("roots_collected"), Some(&1));
+        assert_eq!(success.numbers.get("rows_removed"), Some(&1));
+    }
+
+    /// Gap: `run_gc` must bump the maintenance heartbeat while retiring
+    /// multiple roots, not just once around the whole call.
+    #[tokio::test]
+    async fn run_gc_bumps_heartbeat_for_each_retired_root() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let mut gone_paths = Vec::new();
+        for i in 0..3 {
+            let gone = tempfile::tempdir().expect("gone root");
+            let key = hallouminate_domain::common::CorpusKey::from_configured_root(
+                format!("repo:gone{i}:corpus"),
+                gone.path().to_str().expect("utf8"),
+            );
+            state
+                .store()
+                .apply_batch(vec![prepared_file(&key, &format!("/tmp/gone{i}.md"))])
+                .await
+                .expect("seed retired root");
+            gone_paths.push(gone.path().to_path_buf());
+            drop(gone);
+        }
+        for path in &gone_paths {
+            assert!(!path.exists());
+        }
+
+        let before = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::Maintenance);
+        let (result, gc_result) = state.run_gc(1).await;
+        gc_result.expect("run_gc");
+        let after = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::Maintenance);
+
+        assert_eq!(result.roots_collected, 3);
+        assert!(
+            after >= before + 3,
+            "heartbeat must bump at least once per retired root: before={before}, after={after}"
+        );
     }
 }

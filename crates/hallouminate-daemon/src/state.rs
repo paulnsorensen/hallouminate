@@ -1554,7 +1554,7 @@ mod tests {
         state.set_last_activity_secs_for_test(u64::MAX / 2);
         let idle_clock_before_tick = state.last_activity_secs();
 
-        let tick = state.run_maintenance_tick().await;
+        let tick = state.run_maintenance_tick(true).await;
 
         assert_eq!(tick, MaintenanceTick::Continue);
         assert_eq!(
@@ -1619,7 +1619,7 @@ mod tests {
         let state = test_state().await;
 
         let tick = state
-            .run_maintenance_tick_with(|_| async {
+            .run_maintenance_tick_with(true, |_| async {
                 Err(HallouminateError::Config(
                     "forced maintenance failure".to_owned(),
                 ))
@@ -1651,7 +1651,7 @@ mod tests {
         let lane = state.write_lane();
         let _permit = lane.acquire().await.expect("write lane");
         let tick_state = state.clone();
-        let task = tokio::spawn(async move { tick_state.run_maintenance_tick().await });
+        let task = tokio::spawn(async move { tick_state.run_maintenance_tick(true).await });
 
         for _ in 0..100 {
             let events = capture.maintenance_events();
@@ -1684,7 +1684,7 @@ mod tests {
         let lane = state.write_lane();
         let _permit = lane.acquire().await.expect("write lane");
         let tick_state = state.clone();
-        let task = tokio::spawn(async move { tick_state.run_maintenance_tick().await });
+        let task = tokio::spawn(async move { tick_state.run_maintenance_tick(true).await });
 
         for _ in 0..100 {
             let events = capture.maintenance_events();
@@ -1720,7 +1720,7 @@ mod tests {
         let tick_state = state.clone();
         let task = tokio::spawn(async move {
             tick_state
-                .run_maintenance_tick_with(|_| async move {
+                .run_maintenance_tick_with(true, |_| async move {
                     started_tx.send(()).expect("maintenance started");
                     finish_rx.await.expect("finish maintenance");
                     Ok(MaintenanceStats {
