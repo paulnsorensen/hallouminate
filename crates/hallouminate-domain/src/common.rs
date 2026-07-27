@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 mod paths;
 
-pub use paths::{canonicalize_or_passthrough, expand_tilde};
+pub use paths::{RetiredRoot, canonicalize_or_passthrough, expand_tilde, retired_roots};
 
 /// A reference to a file on disk, identified by its path.
 ///

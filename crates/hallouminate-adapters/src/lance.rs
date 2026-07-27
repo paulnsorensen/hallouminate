@@ -18,7 +18,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 
 use crate::embedder::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
-use hallouminate_domain::common::{CorpusKey, HallouminateError, Result};
+use hallouminate_domain::common::{CorpusKey, HallouminateError, Result, RetiredRoot};
 use hallouminate_domain::corpus::ClaimMark;
 use hallouminate_domain::embeddings::canonical_model_name;
 use hallouminate_domain::indexer::{
@@ -1335,6 +1335,68 @@ impl LanceStore {
         Ok(())
     }
 
+    /// Distinct `root` values present in the chunks table, as stored
+    /// (canonical form). No caller-supplied scope: enumerates every root
+    /// machine-wide, independent of any `CorpusKey`.
+    ///
+    /// # Errors
+    /// Returns an error if the LanceDB scan fails.
+    pub async fn distinct_roots(&self) -> Result<Vec<PathBuf>> {
+        let table = self.table.clone();
+        let batches = supervise_scan("distinct_roots", async move {
+            let stream = table
+                .query()
+                // Every indexed file has an `ord = 0` row (enforced in the
+                // indexer's writer, see `corpus_chunk_stats` above), so
+                // filtering to it cuts row volume by the chunks-per-file
+                // factor without losing any distinct root.
+                .only_if("ord = 0")
+                .select(lancedb::query::Select::columns(&["root"]))
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await?;
+        let mut roots: HashSet<String> = HashSet::new();
+        for rb in &batches {
+            let col = string_col(rb, "root")?;
+            for i in 0..rb.num_rows() {
+                let v = col.value(i);
+                if !roots.contains(v) {
+                    roots.insert(v.to_string());
+                }
+            }
+        }
+        Ok(roots.into_iter().map(PathBuf::from).collect())
+    }
+
+    /// Deletes every row at `root`, across all corpora sharing that root.
+    /// Predicate is `root = '<escaped>'` alone -- deliberately not scoped by
+    /// `corpus_key_filter`, since a retired root orphans every corpus at it.
+    /// Takes `&RetiredRoot` -- the caller must have run `root` through
+    /// `retired_roots` first, which is the entire safety proof for this
+    /// irreversible, machine-wide delete.
+    ///
+    /// # Errors
+    /// Returns an error if `root` is not valid UTF-8 or the LanceDB delete call fails.
+    pub async fn delete_root(&self, root: &RetiredRoot) -> Result<u64> {
+        let Some(root_str) = root.as_path().to_str() else {
+            return Err(HallouminateError::Indexer(format!(
+                "root is not valid UTF-8: {}",
+                root.as_path().display()
+            )));
+        };
+        let predicate = format!("root = '{}'", escape_sql_str(root_str));
+        let table = self.table.clone();
+        supervise_scan("delete_root", async move {
+            table.delete(&predicate).await.map_err(map_lance_err)
+        })
+        .await
+        .map(|result| result.num_deleted_rows)
+    }
+
     /// Looks up the indexer snapshot for a single `(corpus, root, file_ref)`.
     /// Used by the MCP `add_markdown` handler so a re-write of an unchanged
     /// file can short-circuit re-embedding (route the file through the planner's
@@ -1593,6 +1655,14 @@ impl ChunkStore for LanceStore {
 
     async fn delete_file(&self, corpus_key: &CorpusKey, file_ref: &str) -> Result<()> {
         LanceStore::delete_file(self, corpus_key, file_ref).await
+    }
+
+    async fn distinct_roots(&self) -> Result<Vec<PathBuf>> {
+        LanceStore::distinct_roots(self).await
+    }
+
+    async fn delete_root(&self, root: &RetiredRoot) -> Result<u64> {
+        LanceStore::delete_root(self, root).await
     }
 
     async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
@@ -3608,5 +3678,347 @@ schema_version = 1
                 "decode_hits must not leak a raw per-signal score pre-fusion"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn distinct_roots_returns_every_root_independent_of_corpus_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let root_a = tempfile::tempdir().expect("root a");
+        let root_b = tempfile::tempdir().expect("root b");
+        let key_a = corpus_key("repo:a:corpus", root_a.path().to_str().expect("utf8"));
+        let key_b_corpus = corpus_key("repo:b:corpus", root_b.path().to_str().expect("utf8"));
+        let key_b_wiki = corpus_key("repo:b:wiki", root_b.path().to_str().expect("utf8"));
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_a,
+                "/tmp/a.md",
+                1,
+                "roota",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed root a");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_b_corpus,
+                "/tmp/b-corpus.md",
+                1,
+                "rootbcorpus",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed root b corpus");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_b_wiki,
+                "/tmp/b-wiki.md",
+                1,
+                "rootbwiki",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed root b wiki");
+
+        let mut roots = store.distinct_roots().await.expect("distinct roots");
+        roots.sort();
+        let mut expected = vec![
+            key_a.canonical_root.clone(),
+            key_b_corpus.canonical_root.clone(),
+        ];
+        expected.sort();
+        assert_eq!(roots, expected);
+    }
+
+    #[tokio::test]
+    async fn delete_root_removes_all_rows_at_root_and_leaves_others_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let root_a = tempfile::tempdir().expect("root a");
+        let root_b = tempfile::tempdir().expect("root b");
+        let key_a = corpus_key("repo:a:corpus", root_a.path().to_str().expect("utf8"));
+        let key_b = corpus_key("repo:b:corpus", root_b.path().to_str().expect("utf8"));
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_a,
+                "/tmp/a.md",
+                2,
+                "roota",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed root a");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_b,
+                "/tmp/b.md",
+                3,
+                "rootb",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed root b");
+
+        drop(root_a);
+        let retired =
+            hallouminate_domain::common::retired_roots(std::slice::from_ref(&key_a.canonical_root));
+        let retired_root_a = retired.into_iter().next().expect("root a retired");
+
+        let removed = store
+            .delete_root(&retired_root_a)
+            .await
+            .expect("delete root a");
+        assert_eq!(removed, 2);
+
+        let stats_a = store.corpus_chunk_stats(&key_a).await.expect("stats a");
+        assert_eq!(stats_a.total_chunks, 0);
+        let stats_b = store.corpus_chunk_stats(&key_b).await.expect("stats b");
+        assert_eq!(stats_b.total_chunks, 3);
+    }
+
+    /// Two-root regression test (spec's named acceptance criterion): with a
+    /// real store holding rows for two sibling roots, deleting one root's
+    /// directory on disk and running the GC flow (distinct_roots ->
+    /// retired_roots -> delete_root) leaves the surviving root's rows fully
+    /// intact and the deleted root's rows at zero.
+    #[tokio::test]
+    async fn two_root_regression_gc_flow_deletes_retired_root_leaves_survivor_intact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let root_gone = tempfile::tempdir().expect("root gone");
+        let root_survivor = tempfile::tempdir().expect("root survivor");
+        // Same corpus name at both roots -- this is what actually
+        // discriminates a delete correctly keyed on `root` alone from one
+        // mistakenly keyed on `corpus` (or `(corpus, root)`): with two
+        // different corpus names, a corpus-scoped delete would also leave
+        // the survivor untouched, and this regression test would not catch
+        // the #215 sibling-wipe shape it exists to prevent.
+        let key_gone = corpus_key(
+            "repo:shared:corpus",
+            root_gone.path().to_str().expect("utf8"),
+        );
+        let key_survivor = corpus_key(
+            "repo:shared:corpus",
+            root_survivor.path().to_str().expect("utf8"),
+        );
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_gone,
+                "/tmp/gone.md",
+                2,
+                "gone",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed gone root");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_survivor,
+                "/tmp/survivor.md",
+                2,
+                "survivor",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed survivor root");
+
+        // Retire root_gone by deleting its directory on disk.
+        let gone_path = root_gone.path().to_path_buf();
+        drop(root_gone);
+        assert!(!gone_path.exists());
+
+        let known = store.distinct_roots().await.expect("distinct roots");
+        let retired = hallouminate_domain::common::retired_roots(&known);
+        assert_eq!(
+            retired.iter().map(|r| r.as_path()).collect::<Vec<_>>(),
+            vec![key_gone.canonical_root.as_path()]
+        );
+        for root in &retired {
+            store.delete_root(root).await.expect("delete retired root");
+        }
+
+        let stats_gone = store
+            .corpus_chunk_stats(&key_gone)
+            .await
+            .expect("stats gone");
+        assert_eq!(stats_gone.total_chunks, 0);
+        let stats_survivor = store
+            .corpus_chunk_stats(&key_survivor)
+            .await
+            .expect("stats survivor");
+        assert_eq!(stats_survivor.total_chunks, 2);
+    }
+
+    #[tokio::test]
+    async fn delete_root_removes_both_corpora_sharing_one_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let root = tempfile::tempdir().expect("root");
+        let key_wiki = corpus_key("repo:x:wiki", root.path().to_str().expect("utf8"));
+        let key_corpus = corpus_key("repo:x:corpus", root.path().to_str().expect("utf8"));
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_wiki,
+                "/tmp/wiki.md",
+                2,
+                "wiki",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed wiki corpus");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_corpus,
+                "/tmp/corpus.md",
+                3,
+                "corpus",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed corpus corpus");
+
+        drop(root);
+        let retired = hallouminate_domain::common::retired_roots(std::slice::from_ref(
+            &key_wiki.canonical_root,
+        ));
+        let retired_root = retired.into_iter().next().expect("root retired");
+
+        let removed = store
+            .delete_root(&retired_root)
+            .await
+            .expect("delete shared root");
+        assert_eq!(removed, 5);
+
+        let stats_wiki = store
+            .corpus_chunk_stats(&key_wiki)
+            .await
+            .expect("stats wiki");
+        assert_eq!(stats_wiki.total_chunks, 0);
+        let stats_corpus = store
+            .corpus_chunk_stats(&key_corpus)
+            .await
+            .expect("stats corpus");
+        assert_eq!(stats_corpus.total_chunks, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_root_escapes_a_single_quote_in_the_root_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let parent = tempfile::tempdir().expect("parent");
+        let quoted_root = parent.path().join("o'brien");
+        std::fs::create_dir(&quoted_root).expect("create quoted root");
+        let adversarial_root = parent.path().join("x' OR '1'='1");
+        std::fs::create_dir(&adversarial_root).expect("create adversarial root");
+        let survivor_root = tempfile::tempdir().expect("survivor root");
+
+        let key_quoted = corpus_key("repo:quoted:corpus", quoted_root.to_str().expect("utf8"));
+        let key_adversarial = corpus_key(
+            "repo:adversarial:corpus",
+            adversarial_root.to_str().expect("utf8"),
+        );
+        let key_survivor = corpus_key(
+            "repo:survivor:corpus",
+            survivor_root.path().to_str().expect("utf8"),
+        );
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_quoted,
+                "/tmp/quoted.md",
+                2,
+                "quoted",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed quoted root");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_adversarial,
+                "/tmp/adversarial.md",
+                4,
+                "adversarial",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed adversarial root");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key_survivor,
+                "/tmp/survivor.md",
+                3,
+                "survivor",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed survivor root");
+
+        std::fs::remove_dir_all(&quoted_root).ok();
+        let retired_quoted = hallouminate_domain::common::retired_roots(std::slice::from_ref(
+            &key_quoted.canonical_root,
+        ))
+        .into_iter()
+        .next()
+        .expect("quoted root retired");
+        let removed = store
+            .delete_root(&retired_quoted)
+            .await
+            .expect("delete quoted root");
+        assert_eq!(removed, 2);
+
+        std::fs::remove_dir_all(&adversarial_root).ok();
+        let retired_adversarial = hallouminate_domain::common::retired_roots(std::slice::from_ref(
+            &key_adversarial.canonical_root,
+        ))
+        .into_iter()
+        .next()
+        .expect("adversarial root retired");
+        let removed_adversarial = store
+            .delete_root(&retired_adversarial)
+            .await
+            .expect("delete adversarial root");
+        assert_eq!(removed_adversarial, 4);
+
+        let stats_quoted = store
+            .corpus_chunk_stats(&key_quoted)
+            .await
+            .expect("stats quoted");
+        assert_eq!(stats_quoted.total_chunks, 0);
+        let stats_adversarial = store
+            .corpus_chunk_stats(&key_adversarial)
+            .await
+            .expect("stats adversarial");
+        assert_eq!(stats_adversarial.total_chunks, 0);
+        let stats_survivor = store
+            .corpus_chunk_stats(&key_survivor)
+            .await
+            .expect("stats survivor");
+        assert_eq!(stats_survivor.total_chunks, 3);
     }
 }

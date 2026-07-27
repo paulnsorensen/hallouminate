@@ -1,12 +1,18 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 
-use crate::common::{CorpusKey, Result};
+use crate::common::{CorpusKey, Result, RetiredRoot};
 use crate::indexer::chunk::{PreparedFile, SearchHit};
 use crate::indexer::plan::FileSnapshot;
 
-/// Storage-agnostic port for chunk persistence (index-time writes).
+/// Storage-agnostic port for chunk persistence: index-time writes
+/// (`list_files`, `touch_mtime`, `delete_file`, `apply_batch`) plus
+/// orphaned-root garbage collection (`distinct_roots`, `delete_root`), a
+/// maintenance-time concern unrelated to indexing. `delete_root` takes a
+/// `RetiredRoot`, constructible only by `retired_roots`, so a caller cannot
+/// invoke it without first proving the root is absent from the filesystem.
 ///
 /// Text in: embedding is an adapter-internal implementation detail of
 /// `apply_batch`. Domain callers never see a vector.
@@ -22,6 +28,10 @@ pub trait ChunkStore: Send + Sync {
     ) -> Result<()>;
 
     async fn delete_file(&self, corpus_key: &CorpusKey, file_ref: &str) -> Result<()>;
+
+    async fn distinct_roots(&self) -> Result<Vec<PathBuf>>;
+
+    async fn delete_root(&self, root: &RetiredRoot) -> Result<u64>;
 
     async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats>;
 }
