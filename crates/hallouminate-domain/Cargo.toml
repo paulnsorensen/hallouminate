@@ -17,10 +17,24 @@ blake3.workspace = true
 # rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
 cap-std = "4"
 rustix.workspace = true
+# Concurrency fan-out for ground_union's per-corpus-root searches (efficiency
+# finding: sequential awaits made wall time the sum over roots, not the max).
+# Pinned to the 0.3 already in Cargo.lock (pulled transitively via tokio /
+# lancedb) so this direct dep resolves no new version; std-only feature set
+# since we only need future combinators, not the I/O/sink adapters.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 ignore = "0.4"
 globset = "0.4"
 pulldown-cmark = { version = "0.13", default-features = false }
-stop-words = "0.10"
+# Pin the dataset explicitly. The crate's `default = ["iso"]` selects the
+# 1298-word ISO list, but enabling `nltk` — which `--all-features` does,
+# and `scripts/verify.py` passes it — switches `get()` to the 198-word NLTK
+# list. Left on defaults, the term splitter tokenizes differently under
+# `just verify` than in a release build, so the suite and the evaluation
+# would validate a tokenizer that never ships. NLTK is the closed-class
+# list this replaced a hand-rolled 45-word set with; ISO additionally
+# classes content words ("call", "side", "use") as stopwords.
+stop-words = { version = "0.10", default-features = false, features = ["nltk"] }
 unicode-segmentation = "1"
 text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
 # Kept in lockstep with text-splitter's `tokenizers` requirement (now ^0.23):

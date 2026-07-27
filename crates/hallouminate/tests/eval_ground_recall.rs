@@ -31,6 +31,8 @@ const BASELINE_ID: &str = "fusion-without-rerank";
 const JINA_ID: &str = "fusion-with-jina-reranker-v1-turbo-en";
 const JINA_MODEL: &str = "jina-reranker-v1-turbo-en";
 const CHUNK_BUDGET_TOKENS: usize = 384;
+/// Floor on labelled queries the evaluation must report over.
+const MIN_LABELLED_QUERIES: usize = 40;
 const GROUND_RPC_GRACE_MS: u64 = 60_000;
 const EVALUATION_RERANK_TIMEOUT_MS: u64 = 5_000;
 const FOOTNOTE_INVERSION_ID: &str = "footnote-inversion";
@@ -1222,7 +1224,13 @@ fn wiki_authoring_guidance_has_context_and_retrieval_policy() {
 #[test]
 fn query_labels_are_complete_and_digest_is_stable() {
     let (queries, digest) = load_queries().expect("load eval queries");
-    assert_eq!(queries.len(), 12);
+    // The expanded set must stay at or above the labelled-query floor the
+    // evaluation is required to report over; see eval/README.md.
+    assert!(
+        queries.len() >= MIN_LABELLED_QUERIES,
+        "eval query set shrank to {} labelled queries, below the {MIN_LABELLED_QUERIES} floor",
+        queries.len()
+    );
     assert_eq!(digest.len(), 64);
     validate_fixture_labels(&queries, Characters).expect("labels match prepared fixture chunks");
 }

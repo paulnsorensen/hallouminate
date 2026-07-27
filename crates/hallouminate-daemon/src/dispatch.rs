@@ -336,6 +336,30 @@ async fn handle_corpus_stats(
     })
 }
 
+/// Ceiling on the candidate pool a single request may ask for.
+///
+/// `limit` arrives unvalidated from the client and sizes both the candidate
+/// pool and the ripgrep hit budget, so an unbounded value lets one request
+/// steer how much work the daemon does. 1000 is far above any useful pool --
+/// the config default is 50.
+const MAX_GROUND_LIMIT: usize = 1000;
+
+/// Resolve per-request ground options, falling back to configured defaults
+/// for anything the request leaves unset.
+fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
+    GroundOpts {
+        top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
+        chunks_per_file: req
+            .chunks_per_file
+            .unwrap_or(cfg.search.chunks_per_file_default),
+        limit: req
+            .limit
+            .unwrap_or(cfg.search.limit_default)
+            .min(MAX_GROUND_LIMIT),
+        rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
+    }
+}
+
 async fn handle_ground(
     state: &DaemonState,
     cfg: &Config,
@@ -352,14 +376,7 @@ async fn handle_ground(
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
     let store = &res.store;
-    let opts = GroundOpts {
-        top_files: req.top_files.unwrap_or(cfg.search.top_files_default),
-        chunks_per_file: req
-            .chunks_per_file
-            .unwrap_or(cfg.search.chunks_per_file_default),
-        limit: req.limit.unwrap_or(50),
-        rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
-    };
+    let opts = ground_opts(cfg, &req);
 
     // Union ground (#106): a no-corpus request from above all repos fans the
     // query across EVERY effective corpus and merges into one re-ranked set.
@@ -1777,6 +1794,67 @@ mod tests {
     //! helpers (`derived_corpus_name`, `pong_value`).
 
     use super::*;
+
+    fn ground_request() -> GroundRequest {
+        serde_json::from_value(serde_json::json!({ "query": "q" })).expect("minimal ground request")
+    }
+
+    /// The candidate pool must come from configuration, not a hardcoded
+    /// constant. A fixed 50 is a large share of a small corpus and a
+    /// vanishing share of a large one, which is why it is tunable per
+    /// corpus.
+    /// `limit` is unvalidated client input and sizes the ripgrep budget as
+    /// `limit * terms.len()`, so an outsized request must not steer how
+    /// much work the daemon does.
+    #[test]
+    fn ground_opts_clamps_a_request_limit_above_the_ceiling() {
+        let cfg = Config::default();
+        let mut req = ground_request();
+        req.limit = Some(MAX_GROUND_LIMIT * 100);
+        let opts = ground_opts(&cfg, &req);
+        assert_eq!(
+            opts.limit, MAX_GROUND_LIMIT,
+            "an over-large request limit must clamp to the ceiling"
+        );
+    }
+
+    #[test]
+    fn ground_opts_leave_a_request_limit_below_the_ceiling_alone() {
+        let cfg = Config::default();
+        let mut req = ground_request();
+        req.limit = Some(75);
+        assert_eq!(
+            ground_opts(&cfg, &req).limit,
+            75,
+            "a reasonable request limit must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn ground_opts_take_the_candidate_pool_from_config_when_the_request_omits_it() {
+        let mut cfg = Config::default();
+        cfg.search.limit_default = 200;
+        let opts = ground_opts(&cfg, &ground_request());
+        assert_eq!(opts.limit, 200, "configured pool must reach GroundOpts");
+    }
+
+    #[test]
+    fn an_explicit_request_limit_overrides_the_configured_pool() {
+        let mut cfg = Config::default();
+        cfg.search.limit_default = 200;
+        let mut req = ground_request();
+        req.limit = Some(7);
+        assert_eq!(ground_opts(&cfg, &req).limit, 7);
+    }
+
+    #[test]
+    fn ground_opts_default_pool_is_fifty() {
+        let opts = ground_opts(&Config::default(), &ground_request());
+        assert_eq!(
+            opts.limit, 50,
+            "omitting the config key must preserve the historical pool size"
+        );
+    }
 
     #[test]
     fn derived_corpus_name_emits_canonical_string_for_valid_inputs() {

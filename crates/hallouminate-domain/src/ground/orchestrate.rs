@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use futures_util::{StreamExt, TryStreamExt};
+
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
-use crate::indexer::{ChunkStore, SearchHit};
-use crate::search::{Crossencoder, search_with_ripgrep};
+use crate::indexer::SearchHit;
+use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
 
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats, Warning};
@@ -109,7 +111,7 @@ impl Default for GroundOpts {
 pub async fn ground(
     query: &str,
     corpus: &CorpusConfig,
-    store: &dyn ChunkStore,
+    store: &dyn ChunkRetrieval,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
@@ -123,34 +125,68 @@ pub async fn ground(
     .await
 }
 
-/// Searches one root-aware corpus identity, returning its un-reranked hits.
+/// Searches one root-aware corpus identity, returning its un-reranked hits
+/// plus any warnings raised while assembling them.
 async fn search_corpus(
     query: &str,
     corpus_key: &CorpusKey,
-    store: &dyn ChunkStore,
+    store: &dyn ChunkRetrieval,
+    globs: &[String],
     limit: usize,
-) -> Result<Vec<SearchHit>> {
-    search_with_ripgrep(store, corpus_key, query, limit).await
+) -> Result<FusedSearch> {
+    search_fused(store, corpus_key, query, globs, limit).await
 }
+
+/// Cap on concurrent per-root searches fanned out by `ground_union`. Each
+/// root spawns a real `rg` subprocess (forced single-threaded by
+/// `--sort path`) plus a LanceDB scan, so an unbounded fan-out over a large
+/// global corpus set launches one `rg` process and one LanceDB scan per
+/// root simultaneously (regression from 96a2f23). 6 keeps several roots'
+/// worth of subprocess + IO-bound work in flight without saturating the
+/// process/file-descriptor budget on a modest host.
+const MAX_CONCURRENT_CORPUS_SEARCHES: usize = 6;
 
 /// Fans one query across every effective corpus root and globally reranks it.
 pub async fn ground_union(
     query: &str,
     corpora: &[CorpusConfig],
-    store: &dyn ChunkStore,
+    store: &dyn ChunkRetrieval,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
+    let corpus_keys: Vec<(CorpusKey, &[String])> = corpora
+        .iter()
+        .flat_map(|c| {
+            c.corpus_keys()
+                .into_iter()
+                .map(move |k| (k, c.globs.as_slice()))
+        })
+        .collect();
+    // Collected eagerly: a lazy `Map` iterator would bake the closure into
+    // the stream's type, and that closure is not general enough over the
+    // borrow's lifetime once this future is spawned (the daemon spawns it),
+    // so inference fails at the far-away spawn site. Futures are inert until
+    // polled, so building them up front costs nothing and `buffered` still
+    // polls at most MAX_CONCURRENT_CORPUS_SEARCHES of them at a time.
+    let searches: Vec<_> = corpus_keys
+        .iter()
+        .map(|(corpus_key, globs)| search_corpus(query, corpus_key, store, globs, opts.limit))
+        .collect();
+    // `buffered` (not `buffer_unordered`) preserves per-root result order,
+    // which callers rely on for warning ordering; it still propagates the
+    // first `Err` like `try_join_all` did.
+    let search_results: Vec<FusedSearch> = futures_util::stream::iter(searches)
+        .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+        .try_collect()
+        .await?;
     let mut hits: Vec<SearchHit> = Vec::new();
-    for corpus in corpora {
-        for corpus_key in corpus.corpus_keys() {
-            let mut root_hits = search_corpus(query, &corpus_key, store, opts.limit).await?;
-            hits.append(&mut root_hits);
-        }
+    let mut warnings = Vec::new();
+    for result in search_results {
+        hits.extend(result.hits);
+        warnings.extend(result.warnings);
     }
     let stats = Stats { hits: hits.len() };
-    let mut warnings = Vec::new();
 
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
@@ -227,10 +263,9 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::indexer::{BatchWriteStats, FileSnapshot, PreparedFile};
+    use crate::indexer::SignalLists;
 
-    /// In-memory `ChunkStore` test double for orchestration/rerank tests:
-    /// `hybrid_search` returns a canned, pre-seeded hit list; writes are
+    /// `retrieve_signals` returns a canned, pre-seeded hit list; writes are
     /// no-ops. Keeps these tests off the real Lance/embedder adapter stack
     /// (US-002: embedding is adapter-owned, invisible to domain code).
     #[derive(Default)]
@@ -239,48 +274,45 @@ mod tests {
     }
 
     #[async_trait]
-    impl ChunkStore for FakeChunkStore {
-        async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
-            Ok(Vec::new())
-        }
-
-        async fn hybrid_search(
+    impl ChunkRetrieval for FakeChunkStore {
+        async fn retrieve_signals(
             &self,
             corpus_key: &CorpusKey,
             _query: &str,
             limit: usize,
-        ) -> Result<Vec<SearchHit>> {
-            Ok(self
+        ) -> Result<SignalLists> {
+            let hits: Vec<SearchHit> = self
                 .hits
                 .iter()
                 .filter(|hit| hit.corpus_key == *corpus_key)
                 .take(limit)
                 .cloned()
-                .collect())
+                .collect();
+            Ok(SignalLists {
+                fts: hits.iter().map(|h| h.chunk_id.clone()).collect(),
+                vector: Vec::new(),
+                hits: hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect(),
+            })
         }
+    }
 
-        async fn touch_mtime(
-            &self,
-            _corpus_key: &CorpusKey,
-            _file_ref: &str,
-            _mtime_ms: i64,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        async fn delete_file(&self, _corpus_key: &CorpusKey, _file_ref: &str) -> Result<()> {
-            Ok(())
-        }
-
-        async fn apply_batch(&self, _files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
-            Ok(BatchWriteStats::default())
-        }
+    /// An empty directory standing in for a corpus root, shared by every
+    /// fixture in this module.
+    ///
+    /// The root must be a real, *small* directory rather than `/`. `ground`
+    /// runs a ripgrep pass over the corpus root, so rooting a fixture at `/`
+    /// makes these tests crawl the entire filesystem — fast only while the
+    /// literal pass happens to match nothing.
+    fn fixture_root() -> &'static std::path::Path {
+        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| tempfile::tempdir().expect("fixture corpus root"))
+            .path()
     }
 
     fn fixture_corpus() -> CorpusConfig {
         CorpusConfig {
             name: "fixtures".into(),
-            paths: vec!["/".into()],
+            paths: vec![fixture_root().to_string_lossy().into_owned()],
             globs: vec!["**/*.md".into()],
             exclude: Vec::new(),
             global: false,
@@ -305,6 +337,78 @@ mod tests {
         assert_eq!(resp.query, "spice");
         assert_eq!(resp.stats.hits, 0, "empty store yields no hits");
         assert!(resp.docs.is_empty());
+    }
+
+    // --- efficiency: ground_union fans roots out concurrently ---
+
+    /// A `ChunkStore` double whose `retrieve_signals` sleeps a fixed delay
+    /// per call before returning an empty (no-hit) result. Used to prove
+    /// `ground_union` awaits per-root searches concurrently: if the roots
+    /// were still awaited sequentially, N roots would take >= N * delay;
+    /// concurrent awaits take roughly one delay regardless of N.
+    struct SleepyChunkStore {
+        delay: Duration,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for SleepyChunkStore {
+        async fn retrieve_signals(
+            &self,
+            _corpus_key: &CorpusKey,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<SignalLists> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+            Ok(SignalLists::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn ground_union_searches_corpus_roots_concurrently() {
+        const ROOTS: usize = 5;
+        const DELAY: Duration = Duration::from_millis(80);
+
+        let root_dirs: Vec<tempfile::TempDir> = (0..ROOTS)
+            .map(|_| tempfile::tempdir().expect("root dir"))
+            .collect();
+        let corpus = CorpusConfig {
+            name: "concurrency".into(),
+            paths: root_dirs
+                .iter()
+                .map(|dir| dir.path().to_string_lossy().into_owned())
+                .collect(),
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let store = SleepyChunkStore {
+            delay: DELAY,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let started = Instant::now();
+        let resp = ground_union("spice", &[corpus], &store, None, GroundOpts::default())
+            .await
+            .expect("concurrent ground_union must succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            store.calls.load(std::sync::atomic::Ordering::SeqCst),
+            ROOTS,
+            "every corpus root must be searched exactly once"
+        );
+        assert!(resp.docs.is_empty(), "no-hit store yields no docs");
+        assert!(
+            elapsed < DELAY * 2,
+            "expected {ROOTS} roots x {DELAY:?} delay each to run concurrently and finish \
+             in roughly one delay; took {elapsed:?}. A sequential loop would take >= \
+             {:?} (the sum over roots) — this margin (2x one delay) is generous enough \
+             that it cannot pass by accident on a loaded machine, yet fails if the \
+             per-root loop reverts to sequential awaits.",
+            DELAY * ROOTS as u32
+        );
     }
 
     // --- #137: relative_path_for ---
@@ -366,7 +470,10 @@ mod tests {
     fn hit_for_timeout_test(file_ref: &str, score: f32) -> SearchHit {
         SearchHit {
             chunk_id: format!("{file_ref}#0"),
-            corpus_key: CorpusKey::from_configured_root("fixtures", "/"),
+            corpus_key: CorpusKey::from_configured_root(
+                "fixtures",
+                &fixture_root().to_string_lossy(),
+            ),
             file_ref: file_ref.into(),
             heading_path: vec![],
             line_start: 1,
@@ -461,7 +568,10 @@ mod tests {
     /// all-None unconditionally.
     fn fixture_hits() -> Vec<SearchHit> {
         (0..5)
-            .map(|i| hit_for_timeout_test(&format!("/spice{i}.md"), i as f32))
+            .map(|i| {
+                let file_ref = fixture_root().join(format!("spice{i}.md"));
+                hit_for_timeout_test(&file_ref.to_string_lossy(), i as f32)
+            })
             .collect()
     }
 
@@ -705,6 +815,61 @@ mod tests {
         assert_eq!(
             observed, fusion_order,
             "zero-duration timeout fallback must preserve the original fusion order"
+        );
+    }
+
+    // --- warnings: per-root degradation must survive the fan-out ---
+
+    #[tokio::test]
+    async fn ground_union_collects_ripgrep_warnings_from_every_root() {
+        // Two nonexistent roots: `search_fused`'s ripgrep pass errors on
+        // each (no such directory), so both must surface a distinct
+        // "ripgrep-failed" warning in GroundResponse.warnings. If the
+        // fan-out's warnings.extend ever regresses to overwrite-with-last
+        // or keep-only-first, this collapses to one warning and fails.
+        let root_a = "/nonexistent/hallouminate-orchestrate-test-root-a";
+        let root_b = "/nonexistent/hallouminate-orchestrate-test-root-b";
+        let key_a = CorpusKey::from_configured_root("warnings", root_a);
+        let key_b = CorpusKey::from_configured_root("warnings", root_b);
+
+        let mut hit_a = hit_for_timeout_test("a.md", 0.1);
+        hit_a.corpus_key = key_a.clone();
+        let mut hit_b = hit_for_timeout_test("b.md", 0.2);
+        hit_b.corpus_key = key_b.clone();
+        let store = FakeChunkStore {
+            hits: vec![hit_a, hit_b],
+        };
+
+        let corpus = CorpusConfig {
+            name: "warnings".into(),
+            paths: vec![root_a.into(), root_b.into()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let resp = ground_union("spice", &[corpus], &store, None, GroundOpts::default())
+            .await
+            .expect("ground_union must succeed even when every root's ripgrep pass fails");
+
+        let codes: Vec<&str> = resp.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(
+            codes,
+            vec!["ripgrep-failed", "ripgrep-failed"],
+            "both roots must report ripgrep-failed; a dropped or overwritten root warning \
+             would shrink this to one entry: {:?}",
+            resp.warnings
+        );
+        assert!(
+            resp.warnings[0].message.contains(root_a),
+            "first warning must name its own root: {:?}",
+            resp.warnings[0]
+        );
+        assert!(
+            resp.warnings[1].message.contains(root_b),
+            "second warning must name its own root, not root_a's message \
+             (proves the second root's warning wasn't overwritten by the first): {:?}",
+            resp.warnings[1]
         );
     }
 }

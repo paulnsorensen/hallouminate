@@ -288,7 +288,7 @@ mod tests {
 
     use super::*;
     use crate::common::{HallouminateError, canonicalize_or_passthrough, expand_tilde};
-    use crate::indexer::{BatchWriteStats, FileSnapshot, SearchHit, Upsert};
+    use crate::indexer::{BatchWriteStats, FileSnapshot, Upsert};
 
     #[derive(Default)]
     struct RecordingStore {
@@ -299,15 +299,6 @@ mod tests {
     #[async_trait]
     impl ChunkStore for RecordingStore {
         async fn list_files(&self, _corpus_key: &CorpusKey) -> Result<Vec<FileSnapshot>> {
-            Ok(Vec::new())
-        }
-
-        async fn hybrid_search(
-            &self,
-            _corpus_key: &CorpusKey,
-            _query: &str,
-            _limit: usize,
-        ) -> Result<Vec<SearchHit>> {
             Ok(Vec::new())
         }
 

@@ -19,6 +19,22 @@ includes footnote inversion, worktree isolation, paraphrase, and
 lexical-distractor cases. Every measured arm records the expected and actual top
 identity plus pass/fail.
 
+The set must stay at or above `MIN_LABELLED_QUERIES` (40) labelled queries, so
+that a single query is not worth enough of the aggregate to make a change look
+significant when it is noise. The corpus carries topically-adjacent distractor
+pages on purpose — several pairs cover neighbouring concerns (path safety versus
+sandbox roots, idle exit versus arena retention, embedding model versus
+crossencoder) so a query has to discriminate rather than pick the only plausible
+page. Queries are a deliberate mix: some share wording with their target chunk,
+and some are abstract paraphrases that share no distinctive content word with
+it, which is what keeps the set able to tell the lexical and semantic signals
+apart.
+
+Authoring order matters. The query set and fixture corpus are frozen and
+measured *before* the ranking code they evaluate is changed, so the queries
+cannot be shaped, even unconsciously, toward whatever the new implementation
+happens to do well.
+
 ## Production evaluation arms
 
 The production embedding configuration comes from `EmbeddingsConfig::default()`:

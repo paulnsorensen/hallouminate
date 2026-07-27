@@ -2961,6 +2961,7 @@ dependencies = [
  "csv",
  "directories",
  "file-format",
+ "futures-util",
  "globset",
  "ignore",
  "pulldown-cmark",

@@ -21,6 +21,9 @@
 [search]
 top_files_default       = 10
 chunks_per_file_default = 3
+# Candidate pool retrieved per signal before fusion. Raise it on a large
+# corpus, where a fixed 50 covers a vanishing fraction of the chunks.
+limit_default           = 50
 # Optional crossencoder rerank model — runs after FTS+vector+rg fusion
 # to re-score the top candidates. Leave commented to skip the step.
 # Supported: jina-reranker-v1-turbo-en, jina-reranker-v2-base-multiligual,

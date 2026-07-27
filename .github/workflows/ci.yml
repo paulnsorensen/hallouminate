@@ -73,6 +73,23 @@ jobs:
         # crates/hallouminate/tests/it/verification_gate.rs shells out to the
         # real `just` binary to exercise the verification lease end to end.
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Install ripgrep
+        # `rg` is a hard runtime dependency of the lexical search pass, and
+        # neither hosted image ships it. The ripgrep tests fail closed rather
+        # than skip when CI is set (see `require_rg` in
+        # crates/hallouminate-domain/src/search/ripgrep.rs), so the binary must
+        # be present or the matrix goes red.
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            sudo apt-get update && sudo apt-get install -y ripgrep
+          else
+            brew install ripgrep
+          fi
+          rg --version
       - name: Expose Xcode compiler runtime
         if: runner.os == 'macOS'
         run: |
