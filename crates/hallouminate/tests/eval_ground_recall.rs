@@ -272,11 +272,15 @@ fn parse_rg_version_output(stdout: &[u8]) -> Result<String> {
 }
 
 fn ripgrep_version() -> Result<String> {
-    let output = Command::new("rg")
+    ripgrep_version_from_binary("rg")
+}
+
+fn ripgrep_version_from_binary(bin: &str) -> Result<String> {
+    let output = Command::new(bin)
         .arg("--version")
         .output()
-        .context("run `rg --version` for eval provenance")?;
-    ensure!(output.status.success(), "rg --version exited non-zero");
+        .with_context(|| format!("run `{bin} --version` for eval provenance"))?;
+    ensure!(output.status.success(), "{bin} --version exited non-zero");
     parse_rg_version_output(&output.stdout)
 }
 
@@ -1498,6 +1502,46 @@ fn ripgrep_version_returns_installed_version() {
     assert!(
         version.starts_with("ripgrep "),
         "unexpected rg --version output: {version}"
+    );
+}
+
+#[test]
+fn ripgrep_version_fails_loud_when_binary_missing() {
+    let error = ripgrep_version_from_binary("definitely-not-a-real-binary-xyz123")
+        .expect_err("a missing binary must fail loud, not silently degrade");
+    assert!(
+        error.to_string().contains("--version"),
+        "error must name the failed command: {error}"
+    );
+}
+
+#[test]
+fn ripgrep_version_fails_loud_on_nonzero_exit() {
+    let error = ripgrep_version_from_binary("false")
+        .expect_err("a non-zero exit must fail loud, not silently degrade");
+    assert!(
+        error.to_string().contains("exited non-zero"),
+        "error must explain the failure: {error}"
+    );
+}
+
+#[test]
+fn ripgrep_version_fails_loud_on_empty_output() {
+    use std::os::unix::fs::PermissionsExt;
+    // GNU coreutils `true --version` prints a version banner, so it can't
+    // stand in for a silent binary here; a throwaway script that ignores
+    // its arguments and exits clean can.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = dir.path().join("silent-ok");
+    fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write script");
+    let mut perms = fs::metadata(&script).expect("stat script").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&script, perms).expect("chmod script");
+    let error = ripgrep_version_from_binary(script.to_str().expect("utf8 path"))
+        .expect_err("empty output must fail loud, not record a placeholder");
+    assert!(
+        error.to_string().contains("produced no output"),
+        "error must explain the failure: {error}"
     );
 }
 
