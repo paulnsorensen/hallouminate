@@ -62,4 +62,4 @@ jobs:
             eval-models-${{ runner.os }}-
 
       - name: Measure ground retrieval baseline (scratch harvest — reverted before merge)
-        run: just eval-measure
+        run: just verify cargo test -p hallouminate --test eval_ground_recall scratch_measure_baseline_only -- --ignored --nocapture --exact
