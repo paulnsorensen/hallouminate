@@ -55,5 +55,5 @@ jobs:
           restore-keys: |
             eval-models-${{ runner.os }}-
 
-      - name: Enforce ground retrieval baseline
-        run: just eval
+      - name: Measure ground retrieval baseline (scratch harvest — reverted before merge)
+        run: just eval-measure
