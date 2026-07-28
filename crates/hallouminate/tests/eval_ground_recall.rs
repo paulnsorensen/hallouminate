@@ -17,7 +17,7 @@ use hallouminate_daemon::{
 };
 use hallouminate_domain::common::{CorpusConfig, expand_tilde};
 use hallouminate_domain::corpus::{blake3_bytes, load_tokenizer, scan};
-use hallouminate_domain::ground::{DocFile, GroundResponse, Warning};
+use hallouminate_domain::ground::{DocFile, GroundResponse, Stats, Warning};
 use hallouminate_domain::indexer::{Format, HandlerRegistry, PrepareCtx};
 use serde::{Deserialize, Serialize};
 use text_splitter::{Characters, ChunkSizer};
@@ -624,6 +624,25 @@ fn rerank_completion(response: &GroundResponse, arm: ArmSpec<'_>, query_id: &str
     }
 }
 
+/// Warning codes `rerank_completion` already interprets. Any other warning
+/// means a fused retrieval signal degraded mid-run — a ripgrep pass that
+/// failed, timed out, resolved to nothing, or emitted unparseable events
+/// silently changes ranking, so the sweep would record a degraded run as a
+/// valid measurement and bake it into the committed baseline.
+const INTERPRETED_WARNING_CODES: [&str; 2] = ["rerank-timeout", "crossencoder-unavailable"];
+
+fn ensure_signals_intact(response: &GroundResponse, query_id: &str) -> Result<()> {
+    for warning in &response.warnings {
+        ensure!(
+            INTERPRETED_WARNING_CODES.contains(&warning.code.as_str()),
+            "query {query_id} degraded a retrieval signal ({}): {}; a degraded run is not a measurement",
+            warning.code,
+            warning.message
+        );
+    }
+    Ok(())
+}
+
 async fn run_sweep(
     client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
@@ -634,6 +653,7 @@ async fn run_sweep(
     for query in queries {
         let response = ground_query(client, cwd, arm, query).await?;
         let rerank_completed = rerank_completion(&response, arm, &query.id)?;
+        ensure_signals_intact(&response, &query.id)?;
         let ranked = ranked_docs(&response.docs);
         let rank = rank_of_expected(&ranked, &query.expected_chunk.file);
         let actual_top = top_identity(&ranked);
@@ -1645,4 +1665,47 @@ async fn eval_ground_recall_enforce() -> Result<()> {
     compare_against_baseline(&baseline, &current)?;
     println!("{}", serde_json::to_string_pretty(&current)?);
     Ok(())
+}
+
+#[test]
+fn degraded_ripgrep_signal_is_not_a_valid_measurement() {
+    for code in [
+        "ripgrep-timeout",
+        "ripgrep-failed",
+        "ripgrep-unresolved",
+        "ripgrep-unparseable",
+    ] {
+        let response = response_with_warning(code, "ripgrep pass degraded");
+        let error = ensure_signals_intact(&response, "envelope-shape")
+            .expect_err("a degraded ripgrep signal must not be measured as a baseline result");
+        let message = error.to_string();
+        assert!(
+            message.contains(code) && message.contains("envelope-shape"),
+            "error must name the warning code and the query: {message}"
+        );
+    }
+}
+
+#[test]
+fn rerank_warnings_remain_owned_by_rerank_completion() {
+    for code in INTERPRETED_WARNING_CODES {
+        let response = response_with_warning(code, "rerank fell back to fusion");
+        ensure_signals_intact(&response, "envelope-shape").unwrap_or_else(|error| {
+            panic!("{code} is rerank_completion's to judge, not the signal check: {error}")
+        });
+    }
+}
+
+fn response_with_warning(code: &str, message: &str) -> GroundResponse {
+    GroundResponse {
+        query: "request envelope shape".into(),
+        took_ms: 0,
+        stats: Stats::default(),
+        docs: BTreeMap::new(),
+        code: BTreeMap::new(),
+        warnings: vec![Warning {
+            code: code.into(),
+            message: message.into(),
+        }],
+    }
 }
