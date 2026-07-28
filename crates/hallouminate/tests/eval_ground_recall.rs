@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -25,7 +26,7 @@ use text_splitter::{Characters, ChunkSizer};
 mod common;
 use common::daemon::DaemonHarness;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const CORPUS_NAME: &str = "eval-wiki";
 const BASELINE_ID: &str = "fusion-without-rerank";
 const JINA_ID: &str = "fusion-with-jina-reranker-v1-turbo-en";
@@ -177,6 +178,7 @@ struct EvalArtifact {
     schema_version: u32,
     query_set_digest: String,
     embedding: EmbeddingConfiguration,
+    ripgrep_version: String,
     requested_arms: Vec<ArmDescriptor>,
     measurements: Vec<ArmMeasurement>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,15 +240,16 @@ fn embedding_configuration() -> EmbeddingConfiguration {
     }
 }
 
-fn new_artifact(query_set_digest: String, arms: &[ArmSpec<'_>]) -> EvalArtifact {
+fn new_artifact(query_set_digest: String, arms: &[ArmSpec<'_>]) -> Result<EvalArtifact> {
     let mut requested_arms = Vec::with_capacity(arms.len());
     for arm in arms {
         requested_arms.push(ArmDescriptor::from_spec(*arm));
     }
-    EvalArtifact {
+    Ok(EvalArtifact {
         schema_version: SCHEMA_VERSION,
         query_set_digest,
         embedding: embedding_configuration(),
+        ripgrep_version: ripgrep_version()?,
         requested_arms,
         measurements: Vec::new(),
         comparison: None,
@@ -254,7 +257,27 @@ fn new_artifact(query_set_digest: String, arms: &[ArmSpec<'_>]) -> EvalArtifact 
         timeouts: Vec::new(),
         model_load_failures: Vec::new(),
         errors: Vec::new(),
-    }
+    })
+}
+
+fn parse_rg_version_output(stdout: &[u8]) -> Result<String> {
+    let first_line = String::from_utf8_lossy(stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    ensure!(!first_line.is_empty(), "rg --version produced no output");
+    Ok(first_line)
+}
+
+fn ripgrep_version() -> Result<String> {
+    let output = Command::new("rg")
+        .arg("--version")
+        .output()
+        .context("run `rg --version` for eval provenance")?;
+    ensure!(output.status.success(), "rg --version exited non-zero");
+    parse_rg_version_output(&output.stdout)
 }
 
 fn load_queries() -> Result<(Vec<LabelledQuery>, String)> {
@@ -1019,7 +1042,7 @@ async fn measure_diagnostic(
 ) -> Result<EvalArtifact> {
     validate_fixture_labels_with_production_tokenizer(queries)?;
     let arms = diagnostic_arms();
-    let mut artifact = new_artifact(query_set_digest, &arms);
+    let mut artifact = new_artifact(query_set_digest, &arms)?;
     for arm in arms {
         match run_arm(arm, queries).await {
             Ok(measurement) => artifact.measurements.push(measurement),
@@ -1046,7 +1069,7 @@ async fn measure_baseline(
 ) -> Result<EvalArtifact> {
     validate_fixture_labels_with_production_tokenizer(queries)?;
     let arms = baseline_arms();
-    let mut artifact = new_artifact(query_set_digest, &arms);
+    let mut artifact = new_artifact(query_set_digest, &arms)?;
     artifact
         .measurements
         .push(run_arm(BASELINE_ARM, queries).await?);
@@ -1346,7 +1369,8 @@ fn synthetic_measurement(arm: ArmSpec<'_>, mut queries: Vec<QueryMeasurement>) -
 }
 
 fn synthetic_baseline_artifact() -> EvalArtifact {
-    let mut artifact = new_artifact("digest".into(), &baseline_arms());
+    let mut artifact = new_artifact("digest".into(), &baseline_arms())
+        .expect("ripgrep version for synthetic artifact");
     artifact.measurements.push(synthetic_measurement(
         BASELINE_ARM,
         vec![
@@ -1359,7 +1383,8 @@ fn synthetic_baseline_artifact() -> EvalArtifact {
 }
 
 fn synthetic_diagnostic_artifact() -> EvalArtifact {
-    let mut artifact = new_artifact("digest".into(), &diagnostic_arms());
+    let mut artifact = new_artifact("digest".into(), &diagnostic_arms())
+        .expect("ripgrep version for synthetic artifact");
     artifact.measurements.push(synthetic_measurement(
         BASELINE_ARM,
         vec![
@@ -1400,16 +1425,60 @@ fn diagnostic_artifact_has_two_arms_counts_and_no_decision_fields() {
     assert!(json.contains("warm_p95_ms"));
     assert!(json.contains("timeout_count"));
     assert!(json.contains("model_load_failures"));
+    assert!(json.contains("ripgrep_version"));
 }
 
 #[test]
 fn partial_diagnostic_records_timeout_before_validation() {
-    let mut artifact = new_artifact("digest".into(), &diagnostic_arms());
+    let mut artifact = new_artifact("digest".into(), &diagnostic_arms())
+        .expect("ripgrep version for synthetic artifact");
     let error = anyhow::anyhow!("{RERANK_TIMEOUT_MARKER} for query first in {JINA_ID}");
     record_failure(&mut artifact, JINA_ARM, &error);
     validate_diagnostic_artifact(&artifact, false).expect("partial diagnostic");
     assert_eq!(artifact.timeout_count, 1);
     assert_eq!(artifact.timeouts[0].query_id.as_deref(), Some("first"));
+}
+
+#[test]
+fn schema_version_is_four() {
+    assert_eq!(SCHEMA_VERSION, 4);
+}
+
+#[test]
+fn compare_against_baseline_ignores_ripgrep_version_mismatch() {
+    let mut committed = synthetic_baseline_artifact();
+    let mut current = synthetic_baseline_artifact();
+    committed.ripgrep_version = "ripgrep 13.0.0 (rev abc)".into();
+    current.ripgrep_version = "ripgrep 14.1.1 (rev def)".into();
+    compare_against_baseline(&committed, &current)
+        .expect("ripgrep_version mismatch must not affect comparison");
+}
+
+#[test]
+fn parse_rg_version_output_rejects_empty_stdout() {
+    assert!(parse_rg_version_output(b"").is_err());
+}
+
+#[test]
+fn parse_rg_version_output_rejects_whitespace_only_stdout() {
+    assert!(parse_rg_version_output(b"   \n\n").is_err());
+}
+
+#[test]
+fn parse_rg_version_output_trims_and_takes_first_line() {
+    let stdout = b"  ripgrep 14.1.1 (rev abc123)  \nfeatures: pcre2, simd-accel\n";
+    let version = parse_rg_version_output(stdout).expect("parse rg version");
+    assert_eq!(version, "ripgrep 14.1.1 (rev abc123)");
+}
+
+#[test]
+fn ripgrep_version_returns_installed_version() {
+    let version = ripgrep_version().expect("rg --version must succeed in eval environment");
+    assert!(!version.is_empty());
+    assert!(
+        version.starts_with("ripgrep "),
+        "unexpected rg --version output: {version}"
+    );
 }
 
 #[test]
