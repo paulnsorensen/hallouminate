@@ -1666,16 +1666,6 @@ async fn eval_ground_recall_enforce() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&current)?);
     Ok(())
 }
-
-#[tokio::test]
-#[ignore = "scratch harvest — measure baseline arm only, revert before merge"]
-async fn scratch_measure_baseline_only() -> Result<()> {
-    let (queries, query_set_digest) = load_queries()?;
-    let artifact = measure_baseline(&queries, query_set_digest).await?;
-    println!("{}", serde_json::to_string_pretty(&artifact)?);
-    Ok(())
-}
-
 #[test]
 fn degraded_ripgrep_signal_is_not_a_valid_measurement() {
     for code in [

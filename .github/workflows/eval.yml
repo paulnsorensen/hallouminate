@@ -61,5 +61,5 @@ jobs:
           restore-keys: |
             eval-models-${{ runner.os }}-
 
-      - name: Measure ground retrieval baseline (scratch harvest — reverted before merge)
-        run: just verify cargo test -p hallouminate --test eval_ground_recall scratch_measure_baseline_only -- --ignored --nocapture --exact
+      - name: Enforce ground retrieval baseline
+        run: just eval
