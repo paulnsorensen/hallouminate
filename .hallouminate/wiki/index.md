@@ -18,6 +18,8 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [debt-observed-test-isolation](debt-observed-test-isolation.md) — why the process-wide `debt::OBSERVED` static makes any Hard-recording test break concurrent maintenance-defer tests.
 - [design-rationale](design-rationale.md) — what hallouminate deliberately *is* and *isn't*, and why — the "why this design not that one" page.
 - [domain-model](domain-model.md) — proposed `search_text`, root-aware `CorpusKey`, and schema-v4 semantics for issue #288; clearly separated from shipped behavior.
+- [eval-baseline-rg-provenance-adrs](eval-baseline-rg-provenance-adrs.md) — why the eval was re-baselined with the divergence unexplained, and why ripgrep's version is recorded but never enforced.
+- [eval-harness-gotchas](eval-harness-gotchas.md) — operational traps running the ground-retrieval eval: ripgrep as an uninstalled hard dependency, the warning-code taxonomy three crates own, the discarded warmup sweep, and ETXTBSY in parallel tests.
 - [ground-search-evaluation](ground-search-evaluation.md) — discriminative file/chunk relevance metrics, latency thresholds, small-reranker comparison, and scheduled regression gate.
 - [ground-search-quality](ground-search-quality.md) — issue #288's draft spec: indexed-text cleanup, worktree isolation, eval-gated reranking, and authoring context.
 - [ground-search-quality-adrs](ground-search-quality-adrs.md) — five proposed decisions and their research basis for issue #288.

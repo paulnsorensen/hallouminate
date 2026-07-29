@@ -98,6 +98,31 @@ git operation: `checkout -- .`, `restore`, `reset --hard`.
   git operation first, then the tilth parent-checkout leak above.
 
 
+## An abandoned worktree branch can hold the only copy of a real fix
+
+Added 2026-07-29. A `/pasteurize` investigation running in an isolated worktree
+diagnosed a genuine gate blind spot, wrote the fix, committed it to the
+worktree's own branch (`worktree-agent-adeb6eee59a2309c1`, commit `a6f1ba2`),
+and recorded the diagnosis in its `.cheese/pasteurize/` report — but the branch
+was never merged and the worktree was abandoned. The report read as though the
+fix had landed. It had not: `git merge-base --is-ancestor a6f1ba2 main` returned
+false weeks later, and the blind spot it closed (a degraded ripgrep signal being
+silently measured as a valid baseline) was still wide open in `main`.
+
+`<certain>` the mechanism — a session report describing a fix is evidence the
+fix was *written*, never evidence it was *merged*. Nothing in the pipeline
+reconciles an abandoned worktree branch against `main`.
+
+**Rules that follow:**
+- Before trusting a prior session's report that a fix exists, verify it against
+  the trunk: `git merge-base --is-ancestor <sha> main`, or
+  `git branch --contains <sha>`.
+- When closing out a worktree, either merge its branch or state plainly in the
+  handoff that the work is unlanded — "fixed in `<sha>`" without a merge is a
+  claim the next reader will misread.
+- Periodically sweep `git branch --list 'worktree-agent-*'` for branches holding
+  commits that are not ancestors of `main`.
+
 ## Wiki index rows stomp across worktrees
 
 Added 2026-07-13. Indexing or `add_markdown`-ing the repo wiki from one

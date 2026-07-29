@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
@@ -25,7 +27,7 @@ use text_splitter::{Characters, ChunkSizer};
 mod common;
 use common::daemon::DaemonHarness;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const CORPUS_NAME: &str = "eval-wiki";
 const BASELINE_ID: &str = "fusion-without-rerank";
 const JINA_ID: &str = "fusion-with-jina-reranker-v1-turbo-en";
@@ -177,6 +179,7 @@ struct EvalArtifact {
     schema_version: u32,
     query_set_digest: String,
     embedding: EmbeddingConfiguration,
+    ripgrep_version: String,
     requested_arms: Vec<ArmDescriptor>,
     measurements: Vec<ArmMeasurement>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,7 +241,11 @@ fn embedding_configuration() -> EmbeddingConfiguration {
     }
 }
 
-fn new_artifact(query_set_digest: String, arms: &[ArmSpec<'_>]) -> EvalArtifact {
+fn new_artifact(
+    query_set_digest: String,
+    ripgrep_version: String,
+    arms: &[ArmSpec<'_>],
+) -> EvalArtifact {
     let mut requested_arms = Vec::with_capacity(arms.len());
     for arm in arms {
         requested_arms.push(ArmDescriptor::from_spec(*arm));
@@ -247,6 +254,7 @@ fn new_artifact(query_set_digest: String, arms: &[ArmSpec<'_>]) -> EvalArtifact 
         schema_version: SCHEMA_VERSION,
         query_set_digest,
         embedding: embedding_configuration(),
+        ripgrep_version,
         requested_arms,
         measurements: Vec::new(),
         comparison: None,
@@ -255,6 +263,48 @@ fn new_artifact(query_set_digest: String, arms: &[ArmSpec<'_>]) -> EvalArtifact 
         model_load_failures: Vec::new(),
         errors: Vec::new(),
     }
+}
+
+/// `rg --version`'s banner is one short line; anything far longer is a
+/// wrapper or an unrelated binary, not provenance worth committing.
+const MAX_RIPGREP_VERSION_LEN: usize = 200;
+
+fn parse_rg_version_output(bin: &str, stdout: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(stdout)
+        .with_context(|| format!("`{bin} --version` produced non-UTF8 output"))?;
+    let first_line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .with_context(|| format!("`{bin} --version` produced no output"))?;
+    ensure!(
+        first_line.starts_with("ripgrep "),
+        "`{bin} --version` is not a ripgrep banner: {first_line}"
+    );
+    ensure!(
+        first_line.len() <= MAX_RIPGREP_VERSION_LEN,
+        "`{bin} --version` banner is {} bytes, over the {MAX_RIPGREP_VERSION_LEN}-byte cap",
+        first_line.len()
+    );
+    Ok(first_line.to_string())
+}
+
+fn ripgrep_version() -> Result<String> {
+    ripgrep_version_from_binary("rg")
+}
+
+fn ripgrep_version_from_binary(bin: &str) -> Result<String> {
+    let output = Command::new(bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("run `{bin} --version` for eval provenance"))?;
+    ensure!(
+        output.status.success(),
+        "`{bin} --version` exited non-zero ({}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    parse_rg_version_output(bin, &output.stdout)
 }
 
 fn load_queries() -> Result<(Vec<LabelledQuery>, String)> {
@@ -565,14 +615,68 @@ fn top_rerank_signal(ranked: &[(&String, &DocFile)]) -> Option<f64> {
     None
 }
 
+const RERANK_TIMEOUT_CODE: &str = "rerank-timeout";
+const CROSSENCODER_UNAVAILABLE_CODE: &str = "crossencoder-unavailable";
+
+/// A fused retrieval signal broke mid-run — a ripgrep pass that failed, timed
+/// out, resolved to nothing, or emitted unparseable events silently changes
+/// ranking, so the sweep would record a degraded run as a valid measurement and
+/// bake it into the committed baseline. These codes, and only these, fail the
+/// eval.
+const DEGRADED_SIGNAL_CODES: [&str; 4] = [
+    "ripgrep-unresolved",
+    "ripgrep-unparseable",
+    "ripgrep-failed",
+    "ripgrep-timeout",
+];
+
+/// Rerank fell back to plain fusion. `rerank_completion` owns and judges these
+/// two per arm, so the signal check must not re-judge them.
+const RERANK_FALLBACK_CODES: [&str; 2] = [RERANK_TIMEOUT_CODE, CROSSENCODER_UNAVAILABLE_CODE];
+
+/// Informational only — they describe what the query covered, not a broken
+/// signal, so they must never fail the eval.
+const ADVISORY_WARNING_CODES: [&str; 2] = ["code-repos-empty", "cross-repo-union"];
+
+/// Every `Warning.code` the domain and daemon crates emit. Re-derive with:
+///
+/// ```text
+/// rg -n 'code:\s*"' --glob '*.rs' crates/
+/// ```
+///
+/// `producer_warning_codes_are_classified_exactly_once` pins this against the
+/// three sets above, so a new producer-side warning breaks a test at its source
+/// instead of silently reaching the eval gate unclassified.
+const PRODUCER_WARNING_CODES: [&str; 8] = [
+    "ripgrep-unresolved",
+    "ripgrep-unparseable",
+    "ripgrep-failed",
+    "ripgrep-timeout",
+    RERANK_TIMEOUT_CODE,
+    CROSSENCODER_UNAVAILABLE_CODE,
+    "code-repos-empty",
+    "cross-repo-union",
+];
+
+/// Which of `run_arm`'s two sweeps a response came from. Only the measured
+/// sweep is a measurement; the warmup exists to absorb cold-start cost and
+/// nothing it produces reaches an artifact, so a transient *signal* degradation
+/// there must not abort the run. `rerank_completion` still judges both sweeps —
+/// a rerank fallback means the arm is misconfigured, not warming up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepKind {
+    Warmup,
+    Measured,
+}
+
 fn rerank_completion(response: &GroundResponse, arm: ArmSpec<'_>, query_id: &str) -> Result<bool> {
     let mut timed_out = false;
     let mut unavailable = false;
     for warning in &response.warnings {
-        if warning.code == "rerank-timeout" {
+        if warning.code == RERANK_TIMEOUT_CODE {
             timed_out = true;
         }
-        if warning.code == "crossencoder-unavailable" {
+        if warning.code == CROSSENCODER_UNAVAILABLE_CODE {
             unavailable = true;
         }
     }
@@ -601,16 +705,33 @@ fn rerank_completion(response: &GroundResponse, arm: ArmSpec<'_>, query_id: &str
     }
 }
 
+fn ensure_signals_intact(response: &GroundResponse, query_id: &str, kind: SweepKind) -> Result<()> {
+    if kind == SweepKind::Warmup {
+        return Ok(());
+    }
+    for warning in &response.warnings {
+        ensure!(
+            !DEGRADED_SIGNAL_CODES.contains(&warning.code.as_str()),
+            "degraded a retrieval signal for query {query_id} ({}): {}; a degraded run is not a measurement",
+            warning.code,
+            warning.message
+        );
+    }
+    Ok(())
+}
+
 async fn run_sweep(
     client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
     arm: ArmSpec<'_>,
     queries: &[LabelledQuery],
+    kind: SweepKind,
 ) -> Result<Vec<QueryMeasurement>> {
     let mut measurements = Vec::with_capacity(queries.len());
     for query in queries {
         let response = ground_query(client, cwd, arm, query).await?;
         let rerank_completed = rerank_completion(&response, arm, &query.id)?;
+        ensure_signals_intact(&response, &query.id, kind)?;
         let ranked = ranked_docs(&response.docs);
         let rank = rank_of_expected(&ranked, &query.expected_chunk.file);
         let actual_top = top_identity(&ranked);
@@ -692,8 +813,8 @@ async fn run_arm(arm: ArmSpec<'_>, queries: &[LabelledQuery]) -> Result<ArmMeasu
         .with_context(|| format!("connect eval daemon for {}", arm.id))?;
     index_fixture(&client, harness.cwd(), arm).await?;
 
-    let _warmup = run_sweep(&client, harness.cwd(), arm, queries).await?;
-    let measured = run_sweep(&client, harness.cwd(), arm, queries).await?;
+    let _warmup = run_sweep(&client, harness.cwd(), arm, queries, SweepKind::Warmup).await?;
+    let measured = run_sweep(&client, harness.cwd(), arm, queries, SweepKind::Measured).await?;
     drop(client);
     harness.shutdown().await.context("shutdown eval daemon")?;
 
@@ -868,6 +989,10 @@ fn validate_artifact_common(artifact: &EvalArtifact) -> Result<()> {
         "missing query-set digest"
     );
     ensure!(
+        !artifact.ripgrep_version.is_empty(),
+        "missing ripgrep version"
+    );
+    ensure!(
         artifact.embedding == embedding_configuration(),
         "evaluation does not use production embedding defaults"
     );
@@ -1019,7 +1144,7 @@ async fn measure_diagnostic(
 ) -> Result<EvalArtifact> {
     validate_fixture_labels_with_production_tokenizer(queries)?;
     let arms = diagnostic_arms();
-    let mut artifact = new_artifact(query_set_digest, &arms);
+    let mut artifact = new_artifact(query_set_digest, ripgrep_version()?, &arms);
     for arm in arms {
         match run_arm(arm, queries).await {
             Ok(measurement) => artifact.measurements.push(measurement),
@@ -1046,7 +1171,7 @@ async fn measure_baseline(
 ) -> Result<EvalArtifact> {
     validate_fixture_labels_with_production_tokenizer(queries)?;
     let arms = baseline_arms();
-    let mut artifact = new_artifact(query_set_digest, &arms);
+    let mut artifact = new_artifact(query_set_digest, ripgrep_version()?, &arms);
     artifact
         .measurements
         .push(run_arm(BASELINE_ARM, queries).await?);
@@ -1345,8 +1470,30 @@ fn synthetic_measurement(arm: ArmSpec<'_>, mut queries: Vec<QueryMeasurement>) -
     }
 }
 
+/// Fixed provenance for synthetic fixtures. They are never written as a
+/// measurement, so they must not depend on whatever `rg` the dev box runs.
+const SYNTHETIC_RIPGREP_VERSION: &str = "ripgrep 14.1.1 (rev synthetic)";
+
+fn response_with_warning(code: &str, message: &str) -> GroundResponse {
+    GroundResponse {
+        query: "request envelope shape".into(),
+        took_ms: 0,
+        stats: Default::default(),
+        docs: BTreeMap::new(),
+        code: BTreeMap::new(),
+        warnings: vec![Warning {
+            code: code.into(),
+            message: message.into(),
+        }],
+    }
+}
+
 fn synthetic_baseline_artifact() -> EvalArtifact {
-    let mut artifact = new_artifact("digest".into(), &baseline_arms());
+    let mut artifact = new_artifact(
+        "digest".into(),
+        SYNTHETIC_RIPGREP_VERSION.into(),
+        &baseline_arms(),
+    );
     artifact.measurements.push(synthetic_measurement(
         BASELINE_ARM,
         vec![
@@ -1359,7 +1506,11 @@ fn synthetic_baseline_artifact() -> EvalArtifact {
 }
 
 fn synthetic_diagnostic_artifact() -> EvalArtifact {
-    let mut artifact = new_artifact("digest".into(), &diagnostic_arms());
+    let mut artifact = new_artifact(
+        "digest".into(),
+        SYNTHETIC_RIPGREP_VERSION.into(),
+        &diagnostic_arms(),
+    );
     artifact.measurements.push(synthetic_measurement(
         BASELINE_ARM,
         vec![
@@ -1400,11 +1551,16 @@ fn diagnostic_artifact_has_two_arms_counts_and_no_decision_fields() {
     assert!(json.contains("warm_p95_ms"));
     assert!(json.contains("timeout_count"));
     assert!(json.contains("model_load_failures"));
+    assert!(json.contains("ripgrep_version"));
 }
 
 #[test]
 fn partial_diagnostic_records_timeout_before_validation() {
-    let mut artifact = new_artifact("digest".into(), &diagnostic_arms());
+    let mut artifact = new_artifact(
+        "digest".into(),
+        SYNTHETIC_RIPGREP_VERSION.into(),
+        &diagnostic_arms(),
+    );
     let error = anyhow::anyhow!("{RERANK_TIMEOUT_MARKER} for query first in {JINA_ID}");
     record_failure(&mut artifact, JINA_ARM, &error);
     validate_diagnostic_artifact(&artifact, false).expect("partial diagnostic");
@@ -1413,19 +1569,208 @@ fn partial_diagnostic_records_timeout_before_validation() {
 }
 
 #[test]
+fn committed_baseline_matches_the_current_schema_and_records_provenance() {
+    let bytes = fs::read(baseline_path()).expect("read eval/baseline.json");
+    // Probe the version before decoding: a stale baseline is missing fields the
+    // current schema requires, so serde would report the missing field rather
+    // than the schema mismatch that actually explains it.
+    ensure_baseline_schema_current(&bytes).expect("committed baseline is the current schema");
+    let baseline: EvalArtifact = serde_json::from_slice(&bytes).expect("parse eval/baseline.json");
+    assert!(
+        baseline.ripgrep_version.starts_with("ripgrep "),
+        "committed baseline must record real ripgrep provenance: {:?}",
+        baseline.ripgrep_version
+    );
+    validate_baseline_artifact(&baseline).expect("committed baseline validates");
+}
+
+#[test]
+fn validation_rejects_an_empty_ripgrep_version() {
+    let mut artifact = synthetic_baseline_artifact();
+    artifact.ripgrep_version = String::new();
+    let error = validate_baseline_artifact(&artifact)
+        .expect_err("an empty provenance record must not validate");
+    assert!(
+        error.to_string().contains("missing ripgrep version"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compare_against_baseline_ignores_ripgrep_version_mismatch() {
+    let mut committed = synthetic_baseline_artifact();
+    let mut current = synthetic_baseline_artifact();
+    committed.ripgrep_version = "ripgrep 13.0.0 (rev abc)".into();
+    current.ripgrep_version = "ripgrep 14.1.1 (rev def)".into();
+    compare_against_baseline(&committed, &current)
+        .expect("ripgrep_version mismatch must not affect comparison");
+}
+
+#[test]
+fn parse_rg_version_output_rejects_empty_stdout() {
+    let error = parse_rg_version_output("rg", b"").expect_err("empty stdout must fail");
+    assert!(error.to_string().contains("produced no output"), "{error}");
+}
+
+#[test]
+fn parse_rg_version_output_rejects_whitespace_only_stdout() {
+    let error =
+        parse_rg_version_output("rg", b"   \n\n").expect_err("whitespace-only stdout must fail");
+    assert!(error.to_string().contains("produced no output"), "{error}");
+}
+
+#[test]
+fn parse_rg_version_output_trims_and_takes_first_line() {
+    let stdout = b"  ripgrep 14.1.1 (rev abc123)  \nfeatures: pcre2, simd-accel\n";
+    let version = parse_rg_version_output("rg", stdout).expect("parse rg version");
+    assert_eq!(version, "ripgrep 14.1.1 (rev abc123)");
+}
+
+#[test]
+fn parse_rg_version_output_skips_leading_blank_lines() {
+    let stdout = b"\n   \nripgrep 14.1.1 (rev abc123)\nfeatures: pcre2\n";
+    let version = parse_rg_version_output("rg", stdout).expect("parse rg version");
+    assert_eq!(version, "ripgrep 14.1.1 (rev abc123)");
+}
+
+#[test]
+fn parse_rg_version_output_rejects_non_utf8_stdout() {
+    let error = parse_rg_version_output("rg", b"ripgrep 14.1.1 \xff\xfe")
+        .expect_err("non-UTF8 output must fail loud, not decode lossily");
+    assert!(error.to_string().contains("non-UTF8"), "{error}");
+}
+
+#[test]
+fn parse_rg_version_output_rejects_a_foreign_banner() {
+    let error = parse_rg_version_output("rg", b"GNU grep 3.11\n")
+        .expect_err("a non-ripgrep banner must not be recorded as ripgrep provenance");
+    assert!(
+        error.to_string().contains("not a ripgrep banner"),
+        "{error}"
+    );
+}
+
+#[test]
+fn parse_rg_version_output_rejects_an_implausibly_long_banner() {
+    let stdout = format!("ripgrep {}\n", "9".repeat(MAX_RIPGREP_VERSION_LEN));
+    let error = parse_rg_version_output("rg", stdout.as_bytes())
+        .expect_err("an over-long banner must not be recorded");
+    assert!(error.to_string().contains("over the"), "{error}");
+}
+
+/// `rg` is a hard runtime dependency of the eval harness. On a developer
+/// machine without it, skip with a visible notice; in CI, fail closed instead
+/// of reporting green on zero executed assertions.
+fn require_rg() -> bool {
+    if Command::new("rg").arg("--version").output().is_ok() {
+        return true;
+    }
+    assert!(
+        env::var_os("CI").is_none(),
+        "rg not found on PATH; rg is a hard runtime dependency and must be installed in CI"
+    );
+    eprintln!("SKIP: rg not found on PATH; skipping ripgrep provenance test locally");
+    false
+}
+
+/// Serializes every test in this binary that execs a child process.
+///
+/// The harness runs tests on parallel threads. A sibling thread's `fork` can
+/// inherit an open write handle to a stub script written moments earlier, so
+/// the following `execve` fails with `ETXTBSY` ("text file busy") even though
+/// the script is complete and executable. Observed as a real intermittent
+/// failure of `ripgrep_version_fails_loud_on_nonzero_exit`: green 5/5 in
+/// isolation, red once across 7 full-suite runs. Serializing the execs closes
+/// the window; the four affected tests are sub-millisecond, so the cost is nil.
+static EXEC_LOCK: Mutex<()> = Mutex::new(());
+
+fn exec_guard() -> std::sync::MutexGuard<'static, ()> {
+    // A panicking test must not cascade into its siblings via lock poisoning —
+    // the lock guards process-spawn ordering, not shared mutable state.
+    EXEC_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn stub_binary(dir: &Path, name: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    fs::write(&path, script).expect("write stub script");
+    let mut perms = fs::metadata(&path).expect("stat stub script").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).expect("chmod stub script");
+    path
+}
+
+#[test]
+fn ripgrep_version_returns_installed_version() {
+    let _exec = exec_guard();
+    if !require_rg() {
+        return;
+    }
+    let version = ripgrep_version().expect("rg --version must succeed in eval environment");
+    assert!(
+        version.starts_with("ripgrep "),
+        "unexpected rg --version output: {version}"
+    );
+}
+
+#[test]
+fn ripgrep_version_fails_loud_when_binary_missing() {
+    // Guarded too: a failed exec still forks first, and that fork can inherit
+    // a sibling test's open write handle to its stub script.
+    let _exec = exec_guard();
+    let error = ripgrep_version_from_binary("definitely-not-a-real-binary-xyz123")
+        .expect_err("a missing binary must fail loud, not silently degrade");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("definitely-not-a-real-binary-xyz123")
+            && message.contains("for eval provenance"),
+        "error must name the spawn that failed: {message}"
+    );
+}
+
+#[test]
+fn ripgrep_version_fails_loud_on_nonzero_exit() {
+    let _exec = exec_guard();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = stub_binary(
+        dir.path(),
+        "broken-rg",
+        "#!/bin/sh\necho 'error while loading shared libraries' >&2\nexit 127\n",
+    );
+    let error = ripgrep_version_from_binary(script.to_str().expect("utf8 path"))
+        .expect_err("a non-zero exit must fail loud, not silently degrade");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("exited non-zero")
+            && message.contains("127")
+            && message.contains("error while loading shared libraries"),
+        "error must carry the exit status and stderr: {message}"
+    );
+}
+
+#[test]
+fn ripgrep_version_fails_loud_on_empty_output() {
+    let _exec = exec_guard();
+    // GNU coreutils `true --version` prints a version banner, so it can't
+    // stand in for a silent binary here; a throwaway script that ignores
+    // its arguments and exits clean can.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = stub_binary(dir.path(), "silent-ok", "#!/bin/sh\nexit 0\n");
+    let error = ripgrep_version_from_binary(script.to_str().expect("utf8 path"))
+        .expect_err("empty output must fail loud, not record a placeholder");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("produced no output"),
+        "error must explain the failure: {message}"
+    );
+}
+
+#[test]
 fn diagnostic_rejects_rerank_fallback_warnings() {
-    for code in ["rerank-timeout", "crossencoder-unavailable"] {
-        let response = GroundResponse {
-            query: "query".into(),
-            took_ms: 1,
-            stats: Default::default(),
-            docs: BTreeMap::new(),
-            code: BTreeMap::new(),
-            warnings: vec![Warning {
-                code: code.into(),
-                message: "fallback".into(),
-            }],
-        };
+    for code in RERANK_FALLBACK_CODES {
+        let response = response_with_warning(code, "fallback");
         let error = rerank_completion(&response, JINA_ARM, "first")
             .expect_err("diagnostic must reject fallback warning");
         assert!(
@@ -1559,10 +1904,31 @@ async fn eval_ground_recall_measure() -> Result<()> {
     Ok(())
 }
 
+/// `EvalArtifact` gains required fields as the schema moves, so decoding the
+/// full artifact first turns a stale baseline into a serde "missing field"
+/// error. Probe the version separately so the mismatch is reported by the
+/// check that owns it.
+#[derive(Deserialize)]
+struct ArtifactSchemaProbe {
+    schema_version: u32,
+}
+
+fn ensure_baseline_schema_current(bytes: &[u8]) -> Result<()> {
+    let probe: ArtifactSchemaProbe =
+        serde_json::from_slice(bytes).context("read schema_version from eval/baseline.json")?;
+    ensure!(
+        probe.schema_version == SCHEMA_VERSION,
+        "eval/baseline.json is schema {}, but this evaluation requires {SCHEMA_VERSION}; regenerate the baseline",
+        probe.schema_version
+    );
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "loads production embeddings and enforces the committed baseline"]
 async fn eval_ground_recall_enforce() -> Result<()> {
     let baseline_bytes = fs::read(baseline_path()).context("read eval/baseline.json")?;
+    ensure_baseline_schema_current(&baseline_bytes)?;
     let baseline: EvalArtifact =
         serde_json::from_slice(&baseline_bytes).context("parse eval/baseline.json")?;
     validate_baseline_artifact(&baseline).context("validate eval/baseline.json")?;
@@ -1576,4 +1942,149 @@ async fn eval_ground_recall_enforce() -> Result<()> {
     compare_against_baseline(&baseline, &current)?;
     println!("{}", serde_json::to_string_pretty(&current)?);
     Ok(())
+}
+
+#[test]
+fn degraded_ripgrep_signal_is_not_a_valid_measurement() {
+    for code in DEGRADED_SIGNAL_CODES {
+        let response = response_with_warning(code, "ripgrep pass degraded");
+        let error = ensure_signals_intact(&response, "envelope-shape", SweepKind::Measured)
+            .expect_err("a degraded ripgrep signal must not be measured as a baseline result");
+        let message = error.to_string();
+        assert!(
+            message.contains(code) && message.contains("for query envelope-shape"),
+            "error must name the warning code and the query: {message}"
+        );
+    }
+}
+
+#[test]
+fn warmup_sweep_tolerates_degraded_signals() {
+    for code in DEGRADED_SIGNAL_CODES {
+        let response = response_with_warning(code, "ripgrep pass degraded");
+        ensure_signals_intact(&response, "envelope-shape", SweepKind::Warmup).unwrap_or_else(
+            |error| panic!("{code} in the throwaway warmup must not abort the run: {error}"),
+        );
+    }
+}
+
+#[test]
+fn rerank_warnings_remain_owned_by_rerank_completion() {
+    for code in RERANK_FALLBACK_CODES {
+        let response = response_with_warning(code, "rerank fell back to fusion");
+        ensure_signals_intact(&response, "envelope-shape", SweepKind::Measured).unwrap_or_else(
+            |error| panic!("{code} is rerank_completion's to judge, not the signal check: {error}"),
+        );
+    }
+}
+
+#[test]
+fn advisory_warnings_do_not_fail_the_eval() {
+    for code in ADVISORY_WARNING_CODES {
+        let response = response_with_warning(code, "informational");
+        ensure_signals_intact(&response, "envelope-shape", SweepKind::Measured).unwrap_or_else(
+            |error| panic!("{code} is advisory and must not fail the eval: {error}"),
+        );
+    }
+}
+
+/// Collects every `code: "<literal>"` a Rust source constructs.
+fn collect_warning_code_literals(text: &str, found: &mut BTreeSet<String>) {
+    const MARKER: &str = "code: \"";
+    let mut rest = text;
+    while let Some(start) = rest.find(MARKER) {
+        let after = &rest[start + MARKER.len()..];
+        let Some(end) = after.find('"') else { break };
+        found.insert(after[..end].to_string());
+        rest = &after[end..];
+    }
+}
+
+/// Every `Warning.code` the workspace's own sources construct, read from disk.
+///
+/// This is what makes `PRODUCER_WARNING_CODES` a pin rather than a wish: the
+/// list is checked against the producers instead of against itself, so adding a
+/// warning code anywhere under `crates/*/src` fails a test here until it is
+/// classified.
+fn scan_producer_warning_codes() -> BTreeSet<String> {
+    fn visit(dir: &Path, found: &mut BTreeSet<String>) {
+        let entries =
+            fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("read dir entry").path();
+            if path.is_dir() {
+                visit(&path, found);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                collect_warning_code_literals(&text, found);
+            }
+        }
+    }
+
+    let crates = repo_root().join("crates");
+    let mut found = BTreeSet::new();
+    let entries =
+        fs::read_dir(&crates).unwrap_or_else(|error| panic!("read {}: {error}", crates.display()));
+    for entry in entries {
+        let src = entry.expect("read crate dir entry").path().join("src");
+        if src.is_dir() {
+            visit(&src, &mut found);
+        }
+    }
+    assert!(
+        !found.is_empty(),
+        "scanned {} and found no warning codes at all — the scan is broken, not the sources",
+        crates.display()
+    );
+    found
+}
+
+#[test]
+fn producer_warning_codes_match_the_workspace_sources() {
+    let declared: BTreeSet<String> = PRODUCER_WARNING_CODES
+        .iter()
+        .map(|code| (*code).to_string())
+        .collect();
+    assert_eq!(
+        scan_producer_warning_codes(),
+        declared,
+        "PRODUCER_WARNING_CODES is out of date with crates/*/src. Every warning \
+         code a producer emits must be classified into DEGRADED_SIGNAL_CODES, \
+         RERANK_FALLBACK_CODES, or ADVISORY_WARNING_CODES — an unclassified code \
+         reaches the eval gate and is silently tolerated as a valid measurement."
+    );
+}
+
+#[test]
+fn producer_warning_codes_are_classified_exactly_once() {
+    for code in PRODUCER_WARNING_CODES {
+        let mut classes = Vec::new();
+        if DEGRADED_SIGNAL_CODES.contains(&code) {
+            classes.push("degraded");
+        }
+        if RERANK_FALLBACK_CODES.contains(&code) {
+            classes.push("rerank-fallback");
+        }
+        if ADVISORY_WARNING_CODES.contains(&code) {
+            classes.push("advisory");
+        }
+        assert_eq!(
+            classes.len(),
+            1,
+            "{code} must belong to exactly one warning class, found {classes:?}"
+        );
+    }
+}
+
+#[test]
+fn stale_baseline_schema_is_reported_as_a_version_mismatch() {
+    let error = ensure_baseline_schema_current(br#"{"schema_version": 3}"#)
+        .expect_err("a schema-3 baseline must be rejected by the version check");
+    assert!(
+        error.to_string().contains("regenerate the baseline"),
+        "error must name the schema move: {error}"
+    );
+    ensure_baseline_schema_current(br#"{"schema_version": 4}"#)
+        .expect("the current schema must pass the probe");
 }

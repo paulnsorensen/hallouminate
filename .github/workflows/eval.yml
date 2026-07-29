@@ -41,6 +41,12 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
 
+      - name: Install ripgrep
+        # `rg` is a hard runtime dependency of the lexical search pass
+        # (crates/hallouminate-domain/src/search/ripgrep.rs); the ubuntu-24.04
+        # hosted image doesn't ship it. Mirrors ci.yml's Linux install step.
+        run: sudo apt-get update && sudo apt-get install -y ripgrep && rg --version
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: eval
