@@ -80,25 +80,38 @@ fn log_writer(
 fn reap_legacy_dated_logs(dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(date) = name.strip_prefix(LEGACY_LOG_PREFIX) else {
-            continue;
-        };
-        let Some(date) = date.strip_suffix(LEGACY_LOG_SUFFIX) else {
-            continue;
-        };
-        if date.len() != 10 || NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
-            continue;
-        }
-        std::fs::remove_file(entry.path())?;
+        reap_legacy_dated_log(entry)?;
     }
     Ok(())
+}
+
+fn reap_legacy_dated_log(entry: std::fs::DirEntry) -> std::io::Result<()> {
+    let file_type = match entry.file_type() {
+        Ok(file_type) => file_type,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !file_type.is_file() {
+        return Ok(());
+    }
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return Ok(());
+    };
+    let Some(date) = name.strip_prefix(LEGACY_LOG_PREFIX) else {
+        return Ok(());
+    };
+    let Some(date) = date.strip_suffix(LEGACY_LOG_SUFFIX) else {
+        return Ok(());
+    };
+    if date.len() != 10 || NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+        return Ok(());
+    }
+    match std::fs::remove_file(entry.path()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn state_dir() -> PathBuf {
@@ -154,6 +167,21 @@ mod tests {
         for path in preserved {
             assert!(path.exists(), "non-legacy file was removed: {path:?}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reaping_a_legacy_entry_already_removed_by_another_startup() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("hallouminate.2026-07-04.log");
+        std::fs::write(&path, b"log bytes")?;
+        let entry = std::fs::read_dir(dir.path())?
+            .next()
+            .expect("legacy entry")?;
+        std::fs::remove_file(path)?;
+
+        reap_legacy_dated_log(entry)?;
+
         Ok(())
     }
 

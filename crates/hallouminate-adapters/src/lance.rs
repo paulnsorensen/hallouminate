@@ -704,15 +704,17 @@ fn try_acquire_store_lock(ground_dir: &Path, owner: &StoreLockOwner) -> Result<O
                 .truncate(false)
                 .mode(0o600)
                 .open(ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME))?;
-            flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive).map_err(
-                |errno| {
-                    HallouminateError::Config(format!(
+            match flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive) {
+                Ok(()) => {}
+                Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => return Ok(None),
+                Err(errno) => {
+                    return Err(HallouminateError::Config(format!(
                         "failed to guard lock diagnostics for {}: {}",
                         ground_dir.display(),
                         std::io::Error::from(errno),
-                    ))
-                },
-            )?;
+                    )));
+                }
+            }
             let metadata = serde_json::to_vec(owner).map_err(|error| {
                 HallouminateError::Config(format!("serialize store lock owner: {error}"))
             })?;
@@ -1845,6 +1847,37 @@ mod tests {
                 .is_none()
         );
         assert_eq!(contended_store_lock_owner(temp.path()), Some(owner));
+    }
+
+    #[test]
+    fn diagnostics_reader_during_store_lock_transition_retries() {
+        use rustix::fs::{FlockOperation, flock};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let diagnostics_lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(temp.path().join(STORE_LOCK_DIAGNOSTICS_FILENAME))
+            .expect("open diagnostics lock");
+        flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive)
+            .expect("hold diagnostics lock");
+
+        assert!(
+            try_acquire_store_lock(temp.path(), &StoreLockOwner::for_process())
+                .expect("diagnostics reader only delays acquisition")
+                .is_none()
+        );
+        drop(diagnostics_lock);
+
+        assert!(
+            try_acquire_store_lock(temp.path(), &StoreLockOwner::for_process())
+                .expect("retry after diagnostics reader")
+                .is_some()
+        );
     }
 
     #[test]
