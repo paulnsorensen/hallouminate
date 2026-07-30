@@ -30,6 +30,35 @@ const TABLE_NAME: &str = "chunks";
 const META_FILENAME: &str = "meta.toml";
 /// Single-owner lockfile inside the ground dir — see [`acquire_store_lock`].
 const STORE_LOCK_FILENAME: &str = "store.lock";
+/// Separate advisory guard proving that `store.lock` metadata is current.
+const STORE_LOCK_DIAGNOSTICS_FILENAME: &str = "store.lock.diagnostics";
+
+/// Diagnostic metadata written into a successfully acquired store lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreLockOwner {
+    pid: u32,
+    socket: Option<PathBuf>,
+    version: String,
+}
+
+impl StoreLockOwner {
+    /// Metadata for a direct, non-daemon store owner.
+    pub fn for_process() -> Self {
+        Self {
+            pid: std::process::id(),
+            socket: None,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Metadata for a daemon-owned store.
+    pub fn for_daemon(socket: PathBuf) -> Self {
+        Self {
+            socket: Some(socket),
+            ..Self::for_process()
+        }
+    }
+}
 
 /// Aggregate statistics for one corpus key, returned by [`LanceStore::corpus_chunk_stats`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,11 +653,10 @@ pub struct LanceStore {
     /// `ensure_search_indexes` too, since that call guarantees the FTS index
     /// exists (unlike the row-gated ANN index) once it returns `Ok`.
     text_index_present: AtomicBool,
-    /// Exclusive advisory lock on `store.lock` inside the ground dir, held
-    /// for this store's whole lifetime (dropping the handle releases it).
-    /// Pins the single-owner invariant to the store itself — see
-    /// [`acquire_store_lock`].
-    _dir_lock: std::fs::File,
+    /// Exclusive store lock plus its diagnostic freshness guard, held for this
+    /// store's lifetime. Dropping the guard before the store lock means a
+    /// contender either observes current metadata or omits it.
+    _dir_lock: StoreLocks,
     /// Owns query/passage embedding when embeddings are enabled. The shared
     /// synchronous mutex is acquired only on Tokio's blocking pool, keeping
     /// model access serial without blocking either runtime flavor's workers.
@@ -643,31 +671,93 @@ pub struct LanceStore {
 const STORE_LOCK_RETRY_BUDGET: Duration = Duration::from_secs(2);
 const STORE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Store ownership and its metadata-freshness guard. Field declaration order
+/// drops the diagnostics guard first, so no contender can pair stale metadata
+/// with a newly acquired store lock.
+struct StoreLocks {
+    _diagnostics_lock: std::fs::File,
+    _store_lock: std::fs::File,
+}
+
 /// One non-blocking `flock` attempt on `store.lock`. `Ok(None)` means the lock
 /// is currently held (`WOULDBLOCK`); any other errno is a distinct failure.
-fn try_acquire_store_lock(ground_dir: &Path) -> Result<Option<std::fs::File>> {
+fn try_acquire_store_lock(ground_dir: &Path, owner: &StoreLockOwner) -> Result<Option<StoreLocks>> {
+    use std::io::{Seek, Write};
     use std::os::unix::fs::OpenOptionsExt;
 
     use rustix::fs::{FlockOperation, flock};
 
     let lock_path = ground_dir.join(STORE_LOCK_FILENAME);
-    let file = std::fs::OpenOptions::new()
+    let mut store_lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
         .open(&lock_path)?;
-    match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(Some(file)),
-        // WOULDBLOCK is the only errno that implies another owner; anything
-        // else (permissions, I/O, no space, etc.) is a distinct failure.
+    match flock(&store_lock, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {
+            let diagnostics_lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME))?;
+            flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive).map_err(
+                |errno| {
+                    HallouminateError::Config(format!(
+                        "failed to guard lock diagnostics for {}: {}",
+                        ground_dir.display(),
+                        std::io::Error::from(errno),
+                    ))
+                },
+            )?;
+            let metadata = serde_json::to_vec(owner).map_err(|error| {
+                HallouminateError::Config(format!("serialize store lock owner: {error}"))
+            })?;
+            store_lock.set_len(0)?;
+            store_lock.rewind()?;
+            store_lock.write_all(&metadata)?;
+            store_lock.sync_data()?;
+            Ok(Some(StoreLocks {
+                _diagnostics_lock: diagnostics_lock,
+                _store_lock: store_lock,
+            }))
+        }
         Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => Ok(None),
         Err(errno) => Err(HallouminateError::Config(format!(
             "failed to lock {}: {}",
             ground_dir.display(),
             std::io::Error::from(errno),
         ))),
+    }
+}
+
+/// Return metadata only while the current store holder also holds its
+/// diagnostics guard. A raw holder or a release/acquisition transition leaves
+/// the guard available, so stale bytes never become a false owner report.
+fn contended_store_lock_owner(ground_dir: &Path) -> Option<StoreLockOwner> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    use rustix::fs::{FlockOperation, flock};
+
+    let diagnostics_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME))
+        .ok()?;
+    match flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive) {
+        Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => {
+            let lock_path = ground_dir.join(STORE_LOCK_FILENAME);
+            std::fs::read(lock_path)
+                .ok()
+                .and_then(|contents| serde_json::from_slice(&contents).ok())
+        }
+        Ok(()) | Err(_) => None,
     }
 }
 
@@ -691,17 +781,28 @@ fn try_acquire_store_lock(ground_dir: &Path) -> Result<Option<std::fs::File>> {
 /// [`STORE_LOCK_RETRY_BUDGET`] to absorb that window; a genuinely concurrent
 /// second daemon holds the lock for its whole lifetime, far past the budget,
 /// so the #204 single-owner guarantee still fails closed.
-async fn acquire_store_lock(ground_dir: &Path) -> Result<std::fs::File> {
+async fn acquire_store_lock(ground_dir: &Path, owner: &StoreLockOwner) -> Result<StoreLocks> {
     let deadline = tokio::time::Instant::now() + STORE_LOCK_RETRY_BUDGET;
     loop {
-        match try_acquire_store_lock(ground_dir)? {
-            Some(file) => return Ok(file),
+        match try_acquire_store_lock(ground_dir, owner)? {
+            Some(locks) => return Ok(locks),
             None if tokio::time::Instant::now() >= deadline => {
+                let owner = contended_store_lock_owner(ground_dir)
+                    .map(|owner| {
+                        format!(
+                            " lock owner pid={} socket={} version={}",
+                            owner.pid,
+                            owner
+                                .socket
+                                .as_deref()
+                                .map(|socket| socket.display().to_string())
+                                .unwrap_or_else(|| "<direct>".to_string()),
+                            owner.version,
+                        )
+                    })
+                    .unwrap_or_default();
                 return Err(HallouminateError::Config(format!(
-                    "ground store {} is locked by another hallouminate process; \
-                     every ground dir has exactly one owner — stop the other daemon \
-                     (`hallouminate daemon stop`) or point [storage].ground_dir \
-                     elsewhere before retrying",
+                    "ground store {} is locked by another hallouminate process; every ground dir has exactly one owner — stop the other daemon (hallouminate daemon stop) or point [storage].ground_dir elsewhere before retrying.{owner}",
                     ground_dir.display(),
                 )));
             }
@@ -782,16 +883,30 @@ impl LanceStore {
         embeddings_enabled: bool,
         embedder: Option<Box<dyn EmbedBatch>>,
     ) -> Result<Self> {
+        Self::open_or_create_with_owner(
+            ground_dir,
+            model_name,
+            quantized,
+            embeddings_enabled,
+            embedder,
+            StoreLockOwner::for_process(),
+        )
+        .await
+    }
+
+    /// Open a store while recording the supplied diagnostic lock owner.
+    pub async fn open_or_create_with_owner(
+        ground_dir: &Path,
+        model_name: &str,
+        quantized: bool,
+        embeddings_enabled: bool,
+        embedder: Option<Box<dyn EmbedBatch>>,
+        owner: StoreLockOwner,
+    ) -> Result<Self> {
         std::fs::create_dir_all(ground_dir)?;
         let meta_path = ground_dir.join(META_FILENAME);
-        // Meta check first so a same-dir embedding-config mismatch keeps its
-        // actionable "embedding store mismatch" error (the daemon's
-        // repo-layer override flow depends on it) instead of bouncing off
-        // the owner lock. The lock still lands before `lancedb::connect`,
-        // so the dataset itself is never co-owned; error paths after the
-        // acquisition drop the handle and release the lock.
         meta_check_or_init(&meta_path, model_name, quantized, embeddings_enabled)?;
-        let dir_lock = acquire_store_lock(ground_dir).await?;
+        let dir_lock = acquire_store_lock(ground_dir, &owner).await?;
         let uri = ground_dir.to_str().ok_or_else(|| {
             HallouminateError::Config(format!("non-utf8 ground dir: {}", ground_dir.display()))
         })?;
@@ -1693,6 +1808,90 @@ mod tests {
 
     fn docs_key() -> CorpusKey {
         corpus_key("docs", "/tmp")
+    }
+
+    #[test]
+    fn store_lock_owner_serializes_daemon_diagnostics() {
+        let owner = StoreLockOwner::for_daemon(PathBuf::from("/tmp/daemon.sock"));
+        let decoded: StoreLockOwner =
+            serde_json::from_slice(&serde_json::to_vec(&owner).expect("serialize")).expect("parse");
+        assert_eq!(decoded.socket, Some(PathBuf::from("/tmp/daemon.sock")));
+        assert_eq!(decoded.version, env!("CARGO_PKG_VERSION"));
+        assert!(decoded.pid > 0);
+    }
+
+    #[test]
+    fn acquired_store_lock_publishes_its_owner_metadata() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let owner = StoreLockOwner::for_daemon(temp.path().join("daemon.sock"));
+
+        let _locks = try_acquire_store_lock(temp.path(), &owner)
+            .expect("acquire")
+            .expect("uncontended lock");
+        assert_eq!(contended_store_lock_owner(temp.path()), Some(owner));
+    }
+
+    #[test]
+    fn contended_store_lock_reports_the_current_owner() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let owner = StoreLockOwner::for_daemon(temp.path().join("daemon.sock"));
+
+        let _locks = try_acquire_store_lock(temp.path(), &owner)
+            .expect("acquire")
+            .expect("uncontended lock");
+        assert!(
+            try_acquire_store_lock(temp.path(), &StoreLockOwner::for_process())
+                .expect("contend")
+                .is_none()
+        );
+        assert_eq!(contended_store_lock_owner(temp.path()), Some(owner));
+    }
+
+    #[test]
+    fn malformed_contended_owner_metadata_is_omitted() {
+        use std::io::{Seek, Write};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let owner = StoreLockOwner::for_process();
+        let _locks = try_acquire_store_lock(temp.path(), &owner)
+            .expect("acquire")
+            .expect("uncontended lock");
+        let mut metadata = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path().join(STORE_LOCK_FILENAME))
+            .expect("open metadata");
+        metadata.set_len(0).expect("clear metadata");
+        metadata.rewind().expect("rewind metadata");
+        metadata
+            .write_all(b"not json")
+            .expect("write malformed metadata");
+
+        assert_eq!(contended_store_lock_owner(temp.path()), None);
+    }
+
+    #[test]
+    fn stale_owner_metadata_is_not_reported_for_an_uninstrumented_holder() {
+        use rustix::fs::{FlockOperation, flock};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lock_path = temp.path().join(STORE_LOCK_FILENAME);
+        let stale = StoreLockOwner::for_daemon(temp.path().join("stale.sock"));
+        std::fs::write(
+            &lock_path,
+            serde_json::to_vec(&stale).expect("serialize stale"),
+        )
+        .expect("write stale metadata");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lock_path)
+            .expect("open lock");
+        flock(&lock, FlockOperation::NonBlockingLockExclusive).expect("hold raw store lock");
+
+        assert_eq!(contended_store_lock_owner(temp.path()), None);
+        drop(lock);
     }
 
     #[test]

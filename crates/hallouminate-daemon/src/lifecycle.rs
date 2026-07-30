@@ -14,7 +14,7 @@ use tokio::net::UnixStream;
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_primary_or_sibling;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, StatusReport};
-use super::socket::{daemon_socket_path, sibling_socket_path};
+use super::socket::daemon_socket_paths;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_POLL: Duration = Duration::from_millis(50);
@@ -36,9 +36,8 @@ pub enum DaemonStatus {
 /// an unparseable payload is a real fault and surfaces as `Err` — it IS
 /// running, so reporting `NotRunning` would be a lie.
 pub async fn status() -> anyhow::Result<DaemonStatus> {
-    let primary = daemon_socket_path();
-    let sibling = sibling_socket_path();
-    status_at(&primary, sibling.as_deref()).await
+    let paths = daemon_socket_paths()?;
+    status_at(paths.canonical(), paths.legacy()).await
 }
 
 async fn status_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<DaemonStatus> {
@@ -74,9 +73,8 @@ async fn status_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<Dae
 /// is config-independent on the server side, so `cwd` does not need to
 /// resolve a repo config.
 pub async fn stop() -> anyhow::Result<()> {
-    let primary = daemon_socket_path();
-    let sibling = sibling_socket_path();
-    stop_at(&primary, sibling.as_deref()).await
+    let paths = daemon_socket_paths()?;
+    stop_at(paths.canonical(), paths.legacy()).await
 }
 
 async fn stop_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<()> {

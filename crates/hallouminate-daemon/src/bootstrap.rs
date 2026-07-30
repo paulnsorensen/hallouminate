@@ -19,7 +19,7 @@ use tokio::net::UnixStream;
 
 use super::client::{connect_at, connect_primary_or_sibling};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
-use super::socket::{daemon_socket_path, sibling_socket_path};
+use super::socket::daemon_socket_paths;
 
 const CONNECTION_BUDGET: Duration = Duration::from_secs(90);
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -45,10 +45,10 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let socket = daemon_socket_path();
-    let sibling = sibling_socket_path();
+    let paths = daemon_socket_paths()?;
+    let socket = paths.canonical();
     if let Some((running_socket, version_matches)) =
-        probe_running_daemon(&socket, sibling.as_deref()).await
+        probe_running_daemon(socket, paths.legacy()).await
     {
         if version_matches {
             return Ok(());
@@ -92,9 +92,9 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         .spawn()?;
 
     let started = std::time::Instant::now();
-    let socket_for_connect = socket.clone();
+    let socket_for_connect = socket.to_path_buf();
     wait_for_daemon_socket(
-        &socket,
+        socket,
         &log_path,
         CONNECTION_BUDGET,
         move || {

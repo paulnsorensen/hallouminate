@@ -44,8 +44,8 @@ const MAX_STORED_TRIPS: usize = 32;
 /// follows the same per-user runtime-dir conventions (`HALLOUMINATE_SOCKET`
 /// override, `$XDG_RUNTIME_DIR/hallouminate/`, or `~/.cache/hallouminate/`).
 #[allow(dead_code)]
-pub(crate) fn default_trip_state_path() -> PathBuf {
-    super::socket::daemon_socket_path().with_file_name("watchdog-trips")
+pub(crate) fn default_trip_state_path() -> std::io::Result<PathBuf> {
+    Ok(super::socket::daemon_socket_path()?.with_file_name("watchdog-trips"))
 }
 
 /// Read the trip timestamps still inside the decay window, oldest first.
@@ -765,14 +765,16 @@ mod tests {
 
     #[test]
     fn default_trip_state_path_is_sibling_of_the_daemon_socket() {
-        let path = default_trip_state_path();
+        let path = default_trip_state_path().expect("resolve socket path");
         assert_eq!(
             path.file_name().and_then(|n| n.to_str()),
             Some("watchdog-trips"),
         );
         assert_eq!(
             path.parent(),
-            super::super::socket::daemon_socket_path().parent(),
+            super::super::socket::daemon_socket_path()
+                .expect("resolve socket path")
+                .parent(),
             "trip state must live in the same runtime dir as the socket",
         );
     }
