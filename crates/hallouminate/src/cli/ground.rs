@@ -6,7 +6,7 @@ use hallouminate_config::{self, Config};
 use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for,
 };
-use hallouminate_domain::common::expand_tilde;
+use hallouminate_domain::common::{canonicalize_or_passthrough, expand_tilde};
 use hallouminate_domain::ground::{Format, GroundResponse, RenderOpts, render};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -82,7 +82,8 @@ fn resolve_path_prefix_strip(cfg: &Config, requested_corpus: Option<&str>) -> Op
         return None;
     }
     let expanded = expand_tilde(&corpus.paths[0]);
-    let mut prefix = expanded.to_string_lossy().into_owned();
+    let canonical = canonicalize_or_passthrough(&expanded).into_path_buf();
+    let mut prefix = canonical.to_string_lossy().into_owned();
     if !prefix.ends_with('/') {
         prefix.push('/');
     }
@@ -159,6 +160,48 @@ mod tests {
             Some("/abs/cheese/".to_string()),
             "single trailing slash, not two"
         );
+    }
+
+    #[test]
+    fn path_prefix_strip_canonicalizes_dot_components() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wiki = dir.path().join("wiki");
+        std::fs::create_dir(&wiki)?;
+        let configured = format!("{}/./wiki", dir.path().display());
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "only".into(),
+                paths: vec![configured],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let expected = format!("{}/", std::fs::canonicalize(wiki)?.display());
+
+        assert_eq!(resolve_path_prefix_strip(&cfg, None), Some(expected));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_prefix_strip_canonicalizes_symlinked_root() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let wiki = dir.path().join("wiki");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&wiki)?;
+        std::os::unix::fs::symlink(&wiki, &alias)?;
+        let cfg = Config {
+            corpora: vec![CorpusConfig {
+                name: "only".into(),
+                paths: vec![alias.to_string_lossy().into_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let expected = format!("{}/", std::fs::canonicalize(wiki)?.display());
+
+        assert_eq!(resolve_path_prefix_strip(&cfg, None), Some(expected));
+        Ok(())
     }
 
     #[test]

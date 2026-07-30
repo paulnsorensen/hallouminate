@@ -16,7 +16,7 @@ use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
-use super::socket::{daemon_socket_path, sibling_socket_path};
+use super::socket::daemon_socket_paths;
 
 /// Client handle: just remembers which socket path to dial. Stateless
 /// otherwise — every `call` opens a fresh connection.
@@ -28,8 +28,10 @@ pub struct DaemonClient {
 /// Connect to the daemon. Returns `Err` with a clear "daemon unavailable"
 /// message when the socket is missing, unreadable, or the connect fails.
 pub async fn daemon_client() -> anyhow::Result<DaemonClient> {
-    let socket = daemon_socket_path();
-    connect_at(&socket).await
+    let paths = daemon_socket_paths()?;
+    connect_primary_or_sibling(paths.canonical(), paths.legacy())
+        .await
+        .ok_or_else(|| daemon_client_unavailable(paths.canonical().display()))
 }
 
 /// Connect to the daemon at an explicit socket path when set, otherwise
@@ -43,13 +45,9 @@ pub async fn client_for(socket: Option<&Path>) -> anyhow::Result<DaemonClient> {
 /// `client_for` with an injectable respawn step — the test seam behind it,
 /// mirroring [`super::lifecycle::restart_with`]. Production passes
 /// `ensure_daemon_running` (which no-ops under `HALLOUMINATE_SOCKET`). Only the
-/// default-socket path (`None`) self-heals: on connect failure it probes the
-/// sibling candidate path for a live daemon (#218 — prevents doubled
-/// resident daemons when clients disagree on `XDG_RUNTIME_DIR`), then runs
-/// `respawn` once and retries the connect; a second failure returns the loud
-/// "daemon unavailable" error. Explicit-socket callers (`Some(path)`) —
-/// `lifecycle::status`/`stop` and test harnesses — never spawn or probe a
-/// sibling: `stop` must not resurrect what it stopped (ADR-002).
+/// canonical/default path (`None`) self-heals: on connection failure it probes
+/// the legacy candidate, then runs `respawn` once and retries the canonical
+/// socket. Explicit-socket callers (`Some(path)`) never spawn or probe legacy.
 pub async fn client_for_with<F, Fut>(
     socket: Option<&Path>,
     respawn: F,
@@ -61,24 +59,31 @@ where
     match socket {
         Some(path) => connect_at(path).await,
         None => {
-            connect_or_spawn(
-                &daemon_socket_path(),
-                sibling_socket_path().as_deref(),
-                respawn,
-            )
-            .await
+            let paths = daemon_socket_paths()?;
+            connect_or_spawn(paths.canonical(), paths.legacy(), respawn).await
         }
     }
 }
 
-/// Connect to `primary`; on failure, probe `sibling` for a live daemon
-/// before falling back to `respawn` (#218). Clients launched from
-/// environments that disagree on `XDG_RUNTIME_DIR` (a systemd user session
-/// vs a detached shell) resolve different primary socket paths — without
-/// this probe each would auto-spawn its own daemon, doubling resident
-/// ONNX/LanceDB memory. `sibling: None` (an explicit `HALLOUMINATE_SOCKET`
-/// override, via [`super::socket::sibling_socket_path`]) skips straight to
-/// `respawn`, matching pre-#218 behavior.
+/// Connect to the canonical socket or adopt a reachable legacy socket.
+pub(crate) async fn connect_primary_or_sibling(
+    canonical: &Path,
+    legacy: Option<&Path>,
+) -> Option<DaemonClient> {
+    if let Ok(client) = connect_at(canonical).await {
+        return Some(client);
+    }
+    let legacy = legacy?;
+    let client = connect_at(legacy).await.ok()?;
+    tracing::debug!(legacy = %legacy.display(), "adopted live legacy daemon (#218)");
+    Some(client)
+}
+
+/// Connect to the canonical socket; on failure, probe the legacy candidate
+/// before falling back to `respawn` (#218). Clients launched from environments
+/// that disagree on `XDG_RUNTIME_DIR` can otherwise resolve separate legacy
+/// sockets. `legacy: None` means an explicit `HALLOUMINATE_SOCKET` override,
+/// so respawn proceeds without legacy discovery.
 async fn connect_or_spawn<F, Fut>(
     primary: &Path,
     sibling: Option<&Path>,
@@ -88,15 +93,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    match connect_at(primary).await {
-        Ok(c) => Ok(c),
-        Err(_) => {
-            if let Some(sibling) = sibling
-                && let Ok(client) = connect_at(sibling).await
-            {
-                tracing::debug!(sibling = %sibling.display(), "adopted live sibling daemon instead of spawning (#218)");
-                return Ok(client);
-            }
+    match connect_primary_or_sibling(primary, sibling).await {
+        Some(client) => Ok(client),
+        None => {
             respawn().await?;
             connect_at(primary).await
         }

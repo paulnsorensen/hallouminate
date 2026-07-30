@@ -34,7 +34,9 @@ use super::pressure::NoPressureSignal;
 #[cfg(target_os = "linux")]
 use super::pressure::PsiProbe;
 
-use hallouminate_adapters::{EmbedBatch, Embedder, FastembedCrossencoder, LanceStore};
+use hallouminate_adapters::{
+    EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, StoreLockOwner,
+};
 use hallouminate_config::Config;
 use hallouminate_domain::common::{HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
@@ -186,6 +188,7 @@ struct DaemonStateInner {
     /// dir concurrently (the single-open-per-ground-dir invariant), without
     /// holding the `resources` map lock across that async open.
     resource_build_locks: KeyedLockMap<ResourceKey>,
+    store_lock_owner: StoreLockOwner,
     corpus_locks: KeyedLockMap<String>,
     write_lane: Arc<Semaphore>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
@@ -323,6 +326,22 @@ pub(crate) struct LadderTrip {
 
 impl DaemonState {
     pub async fn open(cfg: Config, xdg_path: Option<PathBuf>) -> anyhow::Result<Self> {
+        Self::open_with_owner(cfg, xdg_path, StoreLockOwner::for_process()).await
+    }
+
+    pub(crate) async fn open_with_socket(
+        cfg: Config,
+        xdg_path: Option<PathBuf>,
+        socket: PathBuf,
+    ) -> anyhow::Result<Self> {
+        Self::open_with_owner(cfg, xdg_path, StoreLockOwner::for_daemon(socket)).await
+    }
+
+    async fn open_with_owner(
+        cfg: Config,
+        xdg_path: Option<PathBuf>,
+        store_lock_owner: StoreLockOwner,
+    ) -> anyhow::Result<Self> {
         let ground_dir = expand_tilde(&cfg.storage.ground_dir);
         if let Some(parent) = ground_dir.parent()
             && !parent.as_os_str().is_empty()
@@ -389,12 +408,13 @@ impl DaemonState {
         // Metadata validation happened before model ownership moved into the
         // store, so stale-schema recovery reuses this single ONNX session.
         let build_result: anyhow::Result<LanceStore> = async {
-            let store = LanceStore::open_or_create(
+            let store = LanceStore::open_or_create_with_owner(
                 &ground_dir,
                 &cfg.embeddings.model,
                 cfg.embeddings.quantized,
                 cfg.embeddings.enabled,
                 embedder,
+                store_lock_owner.clone(),
             )
             .await
             .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
@@ -564,6 +584,7 @@ impl DaemonState {
                     resources: Mutex::new(resources_map),
                     resource_build_locks: KeyedLockMap::default(),
                     corpus_locks: KeyedLockMap::default(),
+                    store_lock_owner,
                     write_lane,
                     crossencoders: crossencoders_arc,
                     last_activity_secs: last_activity,
@@ -771,12 +792,13 @@ impl DaemonState {
         };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
-        let store = LanceStore::open_or_create(
+        let store = LanceStore::open_or_create_with_owner(
             &ground_dir,
             &cfg.embeddings.model,
             cfg.embeddings.quantized,
             cfg.embeddings.enabled,
             embedder,
+            self.inner.store_lock_owner.clone(),
         )
         .await
         .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
