@@ -44,12 +44,9 @@ pub async fn client_for(socket: Option<&Path>) -> anyhow::Result<DaemonClient> {
 /// mirroring [`super::lifecycle::restart_with`]. Production passes
 /// `ensure_daemon_running` (which no-ops under `HALLOUMINATE_SOCKET`). Only the
 /// default-socket path (`None`) self-heals: on connect failure it probes the
-/// sibling candidate path for a live daemon (#218 — prevents doubled
-/// resident daemons when clients disagree on `XDG_RUNTIME_DIR`), then runs
-/// `respawn` once and retries the connect; a second failure returns the loud
-/// "daemon unavailable" error. Explicit-socket callers (`Some(path)`) —
-/// `lifecycle::status`/`stop` and test harnesses — never spawn or probe a
-/// sibling: `stop` must not resurrect what it stopped (ADR-002).
+/// sibling candidate path for a live daemon (#218), then runs `respawn` once
+/// and retries the primary socket. Explicit-socket callers (`Some(path)`) never
+/// spawn or probe a sibling.
 pub async fn client_for_with<F, Fut>(
     socket: Option<&Path>,
     respawn: F,
@@ -71,6 +68,20 @@ where
     }
 }
 
+/// Connect to the primary socket or adopt a reachable sibling socket.
+pub(crate) async fn connect_primary_or_sibling(
+    primary: &Path,
+    sibling: Option<&Path>,
+) -> Option<DaemonClient> {
+    if let Ok(client) = connect_at(primary).await {
+        return Some(client);
+    }
+    let sibling = sibling?;
+    let client = connect_at(sibling).await.ok()?;
+    tracing::debug!(sibling = %sibling.display(), "adopted live sibling daemon (#218)");
+    Some(client)
+}
+
 /// Connect to `primary`; on failure, probe `sibling` for a live daemon
 /// before falling back to `respawn` (#218). Clients launched from
 /// environments that disagree on `XDG_RUNTIME_DIR` (a systemd user session
@@ -88,15 +99,9 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    match connect_at(primary).await {
-        Ok(c) => Ok(c),
-        Err(_) => {
-            if let Some(sibling) = sibling
-                && let Ok(client) = connect_at(sibling).await
-            {
-                tracing::debug!(sibling = %sibling.display(), "adopted live sibling daemon instead of spawning (#218)");
-                return Ok(client);
-            }
+    match connect_primary_or_sibling(primary, sibling).await {
+        Some(client) => Ok(client),
+        None => {
             respawn().await?;
             connect_at(primary).await
         }

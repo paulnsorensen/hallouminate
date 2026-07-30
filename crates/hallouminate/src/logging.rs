@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveDate;
 use file_rotate::compression::Compression;
 use file_rotate::suffix::AppendCount;
 use file_rotate::{ContentLimit, FileRotate};
@@ -24,6 +25,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 const DEFAULT_FILTER: &str = "hallouminate=info";
+const LEGACY_LOG_PREFIX: &str = "hallouminate.";
+const LEGACY_LOG_SUFFIX: &str = ".log";
 
 /// Install the global tracing subscriber. Returns a guard that must be held
 /// while logging is active. Dropping the guard drains and flushes queued records
@@ -59,6 +62,7 @@ fn log_writer(
         .map_err(|_| anyhow::anyhow!("logging.max_total_bytes exceeds this platform's usize"))?;
 
     std::fs::create_dir_all(dir)?;
+    reap_legacy_dated_logs(dir)?;
     let appender = FileRotate::new(
         dir.join("hallouminate.log"),
         AppendCount::new(rotated_files),
@@ -71,6 +75,30 @@ fn log_writer(
     // drop, not by non-lossy mode.
     let (writer, guard) = NonBlockingBuilder::default().finish(appender);
     Ok((writer, guard))
+}
+
+fn reap_legacy_dated_logs(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(date) = name.strip_prefix(LEGACY_LOG_PREFIX) else {
+            continue;
+        };
+        let Some(date) = date.strip_suffix(LEGACY_LOG_SUFFIX) else {
+            continue;
+        };
+        if date.len() != 10 || NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err() {
+            continue;
+        }
+        std::fs::remove_file(entry.path())?;
+    }
+    Ok(())
 }
 
 fn state_dir() -> PathBuf {
@@ -92,6 +120,41 @@ mod tests {
             "state dir must terminate in the app subdir: {dir:?}"
         );
         assert!(dir.is_absolute(), "state dir must be absolute: {dir:?}");
+    }
+
+    #[test]
+    fn log_writer_removes_only_legacy_dated_logs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let legacy = [
+            dir.path().join("hallouminate.2026-07-04.log"),
+            dir.path().join("hallouminate.2026-07-12.log"),
+        ];
+        let preserved = [
+            dir.path().join("hallouminate.2026-02-30.log"),
+            dir.path().join("hallouminate.not-a-date.log"),
+            dir.path().join("unrelated.log"),
+        ];
+        for path in &legacy {
+            std::fs::write(path, b"log bytes")?;
+        }
+        for path in &preserved {
+            std::fs::write(path, b"log bytes")?;
+        }
+        let config = hallouminate_config::LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 192,
+        };
+
+        let (_writer, guard) = log_writer(dir.path(), &config)?;
+        drop(guard);
+
+        for path in legacy {
+            assert!(!path.exists(), "legacy dated log survived: {path:?}");
+        }
+        for path in preserved {
+            assert!(path.exists(), "non-legacy file was removed: {path:?}");
+        }
+        Ok(())
     }
 
     #[test]

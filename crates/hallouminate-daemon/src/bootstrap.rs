@@ -11,15 +11,15 @@
 //! cleanly and every `serve` polls the same socket.
 
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use tokio::net::UnixStream;
 
-use super::client::connect_at;
-use super::daemon_socket_path;
+use super::client::{connect_at, connect_primary_or_sibling};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
+use super::socket::{daemon_socket_path, sibling_socket_path};
 
 const CONNECTION_BUDGET: Duration = Duration::from_secs(90);
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -46,21 +46,16 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     }
 
     let socket = daemon_socket_path();
-    if UnixStream::connect(&socket).await.is_ok() {
-        // A daemon is already listening. `flock` guarantees it's the only one,
-        // but NOT that it's our version: after a binary upgrade, this fresh
-        // MCP server could silently drive a daemon spawned from the old
-        // release (Curd C). Adopt it only when its reported version matches
-        // ours.
-        if running_daemon_version_matches(&socket).await {
+    let sibling = sibling_socket_path();
+    if let Some((running_socket, version_matches)) =
+        probe_running_daemon(&socket, sibling.as_deref()).await
+    {
+        if version_matches {
             return Ok(());
         }
-        // Skew: stop the stale daemon, then fall through to the spawn path to
-        // bring up a fresh one. This is exactly `lifecycle::restart`'s
-        // stop→respawn sequence, open-coded here because `restart`'s respawn
-        // step IS `ensure_daemon_running` — calling it would recurse.
         tracing::info!(
             target: "hallouminate::daemon",
+            socket = %running_socket.display(),
             ours = env!("CARGO_PKG_VERSION"),
             "running daemon version mismatch or unverifiable; restarting it",
         );
@@ -110,6 +105,13 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         || started.elapsed(),
     )
     .await
+}
+
+async fn probe_running_daemon(primary: &Path, sibling: Option<&Path>) -> Option<(PathBuf, bool)> {
+    let client = connect_primary_or_sibling(primary, sibling).await?;
+    let socket = client.socket_path().to_path_buf();
+    let version_matches = running_daemon_version_matches(&socket).await;
+    Some((socket, version_matches))
 }
 
 async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
@@ -258,6 +260,46 @@ mod tests {
         assert!(has_explicit_socket_override(Some(std::ffi::OsStr::new(
             "/tmp/test.sock"
         ))));
+    }
+
+    #[tokio::test]
+    async fn probe_running_daemon_adopts_live_sibling() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("primary.sock");
+        let sibling = dir.path().join("sibling.sock");
+        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.expect("read request");
+                if line.is_empty() {
+                    continue;
+                }
+                let response = DaemonResponse::ok(&super::super::ipc::PongResult {
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                });
+                let mut response = serde_json::to_string(&response).expect("serialize response");
+                response.push('\n');
+                write_half
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+                break;
+            }
+        });
+
+        let (socket, version_matches) = probe_running_daemon(&primary, Some(&sibling))
+            .await
+            .expect("live sibling must be detected");
+
+        assert_eq!(socket, sibling);
+        assert!(version_matches, "live sibling reports the current version");
+        server.await.expect("server task");
     }
 
     // ── Curd C: version-skew detection ───────────────────────────────────

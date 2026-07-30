@@ -11,7 +11,7 @@ tool, future agent — dials the daemon over a Unix domain socket.
 
 ## Socket location
 
-Resolved in this order (`src/app/daemon/socket.rs`):
+Resolved in this order (`crates/hallouminate-daemon/src/socket.rs`):
 
 1. `HALLOUMINATE_SOCKET` env var — per-process override.
 2. `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` — the default when a
@@ -24,22 +24,23 @@ The daemon takes a flock on `<socket>.lock` to enforce single-instance
 ownership. A second `hallouminate daemon` against the same socket
 errors out with "another hallouminate daemon already holds …".
 
-**Divergence gotcha (#218).** Single-instance is per *socket path*, not
-per machine. Clients launched from environments that disagree on
-`XDG_RUNTIME_DIR` (systemd user session vs detached shell) resolve
-different paths, each auto-spawns, each wins its own flock → two fully
-resident daemons, each with a loaded embedding model. Observed live
-(2026-07-13): a stale `~/.cache/hallouminate/daemon.sock` alongside the
-active `/run/user/…` socket is the tell. Store co-ownership is guarded
-by #205's single-owner store flock; the memory doubling remains.
+**Sibling adoption (#218, #318).** Single-instance ownership remains per
+socket path, but default-socket clients probe both canonical candidates
+before spawning: the resolved primary and the opposite runtime/cache
+path. `serve` bootstrap, ordinary clients, `daemon status`, and `daemon
+stop` all adopt the reachable candidate, so disagreement about
+`XDG_RUNTIME_DIR` no longer wedges startup or hides the running daemon.
+An explicit `HALLOUMINATE_SOCKET` or per-command socket path is honored
+exactly and never triggers sibling probing.[^1]
 
-**Cold start (#220).** A client that misses the connect probe spawns a
-daemon candidate and polls its socket for one 30s window with no retry
-(`src/app/daemon/bootstrap.rs:24,42-110`). flock losers exit *before*
-loading the model or opening LanceDB
-(`src/app/daemon/server.rs:70-93,463-484`) — a stampede of candidates
-is cheap by design; the risk is spurious client startup failures when
-the winner's open takes >30s under system load.
+**Cold start (#220).** When neither candidate is reachable, bootstrap
+spawns a daemon candidate and polls the primary socket for one 90-second
+total budget, using exponential backoff capped at one second. A flock
+loser exits before opening daemon state, so concurrent candidates do not
+load duplicate models.[^2]
+
+[^1]: `crates/hallouminate-daemon/src/socket.rs:43-92`; `crates/hallouminate-daemon/src/client.rs:43-108`; `crates/hallouminate-daemon/src/bootstrap.rs:43-115`; `crates/hallouminate-daemon/src/lifecycle.rs:38-111`
+[^2]: `crates/hallouminate-daemon/src/bootstrap.rs:24-26,94-153`; `crates/hallouminate-daemon/src/server.rs:114-117,672-694`
 
 ## Wire protocol
 
@@ -116,7 +117,7 @@ Verified request-concurrency model (2026-07-13 audit):
   (`state.rs:156-172`); grounds across keys run genuinely parallel. A
   bulk index holds the per-key embedder guard for its entire run — see
   [blocking-inference-offload](blocking-inference-offload.md) (#219),
-  and #216 for the missing client-side RPC timeout that turns a busy
-  daemon into indefinitely hung callers.
+  and #216's bounded request-class client timeouts
+  (`crates/hallouminate-daemon/src/client.rs:183-254`).
 
-_Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-13 · Supersedes: —_
+_Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-30 · Supersedes: —_
