@@ -10,57 +10,33 @@
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](https://github.com/paulnsorensen/hallouminate/pulls)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=flat-square&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/paulnsorensen)
 
-**Stop hallucinating. Start hallouminating.**
+**Persistent, repo-local knowledge for coding agents.**
 
-> _"The wiki must flow."_
+Hallouminate gives your coding agent a wiki it can write, search, review, and
+commit alongside the code. The markdown files remain the source of truth;
+Hallouminate builds a derived local index so agents can retrieve the right
+context without rereading the entire repository.
 
-![hallouminate demo — ground a question against the repo wiki](docs/assets/demo.gif)
+![Terminal demo: Hallouminate answers a design question from the repository wiki, then shows the underlying markdown files](docs/assets/demo.gif)
 
-**What it is**
+- **Human-owned:** ordinary markdown in `.hallouminate/wiki/`, readable and
+  editable with any text editor.
+- **Agent-native:** a focused MCP surface for searching, reading, and safely
+  updating the wiki.
+- **Local-first:** embeddings and search run locally; no hosted service is
+  required.
+- **Repo-aware:** each repository gets its own wiki, with optional union search
+  across repositories.
 
-- A markdown corpus indexer for LLMs to build and query their own per-repo wikis.
-- Stores markdown verbatim on disk — the filesystem is the source of truth.
-- Embeds content with fastembed and indexes the embeddings in LanceDB, refreshed automatically on write (`add_markdown`) or in bulk (`hallouminate index`).
-- Exposes a small MCP surface (`add_markdown` / `read_markdown` / `delete_markdown` / `ground`) so an LLM can author and search a per-repo knowledge base without leaving its agent loop.
-- Can index code files (`.rs`, `.toml`, …) as text for semantic search too.
+Hallouminate is not a code-intelligence engine: it can index source files as
+text, but it does not parse symbols, types, or call graphs. Pair it with your
+code-search tools; use Hallouminate for the durable knowledge those tools
+cannot infer—the architecture, conventions, gotchas, and reasons behind a
+design.
 
-**What it is not**
-
-- Not a code intelligence tool — no structural analysis of code, even when code files are indexed; it's a wiki indexer that happens to tolerate code.
-
-## How it compares
-
-| Tool | Stores knowledge as | Human-readable + git-committable | Local by default | MCP | Scope | License |
-| --- | --- | --- | --- | --- | --- | --- |
-| **hallouminate** | Markdown files, embedded (fastembed) and indexed in LanceDB | Yes | Yes | Native MCP server | Per-repo wiki (`repo:<name>:wiki`), plus cross-repo union search | MIT |
-| **Basic Memory** | Markdown files, indexed via local SQLite (optional Postgres for cloud sync) | Yes | Yes | Native MCP server | Per-project, with multi-project management | AGPL-3.0 |
-| **mem0** | Vector DB (Qdrant by default) + optional graph store | No | No — cloud by default (OpenAI models) | MCP support via a self-hosted server; not one canonical native binary | Multi-tier (User/Session/Agent), not repo-scoped | Apache-2.0 |
-| **claude-mem** | SQLite (FTS5) + Chroma vector DB | No | Yes (no cloud API key required for compression) | Not a standalone MCP server — a Claude Code plugin exposing 4 MCP tools | Per-session, surfaced cross-session | Apache-2.0 |
-| **Letta** | Markdown + YAML frontmatter, git-committed memory filesystem (MemFS) | Yes | Not required — local (Ollama/LM Studio/llama.cpp) or cloud | — [1] | Per-agent (MemFS scoped to `$MEMORY_DIR`) | Apache-2.0 (legacy repo) [1] |
-| **@modelcontextprotocol/server-memory** | Single JSONL file holding a JSON entity/relation graph | Yes (diffable JSONL, not prose) | Yes — no embeddings, no LLM call | Official reference native MCP server | Global/user-level by convention, no repo scoping concept | MIT |
-| **Graphiti** | Temporal knowledge graph (Neo4j / FalkorDB / Amazon Neptune) | No | Defaults to OpenAI, but supports local LLMs (Ollama, vLLM, llama.cpp) | Native MCP server, ships in-repo | Per-entity/per-user context graphs, not repo-scoped | Apache-2.0 |
-
-Basic Memory is the closest analog — both store markdown on disk as the
-source of truth and ship a native MCP server. hallouminate's differences:
-local vector search (fastembed + LanceDB) instead of Basic Memory's SQLite
-full-text/graph index, MIT instead of AGPL-3.0, and a Rust single binary
-with a background daemon instead of a Python package.
-
-[1] Letta's native MCP exposure is unconfirmed — the dedicated MCP doc page
-404'd at research time. Apache-2.0 is confirmed for the legacy `letta-ai/letta`
-repo; the current `letta-ai/letta-code` repo's license was not independently
-checked.
-
-Sources: [basicmachines-co/basic-memory](https://github.com/basicmachines-co/basic-memory),
-[modelcontextprotocol/servers](https://github.com/modelcontextprotocol/servers/tree/main/src/memory),
-[getzep/graphiti](https://github.com/getzep/graphiti)
-
-A long-lived local daemon owns the LanceDB ground directory, per-corpus
-mutation locks, and config resolution. The CLI and the stdio MCP server
-both talk to it over a Unix domain socket — one owner, no cross-process
-LanceDB races.
-
-> 📖 **Full documentation:** <https://cheeselord.dev/hallouminate/>
+**[Install](#install)** · **[First run](#first-run)** ·
+**[Full documentation](https://cheeselord.dev/hallouminate/)** ·
+**[How it compares](https://cheeselord.dev/hallouminate/comparison.html)**
 
 ## Install
 
@@ -125,19 +101,6 @@ none is running) — this is what an MCP client launches:
 ```sh
 hallouminate serve
 ```
-
-## Install
-
-```sh
-# Prebuilt binary, no Rust toolchain required:
-npx hallouminate --help
-
-# Or from crates.io:
-cargo install hallouminate
-```
-
-The npm package is a thin shim — its postinstall step downloads the
-matching prebuilt binary for your platform from the GitHub release.
 
 From a source checkout, run subcommands through cargo:
 

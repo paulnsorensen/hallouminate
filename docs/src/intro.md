@@ -23,6 +23,8 @@ races. See [Architecture](./architecture.md) for the full picture.
 
 - **[Installation](./install.md)** — install the binary and register the MCP
   server with your agent.
+- **[How it compares](./comparison.md)** — choose between repo-local markdown,
+  agent memory, and knowledge-graph tools.
 - **[CLI reference](./cli.md)** — every subcommand and its flags.
 - **[MCP surface](./mcp.md)** — the ten tools an LLM calls to author and
   search wikis.

@@ -7,6 +7,8 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.5.0...HEAD)
+
 ## [0.5.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.5.0) - 2026-07-19
 
 ### Added

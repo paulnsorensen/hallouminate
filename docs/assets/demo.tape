@@ -1,6 +1,4 @@
-
-# hallouminate README demo — requires the isolated demo env:
-#   daemon on /private/tmp/hallouminate-demo/daemon.sock, wiki indexed (see docs/assets/demo-setup.sh)
+# hallouminate README demo — regenerate with docs/assets/demo-setup.sh
 Output demo.gif
 Set FontSize 17
 Set Width 1200
@@ -10,7 +8,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
 Hide
-Type "cd /private/tmp/hallouminate-demo/hallouminate && export HALLOUMINATE_SOCKET=/private/tmp/hallouminate-demo/daemon.sock XDG_CONFIG_HOME=/private/tmp/hallouminate-demo/xdg-config && clear"
+Type "cd \"$HALLOUMINATE_DEMO/hallouminate\" && clear"
 Enter
 Show
 
