@@ -182,3 +182,7 @@ re-tag version:
     -git tag -d v{{version}}
     git tag v{{version}}
     git push origin v{{version}}
+
+# Regenerate docs/assets/demo.gif; needs the hallouminate binary and vhs on PATH.
+demo:
+    docs/assets/demo-setup.sh

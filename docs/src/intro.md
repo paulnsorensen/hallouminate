@@ -1,7 +1,7 @@
 # hallouminate
 
-A markdown corpus indexer for LLMs to build and query their own per-repo
-wikis. Hallouminate stores markdown verbatim on disk, embeds it with
+Persistent, repo-local knowledge for coding agents. hallouminate stores
+markdown verbatim on disk, embeds it with
 [fastembed](https://github.com/Anush008/fastembed-rs), indexes the embeddings
 in [LanceDB](https://lancedb.com/), and exposes a small MCP surface so an LLM
 can author and search a per-repo knowledge base without leaving its agent loop.
@@ -23,6 +23,8 @@ races. See [Architecture](./architecture.md) for the full picture.
 
 - **[Installation](./install.md)** — install the binary and register the MCP
   server with your agent.
+- **[How it compares](./comparison.md)** — choose between repo-local markdown,
+  agent memory, and knowledge-graph tools.
 - **[CLI reference](./cli.md)** — every subcommand and its flags.
 - **[MCP surface](./mcp.md)** — the ten tools an LLM calls to author and
   search wikis.

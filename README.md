@@ -10,30 +10,33 @@
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=flat-square)](https://github.com/paulnsorensen/hallouminate/pulls)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy_Me_a_Coffee-FFDD00?style=flat-square&logo=buymeacoffee&logoColor=black)](https://www.buymeacoffee.com/paulnsorensen)
 
-**Stop hallucinating. Start hallouminating.**
+**Persistent, repo-local knowledge for coding agents.**
 
-> _"The wiki must flow."_
+hallouminate gives your coding agent a wiki it writes and searches — plain
+markdown you review and commit with the code. The markdown files remain the
+source of truth; hallouminate builds a derived local index so agents can
+retrieve the right context without rereading the entire repository.
 
-A markdown corpus indexer for LLMs to build and query their own per-repo
-wikis. Hallouminate stores markdown verbatim on disk, embeds it with
-fastembed, indexes the embeddings in LanceDB, and exposes a small MCP
-surface (`add_markdown` / `read_markdown` / `delete_markdown` / `ground`)
-so an LLM can author and search a per-repo knowledge base without
-leaving its agent loop.
+![Terminal demo: hallouminate answers a design question from the repository wiki, then shows the underlying markdown files](https://raw.githubusercontent.com/paulnsorensen/hallouminate/main/docs/assets/demo.gif)
 
-The filesystem is the source of truth; LanceDB rows are derived and
-refreshed automatically when an LLM writes via `add_markdown`, or in
-bulk via `hallouminate index`. Code files (`.rs`, `.toml`, …) can also
-be indexed as text for semantic search, but hallouminate does no
-structural analysis — it's a wiki indexer that happens to tolerate
-code, not a code intelligence tool.
+- **Human-owned:** ordinary markdown in `.hallouminate/wiki/`, readable and
+  editable with any text editor.
+- **Agent-native:** a focused MCP surface for searching, reading, and safely
+  updating the wiki.
+- **Local-first:** embeddings and search run on your machine; no hosted account
+  or content upload is required.
+- **Repo-aware:** each repository gets its own wiki, with optional union search
+  across repositories.
 
-A long-lived local daemon owns the LanceDB ground directory, per-corpus
-mutation locks, and config resolution. The CLI and the stdio MCP server
-both talk to it over a Unix domain socket — one owner, no cross-process
-LanceDB races.
+hallouminate is not a code-intelligence engine: it can index source files as
+text, but it does not parse symbols, types, or call graphs. Pair it with your
+code-search tools; use hallouminate for the durable knowledge those tools
+cannot infer — the architecture, conventions, gotchas, and reasons behind a
+design.
 
-> 📖 **Full documentation:** <https://cheeselord.dev/hallouminate/>
+**[Install](#install)** · **[First run](#first-run)** ·
+**[Full documentation](https://cheeselord.dev/hallouminate/)** ·
+**[How it compares](https://cheeselord.dev/hallouminate/comparison.html)**
 
 ## Install
 

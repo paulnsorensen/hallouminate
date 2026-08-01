@@ -3,6 +3,7 @@
 [Introduction](./intro.md)
 
 - [Installation](./install.md)
+- [How it compares](./comparison.md)
 - [CLI reference](./cli.md)
 - [MCP surface](./mcp.md)
 - [Configuration](./config.md)
