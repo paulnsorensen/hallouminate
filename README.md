@@ -23,8 +23,8 @@ retrieve the right context without rereading the entire repository.
   editable with any text editor.
 - **Agent-native:** a focused MCP surface for searching, reading, and safely
   updating the wiki.
-- **Local-first:** embeddings and search run on your machine; no account, no
-  upload.
+- **Local-first:** embeddings and search run on your machine; no hosted account
+  or content upload is required.
 - **Repo-aware:** each repository gets its own wiki, with optional union search
   across repositories.
 

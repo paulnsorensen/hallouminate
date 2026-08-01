@@ -4,14 +4,14 @@ Choose hallouminate when the knowledge should live with a code repository as
 reviewable markdown. Choose an agent-memory or knowledge-graph system when the
 primary unit is a user, conversation, agent, or evolving world model instead.
 
-This is a comparison of product shape, not a benchmark; verify details against
-the linked upstream documentation.
+This is a comparison of product shape, not a benchmark. Features change; the
+links point to upstream documentation and were last checked on 2026-07-31.
 
 ## Start with the job
 
 | If you need… | Start with… | Why |
 | --- | --- | --- |
-| Architecture decisions, conventions, and gotchas committed with a repository | **Hallouminate** | The wiki is ordinary markdown under the repo; the search index is derived and local. |
+| Architecture decisions, conventions, and gotchas committed with a repository | **hallouminate** | The wiki is ordinary markdown under the repo; the search index is derived and local. |
 | A local-first personal or project knowledge base with a richer note schema and knowledge graph | [Basic Memory](https://github.com/basicmachines-co/basic-memory) | Markdown remains central, with observations, relations, project management, and optional cloud sync. |
 | A minimal entity-and-relation memory example for experimenting with MCP | [`@modelcontextprotocol/server-memory`](https://github.com/modelcontextprotocol/servers/tree/main/src/memory) | A small reference server stores a JSONL knowledge graph without embeddings. |
 | Application-level memory scoped to users, agents, sessions, or runs | [Mem0](https://github.com/mem0ai/mem0) | It is a memory layer and SDK/server for applications rather than a repo documentation workflow. |
