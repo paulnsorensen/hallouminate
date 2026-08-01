@@ -1,6 +1,6 @@
 [book]
 title = "hallouminate"
-description = "A markdown corpus indexer for LLMs to build and query their own per-repo wikis."
+description = "Persistent, repo-local knowledge for coding agents."
 authors = ["Paul Sorensen"]
 language = "en"
 src = "src"

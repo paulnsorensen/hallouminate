@@ -7,7 +7,33 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.5.0...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.6.1...HEAD)
+
+## [0.6.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.6.1) - 2026-07-30
+
+### Fixed
+
+- Daemon: resolve socket wedge from runtime/cache path disagreement,
+  canonicalize outline path prefixes, and reap stale dated log files
+
+## [0.6.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.6.0) - 2026-07-29
+
+### Added
+
+- Search: fuse all four retrieval signals as peer ranked lists
+- Search: isolate worktree corpora and improve ranking
+- Daemon: garbage-collect chunk rows at retired worktree roots
+- Eval: record ripgrep provenance and pin the eval gate's warning taxonomy
+
+### Changed
+
+- Docs: prefer npm/npx install, split plugin vs manual skills+MCP setup
+- Docs: correct crate structure drift and stale source paths
+
+### Fixed
+
+- Eval: allow bounded Jina measurement latency
+- Daemon: gate PSI helpers by target
 
 ## [0.5.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.5.0) - 2026-07-19
 
@@ -121,6 +147,21 @@ for each release window.
 
 ### Added
 
+- Indexer: format-aware multi-format ingestion (Phase 1)
+
+### Changed
+
+- Removed MCP client-roots support from tools
+
+### Fixed
+
+- CI: don't let the skills-pack release steal `/latest` from the binary
+  release
+
+## [0.2.2](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.2.2) - 2026-06-27
+
+### Added
+
 - Corpus: claim-level provenance marks
 - Ground: corpus-relative path, stale-index detection, and score-semantics
   docs
@@ -133,17 +174,10 @@ for each release window.
 - MCP: `corpus_stats` tool for corpus index health
 - Wiki-ingest: 3-layer dedup + append-only `log.md` + `index.md` routing
 - Daemon: evict the idle embedder to release ORT arena memory
-- Indexer: format-aware multi-format ingestion (Phase 1)
-
-### Changed
-
-- Removed MCP client-roots support from tools
 
 ### Fixed
 
 - Config: worktree-aware config discovery
-- CI: don't let the skills-pack release steal `/latest` from the binary
-  release
 
 ## [0.2.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.2.1) - 2026-06-14
 

@@ -22,6 +22,10 @@ ci:
 llm:
     just verify --fix
 
+# Regenerate docs/assets/demo.gif; needs the hallouminate binary and vhs on PATH.
+demo:
+    docs/assets/demo-setup.sh
+
 # Prepare a new release bump PR: crate version, lockfile, and plugin manifests.
 prepare-release version:
     #!/usr/bin/env bash

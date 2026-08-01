@@ -8,7 +8,7 @@ Set Theme "Catppuccin Mocha"
 Set TypingSpeed 35ms
 
 Hide
-Type "cd \"$HALLOUMINATE_DEMO/hallouminate\" && clear"
+Type 'cd "$HALLOUMINATE_DEMO/hallouminate" && clear'
 Enter
 Show
 
@@ -21,7 +21,6 @@ Sleep 1.5s
 Type 'hallouminate ground "why is the filesystem the source of truth?" --top-files 2 --chunks-per-file 2 --snippet-chars 150'
 Enter
 Sleep 4.5s
-Screenshot after-ground.png
 
 Type "ls .hallouminate/wiki/ | head -6"
 Enter

@@ -12,26 +12,26 @@
 
 **Persistent, repo-local knowledge for coding agents.**
 
-Hallouminate gives your coding agent a wiki it can write, search, review, and
-commit alongside the code. The markdown files remain the source of truth;
-Hallouminate builds a derived local index so agents can retrieve the right
-context without rereading the entire repository.
+hallouminate gives your coding agent a wiki it writes and searches — plain
+markdown you review and commit with the code. The markdown files remain the
+source of truth; hallouminate builds a derived local index so agents can
+retrieve the right context without rereading the entire repository.
 
-![Terminal demo: Hallouminate answers a design question from the repository wiki, then shows the underlying markdown files](docs/assets/demo.gif)
+![Terminal demo: hallouminate answers a design question from the repository wiki, then shows the underlying markdown files](https://raw.githubusercontent.com/paulnsorensen/hallouminate/main/docs/assets/demo.gif)
 
 - **Human-owned:** ordinary markdown in `.hallouminate/wiki/`, readable and
   editable with any text editor.
 - **Agent-native:** a focused MCP surface for searching, reading, and safely
   updating the wiki.
-- **Local-first:** embeddings and search run locally; no hosted service is
-  required.
+- **Local-first:** embeddings and search run on your machine; no account, no
+  upload.
 - **Repo-aware:** each repository gets its own wiki, with optional union search
   across repositories.
 
-Hallouminate is not a code-intelligence engine: it can index source files as
+hallouminate is not a code-intelligence engine: it can index source files as
 text, but it does not parse symbols, types, or call graphs. Pair it with your
-code-search tools; use Hallouminate for the durable knowledge those tools
-cannot infer—the architecture, conventions, gotchas, and reasons behind a
+code-search tools; use hallouminate for the durable knowledge those tools
+cannot infer — the architecture, conventions, gotchas, and reasons behind a
 design.
 
 **[Install](#install)** · **[First run](#first-run)** ·

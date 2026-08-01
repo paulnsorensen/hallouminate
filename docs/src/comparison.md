@@ -1,12 +1,11 @@
 # How hallouminate compares
 
-Choose Hallouminate when the knowledge should live with a code repository as
+Choose hallouminate when the knowledge should live with a code repository as
 reviewable markdown. Choose an agent-memory or knowledge-graph system when the
 primary unit is a user, conversation, agent, or evolving world model instead.
 
-This is a comparison of product shape, not a benchmark. Features change; the
-links below point to each project's own documentation and were last checked on
-2026-07-31.
+This is a comparison of product shape, not a benchmark; verify details against
+the linked upstream documentation.
 
 ## Start with the job
 
@@ -19,26 +18,26 @@ links below point to each project's own documentation and were last checked on
 | Automatic capture and recall of coding-agent sessions | [claude-mem](https://github.com/thedotmack/claude-mem) | It records session activity, compresses it, and recalls relevant context across sessions. |
 | Temporal facts and relationships extracted into a queryable graph | [Graphiti](https://github.com/getzep/graphiti) | It models episodes, entities, and time-aware relationships over a graph database. |
 
-## Hallouminate and Basic Memory
+## hallouminate and Basic Memory
 
 Basic Memory is the closest match in this list. Both are local-first, expose
 MCP tools, and keep human-readable markdown as durable data. The difference is
 where each product draws its boundary:
 
-- **Hallouminate is repository infrastructure.** A wiki is conventionally
+- **hallouminate is repository infrastructure.** A wiki is conventionally
   stored at `.hallouminate/wiki/`, can be reviewed in the same pull request as
   the code, and is searched through repo-aware corpora. Its markdown has no
   required note schema.
 - **Basic Memory is a knowledge-management system.** Its markdown format adds
   entities, observations, relations, and frontmatter; it supports multiple
   projects and optional cloud sync. Its current local search also includes
-  semantic search, so “Hallouminate has vectors while Basic Memory has only
+  semantic search, so “hallouminate has vectors while Basic Memory has only
   full-text search” is not a meaningful distinction.
 
 The practical choice is therefore workflow and scope, not a claim that one
 search stack is universally better.
 
-## What Hallouminate deliberately does not do
+## What hallouminate deliberately does not do
 
 - It does not capture every agent action or conversation automatically.
 - It does not decide which facts deserve to become durable documentation; the
@@ -51,10 +50,3 @@ search stack is universally better.
 These constraints keep the contract small: markdown is authoritative, the
 index is disposable, and a repository can carry its own durable knowledge
 without depending on one agent vendor.
-
-## Verification notes
-
-The table intentionally avoids star counts, performance claims, and exhaustive
-feature matrices. Those age quickly and can turn different product categories
-into a misleading checklist. For implementation details, verify against the
-linked upstream documentation before making an adoption decision.
