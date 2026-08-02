@@ -1,4 +1,6 @@
-# Configuration
+---
+title: "Configuration"
+---
 
 Config lives at `$XDG_CONFIG_HOME/hallouminate/config.toml`
 (`~/.config/hallouminate/config.toml` by default). Two layers combine per

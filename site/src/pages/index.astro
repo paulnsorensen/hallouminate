@@ -1,0 +1,92 @@
+---
+import Header from '@cheeselord/design/components/Header.astro';
+import '@cheeselord/design/styles/cheeselord.css';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>🧀 hallouminate</title>
+    <meta name="description" content="Persistent, repo-local knowledge for coding agents." />
+    <meta name="theme-color" content="#0b0e0c" />
+    <link rel="icon" type="image/png" href={`${base}/favicon.png`} />
+  </head>
+  <body>
+    <Header project="hallouminate" projectHref={`${base}/`} />
+    <main>
+      <div class="wrap">
+        <div>
+          <p class="eyebrow">The grill is lit</p>
+          <h1>Don't hallucinate. <em>Hallouminate.</em></h1>
+          <nav class="cellar" aria-label="Documentation">
+            <div class="cellar-head">~/hallouminate · grounded docs</div>
+            <a href={`${base}/intro/`}><strong>intro</strong> <span>what it is, why a daemon</span> <i aria-hidden="true">→</i></a>
+            <a href={`${base}/install/`}><strong>install</strong> <span>the binary + MCP registration</span> <i aria-hidden="true">→</i></a>
+            <a href={`${base}/cli/`}><strong>cli</strong> <span>every subcommand and its flags</span> <i aria-hidden="true">→</i></a>
+            <a href={`${base}/mcp/`}><strong>mcp</strong> <span>the tool surface agents call</span> <i aria-hidden="true">→</i></a>
+            <a href="https://github.com/paulnsorensen/hallouminate"><strong>github</strong> <span>source &amp; releases</span> <i aria-hidden="true">→</i></a>
+          </nav>
+        </div>
+        <div class="slab-box">
+          <div class="slab" role="img" aria-label="A slab of halloumi seared with dark grill marks"></div>
+        </div>
+      </div>
+    </main>
+    <footer>
+      <div class="wrap"><span>claims in, citations out 🧀</span></div>
+    </footer>
+  </body>
+</html>
+
+<style>
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    display: flex;
+    flex-direction: column;
+    /* per-site color variation: the night-grill ember replaces the cellar gold */
+    --gold: oklch(72% 0.15 45);
+  }
+  main {
+    flex: 1;
+  }
+  /* halloumi is cut clean: no wonk */
+  h1 {
+    font-variation-settings: 'SOFT' 0, 'WONK' 0;
+  }
+  .slab-box {
+    display: grid;
+    place-items: center;
+  }
+  .slab {
+    inline-size: min(19rem, 80%);
+    aspect-ratio: 1.25;
+    border-radius: 1.4rem;
+    transform: rotate(-4deg);
+    background:
+      repeating-linear-gradient(
+        48deg,
+        oklch(from var(--gold) 34% calc(c * 0.75) h / 85%) 0 0.55rem,
+        transparent 0.55rem 2.6rem
+      ),
+      radial-gradient(circle 1.6rem at 68% 30%, oklch(80% 0.05 85) 97%, transparent),
+      radial-gradient(circle 1rem at 30% 62%, oklch(80% 0.05 85) 97%, transparent),
+      oklch(87% 0.055 88);
+    filter: drop-shadow(0 0 3.5rem oklch(from var(--gold) l c h / 20%));
+  }
+  @media (max-width: 56rem) {
+    .slab-box {
+      order: -1;
+    }
+    .slab {
+      inline-size: min(12rem, 60%);
+    }
+  }
+</style>

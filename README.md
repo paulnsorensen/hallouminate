@@ -36,7 +36,7 @@ design.
 
 **[Install](#install)** · **[First run](#first-run)** ·
 **[Full documentation](https://cheeselord.dev/hallouminate/)** ·
-**[How it compares](https://cheeselord.dev/hallouminate/comparison.html)**
+**[How it compares](https://cheeselord.dev/hallouminate/comparison/)**
 
 ## Install
 

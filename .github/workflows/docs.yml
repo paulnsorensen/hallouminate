@@ -1,13 +1,13 @@
-# Build the mdBook docs site and publish it to GitHub Pages.
-# mdBook is the generator; GitHub Pages is the host. This workflow runs
-# `mdbook build` and deploys the static output in docs/book/ to Pages.
+# Build the Starlight docs site and publish it to GitHub Pages.
+# Astro/Starlight is the generator (site/), themed by @cheeselord/design;
+# GitHub Pages is the host. The static output in site/dist/ is deployed.
 name: docs
 
 on:
   push:
     branches: [main]
     paths:
-      - "docs/**"
+      - "site/**"
       - ".github/workflows/docs.yml"
   workflow_dispatch:
 
@@ -19,9 +19,6 @@ concurrency:
   group: pages
   cancel-in-progress: false
 
-env:
-  MDBOOK_VERSION: "0.5.3"
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,23 +27,31 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install mdBook
-        run: |
-          set -euo pipefail
-          tarball="mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/${tarball}"
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL "$url" | tar -xz -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Set up pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        with:
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      - name: Install docs dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: site
 
       - name: Build
-        run: mdbook build docs
+        run: pnpm run docs:build
+        working-directory: site
 
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
-          path: docs/book
+          path: site/dist
 
   deploy:
     needs: build

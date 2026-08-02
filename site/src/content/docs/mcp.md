@@ -1,4 +1,6 @@
-# MCP surface
+---
+title: "MCP surface"
+---
 
 `hallouminate serve` starts a stdio MCP server. It is stateless beyond its
 tool router and a startup-captured working directory; every tool call dials

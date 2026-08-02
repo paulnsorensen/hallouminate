@@ -41,7 +41,7 @@ just verify cargo test -p hallouminate --test it verification_gate
 Do not run compiler/linker-heavy Cargo gates concurrently in linked worktrees.
 The lease prevents duplicate heavy work for this repository only; host-wide
 admission and resource isolation belong to the execution environment. See
-[Development verification](./docs/src/development-verification.md) for the
+[Development verification](./site/src/content/docs/development-verification.md) for the
 lease, evidence log, compatibility routes, and fix mode.
 
 ## Submitting a pull request

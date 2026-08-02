@@ -1,4 +1,6 @@
-# Installation
+---
+title: "Installation"
+---
 
 The preferred path is npm — a prebuilt binary with no Rust toolchain, no
 `protoc`, no compile. Build from source with cargo only if your platform has no
@@ -121,5 +123,5 @@ hallouminate config init       # scaffold the XDG baseline config
 hallouminate config validate   # confirm it parses
 ```
 
-See [Configuration](./config.md) for what goes in the config and how the
+See [Configuration](/hallouminate/config/) for what goes in the config and how the
 XDG baseline merges with a repo-layer `.hallouminate/config.toml`.

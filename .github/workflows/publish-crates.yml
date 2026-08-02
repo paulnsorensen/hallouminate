@@ -4,7 +4,7 @@
 # Normal releases use crates.io Trusted Publishing (OIDC). A library crate
 # must exist before crates.io can attach a trusted publisher; bootstrap each
 # not-yet-published crate once via the manual job, as documented in
-# docs/src/releasing.md.
+# site/src/content/docs/releasing.md.
 name: publish-crates
 
 on:

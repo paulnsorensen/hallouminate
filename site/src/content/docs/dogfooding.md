@@ -1,4 +1,6 @@
-# Dogfooding: our own wiki
+---
+title: "Dogfooding: our own wiki"
+---
 
 Hallouminate maintains its own wiki **with hallouminate**. The repo declares
 itself as a `[[repository]]`, so its knowledge base is searchable as the
