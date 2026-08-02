@@ -113,6 +113,14 @@ fn main() -> anyhow::Result<()> {
 
     let repo_root = repo_root();
     let checkouts = resolve_checkouts(&repo_root, &manifest)?;
+    if arms.contains(&Arm::Wiki) {
+        for repo in &manifest.subject_repos {
+            let checkout = checkouts
+                .get(&repo.name)
+                .unwrap_or_else(|| panic!("no resolved checkout for repo {:?}", repo.name));
+            check_no_source_corpus_leak(checkout, &repo.name)?;
+        }
+    }
     let bin = std::env::var("AGENT_BENCH_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
 
     for question in &question_set.questions {
@@ -204,6 +212,49 @@ fn resolve_checkouts(
         checkouts.insert(repo.name.clone(), checkout);
     }
     Ok(checkouts)
+}
+
+/// Deserialize-only mirror of `hallouminate_domain::repository::RepositoryConfig`
+/// (`crates/hallouminate-domain/src/repository.rs:27-40`), just enough to read
+/// `[[repository]]` entries out of a checkout's `.hallouminate/config.toml`.
+#[derive(Debug, Deserialize)]
+struct RepoConfigEntry {
+    name: String,
+    #[serde(default)]
+    corpus_paths: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RepoLayerConfig {
+    #[serde(default)]
+    repository: Vec<RepoConfigEntry>,
+}
+
+/// Hard-fails if `checkout`'s `.hallouminate/config.toml` declares
+/// `corpus_paths` for `repo_name`. The wiki arm's entire measurement claim
+/// rests on the wiki corpus being the only corpus the agent can reach; a
+/// non-empty `corpus_paths` derives a `repo:{name}:corpus` source corpus
+/// (`crates/hallouminate-domain/src/repository.rs:104-125`) that would leak
+/// semantic source search into the "wiki" measurement. No config file at
+/// all is fine — no corpus derivation happens without it.
+fn check_no_source_corpus_leak(checkout: &Path, repo_name: &str) -> anyhow::Result<()> {
+    let config_path = checkout.join(".hallouminate").join("config.toml");
+    if !config_path.is_dir() && !config_path.exists() {
+        return Ok(());
+    }
+    let config: RepoLayerConfig = load_toml(&config_path)?;
+    let Some(entry) = config.repository.iter().find(|r| r.name == repo_name) else {
+        return Ok(());
+    };
+    if !entry.corpus_paths.is_empty() {
+        bail!(
+            "subject repo {:?}: {} declares corpus_paths = {:?} \u{2014} the wiki arm requires no source corpus for this repo, or the measured effect stops being \"the wiki\"",
+            repo_name,
+            config_path.display(),
+            entry.corpus_paths,
+        );
+    }
+    Ok(())
 }
 
 fn arm_config_path(repo_root: &Path, arm: Arm) -> PathBuf {

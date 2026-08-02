@@ -33,12 +33,11 @@ and the same native tools (file read, grep, shell). The sole delta between
 arms is whether the hallouminate MCP server is attached and, if attached,
 what corpus it exposes:
 
-- `wiki` — hallouminate MCP server attached, `ground` and read tools scoped
-  to the repository's `repo:<name>:wiki` corpus only. The agent never sees a
-  `repo:<name>:corpus` (semantic source search) corpus in this arm. Wiki-only
-  scoping is what keeps the measured effect "the wiki helped" rather than
-  "semantic source search helped" — mixing the two corpora would confound the
-  claim under test.
+- `wiki` — hallouminate MCP server attached, exposing the repository's
+  `repo:<name>:wiki` corpus and no `repo:<name>:corpus` (semantic source
+  search) corpus. Wiki-only scoping is what keeps the measured effect "the
+  wiki helped" rather than "semantic source search helped" — mixing the two
+  corpora would confound the claim under test.
 - `baseline` — hallouminate MCP server not attached. The agent has only its
   native tools against the checked-out repository at the pinned commit.
 
@@ -46,6 +45,56 @@ Tasks are paired: the same question, the same subject repo and commit, and
 the same non-hallouminate tool set run once per arm. Any difference in
 outcome is attributable to wiki presence, not to a different task or a
 different toolset.
+
+### How wiki-only scoping is actually enforced
+
+`hallouminate serve` takes no corpus-scope flag or environment variable, so
+the restriction cannot be imposed at spawn time. It rests on three
+mechanisms, two structural and one checked by this harness:
+
+1. A source corpus is *derived*, not merely named. `repository_source_corpus`
+   in `crates/hallouminate-domain/src/repository.rs` returns `None` when a
+   `[[repository]]` entry's `corpus_paths` is empty, which it is by default.
+   A repository configured without `corpus_paths` therefore has no
+   `repo:<name>:corpus` at all — the corpus is absent from `effective_corpora`,
+   not just conventionally avoided. `repository_wiki_corpus` always derives
+   `repo:<name>:wiki`.
+2. Corpora resolve per request from the requesting process's cwd
+   (`crates/hallouminate-daemon/src/dispatch.rs`), not once at daemon startup.
+3. `bench-run` refuses to start. Before any wiki-arm session spawns, it reads
+   each subject repo's `<checkout>/.hallouminate/config.toml` and hard-fails
+   if that repo's entry declares a non-empty `corpus_paths`, naming the repo
+   and the offending value.
+
+**Unverified assumption.** Mechanisms 1 and 2 only bind if the hallouminate
+server that Claude Code spawns inherits the cwd `bench-run` sets on the agent
+process (the subject-repo checkout), so that the daemon resolves corpora from
+that checkout's configuration. Ordinary Unix subprocesses inherit cwd, but
+**Claude Code's MCP-server spawn behaviour has not been verified against this
+expectation**, and the pilot's central claim depends on it. Confirm it against
+a real transcript before treating any wiki-arm number as meaningful, and treat
+this paragraph as an open audit item rather than a settled property.
+
+An earlier revision of `config/wiki-arm.mcp.json` carried a
+`HALLOUMINATE_CORPUS_SCOPE` environment variable. No such variable exists in
+hallouminate; it was removed. A configuration that implies enforcement it does
+not deliver is worse than an honest statement of a procedural restriction.
+
+### Preparing subject-repo checkouts
+
+Both runners operate inside a real checkout rather than the harness tree. For
+each subject repo in the manifest, clone it to `<checkout_root>/<name>` and
+check out the pinned commit:
+
+```sh
+git clone <subject_repo.url> <checkout_root>/<subject_repo.name>
+git -C <checkout_root>/<subject_repo.name> checkout <subject_repo.commit>
+```
+
+`bench-run` and `bench-author` verify every checkout before doing any work:
+a missing directory, or a `HEAD` that does not match the manifest's pinned
+`commit`, is a hard failure naming both SHAs. A drifted checkout silently
+invalidates every number produced against it, so this is never a warning.
 
 ## Subject repos
 
@@ -192,6 +241,13 @@ evidence for the claim under test:
   `prompt_hashes`.
 - Changing either model ID in `model_ids` (subject or judge).
 - Editing the question set after `question_set_hash` has been recorded.
+- Declaring a non-empty `corpus_paths` on a subject repo's checkout
+  configuration. That derives a `repo:<name>:corpus` source corpus and voids
+  the wiki-only claim for every wiki-arm run against that repo. `bench-run`
+  refuses to start in this state, so it invalidates prior results rather than
+  producing new bad ones.
+- Repointing `checkout_root`, or moving a checkout to a different commit,
+  between runs that are compared to each other.
 
 ## Known confounds
 

@@ -209,22 +209,91 @@ fn arm_configs_differ_by_exactly_one_hallouminate_server_entry() {
 }
 
 #[test]
-fn wiki_arm_references_wiki_corpus_only_never_source_corpus() {
+fn wiki_arm_config_carries_no_env_based_corpus_scope() {
     let wiki = read_arm_config("wiki-arm.mcp.json");
 
     let mut strings = Vec::new();
     collect_strings(&wiki, &mut strings);
 
     assert!(
-        strings.iter().any(|s| s.ends_with(":wiki")),
-        "wiki-arm.mcp.json must reference a repo:<name>:wiki corpus; found strings: {strings:?}"
+        !strings.iter().any(|s| s.contains("CORPUS_SCOPE")),
+        "wiki-arm.mcp.json must not carry an env-based corpus-scope string \
+         (dead: nothing in the codebase reads it) \u{2014} corpus scoping is \
+         enforced by bench-run's check_no_source_corpus_leak precondition \
+         instead; found: {strings:?}"
     );
-    let source_corpus_refs: Vec<&String> =
-        strings.iter().filter(|s| s.ends_with(":corpus")).collect();
     assert!(
-        source_corpus_refs.is_empty(),
-        "wiki-arm.mcp.json must never reference a source corpus (repo:<name>:corpus) \
-         — the measured effect is the wiki, not semantic source search; found: {source_corpus_refs:?}"
+        wiki.get("mcpServers")
+            .and_then(|servers| servers.get("hallouminate"))
+            .and_then(|server| server.get("env"))
+            .is_none(),
+        "wiki-arm.mcp.json's hallouminate server must carry no env block at all"
+    );
+}
+
+/// Proves `bench-run`'s `check_no_source_corpus_leak` precondition is real
+/// enforcement, not documentation: a checkout whose `.hallouminate/config.toml`
+/// declares `corpus_paths` for the subject repo must abort the wiki arm
+/// before any session is spawned, since a non-empty `corpus_paths` derives a
+/// `repo:{name}:corpus` source corpus (repository.rs:104-125) that would leak
+/// semantic source search into what is supposed to be a wiki-only measurement.
+#[test]
+fn wiki_arm_source_corpus_leak_aborts_before_any_session_spawns() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let sentinel = dir.path().join("sentinel");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
+
+    let hallouminate_dir = checkout_root.join("hallouminate").join(".hallouminate");
+    fs::create_dir_all(&hallouminate_dir).unwrap();
+    fs::write(
+        hallouminate_dir.join("config.toml"),
+        "[[repository]]\nname = \"hallouminate\"\npath = \".\"\ncorpus_paths = [\"docs\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_SENTINEL", &sentinel)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .arg("--arm")
+        .arg("wiki")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a subject repo with non-empty corpus_paths must abort the wiki arm"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake CLI ran despite a source-corpus leak in the checkout config"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hallouminate"),
+        "stderr missing the offending repo name: {stderr}"
+    );
+    assert!(
+        stderr.contains("corpus_paths"),
+        "stderr missing the offending field name: {stderr}"
+    );
+    assert!(
+        stderr.contains("docs"),
+        "stderr missing the offending corpus_paths value: {stderr}"
     );
 }
 
