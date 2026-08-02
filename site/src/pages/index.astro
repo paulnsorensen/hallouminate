@@ -98,11 +98,11 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
        ember accent (mirrors --cl-ink / --cl-amber in the hallouminate flavor) */
     --cellar: oklch(16.5% 0.006 50);
     --panel: oklch(19.5% 0.01 48);
-    --gold: oklch(76% 0.135 58);
+    --gold: oklch(79% 0.12 70);
     /* the docs flavor's sear lines over a faint ember heat-glow at the top */
     background:
       repeating-linear-gradient(90deg, oklch(from var(--gold) l c h / 4%) 0 2px, transparent 2px 16px),
-      radial-gradient(ellipse 60rem 40rem at 50% -10%, oklch(26% 0.025 58 / 45%), transparent),
+      radial-gradient(ellipse 60rem 40rem at 50% -10%, oklch(26% 0.022 70 / 45%), transparent),
       var(--cellar);
   }
   main {
