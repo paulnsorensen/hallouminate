@@ -13,32 +13,75 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
     <meta name="color-scheme" content="dark" />
     <title>🧀 hallouminate</title>
     <meta name="description" content="Persistent, repo-local knowledge for coding agents." />
-    <meta name="theme-color" content="#0b0e0c" />
+    <meta name="theme-color" content="#1a1816" />
     <link rel="icon" type="image/png" href={`${base}/favicon.png`} />
   </head>
   <body>
-    <Header project="hallouminate" projectHref={`${base}/`} />
+    <Header project="hallouminate" projectHref={`${base}/`}>
+      <nav class="top" slot="actions" aria-label="Site">
+        <a href={`${base}/intro/`}>docs</a>
+        <a href={`${base}/install/`}>install</a>
+        <a href="https://github.com/paulnsorensen/hallouminate">github</a>
+      </nav>
+    </Header>
     <main>
       <div class="wrap">
         <div>
-          <p class="eyebrow">The grill is lit</p>
+          <p class="eyebrow">repo-local knowledge · agent-native</p>
           <h1>Don't hallucinate. <em>Hallouminate.</em></h1>
-          <nav class="cellar" aria-label="Documentation">
-            <div class="cellar-head">~/hallouminate · grounded docs</div>
-            <a href={`${base}/intro/`}><strong>intro</strong> <span>what it is, why a daemon</span> <i aria-hidden="true">→</i></a>
-            <a href={`${base}/install/`}><strong>install</strong> <span>the binary + MCP registration</span> <i aria-hidden="true">→</i></a>
-            <a href={`${base}/cli/`}><strong>cli</strong> <span>every subcommand and its flags</span> <i aria-hidden="true">→</i></a>
-            <a href={`${base}/mcp/`}><strong>mcp</strong> <span>the tool surface agents call</span> <i aria-hidden="true">→</i></a>
-            <a href="https://github.com/paulnsorensen/hallouminate"><strong>github</strong> <span>source &amp; releases</span> <i aria-hidden="true">→</i></a>
-          </nav>
+          <p class="lede">
+            A wiki your coding agent writes and searches — ordinary markdown in <code>.hallouminate/wiki/</code>, reviewed and
+            committed with the code. A derived local index turns questions into
+            ranked, cited chunks; embeddings run on your machine, and nothing
+            uploads anywhere.
+          </p>
+          <p class="ctas">
+            <a class="btn btn-fill" href={`${base}/install/`}>light the grill</a>
+            <a class="btn btn-ghost" href={`${base}/intro/`}>read the docs →</a>
+          </p>
+          <p class="meta"><code>npm install -g hallouminate</code> · rust · MIT</p>
         </div>
-        <div class="slab-box">
-          <div class="slab" role="img" aria-label="A slab of halloumi seared with dark grill marks"></div>
+        <div class="term-box">
+          <figure class="term">
+            <figcaption><span class="term-dots" aria-hidden="true">● ● ●</span> ~/work — hallouminate ground</figcaption>
+            <pre><b>$ hallouminate ground</b> "why a daemon?"
+
+<i>why a daemon?  38ms  50 hits</i>
+
+<b>architecture.md</b>  (0.874)
+  Process model
+  <i>L41-58  Daemon › One writer</i>
+    one process owns the index;
+    CLI and MCP clients stay thin
+<b>decisions/adr-004.md</b>  (0.842)
+  <i>L9-24  Decision</i>
+    flock + unix socket; the first
+    caller auto-spawns the daemon</pre>
+          </figure>
         </div>
       </div>
+      <section class="band" aria-label="The tool surface">
+        <div class="wrap band-wrap">
+          <h2>~/hallouminate · the tool surface</h2>
+          <div class="steps">
+            <div><strong>ground</strong><p>ask in prose, get ranked chunks with headings, line ranges, and scores</p></div>
+            <div><strong>read_markdown</strong><p>verbatim page contents, straight off disk</p></div>
+            <div><strong>add_markdown</strong><p>atomic writes that reindex the page and refresh its ancestor indexes</p></div>
+            <div><strong>backlinks</strong><p>every page that wikilinks to the one you're holding</p></div>
+            <div><strong>list_tree</strong><p>walk the wiki's shape without reading every index</p></div>
+            <div><strong>corpus_stats</strong><p>index health — files, chunks, and freshness at a glance</p></div>
+          </div>
+          <p class="more">
+            <code>init-repo</code> seeds the wiki, <code>index</code> builds the local index, <code>serve</code> speaks MCP over stdio. One Rust binary, any harness — <a href={`${base}/cli/`}>the full CLI →</a>
+          </p>
+        </div>
+      </section>
     </main>
     <footer>
-      <div class="wrap"><span>claims in, citations out 🧀</span></div>
+      <div class="wrap">
+        <span>claims in, citations out 🧀</span>
+        <span>MIT · local-first</span>
+      </div>
     </footer>
   </body>
 </html>
@@ -51,42 +94,203 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   body {
     display: flex;
     flex-direction: column;
-    /* per-site color variation: the night-grill ember replaces the cellar gold */
+    /* per-site color variation: the night grill — neutral charcoal field, one
+       ember accent (mirrors --cl-ink / --cl-amber in the hallouminate flavor) */
+    --cellar: oklch(16.5% 0.006 50);
+    --panel: oklch(19.5% 0.01 48);
     --gold: oklch(72% 0.15 45);
+    /* the docs flavor's sear lines over a faint ember heat-glow at the top */
+    background:
+      repeating-linear-gradient(90deg, oklch(from var(--gold) l c h / 4%) 0 2px, transparent 2px 16px),
+      radial-gradient(ellipse 60rem 40rem at 50% -10%, oklch(26% 0.025 45 / 45%), transparent),
+      var(--cellar);
   }
   main {
     flex: 1;
+  }
+  footer {
+    margin-block-start: 0;
   }
   /* halloumi is cut clean: no wonk */
   h1 {
     font-variation-settings: 'SOFT' 0, 'WONK' 0;
   }
-  .slab-box {
+
+  .top {
+    display: flex;
+    gap: 1.4rem;
+    font-size: 0.8rem;
+  }
+  .top a {
+    color: var(--dim);
+    text-decoration: none;
+  }
+  .top a:hover {
+    color: var(--gold);
+  }
+
+  .lede code,
+  .more code {
+    font-size: 0.9em;
+    color: var(--bone);
+  }
+
+  .ctas {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.8rem;
+    margin-block-start: 2.2rem;
+  }
+  .btn {
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.8rem;
+    letter-spacing: 0.04em;
+    padding: 0.7rem 1.15rem;
+    border: 1px solid var(--gold);
+    text-decoration: none;
+  }
+  .btn-fill {
+    background: var(--gold);
+    color: var(--cellar);
+  }
+  .btn-fill:hover {
+    background: oklch(from var(--gold) calc(l - 0.07) c h);
+  }
+  .btn-ghost {
+    color: var(--gold);
+  }
+  .btn-ghost:hover {
+    background: oklch(from var(--gold) l c h / 8%);
+  }
+  .meta {
+    margin-block-start: 1.4rem;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    color: var(--dim);
+  }
+
+  /* the artifact: an elevated terminal panel on the charcoal field */
+  .term-box {
     display: grid;
     place-items: center;
   }
-  .slab {
-    inline-size: min(19rem, 80%);
-    aspect-ratio: 1.25;
-    border-radius: 1.4rem;
-    transform: rotate(-4deg);
-    background:
-      repeating-linear-gradient(
-        48deg,
-        oklch(from var(--gold) 34% calc(c * 0.75) h / 85%) 0 0.55rem,
-        transparent 0.55rem 2.6rem
-      ),
-      radial-gradient(circle 1.6rem at 68% 30%, oklch(80% 0.05 85) 97%, transparent),
-      radial-gradient(circle 1rem at 30% 62%, oklch(80% 0.05 85) 97%, transparent),
-      oklch(87% 0.055 88);
-    filter: drop-shadow(0 0 3.5rem oklch(from var(--gold) l c h / 20%));
+  .term {
+    margin: 0;
+    inline-size: min(26rem, 100%);
+    border-radius: 0.6rem;
+    overflow: hidden;
+    border: 1px solid var(--hairline);
+    background: var(--panel);
+    box-shadow: 0 1.4rem 3rem oklch(0% 0 0 / 40%);
   }
+  .term figcaption {
+    display: flex;
+    gap: 0.9rem;
+    padding: 0.55rem 0.9rem;
+    background: oklch(from var(--cellar) calc(l - 0.015) c h);
+    border-block-end: 1px solid var(--hairline);
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.68rem;
+    letter-spacing: 0.06em;
+    color: var(--dim);
+  }
+  .term-dots {
+    letter-spacing: 0.18em;
+    color: oklch(from var(--gold) l c h / 65%);
+  }
+  .term pre {
+    margin: 0;
+    padding: 1.1rem 1.2rem 1.3rem;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.76rem;
+    line-height: 1.75;
+    color: var(--bone);
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .term pre b {
+    font-weight: 500;
+    color: var(--gold);
+  }
+  .term pre i {
+    font-style: normal;
+    color: var(--dim);
+  }
+
+  .band {
+    background: var(--panel);
+    border-block-start: 1px solid var(--hairline);
+  }
+  .band .wrap {
+    display: block;
+    padding-block: 3.2rem 3.6rem;
+  }
+  .band h2 {
+    margin: 0 0 2rem;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.72rem;
+    font-weight: 400;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--dim);
+  }
+  .steps {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1.8rem 2.4rem;
+    counter-reset: step;
+  }
+  .steps > div {
+    counter-increment: step;
+  }
+  .steps strong {
+    display: block;
+    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-size: 0.85rem;
+    font-weight: 500;
+  }
+  .steps strong::before {
+    content: counter(step, decimal-leading-zero) ' ';
+    color: oklch(from var(--gold) l c h / 55%);
+    font-weight: 400;
+  }
+  .steps p {
+    margin: 0.45rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.6;
+    color: var(--dim);
+    text-wrap: pretty;
+  }
+  .more {
+    margin: 2.4rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    color: var(--dim);
+    max-width: 44rem;
+  }
+  .more a {
+    color: var(--gold);
+  }
+
   @media (max-width: 56rem) {
-    .slab-box {
-      order: -1;
+    .steps {
+      grid-template-columns: 1fr;
+      gap: 1.4rem;
     }
-    .slab {
-      inline-size: min(12rem, 60%);
+    .term {
+      inline-size: 100%;
+    }
+    .top {
+      gap: 1rem;
+    }
+  }
+  @media (max-width: 34rem) {
+    body :global(.cheeselord-header) {
+      flex-wrap: wrap;
+      row-gap: 0.15rem;
+    }
+    .top {
+      flex-basis: 100%;
     }
   }
 </style>
