@@ -1,0 +1,582 @@
+//! Integration tests for `bench-report`: joins `sessions.jsonl` +
+//! `grades.jsonl` into `report.json` / `report.md`. All fixtures are
+//! constructed directly (no fake CLI needed — `bench-report` reads files,
+//! it doesn't spawn an agent).
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+use agent_bench::{
+    Arm, BenchReport, GradeRecord, Question, QuestionSet, QuestionTag, SessionRecord, TokenUsage,
+};
+
+fn bin_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_bench-report"))
+}
+
+fn sample_question(id: &str, tag: QuestionTag) -> Question {
+    Question {
+        repo: "subject-repo".to_string(),
+        id: id.to_string(),
+        tag,
+        question: format!("What does component {id} do?"),
+        gold_answer: format!("Component {id} handles the request queue."),
+        rubric_notes: format!("Must name the request queue for {id}."),
+    }
+}
+
+fn write_question_set(dir: &Path, questions: &[Question]) -> PathBuf {
+    let path = dir.join("questions.json");
+    let set = QuestionSet {
+        questions: questions.to_vec(),
+    };
+    fs::write(&path, serde_json::to_string_pretty(&set).unwrap()).unwrap();
+    path
+}
+
+fn session(question_id: &str, arm: Arm, run_index: u32, usage: TokenUsage) -> SessionRecord {
+    SessionRecord {
+        question_id: question_id.to_string(),
+        repo: "subject-repo".to_string(),
+        arm,
+        run_index,
+        answer_text: "some answer".to_string(),
+        usage,
+        transcript_path: PathBuf::from("/tmp/transcript.json"),
+        wall_ms: 100,
+        exit_status: 0,
+    }
+}
+
+fn grade(question_id: &str, arm: Arm, run_index: u32, pass: bool) -> GradeRecord {
+    GradeRecord::grade(
+        question_id.to_string(),
+        arm,
+        run_index,
+        if pass { 5 } else { 0 },
+        4,
+        "rationale".to_string(),
+    )
+    .unwrap()
+}
+
+/// Write `n` (session, grade) pairs for `question_id`/`arm`, with `passes`
+/// of the first `passes` runs (by run_index) marked as passing. `usage`
+/// applies to every run.
+fn write_runs(
+    sessions_path: &Path,
+    grades_path: &Path,
+    question_id: &str,
+    arm: Arm,
+    n: u32,
+    passes: u32,
+    usage: TokenUsage,
+) {
+    for run_index in 0..n {
+        agent_bench::append_jsonl(sessions_path, &session(question_id, arm, run_index, usage))
+            .unwrap();
+        agent_bench::append_jsonl(
+            grades_path,
+            &grade(question_id, arm, run_index, run_index < passes),
+        )
+        .unwrap();
+    }
+}
+
+struct RunReport {
+    out_dir: PathBuf,
+    report: BenchReport,
+    report_json_bytes: Vec<u8>,
+    report_md: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bench_report(
+    dir: &Path,
+    out_name: &str,
+    sessions_path: &Path,
+    grades_path: &Path,
+    questions_path: &Path,
+    resamples: u32,
+    seed: u64,
+    confidence: f64,
+) -> RunReport {
+    let out_dir = dir.join(out_name);
+    let output = Command::new(bin_path())
+        .arg("--sessions")
+        .arg(sessions_path)
+        .arg("--grades")
+        .arg(grades_path)
+        .arg("--questions")
+        .arg(questions_path)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .arg("--resamples")
+        .arg(resamples.to_string())
+        .arg("--seed")
+        .arg(seed.to_string())
+        .arg("--confidence")
+        .arg(confidence.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bench-report failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let report_json_bytes = fs::read(out_dir.join("report.json")).unwrap();
+    let report: BenchReport = serde_json::from_slice(&report_json_bytes).unwrap();
+    let report_md = fs::read_to_string(out_dir.join("report.md")).unwrap();
+
+    RunReport {
+        out_dir,
+        report,
+        report_json_bytes,
+        report_md,
+    }
+}
+
+// Hand-computed pass@k / pass^k (see python check in the dispatch notes):
+// n = 5 runs, c = 2 passes.
+//   fail = n - c = 3
+//   pass@1 = 1 - C(3,1)/C(5,1) = 1 - 3/5   = 0.4
+//   pass@2 = 1 - C(3,2)/C(5,2) = 1 - 3/10  = 0.7
+//   pass@3 = 1 - C(3,3)/C(5,3) = 1 - 1/10  = 0.9
+//   pass^1 = C(2,1)/C(5,1) = 2/5  = 0.4
+//   pass^2 = C(2,2)/C(5,2) = 1/10 = 0.1
+//   pass^3 = C(2,3)/C(5,3) = 0/10 = 0.0   (k > c)
+#[test]
+fn pass_at_k_and_pass_pow_k_match_hand_computed_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions_path =
+        write_question_set(dir.path(), &[sample_question("q1", QuestionTag::Greppable)]);
+    let sessions_path = dir.path().join("sessions.jsonl");
+    let grades_path = dir.path().join("grades.jsonl");
+    let usage = TokenUsage {
+        input_tokens: 10,
+        output_tokens: 10,
+        cache_read_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+    };
+    write_runs(&sessions_path, &grades_path, "q1", Arm::Wiki, 5, 2, usage);
+    // Baseline data for the same question so paired-CI computation has a
+    // pairable question; irrelevant to this test's assertions.
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q1",
+        Arm::Baseline,
+        5,
+        1,
+        usage,
+    );
+
+    let run = run_bench_report(
+        dir.path(),
+        "out",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        100,
+        1,
+        0.95,
+    );
+
+    let wiki_all = run
+        .report
+        .per_arm
+        .iter()
+        .find(|s| s.arm == Arm::Wiki && s.tag.is_none())
+        .expect("Wiki/all ArmSummary present");
+
+    assert_eq!(wiki_all.questions, 1);
+    assert_eq!(wiki_all.runs, 5);
+
+    let expected_at_k = [(1u32, 0.4), (2, 0.7), (3, 0.9)];
+    for (k, expected) in expected_at_k {
+        let actual = *wiki_all
+            .pass_at_k
+            .get(&k)
+            .unwrap_or_else(|| panic!("pass_at_k missing k={k}: {:?}", wiki_all.pass_at_k));
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "pass@{k}: expected {expected}, got {actual}"
+        );
+    }
+
+    let expected_pow_k = [(1u32, 0.4), (2, 0.1), (3, 0.0)];
+    for (k, expected) in expected_pow_k {
+        let actual = *wiki_all
+            .pass_pow_k
+            .get(&k)
+            .unwrap_or_else(|| panic!("pass_pow_k missing k={k}: {:?}", wiki_all.pass_pow_k));
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "pass^{k}: expected {expected}, got {actual}"
+        );
+    }
+}
+
+fn unpaired_ci_width(
+    wiki: &[f64],
+    baseline: &[f64],
+    resamples: u32,
+    seed: u64,
+    confidence: f64,
+) -> f64 {
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+    let mut diffs = Vec::with_capacity(resamples as usize);
+    for _ in 0..resamples {
+        let mut wsum = 0.0;
+        for _ in 0..wiki.len() {
+            wsum += wiki[rng.random_range(0..wiki.len())];
+        }
+        let mut bsum = 0.0;
+        for _ in 0..baseline.len() {
+            bsum += baseline[rng.random_range(0..baseline.len())];
+        }
+        diffs.push(wsum / wiki.len() as f64 - bsum / baseline.len() as f64);
+    }
+    diffs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let alpha = (1.0 - confidence) / 2.0;
+    let lo_idx = (alpha * (diffs.len() - 1) as f64).round() as usize;
+    let hi_idx = ((1.0 - alpha) * (diffs.len() - 1) as f64).round() as usize;
+    diffs[hi_idx] - diffs[lo_idx]
+}
+
+#[test]
+fn paired_bootstrap_is_deterministic_and_narrower_than_unpaired_resampling() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 6 questions, n = 10 runs per arm. Baseline pass counts are
+    // heterogeneous (1..=6 of 10); Wiki pass counts are baseline + 2 of 10
+    // for every question, so the per-question diff (wiki_rate -
+    // baseline_rate) is EXACTLY 0.2 for all six questions even though the
+    // raw per-question rates vary widely (0.1..0.8).
+    //
+    // Paired bootstrap resamples QUESTIONS as the unit, so every resample's
+    // mean diff is a mix of six values that are all exactly 0.2 -> the
+    // resampled distribution is a point mass at 0.2 and the CI width is
+    // ~0. An unpaired bootstrap that resamples each arm's per-question
+    // rates independently mixes rates from different questions together,
+    // picking up the between-question variance in the raw rates (which is
+    // real, 0.1..0.8) even though the *paired* difference has none. That
+    // makes the unpaired CI strictly, unambiguously wider.
+    let baseline_c = [1u32, 2, 3, 4, 5, 6];
+    let wiki_c = [3u32, 4, 5, 6, 7, 8];
+    let n = 10u32;
+
+    let questions: Vec<Question> = (1..=6)
+        .map(|i| sample_question(&format!("q{i}"), QuestionTag::WikiOnly))
+        .collect();
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions_path = dir.path().join("sessions.jsonl");
+    let grades_path = dir.path().join("grades.jsonl");
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 1,
+        cache_creation_input_tokens: 1,
+    };
+    for i in 0..6 {
+        let qid = format!("q{}", i + 1);
+        write_runs(
+            &sessions_path,
+            &grades_path,
+            &qid,
+            Arm::Baseline,
+            n,
+            baseline_c[i],
+            usage,
+        );
+        write_runs(
+            &sessions_path,
+            &grades_path,
+            &qid,
+            Arm::Wiki,
+            n,
+            wiki_c[i],
+            usage,
+        );
+    }
+
+    let resamples = 20_000;
+    let seed = 42;
+    let confidence = 0.95;
+
+    let run_a = run_bench_report(
+        dir.path(),
+        "out-a",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        resamples,
+        seed,
+        confidence,
+    );
+    let run_b = run_bench_report(
+        dir.path(),
+        "out-b",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        resamples,
+        seed,
+        confidence,
+    );
+
+    assert_eq!(
+        run_a.report_json_bytes, run_b.report_json_bytes,
+        "same seed must produce byte-identical report.json"
+    );
+
+    let paired = &run_a.report.paired_ci;
+    assert_eq!(paired.resamples, resamples);
+    assert_eq!(paired.seed, seed);
+    assert!(
+        (paired.point_estimate - 0.2).abs() < 1e-9,
+        "point estimate should be the constant per-question diff 0.2, got {}",
+        paired.point_estimate
+    );
+    let paired_width = paired.upper - paired.lower;
+    assert!(
+        paired_width < 1e-6,
+        "paired CI should collapse to ~a point given a constant per-question diff, got width {paired_width}"
+    );
+
+    let wiki_rates: Vec<f64> = wiki_c
+        .iter()
+        .map(|&c| f64::from(c) / f64::from(n))
+        .collect();
+    let baseline_rates: Vec<f64> = baseline_c
+        .iter()
+        .map(|&c| f64::from(c) / f64::from(n))
+        .collect();
+    let unpaired_width =
+        unpaired_ci_width(&wiki_rates, &baseline_rates, resamples, seed, confidence);
+
+    assert!(
+        paired_width < unpaired_width,
+        "paired resampling (question as the unit) must be narrower than unpaired resampling: \
+         paired_width={paired_width}, unpaired_width={unpaired_width}"
+    );
+    assert!(
+        unpaired_width > 0.05,
+        "unpaired CI should be clearly wide given the heterogeneous per-question rates, got {unpaired_width}"
+    );
+
+    let _ = run_a.out_dir;
+    let _ = run_b.out_dir;
+}
+
+#[test]
+fn question_with_zero_passes_in_both_arms_is_kept_and_flagged() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions = [
+        sample_question("q-zero", QuestionTag::Abstention),
+        sample_question("q-normal", QuestionTag::Greppable),
+    ];
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions_path = dir.path().join("sessions.jsonl");
+    let grades_path = dir.path().join("grades.jsonl");
+    let usage = TokenUsage {
+        input_tokens: 5,
+        output_tokens: 5,
+        cache_read_input_tokens: 5,
+        cache_creation_input_tokens: 5,
+    };
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q-zero",
+        Arm::Wiki,
+        3,
+        0,
+        usage,
+    );
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q-zero",
+        Arm::Baseline,
+        3,
+        0,
+        usage,
+    );
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q-normal",
+        Arm::Wiki,
+        3,
+        2,
+        usage,
+    );
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q-normal",
+        Arm::Baseline,
+        3,
+        1,
+        usage,
+    );
+
+    let run = run_bench_report(
+        dir.path(),
+        "out",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        50,
+        7,
+        0.95,
+    );
+
+    let zero_row = run
+        .report
+        .per_question
+        .iter()
+        .find(|r| r.question_id == "q-zero")
+        .expect("q-zero must appear in per_question, not be dropped");
+    assert_eq!(
+        zero_row.per_arm.len(),
+        2,
+        "q-zero must have both arms represented"
+    );
+    for stat in zero_row.per_arm.values() {
+        assert_eq!(stat.passes, 0);
+        assert_eq!(stat.runs, 3);
+        assert_eq!(
+            stat.tokens_to_correct_answer, None,
+            "zero correct runs must be represented as None, not dropped or defaulted to 0"
+        );
+    }
+
+    let section = run
+        .report_md
+        .split("### ")
+        .find(|s| s.starts_with("q-zero"))
+        .expect("report.md must have a section for q-zero");
+    assert!(
+        section.contains("FLAGGED"),
+        "report.md must flag q-zero (zero passes in both arms): {section}"
+    );
+
+    let normal_section = run
+        .report_md
+        .split("### ")
+        .find(|s| s.starts_with("q-normal"))
+        .expect("report.md must have a section for q-normal");
+    assert!(
+        !normal_section.contains("FLAGGED"),
+        "report.md must not flag a question with nonzero passes: {normal_section}"
+    );
+}
+
+#[test]
+fn report_md_usage_breakdown_reconciles_exactly_with_report_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions = [sample_question("q1", QuestionTag::Greppable)];
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions_path = dir.path().join("sessions.jsonl");
+    let grades_path = dir.path().join("grades.jsonl");
+
+    // Distinct, unmistakable per-run usage for each arm so a mixed-up
+    // arm/field association in report.md would be caught.
+    let wiki_usage = TokenUsage {
+        input_tokens: 11,
+        output_tokens: 22,
+        cache_read_input_tokens: 33,
+        cache_creation_input_tokens: 44,
+    };
+    let baseline_usage = TokenUsage {
+        input_tokens: 101,
+        output_tokens: 202,
+        cache_read_input_tokens: 303,
+        cache_creation_input_tokens: 404,
+    };
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q1",
+        Arm::Wiki,
+        3,
+        3,
+        wiki_usage,
+    );
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q1",
+        Arm::Baseline,
+        3,
+        3,
+        baseline_usage,
+    );
+
+    let run = run_bench_report(
+        dir.path(),
+        "out",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        50,
+        3,
+        0.95,
+    );
+
+    for (arm, per_run) in [(Arm::Wiki, wiki_usage), (Arm::Baseline, baseline_usage)] {
+        let summary = run
+            .report
+            .per_arm
+            .iter()
+            .find(|s| s.arm == arm && s.tag.is_none())
+            .unwrap_or_else(|| panic!("{arm:?}/all ArmSummary present"));
+        assert_eq!(summary.usage.input_tokens, per_run.input_tokens * 3);
+        assert_eq!(summary.usage.output_tokens, per_run.output_tokens * 3);
+        assert_eq!(
+            summary.usage.cache_read_input_tokens,
+            per_run.cache_read_input_tokens * 3
+        );
+        assert_eq!(
+            summary.usage.cache_creation_input_tokens,
+            per_run.cache_creation_input_tokens * 3
+        );
+
+        // report.md must carry the same four numbers, associated with the
+        // right arm's section (found via a heading containing the arm's
+        // debug name before the next heading).
+        let heading = format!("{arm:?}");
+        let arm_section = run
+            .report_md
+            .split("### ")
+            .find(|s| s.starts_with(&heading))
+            .unwrap_or_else(|| panic!("report.md has a section for {heading}"));
+        assert!(
+            arm_section.contains(&summary.usage.input_tokens.to_string()),
+            "{arm:?} section missing input_tokens {}: {arm_section}",
+            summary.usage.input_tokens
+        );
+        assert!(
+            arm_section.contains(&summary.usage.output_tokens.to_string()),
+            "{arm:?} section missing output_tokens {}: {arm_section}",
+            summary.usage.output_tokens
+        );
+        assert!(
+            arm_section.contains(&summary.usage.cache_read_input_tokens.to_string()),
+            "{arm:?} section missing cache_read_input_tokens {}: {arm_section}",
+            summary.usage.cache_read_input_tokens
+        );
+        assert!(
+            arm_section.contains(&summary.usage.cache_creation_input_tokens.to_string()),
+            "{arm:?} section missing cache_creation_input_tokens {}: {arm_section}",
+            summary.usage.cache_creation_input_tokens
+        );
+    }
+}
