@@ -7,7 +7,8 @@ if none is up.
 
 ## Default corpus
 
-Read-side tools (`ground`, `list_files`, `list_tree`) that omit `corpus`
+Read-side tools (`ground`, `list_files`, `list_tree`, `backlinks`,
+`get_footnote`, `corpus_stats`) that omit `corpus`
 default to the wiki for the repository containing the daemon's working
 directory — `repo:<NAME>:wiki` for the deepest `[[repository]]` whose `path`
 is an ancestor of the cwd. When the cwd sits under no configured repo, the
@@ -17,7 +18,7 @@ The mutating tools (`add_markdown`, `delete_markdown`) and `read_markdown`
 **always** require an explicit `corpus`, to avoid accidental writes to the
 wrong wiki or ambiguous reads.
 
-## The ten tools
+## The eleven tools
 
 ### `list_corpora`
 
@@ -93,6 +94,15 @@ Params: `corpus` (defaults to wiki-for-cwd, same as `ground`), `page` (the
 wiki page's relative path), `footnote_number` (the label after `^` — `"1"` for
 `[^1]`, `"note"` for `[^note]`). Use this to expand one footnote without reading
 the whole page.
+
+### `backlinks`
+
+Corpus-relative paths of every page that links to the given page via a
+`[[wikilink]]`. Params: `corpus` (defaults to wiki-for-cwd, same as `ground`),
+`path` (the target page's relative path). `structuredContent` is `{ corpus,
+path, backlinks }`; `content` is a newline-joined list of backlink paths, or a
+message noting there are none. Use this to find which pages reference a page
+before renaming or deleting it.
 
 ## Conventions for LLM authors
 

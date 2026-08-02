@@ -153,6 +153,8 @@ cargo run -- config show                 # print the effective merged config
 - `delete_markdown` — unlink the file and prune its rows from the index.
 - `get_footnote` — resolve a single citation: the footnote target for a
   page's `#footnote_number`.
+- `backlinks` — corpus-relative paths of every page that links to a given
+  page via a `[[wikilink]]`.
 
 Markdown content is stored verbatim — hallouminate imposes no schema.
 Convention for LLM wiki authors: one topic per file, first line `# Title`,
