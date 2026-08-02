@@ -16,7 +16,7 @@ use serde::Deserialize;
 
 use agent_bench::{
     Arm, Manifest, Question, QuestionSet, SessionRecord, TokenUsage, append_jsonl,
-    blake3_file_hash, load_json, load_toml, read_jsonl,
+    blake3_file_hash, load_json, load_toml, read_jsonl, repo_root,
 };
 
 /// Directory (relative to the repository root, not the process cwd) holding
@@ -112,23 +112,41 @@ fn main() -> anyhow::Result<()> {
         .collect();
 
     let repo_root = repo_root();
+    let checkouts = resolve_checkouts(&repo_root, &manifest)?;
     let bin = std::env::var("AGENT_BENCH_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
 
     for question in &question_set.questions {
         for &arm in &arms {
             let config_path = arm_config_path(&repo_root, arm);
+            let checkout = checkouts
+                .get(&question.repo)
+                .unwrap_or_else(|| panic!("no resolved checkout for repo {:?}", question.repo));
             for run_index in 0..cli.runs {
                 let key = (question.id.clone(), arm, run_index);
                 if let Some(&pos) = index.get(&key) {
                     if !cli.force {
                         continue;
                     }
-                    let record =
-                        run_session(&bin, &config_path, question, arm, run_index, &out_dir)?;
+                    let record = run_session(
+                        &bin,
+                        &config_path,
+                        question,
+                        arm,
+                        run_index,
+                        &out_dir,
+                        checkout,
+                    )?;
                     records[pos] = record;
                 } else {
-                    let record =
-                        run_session(&bin, &config_path, question, arm, run_index, &out_dir)?;
+                    let record = run_session(
+                        &bin,
+                        &config_path,
+                        question,
+                        arm,
+                        run_index,
+                        &out_dir,
+                        checkout,
+                    )?;
                     index.insert(key, records.len());
                     records.push(record);
                 }
@@ -140,15 +158,52 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Repository root, resolved at compile time from this crate's location
-/// under `crates/agent-bench` — independent of the process cwd.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crates/agent-bench has a parent directory")
-        .parent()
-        .expect("crates/ has a parent directory")
-        .to_path_buf()
+/// Resolves and verifies every subject repo's checkout under
+/// `manifest.checkout_root`. Hard-fails if a checkout directory is missing
+/// or its `HEAD` does not match the pinned commit — a drifted checkout
+/// silently invalidates every number this harness produces.
+fn resolve_checkouts(
+    repo_root: &Path,
+    manifest: &Manifest,
+) -> anyhow::Result<HashMap<String, PathBuf>> {
+    let mut checkouts = HashMap::new();
+    for repo in &manifest.subject_repos {
+        let checkout = repo_root.join(&manifest.checkout_root).join(&repo.name);
+        if !checkout.is_dir() {
+            bail!(
+                "subject repo {:?}: checkout not found at {} \u{2014} clone and check out commit {} there before running",
+                repo.name,
+                checkout.display(),
+                repo.commit,
+            );
+        }
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .with_context(|| format!("running git rev-parse HEAD in {}", checkout.display()))?;
+        if !output.status.success() {
+            bail!(
+                "subject repo {:?}: `git -C {} rev-parse HEAD` failed: {}",
+                repo.name,
+                checkout.display(),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+        let actual_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if actual_sha != repo.commit {
+            bail!(
+                "subject repo {:?}: checkout at {} has HEAD {}, but the manifest pins commit {} \u{2014} refusing to start any measured run against a drifted checkout",
+                repo.name,
+                checkout.display(),
+                actual_sha,
+                repo.commit,
+            );
+        }
+        checkouts.insert(repo.name.clone(), checkout);
+    }
+    Ok(checkouts)
 }
 
 fn arm_config_path(repo_root: &Path, arm: Arm) -> PathBuf {
@@ -179,9 +234,11 @@ fn run_session(
     arm: Arm,
     run_index: u32,
     out_dir: &Path,
+    checkout: &Path,
 ) -> anyhow::Result<SessionRecord> {
     let start = Instant::now();
     let spawned = Command::new(bin)
+        .current_dir(checkout)
         .arg("-p")
         .arg(&question.question)
         .arg("--output-format")

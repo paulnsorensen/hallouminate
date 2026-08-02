@@ -27,7 +27,7 @@ fn write_json(path: &Path, value: &Value) {
 /// name in `repos`, and `question_set_hash` set to `hash`.
 fn write_manifest(path: &Path, repos: &[&str], hash: &str) {
     let mut toml = format!(
-        "claude_code_version = \"0.0.0-test\"\nprompt_hashes = []\nquestion_set_hash = \"{hash}\"\ncontainer_image_refs = []\nresults_dir = \"/tmp/results\"\n\n[model_ids]\nsubject = \"claude-sonnet-5\"\njudge = \"claude-opus-5\"\n\n"
+        "claude_code_version = \"0.0.0-test\"\nprompt_hashes = []\nquestion_set_hash = \"{hash}\"\ncontainer_image_refs = []\nresults_dir = \"/tmp/results\"\ncheckout_root = \"/tmp/checkouts\"\n\n[model_ids]\nsubject = \"claude-sonnet-5\"\njudge = \"claude-opus-5\"\n\n"
     );
     for repo in repos {
         toml.push_str(&format!(

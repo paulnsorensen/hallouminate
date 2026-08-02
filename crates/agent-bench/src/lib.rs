@@ -5,7 +5,7 @@ pub use model::*;
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::Serialize;
@@ -67,4 +67,14 @@ pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
         .write_all(b"\n")
         .with_context(|| format!("writing JSONL to {}", path.display()))?;
     Ok(())
+}
+
+/// Repository root, resolved at compile time from this crate's location
+/// under `crates/agent-bench` — independent of the process cwd.
+pub fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("crates/agent-bench has a workspace root two levels up")
+        .to_path_buf()
 }

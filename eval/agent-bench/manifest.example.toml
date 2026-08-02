@@ -9,9 +9,10 @@
 claude_code_version = "0.0.0-placeholder"
 question_set_hash = "024ac056c55ddb82682732e4b652002fc8f77232cacc975b92fa2f9fb36dc4c4"
 container_image_refs = [
-    "ghcr.io/anthropics/agent-bench-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111111111111111",
+    "ghcr.io/anthropics/agent-bench-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111",
 ]
 results_dir = "eval/agent-bench/results"
+checkout_root = "eval/agent-bench/checkouts"
 
 [model_ids]
 subject = "claude-sonnet-5"

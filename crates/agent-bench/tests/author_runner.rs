@@ -15,6 +15,34 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Creates a real git checkout at `root/name`, commits one file, and
+/// returns its HEAD SHA -- `bench-author` requires the pinned commit to
+/// match a real checkout's HEAD.
+fn init_git_checkout(root: &Path, name: &str) -> String {
+    let checkout = root.join(name);
+    fs::create_dir_all(&checkout).unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    fs::write(checkout.join("README.md"), "test\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    let out = Command::new("git")
+        .args(["-C", checkout.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 /// Writes an executable `/bin/sh` fake agent CLI at `path`. `body` is the
 /// shell script's logic between the shebang and EOF.
 fn write_fake_cli(path: &Path, body: &str) {
@@ -25,20 +53,21 @@ fn write_fake_cli(path: &Path, body: &str) {
     fs::set_permissions(path, perms).expect("setting fake CLI script executable");
 }
 
-fn write_manifest(path: &Path, repo_name: &str) {
+fn write_manifest(path: &Path, repo_name: &str, checkout_root: &Path, commit: &str) {
     let manifest = json!({
         "model_ids": {"subject": "claude-sonnet-5", "judge": "claude-opus-5"},
         "claude_code_version": "0.0.0-test",
         "subject_repos": [{
             "name": repo_name,
             "url": "https://example.com/demo",
-            "commit": "deadbeef",
+            "commit": commit,
             "size_class": "small"
         }],
         "prompt_hashes": [],
         "question_set_hash": "question-hash",
         "container_image_refs": [],
-        "results_dir": "/tmp/results"
+        "results_dir": "/tmp/results",
+        "checkout_root": checkout_root
     });
     fs::write(path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
 }
@@ -83,7 +112,9 @@ fn read_log_lines(out_dir: &Path) -> Vec<Value> {
 fn authoring_log_records_all_four_fields_and_cumulative_totals() {
     let dir = tempfile::tempdir().unwrap();
     let manifest_path = dir.path().join("manifest.json");
-    write_manifest(&manifest_path, "demo-repo");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
     let out_dir = dir.path().join("out");
     let counter_path = dir.path().join("counter");
 
@@ -144,7 +175,9 @@ fi
 fn budget_exhaustion_stops_before_exceeding_and_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
     let manifest_path = dir.path().join("manifest.json");
-    write_manifest(&manifest_path, "demo-repo");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
     let out_dir = dir.path().join("out");
 
     let fake_cli = dir.path().join("fake-claude.sh");
@@ -177,7 +210,9 @@ fn budget_exhaustion_stops_before_exceeding_and_exits_nonzero() {
 fn malformed_response_fails_loudly_and_never_logs_zero_usage() {
     let dir = tempfile::tempdir().unwrap();
     let manifest_path = dir.path().join("manifest.json");
-    write_manifest(&manifest_path, "demo-repo");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
     let out_dir = dir.path().join("out");
 
     let fake_cli = dir.path().join("fake-claude.sh");
@@ -203,7 +238,9 @@ fn malformed_response_fails_loudly_and_never_logs_zero_usage() {
 fn prompt_is_loaded_from_disk_and_hash_matches_independent_computation() {
     let dir = tempfile::tempdir().unwrap();
     let manifest_path = dir.path().join("manifest.json");
-    write_manifest(&manifest_path, "demo-repo");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
     let out_dir = dir.path().join("out");
 
     let fake_cli = dir.path().join("fake-claude.sh");
@@ -231,7 +268,9 @@ fn prompt_is_loaded_from_disk_and_hash_matches_independent_computation() {
 fn authoring_summary_reconciles_with_log() {
     let dir = tempfile::tempdir().unwrap();
     let manifest_path = dir.path().join("manifest.json");
-    write_manifest(&manifest_path, "demo-repo");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
     let out_dir = dir.path().join("out");
     let counter_path = dir.path().join("counter");
 

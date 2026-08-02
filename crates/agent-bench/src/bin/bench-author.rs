@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use agent_bench::{Manifest, TokenUsage};
+use agent_bench::{Manifest, TokenUsage, repo_root};
 use anyhow::{Context, bail};
 use clap::Parser;
 use serde::Serialize;
@@ -58,20 +58,60 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     let manifest: Manifest = load_manifest(&args.manifest)?;
-    if !manifest.subject_repos.iter().any(|r| r.name == args.repo) {
-        let known: Vec<&str> = manifest
-            .subject_repos
-            .iter()
-            .map(|r| r.name.as_str())
-            .collect();
+    let repo = manifest
+        .subject_repos
+        .iter()
+        .find(|r| r.name == args.repo)
+        .ok_or_else(|| {
+            let known: Vec<&str> = manifest
+                .subject_repos
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect();
+            anyhow::anyhow!(
+                "unknown repo {:?}; known repos: [{}]",
+                args.repo,
+                known.join(", ")
+            )
+        })?;
+
+    let workspace_root = repo_root();
+    let checkout = workspace_root
+        .join(&manifest.checkout_root)
+        .join(&repo.name);
+    if !checkout.is_dir() {
         bail!(
-            "unknown repo {:?}; known repos: [{}]",
-            args.repo,
-            known.join(", ")
+            "subject repo {:?}: checkout not found at {} \u{2014} clone and check out commit {} there before authoring",
+            repo.name,
+            checkout.display(),
+            repo.commit,
+        );
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&checkout)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .with_context(|| format!("running git rev-parse HEAD in {}", checkout.display()))?;
+    if !output.status.success() {
+        bail!(
+            "subject repo {:?}: `git -C {} rev-parse HEAD` failed: {}",
+            repo.name,
+            checkout.display(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    let actual_sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if actual_sha != repo.commit {
+        bail!(
+            "subject repo {:?}: checkout at {} has HEAD {}, but the manifest pins commit {} \u{2014} refusing to author against a drifted checkout",
+            repo.name,
+            checkout.display(),
+            actual_sha,
+            repo.commit,
         );
     }
 
-    let workspace_root = workspace_root();
     let prompt_path = workspace_root.join("eval/agent-bench/prompts/wiki-authoring.md");
     let prompt_text = std::fs::read_to_string(&prompt_path)
         .with_context(|| format!("reading authoring prompt from {}", prompt_path.display()))?;
@@ -81,17 +121,16 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("creating out-dir {}", args.out_dir.display()))?;
     let log_path = args.out_dir.join("authoring-log.jsonl");
-    let wiki_dir = args.out_dir.join(".hallouminate").join("wiki");
-
+    let wiki_dir = checkout.join(".hallouminate").join("wiki");
     let claude_bin =
         std::env::var("AGENT_BENCH_CLAUDE_BIN").unwrap_or_else(|_| DEFAULT_CLAUDE_BIN.to_string());
-
     let mut cumulative = TokenUsage::default();
     let mut turn = 0usize;
 
     loop {
         let started = Instant::now();
         let mut command = Command::new(&claude_bin);
+        command.current_dir(&checkout);
         if turn == 0 {
             command.args(["-p", &prompt_text, "--output-format", "json"]);
         } else {
@@ -180,14 +219,6 @@ fn load_manifest(path: &Path) -> anyhow::Result<Manifest> {
         Some("toml") => agent_bench::load_toml(path),
         _ => agent_bench::load_json(path),
     }
-}
-
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/agent-bench has a workspace root two levels up")
-        .to_path_buf()
 }
 
 fn parse_usage(value: &Value) -> anyhow::Result<TokenUsage> {

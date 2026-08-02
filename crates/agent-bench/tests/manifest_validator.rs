@@ -38,6 +38,7 @@ fn base_manifest(prompt_path: &str, prompt_hash: &str, question_set_hash: &str) 
 question_set_hash = "{question_set_hash}"
 {image_line}
 results_dir = "eval/agent-bench/results"
+checkout_root = "eval/agent-bench/checkouts"
 
 [model_ids]
 subject = "claude-sonnet-5"
@@ -281,6 +282,58 @@ fn escaping_results_dir_reports_rule() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("rule 6"), "stderr: {stderr}");
+}
+
+#[test]
+fn absolute_checkout_root_reports_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let question_hash = "c".repeat(64);
+    let mut manifest = base_manifest(
+        "eval/agent-bench/prompts/wiki-authoring.md",
+        &agent_bench::blake3_file_hash(
+            &workspace_root().join("eval/agent-bench/prompts/wiki-authoring.md"),
+        )
+        .unwrap(),
+        &question_hash,
+    );
+    manifest = manifest.replace(
+        "checkout_root = \"eval/agent-bench/checkouts\"",
+        "checkout_root = \"/tmp/checkouts\"",
+    );
+
+    let manifest_path = dir.path().join("manifest.toml");
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let output = run_validator(&manifest_path);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rule 7"), "stderr: {stderr}");
+}
+
+#[test]
+fn escaping_checkout_root_reports_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let question_hash = "c".repeat(64);
+    let mut manifest = base_manifest(
+        "eval/agent-bench/prompts/wiki-authoring.md",
+        &agent_bench::blake3_file_hash(
+            &workspace_root().join("eval/agent-bench/prompts/wiki-authoring.md"),
+        )
+        .unwrap(),
+        &question_hash,
+    );
+    manifest = manifest.replace(
+        "checkout_root = \"eval/agent-bench/checkouts\"",
+        "checkout_root = \"eval/agent-bench/../../etc\"",
+    );
+
+    let manifest_path = dir.path().join("manifest.toml");
+    fs::write(&manifest_path, manifest).unwrap();
+
+    let output = run_validator(&manifest_path);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rule 7"), "stderr: {stderr}");
 }
 
 #[test]

@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_bench::{Manifest, SizeClass};
+use agent_bench::{Manifest, SizeClass, repo_root};
 use clap::Parser;
 
 /// `results_dir` must live under this prefix, relative to the repo root.
@@ -56,16 +56,6 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     }
 }
 
-/// The repository root, derived from this crate's manifest directory so the
-/// validator works from any invocation directory.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/agent-bench has a workspace root two levels up")
-        .to_path_buf()
-}
-
 /// Runs every pinning rule against `manifest` and returns every violation
 /// found, each naming the failing rule and the offending field.
 fn validate(manifest: &Manifest, repo_root: &Path) -> Vec<String> {
@@ -77,6 +67,7 @@ fn validate(manifest: &Manifest, repo_root: &Path) -> Vec<String> {
     check_prompt_hashes(manifest, repo_root, &mut violations);
     check_question_set_hash(manifest, &mut violations);
     check_results_dir(manifest, &mut violations);
+    check_checkout_root(manifest, &mut violations);
 
     violations
 }
@@ -118,9 +109,15 @@ fn check_commits(manifest: &Manifest, violations: &mut Vec<String>) {
 
 fn check_container_images(manifest: &Manifest, violations: &mut Vec<String>) {
     for image_ref in &manifest.container_image_refs {
-        if !image_ref.contains("@sha256:") {
+        let digest_ok = image_ref.split_once("@sha256:").is_some_and(|(_, digest)| {
+            digest.len() == 64
+                && digest
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        });
+        if !digest_ok {
             violations.push(format!(
-                "[rule 3: digest-pinned image] container_image_refs entry {image_ref:?} is not digest-pinned (missing @sha256:)"
+                "[rule 3: digest-pinned image] container_image_refs entry {image_ref:?} is not digest-pinned (missing or malformed @sha256:<64 lowercase hex>)"
             ));
         }
     }
@@ -187,6 +184,27 @@ fn check_results_dir(manifest: &Manifest, violations: &mut Vec<String>) {
         violations.push(format!(
             "[rule 6: results_dir] results_dir {:?} must be relative under {RESULTS_DIR_PREFIX}",
             results_dir
+        ));
+    }
+}
+
+/// `checkout_root` must be a relative path with no `..` traversal.
+fn check_checkout_root(manifest: &Manifest, violations: &mut Vec<String>) {
+    let checkout_root = &manifest.checkout_root;
+    if checkout_root.is_absolute() {
+        violations.push(format!(
+            "[rule 7: checkout_root] checkout_root {:?} must be a relative path, not absolute",
+            checkout_root
+        ));
+        return;
+    }
+    if checkout_root
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        violations.push(format!(
+            "[rule 7: checkout_root] checkout_root {:?} must not contain '..' traversal",
+            checkout_root
         ));
     }
 }

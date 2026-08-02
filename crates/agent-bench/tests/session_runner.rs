@@ -61,6 +61,34 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Creates a real git checkout at `root/name`, commits one file, and
+/// returns its HEAD SHA -- `resolve_checkouts` in bench-run.rs requires the
+/// pinned commit to match a real checkout's HEAD.
+fn init_git_checkout(root: &Path, name: &str) -> String {
+    let checkout = root.join(name);
+    fs::create_dir_all(&checkout).unwrap();
+    let git = |args: &[&str]| {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "test"]);
+    fs::write(checkout.join("README.md"), "test\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "init"]);
+    let out = Command::new("git")
+        .args(["-C", checkout.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
 fn write_questions(path: &Path, ids: &[&str]) {
     let questions: Vec<Value> = ids
         .iter()
@@ -79,7 +107,13 @@ fn write_questions(path: &Path, ids: &[&str]) {
     fs::write(path, content).unwrap();
 }
 
-fn write_manifest(path: &Path, question_set_hash: &str, results_dir: &Path) {
+fn write_manifest(
+    path: &Path,
+    question_set_hash: &str,
+    results_dir: &Path,
+    checkout_root: &Path,
+    commit: &str,
+) {
     let content = format!(
         r#"
 claude_code_version = "2.1.0"
@@ -87,6 +121,7 @@ question_set_hash = "{hash}"
 container_image_refs = []
 prompt_hashes = []
 results_dir = "{results_dir}"
+checkout_root = "{checkout_root}"
 
 [model_ids]
 subject = "claude-sonnet-5"
@@ -95,11 +130,13 @@ judge = "claude-opus-5"
 [[subject_repos]]
 name = "hallouminate"
 url = "https://github.com/paulnsorensen/hallouminate"
-commit = "deadbeef"
+commit = "{commit}"
 size_class = "small"
 "#,
         hash = question_set_hash,
         results_dir = results_dir.display(),
+        checkout_root = checkout_root.display(),
+        commit = commit,
     );
     fs::write(path, content).unwrap();
 }
@@ -200,7 +237,9 @@ fn sessions_jsonl_has_one_record_per_question_arm_run_with_transcripts_and_full_
     let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
     let manifest_path = dir.path().join("manifest.toml");
     let out_dir = dir.path().join("out");
-    write_manifest(&manifest_path, &hash, &out_dir);
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
 
     let status = Command::new(env!("CARGO_BIN_EXE_bench-run"))
         .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
@@ -255,7 +294,14 @@ fn drifted_question_set_hash_aborts_before_any_session_spawns() {
     let out_dir = dir.path().join("out");
     let sentinel = dir.path().join("sentinel");
     let stale_hash = "0000deadbeef0000";
-    write_manifest(&manifest_path, stale_hash, &out_dir);
+    let checkout_root = dir.path().join("checkouts");
+    write_manifest(
+        &manifest_path,
+        stale_hash,
+        &out_dir,
+        &checkout_root,
+        "deadbeef",
+    );
 
     let actual_hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
 
@@ -300,7 +346,9 @@ fn rerun_without_force_skips_and_with_force_overwrites() {
     let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
     let manifest_path = dir.path().join("manifest.toml");
     let out_dir = dir.path().join("out");
-    write_manifest(&manifest_path, &hash, &out_dir);
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
 
     let run = |force: bool, answer: &str| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_bench-run"));
@@ -361,7 +409,9 @@ fn invalid_json_response_is_recorded_as_an_error_with_nonzero_exit_status() {
     let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
     let manifest_path = dir.path().join("manifest.toml");
     let out_dir = dir.path().join("out");
-    write_manifest(&manifest_path, &hash, &out_dir);
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
 
     let status = Command::new(env!("CARGO_BIN_EXE_bench-run"))
         .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
@@ -394,5 +444,55 @@ fn invalid_json_response_is_recorded_as_an_error_with_nonzero_exit_status() {
     assert!(
         !records[0].answer_text.is_empty(),
         "an error record must carry a diagnostic, not a silent empty answer"
+    );
+}
+
+#[test]
+fn checkout_drift_aborts_before_any_session_spawns() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let sentinel = dir.path().join("sentinel");
+    let checkout_root = dir.path().join("checkouts");
+    let actual_commit = init_git_checkout(&checkout_root, "hallouminate");
+    let pinned_commit = "0".repeat(40);
+    write_manifest(
+        &manifest_path,
+        &hash,
+        &out_dir,
+        &checkout_root,
+        &pinned_commit,
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_SENTINEL", &sentinel)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "drifted checkout must abort with non-zero exit"
+    );
+    assert!(!sentinel.exists(), "fake CLI ran despite checkout drift");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&pinned_commit),
+        "stderr missing manifest's pinned commit: {stderr}"
+    );
+    assert!(
+        stderr.contains(&actual_commit),
+        "stderr missing the checkout's actual HEAD: {stderr}"
     );
 }

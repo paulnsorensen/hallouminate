@@ -187,6 +187,11 @@ pub struct Manifest {
     pub question_set_hash: String,
     pub container_image_refs: Vec<String>,
     pub results_dir: PathBuf,
+    /// Directory (relative to the repo root) under which subject repo
+    /// checkouts live, at `<checkout_root>/<subject_repo.name>`. Every
+    /// checkout must exist and have its `HEAD` match the pinned `commit`;
+    /// a missing or drifted checkout is a hard failure, never a warning.
+    pub checkout_root: PathBuf,
 }
 
 /// Pass-rate and usage summary for one arm (optionally filtered to one tag).

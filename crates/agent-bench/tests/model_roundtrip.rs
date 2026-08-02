@@ -225,6 +225,7 @@ fn manifest_round_trips_against_literal_json_and_toml() {
         question_set_hash: "question-hash".to_string(),
         container_image_refs: vec!["ghcr.io/example/agent:latest".to_string()],
         results_dir: PathBuf::from("/results/run-1"),
+        checkout_root: PathBuf::from("checkouts"),
     };
 
     let json = serde_json::json!({
@@ -239,7 +240,8 @@ fn manifest_round_trips_against_literal_json_and_toml() {
         "prompt_hashes": [{"path": "prompts/wiki.md", "blake3": "abc123"}],
         "question_set_hash": "question-hash",
         "container_image_refs": ["ghcr.io/example/agent:latest"],
-        "results_dir": "/results/run-1"
+        "results_dir": "/results/run-1",
+        "checkout_root": "checkouts"
     });
     assert_eq!(serde_json::to_value(&manifest).unwrap(), json);
     let from_json: Manifest = serde_json::from_value(json).unwrap();
@@ -250,6 +252,7 @@ claude_code_version = "2.1.0"
 question_set_hash = "question-hash"
 container_image_refs = ["ghcr.io/example/agent:latest"]
 results_dir = "/results/run-1"
+checkout_root = "checkouts"
 
 [model_ids]
 subject = "claude-sonnet-5"
