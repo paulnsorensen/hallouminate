@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "hallouminate": {
+      "command": "hallouminate",
+      "args": ["serve"],
+      "env": {
+        "HALLOUMINATE_CORPUS_SCOPE": "repo:*:wiki"
+      }
+    }
+  }
+}
