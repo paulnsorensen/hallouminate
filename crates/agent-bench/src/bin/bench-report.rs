@@ -244,9 +244,14 @@ fn pass_pow_k(n: usize, c: usize, k: usize) -> f64 {
 }
 
 /// Average the per-question pass@k estimator across `pairs` (one `(n, c)`
-/// per question), for every `k` in the observed range `1..=max(n)`. A
-/// question whose own `n` is smaller than `k` is guarded out of that `k`'s
-/// average (never evaluated with `k > n`) rather than padded or clamped.
+/// per question), for every `k` in `1..=min(n)` across the group. Using
+/// `min(n)` rather than `max(n)` means every reported `k` is averaged over
+/// ALL questions in the group -- the same population `ArmSummary.questions`
+/// reports -- instead of a k-dependent subset that silently shrinks as k
+/// grows while `questions` keeps reporting the full count. The tradeoff:
+/// pass@k above the hardest-judged question's run count is not reported at
+/// all, rather than reported over a smaller, undisclosed population; that
+/// cutoff is visible directly as the highest key in the map.
 fn aggregate_pass_at_k(pairs: &[(usize, usize)]) -> BTreeMap<u32, f64> {
     aggregate(pairs, pass_at_k)
 }
@@ -259,20 +264,11 @@ fn aggregate(
     pairs: &[(usize, usize)],
     estimator: fn(usize, usize, usize) -> f64,
 ) -> BTreeMap<u32, f64> {
-    let max_n = pairs.iter().map(|&(n, _)| n).max().unwrap_or(0);
+    let min_n = pairs.iter().map(|&(n, _)| n).min().unwrap_or(0);
     let mut map = BTreeMap::new();
-    for k in 1..=max_n {
-        let mut sum = 0.0;
-        let mut count = 0usize;
-        for &(n, c) in pairs {
-            if k <= n {
-                sum += estimator(n, c, k);
-                count += 1;
-            }
-        }
-        if count > 0 {
-            map.insert(k as u32, sum / count as f64);
-        }
+    for k in 1..=min_n {
+        let sum: f64 = pairs.iter().map(|&(n, c)| estimator(n, c, k)).sum();
+        map.insert(k as u32, sum / pairs.len() as f64);
     }
     map
 }
@@ -407,7 +403,11 @@ fn render_markdown(report: &BenchReport) -> String {
             "### {} ({}, {:?})\n\n",
             row.question_id, row.repo, row.tag
         ));
-        let flagged = !row.per_arm.is_empty() && row.per_arm.values().all(|s| s.passes == 0);
+        // Arm has exactly two variants (Wiki, Baseline), so `len() > 1` ==
+        // `== 2`: only flag when BOTH arms are present and both zero, not a
+        // single-arm question (which would otherwise vacuously satisfy
+        // `.values().all(...)` on one element).
+        let flagged = row.per_arm.len() > 1 && row.per_arm.values().all(|s| s.passes == 0);
         if flagged {
             out.push_str("**FLAGGED: zero passes in both arms**\n\n");
         }

@@ -87,6 +87,17 @@ const BENCH_RECIPES: &[&str] = &[
     "bench-report",
 ];
 
+/// The five cost-bearing recipes (all of `BENCH_RECIPES` except the free
+/// `bench-validate`) that must require an explicit dataset: no hardcoded
+/// example paths, no default values for `manifest`/`questions`.
+const COST_BEARING_DATASET_RECIPES: &[&str] = &[
+    "bench-author",
+    "bench-run",
+    "bench-judge",
+    "bench-judge-calibrate",
+    "bench-report",
+];
+
 /// Token-spending recipe -> the `--bin <runner>` marker its runner
 /// invocation carries, distinct from the two validator markers.
 const TOKEN_SPENDING_RECIPES: &[(&str, &str)] = &[
@@ -217,6 +228,41 @@ fn bench_recipes_are_not_reachable_from_ci() {
             assert!(
                 !line.contains(name),
                 "`ci` must not reach bench recipe `{name}` (found in line: {line:?})"
+            );
+        }
+    }
+}
+
+/// Full, untrimmed `name ...params...:` header line per recipe.
+fn recipe_headers(text: &str) -> std::collections::BTreeMap<String, String> {
+    let mut headers = std::collections::BTreeMap::new();
+    for line in text.lines() {
+        if is_recipe_header(line) {
+            headers.insert(recipe_name(line).to_string(), line.to_string());
+        }
+    }
+    headers
+}
+
+#[test]
+fn cost_bearing_recipes_require_manifest_and_questions_with_no_default() {
+    let headers = recipe_headers(&justfile_text());
+    for name in COST_BEARING_DATASET_RECIPES {
+        let header = headers
+            .get(*name)
+            .unwrap_or_else(|| panic!("missing bench recipe `{name}`"));
+        for param in ["manifest", "questions"] {
+            let bare = format!(" {param} ");
+            let bare_at_end = format!(" {param}:");
+            assert!(
+                header.contains(&bare) || header.contains(&bare_at_end),
+                "recipe `{name}` must take a required `{param}` parameter: {header:?}"
+            );
+            let default_single = format!("{param}='");
+            let default_double = format!("{param}=\"");
+            assert!(
+                !header.contains(&default_single) && !header.contains(&default_double),
+                "recipe `{name}`'s `{param}` parameter must not have a default value: {header:?}"
             );
         }
     }

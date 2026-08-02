@@ -222,6 +222,119 @@ fn pass_at_k_and_pass_pow_k_match_hand_computed_values() {
     }
 }
 
+#[test]
+fn pass_at_k_range_is_restricted_to_the_shared_min_n_across_questions() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions = [
+        sample_question("q-short", QuestionTag::WikiOnly),
+        sample_question("q-long", QuestionTag::WikiOnly),
+    ];
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions_path = dir.path().join("sessions.jsonl");
+    let grades_path = dir.path().join("grades.jsonl");
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 1,
+        cache_creation_input_tokens: 1,
+    };
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q-short",
+        Arm::Wiki,
+        3,
+        1,
+        usage,
+    );
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q-long",
+        Arm::Wiki,
+        10,
+        4,
+        usage,
+    );
+
+    let run = run_bench_report(
+        dir.path(),
+        "out",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        50,
+        1,
+        0.95,
+    );
+
+    let wiki_all = run
+        .report
+        .per_arm
+        .iter()
+        .find(|s| s.arm == Arm::Wiki && s.tag.is_none())
+        .expect("Wiki/all ArmSummary present");
+
+    assert_eq!(wiki_all.questions, 2);
+    assert_eq!(
+        wiki_all.pass_at_k.keys().max().copied(),
+        Some(3),
+        "pass@k must stop at min(n)=3 so every k covers both questions: {:?}",
+        wiki_all.pass_at_k
+    );
+    assert_eq!(
+        wiki_all.pass_pow_k.keys().max().copied(),
+        Some(3),
+        "pass^k must stop at min(n)=3 so every k covers both questions: {:?}",
+        wiki_all.pass_pow_k
+    );
+}
+
+#[test]
+fn single_arm_zero_passes_is_not_flagged_as_both_arms() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions = [sample_question("q-solo", QuestionTag::WikiOnly)];
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions_path = dir.path().join("sessions.jsonl");
+    let grades_path = dir.path().join("grades.jsonl");
+    let usage = TokenUsage {
+        input_tokens: 1,
+        output_tokens: 1,
+        cache_read_input_tokens: 1,
+        cache_creation_input_tokens: 1,
+    };
+    write_runs(
+        &sessions_path,
+        &grades_path,
+        "q-solo",
+        Arm::Wiki,
+        3,
+        0,
+        usage,
+    );
+
+    let run = run_bench_report(
+        dir.path(),
+        "out",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        50,
+        1,
+        0.95,
+    );
+
+    let section = run
+        .report_md
+        .split("### ")
+        .find(|s| s.starts_with("q-solo"))
+        .expect("report.md must have a section for q-solo");
+    assert!(
+        !section.contains("FLAGGED"),
+        "single-arm question must not be flagged as both arms zero: {section}"
+    );
+}
+
 fn unpaired_ci_width(
     wiki: &[f64],
     baseline: &[f64],
@@ -253,22 +366,23 @@ fn unpaired_ci_width(
 fn paired_bootstrap_is_deterministic_and_narrower_than_unpaired_resampling() {
     let dir = tempfile::tempdir().unwrap();
 
-    // 6 questions, n = 10 runs per arm. Baseline pass counts are
-    // heterogeneous (1..=6 of 10); Wiki pass counts are baseline + 2 of 10
-    // for every question, so the per-question diff (wiki_rate -
-    // baseline_rate) is EXACTLY 0.2 for all six questions even though the
-    // raw per-question rates vary widely (0.1..0.8).
+    // 6 questions, n = 10 runs per arm. Both the raw per-question rates AND
+    // the per-question diff (wiki_rate - baseline_rate) genuinely vary:
+    // diffs = [0.1, 0.3, -0.1, 0.4, 0.0, 0.2] (includes a negative and a
+    // zero), mean 0.15. A `paired_bootstrap` stubbed to return a
+    // degenerate point (e.g. always the point estimate) cannot pass this
+    // test, because the resampled-mean distribution over these varying
+    // diffs has real spread: the CI must have nonzero width and must
+    // bracket the point estimate.
     //
-    // Paired bootstrap resamples QUESTIONS as the unit, so every resample's
-    // mean diff is a mix of six values that are all exactly 0.2 -> the
-    // resampled distribution is a point mass at 0.2 and the CI width is
-    // ~0. An unpaired bootstrap that resamples each arm's per-question
-    // rates independently mixes rates from different questions together,
-    // picking up the between-question variance in the raw rates (which is
-    // real, 0.1..0.8) even though the *paired* difference has none. That
-    // makes the unpaired CI strictly, unambiguously wider.
+    // Paired bootstrap resamples QUESTIONS as the unit, preserving each
+    // question's own (wiki, baseline) pairing; an unpaired bootstrap that
+    // resamples each arm's per-question rates independently additionally
+    // picks up the between-question variance in the raw rates (0.1..0.8),
+    // so it should still come out wider than the paired CI even though
+    // both now have nonzero width.
     let baseline_c = [1u32, 2, 3, 4, 5, 6];
-    let wiki_c = [3u32, 4, 5, 6, 7, 8];
+    let wiki_c = [2u32, 5, 2, 8, 5, 8];
     let n = 10u32;
 
     let questions: Vec<Question> = (1..=6)
@@ -338,15 +452,25 @@ fn paired_bootstrap_is_deterministic_and_narrower_than_unpaired_resampling() {
     let paired = &run_a.report.paired_ci;
     assert_eq!(paired.resamples, resamples);
     assert_eq!(paired.seed, seed);
+    // Hand-computed: diffs = [0.1, 0.3, -0.1, 0.4, 0.0, 0.2], sum = 0.9,
+    // mean = 0.9 / 6 = 0.15.
     assert!(
-        (paired.point_estimate - 0.2).abs() < 1e-9,
-        "point estimate should be the constant per-question diff 0.2, got {}",
+        (paired.point_estimate - 0.15).abs() < 1e-9,
+        "point estimate should be the mean per-question diff 0.15, got {}",
         paired.point_estimate
     );
     let paired_width = paired.upper - paired.lower;
     assert!(
-        paired_width < 1e-6,
-        "paired CI should collapse to ~a point given a constant per-question diff, got width {paired_width}"
+        paired_width > 0.0,
+        "paired CI must have nonzero width given genuinely varying per-question diffs, got width {paired_width}"
+    );
+    assert!(
+        paired.lower <= paired.point_estimate + 1e-9
+            && paired.point_estimate - 1e-9 <= paired.upper,
+        "CI must bracket the point estimate: lower={}, point_estimate={}, upper={}",
+        paired.lower,
+        paired.point_estimate,
+        paired.upper
     );
 
     let wiki_rates: Vec<f64> = wiki_c
