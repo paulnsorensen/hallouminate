@@ -87,9 +87,20 @@ const BENCH_RECIPES: &[&str] = &[
     "bench-report",
 ];
 
+/// Recipes that consume a frozen question set and so must require an
+/// explicit `questions` argument: no hardcoded example paths, no default
+/// value. `bench-author` is deliberately absent — authoring runs BEFORE the
+/// question set exists (see `bench_author_does_not_gate_on_a_frozen_question_set`).
+const QUESTION_SET_RECIPES: &[&str] = &[
+    "bench-run",
+    "bench-judge",
+    "bench-judge-calibrate",
+    "bench-report",
+];
+
 /// The five cost-bearing recipes (all of `BENCH_RECIPES` except the free
-/// `bench-validate`) that must require an explicit dataset: no hardcoded
-/// example paths, no default values for `manifest`/`questions`.
+/// `bench-validate`) that must require an explicit manifest: no hardcoded
+/// example paths, no default value.
 const COST_BEARING_DATASET_RECIPES: &[&str] = &[
     "bench-author",
     "bench-run",
@@ -140,9 +151,6 @@ fn token_spending_recipes_invoke_validators_before_the_runner() {
         let manifest_pos = body
             .find(VALIDATOR_MANIFEST_MARKER)
             .unwrap_or_else(|| panic!("recipe `{name}` never invokes {VALIDATOR_MANIFEST_MARKER}"));
-        let questions_pos = body.find(VALIDATOR_QUESTIONS_MARKER).unwrap_or_else(|| {
-            panic!("recipe `{name}` never invokes {VALIDATOR_QUESTIONS_MARKER}")
-        });
         let runner_pos = body
             .find(runner_marker)
             .unwrap_or_else(|| panic!("recipe `{name}` never invokes {runner_marker}"));
@@ -151,10 +159,72 @@ fn token_spending_recipes_invoke_validators_before_the_runner() {
             manifest_pos < runner_pos,
             "recipe `{name}` must invoke {VALIDATOR_MANIFEST_MARKER} before {runner_marker}"
         );
-        assert!(
-            questions_pos < runner_pos,
-            "recipe `{name}` must invoke {VALIDATOR_QUESTIONS_MARKER} before {runner_marker}"
-        );
+
+        if QUESTION_SET_RECIPES.contains(name) {
+            let questions_pos = body.find(VALIDATOR_QUESTIONS_MARKER).unwrap_or_else(|| {
+                panic!("recipe `{name}` never invokes {VALIDATOR_QUESTIONS_MARKER}")
+            });
+            assert!(
+                questions_pos < runner_pos,
+                "recipe `{name}` must invoke {VALIDATOR_QUESTIONS_MARKER} before {runner_marker}"
+            );
+        }
+    }
+}
+
+/// The protocol freezes the wiki FIRST and authors questions SECOND.
+/// `bench-validate-questions` enforces a ≥24-question count and per-repo tag
+/// floors, so gating `bench-author` on it makes a complete frozen question
+/// set a prerequisite for authoring the wiki those questions are written
+/// against — the ordering inverted.
+#[test]
+fn bench_author_does_not_gate_on_a_frozen_question_set() {
+    let recipes = parse_recipes(&justfile_text());
+    let body = recipes
+        .get("bench-author")
+        .expect("missing bench recipe `bench-author`")
+        .body
+        .join("\n");
+    assert!(
+        !body.contains(VALIDATOR_QUESTIONS_MARKER),
+        "recipe `bench-author` must not invoke {VALIDATOR_QUESTIONS_MARKER}: \
+         authoring consumes no question set, and the validator's count/tag \
+         floors would require a frozen question set to exist before the wiki \
+         those questions describe: {body}"
+    );
+}
+
+/// Every non-defaulted parameter a bench recipe demands must actually be
+/// used by its body. A required-but-discarded parameter makes callers pass
+/// an argument that changes nothing — e.g. a `manifest` the recipe never
+/// validates against.
+#[test]
+fn every_required_bench_recipe_param_is_used_by_its_body() {
+    let text = justfile_text();
+    let headers = recipe_headers(&text);
+    let recipes = parse_recipes(&text);
+    for name in BENCH_RECIPES {
+        let header = headers
+            .get(*name)
+            .unwrap_or_else(|| panic!("missing bench recipe `{name}`"));
+        let params = header
+            .split(':')
+            .next()
+            .expect("header has a colon")
+            .split_whitespace()
+            .skip(1);
+        let body = recipes[*name].body.join("\n");
+        for param in params {
+            if param.contains('=') {
+                continue;
+            }
+            let interpolation = format!("{{{{{param}}}}}");
+            assert!(
+                body.contains(&interpolation),
+                "recipe `{name}` requires parameter `{param}` but its body never \
+                 uses {interpolation} — drop the parameter or wire it in: {body}"
+            );
+        }
     }
 }
 
@@ -251,7 +321,12 @@ fn cost_bearing_recipes_require_manifest_and_questions_with_no_default() {
         let header = headers
             .get(*name)
             .unwrap_or_else(|| panic!("missing bench recipe `{name}`"));
-        for param in ["manifest", "questions"] {
+        let params: Vec<&str> = if QUESTION_SET_RECIPES.contains(name) {
+            vec!["manifest", "questions"]
+        } else {
+            vec!["manifest"]
+        };
+        for param in params {
             let bare = format!(" {param} ");
             let bare_at_end = format!(" {param}:");
             assert!(

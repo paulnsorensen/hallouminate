@@ -18,16 +18,28 @@ use agent_bench::SessionRecord;
 ///
 /// Behaviour is controlled by env vars so a single script covers every
 /// scenario:
-/// - `FAKE_CLI_SENTINEL=<path>`: touch that path on every invocation, so a
-///   test can prove the binary was (or was not) spawned.
+/// - `--version` as the first argument: print `$FAKE_CLI_VERSION (Claude
+///   Code)` (default `2.1.0`, matching `write_manifest`) and exit 0 without
+///   touching the sentinel — a version probe is not a session spawn.
+/// - `FAKE_CLI_SENTINEL=<path>`: touch that path on every session
+///   invocation, so a test can prove the binary was (or was not) spawned.
+/// - `FAKE_CLI_ARGV_LOG=<path>`: append the session's full argv to that
+///   path, one invocation per line.
 /// - `FAKE_CLI_MODE=invalid-json`: print non-JSON stdout and exit 0.
 /// - `FAKE_CLI_MODE=fail`: exit 3 with no stdout.
 /// - otherwise: print `{"result": "$FAKE_CLI_ANSWER", "usage": {...}}` with
 ///   all four usage fields non-zero and distinct, so a two-field sum would
 ///   visibly undercount.
 const FAKE_CLI: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' "${FAKE_CLI_VERSION:-2.1.0} (Claude Code)"
+  exit 0
+fi
 if [ -n "$FAKE_CLI_SENTINEL" ]; then
   touch "$FAKE_CLI_SENTINEL"
+fi
+if [ -n "$FAKE_CLI_ARGV_LOG" ]; then
+  printf '%s\n' "$*" >> "$FAKE_CLI_ARGV_LOG"
 fi
 mode="${FAKE_CLI_MODE:-ok}"
 answer="${FAKE_CLI_ANSWER:-default-answer}"
@@ -513,6 +525,272 @@ fn invalid_json_response_is_recorded_as_an_error_with_nonzero_exit_status() {
     assert!(
         !records[0].answer_text.is_empty(),
         "an error record must carry a diagnostic, not a silent empty answer"
+    );
+}
+
+/// The manifest pins `model_ids.subject` and the README promises every run
+/// is reproducible from its manifest. That only holds if the pin actually
+/// reaches the agent: without `--model`, the CLI resolves whatever default
+/// model is current, so two sweeps a week apart can silently use different
+/// models while the manifest certifies they did not.
+#[test]
+fn pinned_subject_model_reaches_the_agent_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let argv_log = dir.path().join("argv.log");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_ARGV_LOG", &argv_log)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .arg("--arm")
+        .arg("wiki")
+        .arg("--runs")
+        .arg("1")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let logged = fs::read_to_string(&argv_log).unwrap();
+    let lines: Vec<&str> = logged.lines().collect();
+    assert_eq!(lines.len(), 1, "expected exactly one session spawn");
+    // `write_manifest` pins model_ids.subject = "claude-sonnet-5".
+    assert!(
+        lines[0].contains("--model claude-sonnet-5"),
+        "session argv must carry the manifest's pinned subject model: {:?}",
+        lines[0]
+    );
+}
+
+/// `manifest.claude_code_version` is recorded provenance. Recording it
+/// without verifying it certifies a fact the harness never checked, so a
+/// sweep run under a different agent CLI is indistinguishable from a
+/// compliant one.
+#[test]
+fn agent_cli_version_mismatch_aborts_before_any_session_spawns() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let sentinel = dir.path().join("sentinel");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    // `write_manifest` pins claude_code_version = "2.1.0".
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_SENTINEL", &sentinel)
+        .env("FAKE_CLI_VERSION", "9.9.9")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .arg("--arm")
+        .arg("wiki")
+        .arg("--runs")
+        .arg("1")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "an agent CLI whose version differs from the manifest's pin must abort"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake CLI ran a session despite agent CLI version drift"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("2.1.0"),
+        "stderr missing the manifest's pinned version: {stderr}"
+    );
+    assert!(
+        stderr.contains("9.9.9"),
+        "stderr missing the CLI's actual version: {stderr}"
+    );
+}
+
+/// The resumable ledger keys records on (question_id, arm, run_index) only.
+/// After a question set is edited and re-frozen, every one of those triples
+/// still resolves, so a resume would skip every session and grade the OLD
+/// answers against the NEW gold answers. The re-freeze must refuse to resume.
+#[test]
+fn refrozen_question_set_refuses_to_resume_a_stale_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let first_hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(
+        &manifest_path,
+        &first_hash,
+        &out_dir,
+        &checkout_root,
+        &commit,
+    );
+
+    let status = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .arg("--arm")
+        .arg("wiki")
+        .arg("--runs")
+        .arg("1")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // Re-freeze: same question id, edited content, new hash in the manifest.
+    let mut set: Value =
+        serde_json::from_str(&fs::read_to_string(&questions_path).unwrap()).unwrap();
+    set["questions"][0]["gold_answer"] = json!("a materially different gold answer");
+    fs::write(&questions_path, serde_json::to_string(&set).unwrap()).unwrap();
+    let second_hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    assert_ne!(first_hash, second_hash);
+    write_manifest(
+        &manifest_path,
+        &second_hash,
+        &out_dir,
+        &checkout_root,
+        &commit,
+    );
+
+    let sentinel = dir.path().join("sentinel");
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_SENTINEL", &sentinel)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .arg("--arm")
+        .arg("wiki")
+        .arg("--runs")
+        .arg("1")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "resuming a ledger produced under a different question set must abort"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake CLI ran despite a stale ledger — the abort must precede any session"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&first_hash),
+        "stderr missing the ledger's question-set hash: {stderr}"
+    );
+    assert!(
+        stderr.contains(&second_hash),
+        "stderr missing the manifest's question-set hash: {stderr}"
+    );
+    assert!(
+        stderr.contains("--force"),
+        "stderr must point at the escape hatch: {stderr}"
+    );
+}
+
+/// `check_no_source_corpus_leak` used to match only the `[[repository]]`
+/// entry whose `name` equalled the BENCHMARK manifest's repo name. A subject
+/// repo's own config names itself whatever its author chose, so on the most
+/// likely real configuration the check found no entry and returned Ok —
+/// failing open on the sole enforcement point for the wiki-only invariant.
+#[test]
+fn source_corpus_leak_under_a_differently_named_repository_entry_still_aborts() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let sentinel = dir.path().join("sentinel");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
+
+    let hallouminate_dir = checkout_root.join("hallouminate").join(".hallouminate");
+    fs::create_dir_all(&hallouminate_dir).unwrap();
+    // The checkout's own config names itself "upstream-name", not the
+    // benchmark manifest's "hallouminate" label.
+    fs::write(
+        hallouminate_dir.join("config.toml"),
+        "[[repository]]\nname = \"upstream-name\"\npath = \".\"\ncorpus_paths = [\"src\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_SENTINEL", &sentinel)
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .arg("--arm")
+        .arg("wiki")
+        .arg("--out-dir")
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "corpus_paths under any [[repository]] entry must abort the wiki arm, \
+         whatever that entry calls itself"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake CLI ran despite a source-corpus leak under a differently named entry"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("upstream-name"),
+        "stderr missing the offending entry name: {stderr}"
+    );
+    assert!(
+        stderr.contains("src"),
+        "stderr missing the offending corpus_paths value: {stderr}"
     );
 }
 

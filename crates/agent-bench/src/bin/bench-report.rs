@@ -33,8 +33,10 @@ struct Cli {
     /// Directory to write report.json and report.md into.
     #[arg(long)]
     out_dir: PathBuf,
-    /// Bootstrap resamples for the paired confidence interval.
-    #[arg(long, default_value_t = 10_000)]
+    /// Bootstrap resamples for the paired confidence interval. Rejected at
+    /// parse time if zero: an empty resample pool reaches `percentile` with
+    /// an empty slice, where `sorted.len() - 1` underflows.
+    #[arg(long, default_value_t = 10_000, value_parser = clap::value_parser!(u32).range(1..))]
     resamples: u32,
     /// Seed for the bootstrap RNG, so runs are reproducible.
     #[arg(long)]
@@ -64,6 +66,20 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         .collect();
     let grades: Vec<GradeRecord> = read_jsonl(&cli.grades)?;
 
+    // A session that failed to spawn, exited non-zero, or returned
+    // unparseable JSON is recorded with a non-zero `exit_status` and
+    // `TokenUsage::default()`. Counting it would make it a FREE FAILURE: it
+    // would enter `n` for pass@k while contributing zero tokens, deflating
+    // both the arm's pass rate and its measured cost, and polluting the
+    // `tokens_to_correct_answer` denominator with runs that never spent a
+    // token. That is directionally dangerous rather than merely noisy --
+    // the wiki arm carries an extra MCP server and therefore an extra
+    // failure mode, so its startup failures would systematically flatter
+    // its own cost figure. Failed sessions are therefore excluded from `n`
+    // entirely and reported as a separate per-arm count in `report.md`, so
+    // they can never be silently absorbed into a pass rate.
+    let failed_sessions = count_failed_sessions(&sessions);
+
     // Joined by grade, since a grade always implies the session it graded.
     // A session with no matching grade (not yet judged) is simply not part
     // of the report; a grade with no matching session is a data-integrity
@@ -80,6 +96,9 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
                 grade.run_index
             )
         })?;
+        if session.exit_status != 0 {
+            continue;
+        }
         per_question
             .entry(grade.question_id.clone())
             .or_default()
@@ -137,7 +156,25 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         })
         .collect();
 
-    let paired_ci = paired_bootstrap(&question_rows, cli.resamples, cli.seed, cli.confidence);
+    let population = paired_population(&question_rows);
+    let paired_ci = paired_bootstrap(
+        "pass_rate_diff_wiki_minus_baseline",
+        &population.correctness_diffs,
+        cli.resamples,
+        cli.seed,
+        cli.confidence,
+    );
+    // The cost half of the (cost, correctness) pair the spec names. It is
+    // rendered into report.md but NOT into report.json: `BenchReport` holds
+    // a single `paired_ci` field, and extending that shared model type is
+    // outside this change's ownership (see the handoff note).
+    let cost_ci = paired_bootstrap(
+        "mean_tokens_per_run_diff_wiki_minus_baseline",
+        &population.cost_diffs,
+        cli.resamples,
+        cli.seed,
+        cli.confidence,
+    );
 
     let report = BenchReport {
         per_arm,
@@ -154,8 +191,11 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
         .with_context(|| format!("writing {}", report_json_path.display()))?;
 
     let report_md_path = cli.out_dir.join("report.md");
-    fs::write(&report_md_path, render_markdown(&report))
-        .with_context(|| format!("writing {}", report_md_path.display()))?;
+    fs::write(
+        &report_md_path,
+        render_markdown(&report, &failed_sessions, &cost_ci, &population),
+    )
+    .with_context(|| format!("writing {}", report_md_path.display()))?;
 
     Ok(())
 }
@@ -178,6 +218,19 @@ impl GroupAgg {
         self.passes += stat.passes;
         self.runs += stat.runs;
     }
+}
+
+/// Count sessions that did not exit cleanly, per arm. Counted over ALL
+/// sessions, graded or not: a session that never produced an answer may
+/// never have been judged at all, and it must still be visible.
+fn count_failed_sessions(sessions: &[SessionRecord]) -> BTreeMap<Arm, usize> {
+    let mut failed = BTreeMap::new();
+    for session in sessions {
+        if session.exit_status != 0 {
+            *failed.entry(session.arm).or_insert(0) += 1;
+        }
+    }
+    failed
 }
 
 fn question_arm_stat(runs: &[(bool, TokenUsage)]) -> QuestionArmStat {
@@ -283,21 +336,58 @@ fn aggregate(
 /// (cost, correctness) pair; correctness is the per-question pass rate.
 /// If no question has data in both arms, the CI collapses to a zero-width
 /// point at 0.0 rather than panicking on an empty resample pool.
-fn paired_bootstrap(rows: &[QuestionRow], resamples: u32, seed: u64, confidence: f64) -> PairedCi {
-    let diffs: Vec<f64> = rows
-        .iter()
-        .filter_map(|row| {
-            let wiki = row.per_arm.get(&Arm::Wiki)?;
-            let baseline = row.per_arm.get(&Arm::Baseline)?;
-            if wiki.runs == 0 || baseline.runs == 0 {
-                return None;
-            }
-            let wiki_rate = wiki.passes as f64 / wiki.runs as f64;
-            let baseline_rate = baseline.passes as f64 / baseline.runs as f64;
-            Some(wiki_rate - baseline_rate)
-        })
-        .collect();
+/// The paired population behind every CI: one (correctness, cost) pair per
+/// question that has runs in BOTH arms, plus the ids of the questions that
+/// could not be paired.
+///
+/// Dropped ids are carried rather than discarded so `report.md` can name
+/// them: a CI over 3 questions and a CI over 24 otherwise print identically.
+#[derive(Debug, Default)]
+struct PairedPopulation {
+    /// Per-question wiki-minus-baseline pass-rate difference.
+    correctness_diffs: Vec<f64>,
+    /// Per-question wiki-minus-baseline mean tokens per run.
+    ///
+    /// Mean tokens per run, not `tokens_to_correct_answer`: the latter is
+    /// undefined for a question with zero passes in an arm, so pairing on it
+    /// would silently drop exactly the hardest questions from the cost CI's
+    /// population -- the same invisible-population defect this struct exists
+    /// to close.
+    cost_diffs: Vec<f64>,
+    /// Question ids present in the report but missing runs in an arm.
+    dropped: Vec<String>,
+}
 
+fn paired_population(rows: &[QuestionRow]) -> PairedPopulation {
+    let mut population = PairedPopulation::default();
+    for row in rows {
+        let paired = row
+            .per_arm
+            .get(&Arm::Wiki)
+            .zip(row.per_arm.get(&Arm::Baseline))
+            .filter(|(wiki, baseline)| wiki.runs > 0 && baseline.runs > 0);
+        let Some((wiki, baseline)) = paired else {
+            population.dropped.push(row.question_id.clone());
+            continue;
+        };
+        population.correctness_diffs.push(
+            wiki.passes as f64 / wiki.runs as f64 - baseline.passes as f64 / baseline.runs as f64,
+        );
+        population.cost_diffs.push(
+            wiki.usage.total() as f64 / wiki.runs as f64
+                - baseline.usage.total() as f64 / baseline.runs as f64,
+        );
+    }
+    population
+}
+
+fn paired_bootstrap(
+    metric: &str,
+    diffs: &[f64],
+    resamples: u32,
+    seed: u64,
+    confidence: f64,
+) -> PairedCi {
     let point_estimate = if diffs.is_empty() {
         0.0
     } else {
@@ -326,7 +416,7 @@ fn paired_bootstrap(rows: &[QuestionRow], resamples: u32, seed: u64, confidence:
     };
 
     PairedCi {
-        metric: "pass_rate_diff_wiki_minus_baseline".to_string(),
+        metric: metric.to_string(),
         point_estimate,
         lower,
         upper,
@@ -351,9 +441,27 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
-fn render_markdown(report: &BenchReport) -> String {
+fn render_markdown(
+    report: &BenchReport,
+    failed_sessions: &BTreeMap<Arm, usize>,
+    cost_ci: &PairedCi,
+    population: &PairedPopulation,
+) -> String {
     let mut out = String::new();
     out.push_str("# Wiki-Grounding Benchmark Report\n\n");
+
+    // Printed before anything else: a failed session is excluded from every
+    // figure below, so the count of what was dropped has to be as visible
+    // as the figures it was dropped from.
+    out.push_str("## Failed sessions (excluded from every figure below)\n\n");
+    if failed_sessions.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for (arm, count) in failed_sessions {
+            out.push_str(&format!("- {arm:?}: {count}\n"));
+        }
+    }
+    out.push('\n');
 
     out.push_str("## Per-arm summary\n\n");
     for summary in &report.per_arm {
@@ -438,6 +546,48 @@ fn render_markdown(report: &BenchReport) -> String {
     ));
     out.push_str(&format!("- resamples: {}\n", report.paired_ci.resamples));
     out.push_str(&format!("- seed: {}\n", report.paired_ci.seed));
+    out.push_str(&format!(
+        "- paired questions: {}\n",
+        population.correctness_diffs.len()
+    ));
+    out.push('\n');
+
+    // The cost CI lives in report.md only. `BenchReport` carries a single
+    // `paired_ci` field, and that shared model type is consumed by other
+    // binaries, so a second interval cannot enter report.json without
+    // changing it. Tracked as a follow-up.
+    out.push_str("## Paired bootstrap CI (token cost)\n\n");
+    out.push_str(&format!("- metric: {}\n", cost_ci.metric));
+    out.push_str(&format!(
+        "- point_estimate: {:.4}\n",
+        cost_ci.point_estimate
+    ));
+    out.push_str(&format!(
+        "- {:.0}% CI: [{:.4}, {:.4}]\n",
+        cost_ci.confidence * 100.0,
+        cost_ci.lower,
+        cost_ci.upper
+    ));
+    out.push_str(&format!("- resamples: {}\n", cost_ci.resamples));
+    out.push_str(&format!("- seed: {}\n", cost_ci.seed));
+    out.push_str(&format!(
+        "- paired questions: {}\n",
+        population.cost_diffs.len()
+    ));
+    out.push('\n');
+
+    // Named, never silently discarded: a CI computed over a shrunken
+    // population reads as a stronger result than it is, so the questions
+    // that fell out have to appear next to the interval they are missing
+    // from.
+    out.push_str("## Questions dropped from the paired CIs\n\n");
+    if population.dropped.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for id in &population.dropped {
+            out.push_str(&format!("- {id} (missing runs in an arm)\n"));
+        }
+    }
 
     out
 }

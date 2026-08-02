@@ -12,11 +12,11 @@ use std::time::Instant;
 
 use anyhow::{Context, bail};
 use clap::{Parser, ValueEnum};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use agent_bench::{
     Arm, Manifest, Question, QuestionSet, SessionRecord, TokenUsage, append_jsonl,
-    blake3_file_hash, load_json, load_toml, read_jsonl, repo_root,
+    blake3_file_hash, load_json, load_toml, read_jsonl, repo_root, verify_agent_cli_version,
 };
 
 /// Directory (relative to the repository root, not the process cwd) holding
@@ -24,6 +24,12 @@ use agent_bench::{
 /// <ARM_CONFIG_DIR>/wiki-arm.mcp.json`; the baseline arm with
 /// `<ARM_CONFIG_DIR>/baseline-arm.mcp.json`.
 const ARM_CONFIG_DIR: &str = "eval/agent-bench/config";
+
+/// Sidecar in `--out-dir` recording which question set the `sessions.jsonl`
+/// ledger beside it was produced under. `SessionRecord`'s field set is
+/// frozen and shared with the judge and report curds, so the ledger's
+/// question-set identity lives here rather than on every record.
+const RUN_META_FILE: &str = "run-meta.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ArmSelector {
@@ -62,6 +68,20 @@ struct Cli {
 struct AgentOutput {
     result: String,
     usage: TokenUsage,
+}
+
+/// The agent CLI invocation's run-invariant parts: which binary to spawn and
+/// the subject model every session must be pinned to.
+#[derive(Debug, Clone, Copy)]
+struct AgentCli<'a> {
+    bin: &'a str,
+    subject_model: &'a str,
+}
+
+/// Contents of `<out-dir>/run-meta.json`.
+#[derive(Debug, Serialize, Deserialize)]
+struct RunMeta {
+    question_set_hash: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -111,6 +131,17 @@ fn main() -> anyhow::Result<()> {
         .map(|(i, r)| ((r.question_id.clone(), r.arm, r.run_index), i))
         .collect();
 
+    // A ledger is keyed on (question_id, arm, run_index) alone, so after the
+    // question set is edited and re-frozen every one of those triples still
+    // resolves and every session is skipped -- silently grading the previous
+    // set's answers against the new gold answers. Refuse to resume across a
+    // re-freeze.
+    let meta_path = out_dir.join(RUN_META_FILE);
+    if !records.is_empty() && !cli.force {
+        check_ledger_question_set(&meta_path, &manifest.question_set_hash)?;
+    }
+    write_run_meta(&meta_path, &manifest.question_set_hash)?;
+
     let repo_root = repo_root();
     let checkouts = resolve_checkouts(&repo_root, &manifest)?;
     if arms.contains(&Arm::Wiki) {
@@ -122,6 +153,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
     let bin = std::env::var("AGENT_BENCH_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+    verify_agent_cli_version(&bin, &manifest.claude_code_version)?;
+    let agent = AgentCli {
+        bin: &bin,
+        subject_model: &manifest.model_ids.subject,
+    };
 
     for question in &question_set.questions {
         for &arm in &arms {
@@ -136,7 +172,7 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     let record = run_session(
-                        &bin,
+                        agent,
                         &config_path,
                         question,
                         arm,
@@ -147,7 +183,7 @@ fn main() -> anyhow::Result<()> {
                     records[pos] = record;
                 } else {
                     let record = run_session(
-                        &bin,
+                        agent,
                         &config_path,
                         question,
                         arm,
@@ -231,30 +267,74 @@ struct RepoLayerConfig {
 }
 
 /// Hard-fails if `checkout`'s `.hallouminate/config.toml` declares
-/// `corpus_paths` for `repo_name`. The wiki arm's entire measurement claim
-/// rests on the wiki corpus being the only corpus the agent can reach; a
-/// non-empty `corpus_paths` derives a `repo:{name}:corpus` source corpus
+/// `corpus_paths` under ANY `[[repository]]` entry. The wiki arm's entire
+/// measurement claim rests on the wiki corpus being the only corpus the
+/// agent can reach; a non-empty `corpus_paths` derives a
+/// `repo:{name}:corpus` source corpus
 /// (`crates/hallouminate-domain/src/repository.rs:104-125`) that would leak
 /// semantic source search into the "wiki" measurement. No config file at
 /// all is fine — no corpus derivation happens without it.
+///
+/// Every entry is checked, not just the one whose `name` matches the
+/// benchmark manifest's: the benchmark name is a label the operator picked
+/// for the checkout directory, while the checkout's own config names itself
+/// whatever its author chose. Matching on the name made the sole
+/// enforcement point for the wiki-only invariant fail open on the most
+/// likely real configuration. `repo_name` names the subject repo in the
+/// diagnostic only.
 fn check_no_source_corpus_leak(checkout: &Path, repo_name: &str) -> anyhow::Result<()> {
     let config_path = checkout.join(".hallouminate").join("config.toml");
-    if !config_path.is_dir() && !config_path.exists() {
+    if !config_path.exists() {
         return Ok(());
     }
     let config: RepoLayerConfig = load_toml(&config_path)?;
-    let Some(entry) = config.repository.iter().find(|r| r.name == repo_name) else {
-        return Ok(());
-    };
-    if !entry.corpus_paths.is_empty() {
+    for entry in &config.repository {
+        if !entry.corpus_paths.is_empty() {
+            bail!(
+                "subject repo {:?}: {} declares corpus_paths = {:?} under [[repository]] name = {:?} \u{2014} the wiki arm requires no source corpus in this checkout, or the measured effect stops being \"the wiki\"",
+                repo_name,
+                config_path.display(),
+                entry.corpus_paths,
+                entry.name,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to resume a ledger produced under a different question set.
+fn check_ledger_question_set(meta_path: &Path, manifest_hash: &str) -> anyhow::Result<()> {
+    if !meta_path.exists() {
         bail!(
-            "subject repo {:?}: {} declares corpus_paths = {:?} \u{2014} the wiki arm requires no source corpus for this repo, or the measured effect stops being \"the wiki\"",
-            repo_name,
-            config_path.display(),
-            entry.corpus_paths,
+            "existing sessions.jsonl carries no recorded question-set hash ({} is missing), \
+             so it cannot be shown to match the manifest's question_set_hash {} \u{2014} \
+             re-run with --force to overwrite it, or point --out-dir at a fresh directory",
+            meta_path.display(),
+            manifest_hash,
+        );
+    }
+    let meta: RunMeta = load_json(meta_path)?;
+    if meta.question_set_hash != manifest_hash {
+        bail!(
+            "question-set re-freeze: the existing sessions.jsonl was produced under \
+             question_set_hash {}, but the manifest pins {} \u{2014} resuming would skip \
+             every already-recorded session and grade the previous set's answers against \
+             the new gold answers; re-run with --force to re-run them, or point --out-dir \
+             at a fresh directory",
+            meta.question_set_hash,
+            manifest_hash,
         );
     }
     Ok(())
+}
+
+fn write_run_meta(meta_path: &Path, manifest_hash: &str) -> anyhow::Result<()> {
+    let meta = RunMeta {
+        question_set_hash: manifest_hash.to_string(),
+    };
+    let json = serde_json::to_string_pretty(&meta)?;
+    fs::write(meta_path, json)
+        .with_context(|| format!("writing run metadata to {}", meta_path.display()))
 }
 
 fn arm_config_path(repo_root: &Path, arm: Arm) -> PathBuf {
@@ -279,7 +359,7 @@ fn arm_dir_name(arm: Arm) -> &'static str {
 /// `answer_text`, zero usage) rather than dropped or silently treated as a
 /// clean zero-usage success.
 fn run_session(
-    bin: &str,
+    agent: AgentCli<'_>,
     config_path: &Path,
     question: &Question,
     arm: Arm,
@@ -288,7 +368,7 @@ fn run_session(
     checkout: &Path,
 ) -> anyhow::Result<SessionRecord> {
     let start = Instant::now();
-    let spawned = Command::new(bin)
+    let spawned = Command::new(agent.bin)
         .current_dir(checkout)
         .arg("-p")
         .arg(&question.question)
@@ -296,13 +376,18 @@ fn run_session(
         .arg("json")
         .arg("--mcp-config")
         .arg(config_path)
+        // Without this the CLI resolves whatever default model is current,
+        // so `manifest.model_ids.subject` would be recorded provenance the
+        // run never honoured.
+        .arg("--model")
+        .arg(agent.subject_model)
         .output();
     let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let (stdout, mut exit_status) = match spawned {
         Ok(output) => (output.stdout, output.status.code().unwrap_or(-1)),
         Err(err) => (
-            format!("bench-run: failed to spawn agent {bin:?}: {err}").into_bytes(),
+            format!("bench-run: failed to spawn agent {:?}: {err}", agent.bin).into_bytes(),
             -1,
         ),
     };

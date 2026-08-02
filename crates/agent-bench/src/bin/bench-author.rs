@@ -20,6 +20,11 @@ const CONTINUE_MESSAGE: &str = "Continue.";
 /// How many characters of a malformed response to include in diagnostics.
 const EXCERPT_LEN: usize = 500;
 
+/// Hard cap on authoring turns. The budget alone does not bound the loop: a
+/// turn that never signals completion and reports no usage advances neither
+/// exit condition, so the runner respawns forever.
+const MAX_TURNS: usize = 200;
+
 #[derive(Parser)]
 #[command(about = "Drive budgeted agent wiki-authoring for one subject repo")]
 struct Args {
@@ -124,15 +129,34 @@ fn main() -> anyhow::Result<()> {
     let wiki_dir = checkout.join(".hallouminate").join("wiki");
     let claude_bin =
         std::env::var("AGENT_BENCH_CLAUDE_BIN").unwrap_or_else(|_| DEFAULT_CLAUDE_BIN.to_string());
+    agent_bench::verify_agent_cli_version(&claude_bin, &manifest.claude_code_version)?;
+    let subject_model = manifest.model_ids.subject.as_str();
     let mut cumulative = TokenUsage::default();
     let mut turn = 0usize;
 
     loop {
+        if turn >= MAX_TURNS {
+            bail!(
+                "authoring did not complete within the {MAX_TURNS}-turn cap (consumed {} of {} budget tokens) \u{2014} the agent never signalled completion",
+                cumulative.total(),
+                args.budget_tokens,
+            );
+        }
         let started = Instant::now();
         let mut command = Command::new(&claude_bin);
         command.current_dir(&checkout);
+        // Without --model the CLI resolves whatever default model is
+        // current, making `manifest.model_ids.subject` provenance the
+        // authoring run never honoured.
         if turn == 0 {
-            command.args(["-p", &prompt_text, "--output-format", "json"]);
+            command.args([
+                "-p",
+                &prompt_text,
+                "--output-format",
+                "json",
+                "--model",
+                subject_model,
+            ]);
         } else {
             command.args([
                 "-p",
@@ -140,6 +164,8 @@ fn main() -> anyhow::Result<()> {
                 "--output-format",
                 "json",
                 "--continue",
+                "--model",
+                subject_model,
             ]);
         }
         let output = command
@@ -166,6 +192,17 @@ fn main() -> anyhow::Result<()> {
                 excerpt(&stdout)
             )
         })?;
+        // A real turn always costs tokens. A well-formed reply reporting no
+        // usage at all means the CLI never reached the model (auth failure,
+        // MCP startup failure); it advances neither loop exit, so treat it
+        // as the error it is rather than respawning against it.
+        if usage.total() == 0 {
+            bail!(
+                "turn {turn}: agent CLI reported zero total token usage, which no real turn does \u{2014} \
+                 the CLI most likely never reached the model: {}",
+                excerpt(&stdout)
+            );
+        }
 
         cumulative += usage;
         agent_bench::append_jsonl(

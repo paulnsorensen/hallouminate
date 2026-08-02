@@ -43,12 +43,14 @@ bench-validate manifest='eval/agent-bench/manifest.example.toml' questions='eval
     just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}}
 
 # Author one subject repo's wiki under a token budget. Cost-bearing: spends
-# real model tokens. Validates the given manifest/questions dataset first
-# so authoring never runs against a drifted dataset.
-bench-author repo budget manifest questions:
+# real model tokens. Validates the given manifest first so authoring never
+# runs against a drifted manifest. Deliberately does NOT validate a question
+# set: the protocol freezes the wiki first and authors questions second, and
+# bench-validate-questions enforces count and per-repo tag floors that no
+# question set can meet before the wiki it describes exists.
+bench-author repo budget manifest:
     @echo "bench-author: cost-bearing run — spends real model tokens"
     just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
-    just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
     just verify cargo run -q -p agent-bench --bin bench-author -- --manifest {{manifest}} --repo {{repo}} --budget-tokens {{budget}} --out-dir eval/agent-bench/wikis/{{repo}}
 
 # Paired session sweep across both arms. Cost-bearing: spends real model
@@ -67,7 +69,7 @@ bench-judge manifest questions:
     @echo "bench-judge: cost-bearing run — spends real judge tokens"
     just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
     just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
-    just verify cargo run -q -p agent-bench --bin bench-judge -- --sessions eval/agent-bench/results/sessions.jsonl --questions {{questions}} --out eval/agent-bench/results/grades.jsonl
+    just verify cargo run -q -p agent-bench --bin bench-judge -- --manifest {{manifest}} --sessions eval/agent-bench/results/sessions.jsonl --questions {{questions}} --out eval/agent-bench/results/grades.jsonl
 
 # Calibrate the automated judge against a human-labelled grades.jsonl.
 # Cost-bearing: spends real judge tokens. Validates the given
@@ -77,11 +79,15 @@ bench-judge-calibrate manifest questions human_grades:
     @echo "bench-judge-calibrate: cost-bearing run — spends real judge tokens"
     just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
     just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
-    just verify cargo run -q -p agent-bench --bin bench-judge -- --sessions eval/agent-bench/results/sessions.jsonl --questions {{questions}} --out eval/agent-bench/results/grades.jsonl --calibrate {{human_grades}}
+    just verify cargo run -q -p agent-bench --bin bench-judge -- --manifest {{manifest}} --sessions eval/agent-bench/results/sessions.jsonl --questions {{questions}} --out eval/agent-bench/results/grades.jsonl --calibrate {{human_grades}}
 
 # Aggregate sessions and grades into report.json/report.md. Not
 # cost-bearing: reads already-recorded records, spends no model tokens.
+# Still freeze-checks the dataset first: reporting against a drifted
+# question set is as wrong as running against one.
 bench-report manifest questions:
+    just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
+    just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
     just verify cargo run -q -p agent-bench --bin bench-report -- --sessions eval/agent-bench/results/sessions.jsonl --grades eval/agent-bench/results/grades.jsonl --questions {{questions}} --out-dir eval/agent-bench/results --seed 42
 
 # Prepare a new release bump PR: crate version, lockfile, and plugin manifests.

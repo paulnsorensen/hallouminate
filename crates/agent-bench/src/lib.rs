@@ -69,6 +69,37 @@ pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Verify the agent CLI at `bin` reports the version the manifest pins.
+///
+/// `manifest.claude_code_version` is recorded provenance; recording it
+/// without checking it certifies a fact nothing verified. `claude --version`
+/// prints `<version> (Claude Code)`, so the leading whitespace-delimited
+/// token is the version. Callers run this once, before spawning any measured
+/// session, so a drifted CLI aborts instead of producing numbers the
+/// manifest misdescribes.
+pub fn verify_agent_cli_version(bin: &str, expected_version: &str) -> anyhow::Result<()> {
+    let output = std::process::Command::new(bin)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("running `{bin} --version`"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "`{bin} --version` failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let actual = stdout.split_whitespace().next().unwrap_or("");
+    if actual != expected_version {
+        anyhow::bail!(
+            "agent CLI version drift: manifest.claude_code_version = {expected_version}, \
+             but `{bin} --version` reports {actual:?} \u{2014} refusing to start any \
+             measured run under an unpinned agent CLI",
+        );
+    }
+    Ok(())
+}
+
 /// Repository root, resolved at compile time from this crate's location
 /// under `crates/agent-bench` — independent of the process cwd.
 pub fn repo_root() -> PathBuf {

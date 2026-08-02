@@ -45,8 +45,16 @@ fn init_git_checkout(root: &Path, name: &str) -> String {
 
 /// Writes an executable `/bin/sh` fake agent CLI at `path`. `body` is the
 /// shell script's logic between the shebang and EOF.
+///
+/// Every fake answers `--version` first with `$FAKE_CLI_VERSION` (default
+/// `0.0.0-test`, matching `write_manifest`), since `bench-author` probes the
+/// agent CLI's version against the manifest's pin before authoring.
 fn write_fake_cli(path: &Path, body: &str) {
-    let script = format!("#!/bin/sh\n{body}\n");
+    let preamble = r#"if [ "$1" = "--version" ]; then
+  printf '%s\n' "${FAKE_CLI_VERSION:-0.0.0-test} (Claude Code)"
+  exit 0
+fi"#;
+    let script = format!("#!/bin/sh\n{preamble}\n{body}\n");
     fs::write(path, script).expect("writing fake CLI script");
     let mut perms = fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o755);
@@ -93,6 +101,32 @@ fn run_bench_author(
         .env("AGENT_BENCH_CLAUDE_BIN", fake_cli)
         .output()
         .expect("running bench-author")
+}
+
+/// Same as `run_bench_author`, but bounded: the child runs on a worker
+/// thread and the test fails rather than hanging the suite if it does not
+/// terminate within `timeout`.
+fn run_bench_author_bounded(
+    manifest: &Path,
+    repo: &str,
+    budget_tokens: u64,
+    out_dir: &Path,
+    fake_cli: &Path,
+    timeout: std::time::Duration,
+) -> std::process::Output {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (manifest, repo, out_dir, fake_cli) = (
+        manifest.to_path_buf(),
+        repo.to_string(),
+        out_dir.to_path_buf(),
+        fake_cli.to_path_buf(),
+    );
+    std::thread::spawn(move || {
+        let output = run_bench_author(&manifest, &repo, budget_tokens, &out_dir, &fake_cli);
+        let _ = tx.send(output);
+    });
+    rx.recv_timeout(timeout)
+        .expect("bench-author did not terminate within the bound — it is looping forever")
 }
 
 fn read_log_lines(out_dir: &Path) -> Vec<Value> {
@@ -336,4 +370,200 @@ fi
     assert_eq!(summary["total_tokens"].as_u64().unwrap(), expected_total);
     assert_eq!(summary["turns"].as_u64().unwrap(), 2);
     assert_eq!(summary["budget_tokens"].as_u64().unwrap(), 100_000);
+}
+
+/// Authoring is the run whose output the whole wiki arm is measured against.
+/// If the manifest's pinned subject model never reaches the CLI, the wiki was
+/// authored by whatever model happened to be the current default.
+#[test]
+fn pinned_subject_model_reaches_the_agent_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
+    let out_dir = dir.path().join("out");
+    let argv_log = dir.path().join("argv.log");
+    let counter_path = dir.path().join("counter");
+
+    // Two turns, so the resumed (`--continue`) turn is covered too.
+    let fake_cli = dir.path().join("fake-claude.sh");
+    write_fake_cli(
+        &fake_cli,
+        &format!(
+            r#"
+{{ printf '%s' "$*" | tr '\n' ' '; printf '\n'; }} >> "{argv_log}"
+COUNTER="{counter}"
+N=$(cat "$COUNTER" 2>/dev/null || echo 0)
+N=$((N + 1))
+printf '%s\n' "$N" > "$COUNTER"
+if [ "$N" -eq 1 ]; then
+  printf '%s\n' '{{"is_error":false,"subtype":"turn","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}}}}'
+else
+  printf '%s\n' '{{"is_error":false,"subtype":"success","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}}}}'
+fi
+"#,
+            argv_log = argv_log.display(),
+            counter = counter_path.display()
+        ),
+    );
+
+    let output = run_bench_author(&manifest_path, "demo-repo", 100_000, &out_dir, &fake_cli);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let logged = fs::read_to_string(&argv_log).unwrap();
+    let lines: Vec<&str> = logged.lines().collect();
+    assert_eq!(lines.len(), 2, "expected two authoring turns: {logged}");
+    // `write_manifest` pins model_ids.subject = "claude-sonnet-5".
+    for line in &lines {
+        assert!(
+            line.contains("--model claude-sonnet-5"),
+            "every authoring turn must carry the manifest's pinned subject model: {line:?}"
+        );
+    }
+}
+
+/// Same defect class as the unapplied model pin: `claude_code_version` is
+/// recorded provenance nothing verified, so a wiki authored under a
+/// different agent CLI is indistinguishable from a compliant one.
+#[test]
+fn agent_cli_version_mismatch_aborts_before_authoring() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    // `write_manifest` pins claude_code_version = "0.0.0-test".
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
+    let out_dir = dir.path().join("out");
+    let sentinel = dir.path().join("sentinel");
+
+    let fake_cli = dir.path().join("fake-claude.sh");
+    write_fake_cli(
+        &fake_cli,
+        &format!(
+            r#"
+touch "{sentinel}"
+printf '%s\n' '{{"is_error":false,"subtype":"success","usage":{{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}}}}'
+"#,
+            sentinel = sentinel.display()
+        ),
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-author"))
+        .args([
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--repo",
+            "demo-repo",
+            "--budget-tokens",
+            "100000",
+            "--out-dir",
+            out_dir.to_str().unwrap(),
+        ])
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_VERSION", "9.9.9")
+        .output()
+        .expect("running bench-author");
+
+    assert!(
+        !output.status.success(),
+        "an agent CLI whose version differs from the manifest's pin must abort"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake CLI authored a turn despite agent CLI version drift"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("0.0.0-test"),
+        "stderr missing the manifest's pinned version: {stderr}"
+    );
+    assert!(
+        stderr.contains("9.9.9"),
+        "stderr missing the CLI's actual version: {stderr}"
+    );
+    assert!(read_log_lines(&out_dir).is_empty());
+}
+
+/// A CLI returning well-formed JSON with `is_error: true` and all-zero usage
+/// (auth failure, MCP startup failure) satisfies neither loop exit: it never
+/// completes and never spends budget. Before the fix this ran forever —
+/// measured at ~6000 turns in 15 seconds with an unbounded log.
+#[test]
+fn zero_usage_turn_is_an_error_rather_than_an_endless_respawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
+    let out_dir = dir.path().join("out");
+
+    let fake_cli = dir.path().join("fake-claude.sh");
+    write_fake_cli(
+        &fake_cli,
+        r#"printf '%s\n' '{"is_error":true,"subtype":"error_during_execution","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"#,
+    );
+
+    let output = run_bench_author_bounded(
+        &manifest_path,
+        "demo-repo",
+        100_000,
+        &out_dir,
+        &fake_cli,
+        std::time::Duration::from_secs(60),
+    );
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("turn 0") && stderr.contains("zero"),
+        "stderr must name the turn and its zero usage: {stderr}"
+    );
+}
+
+/// A non-completing turn that DOES spend tokens still loops until the budget
+/// runs out — with a generous budget that is effectively forever. The turn
+/// cap bounds it independently of the budget.
+#[test]
+fn non_completing_turns_stop_at_the_turn_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
+    let out_dir = dir.path().join("out");
+
+    let fake_cli = dir.path().join("fake-claude.sh");
+    write_fake_cli(
+        &fake_cli,
+        r#"printf '%s\n' '{"is_error":false,"subtype":"turn","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}'"#,
+    );
+
+    let output = run_bench_author_bounded(
+        &manifest_path,
+        "demo-repo",
+        u64::from(u32::MAX),
+        &out_dir,
+        &fake_cli,
+        std::time::Duration::from_secs(120),
+    );
+    assert!(!output.status.success());
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("200"),
+        "stderr must name the turn cap it hit: {stderr}"
+    );
+
+    let lines = read_log_lines(&out_dir);
+    assert_eq!(
+        lines.len(),
+        200,
+        "the cap must stop the loop at exactly MAX_TURNS turns"
+    );
 }
