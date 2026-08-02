@@ -488,3 +488,187 @@ fn abstention_prompt_carries_the_fabrication_rule_from_the_rubric_file() {
         "prompt did not carry the abstention not-recorded rule: {prompt}"
     );
 }
+
+#[test]
+fn rerun_without_force_skips_and_with_force_overwrites() {
+    let dir = tempfile::tempdir().unwrap();
+    let question = sample_question("q1", QuestionTag::Greppable);
+    let questions_path = write_question_set(dir.path(), std::slice::from_ref(&question));
+    let session = sample_session("q1", Arm::Wiki, 0, "answer text");
+    let sessions_path = write_sessions(dir.path(), std::slice::from_ref(&session));
+    let out_path = dir.path().join("grades.jsonl");
+
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        "cat > /dev/null\n\
+         json=\"{\\\"result\\\":\\\"SCORE: $JUDGE_SCORE\\nRATIONALE: $JUDGE_RATIONALE\\\"}\"\n\
+         printf '%s\\n' \"$json\"",
+    );
+
+    let run = |force: bool, score: &str, rationale: &str| {
+        let mut cmd = Command::new(bin_path());
+        cmd.env("AGENT_BENCH_CLAUDE_BIN", &fake)
+            .env("JUDGE_SCORE", score)
+            .env("JUDGE_RATIONALE", rationale)
+            .args([
+                "--sessions",
+                sessions_path.to_str().unwrap(),
+                "--questions",
+                questions_path.to_str().unwrap(),
+                "--out",
+                out_path.to_str().unwrap(),
+            ]);
+        if force {
+            cmd.arg("--force");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "bench-judge failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(false, "4", "first pass");
+    let records: Vec<GradeRecord> = agent_bench::read_jsonl(&out_path).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].judge_rationale, "first pass");
+
+    run(false, "0", "should be ignored");
+    let records: Vec<GradeRecord> = agent_bench::read_jsonl(&out_path).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "re-run without --force must not duplicate"
+    );
+    assert_eq!(
+        records[0].judge_rationale, "first pass",
+        "re-run without --force must not overwrite the existing record"
+    );
+
+    run(true, "0", "forced update");
+    let records: Vec<GradeRecord> = agent_bench::read_jsonl(&out_path).unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "--force must overwrite the prior record in place, not duplicate it"
+    );
+    assert_eq!(records[0].judge_rationale, "forced update");
+    assert_eq!(records[0].score, 0);
+}
+
+#[test]
+fn arm_blindness_survives_a_realistic_unsanitized_wiki_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let capture_path = dir.path().join("captured_prompt.txt");
+
+    let question = sample_question("q1", QuestionTag::Greppable);
+    let questions_path = write_question_set(dir.path(), std::slice::from_ref(&question));
+    let session = sample_session(
+        "q1",
+        Arm::Wiki,
+        0,
+        "I found this by reading .hallouminate/wiki/architecture.md, which I looked up \
+         via the mcp read_markdown tool, and it names the request queue directly.",
+    );
+    let sessions_path = write_sessions(dir.path(), std::slice::from_ref(&session));
+    let out_path = dir.path().join("grades.jsonl");
+
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        &format!(
+            "cat > {capture:?}\nprintf '%s\\n' '{{\"result\":\"SCORE: 4\\nRATIONALE: matches gold.\"}}'",
+            capture = capture_path
+        ),
+    );
+
+    let output = Command::new(bin_path())
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+        .args([
+            "--sessions",
+            sessions_path.to_str().unwrap(),
+            "--questions",
+            questions_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bench-judge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let prompt = fs::read_to_string(&capture_path).unwrap();
+    let lower = prompt.to_lowercase();
+    for token in ["wiki", "baseline", "mcp", "hallouminate"] {
+        assert!(
+            !lower.contains(token),
+            "prompt leaked provenance token {token:?} from an unsanitized wiki-arm answer: {prompt}"
+        );
+    }
+}
+
+#[test]
+fn large_prompt_does_not_deadlock_writing_to_the_judge_process() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let question = Question {
+        repo: "subject-repo".to_string(),
+        id: "q1".to_string(),
+        tag: QuestionTag::Greppable,
+        question: "What does the queue module do?".to_string(),
+        gold_answer: "It manages the request queue.".to_string(),
+        rubric_notes: "x".repeat(200_000),
+    };
+    let questions_path = write_question_set(dir.path(), &[question]);
+    let session = sample_session("q1", Arm::Wiki, 0, "answer text");
+    let sessions_path = write_sessions(dir.path(), &[session]);
+    let out_path = dir.path().join("grades.jsonl");
+
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        "big=$(yes x | tr -d '\\n' | head -c 200000)\n\
+         json=\"{\\\"result\\\":\\\"SCORE: 4\\nRATIONALE: $big\\\"}\"\n\
+         printf '%s\\n' \"$json\"\n\
+         cat > /dev/null",
+    );
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let sessions_path_thread = sessions_path.clone();
+    let questions_path_thread = questions_path.clone();
+    let out_path_thread = out_path.clone();
+    let fake_thread = fake.clone();
+    std::thread::spawn(move || {
+        let output = Command::new(bin_path())
+            .env("AGENT_BENCH_CLAUDE_BIN", &fake_thread)
+            .args([
+                "--sessions",
+                sessions_path_thread.to_str().unwrap(),
+                "--questions",
+                questions_path_thread.to_str().unwrap(),
+                "--out",
+                out_path_thread.to_str().unwrap(),
+            ])
+            .output();
+        let _ = tx.send(output);
+    });
+
+    let output = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("bench-judge hung writing a large prompt to the judge process (pipe deadlock)")
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "bench-judge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records: Vec<GradeRecord> = agent_bench::read_jsonl(&out_path).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].score, 4);
+}
