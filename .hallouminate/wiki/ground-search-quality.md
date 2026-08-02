@@ -1,13 +1,14 @@
 ---
-status: draft
-last_verified: 2026-07-24
+status: reviewed
+last_verified: 2026-08-02
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
+  - https://github.com/paulnsorensen/hallouminate/pull/290
 ---
 # Ground search quality
 
-This draft fixes citation-noise ranking and sibling-worktree duplication by separating display text from indexed text, keying corpora by canonical root, and requiring relevance measurements before changing reranking defaults. It is proposed, not shipped.[^spec]
+This began as issue #288's design spec and **shipped in PR #290** (2026-07-25): display/indexed text separation, canonical-root corpus keying (schema v4), and the eval gate now exist in the source. The reranker default stayed opt-in because no candidate cleared the thresholds (Decision 4). The spec body, acceptance checklist, and quality gates below are retained as the historical design record, not current status.[^spec]
 
 ## Spec metadata
 
@@ -91,7 +92,7 @@ Grounding the draft against current code exposed five semantics that must be fix
 - `ChunkStore` identity changes ripple through domain, adapter, and daemon call sites.
 - Version-4 rebuild re-embeds every corpus on first touch; large corpora may take minutes.
 - No measured reranker cleared both thresholds; opt-in remains the recorded decision and #287 is the next path.[^measurement]
-- Per-worktree storage grows with active worktrees until #286 lands.[^spec]
+- Per-worktree storage grew with active worktrees until retired-root GC shipped in #304 (`distinct_roots` / `delete_root`); #286 tracked that cleanup.[^spec]
 
 ## Quality gates
 
@@ -109,4 +110,4 @@ Before: the citation chunk may rank first and stale sibling-worktree rows may ap
 [^eval]: `eval/README.md:75-85`; `.cheese/research/ground-retrieval-eval/findings.md:10-56`.
 [^measurement]: `eval/baseline.json` (`decision` and fusion variant metrics).
 
-_Source: GitHub issue #288, embedded spec, and six-comment design record · Updated: 2026-07-24 · Supersedes: —_
+_Source: GitHub issue #288, embedded spec, six-comment design record, and PR #290 (landed) · Updated: 2026-08-02 · Supersedes: the 2026-07-25 draft that declared this spec "proposed, not shipped"_
