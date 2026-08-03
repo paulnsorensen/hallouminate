@@ -1,17 +1,18 @@
 ---
-status: draft
-last_verified: 2026-07-24
+status: reviewed
+last_verified: 2026-08-02
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
+  - https://github.com/paulnsorensen/hallouminate/pull/290
 ---
 # Domain model
 
-Issue #288 proposes derived `search_text`, worktree-specific `CorpusKey`, and automatic older-schema rebuilds. They are not shipped in the source state described here.[^spec]
+Derived `search_text`, worktree-specific `CorpusKey`, and automatic older-schema rebuilds **shipped in PR #290** (schema v4). The right-hand column below and the sections that follow describe what landed, not a proposal.[^spec]
 
 ## Status matrix
 
-| Concern | Shipped baseline | Proposed |
+| Concern | Prior baseline | Landed in #290 |
 |---|---|---|
 | Search/display text | Prepared display `text` feeds rendering and search; claim comments are stripped, footnotes retained | Preserve display behavior; add search-only `search_text` |
 | Corpus identity | Bare name with paths carried separately | Pair name with canonical root |
@@ -50,7 +51,7 @@ LLM-generated context is excluded; #284 may layer it on later while deterministi
 
 ## `CorpusKey`
 
-The proposed semantic identity is:
+The semantic identity, shipped in #290 at `crates/hallouminate-domain/src/common.rs:45`, is:
 
 ```rust
 struct CorpusKey {
@@ -59,7 +60,7 @@ struct CorpusKey {
 }
 ```
 
-The exact Rust name is discretionary. Root resolution uses `canonicalize_or_passthrough(expand_tilde(configured_root))` consistently across scanning, planning, writes, and queries.[^spec]
+Root resolution uses `canonicalize_or_passthrough(expand_tilde(configured_root))` consistently across scanning, planning, writes, and queries.[^spec]
 
 ### Propagation
 
@@ -74,7 +75,7 @@ The current walker returns only `(FileRef, Mtime)` and planning deduplicates by 
 - Same name plus different root means different identity.
 - One worktree cannot list, search, touch, delete, replace, or count another's rows merely because names match.
 - Root canonicalization policy is identical at every seam.
-- Isolation does not clean retired roots; #286 owns garbage collection.[^f003]
+- Isolation does not clean retired roots; retired-root garbage collection shipped separately in #304 (`distinct_roots` / `delete_root`), tracked by #286.[^f003]
 
 ## Schema-version semantics
 
@@ -125,4 +126,4 @@ LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), co
 
 [^loop]: [Search reliability loop ADRs](search-reliability-loop-001.md), [production evaluation](search-reliability-loop-002.md), and [reranker representation](search-reliability-loop-003.md).
 
-_Source: issue #288 entity bindings and the approved search-reliability-loop spec · Updated: 2026-07-24 · Supersedes: —_
+_Source: issue #288 entity bindings, PR #290 (landed), and the approved search-reliability-loop spec · Updated: 2026-08-02 · Supersedes: the 2026-07-25 draft that framed `search_text` / `CorpusKey` / schema-v4 as unshipped_
