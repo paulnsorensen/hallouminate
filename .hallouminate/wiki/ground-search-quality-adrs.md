@@ -1,9 +1,10 @@
 ---
-status: draft
-last_verified: 2026-07-24
+status: reviewed
+last_verified: 2026-08-02
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
+  - https://github.com/paulnsorensen/hallouminate/pull/290
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055379
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055531
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055759
@@ -12,11 +13,11 @@ sources:
 ---
 # Ground search quality ADRs
 
-These five decisions define the proposed issue #288 design; PR #290 implements the retrieval/display and evaluation portions while retaining proposed status for future ranking policy.[^spec]
+These five decisions define the issue #288 design. PR #290 shipped the retrieval/display, worktree-identity, schema-migration, and evaluation portions (ADR-001/002/003, and the ADR-004 eval gate); the ADR-004 reranker default stayed opt-in and the ADR-005 LLM-context layer remains deferred to #284.[^spec]
 
 ## ADR-001 — Index search_text, display text
 
-Status: proposed.
+Status: shipped in #290 (schema v4).
 
 Decision: Preserve text as the rendering authority under its current preparation contract. Build deterministic search_text from heading breadcrumb + file summary + footnote-stripped body, and use it for embedding, FTS, and FM.[^spec]
 
@@ -28,7 +29,7 @@ Consequences: schema v4 and every search index rebuild. “Verbatim” means unc
 
 ## ADR-002 — Key corpora by name plus canonical root
 
-Status: proposed.
+Status: shipped in #290 (`CorpusKey`, `crates/hallouminate-domain/src/common.rs:45`).
 
 Decision: Introduce an identity equivalent to CorpusKey { name, canonical_root }, canonicalized via canonicalize_or_passthrough(expand_tilde(..)); persist root and apply name-plus-root predicates to every store operation.[^spec]
 
@@ -36,11 +37,11 @@ Evidence: #215 made deletes root-safe, yet name-only search still combines sibli
 
 Rejected: git-common-directory identity merges branches; name-only identity preserves duplicates; main-checkout resolution discards worktree-local semantics; post-search dedup may hide conflicts and choose the wrong version.
 
-Consequences: worktrees own distinct rows; storage grows until #286. Deliberate multi-root corpora union root-scoped queries with per-hit provenance.
+Consequences: worktrees own distinct rows; storage grew until retired-root GC shipped in #304 (tracked by #286). Deliberate multi-root corpora union root-scoped queries with per-hit provenance.
 
 ## ADR-003 — Rebuild older derived schemas automatically
 
-Status: proposed; amends the current fail-loud stale-schema convention.
+Status: shipped in #290; amends the prior fail-loud stale-schema convention.
 
 Decision: Version < 4 logs, recreates the derived chunks table, and runs catch-up indexing; = 4 opens normally; > 4 remains fatal.[^spec]
 
@@ -52,7 +53,7 @@ Consequences: first open may spend minutes re-embedding large corpora; migration
 
 ## ADR-004 — Let evaluation choose the reranker default
 
-Status: proposed; thresholds are provisional and agent-introduced.
+Status: eval gate shipped in #290; default remains opt-in — the first complete run selected `none-qualified`. Thresholds are agent-introduced.
 
 Decision: Choose the cheapest supported candidate with absolute MRR gain >= 0.05 and added p50 <= 500 ms; if none qualifies, remain opt-in.[^spec]
 
@@ -64,7 +65,7 @@ Consequences: a failed flip is a valid result; scheduled evaluation gates regres
 
 ## ADR-005 — Deterministic context now, LLM context later
 
-Status: proposed.
+Status: deterministic prepend shipped in #290; credentialed LLM context deferred to #284.
 
 Decision: Prepend heading breadcrumb and file summary to the stripped body, and require authored sections to open self-contained. Defer credentialed 50–100-token LLM context to #284.[^spec]
 
@@ -94,4 +95,4 @@ Implementation note: the diagnostic keeps rerank completion separate from z-scor
 [^eval]: eval/README.md:75-85; [ground-search-evaluation](ground-search-evaluation.md).
 [^implementation]: crates/hallouminate/tests/eval_ground_recall.rs:582-646,1124-1147; crates/hallouminate-domain/src/ground/orchestrate.rs:155-174; crates/hallouminate-daemon/src/dispatch.rs:385-417.
 
-_Source: issue #288 plus research comments 1–4 and Anthropic's Introducing Contextual Retrieval · Updated: 2026-07-24 · Supersedes: —_
+_Source: issue #288 plus research comments 1–4, PR #290 (landed), and Anthropic's Introducing Contextual Retrieval · Updated: 2026-08-02 · Supersedes: the 2026-07-25 draft that marked ADR-001/002/003/005 "proposed"_
