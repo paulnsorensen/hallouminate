@@ -1,5 +1,7 @@
 /target
-/docs/book
+/site/node_modules
+/site/dist
+/site/.astro
 .cheese/
 ralphs/
 .code-review-graph/

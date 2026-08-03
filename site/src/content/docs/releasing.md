@@ -1,4 +1,6 @@
-# Releasing crates
+---
+title: "Releasing crates"
+---
 
 The workspace publishes in dependency order: `hallouminate-domain`, then
 `hallouminate-adapters`, then `hallouminate-config`, then `hallouminate-daemon`,

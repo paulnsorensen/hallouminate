@@ -1,4 +1,6 @@
-# hallouminate
+---
+title: "Introduction"
+---
 
 Persistent, repo-local knowledge for coding agents. hallouminate stores
 markdown verbatim on disk, embeds it with
@@ -17,20 +19,20 @@ a wiki indexer that happens to tolerate code, not a code-intelligence tool.
 A long-lived local daemon owns the LanceDB ground directory, per-corpus
 mutation locks, and config resolution. The CLI and the stdio MCP server both
 talk to it over a Unix domain socket — one owner, no cross-process LanceDB
-races. See [Architecture](./architecture.md) for the full picture.
+races. See [Architecture](/hallouminate/architecture/) for the full picture.
 
 ## Where to go next
 
-- **[Installation](./install.md)** — install the binary and register the MCP
+- **[Installation](/hallouminate/install/)** — install the binary and register the MCP
   server with your agent.
-- **[How it compares](./comparison.md)** — choose between repo-local markdown,
+- **[How it compares](/hallouminate/comparison/)** — choose between repo-local markdown,
   agent memory, and knowledge-graph tools.
-- **[CLI reference](./cli.md)** — every subcommand and its flags.
-- **[MCP surface](./mcp.md)** — the ten tools an LLM calls to author and
+- **[CLI reference](/hallouminate/cli/)** — every subcommand and its flags.
+- **[MCP surface](/hallouminate/mcp/)** — the ten tools an LLM calls to author and
   search wikis.
-- **[Configuration](./config.md)** — the XDG baseline, repo-layer merge, and
+- **[Configuration](/hallouminate/config/)** — the XDG baseline, repo-layer merge, and
   embedding-model options.
-- **[Dogfooding](./dogfooding.md)** — this repo maintains its own wiki with
+- **[Dogfooding](/hallouminate/dogfooding/)** — this repo maintains its own wiki with
   hallouminate; here's how to read it.
 
 ## License

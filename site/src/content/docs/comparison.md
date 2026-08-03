@@ -1,4 +1,6 @@
-# How hallouminate compares
+---
+title: "How it compares"
+---
 
 Choose hallouminate when the knowledge should live with a code repository as
 reviewable markdown. Choose an agent-memory or knowledge-graph system when the

@@ -1,4 +1,6 @@
-# Development verification
+---
+title: "Development verification"
+---
 
 Run local Cargo checks through the repository verification gate:
 

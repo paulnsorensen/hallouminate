@@ -1,8 +1,10 @@
-# CLI reference
+---
+title: "CLI reference"
+---
 
 `hallouminate` is a single binary. The CLI, the MCP server, and the daemon are
 all the same executable; CLI subcommands dial the daemon over a Unix domain
-socket (see [Architecture](./architecture.md)).
+socket (see [Architecture](/hallouminate/architecture/)).
 
 | Command | Purpose |
 |---|---|
@@ -76,7 +78,7 @@ hallouminate config validate   # parse + flag unknown top-level keys
 hallouminate config download   # pre-fetch the configured embedding model
 ```
 
-See [Configuration](./config.md).
+See [Configuration](/hallouminate/config/).
 
 ## `hook`
 
@@ -93,4 +95,4 @@ other than the current directory.
 `--socket PATH` on `index`, `ground`, and the other client subcommands points
 at a specific daemon socket. Otherwise the socket is resolved from
 `HALLOUMINATE_SOCKET`, then `$XDG_RUNTIME_DIR`, then the cache dir — see
-[Architecture](./architecture.md#socket-location).
+[Architecture](/hallouminate/architecture/#socket-location).

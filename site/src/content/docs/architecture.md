@@ -1,4 +1,6 @@
-# Architecture
+---
+title: "Architecture"
+---
 
 Hallouminate uses a [Sliced Bread](https://github.com/paulnsorensen/hallouminate)
 layout — vertical slices with public APIs at slice boundaries, no cross-slice
@@ -71,5 +73,5 @@ skip both and run concurrently.
 ## A living example
 
 This repo's own architecture notes are also maintained as a hallouminate wiki
-at `.hallouminate/wiki/` — see [Dogfooding](./dogfooding.md). The wiki entries
+at `.hallouminate/wiki/` — see [Dogfooding](/hallouminate/dogfooding/). The wiki entries
 carry `file:line` and commit citations that this page summarizes.
