@@ -1,6 +1,7 @@
 ---
 import Header from '@cheeselord/design/components/Header.astro';
 import '@cheeselord/design/styles/cheeselord.css';
+import '@cheeselord/design/styles/flavors/hallouminate.css';
 
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 ---
@@ -94,15 +95,12 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   body {
     display: flex;
     flex-direction: column;
-    /* per-site color variation: the night grill — neutral charcoal field, one
-       ember accent (mirrors --cl-ink / --cl-amber in the hallouminate flavor) */
-    --cellar: oklch(16.5% 0.006 50);
-    --panel: oklch(19.5% 0.01 48);
-    --gold: oklch(79% 0.12 70);
-    /* the docs flavor's sear lines over a faint ember heat-glow at the top */
+    /* one layer past the shell: sear lines over a heat-glow tuned cooler and
+       softer than the default, still taking the flavor's own hue */
+    --glow: oklch(from var(--cl-ink) 26% 0.022 h / 45%);
     background:
       repeating-linear-gradient(90deg, oklch(from var(--gold) l c h / 4%) 0 2px, transparent 2px 16px),
-      radial-gradient(ellipse 60rem 40rem at 50% -10%, oklch(26% 0.022 70 / 45%), transparent),
+      radial-gradient(ellipse 60rem 40rem at 50% -10%, var(--glow), transparent),
       var(--cellar);
   }
   main {
@@ -142,7 +140,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
     margin-block-start: 2.2rem;
   }
   .btn {
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: var(--mono);
     font-size: 0.8rem;
     letter-spacing: 0.04em;
     padding: 0.7rem 1.15rem;
@@ -164,7 +162,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   }
   .meta {
     margin-block-start: 1.4rem;
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: var(--mono);
     font-size: 0.72rem;
     color: var(--dim);
   }
@@ -189,7 +187,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
     padding: 0.55rem 0.9rem;
     background: oklch(from var(--cellar) calc(l - 0.015) c h);
     border-block-end: 1px solid var(--hairline);
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: var(--mono);
     font-size: 0.68rem;
     letter-spacing: 0.06em;
     color: var(--dim);
@@ -201,7 +199,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   .term pre {
     margin: 0;
     padding: 1.1rem 1.2rem 1.3rem;
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: var(--mono);
     font-size: 0.76rem;
     line-height: 1.75;
     color: var(--bone);
@@ -227,7 +225,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   }
   .band h2 {
     margin: 0 0 2rem;
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: var(--mono);
     font-size: 0.72rem;
     font-weight: 400;
     letter-spacing: 0.18em;
@@ -245,7 +243,7 @@ const base = import.meta.env.BASE_URL.replace(/\/$/, '');
   }
   .steps strong {
     display: block;
-    font-family: 'IBM Plex Mono', ui-monospace, monospace;
+    font-family: var(--mono);
     font-size: 0.85rem;
     font-weight: 500;
   }
