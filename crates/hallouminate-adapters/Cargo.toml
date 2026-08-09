@@ -10,9 +10,6 @@ description = "Adapters layer for hallouminate."
 [dependencies]
 hallouminate-domain.workspace = true
 lancedb = "0.31"
-# Only the `arrow` umbrella: its `arrow::array` / `arrow::datatypes` re-exports
-# replace direct arrow-array/arrow-schema deps, so they can never drift apart.
-arrow = "58"
 async-trait.workspace = true
 futures = "0.3"
 fastembed = "5"
