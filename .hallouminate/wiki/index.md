@@ -23,13 +23,19 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [ground-search-evaluation](ground-search-evaluation.md) — discriminative file/chunk relevance metrics, latency thresholds, small-reranker comparison, and scheduled regression gate.
 - [ground-search-quality](ground-search-quality.md) — issue #288's spec, shipped in #290: indexed-text cleanup, worktree isolation, eval-gated reranking (default stayed opt-in), and authoring context.
 - [ground-search-quality-adrs](ground-search-quality-adrs.md) — five decisions and their research basis for issue #288; ADR-001/002/003/005 shipped in #290, ADR-004's reranker default stayed opt-in.
-- [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis.
+- [ground-signal-fusion-adrs](ground-signal-fusion-adrs.md) — the post-#290 ranking audit: why weighted RRF over four peer signals moved into the domain layer, why the shipped 0.5/0.5 literal weights were kept, and why the literal signals only reorder the FTS/vector pool.
+- [log](log.md) — append-only ingest log: what each wiki-ingest run wrote, merged, skipped as a near-duplicate, or flagged as conflicting, and why.
+- [mcp-surface](mcp-surface.md) — the eleven MCP tools the LLM uses to author and search wikis, including `add_markdown`'s surgical edit modes and the multi-root read/write asymmetry.
 - [multi-format-ingestion](multi-format-ingestion.md) — why hallouminate is markdown-only today, the per-format dispatch pattern (text/code/PDF), reachable tooling, and the open design questions before extending the indexer.
 - [office-prose-extraction](office-prose-extraction.md) — deferred/future-phase plan for .docx/.pptx/.odt prose extraction (not shipped today).
 - [ort-arena-retention](ort-arena-retention.md) — why session eviction never reclaimed embedder memory: upstream ONNX Runtime BFCArena retention; superseded by daemon idle-exit.
 - [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — deferred/future-phase plan for PDF and OCR ingestion (not shipped today).
 - [racy-mtime-smudge](racy-mtime-smudge.md) — why stored file mtimes are deliberately smudged by one millisecond at the write seam rather than fixing the equality gates.
 - [release-ceremony](release-ceremony.md) — release-flow gotchas the scripts don't tell you, learned cutting real releases.
+- [search-reliability-loop-001](search-reliability-loop-001.md) — ADR-001: verify authored knowledge with retrieval probes frozen *before* drafting, and give durable external research its own corpus-local source page.
+- [search-reliability-loop-002](search-reliability-loop-002.md) — ADR-002: separate the production regression gate (`just eval`) from reranker measurement (`just eval-measure`); supersedes ground-search-quality ADR-004's selection thresholds.
+- [search-reliability-loop-003](search-reliability-loop-003.md) — ADR-003: rerank the indexed `search_text` while `SearchHit.text` stays the display/evidence contract.
+- [sources/](sources/index.md) — corpus-local source pages for durable external research, each with a fixed indexed identity spine (title, URL, attribution, limitations).
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
 - [worktree-corpus-identity](worktree-corpus-identity.md) — #215's root-scoped delete fix, the #290 root-aware identity that closed the sibling-worktree search leak, and #304's retired-root garbage collection.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).

@@ -1,7 +1,7 @@
 ---
-status: draft
-last_verified: 2026-07-26
-confidence: medium
+status: reviewed
+last_verified: 2026-08-09
+confidence: high
 sources:
   - .cheese/specs/ground-signal-fusion.md
   - .cheese/notes/ground-ranking-fusion-audit.md
@@ -9,7 +9,11 @@ sources:
 ---
 # Ground signal fusion ADRs
 
-Six decisions from the ranking audit that followed PR #290, plus one criterion-2 resolution decided after review (ADR-006). The approved implementation contract is [.cheese/specs/ground-signal-fusion.md]; these records preserve the rationale behind it.
+Five decisions from the ranking audit that followed PR #290 (ADR-001…005), plus ADR-006's criterion-2 resolution decided after review and ADR-007's pool-scoping clarification from the follow-up documentation-accuracy pass.
+
+**This page is the durable record, not a companion to one.** The implementation contract it was written against, `.cheese/specs/ground-signal-fusion.md`, lives under the gitignored `.cheese/` tree and is not in the repository — a future reader has these ADRs and the code, nothing else. Cite the code seams, not the spec.
+
+The decisions shipped. Verified against the tree at 2026-08-09: `WeightedRRFReranker` is gone, weighted N-list RRF lives in `crates/hallouminate-domain/src/search/fuse.rs`, and the four signal weights ADR-006 argues about are live constants — `FTS_WEIGHT = 2.0`, `VECTOR_WEIGHT = 1.0`, `RIPGREP_WEIGHT = 0.5`, `CONTAINS_WEIGHT = 0.5` in `crates/hallouminate-domain/src/search.rs`. `fuse` breaks score ties toward the chunk more signals agreed on, then by `chunk_id` for determinism, and a chunk repeated within one list contributes only from its best rank.
 
 ### ADR-001: Move N-signal fusion into the domain layer [status: accepted]
 

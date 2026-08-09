@@ -53,7 +53,7 @@ Consequences: first open may spend minutes re-embedding large corpora; migration
 
 ## ADR-004 — Let evaluation choose the reranker default
 
-Status: eval gate shipped in #290; default remains opt-in — the first complete run selected `none-qualified`. Thresholds are agent-introduced.
+Status: eval gate shipped in #290; default remains opt-in — the first complete run selected `none-qualified`. Thresholds are agent-introduced. **The selection thresholds below are superseded** by [search-reliability-loop-002](search-reliability-loop-002.md), which split the two concerns: `just eval` enforces the committed production fusion baseline with no crossencoder, and `just eval-measure` reports a quality delta against the documented opt-in candidate but *never selects or enables* one. Nothing in the tree auto-flips the default any more, so read the thresholds below as the rationale for gating rather than as live mechanism.
 
 Decision: Choose the cheapest supported candidate with absolute MRR gain >= 0.05 and added p50 <= 500 ms; if none qualifies, remain opt-in.[^spec]
 
