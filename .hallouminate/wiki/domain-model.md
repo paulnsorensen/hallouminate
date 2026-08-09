@@ -1,10 +1,11 @@
 ---
 status: reviewed
-last_verified: 2026-08-02
+last_verified: 2026-08-09
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
   - https://github.com/paulnsorensen/hallouminate/pull/290
+  - https://github.com/paulnsorensen/hallouminate/pull/320
 ---
 # Domain model
 
@@ -113,6 +114,24 @@ The approved `search-reliability-loop` spec adds four proposed terms without cla
 
 The same approved design extends `SearchHit` with stored `search_text`, feeds that representation to the crossencoder, and continues building public Ground snippets from display `text`. This aligns every ranking stage on retrieval text without changing the Ground wire response.[^loop]
 
+## Daemon identity and ownership
+
+<certain> These terms define the canonical-daemon design, **shipped in PR #320** (issues #277, #318, #319). The ADRs behind them are [daemon-canonical-identity-001](daemon-canonical-identity-001.md), [-002](daemon-canonical-identity-002.md), and [-003](daemon-canonical-identity-003.md).
+
+**Canonical daemon socket** — The sole environment-independent default transport address for one OS user.
+_Avoid_: primary socket, fallback socket
+_Code_: `DaemonSocketPaths.canonical`; `crates/hallouminate-daemon/src/socket.rs:12-15,73-94`
+
+**Legacy daemon socket** — A discoverable pre-migration XDG address probed only during the compatibility window; removal tracked by #323.
+_Avoid_: sibling socket
+_Code_: `DaemonSocketPaths.legacy`; `crates/hallouminate-daemon/src/socket.rs:96-105`
+
+**Store lock owner** — The process whose open file description holds the exclusive `flock`; PID, socket, and version metadata only describe that holder.
+_Avoid_: lock metadata owner
+_Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-764`
+
+<certain> The shipped call sites have not caught up with this vocabulary: `connect_primary_or_sibling` and its `primary` / `sibling` locals still use the avoided terms.
+
 ## Excluded concepts
 
 LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), confidence-gated reranking (#287), rendered-footnote changes, public response-shape expansion, and any database-first source-of-truth model are outside this proposal.[^spec]
@@ -126,4 +145,4 @@ LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), co
 
 [^loop]: [Search reliability loop ADRs](search-reliability-loop-001.md), [production evaluation](search-reliability-loop-002.md), and [reranker representation](search-reliability-loop-003.md).
 
-_Source: issue #288 entity bindings, PR #290 (landed), and the approved search-reliability-loop spec · Updated: 2026-08-02 · Supersedes: the 2026-07-25 draft that framed `search_text` / `CorpusKey` / schema-v4 as unshipped_
+_Source: issue #288 entity bindings, PR #290 (landed), the approved search-reliability-loop spec, and PR #320 (landed) · Updated: 2026-08-09 · Supersedes: the 2026-07-25 draft that framed `search_text` / `CorpusKey` / schema-v4 as unshipped_
