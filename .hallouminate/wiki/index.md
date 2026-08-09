@@ -15,6 +15,9 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [config-layering](config-layering.md) — XDG baseline plus repo-layer merge; how a single daemon serves many repos.
 - [corpus-walker](corpus-walker.md) — gitignore-aware corpus walking and the explicit-root opt-in escape hatch.
 - [daemon-and-cli](daemon-and-cli.md) — why there's a daemon, the JSON-line socket protocol, the CLI subcommand surface.
+- [daemon-canonical-identity-001](daemon-canonical-identity-001.md) — why the default daemon socket is resolved from the OS account record instead of `XDG_RUNTIME_DIR` (#320).
+- [daemon-canonical-identity-002](daemon-canonical-identity-002.md) — the one ordered canonical→legacy discovery seam every client and lifecycle command shares, and the bounded migration window (#323 retires it).
+- [daemon-canonical-identity-003](daemon-canonical-identity-003.md) — store-lock owner diagnostics: what the `store.lock` metadata names, and why a second advisory guard proves it is current.
 - [debt-observed-test-isolation](debt-observed-test-isolation.md) — why the process-wide `debt::OBSERVED` static makes any Hard-recording test break concurrent maintenance-defer tests.
 - [design-rationale](design-rationale.md) — what hallouminate deliberately *is* and *isn't*, and why — the "why this design not that one" page.
 - [domain-model](domain-model.md) — the `search_text`, root-aware `CorpusKey`, and schema-v4 model that shipped in #290 (issue #288's design).
