@@ -376,7 +376,7 @@ fi
 /// If the manifest's pinned subject model never reaches the CLI, the wiki was
 /// authored by whatever model happened to be the current default.
 #[test]
-fn pinned_subject_model_reaches_the_agent_argv() {
+fn pinned_subject_model_and_isolation_flags_reach_the_agent_argv() {
     let dir = tempfile::tempdir().unwrap();
     let manifest_path = dir.path().join("manifest.json");
     let checkout_root = dir.path().join("checkouts");
@@ -423,6 +423,19 @@ fi
         assert!(
             line.contains("--model claude-sonnet-5"),
             "every authoring turn must carry the manifest's pinned subject model: {line:?}"
+        );
+        // Authoring passes no --mcp-config at all, so --strict-mcp-config
+        // means "native tools only"; without it an operator's ambient MCP
+        // config authors the wiki with tools the protocol never granted.
+        assert!(
+            line.contains("--strict-mcp-config"),
+            "every authoring turn must spawn with --strict-mcp-config: {line:?}"
+        );
+        // The fake logs `$*`, so the empty `--setting-sources` argument shows
+        // up as the trailing space after the flag.
+        assert!(
+            line.ends_with("--setting-sources "),
+            "every authoring turn must spawn with an empty --setting-sources: {line:?}"
         );
     }
 }

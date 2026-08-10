@@ -42,10 +42,25 @@ fn write_manifest(dir: &Path, judge_model: &str) -> PathBuf {
     path
 }
 
+/// The version probe every fake judge answers before its own body runs.
+/// `bench-judge` verifies the CLI against `manifest.claude_code_version`
+/// before grading anything, and a version probe is not a grading
+/// invocation, so it must not reach the body (which counts invocations and
+/// consumes stdin). `FAKE_CLI_VERSION` overrides the reported version so a
+/// test can drive the drift abort.
+const FAKE_JUDGE_VERSION_PROBE: &str = r#"if [ "$1" = "--version" ]; then
+  printf '%s\n' "${FAKE_CLI_VERSION:-0.0.0-test} (Claude Code)"
+  exit 0
+fi"#;
+
 /// Write an executable `#!/bin/sh` fake judge script.
 fn write_fake_judge(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::write(
+        &path,
+        format!("#!/bin/sh\n{FAKE_JUDGE_VERSION_PROBE}\n{body}\n"),
+    )
+    .unwrap();
     let mut perms = fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms).unwrap();
@@ -348,7 +363,7 @@ fn pass_derives_from_threshold_and_differs_across_thresholds() {
 }
 
 #[test]
-fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
+fn calibration_reports_hand_computed_agreement_and_gates_on_kappa() {
     let dir = tempfile::tempdir().unwrap();
     let questions = [
         sample_question("q1", QuestionTag::Greppable),
@@ -399,7 +414,9 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
     // exact agreement = 1/4 = 0.25, pass-threshold agreement = 3/4 = 0.75,
     // kappa = 0.5.
 
-    // Failing case: default --min-agreement 0.80 > 0.75 observed.
+    // Failing case: default --min-kappa 0.60 > 0.50 observed. Note the raw
+    // pass-threshold agreement here is 0.75, so the gate is demonstrably
+    // reading kappa and not that number.
     fs::remove_file(&counter_path).ok();
     let failing_out = dir.path().join("grades-fail.jsonl");
     let failing = Command::new(bin_path())
@@ -431,8 +448,13 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
         "{failing_stdout}"
     );
     assert!(failing_stdout.contains("kappa: 0.5000"), "{failing_stdout}");
+    let failing_stderr = String::from_utf8_lossy(&failing.stderr);
+    assert!(
+        failing_stderr.contains("kappa 0.5000") && failing_stderr.contains("--min-kappa"),
+        "the gate must fail on kappa, naming it: {failing_stderr}"
+    );
 
-    // Passing case: lower --min-agreement below the observed 0.75.
+    // Passing case: lower --min-kappa below the observed 0.50.
     fs::remove_file(&counter_path).ok();
     let passing_out = dir.path().join("grades-pass.jsonl");
     let passing = Command::new(bin_path())
@@ -450,8 +472,8 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
             "4",
             "--calibrate",
             human_path.to_str().unwrap(),
-            "--min-agreement",
-            "0.70",
+            "--min-kappa",
+            "0.40",
         ])
         .output()
         .unwrap();
@@ -459,6 +481,134 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
         passing.status.success(),
         "bench-judge failed: {}",
         String::from_utf8_lossy(&passing.stderr)
+    );
+}
+
+/// The regime the raw-agreement gate certified wrongly: every labelled item
+/// passes under both raters, so a judge indistinguishable from a constant
+/// "pass" scored 1.00 raw agreement. Chance-corrected agreement is undefined
+/// there, and an undefined statistic must not read as a passing one.
+#[test]
+fn calibration_on_an_all_pass_labelled_subset_refuses_to_certify() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions = [
+        sample_question("q1", QuestionTag::Greppable),
+        sample_question("q2", QuestionTag::Greppable),
+    ];
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions = [
+        sample_session("q1", Arm::Wiki, 0, "answer 1"),
+        sample_session("q2", Arm::Wiki, 0, "answer 2"),
+    ];
+    let sessions_path = write_sessions(dir.path(), &sessions);
+
+    // A judge that says "pass" to everything.
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        "cat > /dev/null\nprintf '%s\\n' '{\"result\":\"SCORE: 5\\nRATIONALE: r\"}'",
+    );
+
+    let human_grades = vec![
+        GradeRecord::grade("q1".to_string(), Arm::Wiki, 0, 5, 4, "human r1".to_string()).unwrap(),
+        GradeRecord::grade("q2".to_string(), Arm::Wiki, 0, 5, 4, "human r2".to_string()).unwrap(),
+    ];
+    let human_path = write_grades(dir.path(), "human-grades.jsonl", &human_grades);
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+
+    let output = Command::new(bin_path())
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+        .args([
+            "--sessions",
+            sessions_path.to_str().unwrap(),
+            "--questions",
+            questions_path.to_str().unwrap(),
+            "--out",
+            dir.path().join("grades.jsonl").to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--pass-threshold",
+            "4",
+            "--calibrate",
+            human_path.to_str().unwrap(),
+            // Raw pass-threshold agreement is 1.00 here; no min-kappa this
+            // low may rescue an undefined kappa.
+            "--min-kappa",
+            "0.0",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a labelled subset with no variance must not certify a judge"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("pass_threshold_agreement: 1.0000"),
+        "raw agreement must still be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("kappa: undefined"),
+        "kappa must report as undefined, not as a number: {stdout}"
+    );
+}
+
+/// `bench-judge` records `manifest.claude_code_version` as provenance the
+/// same way the runner and author binaries do, so it must verify it too --
+/// grading under a drifted CLI certifies a fact nothing checked.
+#[test]
+fn judge_agent_cli_version_mismatch_aborts_before_grading_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let question = sample_question("q1", QuestionTag::Greppable);
+    let questions_path = write_question_set(dir.path(), std::slice::from_ref(&question));
+    let session = sample_session("q1", Arm::Wiki, 0, "an answer");
+    let sessions_path = write_sessions(dir.path(), std::slice::from_ref(&session));
+    let out_path = dir.path().join("grades.jsonl");
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+
+    let sentinel = dir.path().join("sentinel");
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        &format!(
+            "cat > /dev/null\ntouch {sentinel:?}\nprintf '%s\\n' '{{\"result\":\"SCORE: 5\\nRATIONALE: r\"}}'",
+            sentinel = sentinel
+        ),
+    );
+
+    let output = Command::new(bin_path())
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+        .env("FAKE_CLI_VERSION", "9.9.9")
+        .args([
+            "--sessions",
+            sessions_path.to_str().unwrap(),
+            "--questions",
+            questions_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "grading under a drifted agent CLI must abort"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake judge ran despite the version drift — the abort must precede any grading"
+    );
+    assert!(
+        !out_path.exists(),
+        "no grades file may be written under a drifted agent CLI"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("0.0.0-test") && stderr.contains("9.9.9"),
+        "stderr must name both the pinned and the actual version: {stderr}"
     );
 }
 

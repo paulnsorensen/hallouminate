@@ -156,6 +156,13 @@ fn main() -> anyhow::Result<()> {
                 "json",
                 "--model",
                 subject_model,
+                // No --mcp-config is passed at all, so --strict-mcp-config
+                // here means "no MCP servers" -- intended: wiki authoring
+                // uses native tools only. --setting-sources "" keeps ambient
+                // hooks/permissions/settings out of the authoring run.
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
             ]);
         } else {
             command.args([
@@ -166,6 +173,9 @@ fn main() -> anyhow::Result<()> {
                 "--continue",
                 "--model",
                 subject_model,
+                "--strict-mcp-config",
+                "--setting-sources",
+                "",
             ]);
         }
         let output = command

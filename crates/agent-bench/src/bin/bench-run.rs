@@ -4,7 +4,7 @@
 //! run_index) under the pinned per-arm MCP config, recording one
 //! `SessionRecord` per session to `<out-dir>/sessions.jsonl`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,11 +25,16 @@ use agent_bench::{
 /// `<ARM_CONFIG_DIR>/baseline-arm.mcp.json`.
 const ARM_CONFIG_DIR: &str = "eval/agent-bench/config";
 
-/// Sidecar in `--out-dir` recording which question set the `sessions.jsonl`
-/// ledger beside it was produced under. `SessionRecord`'s field set is
-/// frozen and shared with the judge and report curds, so the ledger's
-/// question-set identity lives here rather than on every record.
+/// Sidecar in `--out-dir` recording which question set and which authored
+/// wikis the `sessions.jsonl` ledger beside it was produced under.
+/// `SessionRecord`'s field set is frozen and shared with the judge and
+/// report curds, so the ledger's treatment identity lives here rather than
+/// on every record.
 const RUN_META_FILE: &str = "run-meta.json";
+
+/// Path, relative to a subject repo checkout, of the authored wiki that is
+/// the wiki arm's entire treatment.
+const WIKI_RELATIVE_DIR: &str = ".hallouminate/wiki";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ArmSelector {
@@ -82,6 +87,12 @@ struct AgentCli<'a> {
 #[derive(Debug, Serialize, Deserialize)]
 struct RunMeta {
     question_set_hash: String,
+    /// blake3 digest of each subject repo's authored wiki tree, keyed by
+    /// subject repo name. Absent in metadata written before wiki
+    /// provenance was recorded, which reads as an empty map and so cannot
+    /// be shown to match anything but an empty wiki.
+    #[serde(default)]
+    wiki_hashes: BTreeMap<String, String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -131,19 +142,21 @@ fn main() -> anyhow::Result<()> {
         .map(|(i, r)| ((r.question_id.clone(), r.arm, r.run_index), i))
         .collect();
 
-    // A ledger is keyed on (question_id, arm, run_index) alone, so after the
-    // question set is edited and re-frozen every one of those triples still
-    // resolves and every session is skipped -- silently grading the previous
-    // set's answers against the new gold answers. Refuse to resume across a
-    // re-freeze.
-    let meta_path = out_dir.join(RUN_META_FILE);
-    if !records.is_empty() && !cli.force {
-        check_ledger_question_set(&meta_path, &manifest.question_set_hash)?;
-    }
-    write_run_meta(&meta_path, &manifest.question_set_hash)?;
-
     let repo_root = repo_root();
     let checkouts = resolve_checkouts(&repo_root, &manifest)?;
+
+    // A ledger is keyed on (question_id, arm, run_index) alone, so once the
+    // treatment changes every one of those triples still resolves and every
+    // completed session is skipped -- silently mixing two treatments into
+    // one arm. The question set and the authored wiki are both treatments,
+    // so both are recorded and both refuse resumption across a change.
+    let wiki_hashes = wiki_tree_hashes(&manifest, &checkouts)?;
+    let meta_path = out_dir.join(RUN_META_FILE);
+    if !records.is_empty() && !cli.force {
+        check_ledger_provenance(&meta_path, &manifest.question_set_hash, &wiki_hashes)?;
+    }
+    write_run_meta(&meta_path, &manifest.question_set_hash, &wiki_hashes)?;
+
     if arms.contains(&Arm::Wiki) {
         for repo in &manifest.subject_repos {
             let checkout = checkouts
@@ -302,8 +315,81 @@ fn check_no_source_corpus_leak(checkout: &Path, repo_name: &str) -> anyhow::Resu
     Ok(())
 }
 
-/// Refuse to resume a ledger produced under a different question set.
-fn check_ledger_question_set(meta_path: &Path, manifest_hash: &str) -> anyhow::Result<()> {
+/// blake3 digest of one checkout's authored wiki tree: every file under
+/// `.hallouminate/wiki`, folded in sorted relative-path order so the digest
+/// depends on content and layout but not on directory-iteration order. An
+/// absent wiki directory digests as the empty tree, which is what a
+/// baseline-only or pre-authoring run legitimately has.
+fn wiki_tree_hash(checkout: &Path) -> anyhow::Result<String> {
+    let wiki_dir = checkout.join(WIKI_RELATIVE_DIR);
+    let mut files = Vec::new();
+    collect_wiki_files(&wiki_dir, &wiki_dir, &mut files)?;
+    files.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (relative, file_hash) in &files {
+        hasher.update(relative.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(file_hash.as_bytes());
+        hasher.update(b"\0");
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn collect_wiki_files(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, String)>,
+) -> anyhow::Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let entries =
+        fs::read_dir(dir).with_context(|| format!("reading wiki directory {}", dir.display()))?;
+    for entry in entries {
+        let entry =
+            entry.with_context(|| format!("reading wiki directory entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_wiki_files(root, &path, out)?;
+        } else {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            out.push((relative, blake3_file_hash(&path)?));
+        }
+    }
+    Ok(())
+}
+
+/// Digest every subject repo's authored wiki, keyed by repo name.
+///
+/// Computed for every subject repo regardless of which arms this invocation
+/// runs: one `--out-dir` holds one ledger shared by both arms, so a
+/// baseline-only invocation still appends to the ledger the wiki arm's
+/// records live in.
+fn wiki_tree_hashes(
+    manifest: &Manifest,
+    checkouts: &HashMap<String, PathBuf>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut hashes = BTreeMap::new();
+    for repo in &manifest.subject_repos {
+        let checkout = checkouts
+            .get(&repo.name)
+            .unwrap_or_else(|| panic!("no resolved checkout for repo {:?}", repo.name));
+        hashes.insert(repo.name.clone(), wiki_tree_hash(checkout)?);
+    }
+    Ok(hashes)
+}
+
+/// Refuse to resume a ledger produced under a different question set or a
+/// different authored wiki.
+fn check_ledger_provenance(
+    meta_path: &Path,
+    manifest_hash: &str,
+    wiki_hashes: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     if !meta_path.exists() {
         bail!(
             "existing sessions.jsonl carries no recorded question-set hash ({} is missing), \
@@ -325,12 +411,59 @@ fn check_ledger_question_set(meta_path: &Path, manifest_hash: &str) -> anyhow::R
             manifest_hash,
         );
     }
+    check_ledger_wiki_hashes(&meta, wiki_hashes)?;
     Ok(())
 }
 
-fn write_run_meta(meta_path: &Path, manifest_hash: &str) -> anyhow::Result<()> {
+/// Refuse to resume a ledger whose recorded wiki digests differ from the
+/// wikis on disk now. The wiki *is* the wiki arm's treatment, so editing or
+/// re-authoring it mid-run puts pre-edit and post-edit sessions in one arm
+/// and averages two treatments into one number, with no error and no
+/// warning.
+fn check_ledger_wiki_hashes(
+    meta: &RunMeta,
+    wiki_hashes: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    if &meta.wiki_hashes == wiki_hashes {
+        return Ok(());
+    }
+    let mut changed = Vec::new();
+    for name in meta.wiki_hashes.keys().chain(wiki_hashes.keys()) {
+        let recorded = meta.wiki_hashes.get(name);
+        let current = wiki_hashes.get(name);
+        if recorded == current {
+            continue;
+        }
+        let describe = |hash: Option<&String>| match hash {
+            Some(hash) => hash.clone(),
+            None => "not recorded".to_string(),
+        };
+        let entry = format!(
+            "{name}: ledger {}, on disk {}",
+            describe(recorded),
+            describe(current),
+        );
+        if !changed.contains(&entry) {
+            changed.push(entry);
+        }
+    }
+    bail!(
+        "authored wiki re-freeze: the existing sessions.jsonl was produced under a different \
+         {WIKI_RELATIVE_DIR} tree \u{2014} [{}]; the wiki is the wiki arm's treatment, so \
+         resuming would keep the pre-edit sessions and average two treatments into one arm; \
+         re-run with --force to re-run them, or point --out-dir at a fresh directory",
+        changed.join("; "),
+    );
+}
+
+fn write_run_meta(
+    meta_path: &Path,
+    manifest_hash: &str,
+    wiki_hashes: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     let meta = RunMeta {
         question_set_hash: manifest_hash.to_string(),
+        wiki_hashes: wiki_hashes.clone(),
     };
     let json = serde_json::to_string_pretty(&meta)?;
     fs::write(meta_path, json)
@@ -381,6 +514,20 @@ fn run_session(
         // run never honoured.
         .arg("--model")
         .arg(agent.subject_model)
+        // Ambient user/project MCP config can attach servers to the baseline
+        // arm, whose entire defining property is having no MCP server
+        // attached; --strict-mcp-config keeps each arm's server set exactly
+        // what --mcp-config declares. --setting-sources "" blocks ambient
+        // hooks/permissions/settings from leaking into measured sessions,
+        // which otherwise vary per machine with nothing in the artifacts
+        // explaining the resulting delta.
+        //
+        // --safe-mode was considered and rejected: it also disables
+        // --mcp-config servers, which would silently run every arm
+        // native-tools-only and turn every reported delta into noise.
+        .arg("--strict-mcp-config")
+        .arg("--setting-sources")
+        .arg("")
         .output();
     let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
