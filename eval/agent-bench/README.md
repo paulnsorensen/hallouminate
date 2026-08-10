@@ -65,6 +65,13 @@ mechanisms, two structural and one checked by this harness:
    each subject repo's `<checkout>/.hallouminate/config.toml` and hard-fails
    if that repo's entry declares a non-empty `corpus_paths`, naming the repo
    and the offending value.
+4. Every session spawns with `--strict-mcp-config` and `--setting-sources ""`,
+   so each arm's server set is exactly what its `--mcp-config` declares and no
+   ambient user/project settings, hooks, or MCP entries reach the run. Without
+   the first flag an operator's own hallouminate entry attaches a server to
+   the baseline arm, whose defining property is having none. `--safe-mode` is
+   not used: it also strips `--mcp-config` servers, which would run every arm
+   native-tools-only and turn every reported delta into noise.
 
 **Unverified assumption.** Mechanisms 1 and 2 only bind if the hallouminate
 server that Claude Code spawns inherits the cwd `bench-run` sets on the agent
@@ -204,9 +211,14 @@ gold answer and `rubric_notes` (`agent_bench::Question`):
 `pass` is derived from `score >= threshold` (`agent_bench::GradeRecord::grade`,
 `GradeRecord::passes`). Judging is arm-blind: the judge sees the question and
 the answer text, never which arm produced it. A human-graded subset is used
-to calibrate the automated judge, and agreement between human and automated
-grades is reported at the pass threshold (fraction of the calibration subset
-where the automated `pass` bool matches the human `pass` bool).
+to calibrate the automated judge. Exact-score agreement and pass-threshold
+agreement are both reported, but the gate (`--min-kappa`, default 0.60) is on
+Cohen's kappa. Raw agreement is inflated by class skew: on a question set
+curated so a competent agent passes most items, a judge that returns "pass"
+unconditionally scores raw agreement equal to the pass rate while kappa = 0.
+A labelled subset with no variance (every item passes, or every item fails,
+under both raters) leaves kappa undefined and fails calibration — such a
+subset cannot certify a judge at all.
 
 ## Pinning and reproduction
 
@@ -236,7 +248,10 @@ re-hashed and every run measured against the old hash is no longer valid
 evidence for the claim under test:
 
 - Editing a subject repo's wiki after question authoring for that repo has
-  begun.
+  begun. `bench-run` records a blake3 digest of every subject repo's
+  `.hallouminate/wiki` tree in `<out-dir>/run-meta.json` and refuses to
+  resume a ledger whose digests no longer match, so a mid-run re-authoring
+  aborts instead of averaging two treatments into one arm.
 - Changing a prompt's text without rotating its recorded hash in
   `prompt_hashes`.
 - Changing either model ID in `model_ids` (subject or judge).

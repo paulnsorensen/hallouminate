@@ -534,7 +534,7 @@ fn invalid_json_response_is_recorded_as_an_error_with_nonzero_exit_status() {
 /// model is current, so two sweeps a week apart can silently use different
 /// models while the manifest certifies they did not.
 #[test]
-fn pinned_subject_model_reaches_the_agent_argv() {
+fn pinned_subject_model_and_isolation_flags_reach_the_agent_argv() {
     let dir = tempfile::tempdir().unwrap();
     let fake_cli = install_fake_cli(dir.path());
     let questions_path = dir.path().join("questions.json");
@@ -555,7 +555,7 @@ fn pinned_subject_model_reaches_the_agent_argv() {
         .arg("--questions")
         .arg(&questions_path)
         .arg("--arm")
-        .arg("wiki")
+        .arg("both")
         .arg("--runs")
         .arg("1")
         .arg("--out-dir")
@@ -570,13 +570,31 @@ fn pinned_subject_model_reaches_the_agent_argv() {
 
     let logged = fs::read_to_string(&argv_log).unwrap();
     let lines: Vec<&str> = logged.lines().collect();
-    assert_eq!(lines.len(), 1, "expected exactly one session spawn");
-    // `write_manifest` pins model_ids.subject = "claude-sonnet-5".
-    assert!(
-        lines[0].contains("--model claude-sonnet-5"),
-        "session argv must carry the manifest's pinned subject model: {:?}",
-        lines[0]
-    );
+    assert_eq!(lines.len(), 2, "expected one session spawn per arm");
+    for line in &lines {
+        // `write_manifest` pins model_ids.subject = "claude-sonnet-5".
+        assert!(
+            line.contains("--model claude-sonnet-5"),
+            "session argv must carry the manifest's pinned subject model: {line:?}"
+        );
+        // Ambient MCP config would otherwise attach a hallouminate server to
+        // the BASELINE arm, whose defining property is having none.
+        assert!(
+            line.contains("--strict-mcp-config"),
+            "every arm must spawn with --strict-mcp-config: {line:?}"
+        );
+        // The fake logs `$*`, so the empty `--setting-sources` argument shows
+        // up as the trailing space after the flag.
+        assert!(
+            line.ends_with("--setting-sources "),
+            "every arm must spawn with an empty --setting-sources: {line:?}"
+        );
+        assert!(
+            !line.contains("--safe-mode"),
+            "--safe-mode also strips --mcp-config servers, which would run \
+             every arm native-tools-only: {line:?}"
+        );
+    }
 }
 
 /// `manifest.claude_code_version` is recorded provenance. Recording it
@@ -632,6 +650,101 @@ fn agent_cli_version_mismatch_aborts_before_any_session_spawns() {
     assert!(
         stderr.contains("9.9.9"),
         "stderr missing the CLI's actual version: {stderr}"
+    );
+}
+
+/// The wiki IS the wiki arm's treatment, and the ledger's keys say nothing
+/// about it. Editing or re-authoring the wiki mid-run must refuse to resume,
+/// or the pre-edit and post-edit sessions sit in one arm and two treatments
+/// average into one number with no error and no warning.
+#[test]
+fn reauthored_wiki_refuses_to_resume_a_stale_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
+
+    // Author a wiki, then run one session against it.
+    let wiki_dir = checkout_root
+        .join("hallouminate")
+        .join(".hallouminate")
+        .join("wiki");
+    fs::create_dir_all(wiki_dir.join("architecture")).unwrap();
+    fs::write(wiki_dir.join("index.md"), "# Index\n").unwrap();
+    fs::write(
+        wiki_dir.join("architecture").join("layering.md"),
+        "# Layering\n\nConfig layers merge lowest-precedence first.\n",
+    )
+    .unwrap();
+
+    let run = |sentinel: Option<&Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_bench-run"));
+        command.env("AGENT_BENCH_CLAUDE_BIN", &fake_cli);
+        if let Some(sentinel) = sentinel {
+            command.env("FAKE_CLI_SENTINEL", sentinel);
+        }
+        command
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--questions")
+            .arg(&questions_path)
+            .arg("--arm")
+            .arg("wiki")
+            .arg("--runs")
+            .arg("1")
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .output()
+            .unwrap()
+    };
+
+    assert!(run(None).status.success());
+
+    // Re-author: same page set, edited content.
+    fs::write(
+        wiki_dir.join("architecture").join("layering.md"),
+        "# Layering\n\nConfig layers merge highest-precedence first.\n",
+    )
+    .unwrap();
+
+    let sentinel = dir.path().join("sentinel");
+    let output = run(Some(&sentinel));
+    assert!(
+        !output.status.success(),
+        "resuming a ledger produced under a different authored wiki must abort"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake CLI ran despite a re-authored wiki — the abort must precede any session"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hallouminate:"),
+        "stderr must name the subject repo whose wiki changed: {stderr}"
+    );
+    assert!(
+        stderr.contains("--force"),
+        "stderr must point at the escape hatch: {stderr}"
+    );
+
+    // Restore the authored content: the guard keys on wiki content, so a
+    // wiki matching the ledger's must still resume.
+    fs::write(
+        wiki_dir.join("architecture").join("layering.md"),
+        "# Layering\n\nConfig layers merge lowest-precedence first.\n",
+    )
+    .unwrap();
+    let resumed = run(Some(&sentinel));
+    assert!(
+        resumed.status.success(),
+        "an unchanged wiki must still resume: {}",
+        String::from_utf8_lossy(&resumed.stderr)
     );
 }
 
