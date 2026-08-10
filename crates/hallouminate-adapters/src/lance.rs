@@ -5,15 +5,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use arrow::array::ListArray;
-use arrow::array::builder::{ListBuilder, StringBuilder};
-use arrow::array::{
+use async_trait::async_trait;
+use futures::TryStreamExt;
+// Re-exported from `lancedb` rather than depended on directly: the two must be
+// the same `arrow` build or every `RecordBatch` we hand to LanceDB is a
+// different type than the one it expects.
+use lancedb::arrow::arrow;
+use lancedb::arrow::arrow::array::ListArray;
+use lancedb::arrow::arrow::array::builder::{ListBuilder, StringBuilder};
+use lancedb::arrow::arrow::array::{
     Array, FixedSizeListArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator,
     StringArray,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use async_trait::async_trait;
-use futures::TryStreamExt;
+use lancedb::arrow::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use lancedb::query::{ExecutableQuery, QueryBase};
 use serde::{Deserialize, Serialize};
 

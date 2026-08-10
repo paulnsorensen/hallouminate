@@ -2934,7 +2934,6 @@ dependencies = [
 name = "hallouminate-adapters"
 version = "0.6.1"
 dependencies = [
- "arrow",
  "async-trait",
  "blake3",
  "fastembed",
