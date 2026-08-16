@@ -38,6 +38,11 @@ hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.7.
 hallouminate-config = { path = "crates/hallouminate-config", version = "0.7.0" }
 hallouminate-daemon = { path = "crates/hallouminate-daemon", version = "0.7.0" }
 
+[profile.dev]
+# Slim debug info: smaller target dir + lower build memory for parallel agent
+# gates; backtraces keep file:line. Matches tern/oh-my-pi. (see crabbot#46)
+debug = "line-tables-only"
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
