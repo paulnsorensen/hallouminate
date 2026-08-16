@@ -11,6 +11,7 @@ description = "Domain layer for hallouminate."
 tokio.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
+strsim.workspace = true
 # `cap-std` is the cross-platform `Dir`-relative API the corpus sandbox uses
 # (built on rustix on unix, windows-sys on Windows). Confines all writes to
 # the corpus root capability and is the symlink-safe replacement for the

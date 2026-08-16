@@ -44,11 +44,14 @@ Two audiences use this server:
 - AUTHORS (curator agents) write entries via `add_markdown` / overwrite via \
   `read_markdown` + `add_markdown { overwrite: true }`.
 
-Default corpus: tool calls that omit `corpus` default to the wiki for the \
-repository containing the client's MCP workspace root when the client exposes \
-roots, falling back to the MCP server process cwd. Pass `corpus` explicitly to \
-target another wiki, the repo's source corpus (`repo:{name}:corpus`), or a \
-user-declared `[[corpus]]` entry; `list_corpora` enumerates everything available.
+Default corpus: READ tools (`ground`, `read_markdown`, `list_files`, \
+`list_tree`, `corpus_stats`, `backlinks`, `get_footnote`) that omit `corpus` \
+default to the wiki for the repository containing the client's MCP workspace \
+root when the client exposes roots, falling back to the MCP server process \
+cwd. WRITE tools (`add_markdown`, `delete_markdown`) require `corpus` \
+explicitly. Pass `corpus` explicitly to target another wiki, the repo's \
+source corpus (`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry; \
+`list_corpora` enumerates everything available.
 
 Tools:
 - `list_corpora` — every configured corpus name.
@@ -463,8 +466,10 @@ pub struct AddMarkdownParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadMarkdownParams {
-    /// Corpus that owns the markdown file.
-    pub corpus: String,
+    /// Corpus that owns the markdown file. Defaults to the wiki for the repo
+    /// containing the MCP workspace root when omitted.
+    #[serde(default)]
+    pub corpus: Option<String>,
     /// Relative path within the corpus, same shape as `add_markdown`. For a
     /// multi-root corpus it resolves against every configured root (first
     /// match wins), so a file searchable under `paths[1..]` is also readable.
@@ -756,7 +761,7 @@ impl HallouminateTools {
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: Some(params.corpus),
+                corpus: params.corpus,
                 path: params.path,
             }),
         };

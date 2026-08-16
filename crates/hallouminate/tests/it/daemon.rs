@@ -18,10 +18,10 @@ use std::time::Duration;
 use hallouminate_adapters::LanceStore;
 use hallouminate_config::Config;
 use hallouminate_daemon::{
-    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult,
-    IndexRequest, LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest,
-    connect_at, serve, spawn_signal_handlers,
+    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonClient, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListFilesResult,
+    Position, ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
@@ -3037,6 +3037,180 @@ async fn daemon_read_markdown_missing_in_all_roots_reports_does_not_exist() {
         }
         DaemonResponse::Ok { result } => panic!("missing file must error; got Ok({result:?})"),
     }
+}
+
+/// Single-root variant of `cfg_two_root_corpus` for the read-miss suggestion
+/// tests. Embeddings disabled so reads don't touch the model.
+fn cfg_single_root_corpus(ground: &Path, root: &Path) -> Config {
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "wiki"
+paths = ["{r}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        r = root.display(),
+        g = ground.display(),
+    );
+    toml::from_str(&toml).expect("single-root corpus toml parses")
+}
+
+/// Issue a `read_markdown` for a path expected to be missing against the
+/// `wiki` corpus and return the InvalidParams error message.
+async fn read_miss_message(client: &DaemonClient, cwd: &Path, path: &str) -> String {
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: cwd.to_path_buf(),
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: Some("wiki".into()),
+                path: path.into(),
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            message
+        }
+        DaemonResponse::Ok { result } => panic!("missing file must error; got Ok({result:?})"),
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_lists_parent_directory_entries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("architecture")).expect("mkdir architecture");
+    std::fs::write(
+        root.join("architecture/agent-routing.md"),
+        "# Agent routing\n",
+    )
+    .expect("seed");
+    std::fs::write(root.join("architecture/subagents.md"), "# Subagents\n").expect("seed");
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(
+        &client,
+        harness.cwd(),
+        "architecture/subagent-routing-policy.md",
+    )
+    .await;
+    assert!(
+        message.contains("architecture/subagent-routing-policy.md does not exist"),
+        "got: {message}"
+    );
+    assert!(
+        message.contains("architecture/ contains:"),
+        "got: {message}"
+    );
+    assert!(message.contains("agent-routing.md"), "got: {message}");
+    assert!(message.contains("subagents.md"), "got: {message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_caps_directory_listing_at_20() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("big")).expect("mkdir big");
+    for i in 0..23 {
+        std::fs::write(root.join(format!("big/entry-{i:02}.md")), "# Entry\n").expect("seed");
+    }
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "big/missing.md").await;
+    // Fuzzy suggestions may legitimately surface the unlisted entries, so the
+    // cap assertions target the directory-listing block only.
+    let listing = message.split("closest matches:").next().expect("listing");
+    assert!(listing.contains("big/ contains:"), "got: {message}");
+    assert!(listing.contains("entry-00.md"), "got: {message}");
+    assert!(listing.contains("entry-19.md"), "got: {message}");
+    assert!(
+        !listing.contains("entry-20.md"),
+        "cap must cut at 20: {message}"
+    );
+    assert!(listing.contains("… and 3 more"), "got: {message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_lists_nearest_existing_ancestor() {
+    // deep/ does not exist at all → the nearest existing ancestor is the
+    // corpus root; its entries (files and subdirs) are listed.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("guides")).expect("mkdir guides");
+    std::fs::write(root.join("readme.md"), "# Readme\n").expect("seed");
+    std::fs::write(root.join("guides/setup.md"), "# Setup\n").expect("seed");
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "deep/missing/dir/note.md").await;
+    assert!(
+        message.contains("deep/missing/dir/note.md does not exist"),
+        "got: {message}"
+    );
+    assert!(message.contains("corpus root contains:"), "got: {message}");
+    assert!(message.contains("readme.md"), "got: {message}");
+    assert!(message.contains("guides/"), "got: {message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_suggests_closest_matches_excluding_listed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("architecture")).expect("mkdir architecture");
+    std::fs::create_dir_all(root.join("notes")).expect("mkdir notes");
+    std::fs::write(
+        root.join("architecture/agent-routing.md"),
+        "# Agent routing\n",
+    )
+    .expect("seed");
+    std::fs::write(root.join("architecture/subagents.md"), "# Subagents\n").expect("seed");
+    std::fs::write(
+        root.join("notes/subagent-routing.md"),
+        "# Subagent routing\n",
+    )
+    .expect("seed");
+    std::fs::write(root.join("notes/policy.md"), "# Policy\n").expect("seed");
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(
+        &client,
+        harness.cwd(),
+        "architecture/subagent-routing-policy.md",
+    )
+    .await;
+    // Top strsim match by filename stem ranks first in the fuzzy block.
+    assert!(
+        message.contains("closest matches: notes/subagent-routing.md"),
+        "got: {message}"
+    );
+    // Paths already shown by the directory listing must not repeat here.
+    let fuzzy = message
+        .split("closest matches:")
+        .nth(1)
+        .expect("fuzzy block");
+    assert!(
+        !fuzzy.contains("architecture/agent-routing.md"),
+        "got: {message}"
+    );
+    assert!(
+        !fuzzy.contains("architecture/subagents.md"),
+        "got: {message}"
+    );
 }
 
 #[tokio::test]

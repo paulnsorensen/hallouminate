@@ -23,6 +23,9 @@ blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 shellexpand = "3"
 schemars = "1"
+# Fuzzy ranking for not-found suggestions (corpus names, wiki paths). Already
+# transitive in the tree via clap, so this direct dep resolves no new version.
+strsim = "0.11"
 toml = "1.1"
 # Page-level frontmatter parsing via serde_yaml_ng, the maintained fork of the
 # archived serde_yaml. lindera 3.x already pulls serde_yaml_ng into the build

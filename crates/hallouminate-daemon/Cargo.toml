@@ -16,6 +16,7 @@ tokio-util = "0.7"
 notify = "8"
 notify-debouncer-full = "0.7"
 rustix.workspace = true
+strsim.workspace = true
 libc = "0.2"
 fastrand = "2"
 shellexpand.workspace = true
