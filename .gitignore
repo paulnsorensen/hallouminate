@@ -2,11 +2,16 @@
 /site/node_modules
 /site/dist
 /site/.astro
+# Stale mdBook output; the docs site moved to Starlight under site/ in #332.
+/docs/book/
+# Local eval scratch: `just eval-measure` writes .context/ (see justfile).
+.context/
 .cheese/
 ralphs/
 .code-review-graph/
 .serena/
 .claude/worktrees/
+.claude/workflows/
 .claude/settings.json
 .milknado/
 milknado.toml
