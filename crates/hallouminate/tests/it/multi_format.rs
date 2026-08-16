@@ -446,6 +446,10 @@ fn detect_format_keys_on_extension_for_every_phase1_type() {
         ("a.markdown", Format::Markdown),
         ("a.txt", Format::PlainText),
         ("a.text", Format::PlainText),
+        ("a.adoc", Format::PlainText),
+        ("a.asciidoc", Format::PlainText),
+        ("a.org", Format::PlainText),
+        ("a.rst", Format::Rst),
         ("a.csv", Format::Spreadsheet),
         ("a.xlsx", Format::Spreadsheet),
         ("a.xls", Format::Spreadsheet),
@@ -549,6 +553,45 @@ fn markdown_handler_golden_snapshot_is_byte_stable() {
     assert_eq!(pf.indexed_at_ms, 99);
     assert_eq!(pf.content_hash, "deadbeef");
     assert!(pf.summary.contains("melange") || pf.summary.contains("Spice"));
+}
+
+// ── reStructuredText breadcrumb regression ─────────────────────────
+
+/// An `.rst` fixture routes to the RST handler, and its chunks carry the
+/// section breadcrumb derived from the title/underline adornment.
+#[test]
+fn rst_handler_attaches_section_breadcrumbs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guide.rst");
+    let body = "Overview\n========\n\nThe melange must flow.\n";
+    fs::write(&path, body).unwrap();
+
+    let registry = HandlerRegistry::new(Characters, 2000);
+    let file = FileRef::new(PathBuf::from(&path));
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(detect_format(&path, &bytes), Some(Format::Rst));
+
+    let corpus = corpus(dir.path(), "docs", &["**/*.rst"]);
+    let corpus_key = corpus.primary_corpus_key().expect("corpus root");
+    let ctx = PrepareCtx {
+        corpus_key: &corpus_key,
+        file: &file,
+        mtime: Mtime(7),
+        bytes: &bytes,
+        content_hash: "deadbeef".into(),
+        indexed_at_ms: 99,
+    };
+    let pf = registry
+        .handler(Format::Rst)
+        .prepare(&ctx)
+        .expect("rst prepare");
+
+    assert!(pf.frontmatter.is_none(), "RST has no frontmatter");
+    assert!(!pf.chunks.is_empty());
+    let c = &pf.chunks[0];
+    assert_eq!(c.heading_path, vec!["Overview".to_string()]);
+    assert!(c.text.contains("The melange must flow."), "{:?}", c.text);
+    assert_eq!(c.line_start, 1, "chunk starts at on-disk line 1");
 }
 
 // ── Hardening: spreadsheet cell shape boundaries ────────────────────────────

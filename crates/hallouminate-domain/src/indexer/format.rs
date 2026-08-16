@@ -41,6 +41,7 @@ fn build_search_text(heading_path: &[String], summary: &str, text: &str) -> Stri
 pub enum Format {
     Markdown,
     PlainText,
+    Rst,
     Spreadsheet,
 }
 
@@ -70,7 +71,8 @@ pub fn format_from_extension(path: &Path) -> Option<Option<Format>> {
     let ext = path.extension().and_then(|e| e.to_str())?;
     Some(match ext.to_ascii_lowercase().as_str() {
         "md" | "markdown" => Some(Format::Markdown),
-        "txt" | "text" => Some(Format::PlainText),
+        "txt" | "text" | "adoc" | "asciidoc" | "org" => Some(Format::PlainText),
+        "rst" => Some(Format::Rst),
         "csv" | "xlsx" | "xls" | "ods" => Some(Format::Spreadsheet),
         // A known-but-unsupported extension is decisive: do NOT fall through
         // to a magic-byte sniff that might mislabel it (e.g. a `.docx` is a
@@ -204,6 +206,61 @@ impl FormatHandler for MarkdownHandler {
             summary,
             keywords,
             frontmatter: frontmatter.as_ref().map(Frontmatter::to_canonical_json),
+            indexed_at_ms: ctx.indexed_at_ms,
+            chunks,
+        })
+    }
+}
+
+// ── reStructuredText ──────────────────────────────────────
+
+/// reStructuredText handler: breadcrumb-bearing chunks from an [`RstChunker`]
+/// with the same summary/keyword/search-text metadata as plain text. RST has
+/// no frontmatter or claim-mark conventions, so neither is parsed here.
+pub struct RstHandler {
+    chunker: Box<dyn CorpusChunker>,
+}
+
+impl RstHandler {
+    pub fn new(chunker: Box<dyn CorpusChunker>) -> Self {
+        Self { chunker }
+    }
+}
+
+impl FormatHandler for RstHandler {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
+            HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
+        })?;
+        let fallback = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let summary = extract_summary(body, &fallback);
+        let keywords = extract_keywords(body);
+        let chunks_raw = self.chunker.chunk_text(body);
+        let mut chunks: Vec<PreparedChunk> = Vec::with_capacity(chunks_raw.len());
+        for c in chunks_raw {
+            let search_text = build_search_text(&c.heading_path, &summary, &c.text);
+            chunks.push(PreparedChunk {
+                ord: c.ord,
+                heading_path: c.heading_path,
+                line_start: c.line_start,
+                line_end: c.line_end,
+                text: c.text,
+                search_text,
+                claim_marks: None,
+            });
+        }
+        Ok(PreparedFile {
+            file_ref: file_ref_string(ctx.file)?,
+            corpus_key: ctx.corpus_key.clone(),
+            mtime_ms: ctx.mtime.0,
+            content_hash: ctx.content_hash.clone(),
+            summary,
+            keywords,
+            frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
         })
@@ -458,6 +515,7 @@ fn extract_err(path: &Path, e: &dyn std::fmt::Display) -> HallouminateError {
 pub struct HandlerRegistry {
     markdown: Box<dyn FormatHandler>,
     text: Box<dyn FormatHandler>,
+    rst: Box<dyn FormatHandler>,
     spreadsheet: Box<dyn FormatHandler>,
 }
 
@@ -473,9 +531,12 @@ impl HandlerRegistry {
         let markdown_chunker: Box<dyn CorpusChunker> = Box::new(
             crate::corpus::MarkdownChunker::new(sizer.clone(), budget_tokens),
         );
+        let rst_chunker: Box<dyn CorpusChunker> =
+            Box::new(crate::corpus::RstChunker::new(sizer.clone(), budget_tokens));
         Self {
             markdown: Box::new(MarkdownHandler::new(markdown_chunker)),
             text: Box::new(TextHandler::new(sizer, budget_tokens)),
+            rst: Box::new(RstHandler::new(rst_chunker)),
             spreadsheet: Box::new(SpreadsheetHandler),
         }
     }
@@ -485,6 +546,7 @@ impl HandlerRegistry {
         match format {
             Format::Markdown => self.markdown.as_ref(),
             Format::PlainText => self.text.as_ref(),
+            Format::Rst => self.rst.as_ref(),
             Format::Spreadsheet => self.spreadsheet.as_ref(),
         }
     }
@@ -542,6 +604,33 @@ mod tests {
         assert!(!chunk.search_text.contains("[^source]"));
         assert!(!chunk.search_text.contains("Citation."));
         assert!(!chunk.search_text.contains("<!--claim:confirmed-->"));
+    }
+
+    #[test]
+    fn rst_handler_attaches_section_breadcrumb_and_omits_frontmatter() {
+        let bytes = b"Overview\n========\n\nThe melange flows.\n";
+        let corpus_key = CorpusKey::from_configured_root("docs", "/tmp/docs");
+        let file = FileRef::new(std::path::PathBuf::from("guide.rst"));
+        let ctx = PrepareCtx {
+            corpus_key: &corpus_key,
+            file: &file,
+            mtime: Mtime(1),
+            bytes,
+            content_hash: "hash".into(),
+            indexed_at_ms: 2,
+        };
+        let chunker: Box<dyn CorpusChunker> = Box::new(crate::corpus::RstChunker::new(
+            text_splitter::Characters,
+            2000,
+        ));
+        let handler = RstHandler::new(chunker);
+
+        let prepared = handler.prepare(&ctx).expect("prepare rst");
+        assert!(prepared.frontmatter.is_none(), "RST has no frontmatter");
+        let chunk = &prepared.chunks[0];
+        assert_eq!(chunk.heading_path, vec!["Overview".to_string()]);
+        assert!(chunk.text.contains("The melange flows."));
+        assert!(chunk.claim_marks.is_none());
     }
 
     #[test]
