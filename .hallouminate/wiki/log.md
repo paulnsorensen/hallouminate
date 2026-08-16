@@ -37,3 +37,6 @@
 - 2026-07-24 · 1dfc05c09b4025be · conflict-flagged · ort-arena-retention.md · current batch cap contradicts the stale #221 gap; narrow supersession note added while #285 owns full correction
 - 2026-07-24 · 1dfc05c09b4025be · skipped-near-duplicate · — · transient session/environment state omitted after durable diagnoses were merged
 
+
+- 2026-08-16 · wiki-harvest-hallouminate-20260816 · merged · architecture.md · third closed boundary seam: `arrow` now sourced only via `lancedb::arrow::arrow` re-export, not declared directly, after a duplicate-arrow-major build break killed the #306 arrow-v59 bump (#356)
+
