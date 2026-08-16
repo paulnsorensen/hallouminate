@@ -45,7 +45,7 @@ Two audiences use this server:
   `read_markdown` + `add_markdown { overwrite: true }`.
 
 Default corpus: READ tools (`ground`, `read_markdown`, `list_files`, \
-`list_tree`, `corpus_stats`, `backlinks`, `get_footnote`) that omit `corpus` \
+`list_tree`, `corpus_stats`, `backlinks`) that omit `corpus` \
 default to the wiki for the repository containing the client's MCP workspace \
 root when the client exposes roots, falling back to the MCP server process \
 cwd. WRITE tools (`add_markdown`, `delete_markdown`) require `corpus` \
