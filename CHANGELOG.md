@@ -7,7 +7,30 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.6.1...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.7.0...HEAD)
+
+## [0.7.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.7.0) - 2026-08-16
+
+### Added
+
+- Indexer: reStructuredText and prose format ingestion
+- Errors: unknown-corpus errors enumerate configured corpora with a
+  closest-match suggestion; `read_markdown` misses list the nearest existing
+  directory plus top fuzzy path matches, and its `corpus` param now defaults
+  to the repo wiki like the other read tools
+- Config: stable not-configured error prefix with onboarding guidance
+
+### Removed
+
+- **Breaking**: `get_footnote` MCP tool removed; use `read_markdown` with
+  `footnotes: "only"`. `backlinks` promoted in the server instructions
+
+### Changed
+
+- Docs site rebuilt on Starlight (replacing mdBook) with the
+  @cheeselord/design flavor shell
+- LanceDB storage engine upgraded to 0.37; arrow sourced from lancedb's
+  re-export
 
 ## [0.6.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.6.1) - 2026-07-30
 
