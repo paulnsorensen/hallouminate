@@ -168,8 +168,12 @@ provenance)?
 
 Apply each decision through the safe update loop:
 
-- **Merge/overwrite:** `read_markdown` the page → edit the section → `add_markdown
-  { overwrite: true }`. (Read-before-clobber is mandatory; it's your rollback point.)
+- **Merge/overwrite:** `read_markdown` the page → `backlinks { corpus, path }` →
+  edit the section → `add_markdown { overwrite: true }`. (Read-before-clobber is
+  mandatory; it's your rollback point. `backlinks` returns the pages that
+  `[[wikilink]]` to this one — the pages that assume or build on it. If the edit
+  changes a claim a backlink relies on, queue that page into the same ingest pass
+  instead of leaving it silently stale.)
 - **New page:** draft one-topic entry (H1 first line, kebab slug, lead-first,
   ~50–150 lines, code cited as `path:line`, shaped on the pack's
   `../../templates/wiki-entry.md`) → `add_markdown { overwrite: false }`.

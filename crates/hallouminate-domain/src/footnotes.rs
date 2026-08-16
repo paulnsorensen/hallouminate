@@ -87,15 +87,6 @@ pub fn apply_footnote_mode(content: &str, mode: FootnoteMode) -> String {
     }
 }
 
-/// Resolve a single footnote target by label. Returns `None` when the label
-/// is absent.
-pub fn get_footnote_target(content: &str, label: &str) -> Option<String> {
-    extract_footnotes(content)
-        .into_iter()
-        .find(|(l, _)| l == label)
-        .map(|(_, text)| text)
-}
-
 // ── private helpers ────────────────────────────────────────────────────────
 
 fn make_parser(content: &str) -> impl Iterator<Item = (Event<'_>, std::ops::Range<usize>)> {
@@ -325,30 +316,6 @@ mod tests {
         assert!(!out.contains("Body."));
     }
 
-    // ── get_footnote_target ────────────────────────────────────────────────
-
-    #[test]
-    fn get_footnote_target_resolves_by_label() {
-        let md = "[^1]: The source.\n[^note]: Another.\n";
-        let got = get_footnote_target(md, "1");
-        assert_eq!(got.as_deref(), Some("The source."));
-    }
-
-    #[test]
-    fn get_footnote_target_returns_none_for_absent_label() {
-        let md = "[^1]: Present.\n";
-        assert!(get_footnote_target(md, "2").is_none());
-    }
-
-    #[test]
-    fn get_footnote_target_word_label() {
-        let md = "[^cite]: Author 2024.\n";
-        assert_eq!(
-            get_footnote_target(md, "cite").as_deref(),
-            Some("Author 2024.")
-        );
-    }
-
     // ── ADVERSARIAL: extract_footnotes edge cases ──────────────────────────
 
     #[test]
@@ -549,60 +516,6 @@ mod tests {
         assert!(out.contains("[^1]:"));
         assert!(out.contains("[^2]:"));
         assert!(out.contains("[^3]:"));
-    }
-
-    // ── ADVERSARIAL: get_footnote_target edge cases ────────────────────────
-
-    #[test]
-    fn get_footnote_target_exact_match_not_prefix() {
-        // [^note] should NOT match when searching for "not"
-        let md = "[^note]: Content.\n";
-        assert!(
-            get_footnote_target(md, "not").is_none(),
-            "prefix should not match"
-        );
-        assert!(
-            get_footnote_target(md, "note").is_some(),
-            "exact label should match"
-        );
-    }
-
-    #[test]
-    fn get_footnote_target_case_sensitive() {
-        // [^Note] vs [^note] should be different
-        let md = "[^Note]: First.\n[^note]: Second.\n";
-        let upper = get_footnote_target(md, "Note");
-        let lower = get_footnote_target(md, "note");
-        assert_eq!(upper.as_deref(), Some("First."));
-        assert_eq!(lower.as_deref(), Some("Second."));
-    }
-
-    #[test]
-    fn get_footnote_target_with_empty_label_search() {
-        // Searching for empty label should not match or panic
-        let md = "[^1]: Content.\n";
-        let result = get_footnote_target(md, "");
-        assert!(result.is_none(), "empty label should not match");
-    }
-
-    #[test]
-    fn get_footnote_target_numeric_and_word_labels_same_doc() {
-        let md = "[^123]: Numeric.\n[^note]: Word.\n[^9]: Another num.\n";
-        assert_eq!(get_footnote_target(md, "123").as_deref(), Some("Numeric."));
-        assert_eq!(get_footnote_target(md, "note").as_deref(), Some("Word."));
-        assert_eq!(
-            get_footnote_target(md, "9").as_deref(),
-            Some("Another num.")
-        );
-    }
-
-    #[test]
-    fn get_footnote_target_with_special_chars_in_target() {
-        // Target text contains special characters, URLs, etc.
-        let md = "[^src]: https://example.com/path?query=1&other=2\n";
-        let target = get_footnote_target(md, "src").unwrap();
-        assert!(target.contains("https://"));
-        assert!(target.contains("?query=1"));
     }
 
     // ── ADVERSARIAL: boundary and recovery ─────────────────────────────────

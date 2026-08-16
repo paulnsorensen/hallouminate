@@ -10,7 +10,7 @@ if none is up.
 ## Default corpus
 
 Read-side tools (`ground`, `list_files`, `list_tree`, `backlinks`,
-`get_footnote`, `corpus_stats`) that omit `corpus`
+`corpus_stats`) that omit `corpus`
 default to the wiki for the repository containing the daemon's working
 directory — `repo:<NAME>:wiki` for the deepest `[[repository]]` whose `path`
 is an ancestor of the cwd. When the cwd sits under no configured repo, the
@@ -20,7 +20,7 @@ The mutating tools (`add_markdown`, `delete_markdown`) and `read_markdown`
 **always** require an explicit `corpus`, to avoid accidental writes to the
 wrong wiki or ambiguous reads.
 
-## The eleven tools
+## The ten tools
 
 ### `list_corpora`
 
@@ -88,14 +88,6 @@ never been indexed), and how many on-disk files matching the corpus globs are
 not yet indexed. Param: `corpus` (defaults to wiki-for-cwd, same resolution as
 `list_files`). `structuredContent` is `{ corpus, indexed_files, total_chunks,
 last_indexed_ms, unindexed_files }`.
-
-### `get_footnote`
-
-Resolve a single citation: the footnote target for a page's `#footnote_number`.
-Params: `corpus` (defaults to wiki-for-cwd, same as `ground`), `page` (the
-wiki page's relative path), `footnote_number` (the label after `^` — `"1"` for
-`[^1]`, `"note"` for `[^note]`). Use this to expand one footnote without reading
-the whole page.
 
 ### `backlinks`
 

@@ -69,7 +69,7 @@ pub enum Command {
     },
     /// Boot the MCP server on stdio. Exposes `ground`, `index`,
     /// `list_corpora`, `list_files`, `list_tree`, `add_markdown`,
-    /// `read_markdown`, `delete_markdown`, and `get_footnote` tools to
+    /// `read_markdown`, `delete_markdown`, and `backlinks` tools to
     /// MCP-aware clients (Claude Desktop, Claude Code, etc.). The process
     /// runs until stdin closes.
     Serve,

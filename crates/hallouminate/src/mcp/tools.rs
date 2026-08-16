@@ -28,7 +28,7 @@ use hallouminate_daemon::{
     Position, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
-use hallouminate_domain::footnotes::{FootnoteMode, apply_footnote_mode, get_footnote_target};
+use hallouminate_domain::footnotes::{FootnoteMode, apply_footnote_mode};
 use hallouminate_domain::ground::{Format, RenderOpts, render};
 
 const SERVER_INSTRUCTIONS: &str = "\
@@ -66,8 +66,9 @@ Tools:
 - `index` — bulk (re)index a corpus or all corpora.
 - `corpus_stats` — index health for one corpus: indexed file count, total \
   chunk rows, newest index timestamp, and count of not-yet-indexed files.
-- `get_footnote` — resolve a single citation: footnote target for page#footnote_number.
-- `backlinks` — corpus-relative paths of pages that `[[wikilink]]` to a given page.
+- `backlinks` — corpus-relative paths of pages that `[[wikilink]]` to a given \
+  page. After landing on a page (usually via `ground`) and before editing it, \
+  call `backlinks` to find the pages that assume or build on it.
 
 Filesystem is the source of truth; LanceDB rows are derived and refreshed \
 after `add_markdown` / `delete_markdown`. `index` is the only way to pick \
@@ -185,8 +186,8 @@ The daemon opens one socket.[^1]
 
 Authoring agents SHOULD add footnotes for any claim that a future reader \
 could not easily verify without re-reading the cited source. Provenance that \
-travels with the page lets grounding agents call `get_footnote` to resolve a \
-citation without pulling the whole document.
+travels with the page lets grounding agents call `read_markdown` with \
+`footnotes: \"only\"` to resolve citations without wading through the body.
 ";
 
 /// Build a `CallToolResult` with both a human-readable text content block
@@ -503,19 +504,6 @@ pub struct BacklinksParams {
     /// Relative path of the wiki page within the corpus whose backlinks are
     /// being resolved.
     pub path: String,
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
-pub struct GetFootnoteParams {
-    /// Corpus that owns the page. Defaults to the wiki for the repo
-    /// containing the client's MCP workspace root, same as `ground`.
-    #[serde(default)]
-    pub corpus: Option<String>,
-    /// Relative path of the wiki page within the corpus.
-    pub page: String,
-    /// The footnote label (the text after `^`). For `[^1]` use `"1"`;
-    /// for `[^note]` use `"note"`.
-    pub footnote_number: String,
 }
 
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
@@ -871,45 +859,6 @@ impl HallouminateTools {
             .join("\n");
         let structured = serde_json::json!({ "corpora": &entries });
         Ok(tool_ok(names, structured))
-    }
-
-    #[tool(
-        description = "Resolve a single citation: return the footnote target (source text / link) \
-                      for page#footnote_number without pulling the whole document.",
-        annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    pub async fn get_footnote(
-        &self,
-        peer: Peer<RoleServer>,
-        Parameters(params): Parameters<GetFootnoteParams>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: params.corpus,
-                path: params.page.clone(),
-            }),
-        };
-        let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let target =
-            get_footnote_target(&response.content, &params.footnote_number).ok_or_else(|| {
-                invalid_params(format!(
-                    "footnote [^{}] not found in {}",
-                    params.footnote_number, params.page
-                ))
-            })?;
-        let structured = serde_json::json!({
-            "page": params.page,
-            "footnote_number": params.footnote_number,
-            "target": target,
-        });
-        Ok(tool_ok(target, structured))
     }
 
     #[tool(
