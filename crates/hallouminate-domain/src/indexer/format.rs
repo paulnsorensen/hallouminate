@@ -619,8 +619,10 @@ mod tests {
             content_hash: "hash".into(),
             indexed_at_ms: 2,
         };
-        let chunker: Box<dyn CorpusChunker> =
-            Box::new(crate::corpus::RstChunker::new(text_splitter::Characters, 2000));
+        let chunker: Box<dyn CorpusChunker> = Box::new(crate::corpus::RstChunker::new(
+            text_splitter::Characters,
+            2000,
+        ));
         let handler = RstHandler::new(chunker);
 
         let prepared = handler.prepare(&ctx).expect("prepare rst");
