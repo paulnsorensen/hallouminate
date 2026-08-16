@@ -43,7 +43,7 @@ tracing.workspace = true
 # via `zip`, pinned to the 7.x already in the tree (transitive via file-format) so
 # no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
 # is covered by a detection/routing unit test, not a generated binary fixture.
-rust_xlsxwriter = "0.97"
+rust_xlsxwriter = "0.98"
 zip = "8"
 hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
