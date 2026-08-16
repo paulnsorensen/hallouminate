@@ -134,13 +134,6 @@ on-disk files matching the corpus globs are not yet indexed. Param: `corpus`
 (defaults to wiki-for-cwd, same resolution as `list_files`). `structuredContent`
 is `{ corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }`.
 
-### `get_footnote`
-
-Resolve a single citation: the footnote target for a page's `#footnote_number`.
-Params: `corpus` (defaults to wiki-for-cwd, same as `ground`), `page` (the wiki
-page's relative path), `footnote_number` (the label after `^` — `"1"` for `[^1]`,
-`"note"` for `[^note]`). Expands one footnote without reading the whole page.
-
 ### `backlinks`
 
 Return the corpus-relative path of every page that links to a given page via
