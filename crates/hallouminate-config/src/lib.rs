@@ -432,12 +432,29 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
     load_xdg(path)
 }
 
+/// Stable machine-recognizable prefix of the "inside a repo but not
+/// configured" discovery error. Harness-side rules match on this exact
+/// string to treat the error as terminal (skip grounding or onboard) rather
+/// than retrying; changing it is a breaking contract change.
+pub const REPO_NOT_CONFIGURED_PREFIX: &str = "hallouminate: not configured for this repo";
+
+fn not_configured_error(cwd: &Path, root: &Path) -> HallouminateError {
+    HallouminateError::Config(format!(
+        "{REPO_NOT_CONFIGURED_PREFIX} (searched up from {}; stopped at repo root {}). \
+         Grounding is unavailable here — skip it, or onboard by creating \
+         .hallouminate/config.toml with a [[repository]] entry.",
+        cwd.display(),
+        root.display(),
+    ))
+}
+
 /// Walk from `cwd` up looking for `.hallouminate/config.toml`.
 ///
 /// First-match-wins; never composes multiple repo configs. Three outcomes:
 ///   - found a config → `Ok(Some(path))`.
 ///   - hit a `.git` entry (file *or* directory — git worktrees use a file)
-///     with no config in between → `Err`. Inside a repo, the daemon refuses
+///     with no config in between → `Err`, with a message starting with
+///     [`REPO_NOT_CONFIGURED_PREFIX`]. Inside a repo, the daemon refuses
 ///     to fall back to baseline-only; explicit repo config is required.
 ///   - reached the filesystem root without ever hitting a `.git` boundary →
 ///     `Ok(None)`. There is no repo context to be strict about, so callers
@@ -467,12 +484,7 @@ pub fn discover_repo_config(cwd: &Path) -> Result<Option<PathBuf>> {
         let git_marker = level.join(".git");
         if git_marker.is_dir() {
             // Normal clone: `.git` directory is the hard repo-root boundary.
-            return Err(HallouminateError::Config(format!(
-                "no .hallouminate/config.toml found walking up from {} \
-                 (stopped at repo root {})",
-                cwd.display(),
-                level.display(),
-            )));
+            return Err(not_configured_error(cwd, level));
         }
         if git_marker.is_file() {
             // `.git` file: either a linked worktree or a submodule.
@@ -483,12 +495,7 @@ pub fn discover_repo_config(cwd: &Path) -> Result<Option<PathBuf>> {
             if let Some(main_root) = worktree_main_root(&git_marker) {
                 return discover_repo_config_from(cwd, &main_root);
             }
-            return Err(HallouminateError::Config(format!(
-                "no .hallouminate/config.toml found walking up from {} \
-                 (stopped at repo root {})",
-                cwd.display(),
-                level.display(),
-            )));
+            return Err(not_configured_error(cwd, level));
         }
         current = level.parent();
     }
@@ -566,12 +573,7 @@ fn discover_repo_config_from(cwd: &Path, start: &Path) -> Result<Option<PathBuf>
         }
         let git_marker = level.join(".git");
         if git_marker.exists() {
-            return Err(HallouminateError::Config(format!(
-                "no .hallouminate/config.toml found walking up from {} \
-                 (stopped at repo root {})",
-                cwd.display(),
-                level.display(),
-            )));
+            return Err(not_configured_error(cwd, level));
         }
         current = level.parent();
     }
@@ -2172,6 +2174,37 @@ rrf_k                   = 60
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn discover_repo_config_not_configured_error_is_terminal_with_guidance() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = canon(dir.path());
+        std::fs::create_dir(root.join(".git")).expect("mkdir .git");
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        let err = discover_repo_config(&nested).expect_err("stop at repo root");
+        match err {
+            HallouminateError::Config(msg) => {
+                let expected = format!(
+                    "{REPO_NOT_CONFIGURED_PREFIX} (searched up from {}; stopped at repo \
+                     root {}). Grounding is unavailable here — skip it, or onboard by \
+                     creating .hallouminate/config.toml with a [[repository]] entry.",
+                    nested.display(),
+                    root.display(),
+                );
+                assert_eq!(msg, expected);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_configured_prefix_is_the_stable_machine_contract() {
+        assert_eq!(
+            REPO_NOT_CONFIGURED_PREFIX,
+            "hallouminate: not configured for this repo"
+        );
     }
 
     #[test]
