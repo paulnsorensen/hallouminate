@@ -24,7 +24,9 @@ use std::time::{Duration, UNIX_EPOCH};
 use crate::report::{CorpusReport, IndexReport};
 use hallouminate_adapters::LanceStore;
 use hallouminate_config::{Config, ResolvedLayers, resolve_for_cwd};
-use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough};
+use hallouminate_domain::common::{
+    CorpusConfig, FileRef, Mtime, canonicalize_or_passthrough, expand_tilde,
+};
 #[cfg(test)]
 use hallouminate_domain::corpus::FileEntry;
 use hallouminate_domain::corpus::scan;
@@ -51,8 +53,9 @@ use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use super::ipc::{
     AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusEntry,
     CorpusStatsResult, DaemonRequest, DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest,
-    DeleteMarkdownResult, GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest,
-    ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
+    DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
+    ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest,
+    ReadMarkdownResult,
 };
 use super::state::{DaemonState, RequestResources, WorkClass};
 use super::status;
@@ -955,9 +958,30 @@ async fn handle_read_markdown(
         };
     let req_path = req.path;
     let resolved = tokio::task::spawn_blocking(move || {
-        let (corpus, root, relative) = validate_wiki_read_path(&corpora, &corpus_name, &req_path)?;
-        let bytes = read_no_follow(&root, &relative)
-            .map_err(|WriteError { kind, source }| map_read_error(kind, source, &relative))?;
+        let (corpus, root, relative) =
+            match validate_wiki_read_path(&corpora, &corpus_name, &req_path) {
+                Ok(t) => t,
+                Err(resp) => {
+                    return Err(enrich_read_not_found(
+                        resp,
+                        &corpora,
+                        &corpus_name,
+                        &req_path,
+                    ));
+                }
+            };
+        let bytes = match read_no_follow(&root, &relative) {
+            Ok(b) => b,
+            Err(WriteError { kind, source }) => {
+                let resp = map_read_error(kind, source, &relative);
+                return Err(enrich_read_not_found(
+                    resp,
+                    &corpora,
+                    &corpus_name,
+                    &req_path,
+                ));
+            }
+        };
         Ok::<_, DaemonResponse>((corpus, root, relative, bytes))
     })
     .await;
@@ -1730,6 +1754,150 @@ fn map_read_error(kind: WriteErrorKind, source: std::io::Error, relative: &Path)
         }
         WriteErrorKind::Exists => DaemonResponse::internal(source.to_string()),
     }
+}
+
+/// Cap on directory entries shown by a read-miss ancestor listing.
+const READ_MISS_LISTING_CAP: usize = 20;
+/// Cap on fuzzy filename suggestions appended to a read miss.
+const READ_MISS_SUGGESTION_CAP: usize = 3;
+
+/// Enrich the bare `<path> does not exist` read miss with the nearest
+/// existing directory's entries and top fuzzy filename matches so a miss
+/// resolves in zero extra round trips. Every other error — symlink,
+/// unsafe-path, delete wording — passes through untouched.
+fn enrich_read_not_found(
+    resp: DaemonResponse,
+    corpora: &[CorpusConfig],
+    corpus_name: &str,
+    req_path: &str,
+) -> DaemonResponse {
+    let bare = format!("{req_path} does not exist");
+    let is_bare_not_found = matches!(
+        &resp,
+        DaemonResponse::Err { kind: ErrorKind::InvalidParams, message } if *message == bare
+    );
+    if !is_bare_not_found {
+        return resp;
+    }
+    let Some(corpus) = corpora.iter().find(|c| c.name == corpus_name) else {
+        return resp;
+    };
+    let relative = Path::new(req_path);
+    let mut msg = bare;
+    let mut shown = Vec::new();
+    if let Some((listing, listed)) = read_miss_ancestor_listing(corpus, relative) {
+        msg.push_str("; ");
+        msg.push_str(&listing);
+        shown = listed;
+    }
+    if let Some(matches) = read_miss_closest_matches(corpus, relative, &shown) {
+        msg.push_str("; ");
+        msg.push_str(&matches);
+    }
+    DaemonResponse::invalid_params(msg)
+}
+
+/// Nearest existing ancestor listing for a read miss: walk from the missing
+/// path's parent toward the corpus root, in configured-root order, and
+/// describe the first directory that exists. Returns the message fragment and
+/// the corpus-relative paths of the files it showed (for deduping the fuzzy
+/// block). None when no root exists or the directory is empty.
+fn read_miss_ancestor_listing(
+    corpus: &CorpusConfig,
+    relative: &Path,
+) -> Option<(String, Vec<String>)> {
+    for raw in &corpus.paths {
+        let root = expand_tilde(raw);
+        let mut dir = relative.parent();
+        while let Some(d) = dir {
+            if root.join(d).is_dir() {
+                return describe_read_miss_dir(&root.join(d), d);
+            }
+            dir = d.parent();
+        }
+    }
+    None
+}
+
+/// Describe one existing directory for a read miss: markdown files plus
+/// subdirectory names (trailing `/`), sorted, capped at
+/// [`READ_MISS_LISTING_CAP`] with an `… and N more` tail.
+fn describe_read_miss_dir(abs: &Path, rel_dir: &Path) -> Option<(String, Vec<String>)> {
+    let entries = std::fs::read_dir(abs).ok()?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if file_type.is_dir() {
+            names.push(format!("{name}/"));
+        } else if file_type.is_file() && name.ends_with(".md") {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    let extra = names.len().saturating_sub(READ_MISS_LISTING_CAP);
+    names.truncate(READ_MISS_LISTING_CAP);
+    let label = if rel_dir.as_os_str().is_empty() {
+        "corpus root".to_string()
+    } else {
+        format!("{}/", rel_dir.display())
+    };
+    let mut fragment = format!("{label} contains: {}", names.join(", "));
+    if extra > 0 {
+        fragment.push_str(&format!(", … and {extra} more"));
+    }
+    let mut listed = Vec::new();
+    for name in &names {
+        if !name.ends_with('/') {
+            listed.push(rel_dir.join(name).to_string_lossy().into_owned());
+        }
+    }
+    Some((fragment, listed))
+}
+
+/// Top fuzzy filename matches for a read miss: rank every corpus markdown
+/// file by strsim similarity between its filename stem and the missing
+/// path's stem, skipping paths the ancestor listing already showed.
+fn read_miss_closest_matches(
+    corpus: &CorpusConfig,
+    relative: &Path,
+    shown: &[String],
+) -> Option<String> {
+    let stem = relative.file_stem()?.to_string_lossy();
+    let entries = list_corpus_files(corpus).ok()?;
+    let mut ranked: Vec<(f64, String)> = Vec::new();
+    for entry in entries {
+        if shown.contains(&entry.path) {
+            continue;
+        }
+        let Some(candidate_stem) = Path::new(&entry.path).file_stem() else {
+            continue;
+        };
+        let score = strsim::jaro_winkler(&stem, &candidate_stem.to_string_lossy());
+        ranked.push((score, entry.path));
+    }
+    if ranked.is_empty() {
+        return None;
+    }
+    ranked.sort_by(|(sa, a), (sb, b)| {
+        sb.partial_cmp(sa)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(b))
+    });
+    ranked.truncate(READ_MISS_SUGGESTION_CAP);
+    let mut paths = Vec::new();
+    for (_, path) in ranked {
+        paths.push(path);
+    }
+    Some(format!("closest matches: {}", paths.join(", ")))
 }
 
 /// Shared error mapping for `delete_no_follow` failures — mirrors

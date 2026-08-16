@@ -989,6 +989,58 @@ async fn mcp_read_markdown_returns_verbatim_content_and_rejects_unsafe_inputs() 
     mcp.shutdown().await;
 }
 
+#[tokio::test]
+async fn mcp_read_markdown_defaults_corpus_to_repo_wiki_when_omitted() {
+    // read_markdown does not touch the embedder; this test runs offline.
+    let xdg = tempfile::tempdir().expect("xdg tempdir");
+    let home = tempfile::tempdir().expect("home tempdir");
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let workspace = repo.path().join("packages/api");
+    std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+    write_minimal_config(xdg.path());
+    write_repo_config(repo.path(), "workspace");
+    let body = "# Halloumi\n\nA grilling cheese.\n";
+    let wiki = repo.path().join(".hallouminate/wiki");
+    std::fs::create_dir_all(wiki.join("cheeses")).expect("mkdir wiki");
+    std::fs::write(wiki.join("cheeses/halloumi.md"), body).expect("seed wiki file");
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
+
+    let mut mcp = Mcp::spawn_with_cwd(xdg.path(), home.path(), Some(harness.socket()), false).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"roots": {"listChanged": true}},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // Omitting `corpus` must resolve to the wiki of the repo containing the
+    // client's workspace root — not fail with a missing-field schema error.
+    let call = mcp
+        .rpc_with_roots(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"path": "cheeses/halloumi.md"}
+            }),
+            &[&workspace],
+        )
+        .await;
+    assert!(call.get("error").is_none(), "read_markdown errored: {call}");
+    let result = &call["result"];
+    let structured = &result["structuredContent"];
+    assert_eq!(structured["corpus"].as_str(), Some("repo:workspace:wiki"));
+    assert_eq!(structured["path"].as_str(), Some("cheeses/halloumi.md"));
+    assert_eq!(structured["content"].as_str(), Some(body));
+
+    mcp.shutdown().await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn mcp_read_markdown_rejects_symlink_inside_corpus() {

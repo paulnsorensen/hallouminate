@@ -91,11 +91,31 @@ pub fn pick_corpus(
     requested: Option<&str>,
 ) -> Result<CorpusConfig, SandboxError> {
     if let Some(name) = requested {
-        return corpora
-            .iter()
-            .find(|c| c.name == name)
-            .cloned()
-            .ok_or_else(|| SandboxError::new(format!("corpus {name:?} not found in config")));
+        if let Some(found) = corpora.iter().find(|c| c.name == name) {
+            return Ok(found.clone());
+        }
+        if corpora.is_empty() {
+            return Err(SandboxError::new(format!(
+                "corpus {name:?} not found in config"
+            )));
+        }
+        // Enumerate what IS configured, closest match first, so a near-miss
+        // name resolves in one round trip instead of a list_corpora call.
+        let mut ranked: Vec<(f64, &str)> = Vec::with_capacity(corpora.len());
+        for c in corpora {
+            ranked.push((strsim::jaro_winkler(name, &c.name), c.name.as_str()));
+        }
+        ranked.sort_by(|(sa, a), (sb, b)| {
+            sb.partial_cmp(sa)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+        let names: Vec<&str> = ranked.iter().map(|(_, n)| *n).collect();
+        return Err(SandboxError::new(format!(
+            "corpus {name:?} not found; configured: {} — did you mean {}?",
+            names.join(", "),
+            names[0],
+        )));
     }
     match corpora {
         [] => Err(SandboxError::new(
@@ -1190,6 +1210,21 @@ mod tests {
         let msg = err.as_str();
         assert!(msg.contains("\"missing\""), "got: {msg}");
         assert!(msg.contains("not found"), "got: {msg}");
+    }
+
+    #[test]
+    fn pick_corpus_unknown_name_lists_configured_and_suggests_closest() {
+        let multiplier = cfg("repo:multiplier:wiki", vec!["/m"]);
+        let dotfiles = cfg("repo:dotfiles:wiki", vec!["/d"]);
+        let err = pick_corpus(&[multiplier, dotfiles], Some("multiplier-wiki"))
+            .expect_err("unknown name must fail");
+        let msg = err.as_str();
+        assert!(msg.contains("repo:multiplier:wiki"), "got: {msg}");
+        assert!(msg.contains("repo:dotfiles:wiki"), "got: {msg}");
+        assert!(
+            msg.contains("did you mean repo:multiplier:wiki?"),
+            "got: {msg}"
+        );
     }
 
     // ── ensure_corpus_allows_file ─────────────────────────────────────────
