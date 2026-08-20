@@ -9,6 +9,11 @@ for each release window.
 
 ## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.7.0...HEAD)
 
+### Added
+
+- Skills: explicit-only `wiki-harvest-memory` workflow for reviewing durable
+  Claude Code or Codex memories and curating approved facts into a repo wiki
+
 ## [0.7.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.7.0) - 2026-08-16
 
 ### Added

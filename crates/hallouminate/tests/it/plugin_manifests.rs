@@ -446,12 +446,40 @@ fn every_pack_skill_opens_with_description_frontmatter() {
         "wiki-init",
         "wiki-query",
         "wiki-roadmap",
+        "wiki-harvest-memory",
     ] {
         assert!(
             checked.contains(&required.to_string()),
             "pack skill {required} is missing its SKILL.md (found: {checked:?})"
         );
     }
+}
+
+#[test]
+fn wiki_harvest_memory_skill_is_explicit_only() {
+    let skill = read_pack_file("plugins/hallouminate/skills/wiki-harvest-memory/SKILL.md");
+    let frontmatter: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(frontmatter_block(&skill)).expect("parse skill frontmatter");
+    assert_eq!(
+        frontmatter
+            .get("disable-model-invocation")
+            .and_then(serde_yaml_ng::Value::as_bool),
+        Some(true),
+        "Claude must hide the skill from model context and allow only explicit invocation"
+    );
+
+    let agent =
+        read_pack_file("plugins/hallouminate/skills/wiki-harvest-memory/agents/openai.yaml");
+    let agent: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&agent).expect("parse Codex skill metadata");
+    assert_eq!(
+        agent
+            .get("policy")
+            .and_then(|policy| policy.get("allow_implicit_invocation"))
+            .and_then(serde_yaml_ng::Value::as_bool),
+        Some(false),
+        "Codex must hide the skill from its prompt and allow only explicit invocation"
+    );
 }
 
 fn read_pack_file(relative: &str) -> String {

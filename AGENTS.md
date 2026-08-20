@@ -60,9 +60,9 @@ Three skills live under `.agents/skills/`. Apply them when working in Rust:
 
 ## Wiki skills (for hallouminate users)
 
-Three skills under `plugins/hallouminate/skills/` (the distributable plugin
-pack) drive the wiki lifecycle through the hallouminate MCP tools. Each runs an **opus reasoning root** with **haiku
-fan-out** sub-agents for parallel retrieval/drafting.
+The skills under `plugins/hallouminate/skills/` form the distributable plugin
+pack and drive the wiki lifecycle through the hallouminate MCP tools. Core
+query and authoring workflows use strong reasoning roots with focused fan-out.
 
 - **`wiki-init`** — bootstrap an empty wiki by interviewing the user with
   Socratic, behavior-first questioning (ACTA: task diagram → knowledge audit
@@ -75,3 +75,7 @@ fan-out** sub-agents for parallel retrieval/drafting.
   the page each claim extends, merge, create-new only when novel, and never
   blend contradictions. Haiku locates via `ground`; the opus root decides
   and writes.
+- **`wiki-harvest-memory`** — explicit invocation only. Curate durable,
+  repository-specific facts from local Claude Code or Codex memories, require
+  a redacted user review before writing, and verify the result through
+  `ground`.
