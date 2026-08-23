@@ -39,4 +39,6 @@
 
 
 - 2026-08-16 · wiki-harvest-hallouminate-20260816 · merged · architecture.md · third closed boundary seam: `arrow` now sourced only via `lancedb::arrow::arrow` re-export, not declared directly, after a duplicate-arrow-major build break killed the #306 arrow-v59 bump (#356)
+- 2026-08-23 · fix-285-stale-wiki-claims · merged · ort-arena-retention.md · #221 rerank-batch-uncapped gap folded into the mechanism as a landed fix (`crossencoder.rs:56`, `RERANK_BATCH_SIZE = 32`); resolves the 2026-07-24 conflict-flagged narrow note (#285)
+- 2026-08-23 · fix-285-stale-wiki-claims · verified-no-change · worktree-corpus-identity.md · already records the #215 delete fix and #290 per-worktree identity re-key with historical framing preserved (landed 2026-07-24); #285's second bullet was already satisfied
 
