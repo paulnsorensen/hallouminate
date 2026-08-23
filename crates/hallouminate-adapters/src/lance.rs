@@ -638,10 +638,6 @@ fn scan_join_error(op: &str, join_error: tokio::task::JoinError) -> Hallouminate
 /// [`open_or_create`]: LanceStore::open_or_create
 pub struct LanceStore {
     table: lancedb::Table,
-    #[allow(dead_code)]
-    connection: lancedb::Connection,
-    #[allow(dead_code)]
-    meta_path: PathBuf,
     /// Mirrors the store's `embeddings_enabled` identity. When false, the
     /// `embedding` column is all nulls, so `ensure_search_indexes` skips the
     /// ANN index entirely (there is nothing to vector-search).
@@ -924,8 +920,6 @@ impl LanceStore {
         let embedder_available = embedder.is_some();
         Ok(Self {
             table,
-            connection,
-            meta_path,
             embeddings_enabled,
             indexes_ensured: AtomicBool::new(false),
             text_index_present: AtomicBool::new(false),

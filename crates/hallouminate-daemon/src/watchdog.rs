@@ -27,7 +27,6 @@ use super::heartbeat::{HeartbeatRegistry, TaskName, TaskStatus, compare_epochs};
 /// Distinct exit code for "boot refused: within the crash-loop backoff
 /// floor". `EX_TEMPFAIL` from sysexits.h — a temporary failure the caller
 /// should retry later — which is exactly the contract: never permanent.
-#[allow(dead_code)]
 pub(crate) const BOOT_BACKOFF_EXIT_CODE: i32 = 75;
 
 /// Trips older than this are forgotten (escalation reset). Must comfortably
@@ -43,7 +42,6 @@ const MAX_STORED_TRIPS: usize = 32;
 /// Default trip-state file location: sibling of the daemon socket, so it
 /// follows the same per-user runtime-dir conventions (`HALLOUMINATE_SOCKET`
 /// override, `$XDG_RUNTIME_DIR/hallouminate/`, or `~/.cache/hallouminate/`).
-#[allow(dead_code)]
 pub(crate) fn default_trip_state_path() -> std::io::Result<PathBuf> {
     Ok(super::socket::daemon_socket_path()?.with_file_name("watchdog-trips"))
 }
@@ -113,7 +111,6 @@ fn record_trip(path: &Path, now_unix: u64) -> io::Result<()> {
 /// how many trips are inside the decay window, when the last one was, and
 /// the backoff floor they currently impose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct TripSnapshot {
     pub(crate) recent_trips: u32,
     pub(crate) last_trip_unix: Option<u64>,
@@ -122,7 +119,6 @@ pub(crate) struct TripSnapshot {
 
 /// Snapshot the trip-state file at `now_unix` under the configured backoff
 /// floor/cap (`boot_backoff_floor_secs` / `boot_backoff_cap_secs`).
-#[allow(dead_code)]
 pub(crate) fn trip_snapshot(
     path: &Path,
     floor_secs: u64,
@@ -141,7 +137,6 @@ pub(crate) fn trip_snapshot(
 /// What boot should do given the persisted trip state. Never a permanent
 /// refusal: `Backoff::retry_after_secs` is always ≤ the configured cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum BootDecision {
     Proceed,
     /// Within the backoff floor — the caller should exit with
@@ -156,7 +151,6 @@ pub(crate) enum BootDecision {
 /// Boot-time crash-loop check: given the trip-state file and the configured
 /// floor/cap, decide whether this start is inside the escalating backoff
 /// floor measured from the most recent trip.
-#[allow(dead_code)]
 pub(crate) fn check_boot_backoff(
     path: &Path,
     floor_secs: u64,
@@ -234,12 +228,10 @@ impl StallTracker {
 
 /// Trip action fired after the trip is persisted (production:
 /// `Box::new(|_| std::process::abort())`; tests inject a recorder).
-#[allow(dead_code)]
 pub(crate) type TripAction = Box<dyn FnOnce(&[TaskName]) + Send>;
 
 /// Handle to the running watchdog thread. Dropping the handle detaches the
 /// thread; `stop` shuts it down promptly and joins it.
-#[allow(dead_code)]
 pub(crate) struct Watchdog {
     stop_tx: mpsc::Sender<()>,
     handle: JoinHandle<()>,
@@ -255,7 +247,6 @@ impl Watchdog {
     /// trip still fires — a wedged daemon must die even if its breadcrumb
     /// cannot be written. One trip per watchdog lifetime: after firing,
     /// the thread exits (production never returns from the abort anyway).
-    #[allow(dead_code)]
     pub(crate) fn spawn(
         registry: Arc<HeartbeatRegistry>,
         tasks: Vec<TaskName>,
@@ -278,7 +269,6 @@ impl Watchdog {
 
     /// Shut the watchdog down and join it. Prompt: the thread's poll sleep
     /// doubles as the shutdown listener, so stop never waits a full poll.
-    #[allow(dead_code)]
     pub(crate) fn stop(self) {
         drop(self.stop_tx);
         let _ = self.handle.join();
