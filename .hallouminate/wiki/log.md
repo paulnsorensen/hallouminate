@@ -40,3 +40,9 @@
 
 - 2026-08-16 · wiki-harvest-hallouminate-20260816 · merged · architecture.md · third closed boundary seam: `arrow` now sourced only via `lancedb::arrow::arrow` re-export, not declared directly, after a duplicate-arrow-major build break killed the #306 arrow-v59 bump (#356)
 
+
+- 2026-08-23 · wiki-harvest-hallouminate-20260823 · rewritten · multi-format-ingestion.md · Phase 1 shipped (0.7.0, #380): page was still "markdown-only today" but Format enum + detect_format + HandlerRegistry now route markdown/text/RST/spreadsheet; wiki corpus stays **/*.md, multi-format rides repo:NAME:corpus; prepare_file skips instead of hard-erroring; PDF/office/code still deferred
+- 2026-08-23 · wiki-harvest-hallouminate-20260823 · new-page · not-found-suggestions.md · #385 zero-round-trip error enrichment: pick_corpus "did you mean" + read_markdown ancestor listing (cap 20) and strsim closest filenames (cap 3); strsim already transitive via clap
+- 2026-08-23 · wiki-harvest-hallouminate-20260823 · merged · mcp-surface.md · read_markdown now defaults corpus to wiki-for-cwd and gained line_numbers/footnotes params; get_footnote removed in 0.7.0 (#384, eleven→ten tools), replaced by footnotes:"only"; not-found enrichment cross-linked
+- 2026-08-23 · wiki-harvest-hallouminate-20260823 · merged · index.md · tool count eleven→ten, multi-format gloss refreshed to shipped Phase 1, added not-found-suggestions entry
+

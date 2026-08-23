@@ -12,10 +12,11 @@ containing the daemon's cwd — `repo:<NAME>:wiki` for the deepest
 `[[repository]]` whose `path` is an ancestor of cwd. When cwd doesn't
 sit under any configured repo, the daemon falls back to the existing
 single-corpus / ambiguity error and the caller must name a corpus
-explicitly. This applies to the read-side tools (`ground`, `list_files`,
-`list_tree`); the mutating tools (`add_markdown`, `delete_markdown`) and
-`read_markdown` still require an explicit `corpus` to avoid accidental
-writes to the wrong wiki or ambiguous reads.
+explicitly. This applies to every read-side tool — `ground`, `list_files`,
+`list_tree`, `corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown`,
+which now defaults `corpus` to wiki-for-cwd like its peers. Only the mutating
+tools (`add_markdown`, `delete_markdown`) still require an explicit `corpus`,
+to prevent an accidental write to the wrong wiki.
 
 ## Tools
 
@@ -108,9 +109,16 @@ a log warning rather than failing the write.
 
 ### `read_markdown`
 
-Read verbatim UTF-8 contents of a file in a corpus. Params: `corpus`,
-`path`. Returns the on-disk text, not the chunked index view. Use this
+Read verbatim UTF-8 contents of a file in a corpus. Params: `corpus`
+(defaults to wiki-for-cwd), `path`, `line_numbers` (default `false` —
+`cat -n`-style gutters in the text block for citing `path:line`; structured
+`content` stays verbatim), `footnotes` (`include` default / `exclude` /
+`only`). Returns the on-disk text, not the chunked index view. Use this
 before `add_markdown { overwrite: true }` to inspect current content.
+
+The dedicated `get_footnote` tool was **removed in 0.7.0** (breaking); its job
+is now `read_markdown` with `footnotes: "only"`, which returns just the
+definition lines. This shrank the surface from eleven tools to ten.
 
 ### `delete_markdown`
 
@@ -171,6 +179,12 @@ Anything that fails before the daemon returns a typed envelope
 (transport error, decode failure, daemon unavailable) collapses to
 `-32603` so MCP clients don't misinterpret a network flake as user
 error.
+
+Two `InvalidParams` misses are **self-enriching** so a caller resolves them in
+zero extra round trips — see [not-found-suggestions](not-found-suggestions.md):
+an unknown `corpus` lists the configured corpora plus a "did you mean" closest
+match, and a `read_markdown` path miss appends the nearest existing directory's
+entries and top fuzzy filename matches.
 
 ## Multi-root corpora
 
