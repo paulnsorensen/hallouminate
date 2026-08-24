@@ -7,14 +7,21 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.7.0...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.8.0...HEAD)
+
+## [0.8.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.8.0) - 2026-08-24
 
 ### Added
 
+- Daemon: per-task restart counts in status
+- Daemon: classify supervisor crash loops as targeted task restarts
 - Skills: explicit-only `wiki-harvest-memory` workflow for reviewing durable
   Claude Code or Codex memories and curating approved facts into a repo wiki
 
-## [0.7.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.7.0) - 2026-08-16
+### Changed
+
+- Build: slimmer development debug information
+
 
 ### Added
 
