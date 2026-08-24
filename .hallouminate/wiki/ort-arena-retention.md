@@ -1,12 +1,14 @@
 ---
 status: reviewed
-last_verified: 2026-07-24
+last_verified: 2026-08-23
 confidence: high
 sources:
   - https://github.com/microsoft/onnxruntime/issues/26831
   - https://github.com/microsoft/onnxruntime/issues/11627
   - https://github.com/microsoft/onnxruntime/issues/23339
   - https://github.com/paulnsorensen/hallouminate/issues/288
+  - https://github.com/paulnsorensen/hallouminate/issues/221
+  - https://github.com/paulnsorensen/hallouminate/issues/285
 ---
 # ORT BFCArena retention — why session eviction never reclaimed memory
 
@@ -57,14 +59,13 @@ rationale in `docs/adr/daemon-idle-exit-001..003.md`).
 - **Smaller high-water mark.** Capping the embed batch
   (`embed(texts, Some(32))` instead of `None`) shrinks the arena
   peak roughly proportionally — a separate mitigation, not a fix.
-  **Historical gap (#221, now fixed):** the crossencoder path once
-  called `rerank(query, &docs, false, None)`, leaving its joint batch
-  uncapped. Current adapter code passes `Some(RERANK_BATCH_SIZE)` with
+- **Rerank batch is capped too (#221, fixed).** The crossencoder path
+  once called `rerank(query, &docs, false, None)`, leaving its joint
+  batch uncapped. It now passes `Some(RERANK_BATCH_SIZE)` with
   `RERANK_BATCH_SIZE = 32`
-  (`crates/hallouminate-adapters/src/crossencoder.rs:56-66`), so the
-  present rerank path has the same bounded-batch mitigation. Reranks
-  still serialize daemon-wide behind a whole-map mutex; issue #285
-  owns the remaining stale-page audit.
+  (`crates/hallouminate-adapters/src/crossencoder.rs:56`), the same
+  bounded-batch mitigation as the embedder. Reranks still serialize
+  daemon-wide behind a whole-map mutex.
 
 ## For future agents
 
@@ -72,4 +73,4 @@ rationale in `docs/adr/daemon-idle-exit-001..003.md`).
   `daemon-idle-exit` lands; the config warns and does nothing.
 - Full cited diagnosis: `.cheese/research/fastembed-ort-arena-leak/`.
 
-_Source: multi-instance concurrency audit plus issue #288 verification · Updated: 2026-07-24 · Supersedes: the stale claim that crossencoder reranking remained uncapped_
+_Source: multi-instance concurrency audit plus issue #288 verification; #221/#285 rerank-cap correction · Updated: 2026-08-23 · Supersedes: the #221 rerank-uncapped gap, now recorded as a landed fix_
