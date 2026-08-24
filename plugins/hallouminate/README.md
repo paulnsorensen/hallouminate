@@ -43,6 +43,19 @@ The `install` skill walks you from zero to a working wiki:
 8. **Index & verify** — indexes and proves it with a `ground` query.
 9. **Commit** — branches and commits the scaffolding with git.
 
+## Harvest local agent memory
+
+`wiki-harvest-memory` curates durable, repository-specific knowledge from local
+Claude Code or Codex memories into an existing wiki. It rejects secrets,
+personal and transient state, verifies candidates against the current repo, and
+requires a redacted user review before the first write.
+
+Invoke it explicitly with `/hallouminate:wiki-harvest-memory claude` in Claude
+Code or `$wiki-harvest-memory codex` in Codex; pass `both` to review both local
+stores. Claude's `disable-model-invocation` flag keeps the skill out of model
+context until invocation. Codex's `allow_implicit_invocation: false` policy
+prevents implicit invocation.
+
 ## Templates
 
 `templates/wiki-entry.md` is the formal shape of a wiki entry — optional

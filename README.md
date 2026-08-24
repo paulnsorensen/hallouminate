@@ -90,6 +90,13 @@ the harness-native route:
 | **Gemini CLI** | From a checkout: `gemini extensions install ./plugins/hallouminate --consent`. From an extracted release archive: `gemini extensions install ./hallouminate-skills-<version>/plugins/hallouminate --consent`. | Inline in `gemini-extension.json`; bundled skills are auto-discovered |
 | **opencode** | Copy `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` | Add `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` to `opencode.json` |
 
+
+To curate local Claude Code or Codex memories into the current repo wiki, invoke
+`/hallouminate:wiki-harvest-memory claude` in Claude Code or
+`$wiki-harvest-memory codex` in Codex. The skill cannot run implicitly; Claude
+Code also keeps it out of model context until invocation. It presents a redacted
+candidate review, then writes only the facts the user approves.
+
 ### Without the plugin: skills + MCP by hand
 
 The plugin is a convenience wrapper — both halves can be wired manually:
