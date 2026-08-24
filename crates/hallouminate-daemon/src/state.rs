@@ -316,8 +316,9 @@ struct WatcherCounters {
 }
 
 /// Snapshot of the most recent ladder trip: which escalation action fired
-/// and when (monotonic seconds). Written by the churn ladder (`watch.rs`)
-/// and the supervisor's WatchdogTrip escalation hook (`state.rs`).
+/// and when (monotonic seconds). Written by the churn ladder (`watch.rs`),
+/// the supervisor's RestartTask escalation hook (`state.rs`), and the
+/// watchdog's stall-triggered WatchdogTrip (`server.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LadderTrip {
     pub(crate) action: LadderAction,
@@ -549,10 +550,13 @@ impl DaemonState {
         let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
         let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
         // Invented defaults, no existing analog in debt.rs.
+        // `RestartTask`'s `TaskName` here is a placeholder: this one `Ladder`
+        // is shared across every supervised task, so the supervisor
+        // substitutes the actual escalating task before recording the trip.
         let ladder = super::ladder::Ladder {
             warn_at: 3,
             act_at: 5,
-            action: LadderAction::WatchdogTrip,
+            action: LadderAction::RestartTask(super::heartbeat::TaskName::Maintenance),
         };
         let state = DaemonState {
             // `new_cyclic`: the escalation hook records trips into the very

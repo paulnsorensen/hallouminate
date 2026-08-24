@@ -2,7 +2,8 @@
 //! a rising count (e.g. consecutive maintenance defers) should trigger --
 //! nothing, a warn, or an escalation action. Wired into `watch.rs`'s churn
 //! ladder (`ForceMaintenance` on reindex churn) and `state.rs`'s supervisor
-//! seed (`WatchdogTrip` on restart-intensity escalation).
+//! seed (`RestartTask` on restart-intensity escalation); `WatchdogTrip` is
+//! fired directly by `watchdog.rs`'s stall detector, not through a `Ladder`.
 
 use super::heartbeat::TaskName;
 
@@ -11,11 +12,11 @@ use super::heartbeat::TaskName;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LadderAction {
     ForceMaintenance,
-    /// Not constructed in production yet; only `WatchdogTrip`/`ForceMaintenance` are
-    /// seeded today. Kept for the planned per-task restart escalation rung;
-    /// decided in #387 to retain rather than delete.
-    #[allow(dead_code)]
+    /// Targeted per-task restart: fired by the supervisor's restart-intensity
+    /// ladder for the task that crossed `act_at` (`state.rs`'s seed).
     RestartTask(TaskName),
+    /// Whole-daemon stall escalation, fired by `watchdog.rs`'s stall
+    /// detector when a task's heartbeat stops advancing.
     WatchdogTrip,
 }
 

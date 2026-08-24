@@ -318,13 +318,20 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) -> anyh
                 _ = tokio::time::sleep(poll) => {}
             }
         }
+        // Recorded for observability before the abort (a status query racing
+        // the abort can then see it); the abort itself never returns, so
+        // this is the trip's only chance to reach `last_ladder_trip`.
+        let record_state = state.clone();
         let watchdog = watchdog::Watchdog::spawn(
             heartbeat,
             candidates,
             stall,
             poll,
             trip_path,
-            Box::new(|_| std::process::abort()),
+            Box::new(move |_| {
+                record_state.record_ladder_trip(super::ladder::LadderAction::WatchdogTrip);
+                std::process::abort()
+            }),
         );
         shutdown.cancelled().await;
         watchdog.stop();
@@ -791,6 +798,7 @@ fn raw_peer_uid(_fd: std::os::fd::RawFd) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ladder::LadderAction;
     use std::path::PathBuf;
 
     #[test]
@@ -800,6 +808,41 @@ mod tests {
             lock_path_for(&sock),
             PathBuf::from("/tmp/hallouminate/daemon.sock.lock"),
         );
+    }
+
+    #[tokio::test]
+    async fn watchdog_stall_records_watchdog_trip_before_the_abort_hook() {
+        // Mirrors spawn_watchdog_when_armed's on_trip closure (record then
+        // abort) without the abort, proving a watchdog stall records
+        // WatchdogTrip via the same DaemonState call the real closure makes.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        assert_eq!(state.last_ladder_trip(), None);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let record_state = state.clone();
+        let watchdog = watchdog::Watchdog::spawn(
+            state.heartbeat().clone(),
+            vec![TaskName::Maintenance],
+            Duration::from_millis(50),
+            Duration::from_millis(10),
+            tmp.path().join("watchdog-trips"),
+            Box::new(move |_| {
+                record_state.record_ladder_trip(LadderAction::WatchdogTrip);
+                tx.send(()).unwrap();
+            }),
+        );
+
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("watchdog must trip within the timeout");
+        assert_eq!(
+            state.last_ladder_trip().expect("trip recorded").action,
+            LadderAction::WatchdogTrip,
+        );
+        watchdog.stop();
     }
 
     // A missing socket is the normal first-boot case: pre-bind cleanup must
