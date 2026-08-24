@@ -359,7 +359,12 @@ fn render_status_report(report: &hallouminate_daemon::StatusReport) -> String {
                 TaskState::Alive => "alive",
                 TaskState::Stalled => "stalled",
             };
-            let _ = writeln!(out, "  {}: {state}", task_name(entry.task));
+            let _ = writeln!(
+                out,
+                "  {}: {state} restarts={}",
+                task_name(entry.task),
+                entry.restarts,
+            );
         }
     }
     let debt = match report.debt {
@@ -779,10 +784,12 @@ mod tests {
                 TaskStatus {
                     task: TaskName::Maintenance,
                     state: TaskState::Alive,
+                    restarts: 0,
                 },
                 TaskStatus {
                     task: TaskName::WatcherPump,
                     state: TaskState::Stalled,
+                    restarts: 3,
                 },
             ],
             debt: DebtLevel::Soft,
@@ -804,8 +811,8 @@ mod tests {
             [
                 "running",
                 "tasks:",
-                "  maintenance: alive",
-                "  watcher_pump: stalled",
+                "  maintenance: alive restarts=0",
+                "  watcher_pump: stalled restarts=3",
                 "debt: soft",
                 "deferred maintenance passes: 4",
                 "watcher: events=12 reindexes=5 noop_reindexes=2",

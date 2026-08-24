@@ -100,10 +100,8 @@ impl Supervisor {
         }
     }
 
-    /// Lifetime restart count for `task` (0 when never restarted). Kept for
-    /// planned `StatusReport` wiring; decided in #387 to retain rather than
-    /// delete (wiring it in is out of scope for that issue).
-    #[allow(dead_code)]
+    /// Lifetime restart count for `task` (0 when never restarted). Read by
+    /// `status::report` for the `StatusReport` per-task restart counts.
     pub(crate) fn restart_count(&self, task: TaskName) -> u64 {
         self.restarts.counts[slot(task)].load(Ordering::Relaxed)
     }

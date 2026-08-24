@@ -371,6 +371,8 @@ pub enum TaskState {
 pub struct TaskStatus {
     pub task: TaskName,
     pub state: TaskState,
+    /// Lifetime restart count from `Supervisor::restart_count`.
+    pub restarts: u64,
 }
 
 /// Graduated maintenance debt level. Mirrors `debt::DebtLevel`.

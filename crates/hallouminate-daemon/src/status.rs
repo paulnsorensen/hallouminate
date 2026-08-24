@@ -27,6 +27,7 @@ pub(super) fn report(state: &DaemonState) -> ipc::StatusReport {
         per_task.push(ipc::TaskStatus {
             task: wire_task(task),
             state: ipc::TaskState::Alive,
+            restarts: state.supervisor().restart_count(task),
         });
     }
     ipc::StatusReport {
@@ -76,6 +77,10 @@ fn wire_task(task: heartbeat::TaskName) -> ipc::TaskName {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
     use super::super::ipc;
     use super::super::{heartbeat, ladder};
     use super::*;
@@ -103,6 +108,11 @@ mod tests {
                 .iter()
                 .all(|t| t.state == ipc::TaskState::Alive),
             "single-snapshot per_task entries are always Alive, got {:?}",
+            report.per_task,
+        );
+        assert!(
+            report.per_task.iter().all(|t| t.restarts == 0),
+            "a fresh daemon has restarted nothing, got {:?}",
             report.per_task,
         );
         // `debt::level()` is a process-wide last-observation static (curd 2's
@@ -197,6 +207,46 @@ mod tests {
                 ipc::TripState::None => panic!("trip for {internal:?} must be reported"),
             }
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn report_reflects_supervisor_restart_counts() {
+        // WHY: `restart_count` feeds StatusReport's per-task restart total;
+        // a task that has actually restarted must show that exact count in
+        // the report, not the reset-to-Alive-only per_task shape.
+        let state = test_state().await;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&attempts);
+        state
+            .supervisor()
+            .spawn(heartbeat::TaskName::Maintenance, move || {
+                let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        panic!("boom {attempt}");
+                    }
+                    std::future::pending::<()>().await
+                }
+            });
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let report = report(&state);
+        let maintenance = report
+            .per_task
+            .iter()
+            .find(|t| t.task == ipc::TaskName::Maintenance)
+            .expect("maintenance task must be reported");
+        assert_eq!(maintenance.restarts, 2);
+        assert!(
+            report
+                .per_task
+                .iter()
+                .filter(|t| t.task != ipc::TaskName::Maintenance)
+                .all(|t| t.restarts == 0),
+            "restarting Maintenance must not count against other tasks, got {:?}",
+            report.per_task,
+        );
     }
 
     #[tokio::test]
