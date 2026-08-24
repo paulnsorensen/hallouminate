@@ -31,14 +31,20 @@ const BACKOFF_FLOOR: Duration = Duration::from_secs(1);
 /// Backoff (and the cap-exceeded cool-down) never exceeds this.
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
+/// Target-free action carried by the shared supervisor ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorAction {
+    RestartCurrentTask,
+}
+
 /// Called when a task's restart intensity has crossed the ladder's
-/// `act_at` threshold. Only `LadderAction::WatchdogTrip` is seeded today
-/// (`DaemonState::new`); the hook records the trip and logs — it does not
-/// itself abort or restart beyond the supervisor's normal backoff (real
-/// stall-triggered aborts are `watchdog.rs`'s separate stall detector).
-/// Contract: the hook is called from the monitor task and must not panic
-/// (a panicking hook kills supervision) and must not block (signal, don't
-/// remediate inline).
+/// `act_at` threshold. The supervisor converts `RestartCurrentTask` into
+/// `LadderAction::RestartTask(name)` for the task that crossed the threshold.
+/// The hook records the trip and logs; it does not itself abort or restart
+/// beyond the supervisor's normal backoff. Stall-triggered aborts are the
+/// watchdog's separate responsibility.
+///
+/// The hook runs from the monitor task and must not panic or block.
 pub(crate) type EscalationHook = Arc<dyn Fn(TaskName, LadderAction) + Send + Sync>;
 
 const TASK_COUNT: usize = 5;
@@ -72,7 +78,7 @@ impl Default for RestartCounters {
 pub(crate) struct Supervisor {
     restart_intensity_cap: u32,
     restart_intensity_window: Duration,
-    ladder: Ladder,
+    ladder: Ladder<SupervisorAction>,
     escalate: EscalationHook,
     shutdown: CancellationToken,
     restarts: Arc<RestartCounters>,
@@ -86,7 +92,7 @@ impl Supervisor {
     pub(crate) fn new(
         restart_intensity_cap: u32,
         restart_intensity_window: Duration,
-        ladder: Ladder,
+        ladder: Ladder<SupervisorAction>,
         escalate: EscalationHook,
         shutdown: CancellationToken,
     ) -> Self {
@@ -218,6 +224,11 @@ impl Supervisor {
                             );
                         }
                         LadderOutcome::Action(action) => {
+                            let action = match action {
+                                SupervisorAction::RestartCurrentTask => {
+                                    LadderAction::RestartTask(name)
+                                }
+                            };
                             tracing::error!(
                                 target: "hallouminate::daemon",
                                 task = ?name,
@@ -289,11 +300,11 @@ mod tests {
         })
     }
 
-    fn ladder(warn_at: u32, act_at: u32) -> Ladder {
+    fn ladder(warn_at: u32, act_at: u32) -> Ladder<SupervisorAction> {
         Ladder {
             warn_at,
             act_at,
-            action: LadderAction::WatchdogTrip,
+            action: SupervisorAction::RestartCurrentTask,
         }
     }
 
@@ -470,7 +481,7 @@ mod tests {
         let sup = Supervisor::new(2, WINDOW, ladder(1, 2), escalate, CancellationToken::new());
         let attempts = Arc::new(AtomicU32::new(0));
         let seen = Arc::clone(&attempts);
-        let monitor = sup.spawn(TaskName::Maintenance, move || {
+        let monitor = sup.spawn(TaskName::WatcherPump, move || {
             seen.fetch_add(1, Ordering::SeqCst);
             async { panic!("crash loop") }
         });
@@ -484,7 +495,13 @@ mod tests {
             fired.len(),
         );
         for entry in fired.iter() {
-            assert_eq!(entry, &(TaskName::Maintenance, LadderAction::WatchdogTrip));
+            assert_eq!(
+                entry,
+                &(
+                    TaskName::WatcherPump,
+                    LadderAction::RestartTask(TaskName::WatcherPump)
+                )
+            );
         }
         assert!(
             !monitor.is_finished(),
