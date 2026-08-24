@@ -45,6 +45,7 @@ use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
 use super::ladder::LadderAction;
 use super::maintenance::{DeferReason, maintenance_loop};
+use super::supervisor::SupervisorAction;
 
 const CHUNK_BUDGET_TOKENS: usize = 384;
 
@@ -232,9 +233,9 @@ struct DaemonStateInner {
     /// completed, and reindexes that upserted nothing) -- additive storage
     /// for curd 9's status surface.
     watcher_counters: WatcherCounters,
-    /// Most recent ladder trip, if any (written by `watch.rs`'s churn
-    /// ladder and `state.rs`'s supervisor WatchdogTrip escalation hook;
-    /// curd 9's status surface reads it).
+    /// Most recent in-process ladder trip. Supervisor and churn writes may
+    /// wait for this lock; watchdog writes are best-effort because abort must
+    /// never wait. Durable watchdog history lives in its trip-state file.
     last_ladder_trip: std::sync::Mutex<Option<LadderTrip>>,
     /// Supervisor owning the daemon's five long-lived loops (G5). Holds the
     /// escalation hook below; loops route through `supervisor().spawn(..)`
@@ -550,13 +551,10 @@ impl DaemonState {
         let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
         let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
         // Invented defaults, no existing analog in debt.rs.
-        // `RestartTask`'s `TaskName` here is a placeholder: this one `Ladder`
-        // is shared across every supervised task, so the supervisor
-        // substitutes the actual escalating task before recording the trip.
         let ladder = super::ladder::Ladder {
             warn_at: 3,
             act_at: 5,
-            action: LadderAction::RestartTask(super::heartbeat::TaskName::Maintenance),
+            action: SupervisorAction::RestartCurrentTask,
         };
         let state = DaemonState {
             // `new_cyclic`: the escalation hook records trips into the very
@@ -946,8 +944,7 @@ impl DaemonState {
         )
     }
 
-    /// Record a ladder trip (curd 1's future ladder wiring calls this when
-    /// `Ladder::evaluate` returns `Action`). Overwrites any prior snapshot.
+    /// Records a ladder trip, overwriting any prior snapshot.
     pub(crate) fn record_ladder_trip(&self, action: LadderAction) {
         let at_secs = monotonic_secs();
         *self
@@ -955,6 +952,27 @@ impl DaemonState {
             .last_ladder_trip
             .lock()
             .expect("ladder trip mutex poisoned") = Some(LadderTrip { action, at_secs });
+    }
+
+    /// Attempts to record a ladder trip without blocking the caller.
+    pub(crate) fn try_record_ladder_trip(&self, action: LadderAction) -> bool {
+        let Ok(mut trip) = self.inner.last_ladder_trip.try_lock() else {
+            return false;
+        };
+        *trip = Some(LadderTrip {
+            action,
+            at_secs: monotonic_secs(),
+        });
+        true
+    }
+
+    /// Holds the ladder-trip slot for contention tests.
+    #[cfg(test)]
+    pub(super) fn lock_ladder_trip(&self) -> std::sync::MutexGuard<'_, Option<LadderTrip>> {
+        self.inner
+            .last_ladder_trip
+            .lock()
+            .expect("ladder trip mutex poisoned")
     }
 
     /// The most recent ladder trip, if any (curd 9's status surface).

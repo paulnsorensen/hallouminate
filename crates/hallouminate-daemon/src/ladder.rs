@@ -2,8 +2,9 @@
 //! a rising count (e.g. consecutive maintenance defers) should trigger --
 //! nothing, a warn, or an escalation action. Wired into `watch.rs`'s churn
 //! ladder (`ForceMaintenance` on reindex churn) and `state.rs`'s supervisor
-//! seed (`RestartTask` on restart-intensity escalation); `WatchdogTrip` is
-//! fired directly by `watchdog.rs`'s stall detector, not through a `Ladder`.
+//! seed (converted to `RestartTask` on restart-intensity escalation);
+//! `WatchdogTrip` is fired directly by `watchdog.rs`'s stall detector, not
+//! through a `Ladder`.
 
 use super::heartbeat::TaskName;
 
@@ -23,23 +24,23 @@ pub(crate) enum LadderAction {
 /// What a ladder evaluation determined for a given count: nothing, a warn,
 /// or the ladder's action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LadderOutcome {
+pub(crate) enum LadderOutcome<A> {
     Nothing,
     Warn,
-    Action(LadderAction),
+    Action(A),
 }
 
 /// A two-threshold ladder: below `warn_at` fires nothing, at/above `warn_at`
 /// (but below `act_at`) fires a warn, at/above `act_at` fires `action`.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Ladder {
+pub(crate) struct Ladder<A> {
     pub(crate) warn_at: u32,
     pub(crate) act_at: u32,
-    pub(crate) action: LadderAction,
+    pub(crate) action: A,
 }
 
-impl Ladder {
-    pub(crate) fn evaluate(&self, count: u32) -> LadderOutcome {
+impl<A: Copy> Ladder<A> {
+    pub(crate) fn evaluate(&self, count: u32) -> LadderOutcome<A> {
         if count >= self.act_at {
             LadderOutcome::Action(self.action)
         } else if count >= self.warn_at {
@@ -54,7 +55,7 @@ impl Ladder {
 mod tests {
     use super::*;
 
-    fn ladder() -> Ladder {
+    fn ladder() -> Ladder<LadderAction> {
         Ladder {
             warn_at: 5,
             act_at: 10,

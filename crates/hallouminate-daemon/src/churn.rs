@@ -26,7 +26,7 @@ pub(crate) enum ReindexEffect {
 /// ever shares the tracker.
 #[derive(Debug)]
 pub(crate) struct ChurnTracker {
-    ladder: Ladder,
+    ladder: Ladder<LadderAction>,
     consecutive_noops: u32,
     /// Re-armed by a real upsert; the act-tier action fires once per streak
     /// (re-firing `ForceMaintenance` on every subsequent noop would itself
@@ -56,7 +56,11 @@ impl ChurnTracker {
     /// upserted rows, `path` is the reindexed file (log context only).
     /// Returns the fired outcome so the call site (wiring task W3) executes
     /// any `LadderOutcome::Action`.
-    pub(crate) fn record_reindex(&mut self, effect: ReindexEffect, path: &Path) -> LadderOutcome {
+    pub(crate) fn record_reindex(
+        &mut self,
+        effect: ReindexEffect,
+        path: &Path,
+    ) -> LadderOutcome<LadderAction> {
         if effect == ReindexEffect::Upserted {
             self.consecutive_noops = 0;
             self.action_armed = true;
@@ -111,11 +115,11 @@ mod tests {
         ChurnTracker::new(3, 5)
     }
 
-    fn noop(t: &mut ChurnTracker) -> LadderOutcome {
+    fn noop(t: &mut ChurnTracker) -> LadderOutcome<LadderAction> {
         t.record_reindex(ReindexEffect::NoOp, Path::new("wiki/hot-page.md"))
     }
 
-    fn real_upsert(t: &mut ChurnTracker) -> LadderOutcome {
+    fn real_upsert(t: &mut ChurnTracker) -> LadderOutcome<LadderAction> {
         t.record_reindex(ReindexEffect::Upserted, Path::new("wiki/hot-page.md"))
     }
 

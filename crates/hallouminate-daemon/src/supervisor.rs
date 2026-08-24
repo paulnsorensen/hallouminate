@@ -31,15 +31,20 @@ const BACKOFF_FLOOR: Duration = Duration::from_secs(1);
 /// Backoff (and the cap-exceeded cool-down) never exceeds this.
 const BACKOFF_CAP: Duration = Duration::from_secs(60);
 
+/// Target-free action carried by the shared supervisor ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SupervisorAction {
+    RestartCurrentTask,
+}
+
 /// Called when a task's restart intensity has crossed the ladder's
-/// `act_at` threshold. `LadderAction::RestartTask(name)` is seeded today
-/// (`DaemonState::open_with_owner`), `name` substituted for the actual
-/// escalating task; the hook records the trip and logs — it does not
-/// itself abort or restart beyond the supervisor's normal backoff (real
-/// stall-triggered aborts are `watchdog.rs`'s separate stall detector).
-/// Contract: the hook is called from the monitor task and must not panic
-/// (a panicking hook kills supervision) and must not block (signal, don't
-/// remediate inline).
+/// `act_at` threshold. The supervisor converts `RestartCurrentTask` into
+/// `LadderAction::RestartTask(name)` for the task that crossed the threshold.
+/// The hook records the trip and logs; it does not itself abort or restart
+/// beyond the supervisor's normal backoff. Stall-triggered aborts are the
+/// watchdog's separate responsibility.
+///
+/// The hook runs from the monitor task and must not panic or block.
 pub(crate) type EscalationHook = Arc<dyn Fn(TaskName, LadderAction) + Send + Sync>;
 
 const TASK_COUNT: usize = 5;
@@ -73,7 +78,7 @@ impl Default for RestartCounters {
 pub(crate) struct Supervisor {
     restart_intensity_cap: u32,
     restart_intensity_window: Duration,
-    ladder: Ladder,
+    ladder: Ladder<SupervisorAction>,
     escalate: EscalationHook,
     shutdown: CancellationToken,
     restarts: Arc<RestartCounters>,
@@ -87,7 +92,7 @@ impl Supervisor {
     pub(crate) fn new(
         restart_intensity_cap: u32,
         restart_intensity_window: Duration,
-        ladder: Ladder,
+        ladder: Ladder<SupervisorAction>,
         escalate: EscalationHook,
         shutdown: CancellationToken,
     ) -> Self {
@@ -219,15 +224,10 @@ impl Supervisor {
                             );
                         }
                         LadderOutcome::Action(action) => {
-                            // The seeded `Ladder` is shared across every
-                            // supervised task, so a `RestartTask` action's
-                            // carried `TaskName` is a placeholder
-                            // (`DaemonState`'s seed) that must be
-                            // substituted with the task actually escalating
-                            // here; other action kinds pass through as-is.
                             let action = match action {
-                                LadderAction::RestartTask(_) => LadderAction::RestartTask(name),
-                                other => other,
+                                SupervisorAction::RestartCurrentTask => {
+                                    LadderAction::RestartTask(name)
+                                }
                             };
                             tracing::error!(
                                 target: "hallouminate::daemon",
@@ -300,11 +300,11 @@ mod tests {
         })
     }
 
-    fn ladder(warn_at: u32, act_at: u32) -> Ladder {
+    fn ladder(warn_at: u32, act_at: u32) -> Ladder<SupervisorAction> {
         Ladder {
             warn_at,
             act_at,
-            action: LadderAction::WatchdogTrip,
+            action: SupervisorAction::RestartCurrentTask,
         }
     }
 
@@ -481,7 +481,7 @@ mod tests {
         let sup = Supervisor::new(2, WINDOW, ladder(1, 2), escalate, CancellationToken::new());
         let attempts = Arc::new(AtomicU32::new(0));
         let seen = Arc::clone(&attempts);
-        let monitor = sup.spawn(TaskName::Maintenance, move || {
+        let monitor = sup.spawn(TaskName::WatcherPump, move || {
             seen.fetch_add(1, Ordering::SeqCst);
             async { panic!("crash loop") }
         });
@@ -495,7 +495,13 @@ mod tests {
             fired.len(),
         );
         for entry in fired.iter() {
-            assert_eq!(entry, &(TaskName::Maintenance, LadderAction::WatchdogTrip));
+            assert_eq!(
+                entry,
+                &(
+                    TaskName::WatcherPump,
+                    LadderAction::RestartTask(TaskName::WatcherPump)
+                )
+            );
         }
         assert!(
             !monitor.is_finished(),
@@ -505,40 +511,6 @@ mod tests {
             attempts.load(Ordering::SeqCst) > 3,
             "restarts must continue (cool-down paced) after escalation",
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn escalation_substitutes_the_actual_churning_task_for_the_seeded_placeholder() {
-        // WHY: the seeded ladder carries `RestartTask(Maintenance)` as a
-        // documented placeholder (one `Ladder` is shared across every
-        // supervised task); `spawn` must substitute the task that actually
-        // crossed `act_at`, not pass the placeholder through untouched.
-        let fired: Arc<Mutex<Vec<(TaskName, LadderAction)>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&fired);
-        let escalate: EscalationHook = Arc::new(move |task, action| {
-            sink.lock().unwrap().push((task, action));
-        });
-        let seeded = Ladder {
-            warn_at: 1,
-            act_at: 2,
-            action: LadderAction::RestartTask(TaskName::Maintenance),
-        };
-        let sup = Supervisor::new(2, WINDOW, seeded, escalate, CancellationToken::new());
-        sup.spawn(TaskName::WatcherPump, || async { panic!("crash loop") });
-
-        tokio::time::sleep(Duration::from_secs(300)).await;
-        let fired = fired.lock().unwrap();
-        assert!(!fired.is_empty(), "the churning task must escalate");
-        for entry in fired.iter() {
-            assert_eq!(
-                entry,
-                &(
-                    TaskName::WatcherPump,
-                    LadderAction::RestartTask(TaskName::WatcherPump)
-                ),
-                "the placeholder Maintenance must be substituted with the churning task",
-            );
-        }
     }
 
     #[tokio::test(start_paused = true)]

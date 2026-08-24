@@ -21,6 +21,7 @@ use hallouminate_config::{self, Config};
 use super::dispatch::dispatch;
 use super::heartbeat::TaskName;
 use super::ipc::{DaemonRequest, DaemonResponse};
+use super::ladder::LadderAction;
 use super::socket::daemon_socket_path;
 use super::state::{DaemonState, WorkClass};
 use super::watchdog;
@@ -42,6 +43,8 @@ pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// `IDLE_READ_TIMEOUT` would otherwise catch it, growing the allocation
 /// without bound.
 const MAX_REQUEST_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+type WatchdogAbort = Box<dyn FnOnce() + Send>;
 
 /// Cap on concurrently active connection handlers. Bounds memory/CPU from a
 /// client (or many clients) opening unlimited connections; excess
@@ -146,7 +149,13 @@ async fn serve_with_config(
             super::dispatch::catch_up_index(factory_state.clone())
         });
     }
-    spawn_watchdog_when_armed(&state, watcher_enabled)?;
+    let trip_path = watchdog::default_trip_state_path()?;
+    spawn_watchdog_when_armed(
+        &state,
+        watcher_enabled,
+        trip_path,
+        Box::new(|| std::process::abort()),
+    );
     let (result, shutdown_deadline): (anyhow::Result<()>, Instant) =
         match serve_on_listener(&state, socket_path, IDLE_READ_TIMEOUT).await {
             Ok(deadline) => (Ok(()), deadline),
@@ -275,7 +284,12 @@ async fn sleep_with_idle_heartbeat(state: &DaemonState, total: Duration) {
 /// sleep (`sleep_with_idle_heartbeat`, above) both bump their heartbeat well
 /// inside the default 300s stall window even on a fully-idle/active daemon,
 /// so neither false-trips once armed.
-fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) -> anyhow::Result<()> {
+fn spawn_watchdog_when_armed(
+    state: &DaemonState,
+    watcher_enabled: bool,
+    trip_path: PathBuf,
+    abort: WatchdogAbort,
+) {
     let daemon = &state.baseline().daemon;
     let stall_secs = daemon.watchdog_stall_secs;
     let mut candidates: Vec<TaskName> = Vec::new();
@@ -296,7 +310,7 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) -> anyh
             candidate_count = candidates.len(),
             "watchdog disabled (no stall window or no monitorable tasks)",
         );
-        return Ok(());
+        return;
     }
     // Same cadence for the arming wait and the watchdog's own poll:
     // stall/4 keeps detection latency within ~1.25x the stall window,
@@ -304,7 +318,6 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) -> anyh
     let poll = Duration::from_secs((stall_secs / 4).clamp(1, 60));
     let stall = Duration::from_secs(stall_secs);
     let state = state.clone();
-    let trip_path = watchdog::default_trip_state_path()?;
     tokio::spawn(async move {
         let shutdown = state.shutdown_token().clone();
         let heartbeat = state.heartbeat().clone();
@@ -318,9 +331,6 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) -> anyh
                 _ = tokio::time::sleep(poll) => {}
             }
         }
-        // Recorded for observability before the abort (a status query racing
-        // the abort can then see it); the abort itself never returns, so
-        // this is the trip's only chance to reach `last_ladder_trip`.
         let record_state = state.clone();
         let watchdog = watchdog::Watchdog::spawn(
             heartbeat,
@@ -329,14 +339,13 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) -> anyh
             poll,
             trip_path,
             Box::new(move |_| {
-                record_state.record_ladder_trip(super::ladder::LadderAction::WatchdogTrip);
-                std::process::abort()
+                let _ = record_state.try_record_ladder_trip(LadderAction::WatchdogTrip);
+                abort();
             }),
         );
         shutdown.cancelled().await;
         watchdog.stop();
     });
-    Ok(())
 }
 
 async fn finish_shutdown(
@@ -798,7 +807,6 @@ fn raw_peer_uid(_fd: std::os::fd::RawFd) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::LadderAction;
     use std::path::PathBuf;
 
     #[test]
@@ -810,39 +818,65 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn watchdog_stall_records_watchdog_trip_before_the_abort_hook() {
-        // Mirrors spawn_watchdog_when_armed's on_trip closure (record then
-        // abort) without the abort, proving a watchdog stall records
-        // WatchdogTrip via the same DaemonState call the real closure makes.
+    async fn watchdog_state() -> (tempfile::TempDir, DaemonState) {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = Config::default();
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 1;
+        cfg.daemon.watchdog_stall_secs = 1;
         let state = DaemonState::open(cfg, None).await.expect("open");
-        assert_eq!(state.last_ladder_trip(), None);
+        state.heartbeat().bump(TaskName::IdleExit);
+        (tmp, state)
+    }
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-        let record_state = state.clone();
-        let watchdog = watchdog::Watchdog::spawn(
-            state.heartbeat().clone(),
-            vec![TaskName::Maintenance],
-            Duration::from_millis(50),
-            Duration::from_millis(10),
+    #[tokio::test]
+    async fn watchdog_stall_records_watchdog_trip_before_the_abort_hook() {
+        let (tmp, state) = watchdog_state().await;
+        assert_eq!(state.last_ladder_trip(), None);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        spawn_watchdog_when_armed(
+            &state,
+            false,
             tmp.path().join("watchdog-trips"),
-            Box::new(move |_| {
-                record_state.record_ladder_trip(LadderAction::WatchdogTrip);
-                tx.send(()).unwrap();
-            }),
+            Box::new(move || tx.send(()).expect("abort receiver dropped")),
         );
 
-        rx.recv_timeout(Duration::from_secs(5))
-            .expect("watchdog must trip within the timeout");
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("watchdog must trip within the timeout")
+            .expect("abort hook must fire");
         assert_eq!(
             state.last_ladder_trip().expect("trip recorded").action,
             LadderAction::WatchdogTrip,
         );
-        watchdog.stop();
+        state.shutdown_token().cancel();
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_abort_hook_fires_when_the_ladder_trip_slot_is_contended() {
+        let (tmp, state) = watchdog_state().await;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        spawn_watchdog_when_armed(
+            &state,
+            false,
+            tmp.path().join("watchdog-trips"),
+            Box::new(move || tx.send(()).expect("abort receiver dropped")),
+        );
+        tokio::task::yield_now().await;
+
+        {
+            let trip = state.lock_ladder_trip();
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("watchdog must trip despite lock contention");
+            assert_eq!(*trip, None);
+        }
+        state.shutdown_token().cancel();
+        tokio::task::yield_now().await;
     }
 
     // A missing socket is the normal first-boot case: pre-bind cleanup must
