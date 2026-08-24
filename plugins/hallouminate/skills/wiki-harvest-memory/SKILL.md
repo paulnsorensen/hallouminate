@@ -73,6 +73,10 @@ host-wide rather than inherently limited to the current repository.
 5. If the memory directory or registry is absent, report that local Codex memories
    may be disabled or not generated yet, then stop that source cleanly.
 
+Before reading any memory file, canonicalize it and require a regular, non-symlink
+file beneath the canonical selected memory root. Reject links and references that escape
+that root, including through path traversal or symlinks.
+
 Do not modify either source memory store.
 
 ## Build the candidate set
@@ -119,8 +123,9 @@ Before the first wiki write, present one compact table containing:
 | --- | --- | --- | --- | --- |
 
 Use redacted, repository-relative descriptions. Source cells may name the harness
-and local file, but must not reveal secret values. Separate rejected candidates into
-reason counts rather than reproducing their content.
+and a memory-root-relative file only after private path components are redacted. Never
+display absolute home paths or encoded project-directory names. Separate rejected
+candidates into reason counts rather than reproducing their content.
 
 Ask once whether to import all eligible candidates, import a selected subset, or
 cancel. Do not write on ambiguity, cancellation, or silence. This gate cannot be
@@ -132,10 +137,11 @@ versioned wiki is a trust-boundary crossing.
 For each approved candidate:
 
 1. Use `ground` to find the existing page it extends.
-2. Before changing an existing page, call `read_markdown` and `backlinks`. Preserve
-   compatible content and note any dependent pages that assume the old wording.
+2. Before changing an existing page, call `read_markdown` and `backlinks`, and retain
+   the exact preimage for rollback. Preserve compatible content and note any dependent
+   pages that assume the old wording.
 3. Merge into the existing page whenever its topic matches. Create a new page only
-   for genuinely novel knowledge.
+   for genuinely novel knowledge, and track its corpus-relative path for rollback.
 4. Follow the wiki's one-topic-per-file, H1-first, kebab-case slug, lifecycle
    frontmatter, and citation conventions.
 5. Write a concise synthesis, not a quotation or memory transcript. Ground claims
@@ -158,14 +164,17 @@ Freeze two probes per changed topic before writing:
 
 After all writes, run both probes with `ground`. Confirm that the intended page is
 retrieved and that its text states the approved fact accurately. If retrieval fails,
-revise once without changing the probes. If the exact probe still fails, restore the
-page content captured before the write and report the blocked candidate.
+revise once without changing the probes. If the exact probe still fails, restore each
+affected existing page from its captured preimage with `add_markdown`, delete each
+affected new page with `delete_markdown`, and report the blocked candidate. Report any
+rollback failure explicitly.
 
 ## Report
 
 Return:
 
-- selected source or sources and matched memory roots
+- selected source or sources and redacted memory roots, with home and encoded project
+  components collapsed
 - candidate, imported, duplicate, contradicted, sensitive, transient, and blocked
   counts
 - wiki pages created or updated

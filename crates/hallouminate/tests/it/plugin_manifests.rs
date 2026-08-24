@@ -478,7 +478,7 @@ fn wiki_harvest_memory_skill_is_explicit_only() {
             .and_then(|policy| policy.get("allow_implicit_invocation"))
             .and_then(serde_yaml_ng::Value::as_bool),
         Some(false),
-        "Codex must hide the skill from its prompt and allow only explicit invocation"
+        "Codex must prevent implicit invocation"
     );
 }
 

@@ -93,9 +93,9 @@ the harness-native route:
 
 To curate local Claude Code or Codex memories into the current repo wiki, invoke
 `/hallouminate:wiki-harvest-memory claude` in Claude Code or
-`$wiki-harvest-memory codex` in Codex. This explicit-only skill stays out of
-model context until invocation, presents a redacted candidate review, then
-writes only the facts the user approves.
+`$wiki-harvest-memory codex` in Codex. The skill cannot run implicitly; Claude
+Code also keeps it out of model context until invocation. It presents a redacted
+candidate review, then writes only the facts the user approves.
 
 ### Without the plugin: skills + MCP by hand
 

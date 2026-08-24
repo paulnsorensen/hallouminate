@@ -52,9 +52,9 @@ requires a redacted user review before the first write.
 
 Invoke it explicitly with `/hallouminate:wiki-harvest-memory claude` in Claude
 Code or `$wiki-harvest-memory codex` in Codex; pass `both` to review both local
-stores. Claude's `disable-model-invocation` flag and Codex's
-`allow_implicit_invocation: false` policy keep the skill out of model context
-until the user invokes it.
+stores. Claude's `disable-model-invocation` flag keeps the skill out of model
+context until invocation. Codex's `allow_implicit_invocation: false` policy
+prevents implicit invocation.
 
 ## Templates
 
