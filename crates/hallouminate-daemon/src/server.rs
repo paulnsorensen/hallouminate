@@ -97,7 +97,7 @@ async fn serve_with_config(
         backoff_secs,
         recent_trips,
     } = watchdog::check_boot_backoff(
-        &socket_path.with_file_name("watchdog-trips"),
+        &watchdog::default_trip_state_path()?,
         cfg.daemon.boot_backoff_floor_secs,
         cfg.daemon.boot_backoff_cap_secs,
         now_unix,
@@ -146,7 +146,7 @@ async fn serve_with_config(
             super::dispatch::catch_up_index(factory_state.clone())
         });
     }
-    spawn_watchdog_when_armed(&state, watcher_enabled, socket_path);
+    spawn_watchdog_when_armed(&state, watcher_enabled)?;
     let (result, shutdown_deadline): (anyhow::Result<()>, Instant) =
         match serve_on_listener(&state, socket_path, IDLE_READ_TIMEOUT).await {
             Ok(deadline) => (Ok(()), deadline),
@@ -275,7 +275,7 @@ async fn sleep_with_idle_heartbeat(state: &DaemonState, total: Duration) {
 /// sleep (`sleep_with_idle_heartbeat`, above) both bump their heartbeat well
 /// inside the default 300s stall window even on a fully-idle/active daemon,
 /// so neither false-trips once armed.
-fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool, socket_path: &Path) {
+fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool) -> anyhow::Result<()> {
     let daemon = &state.baseline().daemon;
     let stall_secs = daemon.watchdog_stall_secs;
     let mut candidates: Vec<TaskName> = Vec::new();
@@ -296,7 +296,7 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool, socket_
             candidate_count = candidates.len(),
             "watchdog disabled (no stall window or no monitorable tasks)",
         );
-        return;
+        return Ok(());
     }
     // Same cadence for the arming wait and the watchdog's own poll:
     // stall/4 keeps detection latency within ~1.25x the stall window,
@@ -304,7 +304,7 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool, socket_
     let poll = Duration::from_secs((stall_secs / 4).clamp(1, 60));
     let stall = Duration::from_secs(stall_secs);
     let state = state.clone();
-    let trip_path = socket_path.with_file_name("watchdog-trips");
+    let trip_path = watchdog::default_trip_state_path()?;
     tokio::spawn(async move {
         let shutdown = state.shutdown_token().clone();
         let heartbeat = state.heartbeat().clone();
@@ -329,6 +329,7 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool, socket_
         shutdown.cancelled().await;
         watchdog.stop();
     });
+    Ok(())
 }
 
 async fn finish_shutdown(
