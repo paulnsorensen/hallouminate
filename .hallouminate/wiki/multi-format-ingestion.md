@@ -1,144 +1,114 @@
 # Multi-format ingestion
 
-Hallouminate is functionally **markdown-only** today. The walker is
-format-agnostic, but everything downstream of it — chunking, summary,
-breadcrumbs, the UTF-8 gate — assumes markdown. Adding plain text,
-source code, and PDF is not a glob change; it is a per-format dispatch
-problem, because the single biggest documented antipattern in mature RAG
-pipelines is using one generic splitter for every format. This page
-captures what is true of the current pipeline, what tooling is reachable,
-the architecture pattern to borrow, and the design questions still open —
-so a future agent has the durable picture before touching the indexer.
+Hallouminate is **no longer markdown-only**. Phase 1 shipped in the 0.7.0
+window (CHANGELOG "Indexer: reStructuredText and prose format ingestion"):
+the indexer now routes four format families — markdown, plain text,
+reStructuredText, and spreadsheets — each to its own handler, exactly the
+per-format-dispatch design this page previously argued for. The single most
+important nuance: **the wiki corpus you author into is still markdown-only**;
+multi-format applies to the non-wiki corpora (`repo:NAME:corpus` and explicit
+`[[corpus]]` entries). This page records what shipped, why, and what is still
+deferred.
 
-Full evidence behind the crate and pattern claims lives in two on-disk
-research artifacts:
+Full research evidence behind the crate/pattern choices lives in two on-disk
+artifacts:
 
 - `.cheese/research/multi-format-ingest/multi-format-ingest.md` — Rust crate survey (text-splitter surface, tree-sitter grammars, PDF extractors, format detectors), with a claim-level source table.
 - `.cheese/research/multi-format-rag-ingestion/multi-format-rag-ingestion.md` — RAG pipeline architecture patterns (LangChain / LlamaIndex / unstructured.io loaders and splitters), with a claim-level source table.
 
-## Current state: markdown all the way down
+## What shipped: extension-keyed dispatch, one handler per format
 
-The walker is *not* the constraint. `src/domain/corpus/walker.rs::scan`
-(`walker.rs:13`) is glob-driven — `build_globset` over `corpus.globs` —
-and empty globs match everything (`scan_with_empty_globs_matches_everything`,
-`walker.rs:250`). There is no extension gate in the walker. The
-markdown-only behavior comes from two places downstream:
+The pipeline is the extension-keyed-loader-registry shape the RAG literature
+converges on. Three seams, all in
+`crates/hallouminate-domain/src/indexer/format.rs`:
 
-1. **The wiki corpus hardcodes `globs: [\"**/*.md\"]`** in
-   `repository_wiki_corpus` (`repository.rs:94`). So the derived
-   `repo:NAME:wiki` corpus only ever sees `.md` files regardless of the
-   walker's generality.
+1. **`Format` enum** (`format.rs::Format`, lines 41-46): `Markdown`,
+   `PlainText`, `Rst`, `Spreadsheet` — the closed Phase 1 set.
+2. **`detect_format`** (`format.rs::detect_format`): **extension is decisive**.
+   `format_from_extension` maps the extension; a *known-but-unsupported*
+   extension returns `None` and is skipped **without a magic-byte sniff** —
+   deliberately, so a `.docx` (a ZIP) is never mislabeled as a spreadsheet
+   container. Only an extensionless name falls back to `detect_by_magic`
+   (`file-format` 0.29 content sniff).
+3. **`HandlerRegistry`** (`format.rs::HandlerRegistry`): holds one boxed
+   `FormatHandler` per format and dispatches with a total `handler(format)`
+   match. The daemon builds it once and threads it through
+   `index_single_file` / `catch_up_corpus`
+   (`crates/hallouminate-daemon/src/dispatch.rs`).
 
-2. **The whole `prepare_file` pipeline assumes markdown.**
-   `src/domain/indexer/writer.rs::prepare_file` (`writer.rs:16`):
-   - **UTF-8 gate** — `String::from_utf8(bytes)` (`writer.rs:26`) hard-rejects
-     any non-UTF-8 file with a `non-utf8 file` error. PDF bytes never make
-     it past this line (regression: `prepare_file_errors_on_non_utf8_file`,
-     `writer.rs:168`).
-   - **Single chunker** — it takes `&dyn CorpusChunker`, and the *only*
-     implementor is `MarkdownChunker` (`chunker.rs:25`), which wraps
-     `text_splitter::MarkdownSplitter` over pulldown-cmark
-     (`chunker.rs:3`, `chunker.rs:53`).
-   - **Markdown-specific enrichment** — `extract_summary`,
-     `build_breadcrumbs` (the H1→H3 `heading_path`, `chunker.rs:124`),
-     `extract_claim_marks`, and `split_frontmatter` (`writer.rs:5-8`,
-     `writer.rs:32-37`) are all markdown semantics.
+Extension routing (not magic-byte sniffing) is the right call for a git-repo
+indexer because source and doc files have well-known extensions; unstructured.io
+is the outlier that sniffs libmagic, and it pays for it. The one place bytes
+still matter is extensionless files.
 
-A reserved intent for code indexing exists, but it is **a comment, not a
-live variant**: `RepoCorpusKind` has only `Wiki` and `Corpus`
-(`repository.rs:46-47`); line 48 is `// Future: Code maps to
-repo:{name}:code if code-aware indexing is added.` Grepping for
-`RepoCorpusKind::Code` finds nothing — the `suffix()` match
-(`repository.rs:53-56`) has no `Code` arm and would not compile with one.
-Treat it as scaffolded intent with no implementation.
+### Format → handler map
 
-## Why this matters: per-format dispatch, not a glob change
-
-The consistent finding across LangChain, LlamaIndex, and unstructured.io
-plus the practitioner community: applying one generic splitter
-(`RecursiveCharacterTextSplitter`-style) to all file types is the most
-common quality antipattern. Markdown loses its heading structure, code
-gets split mid-function, PDFs lose page context — each format degrades
-differently. So multi-format support is fundamentally about routing each
-format to its own splitter and its own metadata, not about widening the
-include glob. Hallouminate's `CorpusChunker` trait (`chunker.rs:17`) is
-already the seam where that dispatch belongs — it just has one impl today.
-
-## Available tooling (reachable without large new deps)
-
-**Chunking — extend the existing dep, don't add one.** `text-splitter`
-`0.32.0` is already locked (`Cargo.lock:6330`) and grouped with
-`tokenizers` in dependabot lockstep (see below). It ships three splitters
-on the same `ChunkConfig` / `ChunkSizer` we already re-export
-(`chunker.rs:12`):
-
-| Splitter | Feature flag | Backed by | Status here |
+| Extension(s) | `Format` | Handler | Chunking |
 |---|---|---|---|
-| `MarkdownSplitter` | `markdown` | pulldown-cmark | in use |
-| `TextSplitter` | none (default) | Unicode segmenter | available today, no flag |
-| `CodeSplitter` | `code` + one `tree-sitter-<lang>` crate per language | tree-sitter AST | one feature line + grammar crates |
+| `md`, `markdown` | `Markdown` | `MarkdownHandler` | `MarkdownChunker` (pulldown-cmark, H1→H3 breadcrumbs, frontmatter + claim marks) |
+| `txt`, `text`, `adoc`, `asciidoc`, `org` | `PlainText` | `TextHandler<S>` | `text_splitter::TextSplitter` budget windows; **empty `heading_path`**, no frontmatter, no claim marks |
+| `rst` | `Rst` | `RstHandler` | `RstChunker`: plain `TextSplitter` windows **plus a section-adornment side-pass** that recovers RST heading breadcrumbs; no frontmatter/claim marks |
+| `csv`, `xlsx`, `xls`, `ods` | `Spreadsheet` | `SpreadsheetHandler` | one chunk **per data row**; first row is the header; each row renders `col: val` lines so the chunk self-describes; breadcrumb `sheet:row-N`. CSV via the `csv` crate, workbooks via `calamine` |
 
-So plain-text and code-aware chunking are extensions of the current dep,
-not new dependencies. `CodeSplitter` bundles the tree-sitter runtime;
-each language is a separate `tree-sitter-rust` / `-python` / … grammar
-crate (~1–2 MB compiled each) that compiles its C parser via `cc` — so a
-**C compiler is required at build time** for code support.
+`.md`/AsciiDoc/`.org` note: AsciiDoc and Org route to the *plain-text*
+handler — there is no AsciiDoc/Org structure parser, they just chunk as text.
+Markdown remains the only format with frontmatter and `<!--claim:-->` parsing.
 
-**PDF text extraction** (a new dep either way):
+## Failure handling: skip one file, never abort the run
 
-- `pdf-extract` (v0.10.0) — pure Rust, no OCR, single `extract_text_from_mem` call, highest download signal. The natural starting point. Extracts in content-stream order (may misorder multi-column layouts); scanned PDFs return empty.
-- `pdfium-render` (v0.9.2) — better layout fidelity, but binds Google's Pdfium C++ lib (~20 MB native runtime dep). Reach for it only if `pdf-extract`'s fidelity proves inadequate.
-- `lopdf` is structural manipulation, **not** a text-extraction library — its `extract_text` is secondary and order-unaware. Not the right tool.
+`prepare_file` (`crates/hallouminate-domain/src/indexer/writer.rs::prepare_file`)
+replaced the old hard UTF-8 gate. The previous behavior — one non-UTF-8 file
+erroring the whole `prepare_file` — is gone. Now:
 
-**Format detection** for routing: `infer` (pure-Rust magic bytes) detects
-PDF reliably, but **neither `infer` nor `file-format` can distinguish
-source code from plain text** — both are just UTF-8 text at the byte
-level. Routing code vs text needs an extension hint (a two-pass
-extension-then-bytes strategy).
+- A known-unsupported extension is skipped **before any IO** (no read, no hash)
+  via `format_from_extension` returning `Some(None)`.
+- A real IO error on a file it *does* read is still a hard error (the caller
+  must not silently drop it).
+- An **extraction failure** inside a handler (corrupt workbook, non-UTF-8 text,
+  extensionless file that sniffs unsupported) is a per-file skip: logged and
+  `Ok(None)`, the reindex continues. One bad file never aborts the run.
 
-## Architecture pattern to borrow
+## Why per-format dispatch, not a wider glob
 
-LangChain, LlamaIndex, and unstructured.io converge on the same shape:
+The consistent finding across LangChain, LlamaIndex, and unstructured.io: one
+generic splitter for all file types is the most common quality antipattern.
+Markdown loses heading structure, code splits mid-function, spreadsheets lose
+row/column context. So multi-format was never a glob widening — it is routing
+each format to its own splitter and its own metadata. The walker was already
+format-agnostic (`crates/hallouminate-domain/src/corpus/walker.rs::scan` is
+glob-driven with no extension gate); the constraint was always downstream, and
+that is exactly where the `FormatHandler` seam now lives.
 
-> **extension-keyed loader registry → normalized `Document(text, metadata)` → format-dispatched splitter**
+## Corpus wiring: rides the source corpus, not a `code` corpus
 
-with the **loader and the splitter as two independently-tuned stages**.
-Mixing them (chunking during extraction) makes chunk parameters
-impossible to tune without re-running extraction. unstructured.io is the
-one outlier on detection — it sniffs magic bytes via libmagic rather than
-trusting the extension; for a git-repo indexer, extension routing is
-generally safe because source files have well-known extensions.
+Multi-format extends the existing wiki/source corpus chunking path rather than a
+new corpus kind. `RepoCorpusKind` still has only `Wiki` and (source) `Corpus` —
+there is **no `Code` variant** (`RepoCorpusKind::Code` finds nothing in the
+tree). The derived wiki corpus keeps `globs: ["**/*.md"]`
+(`crates/hallouminate-domain/src/repository.rs::repository_wiki_corpus`), so
+authored wikis stay markdown-only; the derived `repo:NAME:corpus` source corpus
+and user `[[corpus]]` entries are where text/RST/spreadsheet files get indexed.
+This resolves the old "corpus wiring" open question.
 
-Two specifics worth carrying:
+## Dependencies added
 
-- **Code chunking via tree-sitter AST beats separator lists.** The cAST paper (2025) and LlamaIndex's `CodeSplitter` both show AST-boundary splitting (never mid-syntax, recurses into inner nodes for over-budget functions) outperforms language separator lists on code retrieval.
-- **No framework injects function/class name as structured metadata by default.** This is exactly the generalization of our markdown `heading_path` (`chunker.rs:124`) to a code breadcrumb like `{file}::{class}::{fn}`, and PDF's to `page:{n}`. It requires an extra tree-sitter traversal to find the enclosing declaration node — it is not free.
+- `file-format` 0.29 — magic-byte sniff for extensionless names. Detects the
+  binary spreadsheet containers (OOXML/OLE2/ODF) but has **no CSV or markdown
+  variant**, so an extensionless CSV or markdown file sniffs as `PlainText` and
+  routes to the text handler — acceptable, since extensionful files never reach
+  the sniff.
+- `calamine` — workbook reader (`xlsx`/`xls`/`ods`); `csv` crate for CSV.
 
-## Open design questions
+## Deferred / future-phase (still unshipped)
 
-A parallel `/mold` spec session is deciding these; recorded here so the
-decisions land against a stable problem statement.
+Each has its own forward-looking page recording why it is deferred:
 
-1. **Code `heading_path` equivalent** — first-class `heading_path` field (generalize the existing markdown one) vs an optional enrichment pass.
-2. **PDF crate choice** — `pdf-extract` vs `pdfium-render`, and whether OCR / scanned-PDF support is explicitly out of scope (repos rarely contain scanned PDFs; a \"text-layer only\" limitation may be acceptable).
-3. **Build-time C compiler** — tree-sitter grammars and `pdfium` both add native build requirements. Weigh against the prebuilt-binary install path (`/install`), which currently needs no toolchain on supported targets.
-4. **Default routing for unknown extensions** — skip, treat as plain text, or error.
-5. **Per-format metadata schema** — whether to enforce one unified field name across `heading_path` (markdown), `page:{n}` (PDF), and `{file}::{class}::{fn}` (code), or let each format carry its own.
-6. **Grammar version pinning** — each `tree-sitter-<lang>` grammar must track the tree-sitter runtime `text-splitter` bundles, the same lockstep already enforced for `text-splitter` + `tokenizers` in the `text-processing` dependabot group (`.github/dependabot.yml:20-25`).
-7. **Corpus wiring** — whether multi-format rides the reserved `repo:{name}:code` path (the `// Future: Code` intent) or extends the existing wiki/corpus chunking path.
-
-## Deferred / future-phase research
-
-Phase 1 ships plain text + spreadsheets. The formats below are **out of
-Phase 1** — each has its own forward-looking page recording why it is
-deferred and what a later phase inherits:
-
-- [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — text-layer PDF crate tradeoff (`pdf-extract` vs native `pdfium-render` for a `page:{n}` breadcrumb), the UTF-8-gate bypass, and OCR / scanned-PDF as a separate out-of-scope engine.
+- [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — text-layer PDF crate tradeoff (`pdf-extract` vs native `pdfium-render` for a `page:{n}` breadcrumb) and OCR / scanned-PDF as a separate out-of-scope engine.
 - [office-prose-extraction](office-prose-extraction.md) — the immature .docx/.pptx/.odt crate landscape (no mature + heading-aware option; crate choice deferred to a cook-time spike).
-- [code-aware-chunking](code-aware-chunking.md) — tree-sitter `CodeSplitter`, the build-time C-compiler tension, and the `{file}::{class}::{fn}` cAST breadcrumb gap (note: `RepoCorpusKind::Code` is a comment, not a variant).
+- [code-aware-chunking](code-aware-chunking.md) — tree-sitter `CodeSplitter`, the build-time C-compiler tension, and the `{file}::{class}::{fn}` cAST breadcrumb gap. Still deferred: no code handler or `Code` corpus variant exists.
 
 ## Related
 
 - [architecture](architecture.md) — where `corpus/`, `indexer/`, and `repository.rs` sit in the sliced-bread layout.
-- [corpus-walker](corpus-walker.md) — the format-agnostic walker that already does *not* gate on extension.
+- [corpus-walker](corpus-walker.md) — the format-agnostic walker that never gated on extension.
 - [config-layering](config-layering.md) — how `[[repository]]` entries derive `repo:NAME:wiki` and `repo:NAME:corpus`.
