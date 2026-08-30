@@ -182,7 +182,12 @@ The config lives at `$XDG_CONFIG_HOME/hallouminate/config.toml`
 `ground` (and the read/list tools) resolve corpora relative to the caller's
 working directory:
 
-- **Inside a repo** — the request defaults to that repo's `repo:<name>:wiki`.
+- **Inside a repo** — a `ground` call with **no explicit `corpus`** searches
+  the _union_ of that repo's own `repo:<name>:wiki` with every other
+  config-declared corpus — baseline-registered `[[repository]]` wikis,
+  user-declared `[[corpus]]` entries, and each repository's
+  `repo:<name>:corpus` source corpus when configured — with the repo's own
+  pages ranked first.
 - **Above all repos** (e.g. `cd ~/Dev`) — a `ground` call with **no explicit
   `corpus`** searches the _union_ of every effective corpus: discovered sub-repo
   wikis + baseline-registered `[[repository]]` wikis, plus user-declared

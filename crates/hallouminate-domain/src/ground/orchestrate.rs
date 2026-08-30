@@ -121,6 +121,7 @@ pub async fn ground(
         store,
         crossencoder,
         opts,
+        None,
     )
     .await
 }
@@ -146,13 +147,39 @@ async fn search_corpus(
 /// process/file-descriptor budget on a modest host.
 const MAX_CONCURRENT_CORPUS_SEARCHES: usize = 6;
 
+/// Ordering for the rollup truncation: score descending, then — when a
+/// `priority_corpus` guard is active — files in that corpus before files
+/// from any other, then path for full determinism.
+fn rollup_order(
+    priority_corpus: Option<&str>,
+    a: &(String, DocFile),
+    b: &(String, DocFile),
+) -> std::cmp::Ordering {
+    b.1.score
+        .partial_cmp(&a.1.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| match priority_corpus {
+            Some(p) => (b.1.corpus == p).cmp(&(a.1.corpus == p)),
+            None => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.0.cmp(&b.0))
+}
+
 /// Fans one query across every effective corpus root and globally reranks it.
+///
+/// `priority_corpus`, when `Some`, names the corpus whose docs get ranking
+/// priority in the final `top_files` rollup (#425): equal-score ties favor
+/// it, and up to `RESERVED_LOCAL_SLOTS` of its docs survive the cut even when
+/// their global score falls outside it. `None` (the single-corpus `ground`
+/// wrapper, and an above-all-repos union ground) leaves ranking exactly as
+/// before — pure global score order.
 pub async fn ground_union(
     query: &str,
     corpora: &[CorpusConfig],
     store: &dyn ChunkRetrieval,
     crossencoder: Option<Box<dyn Crossencoder>>,
     opts: GroundOpts,
+    priority_corpus: Option<&str>,
 ) -> Result<GroundResponse> {
     let started = Instant::now();
     let corpus_keys: Vec<(CorpusKey, &[String])> = corpora
@@ -236,15 +263,47 @@ pub async fn ground_union(
         }
     }
 
+    // Repo-local docs (matching `priority_corpus`) get a guaranteed foothold
+    // in the final `top_files` cut even when their global score falls
+    // outside it, so a few high-scoring neighbor-corpus hits can't fully
+    // crowd out the searcher's own repo (#425).
+    const RESERVED_LOCAL_SLOTS: usize = 2;
+
     if docs.len() > opts.top_files {
         let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
-        ranked.sort_by(|a, b| {
-            b.1.score
-                .partial_cmp(&a.1.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.0.cmp(&b.0))
-        });
+        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
+
+        if let Some(priority) = priority_corpus {
+            let local_count = ranked.iter().filter(|(_, d)| d.corpus == priority).count();
+            let reserved = RESERVED_LOCAL_SLOTS.min(opts.top_files).min(local_count);
+            let kept_locals = ranked[..opts.top_files]
+                .iter()
+                .filter(|(_, d)| d.corpus == priority)
+                .count();
+            if kept_locals < reserved {
+                let mut needed = reserved - kept_locals;
+                let promote: Vec<usize> = (opts.top_files..ranked.len())
+                    .filter(|&i| ranked[i].1.corpus == priority)
+                    .take(needed)
+                    .collect();
+                let mut evict_candidates: Vec<usize> = (0..opts.top_files)
+                    .filter(|&i| ranked[i].1.corpus != priority)
+                    .collect();
+                for promote_idx in promote {
+                    if needed == 0 {
+                        break;
+                    }
+                    let Some(evict_idx) = evict_candidates.pop() else {
+                        break;
+                    };
+                    ranked.swap(evict_idx, promote_idx);
+                    needed -= 1;
+                }
+            }
+        }
+
         ranked.truncate(opts.top_files);
+        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
         docs = ranked.into_iter().collect();
     }
 
@@ -389,9 +448,16 @@ mod tests {
         };
 
         let started = Instant::now();
-        let resp = ground_union("spice", &[corpus], &store, None, GroundOpts::default())
-            .await
-            .expect("concurrent ground_union must succeed");
+        let resp = ground_union(
+            "spice",
+            &[corpus],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+        )
+        .await
+        .expect("concurrent ground_union must succeed");
         let elapsed = started.elapsed();
 
         assert_eq!(
@@ -625,6 +691,7 @@ mod tests {
             &store,
             Some(Box::new(ScoringCrossencoder)),
             opts,
+            None,
         )
         .await
         .expect("fast rerank inside a generous timeout must not error");
@@ -658,6 +725,7 @@ mod tests {
             &store,
             Some(Box::new(SleepingCrossencoder)),
             opts,
+            None,
         )
         .await
         .expect("tiny rerank_timeout must not error, only fall back to fusion order");
@@ -848,9 +916,16 @@ mod tests {
             global: false,
         };
 
-        let resp = ground_union("spice", &[corpus], &store, None, GroundOpts::default())
-            .await
-            .expect("ground_union must succeed even when every root's ripgrep pass fails");
+        let resp = ground_union(
+            "spice",
+            &[corpus],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+        )
+        .await
+        .expect("ground_union must succeed even when every root's ripgrep pass fails");
 
         let codes: Vec<&str> = resp.warnings.iter().map(|w| w.code.as_str()).collect();
         assert_eq!(
@@ -870,6 +945,184 @@ mod tests {
             "second warning must name its own root, not root_a's message \
              (proves the second root's warning wasn't overwritten by the first): {:?}",
             resp.warnings[1]
+        );
+    }
+
+    // --- #425: priority_corpus ranking guard ---
+
+    /// Builds a doc-bearing hit whose file lives under `root`, tagged with
+    /// `corpus_name`, at the given score. Mirrors `hit_for_timeout_test` but
+    /// lets each test give local vs. non-local docs distinct corpus keys.
+    fn priority_hit(
+        root: &std::path::Path,
+        corpus_name: &str,
+        file: &str,
+        score: f32,
+    ) -> SearchHit {
+        let file_ref = root.join(file).to_string_lossy().into_owned();
+        let mut hit = hit_for_timeout_test(&file_ref, score);
+        hit.corpus_key = CorpusKey::from_configured_root(corpus_name, &root.to_string_lossy());
+        hit
+    }
+
+    fn priority_corpus_config(root: &std::path::Path, name: &str) -> CorpusConfig {
+        CorpusConfig {
+            name: name.to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        }
+    }
+
+    /// AC4: with `top_files` small and a neighbor corpus dominating raw
+    /// scores, at least `min(RESERVED_LOCAL_SLOTS, top_files, local_count)`
+    /// repo-local docs must survive the rollup truncation, even though every
+    /// one of them scores below every kept neighbor doc before the guard.
+    #[tokio::test]
+    async fn ground_union_reserves_local_slots_when_neighbor_corpus_dominates_scores() {
+        let local_root = tempfile::tempdir().expect("local root");
+        let neighbor_root = tempfile::tempdir().expect("neighbor root");
+        let local = priority_corpus_config(local_root.path(), "repo:local:wiki");
+        let neighbor = priority_corpus_config(neighbor_root.path(), "neighbor");
+
+        let mut hits = Vec::new();
+        for (i, score) in [0.3_f32, 0.2, 0.1].into_iter().enumerate() {
+            hits.push(priority_hit(
+                local_root.path(),
+                "repo:local:wiki",
+                &format!("local{i}.md"),
+                score,
+            ));
+        }
+        for (i, score) in [0.9_f32, 0.8, 0.7, 0.6, 0.5].into_iter().enumerate() {
+            hits.push(priority_hit(
+                neighbor_root.path(),
+                "neighbor",
+                &format!("neighbor{i}.md"),
+                score,
+            ));
+        }
+        let store = FakeChunkStore { hits };
+
+        let opts = GroundOpts {
+            top_files: 3,
+            ..GroundOpts::default()
+        };
+        let resp = ground_union(
+            "spice",
+            &[local, neighbor],
+            &store,
+            None,
+            opts,
+            Some("repo:local:wiki"),
+        )
+        .await
+        .expect("ground_union with priority_corpus must succeed");
+
+        let local_kept = resp
+            .docs
+            .values()
+            .filter(|d| d.corpus == "repo:local:wiki")
+            .count();
+        assert!(
+            local_kept >= 2,
+            "expected at least min(RESERVED_LOCAL_SLOTS=2, top_files=3, local_count=3) == 2 \
+             repo-local docs to survive truncation despite scoring below every neighbor doc, \
+             got {local_kept} local docs among: {:?}",
+            resp.docs
+                .values()
+                .map(|d| (&d.corpus, d.score))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            resp.docs.values().any(|d| d.corpus == "neighbor"),
+            "the dominating neighbor corpus must still contribute at least one doc"
+        );
+    }
+
+    /// AC5: at an equal score, a repo-local doc must win the tie against a
+    /// non-local doc. `FakeChunkStore` only populates the `fts` signal list,
+    /// so RRF score is `weight / (k + rank)` purely by each hit's position
+    /// within its own corpus's list (score field on the fixture hit is not
+    /// itself the fused score) — a corpus's sole hit is always rank 0, so
+    /// one hit per corpus is the simplest way to force a genuine fused-score
+    /// tie between a local and a non-local doc.
+    #[tokio::test]
+    async fn ground_union_priority_corpus_wins_score_tie_against_non_local() {
+        let local_root = tempfile::tempdir().expect("local root");
+        let neighbor_root = tempfile::tempdir().expect("neighbor root");
+        let local = priority_corpus_config(local_root.path(), "repo:local:wiki");
+        let neighbor = priority_corpus_config(neighbor_root.path(), "neighbor");
+
+        let hits = vec![
+            // Tie candidates: alphabetically, the neighbor doc's key sorts
+            // before the local doc's, so the OLD path-only tie-break would
+            // pick the neighbor; the priority guard must pick local instead.
+            // Each corpus has exactly one hit, so both land at fts rank 0
+            // within their own corpus's list and fuse to an identical score.
+            priority_hit(neighbor_root.path(), "neighbor", "a_tied_neighbor.md", 0.5),
+            priority_hit(local_root.path(), "repo:local:wiki", "z_tied_local.md", 0.5),
+        ];
+        let store = FakeChunkStore { hits };
+
+        let opts = GroundOpts {
+            top_files: 1,
+            ..GroundOpts::default()
+        };
+        let resp = ground_union(
+            "spice",
+            &[local, neighbor],
+            &store,
+            None,
+            opts,
+            Some("repo:local:wiki"),
+        )
+        .await
+        .expect("ground_union with priority_corpus must succeed");
+
+        assert_eq!(resp.docs.len(), 1, "top_files=1 must keep exactly 1 doc");
+        assert_eq!(
+            resp.docs.values().next().expect("one doc kept").corpus,
+            "repo:local:wiki",
+            "the tied repo-local doc must win the tie against the tied neighbor doc: {:?}",
+            resp.docs
+                .values()
+                .map(|d| (&d.corpus, d.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// AC3/no-op: `priority_corpus = None` must reproduce today's pure-score
+    /// ordering — at an equal score, the tie falls back to the path-key
+    /// comparator, with no favoritism toward either corpus.
+    #[tokio::test]
+    async fn ground_union_priority_corpus_none_is_a_no_op_on_ties() {
+        let local_root = tempfile::tempdir().expect("local root");
+        let neighbor_root = tempfile::tempdir().expect("neighbor root");
+        let local = priority_corpus_config(local_root.path(), "repo:local:wiki");
+        let neighbor = priority_corpus_config(neighbor_root.path(), "neighbor");
+
+        let hits = vec![
+            priority_hit(neighbor_root.path(), "neighbor", "a_tied_neighbor.md", 0.5),
+            priority_hit(local_root.path(), "repo:local:wiki", "z_tied_local.md", 0.5),
+        ];
+        let store = FakeChunkStore { hits };
+
+        let opts = GroundOpts {
+            top_files: 1,
+            ..GroundOpts::default()
+        };
+        let resp = ground_union("spice", &[local, neighbor], &store, None, opts, None)
+            .await
+            .expect("ground_union with priority_corpus=None must succeed");
+
+        assert_eq!(resp.docs.len(), 1);
+        assert_eq!(
+            resp.docs.values().next().expect("one doc kept").corpus,
+            "neighbor",
+            "with no priority_corpus, the tie must fall back to the unchanged path-key \
+             tie-break (\"a_tied_neighbor.md\" < \"z_tied_local.md\"), not favor either corpus"
         );
     }
 }
