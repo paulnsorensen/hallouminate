@@ -91,7 +91,7 @@ negotiation handshake.
 | `hallouminate index [--corpus NAME]` | bulk index one or all corpora |
 | `hallouminate ground "<query>" [...]` | semantic search; `--format outline\|json\|json-pretty`, `--full`, `--top-files N`, `--chunks-per-file N`, `--limit N`, `--snippet-chars N` |
 | `hallouminate serve` | stdio MCP server (auto-spawns daemon if down) |
-| `hallouminate daemon [--config PATH]` | run the daemon in the foreground |
+| `hallouminate daemon [--config PATH]` | run the daemon in the foreground; `daemon status` renders per-task `restarts=N` — see [supervisor-restart-ladder](supervisor-restart-ladder.md) |
 | `hallouminate config init\|show\|validate\|download` | config inspection / scaffolding |
 | `hallouminate hook install\|uninstall [--repo PATH]` | per-repo discovery hook install |
 

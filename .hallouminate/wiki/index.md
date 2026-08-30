@@ -40,6 +40,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [search-reliability-loop-002](search-reliability-loop-002.md) — ADR-002: separate the production regression gate (`just eval`) from reranker measurement (`just eval-measure`); supersedes ground-search-quality ADR-004's selection thresholds.
 - [search-reliability-loop-003](search-reliability-loop-003.md) — ADR-003: rerank the indexed `search_text` while `SearchHit.text` stays the display/evidence contract.
 - [sources/](sources/index.md) — corpus-local source pages for durable external research, each with a fixed indexed identity spine (title, URL, attribution, limitations).
+- [supervisor-restart-ladder](supervisor-restart-ladder.md) — the shared backpressure-ladder abstraction behind churn/`ForceMaintenance`, crash-loop/`RestartTask`, and watchdog/`WatchdogTrip`; why restarts deliberately don't reset the heartbeat (#407/#408/#409).
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
 - [worktree-corpus-identity](worktree-corpus-identity.md) — #215's root-scoped delete fix, the #290 root-aware identity that closed the sibling-worktree search leak, and #304's retired-root garbage collection.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
