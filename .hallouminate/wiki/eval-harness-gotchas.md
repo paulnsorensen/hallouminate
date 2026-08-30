@@ -48,7 +48,7 @@ different crates:
 | --- | --- | --- |
 | Degraded signal (must fail the eval) | `ripgrep-unresolved`, `ripgrep-unparseable`, `ripgrep-failed`, `ripgrep-timeout` | `hallouminate-domain/src/search.rs:171,187,372,386` |
 | Rerank fallback (judged by `rerank_completion`) | `rerank-timeout`, `crossencoder-unavailable` | `hallouminate-domain/src/ground/orchestrate.rs:204`, `hallouminate-daemon/src/dispatch.rs:431` |
-| Advisory (must **not** fail the eval) | `code-repos-empty`, `cross-repo-union`, `index-coverage` | `hallouminate-domain/src/ground/format.rs:334,368`, `hallouminate-daemon/src/dispatch.rs:444`, `hallouminate-daemon/src/dispatch.rs` (#427 coverage warning) |
+| Advisory (must **not** fail the eval) | `code-repos-empty`, `cross-repo-union`, `index-coverage` | `hallouminate-domain/src/ground/format.rs:334,368`, `hallouminate-daemon/src/dispatch.rs` (`handle_ground`: cross-repo-union + #427 coverage-warning blocks) |
 
 The gate originally allowed only the two rerank codes and failed on everything
 else, so the two advisory codes would have aborted a run. They were inert only
