@@ -302,7 +302,6 @@ async fn handle_corpus_stats(
     let mut indexed_files = 0;
     let mut total_chunks = 0;
     let mut last_indexed_ms = None;
-    let mut indexed_paths = std::collections::HashSet::new();
     for corpus_key in corpus_cfg.corpus_keys() {
         let chunk_stats = match store.corpus_chunk_stats(&corpus_key).await {
             Ok(s) => s,
@@ -311,25 +310,12 @@ async fn handle_corpus_stats(
         indexed_files += chunk_stats.indexed_files;
         total_chunks += chunk_stats.total_chunks;
         last_indexed_ms = last_indexed_ms.max(chunk_stats.last_indexed_ms);
-        let snapshots = match store.list_files(&corpus_key).await {
-            Ok(m) => m,
-            Err(e) => return DaemonResponse::internal(e.to_string()),
-        };
-        for snapshot in snapshots {
-            indexed_paths.insert(snapshot.file_ref);
-        }
     }
-    ensure_paths_exist(&corpus_cfg).await;
-    let disk_files = match list_corpus_files(&corpus_cfg) {
-        Ok(f) => f,
+    let (covered, total) = match corpus_coverage(store, &corpus_cfg).await {
+        Ok(c) => c,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
-    let mut unindexed_files = 0;
-    for entry in disk_files {
-        if !indexed_paths.contains(&entry.absolute_path) {
-            unindexed_files += 1;
-        }
-    }
+    let unindexed_files = total - covered;
     DaemonResponse::ok(&CorpusStatsResult {
         corpus: corpus_cfg.name,
         indexed_files,
@@ -337,6 +323,34 @@ async fn handle_corpus_stats(
         last_indexed_ms,
         unindexed_files,
     })
+}
+
+/// On-disk vs. indexed coverage for one corpus, aggregated across its roots.
+/// Returns `(covered, total)`: `total` in-scope files present on disk, and
+/// `covered` how many of them are embedded in the index. The single on-disk
+/// vs. indexed primitive: `handle_corpus_stats` derives `unindexed_files`
+/// from it and `handle_ground` derives the #427 coverage warning.
+async fn corpus_coverage(
+    store: &LanceStore,
+    corpus_cfg: &CorpusConfig,
+) -> anyhow::Result<(u64, u64)> {
+    let mut indexed_paths = std::collections::HashSet::new();
+    for corpus_key in corpus_cfg.corpus_keys() {
+        for snapshot in store.list_files(&corpus_key).await? {
+            indexed_paths.insert(snapshot.file_ref);
+        }
+    }
+    ensure_paths_exist(corpus_cfg).await;
+    // The directory walk is synchronous (ignore::WalkBuilder); keep it off the
+    // async workers — `ground` runs this check on every request.
+    let walk_cfg = corpus_cfg.clone();
+    let disk_files = tokio::task::spawn_blocking(move || list_corpus_files(&walk_cfg)).await??;
+    let total = disk_files.len() as u64;
+    let covered = disk_files
+        .iter()
+        .filter(|entry| indexed_paths.contains(&entry.absolute_path))
+        .count() as u64;
+    Ok((covered, total))
 }
 
 /// Ceiling on the candidate pool a single request may ask for.
@@ -457,6 +471,56 @@ async fn handle_ground(
                 code: "cross-repo-union".to_string(),
                 message: w.clone(),
             });
+        }
+    }
+
+    // #427 part 2: coverage honesty. When a queried corpus's index trails its
+    // on-disk listing, say so in-band so a caller does not read an
+    // under-provisioned corpus as "the content is not there". Scoped to the
+    // corpus (or union set) this request actually searched; per-corpus checks
+    // run concurrently so a union request pays for the slowest corpus, not
+    // the sum.
+    let coverage_targets: Vec<CorpusConfig> = match single_corpus {
+        Some(corpus) => vec![corpus],
+        None => corpora,
+    };
+    let coverage_checks: Vec<_> = coverage_targets
+        .into_iter()
+        .map(|corpus| {
+            let store = std::sync::Arc::clone(store);
+            tokio::spawn(async move {
+                let coverage = corpus_coverage(store.as_ref(), &corpus).await;
+                (corpus, coverage)
+            })
+        })
+        .collect();
+    for check in coverage_checks {
+        // A JoinError means the task panicked; the panic is already logged.
+        let Ok((corpus, coverage)) = check.await else {
+            continue;
+        };
+        match coverage {
+            Ok((covered, total)) if covered < total => {
+                let root = first_corpus_root(&corpus)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| corpus.name.clone());
+                response.warnings.push(Warning {
+                    code: "index-coverage".to_string(),
+                    message: format!(
+                        "index coverage {covered}/{total} files for {} at {root} — run `index` to build",
+                        corpus.name
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    %error,
+                    corpus = %corpus.name,
+                    "coverage check failed; omitting coverage warning for this corpus",
+                );
+            }
         }
     }
 
@@ -2933,6 +2997,134 @@ mod tests {
             "never-indexed corpus must have null timestamp"
         );
         assert_eq!(stats.corpus, "repo:myrepo:wiki");
+    }
+
+    /// Shared scaffolding for the #427 coverage-warning tests: one `test`
+    /// corpus rooted at `<tmp>/wiki`, embeddings disabled. Returns the corpus
+    /// dir and a ready daemon state.
+    async fn coverage_state(tmp: &Path) -> (std::path::PathBuf, DaemonState) {
+        let corpus_dir = tmp.join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        let repo_config = format!(
+            "[[corpus]]\nname = \"test\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            corpus_dir.display()
+        );
+        write_repo_layer(tmp, &repo_config);
+        let state = state_with_ground(&tmp.join("ground"), "[embeddings]\nenabled = false\n").await;
+        (corpus_dir, state)
+    }
+
+    /// Index the `test` corpus via dispatch, asserting exactly one file was
+    /// embedded — the precondition both coverage tests build on.
+    async fn index_coverage_corpus(state: &DaemonState, cwd: &Path) {
+        let resp = dispatch(
+            state,
+            DaemonRequest {
+                cwd: cwd.to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("test".to_string()),
+                    paths_from: None,
+                    strict: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { result } = resp else {
+            panic!("index must succeed: {resp:?}");
+        };
+        let report: IndexReport = serde_json::from_value(result).expect("parse IndexReport");
+        assert_eq!(report.corpora.len(), 1, "one corpus indexed: {report:?}");
+        assert_eq!(
+            report.corpora[0].files_upserted, 1,
+            "exactly one file indexed: {report:?}"
+        );
+    }
+
+    /// Ground the `test` corpus via dispatch and parse the result.
+    async fn ground_coverage_corpus(state: &DaemonState, cwd: &Path) -> GroundResult {
+        let resp = dispatch(
+            state,
+            DaemonRequest {
+                cwd: cwd.to_path_buf(),
+                payload: DaemonRequestPayload::Ground(
+                    serde_json::from_value(serde_json::json!({
+                        "query": "content",
+                        "corpus": "test",
+                    }))
+                    .expect("ground request"),
+                ),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { result } = resp else {
+            panic!("ground must succeed: {resp:?}");
+        };
+        serde_json::from_value(result).expect("parse GroundResult")
+    }
+
+    /// WHY (#427 part 2): when a queried corpus's index trails its on-disk
+    /// listing, `ground` must say so in-band via a `warnings` entry so an agent
+    /// reading an under-provisioned corpus sees the gap instead of concluding
+    /// the content does not exist. Enumerable-but-unembedded files are surfaced
+    /// where the caller actually looks.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ground_warns_when_index_trails_on_disk_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (corpus_dir, state) = coverage_state(tmp.path()).await;
+
+        // Index exactly one file...
+        std::fs::write(
+            corpus_dir.join("indexed.md"),
+            "# Indexed\n\nAlpha content.\n",
+        )
+        .expect("write indexed");
+        index_coverage_corpus(&state, tmp.path()).await;
+
+        // ...then drop a second in-scope file on disk WITHOUT indexing it.
+        std::fs::write(
+            corpus_dir.join("unindexed.md"),
+            "# Unindexed\n\nBeta content.\n",
+        )
+        .expect("write unindexed");
+
+        let result = ground_coverage_corpus(&state, tmp.path()).await;
+        let coverage = result
+            .response
+            .warnings
+            .iter()
+            .find(|w| w.code == "index-coverage")
+            .expect("ground must emit an index-coverage warning when the index trails disk");
+        assert_eq!(
+            coverage.message,
+            format!(
+                "index coverage 1/2 files for test at {} — run `index` to build",
+                corpus_dir.display()
+            )
+        );
+    }
+
+    /// WHY (#427 part 2): the coverage warning must not fire when every in-scope
+    /// on-disk file is already indexed — otherwise a fully-provisioned corpus
+    /// would nag on every query and train callers to ignore the signal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ground_omits_coverage_warning_when_index_is_complete() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (corpus_dir, state) = coverage_state(tmp.path()).await;
+
+        std::fs::write(corpus_dir.join("only.md"), "# Only\n\nGamma content.\n")
+            .expect("write only");
+        index_coverage_corpus(&state, tmp.path()).await;
+
+        let result = ground_coverage_corpus(&state, tmp.path()).await;
+        assert!(
+            !result
+                .response
+                .warnings
+                .iter()
+                .any(|w| w.code == "index-coverage"),
+            "fully-indexed corpus must not emit a coverage warning: {:?}",
+            result.response.warnings
+        );
     }
 
     // ── index_single_file eviction policy ────────────────────────────────
