@@ -3063,8 +3063,11 @@ mod tests {
         let (corpus_dir, state) = coverage_state(tmp.path()).await;
 
         // Index exactly one file...
-        std::fs::write(corpus_dir.join("indexed.md"), "# Indexed\n\nAlpha content.\n")
-            .expect("write indexed");
+        std::fs::write(
+            corpus_dir.join("indexed.md"),
+            "# Indexed\n\nAlpha content.\n",
+        )
+        .expect("write indexed");
         index_coverage_corpus(&state, tmp.path()).await;
 
         // ...then drop a second in-scope file on disk WITHOUT indexing it.
