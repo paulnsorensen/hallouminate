@@ -1098,14 +1098,16 @@ mod tests {
     /// comparator, with no favoritism toward either corpus.
     #[tokio::test]
     async fn ground_union_priority_corpus_none_is_a_no_op_on_ties() {
-        let local_root = tempfile::tempdir().expect("local root");
-        let neighbor_root = tempfile::tempdir().expect("neighbor root");
-        let local = priority_corpus_config(local_root.path(), "repo:local:wiki");
-        let neighbor = priority_corpus_config(neighbor_root.path(), "neighbor");
+        // Both corpora share one root so the doc-key tie-break (which compares
+        // absolute paths) is decided by the file name, not by two independent
+        // random tempdir names — otherwise the assertion below is flaky.
+        let root = tempfile::tempdir().expect("shared root");
+        let local = priority_corpus_config(root.path(), "repo:local:wiki");
+        let neighbor = priority_corpus_config(root.path(), "neighbor");
 
         let hits = vec![
-            priority_hit(neighbor_root.path(), "neighbor", "a_tied_neighbor.md", 0.5),
-            priority_hit(local_root.path(), "repo:local:wiki", "z_tied_local.md", 0.5),
+            priority_hit(root.path(), "neighbor", "a_tied_neighbor.md", 0.5),
+            priority_hit(root.path(), "repo:local:wiki", "z_tied_local.md", 0.5),
         ];
         let store = FakeChunkStore { hits };
 
