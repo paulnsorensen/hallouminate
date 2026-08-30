@@ -381,11 +381,12 @@ async fn handle_ground(
     let store = &res.store;
     let opts = ground_opts(cfg, &req);
 
-    // Union ground (#106): a no-corpus request from above all repos fans the
-    // query across EVERY effective corpus and merges into one re-ranked set.
-    // An explicit corpus, or a no-corpus request whose cwd defaults to a
-    // single repo wiki, takes the unchanged single-corpus path below.
-    let union = req.corpus.is_none() && default_wiki_for_cwd(&cfg.repositories, cwd).is_none();
+    // Union ground (#106, #425): every corpus-less request fans the query
+    // across EVERY effective corpus and merges into one re-ranked set, whether
+    // cwd sits above all repos or inside one (the repo's own wiki is just one
+    // more corpus in that set, ranked first via `priority_corpus` below). Only
+    // an explicit `corpus` takes the single-corpus path below.
+    let union = req.corpus.is_none();
 
     // Resolve the single corpus up front for the non-union path; on the union
     // path the corpus list is the whole `corpora` set.
@@ -423,7 +424,16 @@ async fn handle_ground(
     let response = if let Some(corpus) = &single_corpus {
         ground(&req.query, corpus, store.as_ref(), crossencoder_box, opts).await
     } else {
-        ground_union(&req.query, &corpora, store.as_ref(), crossencoder_box, opts).await
+        let priority_corpus = default_wiki_for_cwd(&cfg.repositories, cwd);
+        ground_union(
+            &req.query,
+            &corpora,
+            store.as_ref(),
+            crossencoder_box,
+            opts,
+            priority_corpus.as_deref(),
+        )
+        .await
     };
     let mut response = match response {
         Ok(r) => r,

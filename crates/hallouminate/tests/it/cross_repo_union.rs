@@ -97,6 +97,7 @@ async fn union_ground_returns_attributed_hits_from_multiple_discovered_wikis() {
         &store,
         None,
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("union ground");
@@ -260,6 +261,7 @@ async fn union_ground_attributes_each_hit_to_its_true_corpus_after_rerank_reshuf
         &store,
         Some(Box::new(ReversingCrossencoder)),
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("union ground with rerank");
@@ -332,6 +334,7 @@ async fn union_ground_with_single_corpus_attributes_all_hits_to_it() {
         &store,
         None,
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("single-corpus union ground");
@@ -405,6 +408,7 @@ async fn union_ground_with_one_empty_corpus_keeps_the_non_empty_hits() {
         &store,
         None,
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("union ground with an empty corpus");
@@ -451,6 +455,7 @@ async fn union_ground_over_all_empty_corpora_returns_empty_response_without_pani
         &store,
         Some(Box::new(ReversingCrossencoder)),
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("empty union ground must not error");
@@ -572,6 +577,7 @@ async fn union_ground_preserves_attribution_when_chunk_ids_collide_across_corpor
         &store,
         None,
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("union ground with colliding chunk_ids");
@@ -658,6 +664,7 @@ async fn ground_union_embeds_query_once_per_corpus_searched() {
         &store,
         None,
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("union ground");
@@ -700,6 +707,7 @@ async fn union_ground_preserves_exact_hit_text_after_queue_refactor() {
         &store,
         None,
         GroundOpts::default(),
+        None,
     )
     .await
     .expect("union ground");
@@ -728,4 +736,77 @@ async fn union_ground_preserves_exact_hit_text_after_queue_refactor() {
         checked >= 2,
         "expected chunks from both corpora, checked {checked}"
     );
+}
+
+/// AC1/AC2 (#425): a corpus-less union ground with a `priority_corpus` set to
+/// the repo-local corpus must return BOTH the sibling config-declared corpus's
+/// hits (a) and the repo's own wiki hits, attributed to its corpus (b). This
+/// exercises the real store stack (StubEmbedder + LanceStore), unlike the
+/// domain-level tests below which use a `FakeChunkStore` with hand-picked
+/// scores.
+///
+/// AC4 (reserved local slots surviving `top_files` truncation when a neighbor
+/// corpus dominates raw scores) is NOT re-asserted here: `StubEmbedder`
+/// derives vectors from a blake3 hash of each chunk's text, so there is no
+/// deterministic way to force one corpus's *real* hybrid-search scores below
+/// another's through this stack. That guard is covered by the domain-level
+/// `ground_union_reserves_local_slots_when_neighbor_corpus_dominates_scores`
+/// and `ground_union_priority_corpus_wins_score_tie_against_non_local` tests
+/// in `hallouminate_domain::ground::orchestrate`, which control scores
+/// directly via `FakeChunkStore`.
+#[tokio::test]
+async fn union_ground_with_priority_corpus_returns_both_local_and_sibling_hits() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let parent = tempfile::tempdir().expect("tempdir parent");
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+
+    // "local" models the repo the caller is standing in; "sibling" models a
+    // config-declared corpus (baseline [[corpus]] / [[repository]]) that a
+    // corpus-less ground now unions in by default.
+    let local = seed_repo_wiki(parent.path(), "local", "zphyxnort");
+    let sibling = seed_repo_wiki(parent.path(), "sibling", "qwobblefrotz");
+
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("open store");
+    let targets = index_wikis(&store, &[local, sibling]).await;
+    assert_eq!(targets.len(), 2, "both corpora present in the union set");
+
+    let resp = ground_union(
+        "distinctive token wiki",
+        &targets,
+        &store,
+        None,
+        GroundOpts::default(),
+        Some("repo:local:wiki"),
+    )
+    .await
+    .expect("union ground with priority_corpus");
+
+    let corpora_seen: std::collections::HashSet<&str> =
+        resp.docs.values().map(|d| d.corpus.as_str()).collect();
+    assert!(
+        corpora_seen.contains("repo:sibling:wiki"),
+        "a corpus-less union must still surface a sibling config-declared corpus's hits, saw: {corpora_seen:?}"
+    );
+    assert!(
+        corpora_seen.contains("repo:local:wiki"),
+        "a corpus-less union must still surface the repo's own wiki hits, saw: {corpora_seen:?}"
+    );
+    for (path, doc) in &resp.docs {
+        if doc.corpus == "repo:local:wiki" {
+            for chunk in &doc.chunks {
+                assert_eq!(
+                    chunk.provenance.corpus, "repo:local:wiki",
+                    "local doc {path}'s chunks must be attributed to repo:local:wiki"
+                );
+            }
+        }
+    }
 }
