@@ -273,21 +273,21 @@ pub async fn ground_union(
         let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
         ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
 
+        let mut swapped = false;
         if let Some(priority) = priority_corpus {
-            let local_count = ranked.iter().filter(|(_, d)| d.corpus == priority).count();
-            let reserved = RESERVED_LOCAL_SLOTS.min(opts.top_files).min(local_count);
             let kept_locals = ranked[..opts.top_files]
                 .iter()
                 .filter(|(_, d)| d.corpus == priority)
                 .count();
-            if kept_locals < reserved {
+            let missing = RESERVED_LOCAL_SLOTS.saturating_sub(kept_locals);
+            if missing > 0 {
                 let promote: Vec<usize> = (opts.top_files..ranked.len())
                     .filter(|&i| ranked[i].1.corpus == priority)
-                    .take(reserved - kept_locals)
+                    .take(missing)
                     .collect();
                 // Evict the lowest-ranked non-priority docs in the kept
-                // window; `reserved <= top_files` guarantees it holds at
-                // least `promote.len()` of them.
+                // window; the zip truncates to however many of those exist,
+                // so promotion can never over-fill the window.
                 let evict: Vec<usize> = (0..opts.top_files)
                     .rev()
                     .filter(|&i| ranked[i].1.corpus != priority)
@@ -295,12 +295,17 @@ pub async fn ground_union(
                     .collect();
                 for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
                     ranked.swap(evict_idx, promote_idx);
+                    swapped = true;
                 }
             }
         }
 
         ranked.truncate(opts.top_files);
-        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
+        // Truncating a sorted vec leaves it sorted; only actual promotion
+        // swaps disturb the order and need the re-sort.
+        if swapped {
+            ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
+        }
         docs = ranked.into_iter().collect();
     }
 
