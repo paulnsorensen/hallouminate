@@ -281,23 +281,20 @@ pub async fn ground_union(
                 .filter(|(_, d)| d.corpus == priority)
                 .count();
             if kept_locals < reserved {
-                let mut needed = reserved - kept_locals;
                 let promote: Vec<usize> = (opts.top_files..ranked.len())
                     .filter(|&i| ranked[i].1.corpus == priority)
-                    .take(needed)
+                    .take(reserved - kept_locals)
                     .collect();
-                let mut evict_candidates: Vec<usize> = (0..opts.top_files)
+                // Evict the lowest-ranked non-priority docs in the kept
+                // window; `reserved <= top_files` guarantees it holds at
+                // least `promote.len()` of them.
+                let evict: Vec<usize> = (0..opts.top_files)
+                    .rev()
                     .filter(|&i| ranked[i].1.corpus != priority)
+                    .take(promote.len())
                     .collect();
-                for promote_idx in promote {
-                    if needed == 0 {
-                        break;
-                    }
-                    let Some(evict_idx) = evict_candidates.pop() else {
-                        break;
-                    };
+                for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
                     ranked.swap(evict_idx, promote_idx);
-                    needed -= 1;
                 }
             }
         }
@@ -1025,9 +1022,10 @@ mod tests {
             .values()
             .filter(|d| d.corpus == "repo:local:wiki")
             .count();
-        assert!(
-            local_kept >= 2,
-            "expected at least min(RESERVED_LOCAL_SLOTS=2, top_files=3, local_count=3) == 2 \
+        assert_eq!(
+            local_kept,
+            2,
+            "expected exactly min(RESERVED_LOCAL_SLOTS=2, top_files=3, local_count=3) == 2 \
              repo-local docs to survive truncation despite scoring below every neighbor doc, \
              got {local_kept} local docs among: {:?}",
             resp.docs
@@ -1035,9 +1033,13 @@ mod tests {
                 .map(|d| (&d.corpus, d.score))
                 .collect::<Vec<_>>()
         );
-        assert!(
-            resp.docs.values().any(|d| d.corpus == "neighbor"),
-            "the dominating neighbor corpus must still contribute at least one doc"
+        assert_eq!(
+            resp.docs
+                .values()
+                .filter(|d| d.corpus == "neighbor")
+                .count(),
+            1,
+            "the dominating neighbor corpus must keep exactly its top doc in the remaining slot"
         );
     }
 
