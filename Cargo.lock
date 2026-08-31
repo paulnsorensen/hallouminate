@@ -2744,7 +2744,7 @@ dependencies = [
 
 [[package]]
 name = "hallouminate"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -2776,7 +2776,7 @@ dependencies = [
 
 [[package]]
 name = "hallouminate-adapters"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2796,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "hallouminate-config"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "hallouminate-domain",
  "serde",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "hallouminate-daemon"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2834,7 +2834,7 @@ dependencies = [
 
 [[package]]
 name = "hallouminate-domain"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "async-trait",
