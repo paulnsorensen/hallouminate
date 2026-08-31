@@ -6,7 +6,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The five long-lived daemon loops a watchdog can monitor.
+/// The six long-lived daemon loops a watchdog can monitor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskName {
     Maintenance,
@@ -14,9 +14,10 @@ pub(crate) enum TaskName {
     WatcherPump,
     IdleExit,
     Signal,
+    Provision,
 }
 
-const TASK_COUNT: usize = 5;
+const TASK_COUNT: usize = 6;
 
 fn slot(task: TaskName) -> usize {
     match task {
@@ -25,6 +26,7 @@ fn slot(task: TaskName) -> usize {
         TaskName::WatcherPump => 2,
         TaskName::IdleExit => 3,
         TaskName::Signal => 4,
+        TaskName::Provision => 5,
     }
 }
 

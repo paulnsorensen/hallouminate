@@ -388,6 +388,7 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    state.provisioner().observe(&corpora, cfg);
     let res = match state.resources_for(cfg).await {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -1534,7 +1535,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
 
 /// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed
 /// (no work, no model load); `Ok(Some(stats))` = reindexed.
-async fn catch_up_corpus(
+pub(super) async fn catch_up_corpus(
     res: &RequestResources,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,

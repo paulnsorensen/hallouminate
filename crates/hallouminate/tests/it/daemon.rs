@@ -2079,7 +2079,7 @@ async fn status_reports_running_then_not_running_across_shutdown() {
         hallouminate_daemon::DaemonStatus::Running(report) => {
             assert_eq!(
                 report.per_task.len(),
-                5,
+                6,
                 "W1 wiring lists every task name in per_task, got {:?}",
                 report.per_task,
             );

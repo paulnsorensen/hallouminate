@@ -16,7 +16,7 @@
 //! A baseline embedder that fails during startup remains retryable: the next
 //! normal request for that resource key initializes and installs it in place.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -38,7 +38,7 @@ use hallouminate_adapters::{
     EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, StoreLockOwner,
 };
 use hallouminate_config::Config;
-use hallouminate_domain::common::{HallouminateError, expand_tilde};
+use hallouminate_domain::common::{CorpusConfig, CorpusKey, HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
@@ -246,6 +246,7 @@ struct DaemonStateInner {
     heartbeat: Arc<super::heartbeat::HeartbeatRegistry>,
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
+    provisioner: Provisioner,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
@@ -324,6 +325,157 @@ struct WatcherCounters {
 pub(crate) struct LadderTrip {
     pub(crate) action: LadderAction,
     pub(crate) at_secs: u64,
+}
+
+/// One corpus to catch up, paired with the request-resolved config that
+/// discovered it (repo-layer overrides included) — `provision_corpus` must
+/// resolve resources from this config, not the boot baseline, or a
+/// repo-layer `storage.ground_dir`/`embeddings` override indexes into the
+/// wrong store.
+struct ProvisionRequest {
+    corpus: CorpusConfig,
+    cfg: Arc<Config>,
+}
+
+pub(crate) struct Provisioner {
+    seen: std::sync::Mutex<HashSet<CorpusKey>>,
+    tx: mpsc::UnboundedSender<ProvisionRequest>,
+    rx: Mutex<Option<mpsc::UnboundedReceiver<ProvisionRequest>>>,
+}
+
+impl Provisioner {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        Self {
+            seen: std::sync::Mutex::new(HashSet::new()),
+            tx,
+            rx: Mutex::new(Some(rx)),
+        }
+    }
+
+    /// Pre-seed the seen-set with corpora boot catch-up (`catch_up_index`)
+    /// already covers, so `observe` only enqueues request-resolved corpora
+    /// (e.g. a git worktree's repo-layer wiki root) that boot never indexed.
+    fn seed(&self, corpora: &[CorpusConfig]) {
+        let mut seen = self
+            .seen
+            .lock()
+            .expect("provisioner seen-set mutex poisoned");
+        for corpus in corpora {
+            for key in corpus.corpus_keys() {
+                seen.insert(key);
+            }
+        }
+    }
+
+    pub(crate) fn observe(&self, corpora: &[CorpusConfig], cfg: &Config) {
+        let mut seen = self
+            .seen
+            .lock()
+            .expect("provisioner seen-set mutex poisoned");
+        let cfg = Arc::new(cfg.clone());
+        for corpus in corpora {
+            let mut unseen = false;
+            for key in corpus.corpus_keys() {
+                if seen.insert(key) {
+                    unseen = true;
+                }
+            }
+            if unseen {
+                let _ = self.tx.send(ProvisionRequest {
+                    corpus: corpus.clone(),
+                    cfg: Arc::clone(&cfg),
+                });
+            }
+        }
+    }
+
+    fn clear_seen(&self, key: &CorpusKey) {
+        self.seen
+            .lock()
+            .expect("provisioner seen-set mutex poisoned")
+            .remove(key);
+    }
+}
+
+async fn provisioning_loop(state: DaemonState) {
+    let cancel = state.shutdown_token().clone();
+    let mut rx_guard = state.inner.provisioner.rx.lock().await;
+    let Some(rx) = rx_guard.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        let request = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return,
+            recv = rx.recv() => match recv {
+                Some(request) => request,
+                None => return,
+            },
+        };
+        let ProvisionRequest { corpus, cfg } = request;
+        provision_corpus(&state, &corpus, &cfg).await;
+        state
+            .heartbeat()
+            .bump(super::heartbeat::TaskName::Provision);
+    }
+}
+
+async fn provision_corpus(state: &DaemonState, corpus: &CorpusConfig, cfg: &Config) {
+    let _guard = match state.acquire_mutation_guard(&corpus.name).await {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                corpus = %corpus.name,
+                error = %e,
+                "provisioning: could not acquire mutation guard; will retry on next ground",
+            );
+            clear_seen_keys(state, corpus);
+            return;
+        }
+    };
+    let res = match state.resources_for(cfg).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                corpus = %corpus.name,
+                error = %e,
+                "provisioning: could not resolve resources; will retry on next ground",
+            );
+            clear_seen_keys(state, corpus);
+            return;
+        }
+    };
+    let registry = HandlerRegistry::new(res.tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+    match super::dispatch::catch_up_corpus(&res, &registry, corpus).await {
+        Ok(Some(stats)) => tracing::info!(
+            target: "hallouminate::daemon",
+            corpus = %corpus.name,
+            files_upserted = stats.files_upserted,
+            files_touched = stats.files_touched,
+            files_deleted = stats.files_deleted,
+            "provisioning: indexed newly discovered corpus",
+        ),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                corpus = %corpus.name,
+                error = %e,
+                "provisioning: pass failed; will retry on next ground",
+            );
+            clear_seen_keys(state, corpus);
+        }
+    }
+}
+
+fn clear_seen_keys(state: &DaemonState, corpus: &CorpusConfig) {
+    for key in corpus.corpus_keys() {
+        state.provisioner().clear_seen(&key);
+    }
 }
 
 impl DaemonState {
@@ -550,6 +702,20 @@ impl DaemonState {
         let restart_cap = cfg.daemon.restart_intensity_cap;
         let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
         let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
+        // Boot catch-up (`catch_up_index`, spawned by the server after `open`)
+        // covers every baseline corpus; pre-seed the provisioner so `observe`
+        // does not redundantly re-provision them and race the watcher. If
+        // `catch_up_index` itself fails for a corpus, that corpus self-heals
+        // via the maintenance tick or the watcher, not the provisioner —
+        // the seed here is deliberately one-shot, not a retry guarantee.
+        let baseline_corpora_for_seed = cfg.effective_corpora().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "could not enumerate baseline corpora for provisioner seed; provisioning may redundantly re-index them",
+            );
+            Vec::new()
+        });
         // Invented defaults, no existing analog in debt.rs.
         let ladder = super::ladder::Ladder {
             warn_at: 3,
@@ -607,6 +773,11 @@ impl DaemonState {
                     )),
                     heartbeat,
                     maintenance_task: Mutex::new(None),
+                    provisioner: {
+                        let provisioner = Provisioner::new();
+                        provisioner.seed(&baseline_corpora_for_seed);
+                        provisioner
+                    },
                     shutdown,
                 }
             }),
@@ -648,6 +819,16 @@ impl DaemonState {
             *state.inner.maintenance_task.lock().await = Some(maintenance_task);
         }
 
+        {
+            let loop_state = state.clone();
+            state
+                .inner
+                .supervisor
+                .spawn(super::heartbeat::TaskName::Provision, move || {
+                    provisioning_loop(loop_state.clone())
+                });
+        }
+
         Ok(state)
     }
 
@@ -670,6 +851,11 @@ impl DaemonState {
     /// Heartbeat registry the supervised loops bump and the watchdog polls.
     pub(crate) fn heartbeat(&self) -> &Arc<super::heartbeat::HeartbeatRegistry> {
         &self.inner.heartbeat
+    }
+
+    /// Provisioner queuing newly discovered corpus roots for background catch-up.
+    pub(crate) fn provisioner(&self) -> &Provisioner {
+        &self.inner.provisioner
     }
 
     /// Source path of the baseline config the daemon booted from — the XDG
@@ -1315,6 +1501,7 @@ mod tests {
     use super::super::maintenance::{MaintenanceTick, jittered_sleep_secs};
     use super::*;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
+    use hallouminate_domain::indexer::ChunkStore;
 
     use std::fmt;
     use tracing::Subscriber;
@@ -1811,6 +1998,178 @@ mod tests {
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         DaemonState::open(cfg, None).await.expect("open")
+    }
+
+    #[tokio::test]
+    async fn observe_does_not_enqueue_a_corpus_seeded_from_baseline() {
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec!["/tmp/hallouminate-test-baseline-docs".to_string()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let provisioner = Provisioner::new();
+        provisioner.seed(std::slice::from_ref(&corpus));
+
+        provisioner.observe(std::slice::from_ref(&corpus), &Config::default());
+
+        let mut rx = provisioner.rx.lock().await.take().expect("receiver");
+        assert!(
+            rx.try_recv().is_err(),
+            "observe must not enqueue a corpus whose key was pre-seeded from baseline",
+        );
+    }
+
+    #[tokio::test]
+    async fn observe_enqueues_a_corpus_whose_key_is_not_in_baseline() {
+        let baseline_corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec!["/tmp/hallouminate-test-baseline-docs".to_string()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let unseen_corpus = CorpusConfig {
+            name: "repo:worktree:wiki".to_string(),
+            paths: vec!["/tmp/hallouminate-test-worktree-wiki".to_string()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let provisioner = Provisioner::new();
+        provisioner.seed(std::slice::from_ref(&baseline_corpus));
+
+        provisioner.observe(std::slice::from_ref(&unseen_corpus), &Config::default());
+
+        let mut rx = provisioner.rx.lock().await.take().expect("receiver");
+        let enqueued = rx
+            .try_recv()
+            .expect("observe must enqueue a corpus whose key was not seeded from baseline");
+        assert_eq!(enqueued.corpus.name, "repo:worktree:wiki");
+    }
+
+    #[tokio::test]
+    async fn provisioning_holds_the_mutation_lock_before_writing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let ground = tmp.path().join("ground");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = ground.to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
+
+        let guard = state.lock_corpus("docs").await;
+        state
+            .provisioner()
+            .observe(std::slice::from_ref(&corpus), state.baseline());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let files = state
+            .store()
+            .list_files(&corpus_key)
+            .await
+            .expect("list files while locked");
+        assert!(
+            files.is_empty(),
+            "provisioning must not write while the corpus lock is externally held",
+        );
+        drop(guard);
+
+        let mut indexed = false;
+        for _ in 0..100 {
+            let files = state
+                .store()
+                .list_files(&corpus_key)
+                .await
+                .expect("list files after unlock");
+            if !files.is_empty() {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            indexed,
+            "provisioning must index the corpus once the external lock releases",
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_resolves_resources_from_the_enqueued_config_not_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let baseline_ground = tmp.path().join("baseline-ground");
+        let repo_ground = tmp.path().join("repo-ground");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = baseline_ground.to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        // A request-resolved config whose repo layer overrides where the
+        // store lives (#427 taste-test fix): provisioning must index into
+        // the store resolved from the enqueued config, never the baseline's.
+        let mut resolved_cfg = state.baseline().clone();
+        resolved_cfg.storage.ground_dir = repo_ground.to_string_lossy().into_owned();
+
+        let corpus = CorpusConfig {
+            name: "repo:worktree:wiki".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
+
+        state
+            .provisioner()
+            .observe(std::slice::from_ref(&corpus), &resolved_cfg);
+
+        let repo_res = state
+            .resources_for(&resolved_cfg)
+            .await
+            .expect("repo-layer resources");
+        let mut indexed = false;
+        for _ in 0..100 {
+            let files = repo_res
+                .store
+                .list_files(&corpus_key)
+                .await
+                .expect("list repo-layer store");
+            if !files.is_empty() {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            indexed,
+            "provisioning must write to the store resolved from the enqueued request config",
+        );
+        let baseline_files = state
+            .store()
+            .list_files(&corpus_key)
+            .await
+            .expect("list baseline store");
+        assert!(
+            baseline_files.is_empty(),
+            "provisioning must not write to the baseline store when the request config overrides storage",
+        );
     }
 
     #[tokio::test]

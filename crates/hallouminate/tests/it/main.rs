@@ -13,6 +13,8 @@ mod mcp_serve;
 mod model_mismatch;
 mod multi_format;
 mod plugin_manifests;
+mod provisioning;
 mod real_tokenizer;
 mod recovery;
 mod verification_gate;
+mod worktree_provisioning_vector_reuse;

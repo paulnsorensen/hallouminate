@@ -132,6 +132,24 @@ _Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-7
 
 <certain> The shipped call sites have not caught up with this vocabulary: `connect_primary_or_sibling` and its `primary` / `sibling` locals still use the avoided terms.
 
+
+
+## Approved worktree-index-provisioning terms
+
+<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427 parts 1+3; 2026-08-30). They are approved, **not shipped**. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
+
+**Provisioner** — Daemon-lifetime seen-set plus queue plus supervised task that runs catch-up passes for newly observed corpus roots, immediately and off the request path.
+_Avoid_: index scheduler, background indexer
+_Code_: NEW ENTITY (pattern-sibling of `maintenance_task`, `crates/hallouminate-daemon/src/state.rs:636-648`)
+
+**Seen-set** — Per-daemon-lifetime `HashSet<CorpusKey>` deduplicating provisioning triggers; a failed pass clears its key so a later `ground` re-triggers.
+_Avoid_: cache, registry
+_Code_: NEW ENTITY (field of Provisioner)
+
+**Donor** — An existing row group (any root/corpus in the store) whose file-level `content_hash` matches an upserted file; its vectors are copied ord-aligned instead of re-embedding, guarded by donor-chunk-count equality.
+_Avoid_: cache entry
+_Code_: NEW ENTITY (internal to `LanceStore::apply_batch`; hash at `crates/hallouminate-domain/src/indexer/chunk.rs:35`)
+
 ## Excluded concepts
 
 LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), confidence-gated reranking (#287), rendered-footnote changes, public response-shape expansion, and any database-first source-of-truth model are outside this proposal.[^spec]
