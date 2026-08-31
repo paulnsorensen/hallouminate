@@ -7,7 +7,21 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.8.0...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.9.0...HEAD)
+
+## [0.9.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.9.0) - 2026-08-30
+
+### Added
+
+- Ground: search the repo wiki and every configured corpus by default while
+  preserving slots for local results
+- Ground: warn when the index trails files currently present on disk
+- Daemon: provision newly discovered corpora in the background and reuse vectors
+  for byte-identical files across worktrees
+
+### Changed
+
+- Embeddings: upgrade FastEmbed to 6.0.1
 
 ## [0.8.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.8.0) - 2026-08-24
 
