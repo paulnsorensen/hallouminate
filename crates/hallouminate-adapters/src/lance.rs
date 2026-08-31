@@ -1292,10 +1292,10 @@ impl LanceStore {
             ));
         }
 
-        let mut content_hashes: Vec<String> = Vec::new();
+        let mut content_hashes: Vec<&str> = Vec::new();
         if self.embeddings_enabled {
             for file in &batch {
-                content_hashes.push(file.content_hash.clone());
+                content_hashes.push(file.content_hash.as_str());
             }
         }
         let donor_groups = self.donor_vectors_batch(&content_hashes).await?;
@@ -1312,12 +1312,11 @@ impl LanceStore {
 
         let mut all_texts: Vec<String> = Vec::new();
         let mut splits: Vec<usize> = Vec::with_capacity(batch.len());
-        for i in 0..batch.len() {
-            if donor_vectors[i].is_some() {
+        for (file, donor) in batch.iter().zip(&donor_vectors) {
+            if donor.is_some() {
                 splits.push(0);
                 continue;
             }
-            let file = &batch[i];
             splits.push(file.chunks.len());
             for c in &file.chunks {
                 all_texts.push(c.search_text.clone());
@@ -1343,13 +1342,12 @@ impl LanceStore {
                 )));
             }
             let mut iter = vectors.drain(..);
-            for i in 0..batch.len() {
-                if let Some(donor) = donor_vectors[i].take() {
+            for (donor_slot, count) in donor_vectors.iter_mut().zip(splits.iter().copied()) {
+                if let Some(donor) = donor_slot.take() {
                     stats.chunks_written += donor.len();
                     file_embeddings.push(Some(donor));
                     continue;
                 }
-                let count = splits[i];
                 let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
                 for _ in 0..count {
                     let v = iter.next().ok_or_else(|| {
@@ -1442,13 +1440,13 @@ impl LanceStore {
     /// qualifying group exists (chunk count equal to the file's chunk count
     /// and every row carrying a non-null vector), first-qualifying-group-wins
     /// in `(corpus, root, file_ref)` order, groups never blended.
-    async fn donor_vectors_batch(&self, content_hashes: &[String]) -> Result<DonorGroups> {
+    async fn donor_vectors_batch(&self, content_hashes: &[&str]) -> Result<DonorGroups> {
         if content_hashes.is_empty() {
             return Ok(HashMap::new());
         }
         let mut distinct: HashSet<&str> = HashSet::new();
         for hash in content_hashes {
-            distinct.insert(hash.as_str());
+            distinct.insert(hash);
         }
         let mut escaped: Vec<String> = Vec::with_capacity(distinct.len());
         for hash in distinct {
@@ -2372,10 +2370,6 @@ mod tests {
             "donor reuse must skip the embedder for the identical file"
         );
 
-        let mut expected_vector = [0.0_f32; EMBEDDING_DIM];
-        for (i, byte) in "shared text".bytes().enumerate() {
-            expected_vector[i % EMBEDDING_DIM] += byte as f32;
-        }
         let hits = store
             .retrieve_signals(&root_b, "shared", 10)
             .await

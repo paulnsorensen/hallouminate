@@ -185,10 +185,17 @@ mod tests {
         provisioner.observe(std::slice::from_ref(&corpus), &Config::default());
 
         let mut rx = provisioner.rx.lock().await.take().expect("receiver");
-        assert!(
-            rx.try_recv().is_err(),
-            "observe must not enqueue a corpus whose key was pre-seeded from baseline",
-        );
+        match rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                panic!("provisioner queue disconnected while its sender is alive")
+            }
+            Ok(request) => panic!(
+                "observe must not enqueue a corpus whose key was pre-seeded from baseline; \
+                 got {}",
+                request.corpus.name,
+            ),
+        }
     }
 
     #[tokio::test]

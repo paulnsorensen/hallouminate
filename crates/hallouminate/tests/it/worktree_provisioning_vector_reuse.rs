@@ -110,7 +110,8 @@ async fn provisioning_a_byte_identical_root_reuses_vectors_with_zero_embedder_ca
     .await
     .expect("ground over provisioned root b");
     assert!(
-        !resp.docs.is_empty(),
-        "search over the newly provisioned root's corpus must return results"
+        resp.docs.keys().any(|path| path.ends_with("a.md")),
+        "search over the newly provisioned root's corpus must surface a.md, got {:?}",
+        resp.docs.keys().collect::<Vec<_>>(),
     );
 }
