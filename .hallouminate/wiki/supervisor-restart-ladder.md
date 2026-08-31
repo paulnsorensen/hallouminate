@@ -5,77 +5,95 @@ confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/387
 ---
-# Supervisor restart ladder
+# ADR: Supervisor restart ladder
 
-The daemon's task supervisor (`crates/hallouminate-daemon/src/supervisor.rs`)
-restarts a panicked long-lived loop with exponential backoff, and — since
-#407/#408/#409 — exposes per-task restart counts and escalates a
-persistently crash-looping task through the same generic backpressure
-ladder the reindex-churn tracker uses, rather than a bespoke mechanism.
+The daemon uses one generic `Ladder<A>` evaluator for reindex churn and
+supervisor crash loops. The watchdog does not use this evaluator. The three
+failure paths use one `LadderAction` type for status reports.[^1]
 
-## The shared `Ladder<A>` abstraction
+## Status
 
-`crates/hallouminate-daemon/src/ladder.rs` defines one generic two-threshold
-evaluator: below `warn_at` → `Nothing`, at/above `warn_at` → `Warn`, at/above
-`act_at` → `Action(A)`. Three escalation lanes exist in the daemon; two of
-them are `Ladder` instances over different action types, the third
-deliberately isn't:
+Accepted and shipped in #407, #408, and #409.
 
-| Lane | Trigger | Action | Ladder? |
+## Context
+
+The daemon has five supervised tasks. The supervisor restarts a task after the
+task panics. It uses exponential backoff from 1 second to 60 seconds.[^2]
+
+Two settings define the restart-intensity limit:
+
+- `restart_intensity_cap` is the permitted number of restarts.
+- `restart_intensity_window_secs` is the measurement window.
+
+The default limit is five restarts in 60 seconds.[^3] The supervisor must also
+report a persistent crash loop. A normal restart is not sufficient evidence
+for this report.
+
+The daemon has two other failure paths. The churn tracker counts consecutive
+reindexes that have no upserts. The watchdog detects a task that does not
+change its heartbeat.[^4]
+
+## Decision
+
+Use `Ladder<A>` as a generic two-threshold evaluator. A count below
+`warn_at` gives `Nothing`. A count from `warn_at` to `act_at - 1` gives
+`Warn`. A count at or above `act_at` gives `Action(A)`.[^1]
+
+Use separate ladder values for each count:
+
+| Failure path | Input count | Evaluator | Action |
 |---|---|---|---|
-| Reindex churn (`churn.rs`) | consecutive zero-upsert reindexes | `ForceMaintenance` | yes — `Ladder<LadderAction>` |
-| Supervisor crash loop (`supervisor.rs`) | restart-intensity cap repeatedly exceeded | `RestartTask(name)` | yes — `Ladder<SupervisorAction>` |
-| Watchdog stall (`watchdog.rs`) | a task's heartbeat stops advancing | `WatchdogTrip` → `abort()` | **no** — fired directly by the stall detector |
+| Reindex churn | Consecutive reindexes with no upserts | `Ladder<LadderAction>` | `ForceMaintenance` |
+| Supervisor crash loop | Quick panics after the intensity cap is exceeded | `Ladder<SupervisorAction>` | `RestartTask(name)` |
+| Watchdog stall | No heartbeat progress for the stall interval | None | `WatchdogTrip`, then abort |
 
-The watchdog's stall detector bypasses `Ladder` entirely because a stalled
-task has *no* count to escalate against — it either is or isn't making
-progress. Reusing the same `LadderAction` enum across the two ladder-driven
-lanes (rather than one enum per lane) is what let `status.rs` render all
-three trip kinds through one match arm.
+The supervisor ladder has fixed values of `warn_at: 3` and `act_at: 5`.
+These values are not configuration settings.[^5] After the restart-intensity
+cap is exceeded, that panic is strike 1. Each additional quick panic adds one
+strike. With the default values, the action first occurs on quick panic 10:
+five permitted panics, then five escalation strikes.[^2]
 
-## Two-layer crash-loop escalation
+Escalation is sticky during a crash loop. A 60-second restart delay does not
+clear the strike count. Only a task run that lasts for at least the configured
+intensity window clears the backoff count and the strike count.[^2]
 
-Restart intensity and the ladder measure different things, and both are
-configurable independently (`crates/hallouminate-config/src/lib.rs`):
+The escalation hook records `RestartTask(name)` and writes a log message. It
+does not restart or stop the task. The normal supervisor loop continues to
+restart the task.[^2]
 
-1. **`restart_intensity_cap` / `restart_intensity_window_secs`** (defaults
-   `5` / `60`) — how many panics-and-restarts within the rolling window
-   count as "this task is crash-looping" at all. Each time a task exceeds
-   this cap, the supervisor increments that task's escalation-strike count
-   and evaluates the strike count against the ladder.
-2. **The ladder itself** (`warn_at: 3, act_at: 5`, hardcoded in
-   `state.rs` — "invented defaults, no existing analog in debt.rs", i.e. not
-   yet promoted to config) — how many separate crash-loop *episodes* a task
-   racks up before the supervisor stops just backing off and fires
-   `RestartTask(name)` through the escalation hook.
+Do not change the heartbeat when the supervisor restarts a task. A task that
+repeatedly panics must still appear stalled to the watchdog. If a restart
+changed the heartbeat, a crash loop could hide a stall.[^2]
 
-So a single flaky panic never escalates; a task has to blow through the
-intensity cap five separate times before `RestartTask` fires. The hook only
-records the trip (`DaemonStateInner::last_ladder_trip`, surfaced by `daemon
-status`) and logs — it does not itself restart or abort. The supervisor's
-own backoff loop (`BACKOFF_FLOOR` 1s → `BACKOFF_CAP` 60s) keeps restarting
-the task regardless; the ladder action is a signal, not a kill switch.
+Use `LadderAction` as the common status type for `ForceMaintenance`,
+`RestartTask`, and `WatchdogTrip`. This type does not mean that all three
+paths use `Ladder<A>`. The status report converts each variant to the wire
+type with an explicit match.[^6]
 
-## Deliberate: restarts don't reset the heartbeat
+## Alternatives rejected
 
-`supervisor.rs`'s module doc is explicit about this: restart visibility
-(`restart_count`, read by `daemon status`) is tracked separately from the
-heartbeat registry, and a restart **deliberately does not** bump the
-task's heartbeat epoch. A crash-looping task must still look stalled to the
-watchdog, not alive — otherwise a tight panic/restart cycle could keep
-resetting the stall clock and mask a wedge that should trip the watchdog's
-`abort()` path. The two failure classes (crash loop vs. stall) stay
-observable through independent signals even though both ultimately funnel
-into `LadderAction`.
+- Use one configured ladder for all three paths. Rejected because each path
+  measures a different condition. The watchdog has no increasing count.
+- Reset the heartbeat after each restart. Rejected because this can make a
+  crash loop appear healthy.
+- Stop or restart the task in the escalation hook. Rejected because the
+  supervisor already owns restart behavior. The hook only records the event.
+- Put the supervisor thresholds in configuration. Rejected for this change
+  because there was no operational requirement for more settings.
 
-## Status surface
+## Consequences
 
-`Supervisor::restart_count(task)` (lifetime counter, `AtomicU64` per task)
-is read by `status::report()` and rendered as `restarts=N` per task line by
-`hallouminate daemon` status output (`cli.rs`,
-`render_status_report`) — see [daemon-and-cli](daemon-and-cli.md) for the
-rest of the status/CLI surface. Before #408 this counter existed but had no
-reader (`#[allow(dead_code)]`); #407 removed the stale allow once #408 wired
-it into `StatusReport`.
+`daemon status` shows a lifetime `restarts=N` count for each task. It also
+shows the most recent action from the common status type.[^6]
 
-_Source: `crates/hallouminate-daemon/src/{ladder,supervisor,churn,watchdog,state,status}.rs`, commits `ccbba55`/`5440dfe`/`302f4a4` (#407/#408/#409, closing #387) · Updated: 2026-08-30 · Supersedes: —_
+A permanent crash loop continues to produce `RestartTask(name)` actions
+after strike 5. A healthy task run clears the escalation state. A watchdog
+stall records `WatchdogTrip` and then aborts the process.[^2][^7]
+
+[^1]: `crates/hallouminate-daemon/src/ladder.rs:1-51`
+[^2]: `crates/hallouminate-daemon/src/supervisor.rs:29-45,109-113,133-263`
+[^3]: `crates/hallouminate-config/src/lib.rs:228-235`
+[^4]: `crates/hallouminate-daemon/src/churn.rs:1-9`; `crates/hallouminate-daemon/src/watchdog.rs:1-16`
+[^5]: `crates/hallouminate-daemon/src/state.rs:549-558`
+[^6]: `crates/hallouminate-daemon/src/status.rs:17-65`; `crates/hallouminate/src/cli.rs:338-394`
+[^7]: `crates/hallouminate-daemon/src/server.rs:335-344`

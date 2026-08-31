@@ -49,7 +49,7 @@
 - 2026-08-23 · wiki-harvest-hallouminate-20260823 · merged · index.md · tool count eleven→ten, multi-format gloss refreshed to shipped Phase 1, added not-found-suggestions entry
 
 
-- 2026-08-30 · wiki-harvest-hallouminate-20260830 · new-page · supervisor-restart-ladder.md · shared `Ladder<A>` abstraction across churn/`ForceMaintenance`, crash-loop/`RestartTask`, and watchdog/`WatchdogTrip`; two-layer crash-loop escalation (restart-intensity cap vs. fixed warn/act ladder); restarts deliberately don't bump the heartbeat (#407/#408/#409, closing #387)
+- 2026-08-30 · wiki-harvest-hallouminate-20260830 · new-adr · supervisor-restart-ladder.md · documented the shared `Ladder<A>` evaluator and its separate churn and supervisor configurations; corrected the crash-loop sequence, distinguished the direct watchdog path, and recorded why restarts do not change heartbeats (#407/#408/#409, closing #387)
 - 2026-08-30 · wiki-harvest-hallouminate-20260830 · fixed-stale · blocking-inference-offload.md · every citation still pointed at the pre-#273 `crates/hallouminate/src/daemon/` layout; repointed to `hallouminate-daemon`/`hallouminate-adapters` with corrected line numbers (functions moved, e.g. `run_embedding_blocking` 626→816, real `apply_batch` 939-1009→1168)
 - 2026-08-30 · wiki-harvest-hallouminate-20260830 · merged · architecture.md, daemon-and-cli.md, index.md · cross-links to the new supervisor-restart-ladder page
 
