@@ -5,9 +5,9 @@
 //! exponential backoff; restarts are counted against an OTP-style
 //! intensity cap (`restart_intensity_cap` per `restart_intensity_window`),
 //! and exceeding the cap escalates through the seeded [`Ladder`] to the
-//! escalation hook instead of killing the daemon. All five `server.rs`
-//! loops (`Maintenance`, `CatchUp`, `WatcherPump`, `IdleExit`, `Signal`)
-//! are wired through this supervisor's `spawn`.
+//! escalation hook instead of killing the daemon. All six `server.rs`
+//! loops (`Maintenance`, `CatchUp`, `WatcherPump`, `IdleExit`, `Signal`,
+//! `Provision`) are wired through this supervisor's `spawn`.
 //!
 //! Restart visibility: the supervisor keeps per-task restart counters
 //! (`restart_count`) for status reporting. It deliberately does not bump
@@ -47,7 +47,7 @@ pub(crate) enum SupervisorAction {
 /// The hook runs from the monitor task and must not panic or block.
 pub(crate) type EscalationHook = Arc<dyn Fn(TaskName, LadderAction) + Send + Sync>;
 
-const TASK_COUNT: usize = 5;
+const TASK_COUNT: usize = 6;
 
 fn slot(task: TaskName) -> usize {
     match task {
@@ -56,6 +56,7 @@ fn slot(task: TaskName) -> usize {
         TaskName::WatcherPump => 2,
         TaskName::IdleExit => 3,
         TaskName::Signal => 4,
+        TaskName::Provision => 5,
     }
 }
 

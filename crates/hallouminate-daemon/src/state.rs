@@ -45,9 +45,10 @@ use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
 use super::ladder::LadderAction;
 use super::maintenance::{DeferReason, maintenance_loop};
+use super::provisioner::{Provisioner, provisioning_loop};
 use super::supervisor::SupervisorAction;
 
-const CHUNK_BUDGET_TOKENS: usize = 384;
+pub(crate) const CHUNK_BUDGET_TOKENS: usize = 384;
 
 /// Backup ground-store directories (`<ground>.bak-v{N}`, left behind by
 /// `move_stale_store` on a schema-version rebuild) older than this are
@@ -246,6 +247,7 @@ struct DaemonStateInner {
     heartbeat: Arc<super::heartbeat::HeartbeatRegistry>,
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
+    provisioner: Provisioner,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
@@ -550,6 +552,20 @@ impl DaemonState {
         let restart_cap = cfg.daemon.restart_intensity_cap;
         let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
         let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
+        // Boot catch-up (`catch_up_index`, spawned by the server after `open`)
+        // covers every baseline corpus; pre-seed the provisioner so `observe`
+        // does not redundantly re-provision them and race the watcher. If
+        // `catch_up_index` itself fails for a corpus, that corpus self-heals
+        // via the maintenance tick or the watcher, not the provisioner —
+        // the seed here is deliberately one-shot, not a retry guarantee.
+        let baseline_corpora_for_seed = cfg.effective_corpora().unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "could not enumerate baseline corpora for provisioner seed; provisioning may redundantly re-index them",
+            );
+            Vec::new()
+        });
         // Invented defaults, no existing analog in debt.rs.
         let ladder = super::ladder::Ladder {
             warn_at: 3,
@@ -607,6 +623,11 @@ impl DaemonState {
                     )),
                     heartbeat,
                     maintenance_task: Mutex::new(None),
+                    provisioner: {
+                        let provisioner = Provisioner::new();
+                        provisioner.seed(&baseline_corpora_for_seed);
+                        provisioner
+                    },
                     shutdown,
                 }
             }),
@@ -648,6 +669,16 @@ impl DaemonState {
             *state.inner.maintenance_task.lock().await = Some(maintenance_task);
         }
 
+        {
+            let loop_state = state.clone();
+            state
+                .inner
+                .supervisor
+                .spawn(super::heartbeat::TaskName::Provision, move || {
+                    provisioning_loop(loop_state.clone())
+                });
+        }
+
         Ok(state)
     }
 
@@ -670,6 +701,11 @@ impl DaemonState {
     /// Heartbeat registry the supervised loops bump and the watchdog polls.
     pub(crate) fn heartbeat(&self) -> &Arc<super::heartbeat::HeartbeatRegistry> {
         &self.inner.heartbeat
+    }
+
+    /// Provisioner queuing newly discovered corpus roots for background catch-up.
+    pub(crate) fn provisioner(&self) -> &Provisioner {
+        &self.inner.provisioner
     }
 
     /// Source path of the baseline config the daemon booted from — the XDG
@@ -1315,6 +1351,8 @@ mod tests {
     use super::super::maintenance::{MaintenanceTick, jittered_sleep_secs};
     use super::*;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
+    use hallouminate_domain::common::CorpusConfig;
+    use hallouminate_domain::indexer::ChunkStore;
 
     use std::fmt;
     use tracing::Subscriber;
@@ -1811,6 +1849,129 @@ mod tests {
         cfg.embeddings.enabled = false;
         cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
         DaemonState::open(cfg, None).await.expect("open")
+    }
+
+    #[tokio::test]
+    async fn provisioning_holds_the_mutation_lock_before_writing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let ground = tmp.path().join("ground");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = ground.to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
+
+        let guard = state.lock_corpus("docs").await;
+        state
+            .provisioner()
+            .observe(std::slice::from_ref(&corpus), state.baseline());
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let files = state
+            .store()
+            .list_files(&corpus_key)
+            .await
+            .expect("list files while locked");
+        assert!(
+            files.is_empty(),
+            "provisioning must not write while the corpus lock is externally held",
+        );
+        drop(guard);
+
+        let mut indexed = false;
+        for _ in 0..100 {
+            let files = state
+                .store()
+                .list_files(&corpus_key)
+                .await
+                .expect("list files after unlock");
+            if !files.is_empty() {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            indexed,
+            "provisioning must index the corpus once the external lock releases",
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_resolves_resources_from_the_enqueued_config_not_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let baseline_ground = tmp.path().join("baseline-ground");
+        let repo_ground = tmp.path().join("repo-ground");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = baseline_ground.to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        // A request-resolved config whose repo layer overrides where the
+        // store lives (#427 taste-test fix): provisioning must index into
+        // the store resolved from the enqueued config, never the baseline's.
+        let mut resolved_cfg = state.baseline().clone();
+        resolved_cfg.storage.ground_dir = repo_ground.to_string_lossy().into_owned();
+
+        let corpus = CorpusConfig {
+            name: "repo:worktree:wiki".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
+
+        state
+            .provisioner()
+            .observe(std::slice::from_ref(&corpus), &resolved_cfg);
+
+        let repo_res = state
+            .resources_for(&resolved_cfg)
+            .await
+            .expect("repo-layer resources");
+        let mut indexed = false;
+        for _ in 0..100 {
+            let files = repo_res
+                .store
+                .list_files(&corpus_key)
+                .await
+                .expect("list repo-layer store");
+            if !files.is_empty() {
+                indexed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            indexed,
+            "provisioning must write to the store resolved from the enqueued request config",
+        );
+        let baseline_files = state
+            .store()
+            .list_files(&corpus_key)
+            .await
+            .expect("list baseline store");
+        assert!(
+            baseline_files.is_empty(),
+            "provisioning must not write to the baseline store when the request config overrides storage",
+        );
     }
 
     #[tokio::test]

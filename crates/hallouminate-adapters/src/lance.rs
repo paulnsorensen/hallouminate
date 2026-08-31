@@ -434,6 +434,117 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
         .map_err(|e| HallouminateError::Indexer(format!("build record batch: {e}")))
 }
 
+struct DonorRow {
+    ord: i64,
+    vector: Option<[f32; EMBEDDING_DIM]>,
+}
+
+/// (corpus, root, file_ref) identity of one donor row-group.
+type DonorGroupKey = (String, String, String);
+/// Donor rows grouped by content_hash, then by row-group identity.
+type DonorGroups = HashMap<String, HashMap<DonorGroupKey, Vec<DonorRow>>>;
+
+fn decode_donor_rows(batches: &[RecordBatch]) -> Result<DonorGroups> {
+    let mut by_hash: DonorGroups = HashMap::new();
+    for rb in batches {
+        if rb.num_rows() == 0 {
+            continue;
+        }
+        let content_hashes = string_col(rb, "content_hash")?;
+        let corpora = string_col(rb, "corpus")?;
+        let roots = string_col(rb, "root")?;
+        let file_refs = string_col(rb, "file_ref")?;
+        let ords = int64_col(rb, "ord")?;
+        let Some(embedding_column) = rb.column_by_name("embedding") else {
+            return Err(HallouminateError::Indexer(
+                "missing column embedding".into(),
+            ));
+        };
+        let Some(embedding_column) = embedding_column
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+        else {
+            return Err(HallouminateError::Indexer(
+                "embedding column not a fixed-size list".into(),
+            ));
+        };
+        for row in 0..rb.num_rows() {
+            let key = (
+                corpora.value(row).to_string(),
+                roots.value(row).to_string(),
+                file_refs.value(row).to_string(),
+            );
+            let vector = if embedding_column.is_null(row) {
+                None
+            } else {
+                let values = embedding_column.value(row);
+                let Some(floats) = values.as_any().downcast_ref::<Float32Array>() else {
+                    return Err(HallouminateError::Indexer(
+                        "embedding item column not float32".into(),
+                    ));
+                };
+                let mut vector = [0.0_f32; EMBEDDING_DIM];
+                for (slot, target) in vector.iter_mut().enumerate() {
+                    *target = floats.value(slot);
+                }
+                Some(vector)
+            };
+            by_hash
+                .entry(content_hashes.value(row).to_string())
+                .or_default()
+                .entry(key)
+                .or_default()
+                .push(DonorRow {
+                    ord: ords.value(row),
+                    vector,
+                });
+        }
+    }
+    Ok(by_hash)
+}
+
+fn pick_donor_vectors(
+    groups: &HashMap<DonorGroupKey, Vec<DonorRow>>,
+    chunk_count: usize,
+) -> Option<Vec<[f32; EMBEDDING_DIM]>> {
+    let mut keys: Vec<&DonorGroupKey> = Vec::new();
+    for key in groups.keys() {
+        keys.push(key);
+    }
+    keys.sort();
+
+    for key in keys {
+        let rows = &groups[key];
+        if rows.len() != chunk_count {
+            continue;
+        }
+        let mut sorted: Vec<&DonorRow> = Vec::new();
+        for row in rows {
+            sorted.push(row);
+        }
+        sorted.sort_by_key(|row| row.ord);
+        debug_assert!(
+            sorted
+                .iter()
+                .enumerate()
+                .all(|(i, row)| row.ord == i as i64),
+            "donor row-group ords must be exactly 0..chunk_count",
+        );
+
+        let mut vectors: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(chunk_count);
+        for row in sorted {
+            match row.vector {
+                Some(vector) => vectors.push(vector),
+                None => break,
+            }
+        }
+        if vectors.len() == chunk_count {
+            return Some(vectors);
+        }
+    }
+    None
+}
+
 /// Escape a string for inclusion in a DataFusion SQL literal.
 ///
 /// DataFusion follows standard SQL string-literal rules: only single quotes
@@ -1160,6 +1271,11 @@ impl LanceStore {
     /// exact name-and-root identity. The merge join key is
     /// `(corpus, root, chunk_id)`, so sibling roots retain independent rows.
     ///
+    /// Before embedding, each file's `content_hash` is checked against any
+    /// existing rows in the store (any corpus/root — one store carries one
+    /// embedding model). A donor row-group with an equal chunk count and
+    /// non-null vectors is copied ord-aligned instead of re-embedding.
+    ///
     /// # Errors
     ///
     /// Returns an error when the batch mixes corpus keys, when the embedder
@@ -1176,11 +1292,33 @@ impl LanceStore {
             ));
         }
 
+        let mut content_hashes: Vec<&str> = Vec::new();
+        if self.embeddings_enabled {
+            for file in &batch {
+                content_hashes.push(file.content_hash.as_str());
+            }
+        }
+        let donor_groups = self.donor_vectors_batch(&content_hashes).await?;
+
+        let mut donor_vectors: Vec<Option<Vec<[f32; EMBEDDING_DIM]>>> =
+            Vec::with_capacity(batch.len());
+        for file in &batch {
+            let donor = match donor_groups.get(&file.content_hash) {
+                Some(groups) => pick_donor_vectors(groups, file.chunks.len()),
+                None => None,
+            };
+            donor_vectors.push(donor);
+        }
+
         let mut all_texts: Vec<String> = Vec::new();
         let mut splits: Vec<usize> = Vec::with_capacity(batch.len());
-        for pf in &batch {
-            splits.push(pf.chunks.len());
-            for c in &pf.chunks {
+        for (file, donor) in batch.iter().zip(&donor_vectors) {
+            if donor.is_some() {
+                splits.push(0);
+                continue;
+            }
+            splits.push(file.chunks.len());
+            for c in &file.chunks {
                 all_texts.push(c.search_text.clone());
             }
         }
@@ -1204,7 +1342,12 @@ impl LanceStore {
                 )));
             }
             let mut iter = vectors.drain(..);
-            for count in splits.iter().copied() {
+            for (donor_slot, count) in donor_vectors.iter_mut().zip(splits.iter().copied()) {
+                if let Some(donor) = donor_slot.take() {
+                    stats.chunks_written += donor.len();
+                    file_embeddings.push(Some(donor));
+                    continue;
+                }
                 let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(count);
                 for _ in 0..count {
                     let v = iter.next().ok_or_else(|| {
@@ -1287,6 +1430,50 @@ impl LanceStore {
             return Err(e);
         }
         Ok(stats)
+    }
+
+    /// Looks up donor row-groups for every distinct `content_hash` in one
+    /// batch with a single filtered table scan (`content_hash IN (...)`),
+    /// across any corpus/root in the store. Returns each hash's candidate
+    /// groups, keyed by `(corpus, root, file_ref)`, for the caller to pick
+    /// from via [`pick_donor_vectors`]: ord-aligned vectors when exactly one
+    /// qualifying group exists (chunk count equal to the file's chunk count
+    /// and every row carrying a non-null vector), first-qualifying-group-wins
+    /// in `(corpus, root, file_ref)` order, groups never blended.
+    async fn donor_vectors_batch(&self, content_hashes: &[&str]) -> Result<DonorGroups> {
+        if content_hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut distinct: HashSet<&str> = HashSet::new();
+        for hash in content_hashes {
+            distinct.insert(hash);
+        }
+        let mut escaped: Vec<String> = Vec::with_capacity(distinct.len());
+        for hash in distinct {
+            escaped.push(format!("'{}'", escape_sql_str(hash)));
+        }
+        let predicate = format!("content_hash IN ({})", escaped.join(", "));
+        let table = self.table.clone();
+        let batches = supervise_scan("apply_batch_donor_lookup", async move {
+            let stream = table
+                .query()
+                .only_if(predicate)
+                .select(lancedb::query::Select::columns(&[
+                    "content_hash",
+                    "corpus",
+                    "root",
+                    "file_ref",
+                    "ord",
+                    "embedding",
+                ]))
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await?;
+        decode_donor_rows(&batches)
     }
 
     /// Build the FTS index on `search_text` (and the ANN index on `embedding`) if
@@ -2103,6 +2290,195 @@ mod tests {
         );
     }
 
+    type DistinctVectorCalls = Arc<std::sync::Mutex<Vec<Vec<String>>>>;
+
+    struct DistinctVectorEmbedder {
+        calls: DistinctVectorCalls,
+    }
+
+    impl EmbedBatch for DistinctVectorEmbedder {
+        fn embed_batch(
+            &mut self,
+            texts: &[String],
+            _role: EmbedRole,
+        ) -> Result<Vec<[f32; EMBEDDING_DIM]>> {
+            self.calls
+                .lock()
+                .expect("recording lock")
+                .push(texts.to_vec());
+            let mut vectors = Vec::with_capacity(texts.len());
+            for text in texts {
+                let mut vector = [0.0_f32; EMBEDDING_DIM];
+                for (i, byte) in text.bytes().enumerate() {
+                    vector[i % EMBEDDING_DIM] += byte as f32;
+                }
+                vectors.push(vector);
+            }
+            Ok(vectors)
+        }
+    }
+
+    async fn raw_insert(store: &LanceStore, file: &PreparedFile, with_embeddings: bool) {
+        let embeddings: Option<Vec<[f32; EMBEDDING_DIM]>> = if with_embeddings {
+            Some(synth_embeddings(file.chunks.len()))
+        } else {
+            None
+        };
+        let fwe = FileWithEmbeddings {
+            file,
+            embeddings: embeddings.as_deref(),
+        };
+        let schema = chunks_schema();
+        let record_batch = build_record_batch(&[fwe], schema.clone()).expect("build raw batch");
+        let reader = RecordBatchIterator::new(std::iter::once(Ok(record_batch)), schema);
+        let reader: Box<dyn arrow::array::RecordBatchReader + Send> = Box::new(reader);
+        let mut builder = store.table.merge_insert(&["corpus", "root", "chunk_id"]);
+        builder
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        builder.execute(reader).await.expect("write raw batch");
+    }
+
+    #[tokio::test]
+    async fn apply_batch_reuses_vectors_for_byte_identical_file_across_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+
+        let root_a = corpus_key("docs", "/root-a");
+        let file_a = synthetic_prepared_for(&root_a, "same.md", 2, "shared text", 1, 1);
+        store.apply_batch(vec![file_a]).await.expect("apply root a");
+        assert_eq!(calls.lock().expect("recording lock").len(), 1);
+
+        let root_b = corpus_key("docs", "/root-b");
+        let file_b = synthetic_prepared_for(&root_b, "same.md", 2, "shared text", 2, 2);
+        store.apply_batch(vec![file_b]).await.expect("apply root b");
+
+        assert_eq!(
+            calls.lock().expect("recording lock").len(),
+            1,
+            "donor reuse must skip the embedder for the identical file"
+        );
+
+        let hits = store
+            .retrieve_signals(&root_b, "shared", 10)
+            .await
+            .expect("retrieve");
+        assert_eq!(hits.hits.len(), 2, "expected both chunks from root b");
+        for hit in hits.hits.values() {
+            assert_eq!(hit.file_ref, "same.md");
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_batch_embeds_when_content_hash_changes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+
+        let root_a = corpus_key("docs", "/root-a");
+        let mut file_a = synthetic_prepared_for(&root_a, "same.md", 1, "original text", 1, 1);
+        file_a.content_hash = "hash-one".into();
+        store.apply_batch(vec![file_a]).await.expect("apply root a");
+
+        let root_b = corpus_key("docs", "/root-b");
+        let mut file_b = synthetic_prepared_for(&root_b, "same.md", 1, "changed text", 2, 2);
+        file_b.content_hash = "hash-two".into();
+        store.apply_batch(vec![file_b]).await.expect("apply root b");
+
+        assert_eq!(
+            calls.lock().expect("recording lock").len(),
+            2,
+            "a changed content_hash must never reuse a donor and must embed as today"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_batch_embeds_when_donor_chunk_count_differs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+
+        let root_a = corpus_key("docs", "/root-a");
+        let mut file_a = synthetic_prepared_for(&root_a, "same.md", 3, "shared text", 1, 1);
+        file_a.content_hash = "same-hash".into();
+        store.apply_batch(vec![file_a]).await.expect("apply root a");
+
+        let root_b = corpus_key("docs", "/root-b");
+        let mut file_b = synthetic_prepared_for(&root_b, "same.md", 2, "shared text", 2, 2);
+        file_b.content_hash = "same-hash".into();
+        store.apply_batch(vec![file_b]).await.expect("apply root b");
+
+        assert_eq!(
+            calls.lock().expect("recording lock").len(),
+            2,
+            "a donor chunk-count mismatch must never copy stale vectors"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_batch_embeds_when_only_donor_has_null_embeddings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+
+        let root_a = corpus_key("docs", "/root-a");
+        let mut donor = synthetic_prepared_for(&root_a, "donor.md", 1, "shared text", 1, 1);
+        donor.content_hash = "null-donor-hash".into();
+        raw_insert(&store, &donor, false).await;
+
+        let root_b = corpus_key("docs", "/root-b");
+        let mut file_b = synthetic_prepared_for(&root_b, "same.md", 1, "shared text", 2, 2);
+        file_b.content_hash = "null-donor-hash".into();
+        store.apply_batch(vec![file_b]).await.expect("apply root b");
+
+        assert_eq!(
+            calls.lock().expect("recording lock").len(),
+            1,
+            "a null-vector donor must not suppress embedding"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn enabled_store_without_embedder_rejects_embedding_dependent_operations() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2123,8 +2499,10 @@ mod tests {
         *store.embedder.lock().expect("embedder lock") = None;
         store.embedder_available.store(false, Ordering::Release);
 
+        let mut unavailable_file = synthetic_prepared("/tmp/unavailable.md", 1);
+        unavailable_file.content_hash = "cafef00d".into();
         let write_error = store
-            .apply_batch(vec![synthetic_prepared("/tmp/unavailable.md", 1)])
+            .apply_batch(vec![unavailable_file])
             .await
             .expect_err("enabled writes must not degrade to null vectors");
         assert!(
@@ -2230,8 +2608,10 @@ mod tests {
              not held across the rest of the index (#219 regression)"
         );
 
+        let mut batch_two_file = synthetic_prepared("/tmp/batch-two.md", 1);
+        batch_two_file.content_hash = "b16b00b5".into();
         store
-            .apply_batch(vec![synthetic_prepared("/tmp/batch-two.md", 1)])
+            .apply_batch(vec![batch_two_file])
             .await
             .expect("apply batch two");
 

@@ -132,6 +132,24 @@ _Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-7
 
 <certain> The shipped call sites have not caught up with this vocabulary: `connect_primary_or_sibling` and its `primary` / `sibling` locals still use the avoided terms.
 
+
+
+## Worktree-index-provisioning terms
+
+<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). The code is **implemented in PR #430**. PR #430 is open. A person did not merge it yet. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
+
+**Provisioner** — A supervised task in the daemon. The task has a seen-set and a queue. The task continues while the daemon operates. When the daemon finds a new corpus root, the task starts a catch-up pass immediately. The task does the pass away from the request path.
+_Avoid_: index scheduler, background indexer
+_Code_: `Provisioner`, `crates/hallouminate-daemon/src/provisioner.rs:26-31`; `provisioning_loop`, same file line 89; `DaemonState.provisioner`, `crates/hallouminate-daemon/src/state.rs:250`; `handle_ground` calls `observe` at `dispatch.rs:391`
+
+**Seen-set** — A `HashSet<CorpusKey>` in the Provisioner. The set continues while the daemon operates. The set prevents a second provisioning trigger for the same corpus. If a pass fails, the Provisioner removes the key. Then a subsequent `ground` request starts a new pass.
+_Avoid_: cache, registry
+_Code_: `Provisioner.seen`, `crates/hallouminate-daemon/src/provisioner.rs:28`
+
+**Donor** — A group of stored rows with the same file-level `content_hash` as an upserted file. The group can be in any root or corpus in the store. If the donor has the same number of chunks as the new file, the store copies the donor vectors in `ord` sequence. If the counts are different, the store makes new embeddings.
+_Avoid_: cache entry
+_Code_: `decode_donor_rows` and `pick_donor_vectors`, `crates/hallouminate-adapters/src/lance.rs:442-540`; `LanceStore::apply_batch`, same file lines 1295-1350; `donor_vectors_batch`, same file line 1443; hash at `crates/hallouminate-domain/src/indexer/chunk.rs:35`
+
 ## Excluded concepts
 
 LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), confidence-gated reranking (#287), rendered-footnote changes, public response-shape expansion, and any database-first source-of-truth model are outside this proposal.[^spec]
