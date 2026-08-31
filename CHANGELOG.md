@@ -9,6 +9,11 @@ for each release window.
 
 ## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.9.0...HEAD)
 
+### Added
+
+- Corpus: index text-layer PDFs page by page with `page:N` breadcrumbs and
+  graceful handling of empty or unreadable documents
+
 ## [0.9.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.9.0) - 2026-08-30
 
 ### Added

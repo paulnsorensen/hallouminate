@@ -1,14 +1,12 @@
 # Multi-format ingestion
 
-Hallouminate is **no longer markdown-only**. Phase 1 shipped in the 0.7.0
-window (CHANGELOG "Indexer: reStructuredText and prose format ingestion"):
-the indexer now routes four format families — markdown, plain text,
-reStructuredText, and spreadsheets — each to its own handler, exactly the
-per-format-dispatch design this page previously argued for. The single most
-important nuance: **the wiki corpus you author into is still markdown-only**;
-multi-format applies to the non-wiki corpora (`repo:NAME:corpus` and explicit
-`[[corpus]]` entries). This page records what shipped, why, and what is still
-deferred.
+Hallouminate is **no longer markdown-only**. The indexer routes five format
+families — markdown, plain text, reStructuredText, spreadsheets, and text-layer
+PDFs — each to its own handler, following the per-format-dispatch design this
+page previously argued for. The single most important nuance: **the wiki corpus
+you author into is still markdown-only**; multi-format applies to the non-wiki
+corpora (`repo:NAME:corpus` and explicit `[[corpus]]` entries). This page records
+what shipped, why, and what remains deferred.
 
 Full research evidence behind the crate/pattern choices lives in two on-disk
 artifacts:
@@ -22,8 +20,8 @@ The pipeline is the extension-keyed-loader-registry shape the RAG literature
 converges on. Three seams, all in
 `crates/hallouminate-domain/src/indexer/format.rs`:
 
-1. **`Format` enum** (`format.rs::Format`, lines 41-46): `Markdown`,
-   `PlainText`, `Rst`, `Spreadsheet` — the closed Phase 1 set.
+1. **`Format` enum** (`format.rs::Format`): `Markdown`, `PlainText`, `Rst`,
+   `Spreadsheet`, and `Pdf`.
 2. **`detect_format`** (`format.rs::detect_format`): **extension is decisive**.
    `format_from_extension` maps the extension; a *known-but-unsupported*
    extension returns `None` and is skipped **without a magic-byte sniff** —
@@ -49,6 +47,7 @@ still matter is extensionless files.
 | `txt`, `text`, `adoc`, `asciidoc`, `org` | `PlainText` | `TextHandler<S>` | `text_splitter::TextSplitter` budget windows; **empty `heading_path`**, no frontmatter, no claim marks |
 | `rst` | `Rst` | `RstHandler` | `RstChunker`: plain `TextSplitter` windows **plus a section-adornment side-pass** that recovers RST heading breadcrumbs; no frontmatter/claim marks |
 | `csv`, `xlsx`, `xls`, `ods` | `Spreadsheet` | `SpreadsheetHandler` | one chunk **per data row**; first row is the header; each row renders `col: val` lines so the chunk self-describes; breadcrumb `sheet:row-N`. CSV via the `csv` crate, workbooks via `calamine` |
+| `pdf` | `Pdf` | `PdfHandler<S>` | pure-Rust `pdf-extract` page extraction followed by per-page `TextSplitter` windows; breadcrumb `page:N`; empty pages warn and are omitted |
 
 `.md`/AsciiDoc/`.org` note: AsciiDoc and Org route to the *plain-text*
 handler — there is no AsciiDoc/Org structure parser, they just chunk as text.
@@ -87,7 +86,8 @@ there is **no `Code` variant** (`RepoCorpusKind::Code` finds nothing in the
 tree). The derived wiki corpus keeps `globs: ["**/*.md"]`
 (`crates/hallouminate-domain/src/repository.rs::repository_wiki_corpus`), so
 authored wikis stay markdown-only; the derived `repo:NAME:corpus` source corpus
-and user `[[corpus]]` entries are where text/RST/spreadsheet files get indexed.
+and user `[[corpus]]` entries are where text, RST, spreadsheet, and PDF files get
+indexed when their globs select those extensions.
 This resolves the old "corpus wiring" open question.
 
 ## Dependencies added
@@ -98,12 +98,15 @@ This resolves the old "corpus wiring" open question.
   routes to the text handler — acceptable, since extensionful files never reach
   the sniff.
 - `calamine` — workbook reader (`xlsx`/`xls`/`ods`); `csv` crate for CSV.
+- `pdf-extract` 0.10 — pure-Rust, page-separated text-layer PDF extraction. Its
+  page API supports `page:N` breadcrumbs without Pdfium; layout coordinates and
+  OCR remain unavailable.
 
-## Deferred / future-phase (still unshipped)
+## Deferred / future-phase
 
-Each has its own forward-looking page recording why it is deferred:
-
-- [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — text-layer PDF crate tradeoff (`pdf-extract` vs native `pdfium-render` for a `page:{n}` breadcrumb) and OCR / scanned-PDF as a separate out-of-scope engine.
+Each remaining format has its own forward-looking page recording why it is deferred.
+Text-layer PDF support has shipped; [pdf-ocr-ingestion](pdf-ocr-ingestion.md) now
+records the implemented handler and the still-deferred OCR/scanned-PDF subsystem.
 - [office-prose-extraction](office-prose-extraction.md) — the immature .docx/.pptx/.odt crate landscape (no mature + heading-aware option; crate choice deferred to a cook-time spike).
 - [code-aware-chunking](code-aware-chunking.md) — tree-sitter `CodeSplitter`, the build-time C-compiler tension, and the `{file}::{class}::{fn}` cAST breadcrumb gap. Still deferred: no code handler or `Code` corpus variant exists.
 

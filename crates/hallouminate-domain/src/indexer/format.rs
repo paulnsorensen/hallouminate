@@ -11,11 +11,17 @@
 //! Unsupported types and per-handler extraction failures
 //! are graceful per-file skips at the call site, never run-aborting errors.
 
+use std::cell::RefCell;
 use std::io::Cursor;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::rc::Rc;
 
 use calamine::{Data, Reader, open_workbook_auto_from_rs};
 use file_format::FileFormat;
+use pdf_extract::{
+    Document, MediaBox, OutputDev, OutputError, PlainTextOutput, Transform, output_doc,
+};
 use text_splitter::{ChunkConfig, ChunkSizer, TextSplitter};
 
 use super::chunk::{PreparedChunk, PreparedFile};
@@ -35,21 +41,21 @@ fn build_search_text(heading_path: &[String], summary: &str, text: &str) -> Stri
     format!("{breadcrumb}\n{summary}\n{body}")
 }
 
-/// The set of formats Phase 1 can ingest. Extended in later phases (PDF,
-/// office-prose, code-aware).
+/// The set of formats the indexer can ingest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Markdown,
     PlainText,
     Rst,
     Spreadsheet,
+    Pdf,
 }
 
 /// Resolve a file's [`Format`] from its extension first, falling back to a
 /// magic-byte sniff for extensionless names only (a known-but-unsupported
 /// extension returns `None`, never a sniff).
 ///
-/// Returns `None` for any type Phase 1 does not handle — the caller logs a
+/// Returns `None` for any type the registry does not handle — the caller logs a
 /// warning and skips the file.
 pub fn detect_format(path: &Path, bytes: &[u8]) -> Option<Format> {
     match format_from_extension(path) {
@@ -74,6 +80,7 @@ pub fn format_from_extension(path: &Path) -> Option<Option<Format>> {
         "txt" | "text" | "adoc" | "asciidoc" | "org" => Some(Format::PlainText),
         "rst" => Some(Format::Rst),
         "csv" | "xlsx" | "xls" | "ods" => Some(Format::Spreadsheet),
+        "pdf" => Some(Format::Pdf),
         // A known-but-unsupported extension is decisive: do NOT fall through
         // to a magic-byte sniff that might mislabel it (e.g. a `.docx` is a
         // ZIP and could be mistaken for a spreadsheet container).
@@ -82,19 +89,21 @@ pub fn format_from_extension(path: &Path) -> Option<Option<Format>> {
 }
 
 /// Magic-byte fallback for inputs with no usable extension. Maps `file-format`'s
-/// content sniff onto the Phase 1 set; everything else is unsupported.
+/// content sniff onto the supported set; everything else is unsupported.
 ///
 /// `file-format` 0.29 detects the binary spreadsheet containers (OOXML xlsx,
-/// OLE2 xls, ODF ods) by magic bytes but has **no CSV variant** — CSV is a plain
-/// text shape with no signature, so an extensionless CSV sniffs as `PlainText`
-/// and routes to the text handler. Markdown likewise has no variant and sniffs
-/// as `PlainText`. Both are acceptable: extensionful files never reach here.
+/// OLE2 xls, ODF ods) and PDF by magic bytes but has **no CSV variant** — CSV
+/// is a plain text shape with no signature, so an extensionless CSV sniffs as
+/// `PlainText` and routes to the text handler. Markdown likewise has no variant
+/// and sniffs as `PlainText`. Both are acceptable: extensionful files never
+/// reach here.
 fn detect_by_magic(bytes: &[u8]) -> Option<Format> {
     match FileFormat::from_bytes(bytes) {
         FileFormat::OfficeOpenXmlSpreadsheet
         | FileFormat::MicrosoftExcelSpreadsheet
         | FileFormat::OpendocumentSpreadsheet => Some(Format::Spreadsheet),
         FileFormat::PlainText => Some(Format::PlainText),
+        FileFormat::PortableDocumentFormat => Some(Format::Pdf),
         _ => None,
     }
 }
@@ -338,6 +347,230 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
     }
 }
 
+// ── PDF ───────────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct PdfPageState {
+    pages: Vec<String>,
+    writer: String,
+    has_page: bool,
+}
+
+struct PdfPageWriter(Rc<RefCell<PdfPageState>>);
+
+impl std::fmt::Write for PdfPageWriter {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        self.0.borrow_mut().writer.push_str(text);
+        Ok(())
+    }
+}
+
+impl pdf_extract::ConvertToFmt for PdfPageWriter {
+    type Writer = Self;
+
+    fn convert(self) -> Self::Writer {
+        self
+    }
+}
+
+struct PdfPageOutput {
+    state: Rc<RefCell<PdfPageState>>,
+    text: PlainTextOutput<PdfPageWriter>,
+}
+
+impl PdfPageOutput {
+    fn new() -> Self {
+        let state = Rc::new(RefCell::new(PdfPageState::default()));
+        let writer = PdfPageWriter(Rc::clone(&state));
+        Self {
+            state,
+            text: PlainTextOutput::new(writer),
+        }
+    }
+
+    fn finish(self) -> Vec<String> {
+        let mut state = self.state.borrow_mut();
+        if state.has_page {
+            let page = std::mem::take(&mut state.writer);
+            state.pages.push(page);
+        }
+        std::mem::take(&mut state.pages)
+    }
+}
+
+type PdfOutputResult = std::result::Result<(), OutputError>;
+impl OutputDev for PdfPageOutput {
+    fn begin_page(
+        &mut self,
+        page_num: u32,
+        media_box: &MediaBox,
+        art_box: Option<(f64, f64, f64, f64)>,
+    ) -> PdfOutputResult {
+        let mut state = self.state.borrow_mut();
+        if state.has_page {
+            let page = std::mem::take(&mut state.writer);
+            state.pages.push(page);
+        }
+        state.has_page = true;
+        drop(state);
+        self.text = PlainTextOutput::new(PdfPageWriter(Rc::clone(&self.state)));
+        self.text.begin_page(page_num, media_box, art_box)
+    }
+
+    fn end_page(&mut self) -> PdfOutputResult {
+        self.text.end_page()
+    }
+
+    fn output_character(
+        &mut self,
+        trm: &Transform,
+        width: f64,
+        spacing: f64,
+        font_size: f64,
+        character: &str,
+    ) -> PdfOutputResult {
+        self.text
+            .output_character(trm, width, spacing, font_size, character)
+    }
+
+    fn begin_word(&mut self) -> PdfOutputResult {
+        self.text.begin_word()
+    }
+
+    fn end_word(&mut self) -> PdfOutputResult {
+        self.text.end_word()
+    }
+
+    fn end_line(&mut self) -> PdfOutputResult {
+        self.text.end_line()
+    }
+}
+
+fn extract_pdf_pages(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+    let extraction = catch_unwind(AssertUnwindSafe(|| {
+        let doc = Document::load_mem(bytes).map_err(|error| extract_err(path, &error))?;
+        if doc.is_encrypted() {
+            return Err(extract_err(
+                path,
+                &"encrypted PDF documents are not supported",
+            ));
+        }
+
+        let mut output = PdfPageOutput::new();
+        output_doc(&doc, &mut output).map_err(|error| extract_err(path, &error))?;
+        Ok(output.finish())
+    }));
+    match extraction {
+        Ok(result) => result,
+        Err(payload) => Err(extract_pdf_panic_err(path, payload)),
+    }
+}
+
+fn extract_pdf_panic_err(path: &Path, payload: Box<dyn std::any::Any + Send>) -> HallouminateError {
+    let message = if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
+    };
+    HallouminateError::Indexer(format!(
+        "extract {}: PDF extraction panicked: {message}",
+        path.display()
+    ))
+}
+
+/// Text-layer PDF handler: split each extracted page independently with the
+/// configured text splitter and retain page-local line ranges. Empty pages are
+/// skipped, while a wholly empty document is an extraction failure.
+pub struct PdfHandler<S: ChunkSizer> {
+    splitter: TextSplitter<S>,
+}
+
+impl<S: ChunkSizer> PdfHandler<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
+        Self {
+            splitter: TextSplitter::new(config),
+        }
+    }
+}
+
+impl<S: ChunkSizer + Send + Sync> FormatHandler for PdfHandler<S> {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let pages = extract_pdf_pages(path, ctx.bytes)?;
+        let mut empty_pages = Vec::new();
+        for (page_idx, page) in pages.iter().enumerate() {
+            if page.trim().is_empty() {
+                empty_pages.push(page_idx + 1);
+            }
+        }
+        if pages.is_empty() || empty_pages.len() == pages.len() {
+            return Err(extract_err(
+                path,
+                &"PDF has no extractable text (all pages empty)",
+            ));
+        }
+        if !empty_pages.is_empty() {
+            tracing::warn!(
+                target: "hallouminate::indexer",
+                file = %path.display(),
+                empty_pages = ?empty_pages,
+                "PDF contains empty pages; indexing text-bearing pages only"
+            );
+        }
+
+        let fallback = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let extracted = pages.join("\n");
+        let summary = extract_summary(&extracted, &fallback);
+        let keywords = extract_keywords(&extracted);
+        let mut chunks = Vec::new();
+        for (page_idx, page) in pages.iter().enumerate() {
+            if page.trim().is_empty() {
+                continue;
+            }
+            let line_starts = build_line_starts(page);
+            for (byte_off, slice) in self.splitter.chunk_indices(page) {
+                if slice.is_empty() {
+                    continue;
+                }
+                let line_start = byte_to_line(byte_off, &line_starts);
+                let end_byte = byte_off + slice.len();
+                let line_end = if end_byte == 0 {
+                    line_start
+                } else {
+                    byte_to_line(end_byte - 1, &line_starts)
+                };
+                let heading_path = vec![format!("page:{}", page_idx + 1)];
+                chunks.push(PreparedChunk {
+                    ord: chunks.len(),
+                    search_text: build_search_text(&heading_path, &summary, slice),
+                    heading_path,
+                    line_start,
+                    line_end,
+                    text: slice.to_string(),
+                    claim_marks: None,
+                });
+            }
+        }
+        Ok(PreparedFile {
+            file_ref: file_ref_string(ctx.file)?,
+            corpus_key: ctx.corpus_key.clone(),
+            mtime_ms: ctx.mtime.0,
+            content_hash: ctx.content_hash.clone(),
+            summary,
+            keywords,
+            frontmatter: None,
+            indexed_at_ms: ctx.indexed_at_ms,
+            chunks,
+        })
+    }
+}
+
 // ── Spreadsheet ───────────────────────────────────────────────────────────
 
 /// Spreadsheet handler: one self-describing chunk per data row. The first row
@@ -517,13 +750,13 @@ pub struct HandlerRegistry {
     text: Box<dyn FormatHandler>,
     rst: Box<dyn FormatHandler>,
     spreadsheet: Box<dyn FormatHandler>,
+    pdf: Box<dyn FormatHandler>,
 }
 
 impl HandlerRegistry {
     /// Build a registry over a single shared sizer (cloned into each text
-    /// splitter). `S: Clone` so the markdown and plain-text splitters can each
-    /// own a copy; production passes a `tokenizers::Tokenizer`, tests pass
-    /// `Characters`.
+    /// splitter). `S: Clone` so each format splitter can own a copy; production
+    /// passes a `tokenizers::Tokenizer`, tests pass `Characters`.
     pub fn new<S>(sizer: S, budget_tokens: usize) -> Self
     where
         S: ChunkSizer + Clone + Send + Sync + 'static,
@@ -533,21 +766,24 @@ impl HandlerRegistry {
         );
         let rst_chunker: Box<dyn CorpusChunker> =
             Box::new(crate::corpus::RstChunker::new(sizer.clone(), budget_tokens));
+        let pdf_handler = Box::new(PdfHandler::new(sizer.clone(), budget_tokens));
         Self {
             markdown: Box::new(MarkdownHandler::new(markdown_chunker)),
             text: Box::new(TextHandler::new(sizer, budget_tokens)),
             rst: Box::new(RstHandler::new(rst_chunker)),
             spreadsheet: Box::new(SpreadsheetHandler),
+            pdf: pdf_handler,
         }
     }
 
-    /// The handler for a detected format. Total over the Phase 1 set.
+    /// The handler for a detected format. Total over the supported set.
     pub fn handler(&self, format: Format) -> &dyn FormatHandler {
         match format {
             Format::Markdown => self.markdown.as_ref(),
             Format::PlainText => self.text.as_ref(),
             Format::Rst => self.rst.as_ref(),
             Format::Spreadsheet => self.spreadsheet.as_ref(),
+            Format::Pdf => self.pdf.as_ref(),
         }
     }
 }

@@ -1,95 +1,44 @@
 # PDF and OCR ingestion
 
-> **Status: DEFERRED / future-phase.** None of this ships in Phase 1
-> (plain text + spreadsheets). This page records the durable shape of the
-> PDF problem so a later phase starts from the decided constraints, not a
-> blank slate. The crate-level evidence behind every claim lives in
-> `.cheese/research/multi-format-ingest/multi-format-ingest.md` and
-> `.cheese/research/multi-format-rag-ingestion/multi-format-rag-ingestion.md`,
-> each with a claim-level source table.
+> **Status: text-layer PDF support shipped; OCR remains deferred.** PDF files selected by corpus globs are extracted page by page through the existing format-handler seam. The managed repository wiki remains Markdown-only.
 
-PDF support splits into two genuinely different problems: **text-layer
-PDFs** (a crate-choice decision) and **scanned PDFs** (an OCR-engine
-decision). They are deferred for different reasons; conflating them is
-the trap.
+PDF support is two different capabilities: **text-layer extraction**, now implemented, and **scanned-document OCR**, still out of scope. An image-only page has no text for a PDF parser to recover.
 
-## The two crate options, and the tradeoff between them
+## Implemented text-layer path
 
-Adding PDF is a new dependency either way — neither crate is reachable by
-extending `text-splitter` the way plain-text and code chunking are.
+`Format::Pdf` is selected by a case-insensitive `.pdf` extension or `file-format`'s `PortableDocumentFormat` magic-byte result (`crates/hallouminate-domain/src/indexer/format.rs::format_from_extension`; `format.rs::detect_by_magic`). `HandlerRegistry` owns a `PdfHandler` alongside Markdown, text, RST, and spreadsheet handlers (`crates/hallouminate-domain/src/indexer/format.rs::HandlerRegistry`).
 
-| Crate | Native dep | Page metadata | When to reach for it |
-|---|---|---|---|
-| `pdf-extract` (0.10.0) | none — pure Rust (builds on `lopdf`) | **none natively** | the default starting point |
-| `pdfium-render` (0.9.2) | **~20 MB `libpdfium`** (Chromium's Pdfium C++ lib) at runtime | page-level metadata + layout fidelity | only if `pdf-extract`'s fidelity / metadata proves inadequate |
+`PdfHandler` uses pure-Rust `pdf-extract` 0.10 (`crates/hallouminate-domain/Cargo.toml:47-57`). This corrects the earlier research claim that `pdf-extract` could not preserve page boundaries: v0.10 exposes public document/output APIs that permit page-separated in-memory extraction, so `page:N` breadcrumbs do **not** require Pdfium. Hallouminate drives those APIs through its own small page-aware output adapter to preserve strict error handling (`crates/hallouminate-domain/src/indexer/format.rs::PdfPageOutput`; `format.rs::extract_pdf_pages`). Pdfium remains relevant only if layout coordinates or higher-fidelity visual reading order become requirements.
 
-`pdf-extract` is one call (`extract_text_from_mem(&bytes)`), highest
-download signal, no toolchain cost — but it extracts in content-stream
-order (may misorder multi-column layouts) and exposes **no page-level
-metadata**. `pdfium-render` fixes both but binds a native runtime library,
-which fights the prebuilt-binary install path (`/install`) that today needs
-no toolchain on supported targets. `lopdf` is structural manipulation, not
-a text extractor — its `extract_text` is order-unaware and secondary. Not
-the right tool.
+Each page is split independently with the registry's existing `TextSplitter`. Chunks use `page:N` as `heading_path`, page-local extracted-text line ranges, and the normal summary, keyword, search-text, raw-byte hash, and indexing metadata pipeline (`crates/hallouminate-domain/src/indexer/format.rs::PdfHandler::prepare`). No LanceDB schema migration is involved.
 
-The forced choice: **a `page:N` breadcrumb requires the heavier crate.**
-The markdown `heading_path` (`chunker.rs:124`) generalizes to a `page:{n}`
-breadcrumb for PDF — but `pdf-extract` cannot supply the page number, so a
-navigable PDF breadcrumb means taking on the native `pdfium` dep. That is
-the core deferred tradeoff: native-dep-vs-coarse-metadata.
+## Failure and partial-document policy
 
-## Where PDF bytes enter: the UTF-8 gate must be bypassed
+Empty pages are omitted. If other pages contain text, the PDF is indexed and one warning records the 1-based empty page numbers. If every page is empty, the handler returns an extraction error so the file is counted as unreadable rather than as a valid empty document (`crates/hallouminate-domain/src/indexer/format.rs::PdfHandler::prepare`).
 
-`prepare_file` (`writer.rs:16`) reads the file (`writer.rs:22`), hashes the
-raw bytes (`writer.rs:25`), then hard-rejects non-UTF-8 with
-`String::from_utf8(bytes)` at `writer.rs:26` (`non-utf8 file` error,
-guarded by `prepare_file_errors_on_non_utf8_file` at `writer.rs:168`). PDF
-is binary — its bytes never survive that line.
+Corrupt and encrypted PDFs also return contextual extraction errors. The indexer's existing per-file isolation skips them without aborting valid sibling files. The dispatcher continues hashing raw on-disk bytes before handler extraction, so PDF changes retain normal reindex behavior (`crates/hallouminate-domain/src/indexer/writer.rs:27-88`).
 
-The fix is **not** to loosen the gate. Text extraction must run *before*
-the gate, slotting between the byte read (`writer.rs:22`) and the UTF-8
-conversion (`writer.rs:26`): a PDF is detected, decoded to text by the PDF
-crate, and only the extracted text flows into the existing markdown-style
-chunking path. The gate stays intact for everything that is genuinely
-expected to be UTF-8. Note the hash at `writer.rs:25` is over the raw
-bytes and must stay that way — re-index triggering depends on hashing the
-on-disk file, not the extracted text.
+Hallouminate does not use `pdf-extract`'s convenience page iterator because that API treats a later-page decode error as normal end-of-document. Instead it loads the document once and drives `output_doc` through a private page-aware `OutputDev`, discarding all collected pages if extraction returns an error. The third-party decoder contains panic paths for malformed page objects, so this boundary also catches unwind panics and converts them into the ordinary per-file extraction error (`crates/hallouminate-domain/src/indexer/format.rs::extract_pdf_pages`). A malformed later page therefore cannot leave a partially indexed PDF or abort sibling indexing.
 
-## Scanned PDFs / OCR — a separate engine, explicitly out of scope
+## Known limits
 
-A scanned PDF has **no text layer**. Every text extractor — `pdf-extract`
-or `pdfium-render` alike — returns empty or garbage on it. There is no
-crate-choice that fixes this; it needs an entirely separate capability: an
-OCR engine.
+- Text follows PDF content-stream order; complex multi-column layouts may be misordered.
+- Page breadcrumbs are available, but layout coordinates and bounding boxes are not.
+- Ground's `line_range` values are page-local extracted-text lines, not literal lines in the binary file.
+- Binary PDFs do not contribute ripgrep matches; their indexed text still participates in FTS, vector, and term-containment ranking.
+- Password configuration is not supported.
 
-The documented pipeline pattern is a two-stage fallback: detect
-near-empty extraction for a page, then route that page to OCR (the
-standard stack is rasterize-then-Tesseract). This is a whole subsystem —
-a new heavy dependency, image rasterization, and per-page routing logic —
-not a knob on the PDF crate.
+## Scanned PDFs and OCR
 
-**Decision recorded: OCR is out of scope as its own future sub-problem.**
-This is a per-repo wiki/RAG indexer; repos rarely contain scanned PDFs, so
-a clear "text-layer PDF only" limitation is the likely acceptable stance.
-The gap is named here deliberately and left un-researched at the crate
-level — when OCR becomes real work, it earns its own page and its own
-spike, rather than being bolted onto the text-layer PDF effort.
+OCR remains a separate future subsystem. The likely shape is page rasterization followed by an OCR engine for pages with no extractable text, with explicit language packs, packaging, caching, confidence policy, and failure telemetry. It should not be folded into the text-layer handler without a separate design and dependency decision.
 
-## Why this is deferred
+## Configuration
 
-1. **New dependency.** PDF is not an extension of the existing
-   `text-splitter` dep; it adds a crate no matter which option wins.
-2. **Native-dep-vs-metadata tradeoff is unresolved.** Page breadcrumbs
-   require `pdfium`'s ~20 MB native lib, which conflicts with the
-   no-toolchain install path. That call needs a deliberate decision, not a
-   default.
-3. **OCR is a separate engine concern.** Scanned PDFs are a different
-   problem with a different (much heavier) solution; folding it into the
-   text-layer work would mis-scope both.
+PDF ingestion is opt-in through ordinary corpus globs, for example `globs = ["**/*.md", "**/*.pdf"]` or repository `corpus_globs`. The derived `repo:<name>:wiki` corpus stays fixed to `**/*.md`; a repository source corpus preserves its configured globs (`crates/hallouminate-domain/src/repository.rs:87-124`).
 
 ## Related
 
-- [multi-format-ingestion](multi-format-ingestion.md) — the parent picture: why multi-format is per-format dispatch, not a glob change, and where the `CorpusChunker` seam sits.
-- [office-prose-extraction](office-prose-extraction.md) — sibling deferred format: the immature .docx/.pptx/.odt crate landscape.
-- [code-aware-chunking](code-aware-chunking.md) — sibling deferred format: tree-sitter `CodeSplitter` and the `{file}::{class}::{fn}` breadcrumb.
-- [architecture](architecture.md) — where `indexer/writer.rs` and the chunking path sit in the sliced-bread layout.
+- [multi-format-ingestion](multi-format-ingestion.md) — per-format dispatch and the shared handler seam.
+- [office-prose-extraction](office-prose-extraction.md) — deferred office-prose formats.
+- [code-aware-chunking](code-aware-chunking.md) — deferred tree-sitter-aware code chunking.
+- [architecture](architecture.md) — indexer placement in the sliced-bread layout.
