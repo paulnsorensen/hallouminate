@@ -134,21 +134,21 @@ _Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-7
 
 
 
-## Approved worktree-index-provisioning terms
+## Worktree-index-provisioning terms
 
-<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427 parts 1+3; 2026-08-30). They are approved, **not shipped**. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
+<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). The code is **implemented in PR #430**. PR #430 is open. A person did not merge it yet. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
 
-**Provisioner** — Daemon-lifetime seen-set plus queue plus supervised task that runs catch-up passes for newly observed corpus roots, immediately and off the request path.
+**Provisioner** — A supervised task in the daemon. The task has a seen-set and a queue. The task continues while the daemon operates. When the daemon finds a new corpus root, the task starts a catch-up pass immediately. The task does the pass away from the request path.
 _Avoid_: index scheduler, background indexer
-_Code_: NEW ENTITY (pattern-sibling of `maintenance_task`, `crates/hallouminate-daemon/src/state.rs:636-648`)
+_Code_: `Provisioner`, `crates/hallouminate-daemon/src/provisioner.rs:26-31`; `provisioning_loop`, same file line 89; `DaemonState.provisioner`, `crates/hallouminate-daemon/src/state.rs:250`; `handle_ground` calls `observe` at `dispatch.rs:391`
 
-**Seen-set** — Per-daemon-lifetime `HashSet<CorpusKey>` deduplicating provisioning triggers; a failed pass clears its key so a later `ground` re-triggers.
+**Seen-set** — A `HashSet<CorpusKey>` in the Provisioner. The set continues while the daemon operates. The set prevents a second provisioning trigger for the same corpus. If a pass fails, the Provisioner removes the key. Then a subsequent `ground` request starts a new pass.
 _Avoid_: cache, registry
-_Code_: NEW ENTITY (field of Provisioner)
+_Code_: `Provisioner.seen`, `crates/hallouminate-daemon/src/provisioner.rs:28`
 
-**Donor** — An existing row group (any root/corpus in the store) whose file-level `content_hash` matches an upserted file; its vectors are copied ord-aligned instead of re-embedding, guarded by donor-chunk-count equality.
+**Donor** — A group of stored rows with the same file-level `content_hash` as an upserted file. The group can be in any root or corpus in the store. If the donor has the same number of chunks as the new file, the store copies the donor vectors in `ord` sequence. If the counts are different, the store makes new embeddings.
 _Avoid_: cache entry
-_Code_: NEW ENTITY (internal to `LanceStore::apply_batch`; hash at `crates/hallouminate-domain/src/indexer/chunk.rs:35`)
+_Code_: `decode_donor_rows` and `pick_donor_vectors`, `crates/hallouminate-adapters/src/lance.rs:442-540`; `LanceStore::apply_batch`, same file lines 1295-1350; `donor_vectors_batch`, same file line 1443; hash at `crates/hallouminate-domain/src/indexer/chunk.rs:35`
 
 ## Excluded concepts
 
