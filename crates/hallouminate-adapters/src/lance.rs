@@ -1303,10 +1303,6 @@ impl LanceStore {
         let mut donor_vectors: Vec<Option<Vec<[f32; EMBEDDING_DIM]>>> =
             Vec::with_capacity(batch.len());
         for file in &batch {
-            if !self.embeddings_enabled {
-                donor_vectors.push(None);
-                continue;
-            }
             let donor = match donor_groups.get(&file.content_hash) {
                 Some(groups) => pick_donor_vectors(groups, file.chunks.len()),
                 None => None,

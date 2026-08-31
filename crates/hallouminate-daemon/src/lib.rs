@@ -31,6 +31,7 @@ mod ladder;
 mod lifecycle;
 mod maintenance;
 mod pressure;
+mod provisioner;
 mod report;
 mod server;
 mod socket;
