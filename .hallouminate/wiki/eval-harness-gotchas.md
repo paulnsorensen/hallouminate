@@ -110,3 +110,34 @@ still forks first, and that fork is enough to trip a sibling. Take the guard
 before the write, not just before the exec.
 
 _Source: PR #314 and the eval re-baseline investigation · Updated: 2026-07-29 · Supersedes: —_
+
+## The baseline is hardware-sensitive and must be measured on CI
+
+The gate compares MRR and per-query top-chunk passes with zero tolerance
+(`compare_against_baseline`). Scores sit on FP/SIMD-order-sensitive knife
+edges: identical code and embeddings gave MRR 0.75217 on a dev machine and
+0.75584 on the ubuntu-24.04 runner (2026-09, PR #439). A locally measured
+`eval/baseline.json` therefore does not hold on CI. Use the eval workflow's
+`workflow_dispatch` input `mode=measure`, which runs `just eval-measure` and
+uploads the artifact; extract the `fusion-without-rerank` arm and commit it
+as the baseline (single requested arm, no comparison, empty
+timeouts/failures/errors — see `validate_baseline_artifact`).
+
+The upload step runs with `if: always()` on purpose: the Jina diagnostic arm
+periodically hits its 5s rerank timeout on the small runner (historically on
+query `footnote-inversion`), and the partial artifact's completed baseline
+arm is still sufficient for a baseline update.
+
+## lance major bumps reorder near-tie ranks; expect a re-baseline
+
+The Aug 2026 weekly failures (MRR 0.76682 → 0.75584) came from the
+lance 8 → 9 → 10 bumps (lancedb 0.31 → 0.33 → 0.37, #312/#371), not from a
+retrieval quality loss: Recall@5 was unchanged and every rank shift was ±1
+among close neighbours. lance PR #6950 (v9.0.0) rewrote the flat/unindexed
+KNN top-k heap and changed tie-break admission — exactly the path small
+corpora (<256 rows, no ANN index) use. lancedb query defaults were
+byte-identical across 0.33–0.37, so no query knob restores an old ordering.
+When a lance major bump trips the gate with this signature (recall stable,
+±1 rank shuffles), re-baseline rather than pin. Research artifact:
+`.cheese/research/lancedb-lance9-ranking-regression/`.
+
