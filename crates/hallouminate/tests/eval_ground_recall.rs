@@ -1181,6 +1181,14 @@ async fn measure_baseline(
     Ok(artifact)
 }
 
+/// Identical code and embeddings produce MRR 0.7521689497716896 locally and
+/// 0.7558382257012394 on CI (ubuntu-24.04): a 0.0037 FP/SIMD-order spread.
+/// One near-tie rank 1→2 flip on one query costs (1 − 1/2)/73 ≈ 0.0068.
+/// 0.01 absorbs both without masking a real regression: the separate
+/// per-query top_chunk ratchet still fails the gate when a protected query
+/// loses rank 1, so top-of-ranking regressions stay caught.
+const MRR_TOLERANCE: f64 = 0.01;
+
 fn compare_against_baseline(committed: &EvalArtifact, current: &EvalArtifact) -> Result<()> {
     validate_baseline_artifact(committed).context("committed baseline is invalid")?;
     validate_baseline_artifact(current).context("current baseline measurement is invalid")?;
@@ -1197,7 +1205,7 @@ fn compare_against_baseline(committed: &EvalArtifact, current: &EvalArtifact) ->
         current.quality.recall_at_5
     );
     ensure!(
-        current.quality.mrr + f64::EPSILON >= committed.quality.mrr,
+        current.quality.mrr + MRR_TOLERANCE >= committed.quality.mrr,
         "MRR regressed from {} to {}",
         committed.quality.mrr,
         current.quality.mrr
@@ -1606,6 +1614,23 @@ fn compare_against_baseline_ignores_ripgrep_version_mismatch() {
     current.ripgrep_version = "ripgrep 14.1.1 (rev def)".into();
     compare_against_baseline(&committed, &current)
         .expect("ripgrep_version mismatch must not affect comparison");
+}
+
+#[test]
+fn compare_against_baseline_allows_mrr_within_tolerance_but_not_beyond() {
+    let committed = synthetic_baseline_artifact();
+    let committed_mrr = committed.measurements[0].quality.mrr;
+
+    let mut within_tolerance = synthetic_baseline_artifact();
+    within_tolerance.measurements[0].quality.mrr = committed_mrr - 0.009;
+    compare_against_baseline(&committed, &within_tolerance)
+        .expect("an MRR drop within tolerance must pass");
+
+    let mut beyond_tolerance = synthetic_baseline_artifact();
+    beyond_tolerance.measurements[0].quality.mrr = committed_mrr - 0.011;
+    let error = compare_against_baseline(&committed, &beyond_tolerance)
+        .expect_err("an MRR drop beyond tolerance must fail");
+    assert!(error.to_string().contains("MRR regressed"), "{error}");
 }
 
 #[test]
