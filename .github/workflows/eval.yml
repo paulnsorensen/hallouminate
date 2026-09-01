@@ -16,7 +16,7 @@ on:
         default: enforce
 
 concurrency:
-  group: eval-${{ github.ref }}
+  group: eval-${{ github.ref }}-${{ inputs.mode || 'enforce' }}
   cancel-in-progress: true
 
 permissions:
@@ -72,18 +72,18 @@ jobs:
             eval-models-${{ runner.os }}-
 
       - name: Enforce ground retrieval baseline
-        if: inputs.mode != 'measure'
+        if: github.event_name != 'workflow_dispatch' || inputs.mode != 'measure'
         run: just eval
 
       - name: Measure ground retrieval artifact
-        if: inputs.mode == 'measure'
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'measure'
         run: just eval-measure
 
       - name: Upload measurement artifact
-        # always(): a diagnostic-arm failure (e.g. a Jina rerank timeout on
-        # the small runner) still persists a partial artifact whose completed
-        # baseline arm is sufficient for a baseline update.
-        if: always() && inputs.mode == 'measure'
+        # !cancelled(): always() also fired on cancellation, which is routine
+        # under cancel-in-progress; !cancelled() keeps the partial-artifact
+        # upload after a diagnostic-arm failure without that.
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.mode == 'measure' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: eval-measurement
