@@ -97,7 +97,7 @@
             "file": "architecture.md",
             "heading_path": [
               "Architecture",
-              "crates/hallouminate-adapters/ \u2014 driven external systems"
+              "crates/hallouminate-adapters/ — driven external systems"
             ],
             "line_start": 62
           },
@@ -208,7 +208,7 @@
           "expected_top": {
             "file": "ort-arena-retention.md",
             "heading_path": [
-              "ORT BFCArena retention \u2014 why session eviction never reclaimed memory",
+              "ORT BFCArena retention — why session eviction never reclaimed memory",
               "The mechanism"
             ],
             "line_start": 18
@@ -275,7 +275,7 @@
             "file": "pdf-ocr-ingestion.md",
             "heading_path": [
               "PDF and OCR ingestion",
-              "Scanned PDFs / OCR \u2014 a separate engine, explicitly out of scope"
+              "Scanned PDFs / OCR — a separate engine, explicitly out of scope"
             ],
             "line_start": 58
           },
@@ -459,7 +459,7 @@
             "file": "code-aware-chunking.md",
             "heading_path": [
               "Code-aware ingestion (tree-sitter)",
-              "The code breadcrumb \u2014 the cAST open gap"
+              "The code breadcrumb — the cAST open gap"
             ],
             "line_start": 75
           },
@@ -640,7 +640,7 @@
             "file": "architecture.md",
             "heading_path": [
               "Architecture",
-              "crates/hallouminate-config/ \u2014 configuration layer"
+              "crates/hallouminate-config/ — configuration layer"
             ],
             "line_start": 31
           },
@@ -1316,7 +1316,7 @@
             "file": "code-aware-chunking.md",
             "heading_path": [
               "Code-aware ingestion (tree-sitter)",
-              "The chunker already exists \u2014 it's behind a feature flag"
+              "The chunker already exists — it's behind a feature flag"
             ],
             "line_start": 34
           },
