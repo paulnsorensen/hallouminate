@@ -7,12 +7,22 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.9.0...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.10.0...HEAD)
+
+## [0.10.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.10.0) - 2026-09-01
 
 ### Added
 
 - Corpus: index text-layer PDFs page by page with `page:N` breadcrumbs and
   graceful handling of empty or unreadable documents
+
+### Fixed
+
+- Eval: re-baseline ground retrieval to the lance-9/10 ranking
+
+### Changed
+
+- Dependencies: rmcp 3.2.0, pdf-extract 0.12, Astro 7.2.10
 
 ## [0.9.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.9.0) - 2026-08-30
 
