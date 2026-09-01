@@ -440,7 +440,7 @@ async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
 // ── Detection / routing unit checks ────────────────────────────────────────
 
 #[test]
-fn detect_format_keys_on_extension_for_every_phase1_type() {
+fn detect_format_keys_on_extension_for_every_supported_type() {
     let cases: &[(&str, Format)] = &[
         ("a.md", Format::Markdown),
         ("a.markdown", Format::Markdown),
@@ -454,8 +454,10 @@ fn detect_format_keys_on_extension_for_every_phase1_type() {
         ("a.xlsx", Format::Spreadsheet),
         ("a.xls", Format::Spreadsheet),
         ("a.ods", Format::Spreadsheet),
+        ("a.pdf", Format::Pdf),
         ("A.MD", Format::Markdown), // case-insensitive extension
         ("A.CSV", Format::Spreadsheet),
+        ("A.PDF", Format::Pdf),
     ];
     for (name, want) in cases {
         let got = detect_format(Path::new(name), b"irrelevant content");
@@ -895,7 +897,7 @@ fn pdf_fixture(pages: &[Option<&str>]) -> Vec<u8> {
     pdf
 }
 
-fn remove_second_media_box(pdf: &mut [u8]) {
+fn corrupt_second_media_box(pdf: &mut [u8]) {
     const MEDIA_BOX: &[u8] = b"/MediaBox";
     let first = pdf
         .windows(MEDIA_BOX.len())
@@ -962,18 +964,9 @@ fn detect_format_extensionless_pdf_bytes_sniff_as_pdf() {
     let detected = detect_format(Path::new("document_without_extension"), &bytes);
 
     assert_eq!(
-        detected.map(|format| format!("{format:?}")),
-        Some("Pdf".to_string()),
-        "PDF magic bytes must route extensionless input to the PDF handler"
-    );
-}
-
-#[test]
-fn detect_format_uppercase_pdf_extension_routes_to_pdf() {
-    assert_eq!(
-        detect_format(Path::new("document.PDF"), b"not a PDF"),
+        detected,
         Some(Format::Pdf),
-        "PDF extension routing must be case-insensitive and extension-primary"
+        "PDF magic bytes must route extensionless input to the PDF handler"
     );
 }
 
@@ -1048,7 +1041,7 @@ async fn malformed_later_pdf_page_skips_entire_file_without_blocking_valid_sibli
         Some("The first page contains laterpagefailuremarker."),
         Some("The second page is missing required metadata."),
     ]);
-    remove_second_media_box(&mut malformed);
+    corrupt_second_media_box(&mut malformed);
     fs::write(corpus_dir.path().join("later-page-broken.pdf"), malformed).unwrap();
     fs::write(
         corpus_dir.path().join("notes.txt"),
@@ -1136,8 +1129,8 @@ async fn corrupt_and_empty_pdfs_skip_without_blocking_valid_siblings() {
         let bytes = fs::read(corpus_dir.path().join(name)).unwrap();
         let detected = detect_format(Path::new(name), &bytes);
         assert_eq!(
-            detected.map(|format| format!("{format:?}")),
-            Some("Pdf".to_string()),
+            detected,
+            Some(Format::Pdf),
             "{name} must route through the PDF handler before it is rejected"
         );
     }
