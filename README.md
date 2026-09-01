@@ -177,6 +177,18 @@ The config lives at `$XDG_CONFIG_HOME/hallouminate/config.toml`
 - `hallouminate config download` — pre-fetch the configured embedding model
   so the first `index` doesn't pay the download cost.
 
+Corpus globs select which supported documents are indexed. The indexer handles
+Markdown, plain text, reStructuredText, CSV, xlsx/xls/ods spreadsheets, and
+text-layer PDFs. PDF chunks carry `page:N` breadcrumbs; image-only pages require
+OCR and are skipped with a warning. For example:
+
+```toml
+[[corpus]]
+name = "project-docs"
+paths = ["~/Dev/project/docs"]
+globs = ["**/*.md", "**/*.pdf"]
+```
+
 ## Cross-repo union search
 
 `ground` (and the read/list tools) resolve corpora relative to the caller's

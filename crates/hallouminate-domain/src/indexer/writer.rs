@@ -1,10 +1,13 @@
 use std::fs;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use super::chunk::PreparedFile;
 use crate::common::{CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::blake3_bytes;
 
-use super::format::{HandlerRegistry, PrepareCtx, detect_format, format_from_extension};
+use super::format::{
+    HandlerRegistry, PrepareCtx, detect_format, extract_err, format_from_extension,
+};
 
 pub(super) struct WriteRequest<'a> {
     pub corpus_key: CorpusKey,
@@ -71,7 +74,17 @@ pub(super) fn prepare_file(
         content_hash,
         indexed_at_ms,
     };
-    match registry.handler(format).prepare(&ctx) {
+    // Isolated here rather than per-handler so every `FormatHandler` gets
+    // panic isolation for free — a handler bug on one file must not abort
+    // the reindex of the rest of the corpus.
+    let prepared = catch_unwind(AssertUnwindSafe(|| registry.handler(format).prepare(&ctx)))
+        .unwrap_or_else(|payload| {
+            Err(extract_err(
+                path,
+                &format!("extraction panicked: {}", panic_message(&*payload)),
+            ))
+        });
+    match prepared {
         Ok(pf) => Ok(Some(pf)),
         Err(e) => {
             // Extraction failure (corrupt workbook, non-UTF8 text, …) is a
@@ -84,6 +97,16 @@ pub(super) fn prepare_file(
             );
             Ok(None)
         }
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_owned()
     }
 }
 
