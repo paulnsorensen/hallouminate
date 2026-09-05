@@ -9,7 +9,7 @@ description = "Adapters layer for hallouminate."
 
 [dependencies]
 hallouminate-domain.workspace = true
-lancedb = "0.37"
+lancedb = "0.38"
 async-trait.workspace = true
 futures = "0.3"
 fastembed = "6"
