@@ -21,6 +21,10 @@ corpus does not support a claim, say so — do not fall back to training data.
 The root NEVER answers from memory of the codebase. It answers from what the
 haiku digests bring back.
 
+Every hallouminate MCP tool call takes a required `cwd`: the absolute path of
+your own active checkout. Pass the same `cwd` to every call, including each
+fanned-out sub-agent's calls.
+
 ## Flow
 
 ### 1. Plan (root / opus)
@@ -29,8 +33,9 @@ haiku digests bring back.
 - Decompose into **2–5 orthogonal sub-questions**. One retrieval angle each —
   splitting "how does auth work and where are tokens stored" into two beats one
   blurry search. Single, narrow questions skip decomposition.
-- Pick the corpus. If unspecified and >1 corpus exists, call `list_corpora` and
-  ask which, or default to the repo's `repo:{name}:wiki`.
+- Pick the corpus. If unspecified and >1 corpus exists, call
+  `list_corpora { cwd }` and ask which, or default to the repo's
+  `repo:{name}:wiki`.
 - Optionally `list_tree` once to see the wiki's shape — use it to phrase searches
   toward the right area (progressive disclosure: navigate the tree before
   reading leaves).
@@ -40,7 +45,7 @@ haiku digests bring back.
 Spawn one haiku sub-agent per sub-question, **in a single message** so they run
 concurrently. Give each the exact `ground` call to make and this contract:
 
-> Run `ground { query: "<sub-question>", corpus: "<corpus>", top_files: 5, chunks_per_file: 3 }`.
+> Run `ground { query: "<sub-question>", corpus: "<corpus>", top_files: 5, chunks_per_file: 3, cwd }`.
 > For each chunk that actually bears on the question, return a row:
 > `{ claim, path, line_range, heading_path, score, snippet (≤200 chars) }`, where
 > `path` is the **corpus-relative** path. (`ground` keys its `docs` by *absolute*
@@ -49,7 +54,7 @@ concurrently. Give each the exact `ground` call to make and this contract:
 > If `ground` returns nothing relevant, return `{ found: false }` for that
 > sub-question. Do NOT paraphrase beyond the snippet. Do NOT answer the user's
 > question — you only gather evidence. If a top chunk is truncated and the answer
-> hinges on it, `read_markdown { corpus, path, line_numbers: true }` (relative path)
+> hinges on it, `read_markdown { corpus, path, line_numbers: true, cwd }` (relative path)
 > that one file and quote the exact numbered lines.
 
 `ground` returns per file: `summary, keywords, score, mtime, corpus, chunks[]`,
@@ -74,7 +79,7 @@ and per chunk: `heading_path` (H1→leaf breadcrumb), `line_range` ([start,end],
 ### 4. Verify before answering
 
 For each citation, confirm the cited `line_range` in that file actually contains
-the claim — `read_markdown { …, line_numbers: true }` the file if a claim is
+the claim — `read_markdown { …, line_numbers: true, cwd }` the file if a claim is
 high-stakes or a snippet was truncated. The `line_numbers` flag returns the text
 with 1-based gutters, so you can confirm the exact `path:line` you're about to cite
 rather than counting by hand. Wrong citations are worse than no citations.

@@ -53,3 +53,9 @@
 - 2026-08-30 · wiki-harvest-hallouminate-20260830 · fixed-stale · blocking-inference-offload.md · every citation still pointed at the pre-#273 `crates/hallouminate/src/daemon/` layout; repointed to `hallouminate-daemon`/`hallouminate-adapters` with corrected line numbers (functions moved, e.g. `run_embedding_blocking` 626→816, real `apply_batch` 939-1009→1168)
 - 2026-08-30 · wiki-harvest-hallouminate-20260830 · merged · architecture.md, daemon-and-cli.md, index.md · cross-links to the new supervisor-restart-ladder page
 
+
+
+- 2026-09-05 · aed65466a6521ab0 · merged · mcp-surface.md · Required active-checkout cwd replaces startup directory routing.
+- 2026-09-05 · aed65466a6521ab0 · merged · corpus-walker.md · Root-relative patterns, ownership, and independent selection warnings.
+- 2026-09-05 · aed65466a6521ab0 · merged · worktree-dev-gotchas.md · Mise shims override the pinned verification toolchain.
+

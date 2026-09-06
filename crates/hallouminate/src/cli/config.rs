@@ -198,7 +198,7 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
         .as_deref()
         .and_then(|p| unregistered_wiki_advisory(p, &effective));
     let root_advisories = missing_root_advisories(&effective);
-    let selection_advisories = selection_advisories(&effective);
+    let selection_advisories = selection_advisories(&effective)?;
 
     // Check unknown keys against every resolved layer's raw text, not just
     // the baseline — a repo-layer scalar key (e.g. `[embeddings] enable =
@@ -528,20 +528,19 @@ fn unregistered_wiki_advisory(repo_config_path: &Path, cfg: &Config) -> Option<S
 /// `collect_warnings`/`collect_layered_warnings` TOML-only checks. A corpus
 /// with no advisories (including a valid empty corpus) contributes nothing
 /// and never affects the exit code.
-fn selection_advisories(cfg: &Config) -> Vec<String> {
-    let Ok(corpora) = cfg.effective_corpora() else {
-        return Vec::new();
-    };
+fn selection_advisories(cfg: &Config) -> anyhow::Result<Vec<String>> {
+    let corpora = cfg
+        .effective_corpora()
+        .map_err(|e| anyhow!("derive effective corpora: {e}"))?;
     let mut out = Vec::new();
     for corpus in &corpora {
-        let Ok(warnings) = hallouminate_domain::corpus::selection_warnings(corpus) else {
-            continue;
-        };
+        let warnings = hallouminate_domain::corpus::selection_warnings(corpus)
+            .map_err(|e| anyhow!("validate corpus {:?} selection rules: {e}", corpus.name))?;
         for warning in warnings {
             out.push(format!("corpus {:?}: {warning}", corpus.name));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Non-fatal advisory: effective corpora whose declared roots don't exist on
@@ -726,6 +725,82 @@ mod tests {
         .expect_err("typo must surface a warning");
         let msg = format!("{err:#}");
         assert!(msg.contains("warning"), "{msg}");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_glob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("wiki");
+        fs::create_dir(&root).expect("mkdir root");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"[\"]\n",
+                root.display()
+            ),
+        )
+        .expect("write config");
+        let cwd = canon(dir.path());
+        write_repo_config(&cwd, "");
+
+        let err = cmd_config_validate(ConfigValidateArgs {
+            config: Some(path),
+            cwd: Some(cwd),
+        })
+        .expect_err("malformed glob must fail validation");
+        assert!(format!("{err:#}").contains("selection rules"));
+    }
+
+    #[test]
+    fn validate_rejects_absolute_glob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("wiki");
+        fs::create_dir(&root).expect("mkdir root");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"/absolute/**/*.md\"]\n",
+                root.display()
+            ),
+        )
+        .expect("write config");
+        let cwd = canon(dir.path());
+        write_repo_config(&cwd, "");
+
+        let err = cmd_config_validate(ConfigValidateArgs {
+            config: Some(path),
+            cwd: Some(cwd),
+        })
+        .expect_err("absolute glob must fail validation");
+        assert!(format!("{err:#}").contains("selection rules"));
+    }
+
+    #[test]
+    fn selection_advisories_reports_exact_zero_match_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("wiki");
+        fs::create_dir(&root).expect("mkdir root");
+        let cfg: Config = toml::from_str(&format!(
+            "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\nexclude = [\"tmp/**\"]\n",
+            root.display()
+        ))
+        .expect("parse config");
+
+        assert_eq!(
+            selection_advisories(&cfg).expect("valid rules"),
+            vec![
+                format!(
+                    "corpus \"wiki\": corpus \"wiki\" root {}: include pattern \"**/*.md\" matched no files",
+                    canon(&root).display()
+                ),
+                format!(
+                    "corpus \"wiki\": corpus \"wiki\" root {}: exclude pattern \"tmp/**\" matched no files",
+                    canon(&root).display()
+                ),
+            ]
+        );
     }
 
     #[test]

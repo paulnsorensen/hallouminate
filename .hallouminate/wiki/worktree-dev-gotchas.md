@@ -134,3 +134,28 @@ Mechanism, symptoms, and the agreed fix direction (#215):
 [worktree-corpus-identity](worktree-corpus-identity.md). Recover the view
 you want with `hallouminate index` from the checkout you care about.
 
+
+## Mise shims can override the verification toolchain
+
+Mise shims can restore a toolchain override after `env -u RUSTUP_TOOLCHAIN`.
+The measured #453 session selects Rust 1.98 through both `cargo` and `just` shims,
+although `rust-toolchain.toml` pins 1.97.[^mise]
+
+Put rustup proxies first in a clean `PATH`.
+Invoke the installed `just` binary directly.
+Keep every compiler-heavy command inside the repository verification lease.
+
+```sh
+env PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+  RUSTUP_TOOLCHAIN=1.97 /opt/homebrew/bin/just verify
+```
+
+Read the current repository pin before copying this version.
+This procedure replaces the older `env -u` workaround for this shim failure.
+A silent gate can also wait for another worktree's verification lease.
+Check the lease records and owning process before treating that wait as a compiler hang.[^lease]
+
+[^mise]: Issue #453 closeout, 2026-09-05: `type -a cargo just`, `rustup show active-toolchain`, and `env -u RUSTUP_TOOLCHAIN rustc --version` select the mise override; `rustup run 1.97 rustc --version` reports 1.97.1. Repository pin: rust-toolchain.toml:4-5.
+[^lease]: scripts/verify.py::run_leased; AGENTS.md::Local verification
+
+_Source: issue #453 verification diagnosis · Updated: 2026-09-05 · Supersedes: unset-only toolchain selection for mise shims_

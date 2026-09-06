@@ -148,6 +148,11 @@ The hallouminate MCP tools (`ground`, `add_markdown`, `read_markdown`,
 etc.) appear after the harness reloads its plugins or MCP servers. If they have
 not loaded in this session, use the CLI for the remaining phases.
 
+Every MCP tool call takes a required `cwd` argument: the absolute path of
+your own active checkout. In a git worktree, this can differ from the
+harness's original directory. Passing the wrong one silently reads or writes
+the wrong worktree.
+
 ## Phase 4 — Initialize config
 
 Run `hallouminate config init` to write the XDG baseline config
@@ -208,7 +213,8 @@ Using what you learned in Phase 5, write the first page. Convention: one topic
 per file, first line is `# Title`, and the file stem matches the slug
 (e.g. `architecture.md` → `# Architecture`).
 
-Prefer the MCP tool `mcp__hallouminate__add_markdown` — it writes under the
+Prefer the MCP tool `mcp__hallouminate__add_markdown` — pass `cwd` as your
+own active checkout directory. It writes under the
 corpus' first root atomically, auto-reindexes just that file, and returns
 advisory lint `warnings` (empty links, heading-level jumps, empty mermaid
 blocks). If the MCP tools haven't loaded yet this session, write the file

@@ -11,6 +11,10 @@ only spawns a new page when nothing covers it. The failure mode to avoid: dumpin
 raw content that leaves the real pages stale. A smaller, curated wiki beats a larger
 unvetted one.
 
+Every hallouminate MCP tool call takes a required `cwd`: the absolute path of
+your own active checkout. In a git worktree, this can differ from the
+harness's original directory. Pass the same `cwd` to every call in this skill.
+
 **Agent topology (required):**
 
 - **Root = opus-tier** (the strongest model the harness offers). Splits source
@@ -71,7 +75,7 @@ from the finished prose.
 Spawn one haiku sub-agent per atomic claim, **in a single message**, each with this
 contract:
 
-> Run `ground { query: "<claim topic>", corpus: "<corpus>", top_files: 3, chunks_per_file: 3 }`.
+> Run `ground { query: "<claim topic>", corpus: "<corpus>", top_files: 3, chunks_per_file: 3, cwd }`.
 > Return the best-matching existing page: its **corpus-relative path**, the file-level
 > `mtime`, the file-level `score` and `z_score` (`DocFile.score`/`DocFile.z_score` — `z_score` is
 > the Layer-2 banding signal; `None` unless the cross-encoder ran), and from the top chunk its
@@ -80,7 +84,7 @@ contract:
 > not per-chunk — convert the key to the corpus-relative path, the same shape
 > `read_markdown`/`add_markdown` take, since they reject absolute paths.) If the top
 > score is low / nothing relevant, return `{ match: none }`. Do NOT edit anything —
-> you only locate. If the match looks close, `read_markdown { corpus, path }` that
+> you only locate. If the match looks close, `read_markdown { corpus, path, cwd }` that
 > page (relative path) and return the section that would be updated.
 
 **Read `index.md` glosses to route, never rewrite them.** Before or within locate, read the
@@ -168,15 +172,15 @@ provenance)?
 
 Apply each decision through the safe update loop:
 
-- **Merge/overwrite:** `read_markdown` the page → `backlinks { corpus, path }` →
-  edit the section → `add_markdown { overwrite: true }`. (Read-before-clobber is
+- **Merge/overwrite:** `read_markdown` the page → `backlinks { corpus, path, cwd }` →
+  edit the section → `add_markdown { overwrite: true, cwd }`. (Read-before-clobber is
   mandatory; it's your rollback point. `backlinks` returns the pages that
   `[[wikilink]]` to this one — the pages that assume or build on it. If the edit
   changes a claim a backlink relies on, queue that page into the same ingest pass
   instead of leaving it silently stale.)
 - **New page:** draft one-topic entry (H1 first line, kebab slug, lead-first,
   ~50–150 lines, code cited as `path:line`, shaped on the pack's
-  `../../templates/wiki-entry.md`) → `add_markdown { overwrite: false }`.
+  `../../templates/wiki-entry.md`) → `add_markdown { overwrite: false, cwd }`.
 - **Chunk context:** Every H2/H3 section must open self-contained: give enough subject and purpose for the section to remain clear when retrieved without surrounding sections. Name the domain concept in the opening sentence; do not make a heading, pronoun, or parent page carry all context. Breadcrumbs and file summaries may supplement this authored context, but do not generate index-time or per-chunk LLM context; issue #284 remains deferred.
 - **Local links:** if merged or new content links a local file outside the corpus
   (absolute path, `~`, or a relative path escaping the corpus root — the ingest
@@ -205,13 +209,13 @@ Before journaling, verify the complete topic-and-source write set with the froze
 
 Then **journal the decision** in `log.md` (append-only, never rewritten):
 
-> `add_markdown { corpus, path: "log.md", under_heading: "Log", position: "append", content: <row> }`
+> `add_markdown { corpus, path: "log.md", under_heading: "Log", position: "append", content: <row>, cwd }`
 
 where `<row>` is one log row `<date> · <source-hash> · <action> · <target path|—> · <summary>`
 and `action ∈ {skipped-duplicate-hash, skipped-near-duplicate, merged, new-page, conflict-flagged, retrieval-warning}`.
 Log **every** decision — including Layer-1 hash skips (the row *is* the ledger Layer 1 scans) and
 **every** flagged contradiction. If `log.md` is absent, scaffold it once with
-`add_markdown { corpus, path: "log.md", content: "# Ingest Log\n\n## Log\n", overwrite: false }`, then append.
+`add_markdown { corpus, path: "log.md", content: "# Ingest Log\n\n## Log\n", overwrite: false, cwd }`, then append.
 Whole-file rewrites of `log.md` are forbidden — the only writes are `under_heading: append` splices.
 
 The daemon reindexes each written file and refreshes ancestor `index.md` link lists
