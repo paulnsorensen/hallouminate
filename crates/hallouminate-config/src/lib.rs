@@ -166,9 +166,9 @@ impl Default for WatchConfig {
 }
 
 impl WatchConfig {
-    /// Returns the effective reconciliation interval in seconds, falling
-    /// back to the default of `60` when unset.
-    pub fn reconcile_interval_secs(&self) -> u64 {
+    /// Resolved value after baseline-only merge; `None` on the raw layer
+    /// means "inherit", falling back to the default of `60` when unset.
+    pub fn effective_reconcile_interval_secs(&self) -> u64 {
         self.reconcile_interval_secs
             .unwrap_or(DEFAULT_RECONCILE_INTERVAL_SECS)
     }
@@ -1054,19 +1054,37 @@ where
             if baseline == repo {
                 Ok(baseline)
             } else {
-                let baseline_src = baseline_path
-                    .map(|p| format!(" (baseline at {})", p.display()))
-                    .unwrap_or_else(|| " (baseline)".into());
-                let repo_src = repo_path
-                    .map(|p| format!(" (repo at {})", p.display()))
-                    .unwrap_or_else(|| " (repo layer)".into());
-                Err(HallouminateError::Config(format!(
-                    "scalar conflict on {field}: baseline = {baseline:?}{baseline_src}, \
-                     repo = {repo:?}{repo_src}"
-                )))
+                Err(scalar_conflict(
+                    field,
+                    &baseline,
+                    &repo,
+                    baseline_path,
+                    repo_path,
+                ))
             }
         }
     }
+}
+
+/// Build the `HallouminateError::Config` reported when a baseline value and
+/// a repo-layer value both set the same field to different, conflicting values.
+fn scalar_conflict<T: std::fmt::Debug>(
+    field: &str,
+    baseline: &T,
+    repo: &T,
+    baseline_path: Option<&Path>,
+    repo_path: Option<&Path>,
+) -> HallouminateError {
+    let baseline_src = baseline_path
+        .map(|p| format!(" (baseline at {})", p.display()))
+        .unwrap_or_else(|| " (baseline)".into());
+    let repo_src = repo_path
+        .map(|p| format!(" (repo at {})", p.display()))
+        .unwrap_or_else(|| " (repo layer)".into());
+    HallouminateError::Config(format!(
+        "scalar conflict on {field}: baseline = {baseline:?}{baseline_src}, \
+         repo = {repo:?}{repo_src}"
+    ))
 }
 
 /// Merge a daemon-startup-only field: the active value is the baseline's
@@ -1087,16 +1105,13 @@ fn merge_baseline_only(
     if repo_value == active {
         return Ok(Some(active));
     }
-    let baseline_src = baseline_path
-        .map(|p| format!(" (baseline at {})", p.display()))
-        .unwrap_or_else(|| " (baseline)".into());
-    let repo_src = repo_path
-        .map(|p| format!(" (repo at {})", p.display()))
-        .unwrap_or_else(|| " (repo layer)".into());
-    Err(HallouminateError::Config(format!(
-        "scalar conflict on {field}: baseline = {active:?}{baseline_src}, \
-         repo = {repo_value:?}{repo_src}"
-    )))
+    Err(scalar_conflict(
+        field,
+        &active,
+        &repo_value,
+        baseline_path,
+        repo_path,
+    ))
 }
 
 /// Rewrite every relative non-tilde path in `cfg` as `base.join(path)`.
@@ -2829,7 +2844,7 @@ path = "/b"
     fn reconcile_interval_secs_defaults_to_sixty_when_omitted() {
         let cfg = parse("", None).expect("empty config parses");
         assert_eq!(cfg.watch.reconcile_interval_secs, None);
-        assert_eq!(cfg.watch.reconcile_interval_secs(), 60);
+        assert_eq!(cfg.watch.effective_reconcile_interval_secs(), 60);
     }
 
     #[test]
@@ -2849,7 +2864,7 @@ path = "/b"
         let baseline = parse("[watch]\nreconcile_interval_secs = 120\n", None).expect("baseline");
         let repo = parse("", None).expect("repo");
         let merged = merge_layers(&baseline, &repo).expect("merge");
-        assert_eq!(merged.watch.reconcile_interval_secs(), 120);
+        assert_eq!(merged.watch.effective_reconcile_interval_secs(), 120);
     }
 
     #[test]
@@ -2857,75 +2872,58 @@ path = "/b"
         let baseline = parse("[watch]\nreconcile_interval_secs = 120\n", None).expect("baseline");
         let repo = parse("[watch]\nreconcile_interval_secs = 120\n", None).expect("repo");
         let merged = merge_layers(&baseline, &repo).expect("merge");
-        assert_eq!(merged.watch.reconcile_interval_secs(), 120);
+        assert_eq!(merged.watch.effective_reconcile_interval_secs(), 120);
     }
 
-    #[test]
-    fn reconcile_interval_secs_repo_conflicts_with_non_default_baseline() {
-        let baseline = parse("[watch]\nreconcile_interval_secs = 120\n", None).expect("baseline");
-        let repo = parse("[watch]\nreconcile_interval_secs = 30\n", None).expect("repo");
+    /// Shared assertion for the `reconcile_interval_secs` repo/baseline
+    /// conflict cases below: any unequal `(baseline, repo)` pair must reject
+    /// with both values and both source paths named in the error.
+    fn assert_reconcile_interval_secs_conflict(baseline_toml: &str, repo_toml: &str) {
+        let baseline = parse(baseline_toml, None).expect("baseline");
+        let repo = parse(repo_toml, None).expect("repo");
         let xdg = Path::new("/etc/hallouminate/config.toml");
         let repo_p = Path::new("/work/.hallouminate/config.toml");
         let err = merge_layers_with_sources(&baseline, &repo, Some(xdg), Some(repo_p))
-            .expect_err("unequal repo value must conflict");
-        match err {
-            HallouminateError::Config(msg) => {
-                assert!(msg.contains("watch.reconcile_interval_secs"), "got: {msg}");
-                assert!(msg.contains("120"), "got: {msg}");
-                assert!(msg.contains("30"), "got: {msg}");
-                assert!(msg.contains("/etc/hallouminate/config.toml"), "got: {msg}");
-                assert!(
-                    msg.contains("/work/.hallouminate/config.toml"),
-                    "got: {msg}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+            .expect_err("unequal reconcile_interval_secs must conflict");
+        let HallouminateError::Config(msg) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        assert!(msg.contains("watch.reconcile_interval_secs"), "got: {msg}");
+        assert!(
+            msg.contains(
+                &baseline
+                    .watch
+                    .effective_reconcile_interval_secs()
+                    .to_string()
+            ),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(&repo.watch.effective_reconcile_interval_secs().to_string()),
+            "got: {msg}"
+        );
+        assert!(msg.contains("/etc/hallouminate/config.toml"), "got: {msg}");
+        assert!(
+            msg.contains("/work/.hallouminate/config.toml"),
+            "got: {msg}"
+        );
     }
 
     #[test]
-    fn reconcile_interval_secs_repo_conflicts_with_default_baseline() {
-        let baseline = parse("", None).expect("baseline default");
-        let repo = parse("[watch]\nreconcile_interval_secs = 30\n", None).expect("repo");
-        let xdg = Path::new("/etc/hallouminate/config.toml");
-        let repo_p = Path::new("/work/.hallouminate/config.toml");
-        let err = merge_layers_with_sources(&baseline, &repo, Some(xdg), Some(repo_p))
-            .expect_err("repo value unequal to default baseline must conflict");
-        match err {
-            HallouminateError::Config(msg) => {
-                assert!(msg.contains("watch.reconcile_interval_secs"), "got: {msg}");
-                assert!(msg.contains("60"), "got: {msg}");
-                assert!(msg.contains("30"), "got: {msg}");
-                assert!(msg.contains("/etc/hallouminate/config.toml"), "got: {msg}");
-                assert!(
-                    msg.contains("/work/.hallouminate/config.toml"),
-                    "got: {msg}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn reconcile_interval_secs_repo_default_value_conflicts_with_non_default_baseline() {
-        let baseline = parse("[watch]\nreconcile_interval_secs = 120\n", None).expect("baseline");
-        let repo = parse("[watch]\nreconcile_interval_secs = 60\n", None).expect("repo");
-        let xdg = Path::new("/etc/hallouminate/config.toml");
-        let repo_p = Path::new("/work/.hallouminate/config.toml");
-        let err = merge_layers_with_sources(&baseline, &repo, Some(xdg), Some(repo_p))
-            .expect_err("repo default value unequal to non-default baseline must conflict");
-        match err {
-            HallouminateError::Config(msg) => {
-                assert!(msg.contains("watch.reconcile_interval_secs"), "got: {msg}");
-                assert!(msg.contains("120"), "got: {msg}");
-                assert!(msg.contains("60"), "got: {msg}");
-                assert!(msg.contains("/etc/hallouminate/config.toml"), "got: {msg}");
-                assert!(
-                    msg.contains("/work/.hallouminate/config.toml"),
-                    "got: {msg}"
-                );
-            }
-            other => panic!("unexpected error: {other:?}"),
+    fn reconcile_interval_secs_repo_conflicts() {
+        let cases: [(&str, &str); 3] = [
+            (
+                "[watch]\nreconcile_interval_secs = 120\n",
+                "[watch]\nreconcile_interval_secs = 30\n",
+            ),
+            ("", "[watch]\nreconcile_interval_secs = 30\n"),
+            (
+                "[watch]\nreconcile_interval_secs = 120\n",
+                "[watch]\nreconcile_interval_secs = 60\n",
+            ),
+        ];
+        for (baseline_toml, repo_toml) in cases {
+            assert_reconcile_interval_secs_conflict(baseline_toml, repo_toml);
         }
     }
 

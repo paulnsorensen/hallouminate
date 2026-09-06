@@ -59,8 +59,7 @@ use super::ipc::{
 };
 use super::state::{DaemonState, RequestResources, WorkClass};
 use super::status;
-use super::watch::register_runtime_corpora;
-use super::watch::registry::ConfigSource;
+use super::watch::{ConfigSource, register_runtime_corpora};
 
 pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
     // Resolve per-request config layering on every request: discover the
@@ -389,6 +388,102 @@ fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
     }
 }
 
+/// Registers this request's corpora with the live watcher, deriving the
+/// `ConfigSource` from the resolved layers.
+fn register_for_request(
+    state: &DaemonState,
+    layers: &ResolvedLayers,
+    corpora: &[CorpusConfig],
+    cfg: &Config,
+) -> Result<ConfigSource, String> {
+    register_runtime_corpora(state, layers.repo_path.as_deref(), corpora, cfg)
+}
+
+/// Runs the per-corpus coverage check concurrently and renders
+/// "index-coverage" warnings for any corpus whose index trails its on-disk
+/// listing (#427 part 2). Must be called before `Provisioner::observe` so the
+/// snapshot reflects the index state at request time, not after provisioning.
+type CoverageSlot = Option<(CorpusConfig, anyhow::Result<(u64, u64)>)>;
+
+async fn collect_coverage_warnings(
+    store: &std::sync::Arc<LanceStore>,
+    coverage_targets: &[CorpusConfig],
+) -> Vec<Warning> {
+    // Per-corpus coverage checks run concurrently (each does a store
+    // query plus a blocking directory walk) so a union request pays for
+    // its slowest corpus, not the sum of every corpus. JoinSet completion
+    // order is nondeterministic, so slots are indexed and re-ordered back
+    // to `coverage_targets`' order below.
+    let mut coverage_tasks = tokio::task::JoinSet::new();
+    for (idx, corpus) in coverage_targets.iter().cloned().enumerate() {
+        let store = store.clone();
+        coverage_tasks.spawn(async move {
+            let coverage = corpus_coverage(store.as_ref(), &corpus).await;
+            (idx, corpus, coverage)
+        });
+    }
+    let mut coverage_snapshot: Vec<CoverageSlot> =
+        (0..coverage_targets.len()).map(|_| None).collect();
+    while let Some(result) = coverage_tasks.join_next().await {
+        match result {
+            Ok((idx, corpus, coverage)) => coverage_snapshot[idx] = Some((corpus, coverage)),
+            Err(join_err) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %join_err,
+                    "ground: coverage check task panicked",
+                );
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    for (corpus, coverage) in coverage_snapshot.into_iter().flatten() {
+        match coverage {
+            Ok((covered, total)) if covered < total => {
+                let root = first_corpus_root(&corpus)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| corpus.name.clone());
+                warnings.push(Warning {
+                    code: "index-coverage".to_string(),
+                    message: format!(
+                        "index coverage {covered}/{total} files for {} at {root} — run `index` to build",
+                        corpus.name
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    %error,
+                    corpus = %corpus.name,
+                    "coverage check failed; omitting coverage warning for this corpus",
+                );
+            }
+        }
+    }
+    warnings
+}
+
+/// Renders the watch registry's recovery advisories for `source`'s
+/// registrations into "index-reconciliation" warnings.
+fn collect_recovery_warnings(
+    state: &DaemonState,
+    source: &ConfigSource,
+    coverage_targets: &[CorpusConfig],
+) -> Vec<Warning> {
+    state
+        .watch_registry()
+        .recovery_warnings_for(source, coverage_targets)
+        .into_iter()
+        .map(|(corpus, message)| Warning {
+            code: "index-reconciliation".to_string(),
+            message: format!("{corpus}: {message}"),
+        })
+        .collect()
+}
+
 async fn handle_ground(
     state: &DaemonState,
     cfg: &Config,
@@ -400,14 +495,10 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let source = layers
-        .repo_path
-        .clone()
-        .map(ConfigSource::RepoLayer)
-        .unwrap_or(ConfigSource::Baseline);
-    if let Err(error) = register_runtime_corpora(state, source, &corpora, cfg) {
-        return DaemonResponse::invalid_params(error);
-    }
+    let source = match register_for_request(state, layers, &corpora, cfg) {
+        Ok(source) => source,
+        Err(error) => return DaemonResponse::invalid_params(error),
+    };
     let res = match state.resources_for(cfg).await {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -420,13 +511,7 @@ async fn handle_ground(
         },
         None => corpora.clone(),
     };
-    let mut coverage_snapshot = Vec::new();
-    for corpus in &coverage_targets {
-        coverage_snapshot.push((
-            corpus.clone(),
-            corpus_coverage(store.as_ref(), corpus).await,
-        ));
-    }
+    let coverage_warnings = collect_coverage_warnings(store, &coverage_targets).await;
     state.provisioner().observe(&corpora, cfg);
     let opts = ground_opts(cfg, &req);
 
@@ -509,48 +594,11 @@ async fn handle_ground(
         }
     }
 
-    // #427 part 2: coverage honesty. When a queried corpus's index trails its
-    // on-disk listing, say so in-band so a caller does not read an
-    // under-provisioned corpus as "the content is not there". Scoped to the
-    // corpus (or union set) this request actually searched; per-corpus checks
-    // run concurrently so a union request pays for the slowest corpus, not
-    // the sum.
+    response.warnings.extend(coverage_warnings);
 
-    for (corpus, coverage) in coverage_snapshot {
-        match coverage {
-            Ok((covered, total)) if covered < total => {
-                let root = first_corpus_root(&corpus)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| corpus.name.clone());
-                response.warnings.push(Warning {
-                    code: "index-coverage".to_string(),
-                    message: format!(
-                        "index coverage {covered}/{total} files for {} at {root} — run `index` to build",
-                        corpus.name
-                    ),
-                });
-            }
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    %error,
-                    corpus = %corpus.name,
-                    "coverage check failed; omitting coverage warning for this corpus",
-                );
-            }
-        }
-    }
-
-    for (corpus, message) in state
-        .watch_registry()
-        .recovery_warnings_for(&coverage_targets)
-    {
-        response.warnings.push(Warning {
-            code: "index-reconciliation".to_string(),
-            message: format!("{corpus}: {message}"),
-        });
-    }
+    response
+        .warnings
+        .extend(collect_recovery_warnings(state, &source, &coverage_targets));
 
     let response = if let Some(limit) = req.snippet_chars {
         trim_snippets(&response, limit)
@@ -786,12 +834,10 @@ async fn handle_add_markdown(
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
 
-    #[allow(clippy::needless_late_init)]
-    let force_overwrite: bool;
-    match mode {
+    let force_overwrite = match mode {
         EditMode::WholeFile => {
             // Unchanged whole-file path; `overwrite` governs as before.
-            force_overwrite = req.overwrite;
+            req.overwrite
         }
         EditMode::UnderHeading(heading, position) => {
             let existing =
@@ -819,7 +865,7 @@ async fn handle_add_markdown(
                     ));
                 }
             };
-            force_overwrite = true;
+            true
         }
         EditMode::ReplaceLines(range) => {
             let existing =
@@ -840,7 +886,7 @@ async fn handle_add_markdown(
                     return DaemonResponse::invalid_params("start > end".to_string());
                 }
             };
-            force_overwrite = true;
+            true
         }
         EditMode::ReplaceMatch(needle) => {
             let existing =
@@ -863,9 +909,9 @@ async fn handle_add_markdown(
                     ));
                 }
             };
-            force_overwrite = true;
+            true
         }
-    }
+    };
 
     // ── shared tail (lint runs on the COMPOSED file) ──────────────────────────
     // Advisory-only lint of the verbatim content. Never blocks or rewrites the

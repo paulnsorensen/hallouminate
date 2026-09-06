@@ -98,6 +98,10 @@ git operation: `checkout -- .`, `restore`, `reset --hard`.
   git operation first, then the tilth parent-checkout leak above.
 
 
+
+
+The same rule covers `git checkout -- <path>`, `git restore`, `git reset`, and `git clean`. During the PR #461 cure a coder agent ran `git checkout -- crates/hallouminate-daemon/src/watch/mod.rs` to undo its own scratch edit and discarded four earlier waves of uncommitted work on that file. Undo an agent edit with the inverse text patch, never with a working-tree reset. Snapshot changed files to a scratch directory after each green wave so a wipe is recoverable; the #461 recovery replayed patch strings from agent transcripts onto a snapshot.
+
 ## An abandoned worktree branch can hold the only copy of a real fix
 
 Added 2026-07-29. A `/pasteurize` investigation running in an isolated worktree
@@ -202,6 +206,10 @@ load needed to trip the deadline.
 - Re-run with `-- --test-threads=4` before you attribute the failure to your change.
 - Do not "fix" `mcp_serve` and do not raise `READ_TIMEOUT` in response to this.
 - Report any `mcp_serve` failure that is **not** this exact signature — that one is real.
+
+## The watcher's own delete leg does not clear rows locally without reconciliation
+
+`watcher_reindexes_then_prunes_file_in_baseline_corpus_root` (`crates/hallouminate/tests/it/daemon.rs`) passes only with `reconcile_interval_secs = 1`. With a long interval the create leg indexes but the delete/prune leg never clears the row (2/2 runs, 20 s timeout, observed 2026-09-06 on the PR #461 branch). Two hypotheses remain open: the watcher's `notify` remove path regressed, or this host does not deliver the remove event for the tmp layout. Until `/pasteurize` settles it, treat a green run of that test as proof of reconciliation, not of the watcher's prune path; `reconcile_tick_repairs_dropped_remove_event` pins the reconciliation leg on its own.
 
 ## Squash merges leave residue that the melt detector misses
 
