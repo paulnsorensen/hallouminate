@@ -6,6 +6,7 @@ sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
   - https://github.com/paulnsorensen/hallouminate/pull/290
   - https://github.com/paulnsorensen/hallouminate/pull/320
+  - https://github.com/paulnsorensen/hallouminate/pull/430
 ---
 # Domain model
 
@@ -136,7 +137,7 @@ _Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-7
 
 ## Worktree-index-provisioning terms
 
-<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). The code is **implemented in PR #430**. PR #430 is open. A person did not merge it yet. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
+<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). The code **shipped in PR #430** (merged 2026-08-30). ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
 
 **Provisioner** — A supervised task in the daemon. The task has a seen-set and a queue. The task continues while the daemon operates. When the daemon finds a new corpus root, the task starts a catch-up pass immediately. The task does the pass away from the request path.
 _Avoid_: index scheduler, background indexer
@@ -163,4 +164,4 @@ LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), co
 
 [^loop]: [Search reliability loop ADRs](search-reliability-loop-001.md), [production evaluation](search-reliability-loop-002.md), and [reranker representation](search-reliability-loop-003.md).
 
-_Source: issue #288 entity bindings, PR #290 (landed), the approved search-reliability-loop spec, and PR #320 (landed) · Updated: 2026-08-09 · Supersedes: the 2026-07-25 draft that framed `search_text` / `CorpusKey` / schema-v4 as unshipped_
+_Source: issue #288 entity bindings, PR #290 (landed), the approved search-reliability-loop spec, PR #320 (landed), and PR #430 (landed) · Updated: 2026-09-06 · Supersedes: the 2026-07-25 draft that framed `search_text` / `CorpusKey` / schema-v4 as unshipped, and the 2026-08-30 note that framed PR #430 as still open_
