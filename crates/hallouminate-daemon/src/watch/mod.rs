@@ -64,7 +64,7 @@ use registry::RegistrationId;
 /// Canonicalizing the deleted path directly fails and would diverge from the
 /// key the indexer wrote against the resolved ancestor, silently no-op'ing the
 /// prune — the divergence the spec flagged as an open question.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct WatchRoot {
     watched: PathBuf,
     canonical_watched: PathBuf,
@@ -194,6 +194,88 @@ impl WatcherHandle {
     }
 }
 
+fn reload_repo_layer(state: &DaemonState, path: &Path) {
+    let repo = match hallouminate_config::load_repo_layer(path) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: repo-layer reload failed; retaining registrations for retry");
+            return;
+        }
+    };
+    let effective = match hallouminate_config::merge_layers(state.baseline(), &repo) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: repo-layer validation failed; retaining registrations for retry");
+            return;
+        }
+    };
+    let corpora = match effective.effective_corpora() {
+        Ok(corpora) => corpora,
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: repo-layer corpus validation failed; retaining registrations for retry");
+            return;
+        }
+    };
+    let source = registry::ConfigSource::RepoLayer(path.to_path_buf());
+    let result = state.watch_registry().replace_source(
+        source,
+        corpora,
+        std::sync::Arc::new(effective),
+        |corpus| {
+            corpus
+                .paths
+                .iter()
+                .filter_map(|raw| build_watch_root(corpus, raw))
+                .collect()
+        },
+    );
+    match result {
+        Ok(retired) => {
+            for registration in retired {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    cleanup_retired_registration(&state, registration).await;
+                });
+            }
+        }
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::daemon", path = %path.display(), error, "watcher: repo-layer reload could not replace registrations; retaining registrations for retry");
+        }
+    }
+}
+
+async fn cleanup_retired_registration(
+    state: &DaemonState,
+    registration: registry::RetiredRegistration,
+) {
+    let retired = match tokio::task::spawn_blocking(move || {
+        hallouminate_domain::common::retired_roots(std::slice::from_ref(&registration.root))
+            .into_iter()
+            .next()
+            .map(|root| (root, registration.cfg))
+    })
+    .await
+    {
+        Ok(Some(retired)) => retired,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::daemon", error = %error, "watcher: retired-root check failed; retaining storage rows");
+            return;
+        }
+    };
+    let (root, cfg) = retired;
+    let resources = match state.resources_for(&cfg).await {
+        Ok(resources) => resources,
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::daemon", error = %error, "watcher: retired-root storage access failed; retaining storage rows");
+            return;
+        }
+    };
+    if let Err(error) = resources.store.delete_root(&root).await {
+        tracing::warn!(target: "hallouminate::daemon", error = %error, "watcher: retired-root cleanup failed; retaining retry work");
+    }
+}
+
 /// Reconcile the live debouncer against the registry's current
 /// registrations: newly-registered roots get `debouncer.watch()`'d (or
 /// `mark_degraded` on failure), any registration whose catch-up hasn't
@@ -210,19 +292,40 @@ fn reconcile_registrations(
     roots: &mut Vec<WatchRoot>,
 ) {
     let registry = state.watch_registry();
+    registry.refresh_roots(|corpus| {
+        corpus
+            .paths
+            .iter()
+            .filter_map(|raw| build_watch_root(corpus, raw))
+            .collect()
+    });
     let snapshot = registry.snapshot_roots();
+    let desired: std::collections::HashSet<PathBuf> = snapshot
+        .iter()
+        .map(|(_, root)| root.watched.clone())
+        .collect();
+    let obsolete: Vec<PathBuf> = installed.difference(&desired).cloned().collect();
+    for path in obsolete {
+        if let Err(error) = debouncer.unwatch(&path) {
+            tracing::debug!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: obsolete watch removal failed");
+        }
+        installed.remove(&path);
+    }
     *roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
     for (id, root) in &snapshot {
-        if installed.insert(root.watched.clone())
-            && let Err(e) = debouncer.watch(&root.watched, root.mode)
-        {
-            registry.mark_degraded(id, e.to_string());
+        if installed.contains(&root.watched) {
+            continue;
+        }
+        match debouncer.watch(&root.watched, root.mode) {
+            Ok(()) => {
+                installed.insert(root.watched.clone());
+                registry.mark_watched(id);
+            }
+            Err(error) => registry.mark_degraded(id, error.to_string()),
         }
     }
-    for id in registry.ids() {
-        if registry.begin_catch_up(&id) {
-            spawn_registration_catch_up(state.clone(), id);
-        }
+    if let Some(id) = registry.begin_next_catch_up() {
+        spawn_registration_catch_up(state.clone(), id);
     }
 }
 
@@ -232,33 +335,35 @@ fn reconcile_registrations(
 /// those too.
 fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId) {
     tokio::spawn(async move {
-        loop {
-            let Some((corpus, cfg)) = state.watch_registry().config_for(&id) else {
-                return;
-            };
-            // Take the same per-corpus lock and global write-lane, in the same
-            // order, that `handle_index` and `provisioner::provision_corpus`
-            // take. A catch-up pass rewrites the corpus' rows, so without the
-            // guard it races an explicit `index` or an `add_markdown` write.
-            match state.acquire_mutation_guard(&corpus.name).await {
-                Ok(_guard) => {
-                    if let Ok(res) = state.resources_for(&cfg).await {
-                        let reg = state.make_registry();
-                        let _ = super::dispatch::catch_up_corpus(&res, &reg, &corpus).await;
-                    }
+        let Some((corpus, cfg)) = state.watch_registry().config_for(&id) else {
+            return;
+        };
+        // Take the same per-corpus lock and global write-lane, in the same
+        // order, that `handle_index` and `provisioner::provision_corpus`
+        // take. A catch-up pass rewrites the corpus' rows, so without the
+        // guard it races an explicit `index` or an `add_markdown` write.
+        let outcome = match state.acquire_mutation_guard(&corpus.name).await {
+            Ok(_guard) => match state.resources_for(&cfg).await {
+                Ok(res) => {
+                    let reg = state.make_registry();
+                    super::dispatch::catch_up_corpus(&res, &reg, &corpus)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
                 }
-                Err(e) => tracing::warn!(
+                Err(e) => Err(e.to_string()),
+            },
+            Err(e) => {
+                tracing::warn!(
                     target: "hallouminate::daemon",
                     corpus = %corpus.name,
                     error = %e,
                     "watcher: no mutation guard for registration catch-up; retry on recovery",
-                ),
+                );
+                Err(e.to_string())
             }
-            match state.watch_registry().finish_catch_up(&id) {
-                registry::PendingWork::Idle => break,
-                _ => continue,
-            }
-        }
+        };
+        state.watch_registry().finish_catch_up(&id, outcome);
     });
 }
 
@@ -269,6 +374,34 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId) {
 /// `None` only when the watcher backend itself fails to initialize — an
 /// empty baseline root set is not a failure, since runtime registrations may
 /// arrive later.
+/// Registers request-resolved corpora with the live watcher.
+pub(crate) fn register_runtime_corpora(
+    state: &DaemonState,
+    source: registry::ConfigSource,
+    corpora: &[CorpusConfig],
+    cfg: &hallouminate_config::Config,
+) -> Result<(), String> {
+    let cfg = std::sync::Arc::new(cfg.clone());
+    for corpus in corpora {
+        let roots = corpus
+            .paths
+            .iter()
+            .filter_map(|raw| build_watch_root(corpus, raw))
+            .collect();
+        if let registry::RegisterOutcome::Conflict =
+            state
+                .watch_registry()
+                .register(source.clone(), corpus.clone(), cfg.clone(), roots)
+        {
+            return Err(format!(
+                "corpus {:?} has an incompatible watcher registration; use one root binding per corpus",
+                corpus.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     let cfg = state.baseline();
     let debounce = Duration::from_millis(cfg.watch.debounce_ms);
@@ -363,6 +496,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
 
     let churn_warn_at = cfg.daemon.churn_warn_at;
     let churn_act_at = cfg.daemon.churn_act_at;
+    let reconcile_interval = Duration::from_secs(cfg.watch.reconcile_interval_secs());
     let state = state.clone();
     let shutdown = state.shutdown_token().clone();
     let task = tokio::spawn(async move {
@@ -376,6 +510,11 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         let wake_rx = std::sync::Arc::new(std::sync::Mutex::new(wake_rx));
         let mut failures = FailureCoalescer::new(failure_reminder, MAX_FAILURE_SIGNATURES);
         let mut churn = ChurnTracker::new(churn_warn_at, churn_act_at);
+        let mut reconcile_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + reconcile_interval,
+            reconcile_interval,
+        );
+        reconcile_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let wake_rx_recv = wake_rx.clone();
             let next = tokio::select! {
@@ -388,6 +527,14 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
                 // pump -- that reconcile is the correctness backstop; this
                 // arm is purely a latency improvement for the common case.
                 () = state.watch_registry().changed().notified() => {
+                    reconcile_registrations(&state, &mut debouncer, &mut installed, &mut roots);
+                    continue;
+                }
+                _ = reconcile_tick.tick() => {
+                    for path in state.watch_registry().repo_layer_sources() {
+                        reload_repo_layer(&state, &path);
+                    }
+                    state.watch_registry().mark_reconcile_due_all();
                     reconcile_registrations(&state, &mut debouncer, &mut installed, &mut roots);
                     continue;
                 }
@@ -510,8 +657,7 @@ fn record_pending(
 ///   atomic save on the file, without flooding `owning_corpus` with events for
 ///   an unrelated subtree it would discard.
 ///
-/// Returns `None` for a not-yet-created root (e.g. a repo wiki dir absent at
-/// boot); a later boot picks it up.
+/// Retains a not-yet-created root so recovery can install it when it appears.
 fn build_watch_root(corpus: &CorpusConfig, raw: &str) -> Option<WatchRoot> {
     let root = expand_tilde(raw);
     if root.is_dir() {
@@ -535,7 +681,13 @@ fn build_watch_root(corpus: &CorpusConfig, raw: &str) -> Option<WatchRoot> {
             mode: RecursiveMode::NonRecursive,
         })
     } else {
-        None
+        Some(WatchRoot {
+            canonical_watched: canonicalize_or_passthrough(&root).into_path_buf(),
+            watched: root,
+            corpus: corpus.clone(),
+            canonical_file_root: None,
+            mode: RecursiveMode::Recursive,
+        })
     }
 }
 
@@ -561,9 +713,21 @@ async fn process_change_batch(
     state.touch_activity(WorkClass::Internal);
 }
 
-/// Reindex (or prune) one changed markdown path against whichever baseline
-/// corpus owns it. Skips paths that no baseline corpus accepts.
+/// Reindex (or prune) one changed path for every matching registration.
 async fn handle_changed_path(
+    state: &DaemonState,
+    roots: &[WatchRoot],
+    path: &Path,
+    failures: &mut FailureCoalescer,
+    churn: &mut ChurnTracker,
+) {
+    let Some(owner) = owning_corpus(roots, path).cloned() else {
+        return;
+    };
+    handle_changed_path_for_owner(state, &[owner], path, failures, churn).await;
+}
+
+async fn handle_changed_path_for_owner(
     state: &DaemonState,
     roots: &[WatchRoot],
     path: &Path,
@@ -573,14 +737,39 @@ async fn handle_changed_path(
     let Some(owner) = owning_corpus(roots, path) else {
         return;
     };
-    let corpus = &owner.corpus;
-    let store = state.store();
+    let registration = state
+        .watch_registry()
+        .snapshot_roots()
+        .into_iter()
+        .find(|(_, root)| *root == *owner);
+    let (corpus, cfg) = if let Some((owner_id, _)) = registration {
+        state
+            .watch_registry()
+            .record_pending(&owner_id, [path.to_path_buf()]);
+        state
+            .watch_registry()
+            .config_for(&owner_id)
+            .expect("snapshot registration must retain its configuration")
+    } else {
+        (
+            owner.corpus.clone(),
+            std::sync::Arc::new(state.baseline().clone()),
+        )
+    };
+    let resources = match state.resources_for(&cfg).await {
+        Ok(resources) => resources,
+        Err(error) => {
+            tracing::warn!(target: "hallouminate::daemon", error = %error, "watcher: resources unavailable");
+            return;
+        }
+    };
+    let store = resources.store.clone();
     // Stage 1 of the change gate (ADR daemon-rework-003, "git's algorithm,
     // not git's state"): compare the on-disk mtime against the last-indexed
     // snapshot before taking any lock or reading any bytes. Equal means the
     // event is a no-op (e.g. the access-event feedback loop that burned 200%
     // CPU) and is shed for the price of one stat + one snapshot row read.
-    if mtime_matches_last_index(&store, corpus, path).await {
+    if mtime_matches_last_index(&store, &corpus, path).await {
         tracing::debug!(
             target: "hallouminate::daemon",
             corpus = %corpus.name,
@@ -622,7 +811,8 @@ async fn handle_changed_path(
             }
         };
         let registry = state.make_registry();
-        match index_single_file_with_content(&store, &registry, corpus, path, &bytes, mtime).await {
+        match index_single_file_with_content(&store, &registry, &corpus, path, &bytes, mtime).await
+        {
             Ok(stats) => {
                 let noop = stats.files_upserted == 0;
                 state.record_watcher_reindex(noop);
@@ -1112,16 +1302,15 @@ mod tests {
         );
     }
 
-    /// A not-yet-created root (neither dir nor file) yields no WatchRoot — a
-    /// later boot picks it up once it exists.
+    /// A not-yet-created root remains registered for recovery.
     #[test]
     fn build_watch_root_skips_absent_root() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let absent = tmp.path().join("not-there");
         let cfg = corpus("ghost", absent.to_str().unwrap(), &["**/*.md"]);
         assert!(
-            build_watch_root(&cfg, absent.to_str().unwrap()).is_none(),
-            "an absent root must not produce a WatchRoot"
+            build_watch_root(&cfg, absent.to_str().unwrap()).is_some(),
+            "an absent root remains registered for recovery"
         );
     }
 

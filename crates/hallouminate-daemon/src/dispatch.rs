@@ -59,6 +59,8 @@ use super::ipc::{
 };
 use super::state::{DaemonState, RequestResources, WorkClass};
 use super::status;
+use super::watch::register_runtime_corpora;
+use super::watch::registry::ConfigSource;
 
 pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse {
     // Resolve per-request config layering on every request: discover the
@@ -398,12 +400,34 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    state.provisioner().observe(&corpora, cfg);
+    let source = layers
+        .repo_path
+        .clone()
+        .map(ConfigSource::RepoLayer)
+        .unwrap_or(ConfigSource::Baseline);
+    if let Err(error) = register_runtime_corpora(state, source, &corpora, cfg) {
+        return DaemonResponse::invalid_params(error);
+    }
     let res = match state.resources_for(cfg).await {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
     let store = &res.store;
+    let coverage_targets: Vec<CorpusConfig> = match req.corpus.as_deref() {
+        Some(name) => match corpora.iter().find(|corpus| corpus.name == name) {
+            Some(corpus) => vec![corpus.clone()],
+            None => Vec::new(),
+        },
+        None => corpora.clone(),
+    };
+    let mut coverage_snapshot = Vec::new();
+    for corpus in &coverage_targets {
+        coverage_snapshot.push((
+            corpus.clone(),
+            corpus_coverage(store.as_ref(), corpus).await,
+        ));
+    }
+    state.provisioner().observe(&corpora, cfg);
     let opts = ground_opts(cfg, &req);
 
     // Union ground (#106, #425): every corpus-less request fans the query
@@ -491,25 +515,8 @@ async fn handle_ground(
     // corpus (or union set) this request actually searched; per-corpus checks
     // run concurrently so a union request pays for the slowest corpus, not
     // the sum.
-    let coverage_targets: Vec<CorpusConfig> = match single_corpus {
-        Some(corpus) => vec![corpus],
-        None => corpora,
-    };
-    let coverage_checks: Vec<_> = coverage_targets
-        .into_iter()
-        .map(|corpus| {
-            let store = std::sync::Arc::clone(store);
-            tokio::spawn(async move {
-                let coverage = corpus_coverage(store.as_ref(), &corpus).await;
-                (corpus, coverage)
-            })
-        })
-        .collect();
-    for check in coverage_checks {
-        // A JoinError means the task panicked; the panic is already logged.
-        let Ok((corpus, coverage)) = check.await else {
-            continue;
-        };
+
+    for (corpus, coverage) in coverage_snapshot {
         match coverage {
             Ok((covered, total)) if covered < total => {
                 let root = first_corpus_root(&corpus)
@@ -533,6 +540,16 @@ async fn handle_ground(
                 );
             }
         }
+    }
+
+    for (corpus, message) in state
+        .watch_registry()
+        .recovery_warnings_for(&coverage_targets)
+    {
+        response.warnings.push(Warning {
+            code: "index-reconciliation".to_string(),
+            message: format!("{corpus}: {message}"),
+        });
     }
 
     let response = if let Some(limit) = req.snippet_chars {
@@ -769,6 +786,7 @@ async fn handle_add_markdown(
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
 
+    #[allow(clippy::needless_late_init)]
     let force_overwrite: bool;
     match mode {
         EditMode::WholeFile => {

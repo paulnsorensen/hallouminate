@@ -636,8 +636,12 @@ const RERANK_FALLBACK_CODES: [&str; 2] = [RERANK_TIMEOUT_CODE, CROSSENCODER_UNAV
 
 /// Informational only — they describe what the query covered, not a broken
 /// signal, so they must never fail the eval.
-const ADVISORY_WARNING_CODES: [&str; 3] =
-    ["code-repos-empty", "cross-repo-union", "index-coverage"];
+const ADVISORY_WARNING_CODES: [&str; 4] = [
+    "code-repos-empty",
+    "cross-repo-union",
+    "index-coverage",
+    "index-reconciliation",
+];
 
 /// Every `Warning.code` the domain and daemon crates emit. Re-derive with:
 ///
@@ -648,7 +652,7 @@ const ADVISORY_WARNING_CODES: [&str; 3] =
 /// `producer_warning_codes_are_classified_exactly_once` pins this against the
 /// three sets above, so a new producer-side warning breaks a test at its source
 /// instead of silently reaching the eval gate unclassified.
-const PRODUCER_WARNING_CODES: [&str; 9] = [
+const PRODUCER_WARNING_CODES: [&str; 10] = [
     "ripgrep-unresolved",
     "ripgrep-unparseable",
     "ripgrep-failed",
@@ -658,6 +662,7 @@ const PRODUCER_WARNING_CODES: [&str; 9] = [
     "code-repos-empty",
     "cross-repo-union",
     "index-coverage",
+    "index-reconciliation",
 ];
 
 /// Which of `run_arm`'s two sweeps a response came from. Only the measured

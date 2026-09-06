@@ -2409,8 +2409,8 @@ impl Drop for EnvGuard {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
-    // Quality gate (Curd 3): editing a file in a baseline corpus root triggers
-    // a reindex within ~debounce_ms; deleting prunes its rows. Both legs are
+    // Quality gate (Curd 3): the watcher handles edits and deletes first.
+    // Periodic reconciliation recovers any remove event that the platform drops.
     // asserted via `ground` — the watcher's *unique* observable effect on the
     // LanceDB rows — never via a manual `index` (which would index the file
     // itself, so the old assertion passed even with the watcher disabled) nor
@@ -2427,7 +2427,7 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\n\n[storage]\nground_dir = \"{g}\"\n",
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 1\n\n[storage]\nground_dir = \"{g}\"\n",
         c = corpus_root.display(),
         g = ground.display(),
     );
