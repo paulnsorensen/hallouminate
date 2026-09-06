@@ -123,11 +123,27 @@ impl CorpusConfig {
     }
 
     /// Returns the most specific configured root that owns `path`.
+    ///
+    /// Canonicalizes `path` first, which dereferences a symlinked final
+    /// component. Use [`CorpusConfig::corpus_key_for_resolved_path`] when the
+    /// caller has already resolved the path and must keep that component
+    /// literal.
     pub fn corpus_key_for_path(&self, path: &Path) -> Option<CorpusKey> {
         let path = canonicalize_or_passthrough(path);
+        self.corpus_key_for_resolved_path(path.as_path())
+    }
+
+    /// Returns the most specific configured root that owns an already-resolved
+    /// `path`, without resolving it any further.
+    ///
+    /// Symlink containment belongs to the no-follow file primitives, not to
+    /// root selection. A caller that resolves ancestors but deliberately
+    /// leaves a symlinked final component alone uses this, so an escaping
+    /// symlink still reaches the guard that owns it.
+    pub fn corpus_key_for_resolved_path(&self, path: &Path) -> Option<CorpusKey> {
         self.corpus_keys()
             .into_iter()
-            .filter(|key| path.as_path().starts_with(&key.canonical_root))
+            .filter(|key| path.starts_with(&key.canonical_root))
             .max_by_key(|key| key.canonical_root.components().count())
     }
 }

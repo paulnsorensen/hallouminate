@@ -198,6 +198,7 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
         .as_deref()
         .and_then(|p| unregistered_wiki_advisory(p, &effective));
     let root_advisories = missing_root_advisories(&effective);
+    let selection_advisories = selection_advisories(&effective);
 
     // Check unknown keys against every resolved layer's raw text, not just
     // the baseline — a repo-layer scalar key (e.g. `[embeddings] enable =
@@ -215,7 +216,8 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     }
     let warnings = collect_layered_warnings(&layer_sources, &effective);
 
-    let any_advisory = advisory.is_some() || !root_advisories.is_empty();
+    let any_advisory =
+        advisory.is_some() || !root_advisories.is_empty() || !selection_advisories.is_empty();
     if any_advisory || !warnings.is_empty() {
         println!();
     }
@@ -223,6 +225,9 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
         println!("warning: {advisory}");
     }
     for a in &root_advisories {
+        println!("warning: {a}");
+    }
+    for a in &selection_advisories {
         println!("warning: {a}");
     }
     for w in &warnings {
@@ -515,6 +520,28 @@ fn unregistered_wiki_advisory(repo_config_path: &Path, cfg: &Config) -> Option<S
          add a [[repository]] entry to make it searchable",
         wiki_dir.display()
     ))
+}
+
+/// Non-fatal advisory: effective corpora with an include/exclude glob
+/// pattern that matches zero files on disk (a likely typo). Needs filesystem
+/// access, so it stays a separate step rather than living inside the pure
+/// `collect_warnings`/`collect_layered_warnings` TOML-only checks. A corpus
+/// with no advisories (including a valid empty corpus) contributes nothing
+/// and never affects the exit code.
+fn selection_advisories(cfg: &Config) -> Vec<String> {
+    let Ok(corpora) = cfg.effective_corpora() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for corpus in &corpora {
+        let Ok(warnings) = hallouminate_domain::corpus::selection_warnings(corpus) else {
+            continue;
+        };
+        for warning in warnings {
+            out.push(format!("corpus {:?}: {warning}", corpus.name));
+        }
+    }
+    out
 }
 
 /// Non-fatal advisory: effective corpora whose declared roots don't exist on

@@ -31,7 +31,7 @@ use hallouminate_domain::common::{
 use hallouminate_domain::corpus::FileEntry;
 use hallouminate_domain::corpus::scan;
 use hallouminate_domain::corpus::{
-    SlugResolution, blake3_bytes, find_wikilinks, normalize_slug, resolve_slug,
+    SlugResolution, blake3_bytes, find_wikilinks, normalize_slug, resolve_slug, selection_warnings,
 };
 use hallouminate_domain::corpus::{
     WriteError, WriteErrorKind, atomic_write_no_follow, delete_no_follow,
@@ -316,12 +316,22 @@ async fn handle_corpus_stats(
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
     let unindexed_files = total - covered;
+    // The walk is synchronous (ignore::WalkBuilder); keep it off the async
+    // worker, mirroring `corpus_coverage` above.
+    let warnings_cfg = corpus_cfg.clone();
+    let warnings =
+        match tokio::task::spawn_blocking(move || selection_warnings(&warnings_cfg)).await {
+            Ok(Ok(warnings)) => warnings.iter().map(|w| w.to_string()).collect(),
+            Ok(Err(e)) => return DaemonResponse::internal(e.to_string()),
+            Err(e) => return DaemonResponse::internal(e.to_string()),
+        };
     DaemonResponse::ok(&CorpusStatsResult {
         corpus: corpus_cfg.name,
         indexed_files,
         total_chunks,
         last_indexed_ms,
         unindexed_files,
+        warnings,
     })
 }
 
@@ -2862,6 +2872,7 @@ mod tests {
                 "last_indexed_ms",
                 "total_chunks",
                 "unindexed_files",
+                "warnings",
             ],
             "public stats must contain only the stable root-free IPC fields",
         );

@@ -39,11 +39,11 @@ use std::time::SystemTime;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::common::{CorpusConfig, expand_tilde};
 use crate::corpus::scan;
+use crate::corpus::walker;
 
 /// Caller-supplied input failure when validating a corpus / path pair.
 ///
@@ -177,31 +177,100 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
     Ok(path.to_path_buf())
 }
 
-/// Confirm `path` matches the corpus's include globs and isn't excluded.
-pub fn ensure_corpus_allows_file(corpus: &CorpusConfig, path: &Path) -> Result<(), SandboxError> {
-    let include = build_globset(&corpus.globs).map_err(|e| SandboxError::new(e.to_string()))?;
-    if matches!(include.as_ref(), Some(inc) if !inc.is_match(path)) {
+/// Resolve `path`'s ancestors as far as the filesystem allows, so a corpus
+/// root reached through a symlinked ancestor still canonicalizes even when
+/// the leaf itself does not exist yet (e.g. `add_markdown` creating a new
+/// page). Walks up to the longest existing ancestor, canonicalizes that
+/// ancestor, then re-appends the remaining components literally. Falls back
+/// to `path` unchanged when no ancestor can be canonicalized.
+///
+/// The final component is never dereferenced, even when it exists and is a
+/// symlink. Resolving it would let a symlink that escapes the corpus be
+/// rejected here, as a glob mismatch, instead of by the no-follow guards
+/// that own symlink containment (`atomic_write_no_follow`,
+/// `delete_no_follow`, `read_no_follow`). Keeping the leaf literal preserves
+/// that division of labor and the error each layer reports.
+fn best_effort_canonical(path: &Path) -> PathBuf {
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    };
+    let mut ancestor = parent;
+    let mut tail: Vec<&OsStr> = vec![file_name];
+    loop {
+        if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
+            let mut result = canonical_ancestor;
+            for component in tail.iter().rev() {
+                result.push(component);
+            }
+            return result;
+        }
+        let Some(next) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        tail.push(ancestor.file_name().unwrap_or_default());
+        ancestor = next;
+    }
+}
+
+/// The directory include/exclude patterns anchor to for a corpus root. A
+/// configured root usually names a directory, so patterns anchor to it. A
+/// root may instead name one file, so patterns then anchor to that file's
+/// parent, mirroring `walker::match_base`.
+fn corpus_match_base(canonical_root: &Path) -> PathBuf {
+    if canonical_root.is_file() {
+        canonical_root
+            .parent()
+            .unwrap_or(canonical_root)
+            .to_path_buf()
+    } else {
+        canonical_root.to_path_buf()
+    }
+}
+
+/// Confirm a corpus-root-relative `relative` path matches the corpus's
+/// include globs and is not excluded.
+///
+/// Callers that already know which root owns the path use this directly, so
+/// rules anchor to the owning root the caller established. The watcher does
+/// this: its canonical watched root can differ from the corpus config's own
+/// root when the configured path is an unresolved symlink.
+pub fn ensure_corpus_allows_relative(
+    corpus: &CorpusConfig,
+    relative: &Path,
+) -> Result<(), SandboxError> {
+    let include =
+        walker::build_globset(&corpus.globs).map_err(|e| SandboxError::new(e.to_string()))?;
+    if matches!(include.as_ref(), Some(inc) if !inc.is_match(relative)) {
         return Err(SandboxError::new("path is not included by corpus globs"));
     }
-    let exclude = build_globset(&corpus.exclude).map_err(|e| SandboxError::new(e.to_string()))?;
-    if matches!(exclude.as_ref(), Some(ex) if ex.is_match(path)) {
+    let exclude =
+        walker::build_globset(&corpus.exclude).map_err(|e| SandboxError::new(e.to_string()))?;
+    if matches!(exclude.as_ref(), Some(ex) if ex.is_match(relative)) {
         return Err(SandboxError::new("path is excluded by corpus rules"));
     }
     Ok(())
 }
 
-/// Compile a set of glob patterns. Returns `None` for an empty list so the
-/// caller can short-circuit "no rules" before allocating.
-pub fn build_globset(patterns: &[String]) -> anyhow::Result<Option<GlobSet>> {
-    if patterns.is_empty() {
-        return Ok(None);
-    }
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        let glob = Glob::new(pattern)?;
-        builder.add(glob);
-    }
-    Ok(Some(builder.build()?))
+/// Confirm `path` matches the corpus's include globs and isn't excluded.
+///
+/// Resolves the most specific owning root via
+/// [`CorpusConfig::corpus_key_for_resolved_path`] and matches include/exclude
+/// patterns against `path` relative to that root, so a root-anchored
+/// pattern like `docs/**/*.md` means what it says instead of being matched
+/// against the absolute path. `path` need not exist yet.
+pub fn ensure_corpus_allows_file(corpus: &CorpusConfig, path: &Path) -> Result<(), SandboxError> {
+    let resolved = best_effort_canonical(path);
+    let key = corpus
+        .corpus_key_for_resolved_path(&resolved)
+        .ok_or_else(|| {
+            SandboxError::new(format!(
+                "path {} is not under any configured corpus root",
+                path.display()
+            ))
+        })?;
+    let base = corpus_match_base(&key.canonical_root);
+    let relative = resolved.strip_prefix(&base).unwrap_or(resolved.as_path());
+    ensure_corpus_allows_relative(corpus, relative)
 }
 
 /// One entry returned by [`list_corpus_files`]. Serialized as-is into the
@@ -1262,6 +1331,48 @@ mod tests {
         corpus.exclude = vec!["**/drafts/**".to_string()];
         ensure_corpus_allows_file(&corpus, Path::new("/docs/concepts/attention.md"))
             .expect("matching path must pass");
+    }
+
+    #[test]
+    fn ensure_corpus_allows_file_matches_root_anchored_glob_against_relative_path() {
+        // The bug this guards: matching against the absolute path let a
+        // root-anchored pattern accidentally match anywhere the corpus root
+        // happened to sit (e.g. `/docs/**/*.md` matching any `/docs` ancestor
+        // component), and could never express "only directly under the
+        // root" the way a relative pattern can.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("libs/docs")).unwrap();
+        let mut corpus = cfg("docs", vec![root.to_str().unwrap()]);
+        corpus.globs = vec!["docs/**/*.md".to_string()];
+
+        ensure_corpus_allows_file(&corpus, &root.join("docs/a.md"))
+            .expect("root-anchored pattern must admit <root>/docs/a.md");
+        let err = ensure_corpus_allows_file(&corpus, &root.join("libs/docs/a.md"))
+            .expect_err("root-anchored pattern must reject <root>/libs/docs/a.md");
+        assert!(err.as_str().contains("not included"), "got: {err}");
+    }
+
+    #[test]
+    fn ensure_corpus_allows_file_allows_new_file_under_symlinked_root() {
+        // The highest-risk edge case in the relativization fix: `add_markdown`
+        // creates a page that does not exist yet, and the corpus root may be
+        // reached through a symlinked ancestor. `canonicalize_or_passthrough`
+        // cannot resolve a nonexistent leaf, so naively matching against the
+        // raw (unresolved) path against a fully-canonicalized root would find
+        // no owning root at all and wrongly reject the write.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_root = tmp.path().join("real-root");
+        std::fs::create_dir(&real_root).unwrap();
+        let root = tmp.path().join("root-link");
+        std::os::unix::fs::symlink(&real_root, &root).unwrap();
+
+        let corpus = cfg("docs", vec![root.to_str().unwrap()]);
+        let dest = root.join("new-page.md");
+        assert!(!dest.exists(), "the file must not exist yet");
+
+        ensure_corpus_allows_file(&corpus, &dest)
+            .expect("a new file under a symlinked corpus root must be allowed");
     }
 
     // ── first_corpus_root ────────────────────────────────────────────────

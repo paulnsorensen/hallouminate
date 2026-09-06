@@ -27,7 +27,7 @@ use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{
     CorpusConfig, CorpusKey, canonicalize_or_passthrough, expand_tilde,
 };
-use hallouminate_domain::corpus::ensure_corpus_allows_file;
+use hallouminate_domain::corpus::ensure_corpus_allows_relative;
 
 use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
@@ -684,11 +684,21 @@ fn owning_corpus<'r>(roots: &'r [WatchRoot], path: &Path) -> Option<&'r WatchRoo
             // canonicalize, which would fail on the delete case where the path
             // no longer exists).
             Some(file) if file != path => continue,
-            // Directory root: honor the corpus' glob/exclude so a watched dir
-            // that also holds non-corpus markdown doesn't reindex files the
-            // corpus would never have scanned.
-            None if ensure_corpus_allows_file(&root.corpus, path).is_err() => continue,
-            _ => {}
+            Some(_) => {}
+            None => {
+                // Directory root: honor the corpus' glob/exclude so a watched
+                // dir that also holds non-corpus markdown doesn't reindex files
+                // the corpus would never have scanned. Anchor the rules to the
+                // root that owns this event — the canonical watched root, which
+                // differs from the corpus config's own root whenever the
+                // configured path is an unresolved symlink.
+                let Ok(relative) = path.strip_prefix(&root.canonical_watched) else {
+                    continue;
+                };
+                if ensure_corpus_allows_relative(&root.corpus, relative).is_err() {
+                    continue;
+                }
+            }
         }
         let configured_root = root
             .canonical_file_root
@@ -846,6 +856,27 @@ mod tests {
         assert!(
             owning_corpus(&roots, Path::new("/srv/wiki/notes.txt")).is_none(),
             "a non-glob-matched file under a dir root is not owned"
+        );
+    }
+
+    /// A root-anchored include pattern (`docs/**/*.md`, not `**/docs/**/*.md`)
+    /// must match relative to the corpus root: it admits `<root>/docs/a.md` but
+    /// rejects `<root>/libs/docs/a.md`, even though the old absolute-path match
+    /// would have accepted both (`**` in a leading position swallows any prefix,
+    /// including `libs/`). Regresses the AC-6 relativization fix in
+    /// `ensure_corpus_allows_file`.
+    #[test]
+    fn dir_root_honors_root_anchored_include_pattern() {
+        let cfg = corpus("wiki", "/srv/wiki", &["docs/**/*.md"]);
+        let roots = vec![watch_root("/srv/wiki", cfg, None)];
+        assert_eq!(
+            name_of(owning_corpus(&roots, Path::new("/srv/wiki/docs/a.md"))).as_deref(),
+            Some("wiki"),
+            "a root-anchored pattern must admit <root>/docs/a.md"
+        );
+        assert!(
+            owning_corpus(&roots, Path::new("/srv/wiki/libs/docs/a.md")).is_none(),
+            "a root-anchored pattern must reject <root>/libs/docs/a.md"
         );
     }
 
