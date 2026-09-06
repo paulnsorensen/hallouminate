@@ -1,20 +1,27 @@
-//! Filesystem watcher that incrementally re-indexes baseline corpus roots.
+//! Filesystem watcher that incrementally re-indexes registered corpus roots.
 //!
 //! Wires the otherwise-dead `[watch] debounce_ms` knob: `notify` +
-//! `notify-debouncer-full` watch the boot baseline's corpus roots, and on a
-//! debounced change the daemon reindexes just the affected markdown file
-//! (`index_single_file`) or prunes its rows on delete. The debounce window is
-//! `cfg.watch.debounce_ms`.
+//! `notify-debouncer-full` watch every root the `WatchRegistry` (`registry`
+//! submodule) knows about, and on a debounced change the daemon reindexes
+//! just the affected markdown file (`index_single_file`) or prunes its rows
+//! on delete. The debounce window is `cfg.watch.debounce_ms`.
 //!
-//! Scope (spec Non-goal): only the **baseline** `[[corpus]]` and baseline
-//! `[[repository]]` roots are watched. Repo-layer corpora are discovered
-//! per-RPC from the client cwd, so the daemon never caches them and the
-//! watcher cannot see them. This is a documented limitation, not a bug.
+//! Live registration: `spawn_corpus_watcher` seeds the boot baseline's
+//! `[[corpus]]`/`[[repository]]` roots into `state.watch_registry()`, then
+//! the pump task reconciles against that registry every loop iteration —
+//! new registrations get `debouncer.watch()`'d and catch-up'd without a
+//! watcher restart. Nothing in this module yet calls `WatchRegistry::register`
+//! for a repo-layer corpus; wiring `Provisioner`/`dispatch::handle_ground` to
+//! do so, with source-ownership and incompatible-binding rejection, is a
+//! later slice (worktree corpus reconciliation, #427) — the registry API is
+//! ready for that wiring but nothing calls it yet.
 //!
 //! Concurrency (spec Risk): every reindex takes the same per-corpus lock +
 //! global write-lane (`acquire_mutation_guard`) that `handle_index` /
 //! `handle_add_markdown` take, so a watch-triggered reindex never races the
 //! daemon's own writes.
+
+pub(crate) mod registry;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +40,7 @@ use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
 use super::state::{DaemonState, WorkClass};
+use registry::RegistrationId;
 
 /// One watched location: the directory handed to `notify`, the corpus that
 /// owns it, and — for a **file-path** corpus root — the exact declared file.
@@ -56,7 +64,8 @@ use super::state::{DaemonState, WorkClass};
 /// Canonicalizing the deleted path directly fails and would diverge from the
 /// key the indexer wrote against the resolved ancestor, silently no-op'ing the
 /// prune — the divergence the spec flagged as an open question.
-struct WatchRoot {
+#[derive(Clone)]
+pub(crate) struct WatchRoot {
     watched: PathBuf,
     canonical_watched: PathBuf,
     corpus: CorpusConfig,
@@ -167,28 +176,99 @@ impl FailureCoalescer {
 }
 
 /// Owns the background debouncer + event-pump task. Dropping it stops the
-/// watcher (the debouncer's worker thread joins on drop; aborting the task
-/// drops the event receiver so the thread's send fails and it exits).
+/// watcher: the pump task owns the debouncer directly, so aborting/dropping
+/// this handle's `_task` drops the debouncer transitively, which releases
+/// every physical `notify` watch. Registration teardown rides on this drop —
+/// there is no separate explicit "unregister everything" step.
 pub struct WatcherHandle {
     _task: tokio::task::JoinHandle<()>,
-    // The debouncer must outlive the watch session; held here so its worker
-    // thread keeps running until this handle drops.
-    _debouncer: Box<dyn std::any::Any + Send>,
 }
 
 impl WatcherHandle {
     /// Await the pump task; used by the supervisor factory so a watcher
     /// restart rebuilds the whole debouncer + pump pair. Holds `self` (and
-    /// so the debouncer) alive until the pump future completes.
+    /// so the debouncer, owned by the task) alive until the pump future
+    /// completes.
     pub(crate) async fn join(self) {
         let _ = self._task.await;
     }
 }
 
-/// Watch the baseline corpora roots and spawn a task that reindexes changed
-/// markdown files (debounced by `cfg.watch.debounce_ms`). Returns `None` when
-/// there are no watchable roots or the watcher backend fails to initialize —
-/// the daemon still serves; auto-reindex is simply off.
+/// Reconcile the live debouncer against the registry's current
+/// registrations: newly-registered roots get `debouncer.watch()`'d (or
+/// `mark_degraded` on failure), any registration whose catch-up hasn't
+/// started gets one spawned, and `roots` is refreshed to the flattened
+/// current root list for the caller's subsequent `process_change_batch`
+/// call. `installed` tracks watched-path idempotency across calls.
+fn reconcile_registrations(
+    state: &DaemonState,
+    debouncer: &mut notify_debouncer_full::Debouncer<
+        notify::RecommendedWatcher,
+        notify_debouncer_full::RecommendedCache,
+    >,
+    installed: &mut std::collections::HashSet<PathBuf>,
+    roots: &mut Vec<WatchRoot>,
+) {
+    let registry = state.watch_registry();
+    let snapshot = registry.snapshot_roots();
+    *roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
+    for (id, root) in &snapshot {
+        if installed.insert(root.watched.clone())
+            && let Err(e) = debouncer.watch(&root.watched, root.mode)
+        {
+            registry.mark_degraded(id, e.to_string());
+        }
+    }
+    for id in registry.ids() {
+        if registry.begin_catch_up(&id) {
+            spawn_registration_catch_up(state.clone(), id);
+        }
+    }
+}
+
+/// Runs one registration's catch-up pass (indexing whatever changed before
+/// or while the registration was pending catch-up) and loops if events
+/// arrived while the pass was in flight, so a follow-up pass reconciles
+/// those too.
+fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId) {
+    tokio::spawn(async move {
+        loop {
+            let Some((corpus, cfg)) = state.watch_registry().config_for(&id) else {
+                return;
+            };
+            // Take the same per-corpus lock and global write-lane, in the same
+            // order, that `handle_index` and `provisioner::provision_corpus`
+            // take. A catch-up pass rewrites the corpus' rows, so without the
+            // guard it races an explicit `index` or an `add_markdown` write.
+            match state.acquire_mutation_guard(&corpus.name).await {
+                Ok(_guard) => {
+                    if let Ok(res) = state.resources_for(&cfg).await {
+                        let reg = state.make_registry();
+                        let _ = super::dispatch::catch_up_corpus(&res, &reg, &corpus).await;
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "hallouminate::daemon",
+                    corpus = %corpus.name,
+                    error = %e,
+                    "watcher: no mutation guard for registration catch-up; retry on recovery",
+                ),
+            }
+            match state.watch_registry().finish_catch_up(&id) {
+                registry::PendingWork::Idle => break,
+                _ => continue,
+            }
+        }
+    });
+}
+
+/// Watch every corpus root the `WatchRegistry` knows about and spawn a task
+/// that reindexes changed markdown files (debounced by `cfg.watch.debounce_ms`)
+/// and reconciles newly-registered roots. Seeds the boot baseline's corpora
+/// into `state.watch_registry()` before installing any watches. Returns
+/// `None` only when the watcher backend itself fails to initialize — an
+/// empty baseline root set is not a failure, since runtime registrations may
+/// arrive later.
 pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     let cfg = state.baseline();
     let debounce = Duration::from_millis(cfg.watch.debounce_ms);
@@ -205,17 +285,20 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         }
     };
 
-    // Collect a WatchRoot for every existing baseline corpus root.
-    let mut roots: Vec<WatchRoot> = Vec::new();
+    // Seed every existing baseline corpus root into the registry; one
+    // shared Arc<Config> across all baseline corpora (clone the Arc, not
+    // the Config, per corpus).
+    let baseline_cfg = std::sync::Arc::new(cfg.clone());
     for corpus in &corpora {
+        let mut corpus_roots: Vec<WatchRoot> = Vec::new();
         for raw in &corpus.paths {
             if let Some(root) = build_watch_root(corpus, raw) {
-                roots.push(root);
+                corpus_roots.push(root);
             }
         }
-    }
-    if roots.is_empty() {
-        return None;
+        state
+            .watch_registry()
+            .seed_baseline(corpus.clone(), baseline_cfg.clone(), corpus_roots);
     }
 
     // Affected paths pending reindex, coalesced across debounced batches (not
@@ -270,16 +353,13 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         }
     };
 
-    for root in &roots {
-        if let Err(e) = debouncer.watch(&root.watched, root.mode) {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                root = %root.watched.display(),
-                error = %e,
-                "watcher: failed to watch root; that corpus will not auto-reindex",
-            );
-        }
-    }
+    // Fresh locals for the reconcile helper: `installed` tracks watched-path
+    // idempotency, `roots` is the flattened current root list. Reconciled
+    // once here (installing the baseline watches just seeded above) before
+    // the pump task takes ownership of all three.
+    let mut installed: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut roots: Vec<WatchRoot> = Vec::new();
+    reconcile_registrations(state, &mut debouncer, &mut installed, &mut roots);
 
     let churn_warn_at = cfg.daemon.churn_warn_at;
     let churn_act_at = cfg.daemon.churn_act_at;
@@ -300,6 +380,17 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
             let wake_rx_recv = wake_rx.clone();
             let next = tokio::select! {
                 _ = shutdown.cancelled() => break,
+                // `Notify::notify_waiters()` has no permit memory, so a
+                // signal that arrives while nothing is `.await`ing it here is
+                // lost. That is acceptable only because of the unconditional
+                // reconcile below, which runs every loop iteration regardless
+                // and is bounded by the 60s idle-heartbeat timeout on a quiet
+                // pump -- that reconcile is the correctness backstop; this
+                // arm is purely a latency improvement for the common case.
+                () = state.watch_registry().changed().notified() => {
+                    reconcile_registrations(&state, &mut debouncer, &mut installed, &mut roots);
+                    continue;
+                }
                 got = tokio::task::spawn_blocking(move || {
                     wake_rx_recv
                         .lock()
@@ -344,6 +435,11 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
             state
                 .heartbeat()
                 .bump(super::heartbeat::TaskName::WatcherPump);
+            // Correctness backstop (see the `Notify` arm above): reconciling
+            // unconditionally on every loop iteration bounds how stale a
+            // missed registry-changed signal can get to the 60s idle-heartbeat
+            // timeout, independent of whether that signal was ever observed.
+            reconcile_registrations(&state, &mut debouncer, &mut installed, &mut roots);
             let paths: Vec<PathBuf> = {
                 let mut set = pending.lock().expect("watch pending-paths mutex");
                 set.drain().collect()
@@ -354,10 +450,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         }
     });
 
-    Some(WatcherHandle {
-        _task: task,
-        _debouncer: Box::new(debouncer),
-    })
+    Some(WatcherHandle { _task: task })
 }
 
 /// Insert every markdown path from one debounced batch into the shared
@@ -1253,6 +1346,28 @@ mod tests {
             u64::MAX,
             "batch processing must stamp the activity clock so idle-exit does \
              not fire immediately after a delete-branch write",
+        );
+    }
+
+    /// Regression for the "accepts registrations with zero baseline
+    /// corpora" requirement: a `Config` with no `[[corpus]]` and no
+    /// `[[repository]]` entries still starts the live watcher service
+    /// instead of returning `None`, so runtime-discovered corpora can
+    /// register later.
+    #[tokio::test]
+    async fn spawn_corpus_watcher_starts_with_zero_baseline_corpora() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+
+        let handle = spawn_corpus_watcher(&state);
+
+        assert!(
+            handle.is_some(),
+            "the watcher service must start even with no baseline corpora, \
+             so runtime-discovered corpora can register later"
         );
     }
 

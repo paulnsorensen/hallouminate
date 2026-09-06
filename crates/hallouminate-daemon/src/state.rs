@@ -248,6 +248,9 @@ struct DaemonStateInner {
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
     provisioner: Provisioner,
+    /// Live-registration ledger backing the watcher pump (baseline +
+    /// runtime-discovered corpus roots). See `watch::registry`.
+    watch_registry: Arc<super::watch::registry::WatchRegistry>,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
@@ -623,6 +626,7 @@ impl DaemonState {
                     )),
                     heartbeat,
                     maintenance_task: Mutex::new(None),
+                    watch_registry: Arc::new(super::watch::registry::WatchRegistry::new()),
                     provisioner: {
                         let provisioner = Provisioner::new();
                         provisioner.seed(&baseline_corpora_for_seed);
@@ -706,6 +710,11 @@ impl DaemonState {
     /// Provisioner queuing newly discovered corpus roots for background catch-up.
     pub(crate) fn provisioner(&self) -> &Provisioner {
         &self.inner.provisioner
+    }
+
+    /// Live-registration ledger backing the watcher pump.
+    pub(crate) fn watch_registry(&self) -> &Arc<super::watch::registry::WatchRegistry> {
+        &self.inner.watch_registry
     }
 
     /// Source path of the baseline config the daemon booted from — the XDG
