@@ -14,11 +14,10 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ErrorCode, ErrorData, ServerCapabilities, ServerInfo,
 };
-use rmcp::{Peer, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use hallouminate_daemon::{
     AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusStatsResult,
@@ -44,13 +43,19 @@ Two audiences use this server:
 - AUTHORS (curator agents) write entries via `add_markdown` / overwrite via \
   `read_markdown` + `add_markdown { overwrite: true }`.
 
+Every tool call requires `cwd`: the absolute path of your ACTIVE CHECKOUT \
+directory (the worktree or workspace you are currently operating in), not \
+the directory the harness started your process in. Configuration resolves \
+fresh from `cwd` on every request. There is no default, no MCP-roots-derived \
+value, and no server-startup fallback — a missing, relative, or nonexistent \
+`cwd` fails the call before any corpus operation.
+
 Default corpus: READ tools (`ground`, `read_markdown`, `list_files`, \
 `list_tree`, `corpus_stats`, `backlinks`) that omit `corpus` \
-default to the wiki for the repository containing the client's MCP workspace \
-root when the client exposes roots, falling back to the MCP server process \
-cwd. WRITE tools (`add_markdown`, `delete_markdown`) require `corpus` \
-explicitly. Pass `corpus` explicitly to target another wiki, the repo's \
-source corpus (`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry; \
+default to the wiki for the repository containing `cwd`. WRITE tools \
+(`add_markdown`, `delete_markdown`) require `corpus` explicitly. Pass \
+`corpus` explicitly to target another wiki, the repo's source corpus \
+(`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry; \
 `list_corpora` enumerates everything available.
 
 Tools:
@@ -147,6 +152,7 @@ links survive moves of the whole wiki.
 Add a top-level entry:
 ```
 add_markdown {
+  cwd: \"/abs/path/to/checkout\",
   corpus: \"repo:myrepo:wiki\",
   path: \"corpus-walker.md\",
   content: \"# Corpus walker\\n\\nGitignore-aware...\\n\",
@@ -157,6 +163,7 @@ add_markdown {
 Add a nested entry — daemon creates `adapters/index.md` if missing:
 ```
 add_markdown {
+  cwd: \"/abs/path/to/checkout\",
   corpus: \"repo:myrepo:wiki\",
   path: \"adapters/lance.md\",
   content: \"# LanceDB adapter\\n\\n...\\n\",
@@ -166,7 +173,7 @@ add_markdown {
 
 Update with rollback safety:
 ```
-read_markdown { corpus: \"repo:myrepo:wiki\", path: \"corpus-walker.md\" }
+read_markdown { cwd: \"/abs/path/to/checkout\", corpus: \"repo:myrepo:wiki\", path: \"corpus-walker.md\" }
 // edit content
 add_markdown { ..., overwrite: true }
 ```
@@ -246,6 +253,27 @@ fn number_lines(content: &str) -> String {
     out
 }
 
+fn render_corpus_stats_text(result: &CorpusStatsResult) -> String {
+    let mut text = format!(
+        "corpus: {}\nindexed_files: {}\ntotal_chunks: {}\nlast_indexed_ms: {}\nunindexed_files: {}",
+        result.corpus,
+        result.indexed_files,
+        result.total_chunks,
+        result
+            .last_indexed_ms
+            .map_or("null".to_string(), |ms| ms.to_string()),
+        result.unindexed_files,
+    );
+    if !result.warnings.is_empty() {
+        text.push_str("\nwarnings:");
+        for warning in &result.warnings {
+            text.push_str("\n- ");
+            text.push_str(warning);
+        }
+    }
+    text
+}
+
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
 }
@@ -313,52 +341,40 @@ fn map_daemon_err(err: anyhow::Error) -> ErrorData {
     internal_error(format!("{err:#}"))
 }
 
-const ROOTS_LIST_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Resolve the effective cwd for a daemon request.
+/// Validate and canonicalize a tool call's required `cwd` argument.
 ///
-/// When the client advertised `roots` capability, sends `roots/list` and uses
-/// the first root's path as cwd. Falls back to the process-startup cwd when the
-/// client has no roots capability, the request times out, or the first root has
-/// no usable path.
-// MCP roots is deprecated upstream by SEP-2577, but it remains how clients like
-// Claude Code advertise the workspace directory today; keep using it until a
-// replacement lands (https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2577).
-#[allow(deprecated)]
-async fn cwd_from_peer(peer: &Peer<RoleServer>, fallback: &Path) -> PathBuf {
-    let has_roots = peer
-        .peer_info()
-        .is_some_and(|info| info.capabilities.roots.is_some());
-
-    if !has_roots {
-        return fallback.to_path_buf();
+/// Rejects missing (enforced by the schema's `required`), empty, relative,
+/// nonexistent, non-directory, and inaccessible values with an
+/// invalid-parameter error. Runs before any config lookup or daemon
+/// dispatch — there is no fallback (no MCP roots, no server-startup cwd, no
+/// mutable session-wide directory) when `cwd` is invalid.
+fn validate_cwd(cwd: &str) -> Result<PathBuf, ErrorData> {
+    if cwd.is_empty() {
+        return Err(invalid_params("cwd must not be empty"));
     }
-
-    if let Ok(Ok(result)) = tokio::time::timeout(ROOTS_LIST_TIMEOUT, peer.list_roots()).await
-        && let Some(root) = result.roots.first()
-        && let Some(path) = root_uri_to_path(&root.uri)
-    {
-        return path;
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return Err(invalid_params(format!(
+            "cwd must be an absolute path, got {cwd:?}"
+        )));
     }
-
-    fallback.to_path_buf()
-}
-
-/// Parse a roots-list `uri` into a filesystem path. Prefers proper `file://`
-/// URL decoding (percent-escapes, host handling); falls back to treating an
-/// absolute non-URL string as a path.
-fn root_uri_to_path(uri: &str) -> Option<PathBuf> {
-    if let Ok(url) = url::Url::parse(uri)
-        && url.scheme() == "file"
-    {
-        return url.to_file_path().ok();
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| invalid_params(format!("cwd {cwd:?} is not accessible: {err}")))?;
+    if !metadata.is_dir() {
+        return Err(invalid_params(format!("cwd {cwd:?} is not a directory")));
     }
-    let path = PathBuf::from(uri);
-    path.is_absolute().then_some(path)
+    std::fs::read_dir(path)
+        .map_err(|err| invalid_params(format!("cwd {cwd:?} is not accessible: {err}")))?;
+    std::fs::metadata(path.join("."))
+        .map_err(|err| invalid_params(format!("cwd {cwd:?} is not accessible: {err}")))?;
+    std::fs::canonicalize(path)
+        .map_err(|err| invalid_params(format!("cwd {cwd:?} could not be canonicalized: {err}")))
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GroundParams {
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
     /// Free-text query to embed and search against the index.
     pub query: String,
     /// Optional corpus name; required when more than one is configured.
@@ -386,6 +402,8 @@ pub struct GroundParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IndexParams {
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
     /// Optional corpus name; omit to index every configured corpus.
     #[serde(default)]
     pub corpus: Option<String>,
@@ -393,36 +411,47 @@ pub struct IndexParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CorpusStatsParams {
-    /// Corpus name; defaults to the wiki for the repo containing the MCP
-    /// workspace root. Required only when no default applies and multiple
-    /// corpora are configured.
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
+    /// Corpus name; defaults to the wiki for the repo containing `cwd`.
+    /// Required only when no default applies and multiple corpora are
+    /// configured.
     #[serde(default)]
     pub corpus: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ListCorporaParams {}
+pub struct ListCorporaParams {
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesParams {
-    /// Corpus name; defaults to the wiki for the repo containing the
-    /// MCP workspace root. Required only when no default applies and multiple
-    /// corpora are configured.
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
+    /// Corpus name; defaults to the wiki for the repo containing `cwd`.
+    /// Required only when no default applies and multiple corpora are
+    /// configured.
     #[serde(default)]
     pub corpus: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListTreeParams {
-    /// Corpus name; defaults to the wiki for the repo containing the
-    /// MCP workspace root. Required only when no default applies and multiple
-    /// corpora are configured.
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
+    /// Corpus name; defaults to the wiki for the repo containing `cwd`.
+    /// Required only when no default applies and multiple corpora are
+    /// configured.
     #[serde(default)]
     pub corpus: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddMarkdownParams {
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
     /// Corpus that owns the markdown file.
     pub corpus: String,
     /// Relative path under the corpus' single configured root. Writes require
@@ -467,8 +496,10 @@ pub struct AddMarkdownParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadMarkdownParams {
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
     /// Corpus that owns the markdown file. Defaults to the wiki for the repo
-    /// containing the MCP workspace root when omitted.
+    /// containing `cwd` when omitted.
     #[serde(default)]
     pub corpus: Option<String>,
     /// Relative path within the corpus, same shape as `add_markdown`. For a
@@ -492,6 +523,8 @@ pub struct ReadMarkdownParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteMarkdownParams {
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
     /// Corpus that owns the markdown file.
     pub corpus: String,
     /// Relative path under the corpus' single configured root, same shape as
@@ -502,8 +535,10 @@ pub struct DeleteMarkdownParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BacklinksParams {
+    /// Absolute path of the directory this request applies to.
+    pub cwd: String,
     /// Corpus that owns the page. Defaults to the wiki for the repo
-    /// containing the client's MCP workspace root, same as `ground`.
+    /// containing `cwd`, same as `ground`.
     #[serde(default)]
     pub corpus: Option<String>,
     /// Relative path of the wiki page within the corpus whose backlinks are
@@ -512,8 +547,7 @@ pub struct BacklinksParams {
 }
 
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
-/// fresh `UnixStream`, so the server is stateless beyond `tool_router`
-/// and the fallback cwd captured at startup.
+/// fresh `UnixStream`, so the server is stateless beyond `tool_router`.
 #[derive(Debug, Clone)]
 pub struct HallouminateTools {
     // The `tool_router` field is read by `#[tool_handler]`-generated code
@@ -521,30 +555,24 @@ pub struct HallouminateTools {
     // macro expansion, so silence the warning here.
     #[allow(dead_code)]
     tool_router: ToolRouter<HallouminateTools>,
-    /// Fallback CWD captured once at MCP server startup. Tool calls prefer the
-    /// client's MCP roots when advertised, so user-global IDE configs still
-    /// resolve against the open workspace; this is used only when the client
-    /// exposes no usable root.
-    cwd: PathBuf,
 }
 
 #[tool_router]
 impl HallouminateTools {
-    pub fn new(cwd: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
-            cwd,
         }
     }
 
-    /// Shared per-call preamble: dial the daemon and resolve the effective cwd.
-    /// Every tool method opens with this before building its `DaemonRequest`.
-    async fn tool_setup(
-        &self,
-        peer: &Peer<RoleServer>,
-    ) -> Result<(DaemonClient, PathBuf), ErrorData> {
+    /// Shared per-call preamble: validate the request's `cwd`, then dial the
+    /// daemon. Every tool method opens with this before building its
+    /// `DaemonRequest`. Validation happens before any daemon dispatch, and
+    /// there is no fallback for an invalid `cwd` — no MCP roots, no startup
+    /// cwd, no mutable session-wide directory.
+    async fn tool_setup(&self, cwd: &str) -> Result<(DaemonClient, PathBuf), ErrorData> {
+        let cwd = validate_cwd(cwd)?;
         let client = daemon_for_tool().await?;
-        let cwd = cwd_from_peer(peer, &self.cwd).await;
         Ok((client, cwd))
     }
 
@@ -559,10 +587,9 @@ impl HallouminateTools {
     )]
     pub async fn ground(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<GroundParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::Ground(GroundRequest {
@@ -598,10 +625,9 @@ impl HallouminateTools {
     )]
     pub async fn index(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::Index(IndexRequest {
@@ -628,7 +654,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted.",
+        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing `cwd` when `corpus` is omitted.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -638,10 +664,9 @@ impl HallouminateTools {
     )]
     pub async fn list_tree(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ListTreeParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ListTree(ListTreeRequest {
@@ -656,7 +681,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise. Defaults to the wiki for the repo containing the MCP workspace root when `corpus` is omitted.",
+        description = "List files currently visible in a corpus, honoring paths/globs/exclude rules. `content` is newline-separated relative paths. `structuredContent` is { files: [{path, absolute_path}, …] }. Paths are relative when the file lives under a configured corpus root, absolute otherwise. Defaults to the wiki for the repo containing `cwd` when `corpus` is omitted.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -666,10 +691,9 @@ impl HallouminateTools {
     )]
     pub async fn list_files(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
@@ -699,10 +723,9 @@ impl HallouminateTools {
     )]
     pub async fn add_markdown(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<AddMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
@@ -742,10 +765,9 @@ impl HallouminateTools {
     )]
     pub async fn read_markdown(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<ReadMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
@@ -775,10 +797,9 @@ impl HallouminateTools {
     )]
     pub async fn delete_markdown(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<DeleteMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
@@ -796,9 +817,10 @@ impl HallouminateTools {
         description = "Return index health statistics for one corpus: how many files are indexed, \
                       total chunk row count, the newest index timestamp (ms since epoch, null when \
                       the corpus has never been indexed), and how many on-disk files matching the \
-                      corpus globs have not yet been indexed. Corpus selection follows the same \
+                      corpus globs have not yet been indexed. It also reports advisory warnings for \
+                      zero-match include and exclude patterns. Corpus selection follows the same \
                       default resolution as `list_files`. `structuredContent` is \
-                      { corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }.",
+                      { corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files, warnings }.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -808,10 +830,9 @@ impl HallouminateTools {
     )]
     pub async fn corpus_stats(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<CorpusStatsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let result: CorpusStatsResult = client
             .call(DaemonRequest {
                 cwd,
@@ -821,16 +842,7 @@ impl HallouminateTools {
             })
             .await
             .map_err(map_daemon_err)?;
-        let text = format!(
-            "corpus: {}\nindexed_files: {}\ntotal_chunks: {}\nlast_indexed_ms: {}\nunindexed_files: {}",
-            result.corpus,
-            result.indexed_files,
-            result.total_chunks,
-            result
-                .last_indexed_ms
-                .map_or("null".to_string(), |ms| ms.to_string()),
-            result.unindexed_files,
-        );
+        let text = render_corpus_stats_text(&result);
         let structured = to_structured(&result)?;
         Ok(tool_ok(text, structured))
     }
@@ -846,10 +858,9 @@ impl HallouminateTools {
     )]
     pub async fn list_corpora(
         &self,
-        peer: Peer<RoleServer>,
-        _params: Parameters<ListCorporaParams>,
+        Parameters(params): Parameters<ListCorporaParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let entries: ListCorporaResult = client
             .call(DaemonRequest {
                 cwd,
@@ -877,10 +888,9 @@ impl HallouminateTools {
     )]
     pub async fn backlinks(
         &self,
-        peer: Peer<RoleServer>,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&peer).await?;
+        let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
             payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
@@ -903,10 +913,9 @@ impl Default for HallouminateTools {
     /// `#[derive(Default)]` would construct `ToolRouter::default()` (an empty
     /// router) and skip the `#[tool_router]`-generated registration. Manual
     /// impl routes through `new()` so `HallouminateTools::default()` exposes
-    /// the same tool set as `new()`. The default cwd is empty — production
-    /// callers go through `serve_stdio` which captures the real cwd.
+    /// the same tool set as `new()`.
     fn default() -> Self {
-        Self::new(PathBuf::new())
+        Self::new()
     }
 }
 
@@ -972,18 +981,6 @@ mod tests {
     }
 
     #[test]
-    fn new_stores_cwd_for_daemon_hops() {
-        // Pin the field plumbing: the cwd handed to `HallouminateTools::new`
-        // at MCP startup must be the same value every tool handler clones
-        // into its `DaemonRequest`. Testing that cwd actually flows over
-        // the socket needs a daemon fixture and lives in the integration
-        // suite — this guards the boring-but-easy-to-break wiring.
-        let cwd = PathBuf::from("/test/cwd");
-        let tools = HallouminateTools::new(cwd.clone());
-        assert_eq!(tools.cwd, cwd);
-    }
-
-    #[test]
     fn to_structured_maps_serialize_failure_to_internal_error() {
         // A type whose `Serialize` impl always errors must surface as a
         // -32603 internal_error, not panic or silently drop the structured
@@ -1026,30 +1023,83 @@ mod tests {
     }
 
     #[test]
-    fn root_uri_to_path_decodes_file_url() {
-        // A `file://` root from an MCP client must map to its absolute path,
-        // with percent-escapes decoded — otherwise a workspace path with a
-        // space resolves the wrong (or no) corpus.
-        assert_eq!(
-            root_uri_to_path("file:///Users/me/my%20repo"),
-            Some(PathBuf::from("/Users/me/my repo"))
-        );
+    fn corpus_stats_text_renders_structured_warnings() {
+        let result = CorpusStatsResult {
+            corpus: "wiki".to_string(),
+            indexed_files: 1,
+            total_chunks: 2,
+            last_indexed_ms: None,
+            unindexed_files: 3,
+            warnings: vec![
+                "include glob \"docs/**/*.md\" matched zero files".to_string(),
+                "exclude glob \"tmp/**\" matched zero files".to_string(),
+            ],
+        };
+
+        let text = render_corpus_stats_text(&result);
+        for warning in &result.warnings {
+            assert!(text.contains(warning), "text must include {warning:?}");
+        }
+        assert!(text.contains("warnings:"));
     }
 
     #[test]
-    fn root_uri_to_path_accepts_bare_absolute_path() {
-        // Clients that send a bare absolute path instead of a URL still resolve.
-        assert_eq!(
-            root_uri_to_path("/Users/me/repo"),
-            Some(PathBuf::from("/Users/me/repo"))
-        );
+    fn validate_cwd_rejects_empty() {
+        let err = validate_cwd("").expect_err("empty cwd must be rejected");
+        assert_eq!(err.code.0, -32602);
+        assert!(err.message.contains("empty"));
     }
 
     #[test]
-    fn root_uri_to_path_rejects_non_file_and_relative() {
-        // A non-`file` scheme or a relative string is not a usable cwd, so the
-        // caller falls back to the startup cwd rather than guessing.
-        assert_eq!(root_uri_to_path("https://example.com/repo"), None);
-        assert_eq!(root_uri_to_path("relative/path"), None);
+    fn validate_cwd_rejects_relative() {
+        let err = validate_cwd("relative/dir").expect_err("relative cwd must be rejected");
+        assert_eq!(err.code.0, -32602);
+        assert!(err.message.contains("absolute"));
+    }
+
+    #[test]
+    fn validate_cwd_rejects_nonexistent() {
+        let err = validate_cwd("/no/such/hallouminate-test-dir")
+            .expect_err("missing dir must be rejected");
+        assert_eq!(err.code.0, -32602);
+    }
+
+    #[test]
+    fn validate_cwd_rejects_non_directory() {
+        let file = std::env::temp_dir().join("hallouminate-validate-cwd-test-file");
+        std::fs::write(&file, b"not a dir").expect("write temp file");
+        let err = validate_cwd(file.to_str().expect("utf8 path"))
+            .expect_err("a file path is not a directory");
+        assert_eq!(err.code.0, -32602);
+        assert!(err.message.contains("directory"));
+        std::fs::remove_file(&file).expect("cleanup temp file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_cwd_rejects_inaccessible_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("create temp directory");
+        let path = dir.path();
+        for mode in [0o000, 0o400] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("remove directory search permission");
+
+            let err = validate_cwd(path.to_str().expect("utf8 path"))
+                .expect_err("an inaccessible directory must be rejected");
+            assert_eq!(err.code.0, -32602);
+            assert!(err.message.contains("not accessible"));
+        }
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("restore directory permissions");
+    }
+
+    #[test]
+    fn validate_cwd_canonicalizes_valid_directory() {
+        let dir = std::env::temp_dir();
+        let resolved = validate_cwd(dir.to_str().expect("utf8 path")).expect("valid dir accepted");
+        assert_eq!(resolved, dir.canonicalize().expect("canonicalize temp dir"));
     }
 }

@@ -46,9 +46,9 @@ pub use keywords::extract_keywords;
 pub(crate) use keywords::normalized_words;
 pub use sandbox::{
     FileEntry, SandboxError, TreeNode, WriteError, WriteErrorKind, atomic_write_no_follow,
-    build_corpus_tree, delete_no_follow, ensure_corpus_allows_file, first_corpus_root,
-    list_corpus_files, pick_corpus, read_no_follow, read_no_follow_with_mtime, resolve_read_root,
-    safe_relative_path,
+    build_corpus_tree, delete_no_follow, ensure_corpus_allows_file, ensure_corpus_allows_relative,
+    first_corpus_root, list_corpus_files, pick_corpus, read_no_follow, read_no_follow_with_mtime,
+    resolve_read_root, safe_relative_path,
 };
 pub use section::{
     LineRange, MatchError, Position, RangeError, SectionError, replace_line_range,
@@ -59,4 +59,6 @@ pub use summary::extract_summary;
 pub use validate::{
     SlugResolution, find_wikilinks, lint_markdown, lint_wikilinks, normalize_slug, resolve_slug,
 };
-pub use walker::{ScannedFile, missing_roots, scan};
+pub use walker::{
+    RuleKind, ScannedFile, SelectionWarning, missing_roots, scan, selection_warnings,
+};

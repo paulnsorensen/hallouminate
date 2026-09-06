@@ -1,14 +1,24 @@
 # MCP surface
 
-`hallouminate serve` starts a stdio MCP server. The server is stateless
-beyond its tool router and a startup-captured `cwd`; every tool call
-dials the local daemon over a Unix domain socket. Since commit
-`87a7213`, `serve` auto-spawns the daemon if no instance is up.
+`hallouminate serve` starts a stdio MCP server. The server stores its tool
+router, not a startup directory. Every tool call requires an absolute `cwd`
+for the caller's active checkout. The server validates and canonicalizes
+that directory before configuration lookup or daemon work.[^workspace-cwd]
+
+MCP roots, the startup directory, and a mutable session directory cannot
+replace `cwd`. Invalid directories produce invalid-parameter errors.
+Never pass the harness's original directory when work moves to another checkout.
+Each request carries its own directory to the local daemon.
+Since commit `87a7213`, `serve` auto-spawns the daemon if no instance is up.
+
+Document arguments use corpus-relative paths. Absolute provenance paths identify
+results but are not valid document arguments. Absolute paths and parent
+traversal remain rejected.[^workspace-path]
 
 ## Default corpus
 
 Tool calls that omit `corpus` default to the wiki for the repository
-containing the daemon's cwd — `repo:<NAME>:wiki` for the deepest
+containing the request's `cwd` — `repo:<NAME>:wiki` for the deepest
 `[[repository]]` whose `path` is an ancestor of cwd. When cwd doesn't
 sit under any configured repo, the daemon falls back to the existing
 single-corpus / ambiguity error and the caller must name a corpus
@@ -20,11 +30,13 @@ to prevent an accidental write to the wrong wiki.
 
 ## Tools
 
+Every tool requires `cwd`, in addition to the arguments listed below.
+
 ### `list_corpora`
 
 Returns every corpus the daemon knows about — explicit `[[corpus]]`
 entries plus derived `repo:NAME:wiki` and `repo:NAME:corpus` corpora
-from `[[repository]]` declarations. No params. Use this first to learn
+from `[[repository]]` declarations. Requires `cwd`. Use this first to learn
 what's available.
 
 ### `list_files`
@@ -140,7 +152,10 @@ Index health for one corpus: indexed file count, total chunk rows, the newest
 index timestamp (`last_indexed_ms`, null when never indexed), and how many
 on-disk files matching the corpus globs are not yet indexed. Param: `corpus`
 (defaults to wiki-for-cwd, same resolution as `list_files`). `structuredContent`
-is `{ corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }`.
+is `{ corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files, warnings }`.
+The `warnings` array reports zero-match include and exclude patterns per root.
+Human text renders the same advisories. An empty array means no advisories apply.
+Selection warnings do not certify index freshness.[^selection]
 
 ### `backlinks`
 
@@ -218,3 +233,9 @@ Keep one root if you can. Everything above is the cost of not doing so.
 Tool calls return `-32603` with the message "daemon unavailable: …".
 The MCP server does NOT fall back to opening a local LanceDB handle —
 that's exactly the multi-process race the daemon exists to prevent.
+
+[^workspace-cwd]: crates/hallouminate/src/mcp/tools.rs::validate_cwd and HallouminateTools::tool_setup; https://github.com/paulnsorensen/hallouminate/issues/453
+[^workspace-path]: crates/hallouminate-domain/src/corpus/sandbox.rs; crates/hallouminate/src/mcp/tools.rs::SERVER_INSTRUCTIONS
+[^selection]: crates/hallouminate-daemon/src/dispatch.rs::handle_corpus_stats; crates/hallouminate/src/mcp/tools.rs::corpus_stats
+
+_Source: issue #453 workspace path contract · Updated: 2026-09-05 · Supersedes: startup-captured MCP directory and parameterless list_corpora_

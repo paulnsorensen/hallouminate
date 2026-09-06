@@ -2708,6 +2708,7 @@ fn assert_corpus_stats_wire_shape(value: &serde_json::Value) {
             "last_indexed_ms",
             "total_chunks",
             "unindexed_files",
+            "warnings",
         ],
         "corpus stats",
     );

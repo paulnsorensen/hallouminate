@@ -33,7 +33,9 @@ Never widen an explicit source choice. Never harvest another repository's memory
 3. If no wiki exists, stop without reading memory. Tell the user to initialize the
    wiki with the hallouminate install or wiki-init workflow, then invoke this skill
    again.
-4. Keep the selected corpus explicit in every read and write tool call.
+4. Keep the selected corpus explicit in every read and write tool call. Pass
+   `cwd` as the absolute path of your own active checkout — this is the repo
+   whose wiki you write, not necessarily the memory store's canonical root.
 
 ## Discover memory safely
 

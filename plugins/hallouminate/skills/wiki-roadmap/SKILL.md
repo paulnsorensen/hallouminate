@@ -51,7 +51,8 @@ for humans:
 5. **Verify.** Confirm no unfilled `<placeholder>` text survives — an
    unfilled `created` would key the node's permanent identity to the literal
    placeholder, and import succeeds silently on it. Prefer `add_markdown` for
-   the writes (auto-reindex + ancestor link lists); otherwise run
+   the writes (auto-reindex + ancestor link lists) — pass `cwd` as your own
+   active checkout directory; otherwise run
    `hallouminate index`. If milknado is installed,
    `milknado roadmap import <slug>` now seeds the graph; goals decompose into
    tasks with `milknado_plan_batches`, and outcomes flow back with harvest.

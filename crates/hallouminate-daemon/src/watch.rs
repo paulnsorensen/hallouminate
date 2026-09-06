@@ -27,7 +27,7 @@ use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{
     CorpusConfig, CorpusKey, canonicalize_or_passthrough, expand_tilde,
 };
-use hallouminate_domain::corpus::ensure_corpus_allows_file;
+use hallouminate_domain::corpus::ensure_corpus_allows_relative;
 
 use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
@@ -669,37 +669,40 @@ async fn mtime_matches_last_index(store: &LanceStore, corpus: &CorpusConfig, pat
 /// parent) accepts only the exact declared file — never a sibling `.md` under
 /// the same parent, which `scan` would never index.
 fn owning_corpus<'r>(roots: &'r [WatchRoot], path: &Path) -> Option<&'r WatchRoot> {
-    let mut best: Option<(usize, &WatchRoot)> = None;
+    // Select the deepest geometric owner first. A rejected nested root must not
+    // fall back to a broader root that would claim the same event.
+    let mut owner: Option<(usize, &WatchRoot)> = None;
     for root in roots {
-        // notify emits canonical paths, so prefix-match against the resolved
-        // watched root — comparing against the unresolved `watched` would miss
-        // every event under a symlinked ancestor (e.g. macOS `/var`).
         if !path.starts_with(&root.canonical_watched) {
             continue;
         }
-        match &root.canonical_file_root {
-            // File-path root: only the exact declared file is a member. Compare
-            // against the canonical declared file (notify's canonical event path
-            // equals it for create/modify/delete alike — no per-event
-            // canonicalize, which would fail on the delete case where the path
-            // no longer exists).
-            Some(file) if file != path => continue,
-            // Directory root: honor the corpus' glob/exclude so a watched dir
-            // that also holds non-corpus markdown doesn't reindex files the
-            // corpus would never have scanned.
-            None if ensure_corpus_allows_file(&root.corpus, path).is_err() => continue,
-            _ => {}
+        if root
+            .canonical_file_root
+            .as_ref()
+            .is_some_and(|file| file != path)
+        {
+            continue;
         }
         let configured_root = root
             .canonical_file_root
             .as_ref()
             .unwrap_or(&root.canonical_watched);
         let depth = configured_root.components().count();
-        if best.as_ref().is_none_or(|(d, _)| depth > *d) {
-            best = Some((depth, root));
+        if owner.as_ref().is_none_or(|(current, _)| depth > *current) {
+            owner = Some((depth, root));
         }
     }
-    best.map(|(_, r)| r)
+    let (_, root) = owner?;
+
+    match &root.canonical_file_root {
+        // A file-path root watches its parent, but owns only its declared file.
+        Some(file) if file != path => None,
+        Some(_) | None => {
+            let relative = path.strip_prefix(&root.canonical_watched).ok()?;
+            ensure_corpus_allows_relative(&root.corpus, relative).ok()?;
+            Some(root)
+        }
+    }
 }
 
 /// Canonical `file_ref` to prune for a now-deleted `path`, matching the key the
@@ -807,6 +810,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejected_deepest_root_does_not_fall_back_to_broader_root() {
+        let outer = corpus("outer", "/home/u/wiki", &["**/*.md"]);
+        let inner = corpus("inner", "/home/u/wiki/private", &["**/*.txt"]);
+        let roots = vec![
+            watch_root("/home/u/wiki", outer, None),
+            watch_root("/home/u/wiki/private", inner, None),
+        ];
+
+        assert!(
+            owning_corpus(&roots, Path::new("/home/u/wiki/private/notes.md")).is_none(),
+            "a rejected deepest root must not fall back to the outer root"
+        );
+    }
+
+    #[test]
+    fn file_root_applies_include_and_exclude_rules() {
+        let cfg = corpus("config", "/home/u/.claude/CLAUDE.md", &["**/*.md"]);
+        let mut cfg = cfg;
+        cfg.exclude = vec!["CLAUDE.md".to_string()];
+        let roots = vec![watch_root(
+            "/home/u/.claude",
+            cfg,
+            Some("/home/u/.claude/CLAUDE.md"),
+        )];
+
+        assert!(
+            owning_corpus(&roots, Path::new("/home/u/.claude/CLAUDE.md")).is_none(),
+            "a file root must reject an event rejected by its selection rules"
+        );
+    }
+
+    #[test]
+    fn file_root_does_not_hide_directory_root_for_siblings() {
+        let directory = corpus("directory", "/home/u/wiki", &["**/*.md"]);
+        let file = corpus("file", "/home/u/wiki/CLAUDE.md", &["**/*.md"]);
+        let roots = vec![
+            watch_root("/home/u/wiki", directory, None),
+            watch_root("/home/u/wiki", file, Some("/home/u/wiki/CLAUDE.md")),
+        ];
+
+        assert_eq!(
+            name_of(owning_corpus(&roots, Path::new("/home/u/wiki/notes.md"))).as_deref(),
+            Some("directory"),
+            "a file root must not geometrically claim sibling events"
+        );
+    }
+
     /// The delete case (path no longer on disk) still resolves the owning
     /// corpus, since membership is a path compare, not a filesystem probe.
     #[test]
@@ -846,6 +897,27 @@ mod tests {
         assert!(
             owning_corpus(&roots, Path::new("/srv/wiki/notes.txt")).is_none(),
             "a non-glob-matched file under a dir root is not owned"
+        );
+    }
+
+    /// A root-anchored include pattern (`docs/**/*.md`, not `**/docs/**/*.md`)
+    /// must match relative to the corpus root: it admits `<root>/docs/a.md` but
+    /// rejects `<root>/libs/docs/a.md`, even though the old absolute-path match
+    /// would have accepted both (`**` in a leading position swallows any prefix,
+    /// including `libs/`). Regresses the AC-6 relativization fix in
+    /// `ensure_corpus_allows_file`.
+    #[test]
+    fn dir_root_honors_root_anchored_include_pattern() {
+        let cfg = corpus("wiki", "/srv/wiki", &["docs/**/*.md"]);
+        let roots = vec![watch_root("/srv/wiki", cfg, None)];
+        assert_eq!(
+            name_of(owning_corpus(&roots, Path::new("/srv/wiki/docs/a.md"))).as_deref(),
+            Some("wiki"),
+            "a root-anchored pattern must admit <root>/docs/a.md"
+        );
+        assert!(
+            owning_corpus(&roots, Path::new("/srv/wiki/libs/docs/a.md")).is_none(),
+            "a root-anchored pattern must reject <root>/libs/docs/a.md"
         );
     }
 

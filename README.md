@@ -142,12 +142,18 @@ cargo run -- config show                 # print the effective merged config
 
 ## MCP
 
-`hallouminate serve` starts a stdio MCP server. Tools:
+`hallouminate serve` starts a stdio MCP server. Every tool call takes a
+required `cwd` argument: the absolute path of the directory the request
+applies to. Pass your own active checkout — in a git worktree, the harness's
+original working directory is often a different checkout from the one you
+are working in, and passing the stale one silently reads and writes the
+wrong worktree. Tools:
 
 - `ground` — semantic search.
 - `index` — bulk (re)build a corpus index.
 - `corpus_stats` — index health for one corpus: indexed file count, total
-  chunk rows, newest index timestamp, and unindexed-file count.
+  chunk rows, newest index timestamp, unindexed-file count, and zero-match
+  include/exclude warnings.
 - `list_corpora` — list every configured corpus.
 - `list_files` — flat list of relative paths in a corpus.
 - `list_tree` — the same files grouped into a directory tree, for
@@ -160,6 +166,10 @@ cargo run -- config show                 # print the effective merged config
 - `delete_markdown` — unlink the file and prune its rows from the index.
 - `backlinks` — corpus-relative paths of every page that links to a given
   page via a `[[wikilink]]`.
+
+Document paths (`path` on `add_markdown`, `read_markdown`, `delete_markdown`,
+`backlinks`) are corpus-relative. Absolute paths and `..` traversal are
+rejected.
 
 Markdown content is stored verbatim — hallouminate imposes no schema.
 Convention for LLM wiki authors: one topic per file, first line `# Title`,
@@ -189,10 +199,20 @@ paths = ["~/Dev/project/docs"]
 globs = ["**/*.md", "**/*.pdf"]
 ```
 
+Include and exclude patterns match paths relative to each configured corpus
+root. For example, `docs/**/*.md` selects root-level `docs/`, not `libs/docs/`.
+Use `**/docs/**/*.md` to select both. The most-specific root owns files when
+roots overlap. A single-file root matches patterns against its file name.
+Absolute patterns are errors; no legacy matching or automatic rewrite exists.
+
+`config validate` and `corpus_stats` report patterns with zero matches as
+advisory warnings. Each warning names the corpus, root, rule kind, and pattern.
+A valid empty corpus still succeeds. These warnings do not certify index freshness.
+
 ## Cross-repo union search
 
-`ground` (and the read/list tools) resolve corpora relative to the caller's
-working directory:
+`ground` (and the read/list tools) resolve corpora relative to the directory
+passed as `cwd`:
 
 - **Inside a repo** — a `ground` call with **no explicit `corpus`** searches
   the _union_ of that repo's own `repo:<name>:wiki` with every other
@@ -200,7 +220,7 @@ working directory:
   user-declared `[[corpus]]` entries, and each repository's
   `repo:<name>:corpus` source corpus when configured — with the repo's own
   pages ranked first.
-- **Above all repos** (e.g. `cd ~/Dev`) — a `ground` call with **no explicit
+- **Above all repos** (e.g. `cwd: ~/Dev`) — a `ground` call with **no explicit
   `corpus`** searches the _union_ of every effective corpus: discovered sub-repo
   wikis + baseline-registered `[[repository]]` wikis, plus user-declared
   `[[corpus]]` entries and each repository's `repo:<name>:corpus` source corpus
@@ -210,7 +230,7 @@ working directory:
 
 The downward walk is bounded: it honours `.gitignore`, skips hidden
 directories (except `.hallouminate` itself), caps its depth, and never scans
-above the working directory. Walk-discovered wikis are deduped against the
+above the `cwd` directory. Walk-discovered wikis are deduped against the
 baseline by resolved path; a discovered local config that collides with a
 baseline repository of the same name wins, with a `cross-repo-union` warning
 on the response rather than a silent shadow.

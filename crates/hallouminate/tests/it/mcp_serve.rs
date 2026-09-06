@@ -15,7 +15,7 @@
 //! itself (initialize / tools/list) does not need a daemon — pure protocol
 //! plumbing — so tests that only exercise the handshake skip the harness.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -37,6 +37,9 @@ struct Mcp {
     // `Drop` impl — see the impl block below.
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    // Directory `rpc()` auto-injects as `arguments.cwd` on `tools/call`
+    // requests that omit it. Set from `spawn_with_cwd`'s `cwd` argument.
+    cwd: PathBuf,
 }
 
 impl Drop for Mcp {
@@ -107,46 +110,7 @@ impl Mcp {
             child,
             stdin: Some(stdin),
             stdout,
-        }
-    }
-
-    async fn rpc_with_roots(
-        &mut self,
-        id: u64,
-        method: &str,
-        params: Value,
-        roots: &[&Path],
-    ) -> Value {
-        self.send(json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": params,
-        }))
-        .await;
-        loop {
-            let msg = self.recv().await;
-            if msg.get("id").and_then(Value::as_u64) == Some(id) {
-                return msg;
-            }
-            if msg.get("method").and_then(Value::as_str) == Some("roots/list") {
-                let request_id = msg["id"].clone();
-                let roots = roots
-                    .iter()
-                    .map(|path| {
-                        json!({
-                            "uri": format!("file://{}", path.display()),
-                            "name": path.file_name().and_then(|s| s.to_str()).unwrap_or("workspace"),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                self.send(json!({
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": { "roots": roots },
-                }))
-                .await;
-            }
+            cwd: cwd.to_path_buf(),
         }
     }
 
@@ -170,7 +134,28 @@ impl Mcp {
         })
     }
 
+    /// Injects `cwd` into `tools/call` arguments that omit it, then dispatches
+    /// via `rpc_raw`. Keeps the ~15 pre-existing call sites exercising the
+    /// directory the test harness set up without per-call-site edits. Tests
+    /// asserting the `cwd` contract itself (AC-1/AC-2/AC-3/AC-4) must pass
+    /// `cwd` explicitly or use `rpc_raw` so this injection is never the thing
+    /// under test.
     async fn rpc(&mut self, id: u64, method: &str, params: Value) -> Value {
+        let params = self.inject_cwd(method, params);
+        self.rpc_raw(id, method, params).await
+    }
+
+    fn inject_cwd(&self, method: &str, mut params: Value) -> Value {
+        if method == "tools/call"
+            && let Some(args) = params.get_mut("arguments").and_then(Value::as_object_mut)
+            && !args.contains_key("cwd")
+        {
+            args.insert("cwd".to_string(), json!(self.cwd.to_string_lossy()));
+        }
+        params
+    }
+
+    async fn rpc_raw(&mut self, id: u64, method: &str, params: Value) -> Value {
         self.send(json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -185,6 +170,30 @@ impl Mcp {
                 return msg;
             }
         }
+    }
+
+    async fn rpc_batch(&mut self, requests: Vec<(u64, Value)>) -> Vec<Value> {
+        for (id, params) in &requests {
+            self.send(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": params,
+            }))
+            .await;
+        }
+        let mut responses = Vec::with_capacity(requests.len());
+        while responses.len() < requests.len() {
+            let response = self.recv().await;
+            if let Some(id) = response.get("id").and_then(Value::as_u64)
+                && requests.iter().any(|(expected, _)| *expected == id)
+                && !responses.iter().any(|seen: &Value| seen["id"] == id)
+            {
+                responses.push(response);
+            }
+        }
+        responses.sort_by_key(|response| response["id"].as_u64().unwrap_or_default());
+        responses
     }
 
     async fn notify(&mut self, method: &str, params: Value) {
@@ -296,6 +305,7 @@ fn load_minimal_config(dir: &Path) -> Config {
     // its `meta.toml` or fail with a real-store model mismatch.
     let mut cfg = Config::default();
     cfg.storage.ground_dir = dir.join("ground").to_string_lossy().into_owned();
+    cfg.embeddings.enabled = false;
     cfg
 }
 
@@ -392,6 +402,183 @@ async fn mcp_server_initialize_lists_tools_and_calls_list_corpora() {
     assert!(
         corpora.is_empty(),
         "no corpora configured in test fixture — expected empty: {corpora:?}"
+    );
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_corpus_stats_reports_selection_warnings() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+    let ground_dir = tempfile::tempdir().expect("ground tempdir");
+    let corpus_root = corpus_dir.path().to_string_lossy();
+    let config_toml = format!(
+        r#"
+[[corpus]]
+name = "wiki"
+paths = ["{corpus_root}"]
+globs = ["docs/**/*.md"]
+exclude = ["drafts/**"]
+
+[embeddings]
+enabled = false
+
+[storage]
+ground_dir = "{ground}"
+"#,
+        ground = ground_dir.path().display(),
+    );
+    let config_dir = xdg.path().join("hallouminate");
+    std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
+    std::fs::write(config_dir.join("config.toml"), &config_toml).expect("write config");
+    let cfg: Config = toml::from_str(&config_toml).expect("parse config");
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({"name": "corpus_stats", "arguments": {"corpus": "wiki"}}),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "corpus_stats errored: {call}");
+
+    let result = &call["result"];
+    let structured = &result["structuredContent"];
+    let root = corpus_dir
+        .path()
+        .canonicalize()
+        .expect("canonical corpus root");
+    let warnings = vec![
+        format!(
+            "corpus \"wiki\" root {}: include pattern \"docs/**/*.md\" matched no files",
+            root.display()
+        ),
+        format!(
+            "corpus \"wiki\" root {}: exclude pattern \"drafts/**\" matched no files",
+            root.display()
+        ),
+    ];
+    assert_eq!(structured["corpus"], "wiki");
+    assert_eq!(structured["indexed_files"], 0);
+    assert_eq!(structured["total_chunks"], 0);
+    assert_eq!(structured["last_indexed_ms"], Value::Null);
+    assert_eq!(structured["unindexed_files"], 0);
+    assert_eq!(structured["warnings"], json!(warnings));
+
+    let text = result["content"][0]["text"]
+        .as_str()
+        .expect("corpus_stats text");
+    for warning in warnings {
+        assert!(
+            text.contains(&warning),
+            "text must include warning: {warning}"
+        );
+    }
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tools_list_requires_cwd_on_every_tool() {
+    // AC-1: every advertised MCP tool schema requires `cwd`.
+    let xdg = tempfile::tempdir().expect("tempdir");
+    write_minimal_config(xdg.path());
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let list = mcp.rpc(2, "tools/list", json!({})).await;
+    assert!(list.get("error").is_none(), "tools/list errored: {list}");
+    let tools = list["result"]["tools"]
+        .as_array()
+        .expect("tools array present");
+    assert!(!tools.is_empty(), "no tools advertised: {list}");
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("?");
+        let required = tool["inputSchema"]["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("tool `{name}` inputSchema.required missing: {tool}"));
+        let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
+        assert!(
+            required.contains(&"cwd"),
+            "tool `{name}` does not require `cwd`: {required:?}"
+        );
+    }
+
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_tool_call_without_cwd_fails_before_corpus_operation() {
+    // AC-1: calls without a valid `cwd` fail before any corpus operation.
+    // Uses `rpc_raw` so `rpc()`'s auto-injection can't supply the missing
+    // argument under test. An ABSENT field fails in the schema layer, which
+    // reports `isError` on the tool result; a PRESENT but invalid value
+    // reaches `validate_cwd` and returns `-32602`
+    // (`mcp_tool_invalid_cwd_never_falls_back` covers that path). Either way
+    // no corpus data comes back.
+    let xdg = tempfile::tempdir().expect("tempdir");
+    write_minimal_config(xdg.path());
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let call = mcp
+        .rpc_raw(
+            2,
+            "tools/call",
+            json!({"name": "list_corpora", "arguments": {}}),
+        )
+        .await;
+    assert!(
+        call.to_string().contains("cwd"),
+        "the failure must name the missing `cwd` field: {call}"
+    );
+    assert_eq!(
+        call["result"]["isError"].as_bool(),
+        Some(true),
+        "missing cwd must be reported as an error: {call}"
+    );
+    assert!(
+        call["result"].get("structuredContent").is_none(),
+        "missing cwd must not return corpus data: {call}"
     );
 
     mcp.shutdown().await;
@@ -528,7 +715,12 @@ async fn mcp_list_corpora_surfaces_configured_corpora_with_names_and_paths() {
 }
 
 #[tokio::test]
-async fn mcp_tool_uses_client_root_when_process_cwd_is_not_a_repo() {
+async fn mcp_tool_explicit_cwd_governs_resolution_not_process_cwd() {
+    // AC-3: the process's own working directory never wins over an explicit
+    // `cwd`. Spawn the child with a process cwd (`home`) that is NOT a repo
+    // at all, but pass an explicit valid `cwd` pointing at a real repo
+    // workspace on the tool call — the resolved corpus must come from the
+    // argument, proving process cwd did not win.
     let xdg = tempfile::tempdir().expect("xdg tempdir");
     let home = tempfile::tempdir().expect("home tempdir");
     let repo = tempfile::tempdir().expect("repo tempdir");
@@ -544,7 +736,7 @@ async fn mcp_tool_uses_client_root_when_process_cwd_is_not_a_repo() {
         "initialize",
         json!({
             "protocolVersion": "2025-03-26",
-            "capabilities": {"roots": {"listChanged": true}},
+            "capabilities": {},
             "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
         }),
     )
@@ -552,11 +744,13 @@ async fn mcp_tool_uses_client_root_when_process_cwd_is_not_a_repo() {
     mcp.notify("notifications/initialized", json!({})).await;
 
     let call = mcp
-        .rpc_with_roots(
+        .rpc(
             2,
             "tools/call",
-            json!({"name": "list_corpora", "arguments": {}}),
-            &[&workspace],
+            json!({
+                "name": "list_corpora",
+                "arguments": {"cwd": workspace.to_string_lossy()}
+            }),
         )
         .await;
     assert!(call.get("error").is_none(), "tools/call errored: {call}");
@@ -573,7 +767,11 @@ async fn mcp_tool_uses_client_root_when_process_cwd_is_not_a_repo() {
 }
 
 #[tokio::test]
-async fn mcp_tool_falls_back_to_process_cwd_without_client_roots() {
+async fn mcp_tool_invalid_cwd_never_falls_back() {
+    // AC-3: an invalid `cwd` never falls back to anything. Process cwd IS a
+    // valid repo (`repo`) so a fallback-to-process-cwd bug would silently
+    // succeed here — asserting -32602 with no result proves the invalid
+    // argument is rejected outright, never quietly substituted.
     let xdg = tempfile::tempdir().expect("xdg tempdir");
     let repo = tempfile::tempdir().expect("repo tempdir");
     write_minimal_config(xdg.path());
@@ -593,26 +791,158 @@ async fn mcp_tool_falls_back_to_process_cwd_without_client_roots() {
     .await;
     mcp.notify("notifications/initialized", json!({})).await;
 
+    let nonexistent = repo.path().join("does-not-exist");
     let call = mcp
-        .rpc(
+        .rpc_raw(
             2,
             "tools/call",
-            json!({"name": "list_corpora", "arguments": {}}),
+            json!({
+                "name": "list_corpora",
+                "arguments": {"cwd": nonexistent.to_string_lossy()}
+            }),
         )
         .await;
-    assert!(call.get("error").is_none(), "tools/call errored: {call}");
-    let corpora = call["result"]["structuredContent"]["corpora"]
-        .as_array()
-        .expect("structuredContent.corpora is an array");
-    let names: Vec<&str> = corpora
-        .iter()
-        .filter_map(|entry| entry["name"].as_str())
-        .collect();
-    assert_eq!(names, vec!["repo:fallback:wiki"]);
+    let error = call
+        .get("error")
+        .unwrap_or_else(|| panic!("invalid cwd must error, got: {call}"));
+    assert_eq!(error["code"].as_i64(), Some(-32602), "invalid cwd: {error}");
+    assert!(
+        call.get("result").is_none(),
+        "invalid cwd must not fall back to a result: {call}"
+    );
 
     mcp.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_two_worktrees_with_identical_corpus_names_never_cross_read_or_write() {
+    // AC-2: one MCP session targets two worktrees that derive the SAME corpus
+    // name from their own repo layer. Only the per-request `cwd` distinguishes
+    // them, so a stale or shared directory would silently serve the wrong
+    // worktree's bytes. The fixture disables embeddings, so writes stay offline.
+    let xdg = tempfile::tempdir().expect("xdg tempdir");
+    let worktree_a = tempfile::tempdir().expect("worktree a");
+    let worktree_b = tempfile::tempdir().expect("worktree b");
+    write_minimal_config(xdg.path());
+    write_repo_config(worktree_a.path(), "proj");
+    write_repo_config(worktree_b.path(), "proj");
+    let body_a = "# A\n\nWorktree A content.\n";
+    let body_b = "# B\n\nWorktree B content, deliberately different.\n";
+    let wiki_a = worktree_a.path().join(".hallouminate/wiki");
+    let wiki_b = worktree_b.path().join(".hallouminate/wiki");
+    std::fs::create_dir_all(&wiki_a).expect("mkdir wiki a");
+    std::fs::create_dir_all(&wiki_b).expect("mkdir wiki b");
+    std::fs::write(wiki_a.join("notes.md"), body_a).expect("seed a");
+    std::fs::write(wiki_b.join("notes.md"), body_b).expect("seed b");
+    let harness = DaemonHarness::spawn(load_minimal_config(xdg.path())).await;
+
+    let mut mcp = Mcp::spawn_with_cwd(xdg.path(), xdg.path(), Some(harness.socket()), false).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    // Send both reads before receiving either response to exercise concurrent
+    // same-session requests with identical corpus names.
+    let reads = mcp
+        .rpc_batch(vec![
+            (
+                2,
+                json!({"name":"read_markdown","arguments":{"cwd":worktree_a.path().to_string_lossy(),"corpus":"repo:proj:wiki","path":"notes.md"}}),
+            ),
+            (
+                3,
+                json!({"name":"read_markdown","arguments":{"cwd":worktree_b.path().to_string_lossy(),"corpus":"repo:proj:wiki","path":"notes.md"}}),
+            ),
+        ])
+        .await;
+    for (call, expected, worktree) in [
+        (&reads[0], body_a, worktree_a.path()),
+        (&reads[1], body_b, worktree_b.path()),
+    ] {
+        assert!(call.get("error").is_none(), "read_markdown errored: {call}");
+        let structured = &call["result"]["structuredContent"];
+        assert_eq!(structured["corpus"].as_str(), Some("repo:proj:wiki"));
+        assert_eq!(
+            structured["content"].as_str(),
+            Some(expected),
+            "worktree {} must serve its own content, not the sibling's",
+            worktree.display()
+        );
+    }
+
+    // Send both writes before receiving either response. Embeddings stay
+    // disabled in this fixture, so the regression remains offline.
+    let writes = mcp
+        .rpc_batch(vec![
+            (
+                4,
+                json!({"name":"add_markdown","arguments":{"cwd":worktree_a.path().to_string_lossy(),"corpus":"repo:proj:wiki","path":"written.md","content":"# Written A\n"}}),
+            ),
+            (
+                5,
+                json!({"name":"add_markdown","arguments":{"cwd":worktree_b.path().to_string_lossy(),"corpus":"repo:proj:wiki","path":"written.md","content":"# Written B\n"}}),
+            ),
+        ])
+        .await;
+    assert!(
+        writes.iter().all(|call| call.get("error").is_none()),
+        "writes errored: {writes:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wiki_a.join("written.md")).expect("written A"),
+        "# Written A\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wiki_b.join("written.md")).expect("written B"),
+        "# Written B\n"
+    );
+
+    // Existing escape check remains below.
+
+    // A rejected mutation aimed at worktree A must not touch either worktree.
+    let escape = mcp
+        .rpc(
+            6,
+            "tools/call",
+            json!({
+                "name": "delete_markdown",
+                "arguments": {
+                    "cwd": worktree_a.path().to_string_lossy(),
+                    "corpus": "repo:proj:wiki",
+                    "path": "../escape.md"
+                }
+            }),
+        )
+        .await;
+    let error = escape
+        .get("error")
+        .unwrap_or_else(|| panic!("parent escape must error, got: {escape}"));
+    assert_eq!(
+        error["code"].as_i64(),
+        Some(-32602),
+        "parent escape: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wiki_a.join("notes.md")).expect("read a"),
+        body_a,
+        "worktree A must be unchanged after a rejected write"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wiki_b.join("notes.md")).expect("read b"),
+        body_b,
+        "worktree B must be unchanged after a rejected write aimed at A"
+    );
+
+    mcp.shutdown().await;
+}
 #[tokio::test]
 async fn mcp_server_returns_error_for_unknown_corpus_without_panicking() {
     // Regression: an unknown corpus argument must surface as a JSON-RPC
@@ -1011,7 +1341,7 @@ async fn mcp_read_markdown_defaults_corpus_to_repo_wiki_when_omitted() {
         "initialize",
         json!({
             "protocolVersion": "2025-03-26",
-            "capabilities": {"roots": {"listChanged": true}},
+            "capabilities": {},
             "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
         }),
     )
@@ -1019,16 +1349,20 @@ async fn mcp_read_markdown_defaults_corpus_to_repo_wiki_when_omitted() {
     mcp.notify("notifications/initialized", json!({})).await;
 
     // Omitting `corpus` must resolve to the wiki of the repo containing the
-    // client's workspace root — not fail with a missing-field schema error.
+    // request's explicit `cwd` — not fail with a missing-field schema error.
+    // Process cwd (`home`) is not a repo at all, proving the explicit `cwd`
+    // argument, not process cwd, governs resolution.
     let call = mcp
-        .rpc_with_roots(
+        .rpc(
             2,
             "tools/call",
             json!({
                 "name": "read_markdown",
-                "arguments": {"path": "cheeses/halloumi.md"}
+                "arguments": {
+                    "cwd": workspace.to_string_lossy(),
+                    "path": "cheeses/halloumi.md"
+                }
             }),
-            &[&workspace],
         )
         .await;
     assert!(call.get("error").is_none(), "read_markdown errored: {call}");
@@ -1041,6 +1375,62 @@ async fn mcp_read_markdown_defaults_corpus_to_repo_wiki_when_omitted() {
     mcp.shutdown().await;
 }
 
+#[tokio::test]
+async fn mcp_read_markdown_rejects_absolute_path_argument() {
+    // AC-4: document arguments are corpus-relative. An absolute path is not a
+    // permitted document argument even when it names a real file, and even
+    // when that file sits inside the corpus root — absolute paths identify
+    // results in provenance fields, never inputs.
+    let xdg = tempfile::tempdir().expect("xdg tempdir");
+    let corpus = tempfile::tempdir().expect("corpus tempdir");
+    let inside = corpus.path().join("halloumi.md");
+    std::fs::write(&inside, "# Halloumi\n").expect("seed corpus file");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+
+    let mut mcp = Mcp::spawn(xdg.path(), Some(harness.socket())).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    for (id, absolute) in [
+        (2, inside.to_string_lossy().into_owned()),
+        (3, "/etc/passwd".to_string()),
+    ] {
+        let call = mcp
+            .rpc(
+                id,
+                "tools/call",
+                json!({
+                    "name": "read_markdown",
+                    "arguments": {"corpus": "wiki", "path": absolute}
+                }),
+            )
+            .await;
+        let error = call
+            .get("error")
+            .unwrap_or_else(|| panic!("absolute path {absolute} must error, got: {call}"));
+        assert_eq!(
+            error["code"].as_i64(),
+            Some(-32602),
+            "absolute path {absolute}: {error}"
+        );
+        assert!(
+            call.get("result").is_none(),
+            "absolute path {absolute} must not return a result: {call}"
+        );
+    }
+
+    mcp.shutdown().await;
+}
 #[cfg(unix)]
 #[tokio::test]
 async fn mcp_read_markdown_rejects_symlink_inside_corpus() {

@@ -6,6 +6,26 @@ globs) into a list of `(FileRef, Mtime)` pairs. Lives at
 fix in `39c3908`), it's built on BurntSushi's `ignore` crate — the
 same gitignore-aware walker ripgrep uses — instead of `walkdir`.
 
+## Root-relative selection
+
+Include and exclude patterns match paths relative to the most-specific owning
+corpus root. Ownership resolves before rule evaluation. Rejection does not transfer
+a file to a broader overlapping root.[^relative]
+
+`docs/**/*.md` selects `docs/start.md`, not `libs/docs/start.md`.
+`**/docs/**/*.md` selects both. A single-file root matches its file name.
+Absolute patterns are errors. No legacy matching or automatic rewrite exists.
+Exclude rules still win over include rules.
+
+`config validate` and `corpus_stats` report zero-match patterns as advisory warnings.
+Each warning identifies the corpus, canonical root, rule kind, and original pattern.
+A valid empty corpus succeeds with advisories.[^warnings]
+
+Include counts follow traversal filters but precede include and exclude selection.
+Exclude counts use include-eligible files before any exclude rule applies.
+Each rule counts independently. Missing roots retain their separate diagnostic.
+Selection warnings do not certify index coverage or revision freshness.
+
 ## Gitignore-aware by default
 
 The walker honors `.gitignore`, `.ignore`, `.git/info/exclude`, and the
@@ -74,3 +94,8 @@ corpus_exclude = [
 ]
 # target/, .cheese/, ralphs/, .code-review-graph/ are filtered by .gitignore.
 ```
+
+[^relative]: crates/hallouminate-domain/src/corpus/walker.rs::walk_owned_entries and walk_root; https://github.com/paulnsorensen/hallouminate/issues/453
+[^warnings]: crates/hallouminate-domain/src/corpus/walker.rs::selection_warnings; crates/hallouminate/src/cli/config.rs::selection_advisories; crates/hallouminate-daemon/src/dispatch.rs::handle_corpus_stats
+
+_Source: issue #453 workspace path contract · Updated: 2026-09-05 · Supersedes: absolute-path glob matching_

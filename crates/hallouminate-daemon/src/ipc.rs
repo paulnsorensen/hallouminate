@@ -300,6 +300,13 @@ pub struct CorpusStatsResult {
     pub total_chunks: u64,
     pub last_indexed_ms: Option<i64>,
     pub unindexed_files: u64,
+    /// Configured include/exclude glob patterns that matched zero files on
+    /// disk, rendered via `SelectionWarning::Display`. Always present (an
+    /// empty array means no dead rules) — unlike `BacklinksResult::warnings`,
+    /// this field is not omitted when empty, so callers can rely on its
+    /// presence to distinguish "checked, found none" from an older daemon.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// `Ping` reply payload (Curd C — cross-version daemon skew). Carries the
