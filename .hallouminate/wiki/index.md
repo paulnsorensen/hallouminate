@@ -20,7 +20,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [daemon-canonical-identity-003](daemon-canonical-identity-003.md) — store-lock owner diagnostics: what the `store.lock` metadata names, and why a second advisory guard proves it is current.
 - [debt-observed-test-isolation](debt-observed-test-isolation.md) — why the process-wide `debt::OBSERVED` static makes any Hard-recording test break concurrent maintenance-defer tests.
 - [design-rationale](design-rationale.md) — what hallouminate deliberately *is* and *isn't*, and why — the "why this design not that one" page.
-- [domain-model](domain-model.md) — the `search_text`, root-aware `CorpusKey`, and schema-v4 model that shipped in #290 (issue #288's design).
+- [domain-model](domain-model.md) — the `search_text`, root-aware `CorpusKey`, and schema-v4 model that shipped in #290 (issue #288's design), plus the shipped `Provisioner`/donor vocabulary from #430.
 - [eval-baseline-rg-provenance-adrs](eval-baseline-rg-provenance-adrs.md) — why the eval was re-baselined with the divergence unexplained, and why ripgrep's version is recorded but never enforced.
 - [eval-harness-gotchas](eval-harness-gotchas.md) — operational traps running the ground-retrieval eval: ripgrep as an uninstalled hard dependency, the warning-code taxonomy three crates own, the discarded warmup sweep, and ETXTBSY in parallel tests.
 - [ground-search-evaluation](ground-search-evaluation.md) — discriminative file/chunk relevance metrics, latency thresholds, small-reranker comparison, and scheduled regression gate.
@@ -28,7 +28,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [ground-search-quality-adrs](ground-search-quality-adrs.md) — five decisions and their research basis for issue #288; ADR-001/002/003/005 shipped in #290, ADR-004's reranker default stayed opt-in.
 - [ground-signal-fusion-adrs](ground-signal-fusion-adrs.md) — the post-#290 ranking audit: why weighted RRF over four peer signals moved into the domain layer, why the shipped 0.5/0.5 literal weights were kept, and why the literal signals only reorder the FTS/vector pool.
 - [log](log.md) — append-only ingest log: what each wiki-ingest run wrote, merged, skipped as a near-duplicate, or flagged as conflicting, and why.
-- [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis, including `add_markdown`'s surgical edit modes and the multi-root read/write asymmetry.
+- [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis: every call requires an absolute `cwd` (#453), `ground`'s default corpus unions every configured corpus with a repo-local ranking guard (#425/#426), plus `add_markdown`'s surgical edit modes and the multi-root read/write asymmetry.
 - [multi-format-ingestion](multi-format-ingestion.md) — the shipped Phase 1 per-format dispatch (markdown/text/RST/spreadsheet), why the wiki corpus stays markdown-only, and what (PDF/office/code) is still deferred.
 - [not-found-suggestions](not-found-suggestions.md) — how an unknown-corpus error and a `read_markdown` path miss self-enrich with `strsim` closest-match hints so a caller recovers in zero extra round trips.
 - [office-prose-extraction](office-prose-extraction.md) — deferred/future-phase plan for .docx/.pptx/.odt prose extraction (not shipped today).
@@ -44,6 +44,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
 - [worktree-corpus-identity](worktree-corpus-identity.md) — #215's root-scoped delete fix, the #290 root-aware identity that closed the sibling-worktree search leak, and #304's retired-root garbage collection.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
+- [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md) — ADRs for the shipped #427/#430 work: a dedicated Provisioner task catches up new worktree roots on discovery, file-level vector donor reuse keyed by `content_hash`, and why root GC (#427 part 4) was dropped as already shipped in #304.
 
 ## How to use this index
 

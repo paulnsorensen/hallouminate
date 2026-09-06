@@ -59,3 +59,8 @@
 - 2026-09-05 · aed65466a6521ab0 · merged · corpus-walker.md · Root-relative patterns, ownership, and independent selection warnings.
 - 2026-09-05 · aed65466a6521ab0 · merged · worktree-dev-gotchas.md · Mise shims override the pinned verification toolchain.
 
+
+- 2026-09-06 · wiki-harvest-hallouminate-20260906 · merged · index.md · added missing worktree-index-provisioning-adr entry; refreshed domain-model and mcp-surface glosses for #430 (shipped) and #453 (required cwd) / #425-#426 (union ranking)
+- 2026-09-06 · wiki-harvest-hallouminate-20260906 · fixed-stale · domain-model.md · Worktree-index-provisioning terms said "PR #430 is open"; PR #430 merged 2026-08-30 (confirmed in git log) — corrected to shipped
+- 2026-09-06 · wiki-harvest-hallouminate-20260906 · merged · mcp-surface.md · documented #425/#426: a corpus-less `ground` now unions every configured corpus (not just the repo-local wiki), plus the new `RESERVED_LOCAL_SLOTS` repo-local ranking guard in `ground_union`
+- 2026-09-06 · wiki-harvest-hallouminate-20260906 · fixed-stale · pdf-ocr-ingestion.md · cited `pdf-extract` 0.10; a renovate bump moved the dependency to 0.12 with no call-site change

@@ -17,16 +17,24 @@ traversal remain rejected.[^workspace-path]
 
 ## Default corpus
 
-Tool calls that omit `corpus` default to the wiki for the repository
-containing the request's `cwd` — `repo:<NAME>:wiki` for the deepest
-`[[repository]]` whose `path` is an ancestor of cwd. When cwd doesn't
-sit under any configured repo, the daemon falls back to the existing
-single-corpus / ambiguity error and the caller must name a corpus
-explicitly. This applies to every read-side tool — `ground`, `list_files`,
-`list_tree`, `corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown`,
-which now defaults `corpus` to wiki-for-cwd like its peers. Only the mutating
-tools (`add_markdown`, `delete_markdown`) still require an explicit `corpus`,
-to prevent an accidental write to the wrong wiki.
+`list_files`, `list_tree`, `corpus_stats`, `backlinks`, and `read_markdown`
+default an omitted `corpus` to the wiki for the repository containing the
+request's `cwd` — `repo:<NAME>:wiki` for the deepest `[[repository]]` whose
+`path` is an ancestor of cwd. When cwd doesn't sit under any configured
+repo, the daemon falls back to the existing single-corpus / ambiguity error
+and the caller must name a corpus explicitly. Only the mutating tools
+(`add_markdown`, `delete_markdown`) still require an explicit `corpus`, to
+prevent an accidental write to the wrong wiki.
+
+`ground` follows a different rule (issues #425/#426): an omitted `corpus`
+always unions **every** effective corpus — the cwd's own repo wiki, every
+other `[[repository]]` wiki, user-declared `[[corpus]]` entries, and each
+repository's `repo:<name>:corpus` source corpus when configured — not just
+the repo-local wiki. This closed a gap where an agent inside a repo, who
+almost never passes `corpus`, never saw globally declared knowledge by
+default. An explicit `corpus` still pins `ground` to exactly that one
+corpus, same as every other tool. See [Cross-repo union
+ranking](#cross-repo-union-ranking) for how the merged results are ordered.
 
 ## Tools
 
@@ -59,9 +67,10 @@ reading every `index.md` first.
 Semantic search. Embeds the query with the configured embeddings model
 (default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from LanceDB,
 rolls up per-file with breadcrumb context. Params: `query` (required),
-`corpus` (defaults to wiki-for-cwd), `top_files`, `chunks_per_file`,
-`limit`, `snippet_chars`, `footnotes`. Returns a ripgrep-style outline in
-`content` and the full structured response in `structuredContent.docs`.
+`corpus` (omitted ⇒ unions every effective corpus — see [Default
+corpus](#default-corpus)), `top_files`, `chunks_per_file`, `limit`,
+`snippet_chars`, `footnotes`. Returns a ripgrep-style outline in `content`
+and the full structured response in `structuredContent.docs`.
 
 `footnotes` (`include` default / `exclude` / `only`, defined at
 `crates/hallouminate-domain/src/footnotes.rs`) controls footnote visibility in
@@ -69,6 +78,26 @@ snippets only — it is a display filter, not a retrieval one. First-stage
 retrieval already runs on footnote-stripped `search_text`, so `exclude` does
 not change which chunks come back, only what you are shown; `only` is the
 cheap way to pull a page's citation targets without reading the page.
+
+## Cross-repo union ranking
+
+When `ground` unions multiple corpora (see [Default corpus](#default-corpus)),
+results are pure global score order with one exception: the searcher's own
+repo wiki gets a ranking guard so a few high-scoring neighbor-corpus hits
+cannot fully crowd it out of the response (#425).
+
+- Equal-score ties favor the repo-local corpus over any other.
+- Up to `RESERVED_LOCAL_SLOTS` (2, a compile-time constant) of the
+  repo-local corpus's top-scoring docs survive the `top_files` cut even
+  when their global score falls outside it — promoted by swapping out the
+  lowest-ranked non-local docs still inside the cut.
+- The guard only applies when `ground` knows which corpus is repo-local (a
+  corpus-less request run from inside a configured repo). An
+  above-all-repos union (`cwd` above every repo) has no repo-local corpus,
+  so it keeps the older pure-score order unchanged.
+
+`crates/hallouminate-domain/src/ground/orchestrate.rs::ground_union` and
+its `rollup_order` comparator implement this guard.
 
 ### `add_markdown`
 
@@ -238,4 +267,4 @@ that's exactly the multi-process race the daemon exists to prevent.
 [^workspace-path]: crates/hallouminate-domain/src/corpus/sandbox.rs; crates/hallouminate/src/mcp/tools.rs::SERVER_INSTRUCTIONS
 [^selection]: crates/hallouminate-daemon/src/dispatch.rs::handle_corpus_stats; crates/hallouminate/src/mcp/tools.rs::corpus_stats
 
-_Source: issue #453 workspace path contract · Updated: 2026-09-05 · Supersedes: startup-captured MCP directory and parameterless list_corpora_
+_Source: issue #453 workspace path contract, issues #425/#426 cross-repo union ranking · Updated: 2026-09-06 · Supersedes: startup-captured MCP directory, parameterless list_corpora, and a `ground` default scoped to only the repo-local wiki_
