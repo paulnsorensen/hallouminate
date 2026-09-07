@@ -2431,6 +2431,28 @@ mod tests {
         assert!(second.rerank("q", &mut []).is_ok());
         assert_eq!(initializations.load(Ordering::SeqCst), 2);
     }
+    #[test]
+    fn crossencoder_guard_updates_last_use_on_drop() {
+        let last_use_secs = Arc::new(AtomicU64::new(1));
+        let before_drop = monotonic_secs();
+        let initialize: CrossencoderInitializer =
+            Arc::new(|| Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>));
+        let model = Arc::new(StdMutex::new(CrossencoderSlot {
+            model: None,
+            initialize,
+        }));
+
+        drop(CrossencoderGuard {
+            model,
+            last_use_secs: Arc::clone(&last_use_secs),
+        });
+
+        let observed = last_use_secs.load(Ordering::Relaxed);
+        assert!(
+            observed >= before_drop,
+            "drop should stamp crossencoder use at or after guard lifetime start: observed {observed}, before {before_drop}",
+        );
+    }
 
     #[tokio::test]
     async fn prune_stale_backups_removes_dirs_at_or_past_max_age() {
