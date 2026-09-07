@@ -24,6 +24,8 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+use std::sync::{Condvar, Mutex as StdMutex};
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -50,6 +52,114 @@ use super::supervisor::SupervisorAction;
 
 pub(crate) const CHUNK_BUDGET_TOKENS: usize = 384;
 
+/// Maximum number of daemon-wide Ground coverage checks that may run at once.
+pub(crate) const MAX_CONCURRENT_COVERAGE_CHECKS: usize = 6;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CoverageProbe {
+    active_store: Arc<AtomicUsize>,
+    max_store: Arc<AtomicUsize>,
+    active_walk: Arc<AtomicUsize>,
+    max_walk: Arc<AtomicUsize>,
+    walk_release: Arc<(StdMutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+impl Default for CoverageProbe {
+    fn default() -> Self {
+        Self {
+            active_store: Arc::new(AtomicUsize::new(0)),
+            max_store: Arc::new(AtomicUsize::new(0)),
+            active_walk: Arc::new(AtomicUsize::new(0)),
+            max_walk: Arc::new(AtomicUsize::new(0)),
+            walk_release: Arc::new((StdMutex::new(true), Condvar::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CoveragePhaseGuard {
+    active: Arc<AtomicUsize>,
+    activity: Arc<(StdMutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+impl Drop for CoveragePhaseGuard {
+    fn drop(&mut self) {
+        let (activity, wake) = &*self.activity;
+        let _activity = activity.lock().expect("coverage probe lock");
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl CoverageProbe {
+    fn enter(
+        active: &Arc<AtomicUsize>,
+        maximum: &Arc<AtomicUsize>,
+        activity: &Arc<(StdMutex<bool>, Condvar)>,
+    ) -> CoveragePhaseGuard {
+        let (activity_lock, wake) = &**activity;
+        let _activity = activity_lock.lock().expect("coverage probe lock");
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(current, Ordering::SeqCst);
+        wake.notify_all();
+        CoveragePhaseGuard {
+            active: Arc::clone(active),
+            activity: Arc::clone(activity),
+        }
+    }
+
+    pub(crate) fn enter_store(&self) -> CoveragePhaseGuard {
+        Self::enter(&self.active_store, &self.max_store, &self.walk_release)
+    }
+
+    pub(crate) fn enter_walk(&self) -> CoveragePhaseGuard {
+        Self::enter(&self.active_walk, &self.max_walk, &self.walk_release)
+    }
+
+    pub(crate) fn block_walk(&self) {
+        let (release, _) = &*self.walk_release;
+        *release.lock().expect("coverage probe lock") = false;
+    }
+
+    pub(crate) fn release_walk(&self) {
+        let (release, wake) = &*self.walk_release;
+        *release.lock().expect("coverage probe lock") = true;
+        wake.notify_all();
+    }
+
+    pub(crate) fn wait_for_walk_release(&self) {
+        let (release, wake) = &*self.walk_release;
+        let mut released = release.lock().expect("coverage probe lock");
+        while !*released {
+            released = wake.wait(released).expect("coverage probe lock");
+        }
+    }
+
+    pub(crate) fn wait_for_active_walks(&self, expected: usize) -> bool {
+        let (activity, wake) = &*self.walk_release;
+        let mut activity = activity.lock().expect("coverage probe lock");
+        while self.active_walk.load(Ordering::SeqCst) < expected && !*activity {
+            activity = wake.wait(activity).expect("coverage probe lock");
+        }
+        self.active_walk.load(Ordering::SeqCst) >= expected
+    }
+
+    pub(crate) fn active_walk(&self) -> usize {
+        self.active_walk.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn max_walk(&self) -> usize {
+        self.max_walk.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn max_store(&self) -> usize {
+        self.max_store.load(Ordering::SeqCst)
+    }
+}
 /// Backup ground-store directories (`<ground>.bak-v{N}`, left behind by
 /// `move_stale_store` on a schema-version rebuild) older than this are
 /// pruned at daemon boot; they're recoverable-until-pruned, not permanent.
@@ -193,6 +303,10 @@ struct DaemonStateInner {
     store_lock_owner: StoreLockOwner,
     corpus_locks: KeyedLockMap<String>,
     write_lane: Arc<Semaphore>,
+    /// Daemon-wide gate for filesystem and indexed-path coverage work.
+    coverage_gate: Arc<Semaphore>,
+    #[cfg(test)]
+    coverage_probe: Arc<CoverageProbe>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
     /// A per-model cache (rather than a single slot) so that repos
     /// selecting different `[search].crossencoder` models via repo-layer
@@ -518,6 +632,7 @@ impl DaemonState {
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
         let write_lane = Arc::new(Semaphore::new(1));
+        let coverage_gate = Arc::new(Semaphore::new(MAX_CONCURRENT_COVERAGE_CHECKS));
 
         // #161's idle eviction is deleted (ADR-001): dropping the ONNX session
         // released nothing (the CPU BFCArena retains its extents), so each
@@ -607,6 +722,9 @@ impl DaemonState {
                     corpus_locks: KeyedLockMap::default(),
                     store_lock_owner,
                     write_lane,
+                    coverage_gate,
+                    #[cfg(test)]
+                    coverage_probe: Arc::new(CoverageProbe::default()),
                     crossencoders: crossencoders_arc,
                     last_activity_secs: last_activity,
                     active_connections: Arc::new(AtomicUsize::new(0)),
@@ -759,6 +877,15 @@ impl DaemonState {
         self.inner.baseline_resources.embeddings_enabled
     }
 
+    /// Return the daemon-wide Ground coverage admission gate.
+    pub(crate) fn coverage_gate(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.inner.coverage_gate)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coverage_probe(&self) -> Arc<CoverageProbe> {
+        Arc::clone(&self.inner.coverage_probe)
+    }
     /// Per-request resource seam (B2+B3): resolve (or lazily build) the
     /// `RequestResources` for the effective config's `(ground_dir, model,
     /// quantized, enabled)` key. A repo-layer override of any of those

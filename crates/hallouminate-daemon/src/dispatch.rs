@@ -57,6 +57,8 @@ use super::ipc::{
     ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest,
     ReadMarkdownResult,
 };
+#[cfg(test)]
+use super::state::MAX_CONCURRENT_COVERAGE_CHECKS;
 use super::state::{DaemonState, RequestResources, WorkClass};
 use super::status;
 use super::watch::{ConfigSource, register_runtime_corpora};
@@ -312,7 +314,7 @@ async fn handle_corpus_stats(
         total_chunks += chunk_stats.total_chunks;
         last_indexed_ms = last_indexed_ms.max(chunk_stats.last_indexed_ms);
     }
-    let (covered, total) = match corpus_coverage(store, &corpus_cfg).await {
+    let (covered, total) = match corpus_coverage(state, store, &corpus_cfg).await {
         Ok(c) => c,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
@@ -342,20 +344,43 @@ async fn handle_corpus_stats(
 /// vs. indexed primitive: `handle_corpus_stats` derives `unindexed_files`
 /// from it and `handle_ground` derives the #427 coverage warning.
 async fn corpus_coverage(
+    state: &DaemonState,
     store: &LanceStore,
     corpus_cfg: &CorpusConfig,
 ) -> anyhow::Result<(u64, u64)> {
+    let permit = state
+        .coverage_gate()
+        .acquire_owned()
+        .await
+        .expect("coverage gate remains open while daemon runs");
+    #[cfg(test)]
+    let coverage_probe = state.coverage_probe();
+    #[cfg(test)]
+    let store_phase = coverage_probe.enter_store();
     let mut indexed_paths = std::collections::HashSet::new();
     for corpus_key in corpus_cfg.corpus_keys() {
         for snapshot in store.list_files(&corpus_key).await? {
             indexed_paths.insert(snapshot.file_ref);
         }
     }
+    #[cfg(test)]
+    drop(store_phase);
     ensure_paths_exist(corpus_cfg).await;
     // The directory walk is synchronous (ignore::WalkBuilder); keep it off the
     // async workers — `ground` runs this check on every request.
     let walk_cfg = corpus_cfg.clone();
-    let disk_files = tokio::task::spawn_blocking(move || list_corpus_files(&walk_cfg)).await??;
+    let disk_files = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        #[cfg(test)]
+        let walk_phase = coverage_probe.enter_walk();
+        #[cfg(test)]
+        coverage_probe.wait_for_walk_release();
+        let result = list_corpus_files(&walk_cfg);
+        #[cfg(test)]
+        drop(walk_phase);
+        result
+    })
+    .await??;
     let total = disk_files.len() as u64;
     let covered = disk_files
         .iter()
@@ -406,6 +431,7 @@ fn register_for_request(
 type CoverageSlot = Option<(CorpusConfig, anyhow::Result<(u64, u64)>)>;
 
 async fn collect_coverage_warnings(
+    state: &DaemonState,
     store: &std::sync::Arc<LanceStore>,
     coverage_targets: &[CorpusConfig],
 ) -> Vec<Warning> {
@@ -416,9 +442,10 @@ async fn collect_coverage_warnings(
     // to `coverage_targets`' order below.
     let mut coverage_tasks = tokio::task::JoinSet::new();
     for (idx, corpus) in coverage_targets.iter().cloned().enumerate() {
+        let state = state.clone();
         let store = store.clone();
         coverage_tasks.spawn(async move {
-            let coverage = corpus_coverage(store.as_ref(), &corpus).await;
+            let coverage = corpus_coverage(&state, store.as_ref(), &corpus).await;
             (idx, corpus, coverage)
         });
     }
@@ -511,7 +538,7 @@ async fn handle_ground(
         },
         None => corpora.clone(),
     };
-    let coverage_warnings = collect_coverage_warnings(store, &coverage_targets).await;
+    let coverage_warnings = collect_coverage_warnings(state, store, &coverage_targets).await;
     state.provisioner().observe(&corpora, cfg);
     let opts = ground_opts(cfg, &req);
 
@@ -3136,6 +3163,102 @@ mod tests {
             panic!("ground must succeed: {resp:?}");
         };
         serde_json::from_value(result).expect("parse GroundResult")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ground_coverage_caps_real_scans_and_releases_cancelled_walks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (corpus_dir, state) = coverage_state(tmp.path()).await;
+        std::fs::write(corpus_dir.join("pending.md"), "# Pending\n\ncontent\n")
+            .expect("write pending");
+        let gate = state.coverage_gate();
+        let probe = state.coverage_probe();
+        probe.block_walk();
+        struct WalkReleaseGuard {
+            probe: std::sync::Arc<crate::state::CoverageProbe>,
+            released: bool,
+        }
+        impl WalkReleaseGuard {
+            fn release(&mut self) {
+                if !self.released {
+                    self.probe.release_walk();
+                    self.released = true;
+                }
+            }
+        }
+        impl Drop for WalkReleaseGuard {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+        let mut walk_release = WalkReleaseGuard {
+            probe: std::sync::Arc::clone(&probe),
+            released: false,
+        };
+        async fn wait_for_active_walks(
+            probe: std::sync::Arc<crate::state::CoverageProbe>,
+            expected: usize,
+        ) {
+            let reached = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || probe.wait_for_active_walks(expected)),
+            )
+            .await
+            .expect("coverage walk admission must make progress")
+            .expect("coverage walk wait must not panic");
+            assert!(
+                reached,
+                "coverage walk admission was released before the target"
+            );
+        }
+
+        let mut requests = Vec::new();
+        for expected_active in 1..=MAX_CONCURRENT_COVERAGE_CHECKS {
+            let request_state = state.clone();
+            let cwd = tmp.path().to_path_buf();
+            requests.push(tokio::spawn(async move {
+                ground_coverage_corpus(&request_state, &cwd).await
+            }));
+            wait_for_active_walks(std::sync::Arc::clone(&probe), expected_active).await;
+            assert_eq!(probe.active_walk(), expected_active);
+        }
+
+        let request_state = state.clone();
+        let cwd = tmp.path().to_path_buf();
+        requests.push(tokio::spawn(async move {
+            ground_coverage_corpus(&request_state, &cwd).await
+        }));
+        wait_for_active_walks(
+            std::sync::Arc::clone(&probe),
+            MAX_CONCURRENT_COVERAGE_CHECKS,
+        )
+        .await;
+        assert_eq!(probe.active_walk(), MAX_CONCURRENT_COVERAGE_CHECKS);
+        assert_eq!(probe.max_walk(), MAX_CONCURRENT_COVERAGE_CHECKS);
+        assert!(probe.max_store() > 0);
+        assert!(probe.max_store() <= MAX_CONCURRENT_COVERAGE_CHECKS);
+        for request in &requests {
+            assert!(!request.is_finished());
+        }
+        assert_eq!(gate.available_permits(), 0);
+
+        requests[0].abort();
+        let cancelled = requests
+            .remove(0)
+            .await
+            .expect_err("aborted coverage request must cancel");
+        assert!(cancelled.is_cancelled());
+        assert_eq!(probe.active_walk(), MAX_CONCURRENT_COVERAGE_CHECKS);
+        assert_eq!(gate.available_permits(), 0);
+
+        walk_release.release();
+        for request in requests {
+            let result = request
+                .await
+                .expect("remaining coverage request must complete");
+            assert_eq!(result.response.query, "content");
+        }
+        assert_eq!(gate.available_permits(), MAX_CONCURRENT_COVERAGE_CHECKS);
     }
 
     /// WHY (#427 part 2): when a queried corpus's index trails its on-disk
