@@ -40,9 +40,9 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
@@ -270,6 +270,24 @@ impl ResourceKey {
     }
 }
 
+type CrossencoderInitializer =
+    Arc<dyn Fn() -> hallouminate_domain::common::Result<Box<dyn Crossencoder>> + Send + Sync>;
+
+struct CrossencoderSlot {
+    model: Option<Box<dyn Crossencoder>>,
+    initialize: CrossencoderInitializer,
+}
+
+fn crossencoder_initializer(model_name: String, cache_dir: PathBuf) -> CrossencoderInitializer {
+    Arc::new(move || {
+        FastembedCrossencoder::try_new(&model_name, &cache_dir)
+            .map(|model| Box::new(model) as Box<dyn Crossencoder>)
+            .map_err(|error| {
+                HallouminateError::Embed(format!("init crossencoder ({model_name}): {error}"))
+            })
+    })
+}
+
 /// Resources effective for one repo-layer config. Keyed cache entry —
 /// mirrors the `crossencoders: Arc<Mutex<HashMap<..>>>` cache precedent.
 pub struct RequestResources {
@@ -332,8 +350,8 @@ struct DaemonStateInner {
     /// selecting different `[search].crossencoder` models via repo-layer
     /// config each get their own loaded model instead of clobbering a
     /// shared one. Empty until the first `ground` request that resolves a
-    /// configured model; the baseline model (if any) is pre-warmed at boot.
-    crossencoders: Arc<Mutex<HashMap<String, FastembedCrossencoder>>>,
+    /// configured model names each get a lazily initialized, independently locked slot.
+    crossencoders: Arc<Mutex<HashMap<String, Arc<StdMutex<CrossencoderSlot>>>>>,
     /// Monotonic (`Instant`-based) seconds-since-process-start timestamp of
     /// completion (handle_connection) plus embedder/crossencoder acquire and
     /// guard drop. Idle-exit (server.rs) fires when this is quiet for
@@ -619,35 +637,10 @@ impl DaemonState {
                 "failed to prune stale ground store backups",
             );
         }
-        // Pre-warm the baseline crossencoder iff configured; tolerate
-        // failure so a misconfigured model name (or offline first run)
-        // doesn't brick the daemon. The cache stays empty for that model
-        // and a later `crossencoder()` call retries the load. Per-request
-        // repo-layer models are loaded lazily on first use, keyed by name.
-        let mut crossencoders: HashMap<String, FastembedCrossencoder> = HashMap::new();
-        if let Some(model) = cfg.search.crossencoder.as_deref() {
-            match canonical_crossencoder_model(model)
-                .map_err(anyhow::Error::from)
-                .and_then(|canonical| {
-                    FastembedCrossencoder::try_new(canonical, &cache_dir)
-                        .map(|c| (canonical, c))
-                        .map_err(anyhow::Error::from)
-                }) {
-                Ok((canonical, c)) => {
-                    crossencoders.insert(canonical.to_string(), c);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        model = %model,
-                        error = %e,
-                        "crossencoder unavailable at startup; ground will skip rerank until reload",
-                    );
-                }
-            }
-        }
+        // Keep model construction lazy. The rerank blocking-pool task owns
+        // construction and the per-model slot for the configured deadline.
+        let crossencoders = Arc::new(Mutex::new(HashMap::new()));
         let shutdown = CancellationToken::new();
-        let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
         let write_lane = Arc::new(Semaphore::new(1));
@@ -730,7 +723,7 @@ impl DaemonState {
                     coverage_gate,
                     #[cfg(test)]
                     coverage_probe: Arc::new(CoverageProbe::default()),
-                    crossencoders: crossencoders_arc,
+                    crossencoders,
                     last_activity_secs: last_activity,
                     active_connections: Arc::new(AtomicUsize::new(0)),
                     external_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
@@ -982,14 +975,13 @@ impl DaemonState {
         Ok(resources)
     }
 
-    /// Borrow the crossencoder for the model named by the per-request
-    /// resolved config, loading it lazily on first use and caching it by
-    /// canonical model name. Pass `None` (no model configured for this
-    /// request) to skip reranking — returns `Ok(None)`. Returns `Err`
-    /// when a configured model name is unknown or fails to load; the
-    /// caller logs and falls back to fusion-only ranking. Resolving from
-    /// the per-request `cfg.search.crossencoder` (not the baseline) is
-    /// what lets repo-layer `[search].crossencoder` overrides take effect.
+    /// Admit the crossencoder named by the per-request resolved config. This
+    /// operation validates the canonical name without constructing native state.
+    /// Pass `None` to skip reranking and receive `Ok(None)`. Unknown model names
+    /// return `Err`; initialization failures return from the bounded rerank task.
+    /// The model is constructed lazily on the blocking pool and cached by name.
+    /// Resolving from per-request `cfg.search.crossencoder` lets repo-layer
+    /// `[search].crossencoder` overrides take effect without daemon restart.
     pub async fn crossencoder(
         &self,
         model_name: Option<&str>,
@@ -997,25 +989,28 @@ impl DaemonState {
         let Some(model_name) = model_name else {
             return Ok(None);
         };
-        // Canonicalize so config aliases (e.g. the corrected English
-        // spelling of a typo'd upstream id) share one cache entry.
         let canonical = canonical_crossencoder_model(model_name)?;
-        // Owned lock (not a borrowed `MutexGuard<'_, ...>`): #139's per-request
-        // rerank timeout boxes this guard as `dyn Crossencoder` and moves it
-        // into `spawn_blocking`, which requires 'static ownership.
-        let mut guard = Arc::clone(&self.inner.crossencoders).lock_owned().await;
-        if !guard.contains_key(canonical) {
-            let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
-            let model = FastembedCrossencoder::try_new(canonical, &cache_dir)
-                .map_err(|e| anyhow::anyhow!("init crossencoder ({canonical}): {e}"))?;
-            guard.insert(canonical.to_string(), model);
-        }
+        let key = canonical.to_owned();
+        let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
+        let initialize = crossencoder_initializer(key.clone(), cache_dir);
+        let model = self
+            .inner
+            .crossencoders
+            .lock()
+            .await
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(StdMutex::new(CrossencoderSlot {
+                    model: None,
+                    initialize,
+                }))
+            })
+            .clone();
         self.inner
             .last_activity_secs
             .store(monotonic_secs(), Ordering::Relaxed);
         Ok(Some(CrossencoderGuard {
-            guard,
-            key: canonical.to_string(),
+            model,
             last_use_secs: Arc::clone(&self.inner.last_activity_secs),
         }))
     }
@@ -1425,32 +1420,40 @@ async fn prune_stale_backups(
     Ok(())
 }
 
-/// Owned guard around the lazily-loaded crossencoder. Derefs to
-/// `FastembedCrossencoder` so callers can
-/// pass `&mut *guard` directly into anything that wants
-/// `&mut dyn Crossencoder`. Holds an `OwnedMutexGuard` (not a borrowed
-/// `MutexGuard<'a, ...>`) so it can be boxed as `Box<dyn Crossencoder>` and
-/// moved into `spawn_blocking` for the #139 per-request rerank timeout.
+/// Handle for a lazily loaded crossencoder keyed by canonical model name.
+/// Rerank acquires the per-model slot without waiting. Busy and initialization
+/// failures return domain errors, which let ground preserve fusion order. The
+/// handle moves into the ground blocking-pool task that enforces its deadline.
 pub struct CrossencoderGuard {
-    guard: OwnedMutexGuard<HashMap<String, FastembedCrossencoder>>,
-    /// Canonical model name; the key into `guard` that `crossencoder()`
-    /// inserted before handing the guard out.
-    key: String,
+    model: Arc<StdMutex<CrossencoderSlot>>,
     last_use_secs: Arc<AtomicU64>,
 }
 
-impl std::ops::Deref for CrossencoderGuard {
-    type Target = FastembedCrossencoder;
-    fn deref(&self) -> &FastembedCrossencoder {
-        // `crossencoder()` inserts `key` before constructing the guard,
-        // and the guard holds the lock, so the entry can't vanish.
-        self.guard.get(&self.key).expect("crossencoder loaded")
-    }
-}
-
-impl std::ops::DerefMut for CrossencoderGuard {
-    fn deref_mut(&mut self) -> &mut FastembedCrossencoder {
-        self.guard.get_mut(&self.key).expect("crossencoder loaded")
+impl Crossencoder for CrossencoderGuard {
+    fn rerank(
+        &mut self,
+        query: &str,
+        hits: &mut [SearchHit],
+    ) -> hallouminate_domain::common::Result<()> {
+        let mut slot = match self.model.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(HallouminateError::Embed("crossencoder busy".into()));
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                self.model.clear_poison();
+                let mut slot = poisoned.into_inner();
+                slot.model = None;
+                slot
+            }
+        };
+        if slot.model.is_none() {
+            slot.model = Some((slot.initialize)()?);
+        }
+        slot.model
+            .as_mut()
+            .expect("crossencoder initialized")
+            .rerank(query, hits)
     }
 }
 
@@ -1460,20 +1463,6 @@ impl Drop for CrossencoderGuard {
             .store(monotonic_secs(), Ordering::Relaxed);
     }
 }
-
-/// Lets a `CrossencoderGuard` be boxed as `Box<dyn Crossencoder>` and moved
-/// into `spawn_blocking` for the #139 per-request rerank timeout, instead of
-/// call sites unwrapping it to a borrowed `&mut dyn Crossencoder`.
-impl Crossencoder for CrossencoderGuard {
-    fn rerank(
-        &mut self,
-        query: &str,
-        hits: &mut [SearchHit],
-    ) -> hallouminate_domain::common::Result<()> {
-        (**self).rerank(query, hits)
-    }
-}
-
 impl std::fmt::Debug for DaemonState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaemonState")
@@ -1487,8 +1476,13 @@ impl std::fmt::Debug for DaemonState {
 mod tests {
     use super::super::maintenance::{MaintenanceTick, jittered_sleep_secs};
     use super::*;
+    use async_trait::async_trait;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
-    use hallouminate_domain::common::CorpusConfig;
+    use hallouminate_domain::common::{CorpusConfig, CorpusKey};
+    use hallouminate_domain::ground::{GroundOpts, ground};
+    use hallouminate_domain::indexer::{ChunkStore, SignalLists};
+    use hallouminate_domain::search::{ChunkRetrieval, NoopCrossencoder};
+    use std::sync::atomic::AtomicBool;
 
     use std::fmt;
     use tracing::Subscriber;
@@ -2394,21 +2388,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crossencoder_guard_updates_last_use_on_drop() {
-        let last_use_secs = Arc::new(AtomicU64::new(1));
-        let before_drop = monotonic_secs();
+    async fn crossencoder_guard_recovers_after_native_panic() {
+        struct PanicCrossencoder;
+        impl Crossencoder for PanicCrossencoder {
+            fn rerank(
+                &mut self,
+                _query: &str,
+                _hits: &mut [SearchHit],
+            ) -> hallouminate_domain::common::Result<()> {
+                panic!("test crossencoder panic");
+            }
+        }
 
-        drop(CrossencoderGuard {
-            guard: Arc::new(Mutex::new(HashMap::new())).lock_owned().await,
-            key: String::new(),
-            last_use_secs: Arc::clone(&last_use_secs),
-        });
+        let state = test_state().await;
+        let initializations = Arc::new(AtomicUsize::new(0));
+        let initialize: CrossencoderInitializer = {
+            let initializations = Arc::clone(&initializations);
+            Arc::new(move || {
+                if initializations.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Box::new(PanicCrossencoder) as Box<dyn Crossencoder>)
+                } else {
+                    Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
+                }
+            })
+        };
+        install_test_crossencoder(&state, "bge-reranker-base", initialize).await;
+        let mut first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .await
+            .expect("first")
+            .expect("configured");
+        let panic_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first.rerank("q", &mut [])));
+        assert!(panic_result.is_err());
+        drop(first);
 
-        let observed = last_use_secs.load(Ordering::Relaxed);
-        assert!(
-            observed >= before_drop,
-            "drop should stamp crossencoder use at or after guard lifetime start: observed {observed}, before {before_drop}",
-        );
+        let mut second = state
+            .crossencoder(Some("bge-reranker-base"))
+            .await
+            .expect("second")
+            .expect("configured");
+        assert!(second.rerank("q", &mut []).is_ok());
+        assert_eq!(initializations.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -3067,5 +3088,355 @@ mod tests {
     #[test]
     fn jittered_sleep_secs_below_ten_adds_no_jitter() {
         assert_eq!(jittered_sleep_secs(5), 5);
+    }
+    struct BlockingCrossencoder {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Crossencoder for BlockingCrossencoder {
+        fn rerank(
+            &mut self,
+            _query: &str,
+            hits: &mut [SearchHit],
+        ) -> hallouminate_domain::common::Result<()> {
+            self.started.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            hits.reverse();
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestChunkStore {
+        hits: Vec<SearchHit>,
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for TestChunkStore {
+        async fn retrieve_signals(
+            &self,
+            corpus_key: &CorpusKey,
+            _query: &str,
+            limit: usize,
+        ) -> hallouminate_domain::common::Result<SignalLists> {
+            let mut hits = Vec::new();
+            for hit in &self.hits {
+                if hit.corpus_key != *corpus_key {
+                    continue;
+                }
+                if hits.len() >= limit {
+                    break;
+                }
+                hits.push(hit.clone());
+            }
+            let mut fts = Vec::with_capacity(hits.len());
+            let mut hit_map = HashMap::with_capacity(hits.len());
+            for hit in hits {
+                fts.push(hit.chunk_id.clone());
+                hit_map.insert(hit.chunk_id.clone(), hit);
+            }
+            Ok(SignalLists {
+                fts,
+                vector: Vec::new(),
+                hits: hit_map,
+            })
+        }
+    }
+
+    async fn install_test_crossencoder(
+        state: &DaemonState,
+        model_name: &str,
+        initialize: CrossencoderInitializer,
+    ) {
+        let key = canonical_crossencoder_model(model_name)
+            .expect("test model name")
+            .to_owned();
+        state.inner.crossencoders.lock().await.insert(
+            key,
+            Arc::new(StdMutex::new(CrossencoderSlot {
+                model: None,
+                initialize,
+            })),
+        );
+    }
+
+    fn rerank_corpus() -> CorpusConfig {
+        CorpusConfig {
+            name: "rerank".into(),
+            paths: vec!["/tmp".into()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        }
+    }
+
+    fn rerank_hit(corpus: &CorpusConfig, file_ref: &str, score: f32) -> SearchHit {
+        SearchHit {
+            chunk_id: format!("{file_ref}#0"),
+            corpus_key: corpus
+                .corpus_keys()
+                .into_iter()
+                .next()
+                .expect("test corpus key"),
+            file_ref: file_ref.into(),
+            heading_path: Vec::new(),
+            line_start: 1,
+            line_end: 2,
+            text: "test hit".into(),
+            search_text: "test hit".into(),
+            summary: String::new(),
+            keywords: Vec::new(),
+            score,
+            mtime_ms: 0,
+            claim_marks: Vec::new(),
+            z_score: None,
+        }
+    }
+
+    fn rerank_opts() -> GroundOpts {
+        GroundOpts {
+            top_files: 10,
+            chunks_per_file: 10,
+            limit: 10,
+            rerank_timeout: Duration::from_millis(10),
+        }
+    }
+
+    #[tokio::test]
+    async fn crossencoder_admission_deadline_falls_back_while_native_rerank_is_blocked() {
+        let state = test_state().await;
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_guard = ReleaseOnDrop(Arc::clone(&release));
+        let initialize: CrossencoderInitializer = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                Ok(Box::new(BlockingCrossencoder {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }) as Box<dyn Crossencoder>)
+            })
+        };
+        install_test_crossencoder(&state, "bge-reranker-base", initialize).await;
+
+        let corpus = rerank_corpus();
+        let store = TestChunkStore {
+            hits: vec![
+                rerank_hit(&corpus, "/tmp/a.md", 0.5),
+                rerank_hit(&corpus, "/tmp/b.md", 0.4),
+            ],
+        };
+        let first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .await
+            .expect("admit first crossencoder")
+            .expect("configured crossencoder");
+        let first_task = tokio::spawn({
+            let corpus = corpus.clone();
+            let store = store.clone();
+            async move { ground("q", &corpus, &store, Some(Box::new(first)), rerank_opts()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first native rerank starts");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut second = state
+            .crossencoder(Some("bge-reranker-base"))
+            .await
+            .expect("admit second crossencoder")
+            .expect("configured crossencoder");
+        let mut probe_hits = Vec::new();
+        assert!(second.rerank("q", &mut probe_hits).is_err());
+        let second_started = Instant::now();
+        let second = ground("q", &corpus, &store, Some(Box::new(second)), rerank_opts())
+            .await
+            .expect("second ground request");
+        assert!(
+            second_started.elapsed() < Duration::from_millis(100),
+            "busy admission must return fallback without waiting for the blocked native call",
+        );
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "crossencoder-unavailable"),
+            "second request must report unavailable fallback after bounded admission"
+        );
+        assert_eq!(second.docs.len(), 2);
+        let first_score = second
+            .docs
+            .get("/tmp/a.md")
+            .expect("first fallback doc")
+            .score;
+        let second_score = second
+            .docs
+            .get("/tmp/b.md")
+            .expect("second fallback doc")
+            .score;
+        assert!(
+            first_score > second_score,
+            "fusion order must remain unchanged on fallback"
+        );
+
+        drop(release_guard);
+        let first = first_task
+            .await
+            .expect("first ground task")
+            .expect("first ground request");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "rerank-timeout"),
+            "first request must use fusion fallback after its deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn crossencoder_concurrent_reranks_initialize_once() {
+        let state = test_state().await;
+        let initializations = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_guard = ReleaseOnDrop(Arc::clone(&release));
+        let initialize: CrossencoderInitializer = {
+            let initializations = Arc::clone(&initializations);
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            Arc::new(move || {
+                initializations.fetch_add(1, Ordering::SeqCst);
+                entered.store(true, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
+            })
+        };
+        install_test_crossencoder(&state, "bge-reranker-base", initialize).await;
+        let corpus = rerank_corpus();
+        let store = TestChunkStore {
+            hits: vec![
+                rerank_hit(&corpus, "/tmp/a.md", 0.5),
+                rerank_hit(&corpus, "/tmp/b.md", 0.4),
+            ],
+        };
+        let first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .await
+            .expect("first")
+            .expect("configured");
+        let first_task = tokio::spawn({
+            let corpus = corpus.clone();
+            let store = store.clone();
+            async move { ground("q", &corpus, &store, Some(Box::new(first)), rerank_opts()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("lazy constructor starts on the blocking pool");
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await
+        .expect("the current-thread runtime stays responsive during construction");
+        let second = state
+            .crossencoder(Some("bge-reranker-base"))
+            .await
+            .expect("second")
+            .expect("configured");
+        let second_started = Instant::now();
+        let second = ground("q", &corpus, &store, Some(Box::new(second)), rerank_opts())
+            .await
+            .expect("second ground request");
+        assert!(second_started.elapsed() < Duration::from_millis(100));
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "crossencoder-unavailable")
+        );
+        drop(release_guard);
+        let first = first_task
+            .await
+            .expect("first ground task")
+            .expect("first ground request");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "rerank-timeout")
+        );
+        assert_eq!(initializations.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn crossencoder_different_models_initialize_independently() {
+        let state = test_state().await;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_guard = ReleaseOnDrop(Arc::clone(&release));
+        for model_name in ["bge-reranker-base", "bge-reranker-v2-m3"] {
+            let entered = Arc::clone(&entered);
+            let release = Arc::clone(&release);
+            let initialize: CrossencoderInitializer = Arc::new(move || {
+                entered.fetch_add(1, Ordering::SeqCst);
+                while !release.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
+            });
+            install_test_crossencoder(&state, model_name, initialize).await;
+        }
+        let mut first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .await
+            .expect("first")
+            .expect("configured");
+        let mut second = state
+            .crossencoder(Some("bge-reranker-v2-m3"))
+            .await
+            .expect("second")
+            .expect("configured");
+        let first_task = tokio::task::spawn_blocking(move || first.rerank("q", &mut []));
+        let second_task = tokio::task::spawn_blocking(move || second.rerank("q", &mut []));
+        let entered_result = tokio::time::timeout(Duration::from_secs(1), async {
+            while entered.load(Ordering::SeqCst) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        drop(release_guard);
+        entered_result.expect("different models must initialize concurrently");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first_task
+                .await
+                .expect("first model")
+                .expect("first rerank");
+            second_task
+                .await
+                .expect("second model")
+                .expect("second rerank");
+        })
+        .await
+        .expect("different models must not share an execution lock");
     }
 }
