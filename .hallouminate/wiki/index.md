@@ -28,6 +28,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [ground-search-quality-adrs](ground-search-quality-adrs.md) — five decisions and their research basis for issue #288; ADR-001/002/003/005 shipped in #290, ADR-004's reranker default stayed opt-in.
 - [ground-signal-fusion-adrs](ground-signal-fusion-adrs.md) — the post-#290 ranking audit: why weighted RRF over four peer signals moved into the domain layer, why the shipped 0.5/0.5 literal weights were kept, and why the literal signals only reorder the FTS/vector pool.
 - [log](log.md) — append-only ingest log: what each wiki-ingest run wrote, merged, skipped as a near-duplicate, or flagged as conflicting, and why.
+- [maintenance-compaction-index-deltas](maintenance-compaction-index-deltas.md) — why `maintain` merges index deltas before compaction: per-batch ANN deltas split every compaction bin, so Hard debt never drained (issue #463).
 - [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis, including `add_markdown`'s surgical edit modes and the multi-root read/write asymmetry.
 - [multi-format-ingestion](multi-format-ingestion.md) — the shipped Phase 1 per-format dispatch (markdown/text/RST/spreadsheet), why the wiki corpus stays markdown-only, and what (PDF/office/code) is still deferred.
 - [not-found-suggestions](not-found-suggestions.md) — how an unknown-corpus error and a `read_markdown` path miss self-enrich with `strsim` closest-match hints so a caller recovers in zero extra round trips.
