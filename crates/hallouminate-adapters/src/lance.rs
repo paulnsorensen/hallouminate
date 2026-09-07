@@ -434,115 +434,362 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
         .map_err(|e| HallouminateError::Indexer(format!("build record batch: {e}")))
 }
 
-struct DonorRow {
-    ord: i64,
-    vector: Option<[f32; EMBEDDING_DIM]>,
+const MAX_PENDING_DONOR_GROUPS_PER_HASH: usize = 2;
+
+#[derive(Clone)]
+struct DonorExpectation {
+    content_hash: String,
+    search_texts: Vec<String>,
 }
 
-/// (corpus, root, file_ref) identity of one donor row-group.
-type DonorGroupKey = (String, String, String);
-/// Donor rows grouped by content_hash, then by row-group identity.
-type DonorGroups = HashMap<String, HashMap<DonorGroupKey, Vec<DonorRow>>>;
+fn donor_expectation(file: &PreparedFile) -> DonorExpectation {
+    let mut search_texts = Vec::with_capacity(file.chunks.len());
+    for chunk in &file.chunks {
+        search_texts.push(chunk.search_text.clone());
+    }
+    DonorExpectation {
+        content_hash: file.content_hash.clone(),
+        search_texts,
+    }
+}
 
-fn decode_donor_rows(batches: &[RecordBatch]) -> Result<DonorGroups> {
-    let mut by_hash: DonorGroups = HashMap::new();
-    for rb in batches {
-        if rb.num_rows() == 0 {
-            continue;
+struct DonorCandidate {
+    expectation: usize,
+    vectors: Vec<Option<[f32; EMBEDDING_DIM]>>,
+    retained_rows: usize,
+}
+
+struct DonorLookup {
+    vectors: Vec<Option<Vec<[f32; EMBEDDING_DIM]>>>,
+    peak_candidate_rows: usize,
+    peak_candidate_slots: usize,
+    active_rows: usize,
+    active_slots: usize,
+    rejected: Vec<bool>,
+    rejected_hashes: HashSet<String>,
+}
+
+impl DonorLookup {
+    fn new(expectation_count: usize) -> Self {
+        Self {
+            vectors: vec![None; expectation_count],
+            peak_candidate_rows: 0,
+            peak_candidate_slots: 0,
+            active_rows: 0,
+            active_slots: 0,
+            rejected: vec![false; expectation_count],
+            rejected_hashes: HashSet::new(),
         }
-        let content_hashes = string_col(rb, "content_hash")?;
-        let corpora = string_col(rb, "corpus")?;
-        let roots = string_col(rb, "root")?;
-        let file_refs = string_col(rb, "file_ref")?;
-        let ords = int64_col(rb, "ord")?;
-        let Some(embedding_column) = rb.column_by_name("embedding") else {
-            return Err(HallouminateError::Indexer(
-                "missing column embedding".into(),
-            ));
-        };
-        let Some(embedding_column) = embedding_column
-            .as_any()
-            .downcast_ref::<FixedSizeListArray>()
-        else {
-            return Err(HallouminateError::Indexer(
-                "embedding column not a fixed-size list".into(),
-            ));
-        };
-        for row in 0..rb.num_rows() {
-            let key = (
-                corpora.value(row).to_string(),
-                roots.value(row).to_string(),
-                file_refs.value(row).to_string(),
-            );
-            let vector = if embedding_column.is_null(row) {
-                None
-            } else {
-                let values = embedding_column.value(row);
-                let Some(floats) = values.as_any().downcast_ref::<Float32Array>() else {
-                    return Err(HallouminateError::Indexer(
-                        "embedding item column not float32".into(),
-                    ));
+    }
+}
+
+fn donor_vector(embedding_column: &FixedSizeListArray, row: usize) -> Option<[f32; EMBEDDING_DIM]> {
+    if embedding_column.is_null(row) {
+        return None;
+    }
+    let values = embedding_column.value(row);
+    let floats = values.as_any().downcast_ref::<Float32Array>()?;
+    if floats.len() != EMBEDDING_DIM {
+        return None;
+    }
+    let mut vector = [0.0_f32; EMBEDDING_DIM];
+    for (slot, target) in vector.iter_mut().enumerate() {
+        if floats.is_null(slot) {
+            return None;
+        }
+        *target = floats.value(slot);
+    }
+    Some(vector)
+}
+
+fn discard_donor_candidate(
+    active: &mut HashMap<(String, (String, String, String)), DonorCandidate>,
+    key: &(String, (String, String, String)),
+    lookup: &mut DonorLookup,
+) {
+    let Some(candidate) = active.remove(key) else {
+        return;
+    };
+    lookup.active_rows -= candidate.retained_rows;
+    lookup.active_slots -= candidate.vectors.len();
+}
+
+fn reject_donor_expectation(
+    expectations: &[DonorExpectation],
+    lookup: &mut DonorLookup,
+    index: usize,
+) {
+    let expected = &expectations[index];
+    for (other_index, other) in expectations.iter().enumerate() {
+        if other.content_hash == expected.content_hash
+            && other.search_texts == expected.search_texts
+        {
+            lookup.rejected[other_index] = true;
+            lookup.vectors[other_index] = None;
+        }
+    }
+}
+
+fn reject_donor_hash(expectations: &[DonorExpectation], lookup: &mut DonorLookup, hash: &str) {
+    lookup.rejected_hashes.insert(hash.to_string());
+    for (index, expected) in expectations.iter().enumerate() {
+        if expected.content_hash == hash {
+            lookup.rejected[index] = true;
+            lookup.vectors[index] = None;
+        }
+    }
+}
+
+struct DonorDecodeState<'a> {
+    expectations: &'a [DonorExpectation],
+    lookup: &'a mut DonorLookup,
+    active: &'a mut HashMap<(String, (String, String, String)), DonorCandidate>,
+    completed: &'a mut HashMap<(String, (String, String, String)), usize>,
+}
+
+fn decode_active_donor_row(
+    state: &mut DonorDecodeState<'_>,
+    active_key: &(String, (String, String, String)),
+    ord: Option<usize>,
+    search_texts: &StringArray,
+    embedding_column: &FixedSizeListArray,
+    row: usize,
+) {
+    let candidate_expectation = state
+        .active
+        .get(active_key)
+        .expect("active candidate")
+        .expectation;
+    let valid_text = match ord {
+        Some(ord) if ord < state.expectations[candidate_expectation].search_texts.len() => {
+            state.expectations[candidate_expectation].search_texts[ord] == search_texts.value(row)
+        }
+        Some(_) | None => false,
+    };
+    let vector = if valid_text {
+        donor_vector(embedding_column, row)
+    } else {
+        None
+    };
+    let Some(ord) = ord else {
+        reject_donor_expectation(state.expectations, state.lookup, candidate_expectation);
+        discard_donor_candidate(state.active, active_key, state.lookup);
+        return;
+    };
+    let mut reject = false;
+    let mut completed_candidate = None;
+    {
+        let candidate = state.active.get_mut(active_key).expect("active candidate");
+        if !valid_text
+            || (ord < candidate.vectors.len() && candidate.vectors[ord].is_some())
+            || vector.is_none()
+        {
+            reject = true;
+        } else {
+            candidate.vectors[ord] = vector;
+            candidate.retained_rows += 1;
+            state.lookup.active_rows += 1;
+            state.lookup.peak_candidate_rows = state
+                .lookup
+                .peak_candidate_rows
+                .max(state.lookup.active_rows);
+            let mut vectors = Vec::with_capacity(candidate.vectors.len());
+            let mut complete = true;
+            for vector in &candidate.vectors {
+                let Some(vector) = vector else {
+                    complete = false;
+                    break;
                 };
-                let mut vector = [0.0_f32; EMBEDDING_DIM];
-                for (slot, target) in vector.iter_mut().enumerate() {
-                    *target = floats.value(slot);
-                }
-                Some(vector)
-            };
-            by_hash
-                .entry(content_hashes.value(row).to_string())
-                .or_default()
-                .entry(key)
-                .or_default()
-                .push(DonorRow {
-                    ord: ords.value(row),
-                    vector,
-                });
-        }
-    }
-    Ok(by_hash)
-}
-
-fn pick_donor_vectors(
-    groups: &HashMap<DonorGroupKey, Vec<DonorRow>>,
-    chunk_count: usize,
-) -> Option<Vec<[f32; EMBEDDING_DIM]>> {
-    let mut keys: Vec<&DonorGroupKey> = Vec::new();
-    for key in groups.keys() {
-        keys.push(key);
-    }
-    keys.sort();
-
-    for key in keys {
-        let rows = &groups[key];
-        if rows.len() != chunk_count {
-            continue;
-        }
-        let mut sorted: Vec<&DonorRow> = Vec::new();
-        for row in rows {
-            sorted.push(row);
-        }
-        sorted.sort_by_key(|row| row.ord);
-        debug_assert!(
-            sorted
-                .iter()
-                .enumerate()
-                .all(|(i, row)| row.ord == i as i64),
-            "donor row-group ords must be exactly 0..chunk_count",
-        );
-
-        let mut vectors: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(chunk_count);
-        for row in sorted {
-            match row.vector {
-                Some(vector) => vectors.push(vector),
-                None => break,
+                vectors.push(*vector);
+            }
+            if complete {
+                completed_candidate = Some((candidate.expectation, vectors));
             }
         }
-        if vectors.len() == chunk_count {
-            return Some(vectors);
+    }
+    if reject {
+        reject_donor_expectation(state.expectations, state.lookup, candidate_expectation);
+        discard_donor_candidate(state.active, active_key, state.lookup);
+    } else if let Some((index, vectors)) = completed_candidate {
+        state.active.remove(active_key);
+        state.lookup.active_rows -= vectors.len();
+        state.lookup.active_slots -= vectors.len();
+        let expected = &state.expectations[index];
+        for (other_index, other) in state.expectations.iter().enumerate() {
+            if other.content_hash == expected.content_hash
+                && other.search_texts == expected.search_texts
+                && !state.lookup.rejected[other_index]
+            {
+                state.lookup.vectors[other_index] = Some(vectors.clone());
+            }
+        }
+        let mut already_completed = false;
+        for completed_index in state.completed.values() {
+            if *completed_index == index {
+                already_completed = true;
+                break;
+            }
+        }
+        if !already_completed {
+            state.completed.insert(active_key.clone(), index);
         }
     }
-    None
+}
+
+fn decode_donor_batch(
+    rb: &RecordBatch,
+    expectations: &[DonorExpectation],
+    lookup: &mut DonorLookup,
+    active: &mut HashMap<(String, (String, String, String)), DonorCandidate>,
+    completed: &mut HashMap<(String, (String, String, String)), usize>,
+) -> Result<()> {
+    if rb.num_rows() == 0 {
+        return Ok(());
+    }
+    let Ok(content_hashes) = string_col(rb, "content_hash") else {
+        return Ok(());
+    };
+    let Ok(corpora) = string_col(rb, "corpus") else {
+        return Ok(());
+    };
+    let Ok(roots) = string_col(rb, "root") else {
+        return Ok(());
+    };
+    let Ok(file_refs) = string_col(rb, "file_ref") else {
+        return Ok(());
+    };
+    let Ok(search_texts) = string_col(rb, "search_text") else {
+        return Ok(());
+    };
+    let Ok(ords) = int64_col(rb, "ord") else {
+        return Ok(());
+    };
+    let Some(embedding_column) = rb.column_by_name("embedding") else {
+        return Ok(());
+    };
+    let Some(embedding_column) = embedding_column
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+    else {
+        return Ok(());
+    };
+    for row in 0..rb.num_rows() {
+        let hash = content_hashes.value(row);
+        let group_key = (
+            corpora.value(row).to_string(),
+            roots.value(row).to_string(),
+            file_refs.value(row).to_string(),
+        );
+        let active_key = (hash.to_string(), group_key);
+        let ord = usize::try_from(ords.value(row)).ok();
+        let mut hash_is_expected = false;
+        let mut hash_has_out_of_range_ord = false;
+        for expected in expectations {
+            if expected.content_hash == hash {
+                hash_is_expected = true;
+                if ord.is_none_or(|ord| ord >= expected.search_texts.len()) {
+                    hash_has_out_of_range_ord = true;
+                }
+            }
+        }
+        if hash_is_expected && hash_has_out_of_range_ord {
+            reject_donor_hash(expectations, lookup, hash);
+            continue;
+        }
+        if lookup.rejected_hashes.contains(hash) {
+            continue;
+        }
+        if let Some(index) = completed.get(&active_key).copied() {
+            reject_donor_expectation(expectations, lookup, index);
+            continue;
+        }
+        if active.contains_key(&active_key) {
+            let mut state = DonorDecodeState {
+                expectations,
+                lookup,
+                active,
+                completed,
+            };
+            decode_active_donor_row(
+                &mut state,
+                &active_key,
+                ord,
+                search_texts,
+                embedding_column,
+                row,
+            );
+            continue;
+        }
+        let Some(ord) = usize::try_from(ords.value(row)).ok() else {
+            continue;
+        };
+        let mut expectation = None;
+        for (index, expected) in expectations.iter().enumerate() {
+            if expected.content_hash == hash
+                && lookup.vectors[index].is_none()
+                && !lookup.rejected[index]
+                && ord < expected.search_texts.len()
+                && expected.search_texts[ord] == search_texts.value(row)
+            {
+                expectation = Some(index);
+                break;
+            }
+        }
+        let Some(expectation) = expectation else {
+            continue;
+        };
+        let Some(vector) = donor_vector(embedding_column, row) else {
+            reject_donor_expectation(expectations, lookup, expectation);
+            continue;
+        };
+        if expectations[expectation].search_texts.len() == 1 {
+            let expected = &expectations[expectation];
+            for (other_index, other) in expectations.iter().enumerate() {
+                if other.content_hash == expected.content_hash
+                    && other.search_texts == expected.search_texts
+                    && !lookup.rejected[other_index]
+                {
+                    lookup.vectors[other_index] = Some(vec![vector]);
+                }
+            }
+            let mut already_completed = false;
+            for completed_index in completed.values() {
+                if *completed_index == expectation {
+                    already_completed = true;
+                    break;
+                }
+            }
+            if !already_completed {
+                completed.insert(active_key, expectation);
+            }
+            continue;
+        }
+        let mut active_for_hash = 0;
+        for (active_hash, _) in active.keys() {
+            if active_hash == hash {
+                active_for_hash += 1;
+            }
+        }
+        if active_for_hash >= MAX_PENDING_DONOR_GROUPS_PER_HASH {
+            continue;
+        }
+        let mut vectors = vec![None; expectations[expectation].search_texts.len()];
+        vectors[ord] = Some(vector);
+        let candidate_slots = vectors.len();
+        active.insert(
+            active_key,
+            DonorCandidate {
+                expectation,
+                vectors,
+                retained_rows: 1,
+            },
+        );
+        lookup.active_rows += 1;
+        lookup.active_slots += candidate_slots;
+        lookup.peak_candidate_rows = lookup.peak_candidate_rows.max(lookup.active_rows);
+        lookup.peak_candidate_slots = lookup.peak_candidate_slots.max(lookup.active_slots);
+    }
+    Ok(())
 }
 
 /// Escape a string for inclusion in a DataFusion SQL literal.
@@ -1363,7 +1610,8 @@ impl LanceStore {
     /// Before embedding, each file's `content_hash` is checked against any
     /// existing rows in the store (any corpus/root — one store carries one
     /// embedding model). A donor row-group with an equal chunk count and
-    /// non-null vectors is copied ord-aligned instead of re-embedding.
+    /// non-null vectors is copied ord-aligned instead of re-embedding. Donor
+    /// reuse requires ordered equality for every stored `search_text`.
     ///
     /// # Errors
     ///
@@ -1381,22 +1629,18 @@ impl LanceStore {
             ));
         }
 
-        let mut content_hashes: Vec<&str> = Vec::new();
+        let mut expectations = Vec::with_capacity(batch.len());
         if self.embeddings_enabled {
             for file in &batch {
-                content_hashes.push(file.content_hash.as_str());
+                expectations.push(donor_expectation(file));
             }
         }
-        let donor_groups = self.donor_vectors_batch(&content_hashes).await?;
+        let mut donor_lookup = self.donor_vectors_batch(&expectations).await?;
 
         let mut donor_vectors: Vec<Option<Vec<[f32; EMBEDDING_DIM]>>> =
             Vec::with_capacity(batch.len());
-        for file in &batch {
-            let donor = match donor_groups.get(&file.content_hash) {
-                Some(groups) => pick_donor_vectors(groups, file.chunks.len()),
-                None => None,
-            };
-            donor_vectors.push(donor);
+        for index in 0..batch.len() {
+            donor_vectors.push(donor_lookup.vectors.get_mut(index).and_then(Option::take));
         }
 
         let mut all_texts: Vec<String> = Vec::new();
@@ -1521,21 +1765,18 @@ impl LanceStore {
         Ok(stats)
     }
 
-    /// Looks up donor row-groups for every distinct `content_hash` in one
-    /// batch with a single filtered table scan (`content_hash IN (...)`),
-    /// across any corpus/root in the store. Returns each hash's candidate
-    /// groups, keyed by `(corpus, root, file_ref)`, for the caller to pick
-    /// from via [`pick_donor_vectors`]: ord-aligned vectors when exactly one
-    /// qualifying group exists (chunk count equal to the file's chunk count
-    /// and every row carrying a non-null vector), first-qualifying-group-wins
-    /// in `(corpus, root, file_ref)` order, groups never blended.
-    async fn donor_vectors_batch(&self, content_hashes: &[&str]) -> Result<DonorGroups> {
-        if content_hashes.is_empty() {
-            return Ok(HashMap::new());
+    /// Looks up donor rows for every requested file in one filtered table scan.
+    /// A donor is reusable only when its ordered stored search text equals the
+    /// requested file's ordered embedding input. The decoder streams batches and
+    /// retains at most a fixed number of candidate groups per content hash.
+    /// Scan CPU still visits every matching row when sibling roots share a hash.
+    async fn donor_vectors_batch(&self, expectations: &[DonorExpectation]) -> Result<DonorLookup> {
+        if expectations.is_empty() {
+            return Ok(DonorLookup::new(0));
         }
         let mut distinct: HashSet<&str> = HashSet::new();
-        for hash in content_hashes {
-            distinct.insert(hash);
+        for expected in expectations {
+            distinct.insert(expected.content_hash.as_str());
         }
         let mut escaped: Vec<String> = Vec::with_capacity(distinct.len());
         for hash in distinct {
@@ -1543,8 +1784,9 @@ impl LanceStore {
         }
         let predicate = format!("content_hash IN ({})", escaped.join(", "));
         let table = self.table.clone();
-        let batches = supervise_scan("apply_batch_donor_lookup", async move {
-            let stream = table
+        let expectations = expectations.to_vec();
+        supervise_scan("apply_batch_donor_lookup", async move {
+            let mut stream = table
                 .query()
                 .only_if(predicate)
                 .select(lancedb::query::Select::columns(&[
@@ -1553,16 +1795,27 @@ impl LanceStore {
                     "root",
                     "file_ref",
                     "ord",
+                    "search_text",
                     "embedding",
                 ]))
                 .execute()
                 .await
                 .map_err(map_lance_err)?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
-            Ok(batches)
+            let mut lookup = DonorLookup::new(expectations.len());
+            let mut active = HashMap::new();
+            let mut completed = HashMap::new();
+            while let Some(batch) = stream.try_next().await.map_err(map_lance_err)? {
+                decode_donor_batch(
+                    &batch,
+                    &expectations,
+                    &mut lookup,
+                    &mut active,
+                    &mut completed,
+                )?;
+            }
+            Ok(lookup)
         })
-        .await?;
-        decode_donor_rows(&batches)
+        .await
     }
 
     /// Build the FTS index on `search_text` (and the ANN index on `embedding`) if
@@ -2076,7 +2329,8 @@ impl ChunkRetrieval for LanceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hallouminate_domain::indexer::PreparedChunk;
+    use hallouminate_domain::indexer::{Format, HandlerRegistry, PreparedChunk};
+    use text_splitter::Characters;
 
     fn corpus_key(name: &str, root: &str) -> CorpusKey {
         CorpusKey::from_configured_root(name, root)
@@ -2084,6 +2338,26 @@ mod tests {
 
     fn docs_key() -> CorpusKey {
         corpus_key("docs", "/tmp")
+    }
+
+    fn real_markdown_prepared(
+        corpus_key: &CorpusKey,
+        file_ref: &str,
+        bytes: &[u8],
+    ) -> PreparedFile {
+        let file = hallouminate_domain::common::FileRef::new(PathBuf::from(file_ref));
+        let registry = HandlerRegistry::new(Characters, 1500);
+        registry
+            .handler(Format::Markdown)
+            .prepare(&hallouminate_domain::indexer::PrepareCtx {
+                corpus_key,
+                file: &file,
+                mtime: hallouminate_domain::common::Mtime(1),
+                bytes,
+                content_hash: hallouminate_domain::corpus::blake3_bytes(bytes).to_string(),
+                indexed_at_ms: 1,
+            })
+            .expect("prepare markdown")
     }
 
     #[test]
@@ -2385,6 +2659,16 @@ mod tests {
         calls: DistinctVectorCalls,
     }
 
+    impl DistinctVectorEmbedder {
+        fn vector_for(text: &str) -> [f32; EMBEDDING_DIM] {
+            let mut vector = [0.0_f32; EMBEDDING_DIM];
+            for (i, byte) in text.bytes().enumerate() {
+                vector[i % EMBEDDING_DIM] += byte as f32;
+            }
+            vector
+        }
+    }
+
     impl EmbedBatch for DistinctVectorEmbedder {
         fn embed_batch(
             &mut self,
@@ -2397,11 +2681,7 @@ mod tests {
                 .push(texts.to_vec());
             let mut vectors = Vec::with_capacity(texts.len());
             for text in texts {
-                let mut vector = [0.0_f32; EMBEDDING_DIM];
-                for (i, byte) in text.bytes().enumerate() {
-                    vector[i % EMBEDDING_DIM] += byte as f32;
-                }
-                vectors.push(vector);
+                vectors.push(Self::vector_for(text));
             }
             Ok(vectors)
         }
@@ -2428,6 +2708,45 @@ mod tests {
         builder.execute(reader).await.expect("write raw batch");
     }
 
+    async fn stored_vectors(
+        store: &LanceStore,
+        root: &str,
+        file_ref: &str,
+    ) -> Vec<[f32; EMBEDDING_DIM]> {
+        let predicate = format!(
+            "corpus = 'docs' AND root = '{}' AND file_ref = '{}'",
+            escape_sql_str(root),
+            escape_sql_str(file_ref),
+        );
+        let stream = store
+            .table
+            .query()
+            .only_if(predicate)
+            .select(lancedb::query::Select::columns(&["ord", "embedding"]))
+            .execute()
+            .await
+            .expect("read persisted vectors");
+        let batches: Vec<RecordBatch> = stream.try_collect().await.expect("collect vectors");
+        let mut rows = Vec::new();
+        for rb in batches {
+            let ords = int64_col(&rb, "ord").expect("ord column");
+            let embedding_column = rb
+                .column_by_name("embedding")
+                .and_then(|column| column.as_any().downcast_ref::<FixedSizeListArray>())
+                .expect("embedding column");
+            for row in 0..rb.num_rows() {
+                let vector = donor_vector(embedding_column, row).expect("persisted vector");
+                rows.push((ords.value(row), vector));
+            }
+        }
+        rows.sort_by_key(|(ord, _)| *ord);
+        let mut vectors = Vec::with_capacity(rows.len());
+        for (_, vector) in rows {
+            vectors.push(vector);
+        }
+        vectors
+    }
+
     #[tokio::test]
     async fn apply_batch_reuses_vectors_for_byte_identical_file_across_roots() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2451,7 +2770,10 @@ mod tests {
 
         let root_b = corpus_key("docs", "/root-b");
         let file_b = synthetic_prepared_for(&root_b, "same.md", 2, "shared text", 2, 2);
-        store.apply_batch(vec![file_b]).await.expect("apply root b");
+        store
+            .apply_batch(vec![file_b])
+            .await
+            .expect("apply equivalent root");
 
         assert_eq!(
             calls.lock().expect("recording lock").len(),
@@ -2467,6 +2789,185 @@ mod tests {
         for hit in hits.hits.values() {
             assert_eq!(hit.file_ref, "same.md");
         }
+    }
+
+    #[tokio::test]
+    async fn donor_lookup_shares_vectors_for_equivalent_batch_inputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+
+        let donor_key = corpus_key("docs", "/root-donor");
+        let donor = synthetic_prepared_for(&donor_key, "donor.md", 2, "shared text", 1, 1);
+        store.apply_batch(vec![donor]).await.expect("apply donor");
+
+        let root_b = corpus_key("docs", "/root-b");
+        let expected_b = synthetic_prepared_for(&root_b, "copy-b.md", 2, "shared text", 2, 2);
+        let root_c = corpus_key("docs", "/root-c");
+        let expected_c = synthetic_prepared_for(&root_c, "copy-c.md", 2, "shared text", 3, 3);
+        let expectations = vec![
+            donor_expectation(&expected_b),
+            donor_expectation(&expected_c),
+        ];
+
+        let lookup = store
+            .donor_vectors_batch(&expectations)
+            .await
+            .expect("donor lookup");
+        assert!(lookup.vectors[0].is_some());
+        assert!(lookup.vectors[1].is_some());
+        assert_eq!(lookup.vectors[0], lookup.vectors[1]);
+        assert_eq!(calls.lock().expect("recording lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_batch_embeds_when_same_bytes_have_different_search_text() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        let bytes = b"hello\n";
+
+        let root_a = corpus_key("docs", "/root-a");
+        let file_a = real_markdown_prepared(&root_a, "a.md", bytes);
+        let input_a = file_a.chunks[0].search_text.clone();
+        store.apply_batch(vec![file_a]).await.expect("apply root a");
+
+        let root_b = corpus_key("docs", "/root-b");
+        let file_b = real_markdown_prepared(&root_b, "b.md", bytes);
+        let input_b = file_b.chunks[0].search_text.clone();
+        assert_ne!(input_a, input_b);
+        store.apply_batch(vec![file_b]).await.expect("apply root b");
+
+        let mut fresh = DistinctVectorEmbedder {
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let expected_a = fresh
+            .embed_batch(std::slice::from_ref(&input_a), EmbedRole::Passage)
+            .expect("fresh vector a");
+        let expected_b = fresh
+            .embed_batch(std::slice::from_ref(&input_b), EmbedRole::Passage)
+            .expect("fresh vector b");
+        assert_eq!(stored_vectors(&store, "/root-a", "a.md").await, expected_a);
+        assert_eq!(stored_vectors(&store, "/root-b", "b.md").await, expected_b);
+
+        let calls = calls.lock().expect("recording lock");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], vec![input_a]);
+        assert_eq!(calls[1], vec![input_b]);
+    }
+
+    #[tokio::test]
+    async fn donor_lookup_bounds_retained_rows_across_sibling_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+
+        for index in 0..513 {
+            let root = format!("/root-{index}");
+            let key = corpus_key("docs", &root);
+            let file = synthetic_prepared_for(&key, "same.md", 2, "shared text", index as i64, 1);
+            raw_insert(&store, &file, true).await;
+        }
+
+        let expected = synthetic_prepared_for(
+            &corpus_key("docs", "/root-target"),
+            "same.md",
+            2,
+            "shared text",
+            4,
+            1,
+        );
+        let expectation = donor_expectation(&expected);
+        let lookup = store
+            .donor_vectors_batch(&[expectation])
+            .await
+            .expect("donor lookup");
+
+        assert_eq!(lookup.peak_candidate_rows, 2);
+        assert_eq!(lookup.peak_candidate_slots, 2);
+        assert!(lookup.vectors[0].is_some());
+    }
+
+    #[tokio::test]
+    async fn donor_lookup_rejects_extra_or_missing_ord() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+
+        let donor_key = corpus_key("docs", "/root-donor");
+        let mut donor = synthetic_prepared_for(&donor_key, "same.md", 2, "shared text", 1, 1);
+        donor.chunks[1].ord = 2;
+        raw_insert(&store, &donor, true).await;
+
+        let target_key = corpus_key("docs", "/root-target");
+        let target = synthetic_prepared_for(&target_key, "same.md", 2, "shared text", 2, 2);
+        store.apply_batch(vec![target]).await.expect("apply target");
+
+        assert_eq!(calls.lock().expect("recording lock").len(), 1);
+    }
+
+    #[test]
+    fn decode_donor_batch_rejects_duplicate_ord() {
+        let donor_key = corpus_key("docs", "/root-donor");
+        let mut donor = synthetic_prepared_for(&donor_key, "same.md", 3, "shared text", 1, 1);
+        donor.chunks[1].ord = 0;
+        let embeddings = synth_embeddings(donor.chunks.len());
+        let fwe = FileWithEmbeddings {
+            file: &donor,
+            embeddings: Some(&embeddings),
+        };
+        let schema = chunks_schema();
+        let rb = build_record_batch(&[fwe], schema).expect("build duplicate ord batch");
+        let target_key = corpus_key("docs", "/root-target");
+        let target = synthetic_prepared_for(&target_key, "same.md", 3, "shared text", 2, 2);
+        let expectations = vec![donor_expectation(&target)];
+        let mut lookup = DonorLookup::new(expectations.len());
+        let mut active = HashMap::new();
+        let mut completed = HashMap::new();
+        decode_donor_batch(&rb, &expectations, &mut lookup, &mut active, &mut completed)
+            .expect("decode duplicate ord batch");
+
+        assert!(lookup.rejected[0]);
+        assert!(lookup.vectors[0].is_none());
     }
 
     #[tokio::test]
