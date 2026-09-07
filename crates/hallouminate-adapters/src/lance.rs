@@ -1100,8 +1100,24 @@ impl LanceStore {
     ///
     /// # Errors
     ///
-    /// Returns an error if the LanceDB compaction or version-cleanup fails.
+    /// Returns an error if the LanceDB index-delta merge, compaction, or
+    /// version-cleanup fails.
     pub async fn maintain(&self, options: MaintenanceOptions) -> Result<MaintenanceStats> {
+        // `apply_batch` refreshes the search indexes after every merge_insert,
+        // which appends one delta index per batch. Lance's compaction planner
+        // never bins fragments covered by different index sets, so with one
+        // delta per fragment every bin holds a single fragment and compaction
+        // is a no-op -- fragment debt then grows without bound (issue #463).
+        // Merging every delta into one index per name first puts all
+        // fragments under the same index set, so the planner can coalesce them.
+        // The merge is skipped when nothing needs merging: `merge(usize::MAX)`
+        // always rewrites the index files, and a paced pass calls `maintain`
+        // once per slice, so an unconditional merge would rewrite every index
+        // on every slice under the I/O pressure pacing exists to relieve.
+        if let Some(index_segments) = self.index_segments_to_merge().await? {
+            self.merge_index_deltas(options.maintenance_id, index_segments)
+                .await?;
+        }
         tracing::debug!(
             target: "hallouminate::lance",
             maintenance_event = "compaction_started",
@@ -1200,6 +1216,79 @@ impl LanceStore {
             fragments_added: stats.compaction.as_ref().map(|stats| stats.fragments_added),
             old_versions_pruned: stats.prune.as_ref().map(|stats| stats.old_versions),
         })
+    }
+
+    /// The largest segment count (base plus deltas) across the indexes when
+    /// any index has more than one segment or leaves rows unindexed, i.e. when fragments are
+    /// covered by differing index sets and compaction would refuse to bin
+    /// them (see [`Self::maintain`]). `None` means nothing needs merging.
+    ///
+    /// The FM index is excluded: its statistics report zero indexed rows,
+    /// so every row counts as unindexed forever and the guard would never
+    /// let a steady-state pass skip the merge.
+    async fn index_segments_to_merge(&self) -> Result<Option<u32>> {
+        let indices = self.table.list_indices().await.map_err(map_lance_err)?;
+        let mut segments: Option<u32> = None;
+        for index in &indices {
+            if index.index_type == lancedb::index::IndexType::Fm {
+                continue;
+            }
+            let Some(stats) = self
+                .table
+                .index_stats(&index.name)
+                .await
+                .map_err(map_lance_err)?
+            else {
+                continue;
+            };
+            let num_indices = stats.num_indices.unwrap_or(1);
+            if num_indices > 1 || stats.num_unindexed_rows > 0 {
+                segments = Some(segments.map_or(num_indices, |d| d.max(num_indices)));
+            }
+        }
+        Ok(segments)
+    }
+
+    /// Merges every delta of every index into one index per name, with the
+    /// `index_merge_*` lifecycle events. `index_segments` is the count
+    /// [`Self::index_segments_to_merge`] observed, for the log.
+    async fn merge_index_deltas(&self, maintenance_id: u64, index_segments: u32) -> Result<()> {
+        tracing::debug!(
+            target: "hallouminate::lance",
+            maintenance_event = "index_merge_started",
+            maintenance_id,
+            index_segments,
+            "LanceDB maintenance index-delta merge started",
+        );
+        let merge_started = std::time::Instant::now();
+        if let Err(error) = self
+            .table
+            .optimize(lancedb::table::OptimizeAction::Index(
+                lancedb::table::OptimizeOptions::merge(usize::MAX),
+            ))
+            .await
+        {
+            let error = map_lance_err(error);
+            tracing::warn!(
+                target: "hallouminate::lance",
+                maintenance_event = "index_merge_finished",
+                maintenance_id,
+                outcome = "failure",
+                error = %error,
+                "LanceDB maintenance index-delta merge failed",
+            );
+            return Err(error);
+        }
+        tracing::debug!(
+            target: "hallouminate::lance",
+            maintenance_event = "index_merge_finished",
+            maintenance_id,
+            outcome = "success",
+            index_segments,
+            merge_ms = u64::try_from(merge_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "LanceDB maintenance index-delta merge completed",
+        );
+        Ok(())
     }
 
     /// Reads real backlog signals used by the daemon's maintenance-debt ladder
@@ -2874,6 +2963,187 @@ mod tests {
 
         // The bounded run must still leave correct, queryable data behind.
         assert_eq!(bounded_store.count_rows().await.unwrap(), 20);
+    }
+
+    #[tokio::test]
+    async fn maintain_compacts_fragments_covered_by_per_batch_ann_index_deltas() {
+        // Issue #463: the daemon's per-batch `optimize(Index)` writes one
+        // ANN index delta per `apply_batch`, so every small fragment is
+        // covered by a distinct index set. Compaction must still coalesce
+        // those fragments, or Hard debt never drains.
+        let dir = tempfile::tempdir().unwrap();
+        let calls: DistinctVectorCalls = Arc::default();
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open store");
+        // Cross the ANN row threshold in one batch so the vector index
+        // exists before the small per-batch fragments accumulate.
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/big.md", 300)])
+            .await
+            .expect("apply big batch");
+        for i in 0..30 {
+            let pf = synthetic_prepared(&format!("/tmp/f{i}.md"), 1);
+            store.apply_batch(vec![pf]).await.expect("apply");
+        }
+        let ann_deltas = store
+            .table
+            .index_stats("embedding_idx")
+            .await
+            .expect("index stats")
+            .expect("ANN index must exist before the per-batch deltas accumulate")
+            .num_indices;
+        assert!(
+            ann_deltas.is_some_and(|n| n > 1),
+            "per-batch index refresh must have left several ANN deltas: {ann_deltas:?}"
+        );
+        let before = store.debt().await.expect("debt before");
+        let stats = store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 1,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
+            })
+            .await
+            .expect("maintain");
+        assert!(
+            stats.fragments_removed.is_some_and(|n| n > 0),
+            "compaction must remove fragments: {stats:?}"
+        );
+        let after = store.debt().await.expect("debt after");
+        assert!(
+            after.fragments < before.fragments,
+            "maintain must reduce the fragment count: before {}, after {}, stats {stats:?}",
+            before.fragments,
+            after.fragments
+        );
+        let merged = store
+            .table
+            .index_stats("embedding_idx")
+            .await
+            .expect("index stats")
+            .expect("ANN index survives maintenance")
+            .num_indices;
+        assert_eq!(
+            merged,
+            Some(1),
+            "maintain must merge the ANN deltas into one index"
+        );
+        assert_eq!(store.count_rows().await.unwrap(), 330);
+    }
+
+    /// Recursively locates the `_indices` directory inside a LanceDB table
+    /// dataset (`<root>/<table>.lance/_indices`) without hard-coding the
+    /// table's on-disk file naming.
+    fn find_indices_dir(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        let entries = std::fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().and_then(|n| n.to_str()) == Some("_indices") {
+                    return Some(path);
+                }
+                if let Some(found) = find_indices_dir(&path) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn maintain_second_call_on_merged_steady_state_leaves_indices_untouched() {
+        // Issue #463 regression: once the merge has already collapsed every
+        // ANN index to `num_indices == 1`, a second `maintain` call (as a
+        // paced pass issues once per slice) must skip the merge entirely --
+        // it must not rewrite the on-disk index files or change the
+        // fragment count on an already-drained dataset.
+        let dir = tempfile::tempdir().unwrap();
+        let calls: DistinctVectorCalls = Arc::default();
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(DistinctVectorEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/big.md", 300)])
+            .await
+            .expect("apply big batch");
+        for i in 0..30 {
+            let pf = synthetic_prepared(&format!("/tmp/f{i}.md"), 1);
+            store.apply_batch(vec![pf]).await.expect("apply");
+        }
+
+        store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 1,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
+            })
+            .await
+            .expect("first maintain");
+
+        let indices_dir = find_indices_dir(dir.path()).expect(
+            "lance on-disk layout changed: no `_indices` directory under the store; \
+                 update this test's layout probe",
+        );
+        let mut before: Vec<String> = std::fs::read_dir(&indices_dir)
+            .expect("read _indices dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        before.sort();
+        let debt_before = store.debt().await.expect("debt before second maintain");
+
+        store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 2,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
+            })
+            .await
+            .expect("second maintain");
+
+        let mut after: Vec<String> = std::fs::read_dir(&indices_dir)
+            .expect("read _indices dir")
+            .map(|entry| {
+                entry
+                    .expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        after.sort();
+        assert_eq!(
+            before, after,
+            "steady state must not rewrite index files on a second maintain call: \
+             before {before:?}, after {after:?}"
+        );
+        let debt_after = store.debt().await.expect("debt after second maintain");
+        assert_eq!(
+            debt_before.fragments, debt_after.fragments,
+            "steady state must not change fragment count on a second maintain call"
+        );
     }
 
     #[tokio::test]
