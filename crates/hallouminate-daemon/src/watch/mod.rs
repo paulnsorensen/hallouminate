@@ -428,15 +428,13 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
             state.touch_activity(WorkClass::Internal);
             return;
         };
-        // Take the same per-corpus lock and global write-lane, in the same
-        // order, that `handle_index` and `provisioner::provision_corpus`
-        // take. A catch-up pass rewrites the corpus' rows, so without the
-        // guard it races an explicit `index` or an `add_markdown` write.
-        let outcome = match state.acquire_mutation_guard(&corpus.name).await {
-            Ok(_guard) => match state.resources_for(&cfg).await {
+        // Hold the per-corpus lock while scanning and planning. The catch-up
+        // acquires the global write lane only when the plan contains mutations.
+        let outcome = match state.acquire_corpus_guard(&corpus.name).await {
+            Ok(_corpus_guard) => match state.resources_for(&cfg).await {
                 Ok(res) => {
                     let reg = state.make_registry();
-                    match super::dispatch::catch_up_corpus(&res, &reg, &corpus).await {
+                    match super::dispatch::catch_up_corpus(&state, &res, &reg, &corpus).await {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             tracing::warn!(
@@ -466,7 +464,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     target: "hallouminate::daemon",
                     corpus = %corpus.name,
                     error = %e,
-                    "watcher: no mutation guard for registration catch-up; retry on recovery",
+                "watcher: no corpus guard for registration catch-up; retry on recovery",
                 );
                 Err(e.to_string())
             }

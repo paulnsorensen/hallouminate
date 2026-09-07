@@ -13,6 +13,22 @@ use std::time::{Duration, Instant};
 use super::debt::{self, DebtLevel, MaintenanceDebt};
 use super::state::{DaemonState, MutationGuard};
 
+pub(super) async fn acquire_corpus(
+    state: &DaemonState,
+    corpus: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>, &'static str> {
+    let daemon_cfg = &state.baseline().daemon;
+    let maintenance_disabled = daemon_cfg.maintenance_interval_secs == 0;
+    gate(
+        || probe_admitting_hard_debt_without_maintenance(state, maintenance_disabled),
+        Duration::from_millis(daemon_cfg.debt_soft_delay_ms),
+        Duration::from_secs(daemon_cfg.hard_block_wait_secs),
+        Duration::from_secs(daemon_cfg.debt_cache_ttl_secs.max(1)),
+    )
+    .await?;
+    Ok(state.lock_corpus(corpus).await)
+}
+
 /// Error for a mutation that timed out waiting out `DebtLevel::Hard`. The
 /// operation was never started, so retrying is safe; dispatch should map
 /// exactly this message to `ErrorKind::Retryable` on the wire (`ipc.rs`).
@@ -26,21 +42,8 @@ pub(super) async fn acquire(
     state: &DaemonState,
     corpus: &str,
 ) -> Result<MutationGuard, &'static str> {
-    let daemon_cfg = &state.baseline().daemon;
-    let maintenance_disabled = daemon_cfg.maintenance_interval_secs == 0;
-    gate(
-        || probe_admitting_hard_debt_without_maintenance(state, maintenance_disabled),
-        Duration::from_millis(daemon_cfg.debt_soft_delay_ms),
-        Duration::from_secs(daemon_cfg.hard_block_wait_secs),
-        Duration::from_secs(daemon_cfg.debt_cache_ttl_secs.max(1)),
-    )
-    .await?;
-    let corpus_guard = state.lock_corpus(corpus).await;
-    let permit = state
-        .write_lane()
-        .acquire_owned()
-        .await
-        .map_err(|_| "write lane closed")?;
+    let corpus_guard = acquire_corpus(state, corpus).await?;
+    let permit = state.acquire_write_lane().await?;
     Ok(MutationGuard::new(permit, corpus_guard))
 }
 

@@ -1163,6 +1163,24 @@ impl DaemonState {
         self.inner.corpus_locks.lock(corpus).await
     }
 
+    /// Acquire the per-corpus mutex after the debt gate.
+    pub(crate) async fn acquire_corpus_guard(
+        &self,
+        corpus: &str,
+    ) -> Result<OwnedMutexGuard<()>, &'static str> {
+        super::backpressure::acquire_corpus(self, corpus).await
+    }
+
+    /// Acquire the global write-lane permit after the per-corpus lock.
+    pub(crate) async fn acquire_write_lane(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        self.inner
+            .write_lane
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "write lane closed")
+    }
+
     /// Acquire the global write-lane permit. ALWAYS call after
     /// `lock_corpus` for the same operation to maintain the documented
     /// `corpus → write_lane` order and prevent deadlock.

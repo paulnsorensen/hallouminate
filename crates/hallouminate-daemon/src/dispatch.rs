@@ -1586,7 +1586,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
         if !hallouminate_domain::corpus::missing_roots(&corpus).is_empty() {
             continue; // absent root; watcher skips it too, later boot picks it up
         }
-        let _guard = match state.acquire_mutation_guard(&corpus.name).await {
+        let _corpus_guard = match state.acquire_corpus_guard(&corpus.name).await {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
@@ -1594,7 +1594,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
                 continue;
             }
         };
-        match catch_up_corpus(&res, &registry, &corpus).await {
+        match catch_up_corpus(&state, &res, &registry, &corpus).await {
             Ok(Some(stats)) => tracing::info!(target: "hallouminate::daemon",
                 corpus = %corpus.name, files_upserted = stats.files_upserted,
                 files_touched = stats.files_touched, files_deleted = stats.files_deleted,
@@ -1609,13 +1609,44 @@ pub(super) async fn catch_up_index(state: DaemonState) {
 
 /// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed
 /// (no work, no model load); `Ok(Some(stats))` = reindexed.
+/// The caller must hold the corpus guard from planning through apply.
 pub(super) async fn catch_up_corpus(
+    state: &DaemonState,
     res: &RequestResources,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
 ) -> anyhow::Result<Option<hallouminate_domain::indexer::ApplyStats>> {
+    catch_up_corpus_inner(state, res, registry, corpus, async { scan(corpus) }).await
+}
+
+#[cfg(test)]
+async fn catch_up_corpus_with_scan_barrier(
+    state: &DaemonState,
+    res: &RequestResources,
+    registry: &HandlerRegistry,
+    corpus: &CorpusConfig,
+    scan_started: std::sync::Arc<tokio::sync::Notify>,
+    release_scan: std::sync::Arc<tokio::sync::Notify>,
+) -> anyhow::Result<Option<hallouminate_domain::indexer::ApplyStats>> {
+    catch_up_corpus_inner(state, res, registry, corpus, async move {
+        scan_started.notify_one();
+        release_scan.notified().await;
+        scan(corpus)
+    })
+    .await
+}
+
+async fn catch_up_corpus_inner(
+    state: &DaemonState,
+    res: &RequestResources,
+    registry: &HandlerRegistry,
+    corpus: &CorpusConfig,
+    scan_files: impl std::future::Future<
+        Output = hallouminate_domain::common::Result<Vec<hallouminate_domain::corpus::ScannedFile>>,
+    >,
+) -> anyhow::Result<Option<hallouminate_domain::indexer::ApplyStats>> {
     let mut disk_by_key = HashMap::new();
-    for scanned in scan(corpus)? {
+    for scanned in scan_files.await.map_err(anyhow::Error::msg)? {
         disk_by_key
             .entry(scanned.corpus_key.clone())
             .or_insert_with(Vec::new)
@@ -1641,6 +1672,10 @@ pub(super) async fn catch_up_corpus(
     {
         return Ok(None);
     }
+    let _permit = state
+        .acquire_write_lane()
+        .await
+        .map_err(anyhow::Error::msg)?;
     let stats = apply(
         combined,
         res.store.as_ref(),
@@ -1652,12 +1687,6 @@ pub(super) async fn catch_up_corpus(
     .await?;
     Ok(Some(stats))
 }
-
-/// Best-effort `mkdir -p` on daemon-managed corpus roots so a fresh
-/// repository wiki (which only exists logically until the first write)
-/// doesn't blow up the first `list_files` / `index` call. Restricted to
-/// `repo:*:wiki` corpora so a typo'd `[[corpus]] paths = ...` surfaces as a
-/// clear scan error instead of silently creating an empty directory and
 /// reporting success.
 async fn ensure_paths_exist(corpus: &CorpusConfig) {
     if !is_wiki_corpus(corpus) {
@@ -2418,6 +2447,10 @@ mod tests {
             .into_iter()
             .find(|c| c.name == "docs")
             .expect("docs corpus present");
+        let _corpus_guard = state
+            .acquire_corpus_guard(&corpus.name)
+            .await
+            .expect("corpus guard");
         let corpus_keys = corpus.corpus_keys();
         assert_eq!(
             corpus_keys.len(),
@@ -2444,7 +2477,7 @@ mod tests {
             .resources_for(state.baseline())
             .await
             .expect("resources_for");
-        let stats = catch_up_corpus(&res, &state.make_registry(), &corpus)
+        let stats = catch_up_corpus(&state, &res, &state.make_registry(), &corpus)
             .await
             .expect("catch_up_corpus")
             .expect("secondary-root deletion needs work");
@@ -2469,7 +2502,7 @@ mod tests {
             "root B deletion must remove only its exact rows",
         );
         assert!(
-            catch_up_corpus(&res, &state.make_registry(), &corpus)
+            catch_up_corpus(&state, &res, &state.make_registry(), &corpus)
                 .await
                 .expect("no-work catch_up_corpus")
                 .is_none(),
@@ -2477,6 +2510,76 @@ mod tests {
         );
     }
 
+    struct ScanRelease(std::sync::Arc<tokio::sync::Notify>);
+
+    impl Drop for ScanRelease {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    /// Holds scan before planning to prove that no-op reconciliation leaves the write lane available.
+    #[tokio::test]
+    async fn unchanged_catch_up_does_not_hold_global_write_lane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        let ground = tmp.path().join("ground");
+        let baseline = format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n[embeddings]\nenabled = false\n",
+            root.display(),
+        );
+        let state = state_with_ground(&ground, &baseline).await;
+        let corpus = state
+            .baseline()
+            .effective_corpora()
+            .expect("corpora")
+            .into_iter()
+            .next()
+            .expect("docs corpus");
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources_for");
+        let scan_started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_scan = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release_on_drop = ScanRelease(release_scan.clone());
+        let scan_started_signal = scan_started.notified();
+        let scan_started_for_catch_up = scan_started.clone();
+        let catch_up_state = state.clone();
+        let catch_up_corpus_config = corpus.clone();
+        let catch_up = tokio::spawn(async move {
+            let _corpus_guard = catch_up_state
+                .acquire_corpus_guard(&catch_up_corpus_config.name)
+                .await
+                .expect("corpus guard");
+            let registry = catch_up_state.make_registry();
+            catch_up_corpus_with_scan_barrier(
+                &catch_up_state,
+                &res,
+                &registry,
+                &catch_up_corpus_config,
+                scan_started_for_catch_up,
+                release_scan,
+            )
+            .await
+        });
+        scan_started_signal.await;
+        let permit = tokio::time::timeout(Duration::from_secs(1), state.acquire_write_lane())
+            .await
+            .expect("unrelated mutation must acquire write lane")
+            .expect("write lane");
+        drop(permit);
+        drop(release_on_drop);
+        assert!(
+            catch_up
+                .await
+                .expect("unchanged catch-up task")
+                .expect("unchanged catch-up")
+                .is_none(),
+            "unchanged corpus must not produce an index plan",
+        );
+    }
     #[tokio::test]
     async fn dispatch_ping_is_config_independent_and_reports_version() {
         // Curd C: `Ping` is a config-independent control op handled BEFORE

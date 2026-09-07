@@ -111,14 +111,14 @@ pub(super) async fn provisioning_loop(state: DaemonState) {
 }
 
 async fn provision_corpus(state: &DaemonState, corpus: &CorpusConfig, cfg: &Config) {
-    let _guard = match state.acquire_mutation_guard(&corpus.name).await {
+    let _corpus_guard = match state.acquire_corpus_guard(&corpus.name).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(
                 target: "hallouminate::daemon",
                 corpus = %corpus.name,
                 error = %e,
-                "provisioning: could not acquire mutation guard; will retry on next ground",
+                "provisioning: could not acquire corpus guard; will retry on next ground",
             );
             clear_seen_keys(state, corpus);
             return;
@@ -138,7 +138,7 @@ async fn provision_corpus(state: &DaemonState, corpus: &CorpusConfig, cfg: &Conf
         }
     };
     let registry = HandlerRegistry::new(res.tokenizer.clone(), CHUNK_BUDGET_TOKENS);
-    match super::dispatch::catch_up_corpus(&res, &registry, corpus).await {
+    match super::dispatch::catch_up_corpus(state, &res, &registry, corpus).await {
         Ok(Some(stats)) => tracing::info!(
             target: "hallouminate::daemon",
             corpus = %corpus.name,
