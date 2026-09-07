@@ -68,6 +68,7 @@ use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
 use super::ladder::LadderAction;
 use super::maintenance::{DeferReason, maintenance_loop};
+#[cfg(test)]
 use super::provisioner::{Provisioner, provisioning_loop};
 use super::supervisor::SupervisorAction;
 
@@ -382,6 +383,7 @@ struct DaemonStateInner {
     heartbeat: Arc<super::heartbeat::HeartbeatRegistry>,
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
     provisioner: Provisioner,
     /// Live-registration ledger backing the watcher pump (baseline +
     /// runtime-discovered corpus roots). See `watch::registry`.
@@ -691,17 +693,12 @@ impl DaemonState {
         let restart_cap = cfg.daemon.restart_intensity_cap;
         let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
         let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
-        // Boot catch-up (`catch_up_index`, spawned by the server after `open`)
-        // covers every baseline corpus; pre-seed the provisioner so `observe`
-        // does not redundantly re-provision them and race the watcher. If
-        // `catch_up_index` itself fails for a corpus, that corpus self-heals
-        // via the maintenance tick or the watcher, not the provisioner —
-        // the seed here is deliberately one-shot, not a retry guarantee.
+        #[cfg(test)]
         let baseline_corpora_for_seed = cfg.effective_corpora().unwrap_or_else(|e| {
             tracing::warn!(
                 target: "hallouminate::daemon",
                 error = %e,
-                "could not enumerate baseline corpora for provisioner seed; provisioning may redundantly re-index them",
+                "could not enumerate baseline corpora for provisioner test seed",
             );
             Vec::new()
         });
@@ -766,6 +763,7 @@ impl DaemonState {
                     heartbeat,
                     maintenance_task: Mutex::new(None),
                     watch_registry: Arc::new(super::watch::WatchRegistry::new()),
+                    #[cfg(test)]
                     provisioner: {
                         let provisioner = Provisioner::new();
                         provisioner.seed(&baseline_corpora_for_seed);
@@ -775,6 +773,12 @@ impl DaemonState {
                 }
             }),
         };
+
+        #[cfg(test)]
+        {
+            let provisioning_state = state.clone();
+            tokio::spawn(provisioning_loop(provisioning_state));
+        }
 
         // Low-frequency LanceDB maintenance tick (compaction + version
         // prune, see `LanceStore::maintain`). Runs under the write-lane
@@ -812,16 +816,6 @@ impl DaemonState {
             *state.inner.maintenance_task.lock().await = Some(maintenance_task);
         }
 
-        {
-            let loop_state = state.clone();
-            state
-                .inner
-                .supervisor
-                .spawn(super::heartbeat::TaskName::Provision, move || {
-                    provisioning_loop(loop_state.clone())
-                });
-        }
-
         Ok(state)
     }
 
@@ -846,7 +840,7 @@ impl DaemonState {
         &self.inner.heartbeat
     }
 
-    /// Provisioner queuing newly discovered corpus roots for background catch-up.
+    #[cfg(test)]
     pub(crate) fn provisioner(&self) -> &Provisioner {
         &self.inner.provisioner
     }
