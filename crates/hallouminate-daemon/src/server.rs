@@ -125,7 +125,13 @@ async fn serve_with_config(
     // even with zero baseline roots, since runtime registrations may arrive
     // later. The probe handle is dropped before the supervised factory
     // creates the long-lived instance, so two debouncers never run at once.
-    let watcher_enabled = super::watch::spawn_corpus_watcher(&state).is_some();
+    let watcher_enabled = match super::watch::spawn_corpus_watcher(&state) {
+        Some(handle) => {
+            handle.stop().await;
+            true
+        }
+        None => false,
+    };
     {
         let sup = state.supervisor().clone();
         let factory_state = state.clone();

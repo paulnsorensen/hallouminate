@@ -212,7 +212,7 @@ impl ReloadFailureMemo {
 /// every physical `notify` watch. Registration teardown rides on this drop —
 /// there is no separate explicit "unregister everything" step.
 pub struct WatcherHandle {
-    _task: tokio::task::JoinHandle<()>,
+    _task: Option<tokio::task::JoinHandle<()>>,
     tracker: TaskTracker,
 }
 
@@ -221,8 +221,13 @@ impl WatcherHandle {
     /// restart rebuilds the whole debouncer + pump pair. Holds `self` (and
     /// so the debouncer, owned by the task) alive until the pump future
     /// completes.
-    pub(crate) async fn join(self) {
-        let result = self._task.await;
+    pub(crate) async fn join(mut self) {
+        let result = self
+            ._task
+            .as_mut()
+            .expect("watcher task already joined")
+            .await;
+        self._task = None;
         self.tracker.close();
         self.tracker.wait().await;
         if let Err(join_err) = result {
@@ -231,6 +236,25 @@ impl WatcherHandle {
                 std::panic::resume_unwind(join_err.into_panic());
             }
         }
+    }
+
+    pub(crate) async fn stop(mut self) {
+        if let Some(task) = self._task.as_mut() {
+            task.abort();
+            let _ = task.await;
+        }
+        self._task = None;
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+}
+
+impl Drop for WatcherHandle {
+    fn drop(&mut self) {
+        if let Some(task) = self._task.take() {
+            task.abort();
+        }
+        self.tracker.close();
     }
 }
 
@@ -635,6 +659,9 @@ async fn run_pump(
             () = state.watch_registry().changed().notified() => {
                 pump.reconcile(&state, &tracker);
                 last_reconciled = state.watch_registry().generation();
+                state
+                    .heartbeat()
+                    .bump(super::heartbeat::TaskName::WatcherPump);
                 continue;
             }
             _ = reconcile_tick.tick() => {
@@ -644,6 +671,9 @@ async fn run_pump(
                 state.watch_registry().mark_reconcile_due_all();
                 pump.reconcile(&state, &tracker);
                 last_reconciled = state.watch_registry().generation();
+                state
+                    .heartbeat()
+                    .bump(super::heartbeat::TaskName::WatcherPump);
                 continue;
             }
             // `notify_one()` carries a permit, so this is cancel-safe:
@@ -755,7 +785,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     ));
 
     Some(WatcherHandle {
-        _task: task,
+        _task: Some(task),
         tracker,
     })
 }
@@ -1758,6 +1788,145 @@ mod tests {
             "the watcher service must start even with no baseline corpora, \
              so runtime-discovered corpora can register later"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_pump_heartbeats_after_completed_reconcile_ticks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        cfg.watch.reconcile_interval_secs = Some(1);
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let first = spawn_corpus_watcher(&state).expect("watcher");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump),
+            0,
+            "a newly spawned pump must not advance a prior heartbeat before a cycle completes"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let previous = state
+            .heartbeat()
+            .epoch(crate::heartbeat::TaskName::WatcherPump);
+        assert!(
+            previous > 0,
+            "watcher pump must heartbeat after its first reconcile tick"
+        );
+
+        drop(first);
+        tokio::task::yield_now().await;
+        let restarted = spawn_corpus_watcher(&state).expect("restarted watcher");
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump),
+            previous,
+            "a restarted pump must not advance a prior heartbeat before a cycle completes"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump),
+            previous + 1,
+            "dropping the prior watcher must leave one active pump"
+        );
+
+        state.shutdown_token().cancel();
+        restarted.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_pump_cancelling_join_stops_before_replacement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        cfg.watch.reconcile_interval_secs = Some(1);
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let first = spawn_corpus_watcher(&state).expect("watcher");
+        let join = tokio::spawn(async move { first.join().await });
+
+        tokio::task::yield_now().await;
+        join.abort();
+        assert!(
+            join.await.expect_err("cancelled join task").is_cancelled(),
+            "cancelling join must drop the watcher handle"
+        );
+
+        let replacement = spawn_corpus_watcher(&state).expect("replacement watcher");
+        tokio::task::yield_now().await;
+        let before = state
+            .heartbeat()
+            .epoch(crate::heartbeat::TaskName::WatcherPump);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump),
+            before + 1,
+            "a cancelled join must stop its pump before replacement starts"
+        );
+
+        state.shutdown_token().cancel();
+        replacement.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_pump_heartbeats_after_registry_event_before_watchdog_poll() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        cfg.watch.reconcile_interval_secs = Some(1);
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let handle = spawn_corpus_watcher(&state).expect("watcher");
+        tokio::task::yield_now().await;
+        let before = state
+            .heartbeat()
+            .epoch(crate::heartbeat::TaskName::WatcherPump);
+
+        let runtime_corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        register_runtime_corpora(&state, None, &[runtime_corpus], &cfg).expect("register");
+        tokio::task::yield_now().await;
+        let after_event = state
+            .heartbeat()
+            .epoch(crate::heartbeat::TaskName::WatcherPump);
+        assert!(
+            after_event > before,
+            "watcher pump heartbeat must advance after a registry event"
+        );
+
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+        }
+        let after_ticks = state
+            .heartbeat()
+            .epoch(crate::heartbeat::TaskName::WatcherPump);
+        assert!(
+            after_ticks >= after_event + 3,
+            "repeated reconcile ticks must keep the watcher alive after an event"
+        );
+
+        state.shutdown_token().cancel();
+        handle.join().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
