@@ -119,10 +119,12 @@ async fn serve_with_config(
     let lock = acquire_single_instance(&lock_path)?;
     let state = DaemonState::open_with_socket(cfg, xdg_path, socket_path.to_path_buf()).await?;
     remove_stale_socket(socket_path).await;
-    // One-shot probe to learn whether the watcher is enabled (watchable
-    // roots exist and the backend initializes); the probe handle is dropped
-    // before the supervised factory creates the long-lived instance, so two
-    // debouncers never run at once.
+    // One-shot probe to learn whether the watcher is enabled: whether the
+    // watcher backend itself initialized (debouncer construction succeeded),
+    // not whether any roots exist yet -- `spawn_corpus_watcher` starts live
+    // even with zero baseline roots, since runtime registrations may arrive
+    // later. The probe handle is dropped before the supervised factory
+    // creates the long-lived instance, so two debouncers never run at once.
     let watcher_enabled = super::watch::spawn_corpus_watcher(&state).is_some();
     {
         let sup = state.supervisor().clone();

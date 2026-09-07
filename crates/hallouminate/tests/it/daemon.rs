@@ -2409,9 +2409,9 @@ impl Drop for EnvGuard {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
-    // Quality gate (Curd 3): editing a file in a baseline corpus root triggers
-    // a reindex within ~debounce_ms; deleting prunes its rows. Both legs are
-    // asserted via `ground` — the watcher's *unique* observable effect on the
+    // Quality gate (Curd 3): the watcher handles edits and deletes first.
+    // Periodic reconciliation recovers any remove event that the platform drops.
+    // Both legs are asserted via `ground` — the watcher's *unique* observable effect on the
     // LanceDB rows — never via a manual `index` (which would index the file
     // itself, so the old assertion passed even with the watcher disabled) nor
     // `list_files` (a filesystem scan that sees the on-disk file regardless of
@@ -2427,7 +2427,7 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\n\n[storage]\nground_dir = \"{g}\"\n",
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 1\n\n[storage]\nground_dir = \"{g}\"\n",
         c = corpus_root.display(),
         g = ground.display(),
     );
@@ -2509,6 +2509,99 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     assert!(
         pruned,
         "watcher must prune watched.md's rows on delete so `ground` no longer returns it"
+    );
+}
+
+/// Pins AC-5: reconciliation (not the live watcher) repairs a remove event
+/// dropped while nothing was watching. The file is deleted after the first
+/// daemon shuts down (watcher not running to observe it), then a second
+/// daemon boots against the same ground dir with a short reconcile interval
+/// and must prune the stale row on its own, unprompted by any live event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_tick_repairs_dropped_remove_event() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
+    let watched = corpus_root.join("watched.md");
+    std::fs::write(
+        &watched,
+        "# Spice\n\nthe rarespiceword melange flows here\n",
+    )
+    .expect("write watched file");
+
+    let ground_hits = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let res: hallouminate_daemon::GroundResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                    query: "rarespiceword".into(),
+                    corpus: Some("docs".into()),
+                    top_files: None,
+                    chunks_per_file: None,
+                    limit: None,
+                    snippet_chars: None,
+                }),
+            })
+            .await
+            .expect("ground ok");
+        res.response.docs.len()
+    };
+
+    let first = DaemonHarness::spawn(cfg.clone()).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut indexed = false;
+    while std::time::Instant::now() < deadline {
+        if ground_hits(
+            connect_at(first.socket()).await.expect("connect"),
+            first.cwd().to_path_buf(),
+        )
+        .await
+            >= 1
+        {
+            indexed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        indexed,
+        "first daemon's watcher must index watched.md before shutdown"
+    );
+    first
+        .shutdown()
+        .await
+        .expect("first daemon shuts down cleanly");
+
+    std::fs::remove_file(&watched).expect("remove watched file while no daemon runs");
+
+    let mut reconcile_cfg = cfg;
+    reconcile_cfg.watch.reconcile_interval_secs = Some(1);
+    let second = DaemonHarness::spawn(reconcile_cfg).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut pruned = false;
+    while std::time::Instant::now() < deadline {
+        if ground_hits(
+            connect_at(second.socket()).await.expect("connect"),
+            second.cwd().to_path_buf(),
+        )
+        .await
+            == 0
+        {
+            pruned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        pruned,
+        "reconciliation must prune watched.md's stale row within ~5s of the second daemon's tick"
     );
 }
 

@@ -164,7 +164,7 @@ struct DaemonStateInner {
     /// (`.hallouminate/config.toml` walk from the request's `cwd`) on top of
     /// this via `Config::resolve_for_cwd` in the dispatcher — the baseline
     /// never changes once the daemon is running.
-    baseline: Config,
+    baseline: Arc<Config>,
     /// Source path of the baseline (the XDG config path or the `--config
     /// PATH` override). Threaded into `resolve_for_cwd` so scalar-conflict
     /// diagnostics name the actual file that owns the baseline value, per
@@ -248,6 +248,9 @@ struct DaemonStateInner {
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
     provisioner: Provisioner,
+    /// Live-registration ledger backing the watcher pump (baseline +
+    /// runtime-discovered corpus roots). See `watch::registry`.
+    watch_registry: Arc<super::watch::WatchRegistry>,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
@@ -596,7 +599,7 @@ impl DaemonState {
                     }
                 });
                 DaemonStateInner {
-                    baseline: cfg,
+                    baseline: Arc::new(cfg),
                     baseline_xdg_path: xdg_path,
                     baseline_resources,
                     resources: Mutex::new(resources_map),
@@ -623,6 +626,7 @@ impl DaemonState {
                     )),
                     heartbeat,
                     maintenance_task: Mutex::new(None),
+                    watch_registry: Arc::new(super::watch::WatchRegistry::new()),
                     provisioner: {
                         let provisioner = Provisioner::new();
                         provisioner.seed(&baseline_corpora_for_seed);
@@ -708,6 +712,11 @@ impl DaemonState {
         &self.inner.provisioner
     }
 
+    /// Live-registration ledger backing the watcher pump.
+    pub(crate) fn watch_registry(&self) -> &Arc<super::watch::WatchRegistry> {
+        &self.inner.watch_registry
+    }
+
     /// Source path of the baseline config the daemon booted from — the XDG
     /// path when no `--config PATH` was given, or the `--config PATH` value
     /// itself. `None` when the baseline was constructed without a known
@@ -726,6 +735,13 @@ impl DaemonState {
     /// for a request should use the resolved value, not this baseline.
     pub fn baseline(&self) -> &Config {
         &self.inner.baseline
+    }
+
+    /// `baseline()` behind a cheap `Arc` clone, for call sites that need an
+    /// owned handle (e.g. as a fallback `Arc<Config>` in the watcher) without
+    /// deep-cloning the whole `Config` on every call.
+    pub(crate) fn baseline_arc(&self) -> Arc<Config> {
+        Arc::clone(&self.inner.baseline)
     }
 
     pub fn store(&self) -> Arc<LanceStore> {

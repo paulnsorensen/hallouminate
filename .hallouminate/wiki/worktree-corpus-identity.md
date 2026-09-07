@@ -37,9 +37,9 @@ The issue #288 reproduction queried `repo:hallouminate:wiki` from one Conductor 
 
 Per-worktree storage no longer grows without bound. PR #304 (`feat(daemon): garbage-collect chunk rows at retired worktree roots`, commit `b25ade5`) added `ChunkStore::distinct_roots` and `delete_root`, evicting rows whose recorded root no longer exists on disk. Issue #286 tracked this orphan-cleanup work.
 
-## Related watcher caveat
+## Related watcher coverage
 
-Repo-layer worktree wikis are not part of the daemon's boot-time baseline watcher set. Edits made outside `add_markdown` remain invisible until an explicit `index`; MCP writes reindex their target file immediately.
+Until PR #461 the daemon watcher covered only the boot-time baseline roots, so edits to a repo-layer worktree wiki made outside `add_markdown` stayed invisible until an explicit `index`. PR #461 (open) registers every corpus a Ground request resolves into a durable `WatchRegistry`, watches its roots, and repairs missed events on a reconcile tick (`watch.reconcile_interval_secs`, default 60 s); see [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md) ADR-004. MCP writes still reindex their target file immediately.
 
 See [ground-search-quality](ground-search-quality.md), [ground-search-quality-adrs](ground-search-quality-adrs.md), [domain-model](domain-model.md), [config-layering](config-layering.md), and [worktree-dev-gotchas](worktree-dev-gotchas.md).
 

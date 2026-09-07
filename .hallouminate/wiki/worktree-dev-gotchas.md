@@ -98,6 +98,10 @@ git operation: `checkout -- .`, `restore`, `reset --hard`.
   git operation first, then the tilth parent-checkout leak above.
 
 
+
+
+The same rule covers `git checkout -- <path>`, `git restore`, `git reset`, and `git clean`. During the PR #461 cure a coder agent ran `git checkout -- crates/hallouminate-daemon/src/watch/mod.rs` to undo its own scratch edit and discarded four earlier waves of uncommitted work on that file. Undo an agent edit with the inverse text patch, never with a working-tree reset. Snapshot changed files to a scratch directory after each green wave so a wipe is recoverable; the #461 recovery replayed patch strings from agent transcripts onto a snapshot.
+
 ## An abandoned worktree branch can hold the only copy of a real fix
 
 Added 2026-07-29. A `/pasteurize` investigation running in an isolated worktree
@@ -151,11 +155,87 @@ env PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 ```
 
 Read the current repository pin before copying this version.
-This procedure replaces the older `env -u` workaround for this shim failure.
+
+The `env -u RUSTUP_TOOLCHAIN` workaround is **conditional, not superseded**.
+It selects the pinned toolchain when the rustup proxies precede the mise shim in `PATH`.
+It fails when the mise shim comes first.
+A 2026-09-05 measurement in the `macau-v1` worktree resolves `cargo` to
+`/opt/homebrew/opt/rustup/bin/cargo` before `~/.local/share/mise/shims/cargo`,
+and `env -u RUSTUP_TOOLCHAIN rustc --version` reports 1.97.1 correctly.[^pathorder]
+The explicit-`PATH` form above works in both orders, so prefer it in an agent brief.
+Always confirm the selection before you trust a gate result:
+
+```sh
+env -u RUSTUP_TOOLCHAIN rustc --version   # must report the rust-toolchain.toml pin
+```
 A silent gate can also wait for another worktree's verification lease.
 Check the lease records and owning process before treating that wait as a compiler hang.[^lease]
 
 [^mise]: Issue #453 closeout, 2026-09-05: `type -a cargo just`, `rustup show active-toolchain`, and `env -u RUSTUP_TOOLCHAIN rustc --version` select the mise override; `rustup run 1.97 rustc --version` reports 1.97.1. Repository pin: rust-toolchain.toml:4-5.
 [^lease]: scripts/verify.py::run_leased; AGENTS.md::Local verification
 
-_Source: issue #453 verification diagnosis · Updated: 2026-09-05 · Supersedes: unset-only toolchain selection for mise shims_
+## `mcp_serve` tests time out under host load, not from a code fault
+
+Added 2026-09-05. The `it` integration binary fails with
+`response within timeout: Elapsed(())` at `crates/hallouminate/tests/it/mcp_serve.rs`
+when the host runs many worktrees at once.
+Each `mcp_serve` test spawns a real daemon subprocess and waits on a 15-second
+`READ_TIMEOUT` for the JSON-RPC reply.
+The deadline is wall-clock, so host contention alone exhausts it.
+
+`<certain>` this is contention and not a logic fault.
+One tree measured on the same commit, varying only parallelism:[^mcpload]
+
+| Invocation | Result |
+| --- | --- |
+| `just verify` (default parallelism) | 20 failed, exit 101 |
+| `cargo test -p hallouminate --test it` | 11 failed |
+| `cargo test -p hallouminate --test it -- --test-threads=4` | 182 passed, 0 failed, exit 0 |
+| `--test it mcp_serve` filter alone | 25 passed, 0 failed |
+
+The discriminator is that **every** failure is the same read deadline with
+**zero** assertion failures.
+A real regression changes values; it does not produce uniform timeouts.
+
+PR #459 grew `mcp_serve` from 22 to 27 daemon-spawning tests, which lowers the
+load needed to trip the deadline.
+
+**Rules that follow:**
+- Check `uptime` before you trust an `it`-suite failure. Load average above ~20 on
+  this host makes the default parallelism unreliable.
+- Re-run with `-- --test-threads=4` before you attribute the failure to your change.
+- Do not "fix" `mcp_serve` and do not raise `READ_TIMEOUT` in response to this.
+- Report any `mcp_serve` failure that is **not** this exact signature — that one is real.
+
+## The watcher's own delete leg does not clear rows locally without reconciliation
+
+`watcher_reindexes_then_prunes_file_in_baseline_corpus_root` (`crates/hallouminate/tests/it/daemon.rs`) passes only with `reconcile_interval_secs = 1`. With a long interval the create leg indexes but the delete/prune leg never clears the row (2/2 runs, 20 s timeout, observed 2026-09-06 on the PR #461 branch). Two hypotheses remain open: the watcher's `notify` remove path regressed, or this host does not deliver the remove event for the tmp layout. Until `/pasteurize` settles it, treat a green run of that test as proof of reconciliation, not of the watcher's prune path; `reconcile_tick_repairs_dropped_remove_event` pins the reconciliation leg on its own.
+
+## Squash merges leave residue that the melt detector misses
+
+Added 2026-09-05. This repository squash-merges pull requests.
+A branch stacked on another branch therefore keeps a base commit whose content
+already reached `main` under a different SHA and a different commit message.
+
+`/melt`'s `detect-squash-residue` compares whole trees.
+It returned `not-detected` for a branch stacked on `paulnsorensen/gh-issue-453`
+after that branch merged as PR #459, because the squash commit contained **more**
+than the stacked base commit did, so no tree matched.[^squash]
+
+`<certain>` the reliable offline check is blob comparison, not tree comparison:
+
+```sh
+git rev-parse <base-commit>:<path>    # compare against
+git rev-parse origin/main:<path>      # identical blobs => content already landed
+```
+
+Then drop the superseded commit with `git rebase --onto origin/main <base-commit>`.
+Git's rename detection carries upstream edits across a file that the branch
+renamed, but verify that rather than assume it: diff the upstream-added and
+upstream-removed lines against the renamed file before you continue.
+
+[^mcpload]: Issue #427 slice-3 resume, 2026-09-05. Host at load average 25-33 with ~12 concurrent worktrees. `READ_TIMEOUT` is `Duration::from_secs(15)` at mcp_serve.rs:30.
+[^squash]: Issue #427 rebase, 2026-09-05. Base `a1219fd` versus squash `e745955`; `walker.rs` and `sandbox.rs` blobs identical, detector verdict `not-detected`.
+[^pathorder]: Issue #427 resume, 2026-09-05: `type -a cargo` in the `macau-v1` worktree lists the rustup proxy before the mise shim; `env -u RUSTUP_TOOLCHAIN cargo --version` reports 1.97.1.
+
+_Source: issue #453 verification diagnosis; issue #427 slice-3 resume · Updated: 2026-09-05 · Supersedes: unset-only toolchain selection for mise shims_

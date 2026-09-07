@@ -12,7 +12,7 @@ hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
 hallouminate-config.workspace = true
 tokio.workspace = true
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 notify = "8"
 notify-debouncer-full = "0.7"
 rustix.workspace = true
