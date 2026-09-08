@@ -908,6 +908,12 @@ fn reject_symlink_leaf(parent: &Dir, name: &OsStr) -> Result<(), WriteError> {
 /// directories (`0o755`).
 const NEW_FILE_MODE: u32 = 0o644;
 
+#[derive(Clone, Copy)]
+enum ReplaceTarget {
+    Existing(u32),
+    Missing,
+}
+
 fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
     // `create_new(true)` maps to `O_CREAT | O_EXCL`. The pre-existing-leaf
     // case (including a pre-existing symlink) surfaces as `AlreadyExists`,
@@ -931,27 +937,70 @@ fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), Writ
 }
 
 fn atomic_replace(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
-    let mode = validate_replace_target(parent, name)?;
-    let (temp_name, mut file) = create_temp_file(parent, name, mode)?;
-    if let Err(err) = write_and_sync(&mut file, content) {
-        cleanup_temp(parent, &temp_name);
-        return Err(err);
-    }
-    drop(file);
-
-    if let Err(e) = parent.rename(temp_name.as_os_str(), parent, name) {
-        cleanup_temp(parent, &temp_name);
-        return Err(classify_create_io_error(e));
-    }
-    fsync_dir(parent)
+    atomic_replace_with_hooks(
+        parent,
+        name,
+        content,
+        |file, bytes| write_and_sync_cap(file.as_file_mut(), bytes),
+        set_replace_mode,
+        |temp, _, name| temp.replace(name).map_err(classify_create_io_error),
+        fsync_dir,
+    )
 }
 
-/// Confirms `name` is either absent or an existing regular file, and returns
-/// the mode the replacement temp file must be created with: the
-/// destination's own mode when it exists -- so an overwrite can never
-/// broaden permissions -- or [`NEW_FILE_MODE`] when there is nothing to
-/// inherit from.
-fn validate_replace_target(parent: &Dir, name: &OsStr) -> Result<u32, WriteError> {
+fn atomic_replace_with_hooks<WriteHook, PermissionHook, ReplaceHook, SyncHook>(
+    parent: &Dir,
+    name: &OsStr,
+    content: &[u8],
+    write_hook: WriteHook,
+    permission_hook: PermissionHook,
+    replace_hook: ReplaceHook,
+    sync_hook: SyncHook,
+) -> Result<(), WriteError>
+where
+    WriteHook: FnOnce(&mut cap_tempfile::TempFile<'_>, &[u8]) -> Result<(), WriteError>,
+    PermissionHook: FnOnce(&cap_tempfile::TempFile<'_>, ReplaceTarget) -> Result<(), WriteError>,
+    ReplaceHook: FnOnce(cap_tempfile::TempFile<'_>, &Dir, &OsStr) -> Result<(), WriteError>,
+    SyncHook: FnOnce(&Dir) -> Result<(), WriteError>,
+{
+    let target = validate_replace_target(parent, name)?;
+    let mut temp = cap_tempfile::TempFile::new(parent).map_err(classify_create_io_error)?;
+    permission_hook(&temp, target)?;
+    write_hook(&mut temp, content)?;
+    replace_hook(temp, parent, name)?;
+    sync_hook(parent)
+}
+
+fn set_replace_mode(
+    temp: &cap_tempfile::TempFile<'_>,
+    target: ReplaceTarget,
+) -> Result<(), WriteError> {
+    #[cfg(unix)]
+    {
+        use cap_std::fs::{Permissions, PermissionsExt};
+
+        let mode = match target {
+            ReplaceTarget::Existing(mode) => mode,
+            ReplaceTarget::Missing => {
+                temp.as_file()
+                    .metadata()
+                    .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?
+                    .permissions()
+                    .mode()
+                    & NEW_FILE_MODE
+            }
+        };
+        temp.as_file()
+            .set_permissions(Permissions::from_mode(mode))
+            .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (temp, target);
+    Ok(())
+}
+
+/// Confirms `name` is either absent or an existing regular file.
+fn validate_replace_target(parent: &Dir, name: &OsStr) -> Result<ReplaceTarget, WriteError> {
     match parent.symlink_metadata(name) {
         Ok(meta) => {
             let ft = meta.file_type();
@@ -961,56 +1010,28 @@ fn validate_replace_target(parent: &Dir, name: &OsStr) -> Result<u32, WriteError
                 #[cfg(unix)]
                 {
                     use cap_std::fs::PermissionsExt;
-                    Ok(meta.permissions().mode() & 0o777)
+                    Ok(ReplaceTarget::Existing(meta.permissions().mode() & 0o777))
                 }
                 #[cfg(not(unix))]
                 {
-                    Ok(NEW_FILE_MODE)
+                    Ok(ReplaceTarget::Missing)
                 }
             } else {
                 Err(invalid_path_error("target is not a regular file"))
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(NEW_FILE_MODE),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReplaceTarget::Missing),
         Err(e) => Err(classify_create_io_error(e)),
     }
 }
 
-fn create_temp_file(
-    parent: &Dir,
-    name: &OsStr,
-    mode: u32,
-) -> Result<(OsString, std::fs::File), WriteError> {
-    for attempt in 0..100 {
-        let mut temp = OsString::from(".");
-        temp.push(name);
-        temp.push(format!(
-            ".hallouminate-{}-{attempt}.tmp",
-            std::process::id()
-        ));
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use cap_std::fs::OpenOptionsExt;
-            opts.mode(mode);
-        }
-        match parent.open_with(temp.as_os_str(), &opts) {
-            Ok(cap_file) => return Ok((temp, cap_file.into_std())),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(classify_create_io_error(e)),
-        }
-    }
-    Err(WriteError::new(
-        WriteErrorKind::Io,
-        std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "temporary filename collision",
-        ),
-    ))
+fn write_and_sync(file: &mut std::fs::File, content: &[u8]) -> Result<(), WriteError> {
+    file.write_all(content)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
 }
 
-fn write_and_sync(file: &mut std::fs::File, content: &[u8]) -> Result<(), WriteError> {
+fn write_and_sync_cap(file: &mut cap_std::fs::File, content: &[u8]) -> Result<(), WriteError> {
     file.write_all(content)
         .and_then(|_| file.sync_all())
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
@@ -1038,10 +1059,6 @@ fn fsync_dir(dir: &Dir) -> Result<(), WriteError> {
     dot.into_std()
         .sync_all()
         .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
-}
-
-fn cleanup_temp(parent: &Dir, name: &OsStr) {
-    let _ = parent.remove_file(name);
 }
 
 // Numeric errno constants used in path-error classification.
@@ -1514,6 +1531,34 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_replace_missing_target_keeps_umask_cleared_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        with_umask(0o077, || {
+            atomic_write_no_follow(root, Path::new("fresh.md"), b"data", true).unwrap();
+        });
+        let mode = std::fs::metadata(root.join("fresh.md"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        with_umask(0, || {
+            atomic_write_no_follow(root, Path::new("fresh-open.md"), b"data", true).unwrap();
+        });
+        let mode = std::fs::metadata(root.join("fresh-open.md"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
     #[test]
     fn atomic_write_no_follow_refuses_existing_without_overwrite() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1856,14 +1901,14 @@ mod tests {
         assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
     }
 
-    /// Run `body` with the process umask forced to 0, holding a process-wide
+    /// Run `body` with a controlled process umask, holding a process-wide
     /// lock for the whole window so the global umask cannot race a sibling
     /// test, and restoring the inherited umask before releasing the lock.
     /// Needed because `cargo test` runs a binary's tests on multiple threads
     /// and `umask(2)` is per-process, not per-thread; the `Restore` guard also
     /// repairs the umask if `body` panics.
     #[cfg(unix)]
-    fn with_permissive_umask<R>(body: impl FnOnce() -> R) -> R {
+    fn with_umask<R>(mask: u16, body: impl FnOnce() -> R) -> R {
         use rustix::fs::Mode;
         use rustix::process::umask;
         use std::sync::Mutex;
@@ -1884,7 +1929,7 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         // Dropped before `_serialize` (LIFO), so the umask is restored while
         // the lock is still held.
-        let _restore = Restore(umask(Mode::empty()));
+        let _restore = Restore(umask(Mode::from_bits_retain(mask)));
         body()
     }
 
@@ -1903,7 +1948,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        with_permissive_umask(|| {
+        with_umask(0, || {
             atomic_write_no_follow(root, Path::new("perm/leaf.md"), b"x", false)
                 .expect("write through a fresh intermediate dir");
         });
@@ -1932,7 +1977,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        with_permissive_umask(|| {
+        with_umask(0, || {
             atomic_write_no_follow(root, Path::new("a/b/c/leaf.md"), b"x", false)
                 .expect("write through three fresh intermediate dirs");
         });
@@ -1946,6 +1991,176 @@ mod tests {
             assert_eq!(mode, 0o755, "{rel} must be capped at 0o755, got {mode:o}");
         }
     }
+    #[test]
+    fn atomic_replace_write_failure_keeps_destination_and_cleans_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let destination = root.join("target.md");
+        std::fs::write(&destination, b"original").unwrap();
+        let result = atomic_replace_with_hooks(
+            &Dir::open_ambient_dir(root, ambient_authority()).unwrap(),
+            OsStr::new("target.md"),
+            b"replacement",
+            |temp, bytes| {
+                temp.as_file_mut().write_all(&bytes[..1]).unwrap();
+                Err(WriteError::new(
+                    WriteErrorKind::Io,
+                    std::io::Error::other("injected write failure"),
+                ))
+            },
+            |_, _| Ok(()),
+            |_, _, _| Ok(()),
+            |_| Ok(()),
+        );
+        let WriteErrorKind::Io = result.unwrap_err().kind else {
+            panic!("injected write failure must classify as Io");
+        };
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        let entries: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsString::from("target.md")]);
+    }
+
+    #[test]
+    fn atomic_replace_replace_failure_keeps_destination_and_cleans_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let destination = root.join("target.md");
+        std::fs::write(&destination, b"original").unwrap();
+        std::fs::create_dir(root.join("blocked")).unwrap();
+        let dir = Dir::open_ambient_dir(root, ambient_authority()).unwrap();
+        let result = atomic_replace_with_hooks(
+            &dir,
+            OsStr::new("target.md"),
+            b"replacement",
+            |temp, bytes| write_and_sync_cap(temp.as_file_mut(), bytes),
+            |_, _| Ok(()),
+            |temp, _, _| {
+                temp.replace(OsStr::new("blocked"))
+                    .map_err(|error| WriteError::new(WriteErrorKind::Io, error))
+            },
+            |_| Ok(()),
+        );
+        let WriteErrorKind::Io = result.unwrap_err().kind else {
+            panic!("injected replace failure must classify as Io");
+        };
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        let mut entries: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![OsString::from("blocked"), OsString::from("target.md")]
+        );
+    }
+
+    #[test]
+    fn atomic_replace_orders_file_sync_replace_and_directory_sync() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = Dir::open_ambient_dir(root, ambient_authority()).unwrap();
+        let order = Rc::new(RefCell::new(Vec::new()));
+        let write_order = Rc::clone(&order);
+        let replace_order = Rc::clone(&order);
+        let sync_order = Rc::clone(&order);
+        atomic_replace_with_hooks(
+            &dir,
+            OsStr::new("target.md"),
+            b"replacement",
+            |temp, bytes| {
+                write_and_sync_cap(temp.as_file_mut(), bytes)?;
+                write_order.borrow_mut().push("file_sync");
+                Ok(())
+            },
+            |_, _| Ok(()),
+            |temp, _, name| {
+                temp.replace(name).map_err(classify_create_io_error)?;
+                replace_order.borrow_mut().push("replace");
+                Ok(())
+            },
+            |dir| {
+                fsync_dir(dir)?;
+                sync_order.borrow_mut().push("directory_sync");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*order.borrow(), ["file_sync", "replace", "directory_sync"]);
+        assert_eq!(
+            std::fs::read(root.join("target.md")).unwrap(),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn atomic_replace_permission_failure_keeps_destination_and_cleans_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let destination = root.join("target.md");
+        std::fs::write(&destination, b"original").unwrap();
+        let result = atomic_replace_with_hooks(
+            &Dir::open_ambient_dir(root, ambient_authority()).unwrap(),
+            OsStr::new("target.md"),
+            b"replacement",
+            |_, _| Ok(()),
+            |_, _| {
+                Err(WriteError::new(
+                    WriteErrorKind::Io,
+                    std::io::Error::other("injected permission failure"),
+                ))
+            },
+            |_, _, _| Ok(()),
+            |_| Ok(()),
+        );
+        let WriteErrorKind::Io = result.unwrap_err().kind else {
+            panic!("injected permission failure must classify as Io");
+        };
+        assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+        let entries: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsString::from("target.md")]);
+    }
+
+    #[test]
+    fn atomic_replace_directory_sync_failure_keeps_replacement_and_cleans_temp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let destination = root.join("target.md");
+        std::fs::write(&destination, b"original").unwrap();
+        let result = atomic_replace_with_hooks(
+            &Dir::open_ambient_dir(root, ambient_authority()).unwrap(),
+            OsStr::new("target.md"),
+            b"replacement",
+            |temp, bytes| write_and_sync_cap(temp.as_file_mut(), bytes),
+            |_, _| Ok(()),
+            |temp, _, name| temp.replace(name).map_err(classify_create_io_error),
+            |_| {
+                Err(WriteError::new(
+                    WriteErrorKind::Io,
+                    std::io::Error::other("injected sync failure"),
+                ))
+            },
+        );
+        let WriteErrorKind::Io = result.unwrap_err().kind else {
+            panic!("injected sync failure must classify as Io");
+        };
+        assert_eq!(std::fs::read(&destination).unwrap(), b"replacement");
+        let entries: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![OsString::from("target.md")]);
+    }
+
     #[test]
     fn atomic_write_no_follow_durable_write_round_trips_through_fsync_path() {
         // Locks the `fsync_dir` workaround for cap-std's `O_PATH` `Dir`
