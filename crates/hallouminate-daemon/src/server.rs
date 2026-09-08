@@ -11,14 +11,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::codec::LinesCodecError;
 
 use hallouminate_config::{self, Config};
 
 use super::dispatch::dispatch;
+use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::heartbeat::TaskName;
 use super::ipc::{DaemonRequest, DaemonResponse};
 use super::ladder::LadderAction;
@@ -33,16 +36,9 @@ pub struct DaemonArgs {
 
 /// How long `handle_connection` waits for a client to send its request
 /// line before giving up and closing the connection. Guards against a
-/// client that opens a connection and never writes (or writes a partial
-/// line with no trailing newline), which would otherwise pin a
-/// `BufReader::read_line` await forever and leak the per-connection task.
+/// client that opens a connection and never writes, which would otherwise
+/// pin the framed-line read forever and leak the per-connection task.
 pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Cap on the newline-delimited request line's `String` allocation. Without
-/// this, a client can stream an arbitrarily large line before
-/// `IDLE_READ_TIMEOUT` would otherwise catch it, growing the allocation
-/// without bound.
-const MAX_REQUEST_LINE_BYTES: u64 = 4 * 1024 * 1024;
 
 type WatchdogAbort = Box<dyn FnOnce() + Send>;
 
@@ -619,13 +615,9 @@ async fn handle_connection(
     let peer_uid = peer_credential_uid(&stream);
     let effective_uid = rustix::process::geteuid().as_raw();
     let (read_half, mut write_half) = stream.into_split();
-    // Cap the newline-delimited request line's allocation — `.take()` bounds
-    // how many bytes `read_line` will pull before giving up, so an oversized
-    // line is rejected instead of growing the `String` without bound.
-    let mut reader = BufReader::new(read_half).take(MAX_REQUEST_LINE_BYTES);
-    let mut line = String::new();
-    let n = match tokio::time::timeout(idle_timeout, reader.read_line(&mut line)).await {
-        Ok(res) => res?,
+    let mut lines = ipc_lines(read_half);
+    let frame = match tokio::time::timeout(idle_timeout, lines.next()).await {
+        Ok(frame) => frame,
         Err(_) => {
             tracing::debug!(
                 target: "hallouminate::daemon",
@@ -635,26 +627,31 @@ async fn handle_connection(
             return Ok(());
         }
     };
-    if n == 0 {
+    let Some(frame) = frame else {
         return Ok(());
-    }
-    let response = if !line.ends_with('\n') {
-        tracing::warn!(
-            target: "hallouminate::daemon",
-            cap_bytes = MAX_REQUEST_LINE_BYTES,
-            "request line exceeded the size cap; returning structured error",
-        );
-        DaemonResponse::invalid_params(format!(
-            "request line exceeds {MAX_REQUEST_LINE_BYTES}-byte cap"
-        ))
-    } else {
-        match serde_json::from_str::<DaemonRequest>(line.trim_end()) {
+    };
+    let response = match frame {
+        Ok(line) => match serde_json::from_str::<DaemonRequest>(&line) {
             Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
                 Some(denied) => denied,
                 None => dispatch(&state, req).await,
             },
             Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
+        },
+        Err(LinesCodecError::MaxLineLengthExceeded) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                cap_bytes = MAX_IPC_LINE_BYTES,
+                "request line exceeded the size cap; returning structured error",
+            );
+            DaemonResponse::invalid_params(format!(
+                "request line exceeds {MAX_IPC_LINE_BYTES}-byte cap"
+            ))
         }
+        Err(LinesCodecError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+            DaemonResponse::invalid_params(format!("invalid request: {error}"))
+        }
+        Err(LinesCodecError::Io(error)) => return Err(error.into()),
     };
     // Request completed; stamp the activity clock so idle-exit keys on real
     // request throughput, not just embed use (ADR-003).
@@ -811,6 +808,131 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn ping_request_bytes() -> Vec<u8> {
+        serde_json::to_vec(&DaemonRequest {
+            cwd: PathBuf::from("."),
+            payload: super::super::ipc::DaemonRequestPayload::Ping,
+        })
+        .expect("serialize request")
+    }
+
+    fn request_bytes(total_bytes: usize) -> Vec<u8> {
+        let mut bytes = ping_request_bytes();
+        assert!(bytes.len() < total_bytes);
+        bytes.resize(total_bytes - 1, b' ');
+        bytes.push(b'\n');
+        bytes
+    }
+
+    async fn exchange_request(bytes: Vec<u8>) -> Option<DaemonResponse> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open state");
+        let socket = tmp.path().join("request.sock");
+        let listener = UnixListener::bind(&socket).expect("bind request socket");
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&socket).await.expect("connect request");
+            let _ = stream.write_all(&bytes).await;
+            let _ = stream.shutdown().await;
+            let mut lines = ipc_lines(stream);
+            let line = lines.next().await.transpose().expect("read response")?;
+            Some(serde_json::from_str(&line).expect("decode response"))
+        });
+        let (stream, _) = listener.accept().await.expect("accept request");
+        handle_connection(state, stream, Duration::from_secs(5))
+            .await
+            .expect("handle request");
+        client.await.expect("request client")
+    }
+
+    fn assert_ping_response(response: Option<DaemonResponse>) {
+        match response.expect("response") {
+            DaemonResponse::Ok { result } => assert!(result.is_object()),
+            DaemonResponse::Err { kind, message } => {
+                panic!("ping request failed with {kind:?}: {message}")
+            }
+        }
+    }
+
+    fn invalid_request_message(response: Option<DaemonResponse>) -> String {
+        match response.expect("response") {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams);
+                message
+            }
+            DaemonResponse::Ok { result } => panic!("invalid request returned {result:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_below_newline_inclusive_byte_cap_is_accepted() {
+        let response = exchange_request(request_bytes(MAX_IPC_LINE_BYTES - 1)).await;
+        assert_ping_response(response);
+    }
+
+    #[tokio::test]
+    async fn request_at_newline_inclusive_byte_cap_is_accepted() {
+        let response = exchange_request(request_bytes(MAX_IPC_LINE_BYTES)).await;
+        assert_ping_response(response);
+    }
+
+    #[tokio::test]
+    async fn request_above_newline_inclusive_byte_cap_gets_structured_error() {
+        let response = exchange_request(request_bytes(MAX_IPC_LINE_BYTES + 1)).await;
+        let message = invalid_request_message(response);
+        assert_eq!(
+            message,
+            format!("request line exceeds {MAX_IPC_LINE_BYTES}-byte cap")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_request_gets_structured_error() {
+        let message = invalid_request_message(exchange_request(vec![0xff, b'\n']).await);
+        assert!(message.contains("Unable to decode input as UTF8"));
+    }
+
+    #[tokio::test]
+    async fn empty_request_closes_without_response() {
+        match exchange_request(Vec::new()).await {
+            None => {}
+            Some(response) => panic!("empty request returned {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_without_lf_is_decoded_at_eof() {
+        let response = exchange_request(ping_request_bytes()).await;
+        assert_ping_response(response);
+    }
+
+    #[tokio::test]
+    async fn truncated_request_at_eof_gets_structured_error() {
+        let message = invalid_request_message(exchange_request(br#"{"cwd":"#.to_vec()).await);
+        assert!(message.starts_with("invalid request:"));
+    }
+
+    #[tokio::test]
+    async fn idle_request_times_out_and_closes_without_response() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open state");
+        let socket = tmp.path().join("idle.sock");
+        let listener = UnixListener::bind(&socket).expect("bind idle socket");
+        let client = UnixStream::connect(&socket)
+            .await
+            .expect("connect idle client");
+        let (stream, _) = listener.accept().await.expect("accept idle request");
+        handle_connection(state, stream, Duration::from_millis(10))
+            .await
+            .expect("handle idle request");
+        let mut lines = ipc_lines(client);
+        assert_eq!(lines.next().await.transpose().expect("read idle EOF"), None);
+    }
     #[test]
     fn lock_path_appends_dot_lock_suffix() {
         let sock = PathBuf::from("/tmp/hallouminate/daemon.sock");

@@ -4545,9 +4545,8 @@ async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
 
 #[tokio::test]
 async fn daemon_returns_structured_error_when_request_line_exceeds_cap() {
-    // MAX_REQUEST_LINE_BYTES (4 MiB) bounds the newline-delimited request
-    // line's allocation via a `.take()`-wrapped reader. A line that never
-    // hits its newline within the cap must yield a structured
+    // LinesCodec bounds the request to a 4 MiB newline-inclusive cap.
+    // A line that exceeds the cap must yield a structured
     // `DaemonResponse::Err { kind: InvalidParams }` naming the cap, not a
     // bare transport EOF with no error payload (a legitimate oversized
     // `add_markdown.content` write would otherwise look identical to a
@@ -4628,7 +4627,7 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
     // Quality gate: `drain_handlers` (SHUTDOWN_DRAIN_TIMEOUT) must let an
     // in-flight connection handler finish before `serve_with_idle_timeout`
     // releases the socket + single-instance flock. A connection that never
-    // sends its request line stays "in-flight" (blocked on `read_line`)
+    // sends its request line stays "in-flight" while awaiting a codec frame
     // until the per-connection idle timeout elapses, giving us a real
     // in-flight handler without any test-only injection seam.
     use hallouminate_daemon::serve_with_idle_timeout;
@@ -4659,8 +4658,8 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Open a connection and never write to it: its handler stays alive,
-    // blocked on `read_line` under `idle_timeout`, until that timeout fires.
+    // Open a connection and never write to it.
+    // Its handler stays alive while awaiting a codec frame under `idle_timeout`.
     let _in_flight = UnixStream::connect(&socket)
         .await
         .expect("connect in-flight handler");

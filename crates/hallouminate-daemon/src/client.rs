@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
+use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
+use super::framing::ipc_lines;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
 use super::socket::daemon_socket_paths;
 
@@ -154,18 +156,17 @@ impl DaemonClient {
             daemon_client_unavailable(format!("flush {} failed: {e}", self.socket.display()))
         })?;
         let (read_half, _) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.map_err(|e| {
-            daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
-        })?;
-        if n == 0 {
+        let mut lines = ipc_lines(read_half);
+        let Some(line) = lines.next().await else {
             return Err(daemon_client_unavailable(format!(
                 "daemon at {} closed the connection before responding",
                 self.socket.display(),
             )));
-        }
-        let response: DaemonResponse = serde_json::from_str(line.trim_end()).map_err(|e| {
+        };
+        let line = line.map_err(|e| {
+            daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
+        })?;
+        let response: DaemonResponse = serde_json::from_str(&line).map_err(|e| {
             daemon_client_unavailable(format!(
                 "invalid daemon response from {}: {e} (response: {line:?})",
                 self.socket.display(),
@@ -293,6 +294,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[tokio::test]
     async fn client_for_with_explicit_socket_never_respawns() {
@@ -583,5 +585,124 @@ mod tests {
             err.downcast_ref::<DaemonRpcError>().is_none(),
             "transport EOF must not be classified retryable: {err:#}",
         );
+    }
+
+    use super::super::framing::MAX_IPC_LINE_BYTES;
+
+    fn ping_request() -> DaemonRequest {
+        DaemonRequest {
+            cwd: PathBuf::from("."),
+            payload: DaemonRequestPayload::Ping,
+        }
+    }
+
+    enum LineEnding {
+        Lf,
+        Eof,
+    }
+
+    fn response_bytes(total_bytes: usize, ending: LineEnding) -> Vec<u8> {
+        let empty = serde_json::to_vec(&DaemonResponse::Ok {
+            result: serde_json::Value::String(String::new()),
+        })
+        .expect("serialize empty response");
+        let newline_bytes = match ending {
+            LineEnding::Lf => 1,
+            LineEnding::Eof => 0,
+        };
+        let payload_bytes = total_bytes
+            .checked_sub(empty.len() + newline_bytes)
+            .expect("response size must fit JSON envelope");
+        let mut bytes = serde_json::to_vec(&DaemonResponse::Ok {
+            result: serde_json::Value::String("a".repeat(payload_bytes)),
+        })
+        .expect("serialize response");
+        match ending {
+            LineEnding::Lf => bytes.push(b'\n'),
+            LineEnding::Eof => {}
+        }
+        assert_eq!(bytes.len(), total_bytes);
+        bytes
+    }
+
+    async fn call_with_response(bytes: Vec<u8>) -> anyhow::Result<DaemonResponse> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("response.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (probe, _) = listener.accept().await.expect("accept probe");
+            drop(probe);
+            let (stream, _) = listener.accept().await.expect("accept request");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.expect("read request");
+            let _ = write_half.write_all(&bytes).await;
+        });
+        let client = connect_at(&socket).await.expect("connect client");
+        let result = client.call_raw(ping_request()).await;
+        server.await.expect("response server");
+        result
+    }
+
+    #[tokio::test]
+    async fn response_below_byte_cap_is_accepted() {
+        let bytes = response_bytes(MAX_IPC_LINE_BYTES - 1, LineEnding::Lf);
+        call_with_response(bytes)
+            .await
+            .expect("response below cap must decode");
+    }
+
+    #[tokio::test]
+    async fn response_at_newline_inclusive_byte_cap_is_accepted() {
+        let bytes = response_bytes(MAX_IPC_LINE_BYTES, LineEnding::Lf);
+        call_with_response(bytes)
+            .await
+            .expect("response at cap must decode");
+    }
+
+    #[tokio::test]
+    async fn response_above_newline_inclusive_byte_cap_is_rejected() {
+        let bytes = response_bytes(MAX_IPC_LINE_BYTES + 1, LineEnding::Lf);
+        let error = call_with_response(bytes)
+            .await
+            .expect_err("response above cap must fail");
+        assert!(error.to_string().contains("max line length exceeded"));
+    }
+
+    #[tokio::test]
+    async fn response_without_lf_is_decoded_at_eof() {
+        let bytes = response_bytes(128, LineEnding::Eof);
+        call_with_response(bytes)
+            .await
+            .expect("complete response at EOF must decode");
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_response_is_rejected() {
+        let error = call_with_response(vec![0xff, b'\n'])
+            .await
+            .expect_err("invalid UTF-8 must fail");
+        assert!(error.to_string().contains("Unable to decode input as UTF8"));
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_rejected_as_transport_eof() {
+        let error = call_with_response(Vec::new())
+            .await
+            .expect_err("empty response must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection before responding")
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_response_is_rejected_as_invalid_json() {
+        let error = call_with_response(br#"{"Ok":"#.to_vec())
+            .await
+            .expect_err("truncated response must fail");
+        assert!(error.to_string().contains("invalid daemon response"));
     }
 }
