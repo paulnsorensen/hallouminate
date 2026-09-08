@@ -25,6 +25,7 @@ mod churn;
 mod client;
 mod debt;
 mod dispatch;
+mod framing;
 mod heartbeat;
 mod ipc;
 mod ladder;
