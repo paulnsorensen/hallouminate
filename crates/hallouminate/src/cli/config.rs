@@ -43,6 +43,7 @@ pub struct ConfigValidateArgs {
 /// `cmd_config_validate` to flag misspellings (`[[corpora]]`, `Storage`)
 /// that parse cleanly but produce a silently empty/wrong config.
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "inherit_global_corpora",
     "corpus",
     "repository",
     "search",
@@ -981,6 +982,39 @@ mod tests {
             cwd: Some(cwd),
         })
         .expect("show with merged layers");
+    }
+
+    #[test]
+    fn show_renders_local_corpus_policy_and_excludes_baseline_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = canon(dir.path());
+        let xdg_path = cwd.join("xdg.toml");
+        fs::write(
+            &xdg_path,
+            "[[corpus]]\nname = \"global\"\npaths = [\"/global\"]\n",
+        )
+        .expect("write XDG with global corpus");
+        write_repo_config(
+            &cwd,
+            "inherit_global_corpora = false\n[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n",
+        );
+
+        let baseline = hallouminate_config::load_xdg(Some(&xdg_path)).expect("load baseline");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&baseline, &cwd, None).expect("resolve");
+        assert_eq!(
+            effective
+                .corpora
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+        let rendered = render_config(&effective).expect("render effective config");
+        assert!(
+            rendered.contains("inherit_global_corpora = false"),
+            "{rendered}"
+        );
     }
 
     #[test]
