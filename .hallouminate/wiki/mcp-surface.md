@@ -17,16 +17,23 @@ traversal remain rejected.[^workspace-path]
 
 ## Default corpus
 
-Tool calls that omit `corpus` default to the wiki for the repository
-containing the request's `cwd` — `repo:<NAME>:wiki` for the deepest
-`[[repository]]` whose `path` is an ancestor of cwd. When cwd doesn't
-sit under any configured repo, the daemon falls back to the existing
-single-corpus / ambiguity error and the caller must name a corpus
-explicitly. This applies to every read-side tool — `ground`, `list_files`,
-`list_tree`, `corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown`,
-which now defaults `corpus` to wiki-for-cwd like its peers. Only the mutating
-tools (`add_markdown`, `delete_markdown`) still require an explicit `corpus`,
-to prevent an accidental write to the wrong wiki.
+`ground` without `corpus` searches every effective corpus, including globally
+configured corpora from other repositories. An explicit `corpus` restricts
+search to that corpus. `cwd` selects configuration; it does not restrict
+an unscoped search to the current repository.[^ground-union]
+
+The other read tools default to the wiki for the deepest configured
+repository that contains `cwd`. Without a matching repository, they use
+the single-corpus fallback or return an ambiguity error. Mutations require
+an explicit `corpus`.[^ground-default]
+
+Union search orders results by score. A resolved local wiki receives
+priority for equal scores and reserved result slots, not exclusive access
+to the result set.[^ground-order]
+
+[^ground-union]: crates/hallouminate-daemon/src/dispatch.rs:514-598
+[^ground-default]: crates/hallouminate-domain/src/repository.rs::default_wiki_for_cwd; crates/hallouminate-daemon/src/dispatch.rs::pick_corpus_or_default
+[^ground-order]: crates/hallouminate-domain/src/ground/orchestrate.rs:150-175
 
 ## Tools
 
@@ -59,7 +66,7 @@ reading every `index.md` first.
 Semantic search. Embeds the query with the configured embeddings model
 (default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from LanceDB,
 rolls up per-file with breadcrumb context. Params: `query` (required),
-`corpus` (defaults to wiki-for-cwd), `top_files`, `chunks_per_file`,
+`corpus` (omit to search all effective corpora), `top_files`, `chunks_per_file`,
 `limit`, `snippet_chars`, `footnotes`. Returns a ripgrep-style outline in
 `content` and the full structured response in `structuredContent.docs`.
 
