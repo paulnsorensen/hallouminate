@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use notify::RecursiveMode;
-use notify_debouncer_full::{DebounceEventResult, new_debouncer};
+use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
 
 use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{
@@ -352,10 +352,7 @@ async fn cleanup_retired_registration(
 /// debouncer, the set of paths currently `debouncer.watch()`'d, and the
 /// flattened current root list used by `process_change_batch`.
 struct PumpState {
-    debouncer: notify_debouncer_full::Debouncer<
-        notify::RecommendedWatcher,
-        notify_debouncer_full::RecommendedCache,
-    >,
+    debouncer: notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
     installed: std::collections::HashSet<PathBuf>,
     roots: Vec<WatchRoot>,
 }
@@ -532,12 +529,7 @@ fn build_debouncer(
     state: &DaemonState,
     wake: std::sync::Arc<tokio::sync::Notify>,
     pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
-) -> Option<
-    notify_debouncer_full::Debouncer<
-        notify::RecommendedWatcher,
-        notify_debouncer_full::RecommendedCache,
-    >,
-> {
+) -> Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>> {
     let debounce = Duration::from_millis(cfg.watch.debounce_ms);
     // Affected paths pending reindex, coalesced across debounced batches (not
     // just within one) rather than forwarded whole-batch through an
@@ -550,32 +542,40 @@ fn build_debouncer(
     // returning `Full` is that explicit overflow behavior: a no-op, never a
     // block or a panic, because the paths it would have carried are already
     // sitting in `pending`.
+    // Disable notify-debouncer-full's recursive file-ID map; large dependency trees can exhaust
+    // memory.
     let state_for_debouncer = state.clone();
     let pending_for_debouncer = pending;
     let wake_for_debouncer = wake;
-    match new_debouncer(debounce, None, move |res: DebounceEventResult| {
-        // The debouncer worker thread calls this on each debounced batch.
-        match res {
-            Ok(events) => {
-                record_pending(&pending_for_debouncer, &events);
-                state_for_debouncer.record_watcher_events(events.len() as u64);
-                // `Notify::notify_one()` carries a wake permit even when
-                // nothing is currently `.await`ing it, so a batch that lands
-                // between pump iterations is never lost the way a
-                // `try_send` on a full bounded channel would be.
-                wake_for_debouncer.notify_one();
-            }
-            Err(errors) => {
-                for err in errors {
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        error = %err,
-                        "watcher: notify backend error",
-                    );
+    match new_debouncer_opt(
+        debounce,
+        None,
+        move |res: DebounceEventResult| {
+            // The debouncer worker thread calls this on each debounced batch.
+            match res {
+                Ok(events) => {
+                    record_pending(&pending_for_debouncer, &events);
+                    state_for_debouncer.record_watcher_events(events.len() as u64);
+                    // `Notify::notify_one()` carries a wake permit even when
+                    // nothing is currently `.await`ing it, so a batch that lands
+                    // between pump iterations is never lost the way a
+                    // `try_send` on a full bounded channel would be.
+                    wake_for_debouncer.notify_one();
+                }
+                Err(errors) => {
+                    for err in errors {
+                        tracing::warn!(
+                            target: "hallouminate::daemon",
+                            error = %err,
+                            "watcher: notify backend error",
+                        );
+                    }
                 }
             }
-        }
-    }) {
+        },
+        NoCache,
+        notify::Config::default(),
+    ) {
         Ok(d) => Some(d),
         Err(e) => {
             tracing::warn!(
@@ -2506,5 +2506,130 @@ body
         memo.record_failure(&path, "boom");
         assert!(memo.record_success(&path));
         assert!(!memo.record_success(&path));
+    }
+    /// The production construction seam uses `NoCache`, so recursive watches
+    /// do not retain a file-ID entry for every path in dependency-like trees.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_debouncer_uses_no_cache_for_recursive_dependency_trees() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let tree = tmp.path().join("dependency-tree");
+        std::fs::create_dir_all(tree.join("node_modules/@opentelemetry"))
+            .expect("create dependency-like tree");
+        let target = tree.join("node_modules/@opentelemetry/package.md");
+        std::fs::write(&target, "# dependency\n").expect("write dependency file");
+        let link = tmp.path().join("linked-dependency-tree");
+        std::os::unix::fs::symlink(&tree, &link).expect("link dependency-like tree");
+        std::os::unix::fs::symlink(tree.join("node_modules"), tree.join("linked-node-modules"))
+            .expect("link dependency subtree");
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut debouncer = build_debouncer(&cfg, &state, wake, pending).expect("build watcher");
+
+        debouncer
+            .watch(&link, RecursiveMode::Recursive)
+            .expect("watch symlink-heavy dependency-like tree");
+
+        fn assert_no_cache<W, C>(_: &notify_debouncer_full::Debouncer<W, C>)
+        where
+            W: notify::Watcher,
+            C: notify_debouncer_full::FileIdCache + 'static,
+        {
+            assert_eq!(
+                std::any::TypeId::of::<C>(),
+                std::any::TypeId::of::<NoCache>(),
+                "the production watcher must use NoCache"
+            );
+        }
+
+        assert_no_cache(&debouncer);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_debouncer_forwards_native_file_lifecycle_events() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.debounce_ms = 50;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let root = tmp.path().join("watch-root");
+        std::fs::create_dir(&root).expect("create watch root");
+        let root = root.canonicalize().expect("canonicalize watch root");
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let pending_for_test = pending.clone();
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut debouncer = build_debouncer(&cfg, &state, wake, pending).expect("build watcher");
+        debouncer
+            .watch(&root, RecursiveMode::Recursive)
+            .expect("watch root");
+        async fn wait_for_paths(
+            pending: &std::sync::Arc<
+                std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
+            >,
+            expected: &[std::path::PathBuf],
+        ) -> std::collections::HashSet<std::path::PathBuf> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut observed = std::collections::HashSet::new();
+            loop {
+                observed.extend(pending.lock().expect("pending mutex").drain());
+                if expected.iter().all(|path| observed.contains(path))
+                    || std::time::Instant::now() >= deadline
+                {
+                    return observed;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let old = root.join("old.md");
+        std::fs::write(&old, "one\n").expect("create file");
+        assert!(
+            wait_for_paths(&pending_for_test, std::slice::from_ref(&old))
+                .await
+                .contains(&old),
+            "native create must reach pending"
+        );
+        std::fs::write(&old, "two\n").expect("edit file");
+        assert!(
+            wait_for_paths(&pending_for_test, std::slice::from_ref(&old))
+                .await
+                .contains(&old),
+            "native edit must reach pending"
+        );
+        let renamed = root.join("renamed.md");
+        std::fs::rename(&old, &renamed).expect("rename file");
+        let rename_events =
+            wait_for_paths(&pending_for_test, &[old.clone(), renamed.clone()]).await;
+        assert!(
+            rename_events.contains(&old),
+            "native rename must report old path"
+        );
+        assert!(
+            rename_events.contains(&renamed),
+            "native rename must report new path"
+        );
+        let temp = root.join("atomic.tmp");
+        std::fs::write(&temp, "three\n").expect("write atomic temp");
+        std::fs::rename(&temp, &renamed).expect("atomic replace");
+        let atomic_events = wait_for_paths(&pending_for_test, std::slice::from_ref(&renamed)).await;
+        assert!(
+            atomic_events.contains(&renamed),
+            "atomic save must report target path"
+        );
+        assert!(
+            !atomic_events.contains(&temp),
+            "unsupported atomic temp path must not reach pending"
+        );
+        std::fs::remove_file(&renamed).expect("delete file");
+        assert!(
+            wait_for_paths(&pending_for_test, std::slice::from_ref(&renamed))
+                .await
+                .contains(&renamed),
+            "native delete must reach pending"
+        );
     }
 }
