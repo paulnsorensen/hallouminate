@@ -2407,6 +2407,15 @@ impl Drop for EnvGuard {
 
 // ─── Curd 3: corpus watcher ──────────────────────────────────────────────
 
+// Flaky under CI/loaded machines: this exercises the LIVE native watcher across
+// five sequential filesystem events (create/edit/rename/atomic-replace/delete)
+// with reconciliation disabled (reconcile_interval_secs = 3600), so a single
+// coalesced or platform-dropped native event within a 20s window has no backstop
+// and fails whichever stage lost the race. Observed failing at three different
+// stages across runs. The reconcile backstop is covered deterministically by
+// `reconcile_tick_repairs_dropped_remove_event`, and the live-watcher path by the
+// out-of-process release smoke. Run explicitly with `--ignored`.
+#[ignore = "nondeterministic native-FS live-watcher e2e; run with --ignored"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() {
     // Quality gate (Curd 3): the watcher handles edits and deletes first.
@@ -4866,7 +4875,12 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
 
     let state = DaemonState::open(cfg, None).await.expect("open state");
     let socket_clone = socket.clone();
-    let idle_timeout = Duration::from_millis(500);
+    // Generous drain window: the assertion below checks the socket still exists
+    // ~150ms after the shutdown ack, so the in-flight handler must not drain
+    // before then even under heavy CI parallelism that stretches wall-clock
+    // sleeps. 2s keeps a wide margin over the ~150ms check without slowing the
+    // test meaningfully (serve returns as soon as the handler drains).
+    let idle_timeout = Duration::from_secs(2);
     let handle =
         tokio::spawn(
             async move { serve_with_idle_timeout(&state, &socket_clone, idle_timeout).await },
