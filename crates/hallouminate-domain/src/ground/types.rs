@@ -90,9 +90,6 @@ pub struct DocChunk {
     pub z_score: Option<f64>,
     /// Chunk text, trimmed to the request's `snippet_chars` when set.
     pub snippet: String,
-    /// Raw source retained across daemon IPC for transport-specific filtering.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub source_text: String,
     /// Per-chunk provenance: which corpus this chunk came from (#106), and the
     /// extension point for #88's claim-status marks. `#[serde(default)]` so a
     /// strict-schema client reading a payload that predates this field (or one
@@ -159,7 +156,6 @@ mod tests {
                     score: 0.91,
                     z_score: None,
                     snippet: "first ~200 chars of chunk text\u{2026}".into(),
-                    source_text: String::new(),
                     provenance: ChunkProvenance {
                         corpus: "tern-docs".into(),
                         claim_marks: vec![ClaimMark {

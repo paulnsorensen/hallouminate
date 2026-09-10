@@ -2094,10 +2094,6 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
         "exclude must return fixture chunks"
     );
     for chunk in exclude_chunks {
-        assert!(
-            chunk.get("source_text").is_none(),
-            "internal source_text must not cross MCP response boundary: {chunk}"
-        );
         let snippet = chunk["snippet"].as_str().expect("exclude snippet");
         assert!(
             !snippet.contains("[^src]"),
@@ -2165,10 +2161,6 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
         let chunks = doc["chunks"].as_array().expect("include chunks array");
         assert!(!chunks.is_empty(), "include must return fixture chunks");
         for chunk in chunks {
-            assert!(
-                chunk.get("source_text").is_none(),
-                "internal source_text must not cross include response boundary: {chunk}"
-            );
             let snippet = chunk["snippet"].as_str().expect("include snippet");
             found_marker |= snippet.contains("[^src]");
         }

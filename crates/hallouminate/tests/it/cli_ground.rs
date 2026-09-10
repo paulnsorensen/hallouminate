@@ -135,6 +135,18 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
         top_path.ends_with("arrakis.md"),
         "expected arrakis.md as top hit, got {top_path}"
     );
+    assert_eq!(
+        response["query"], "spice melange Arrakis",
+        "ground JSON must echo the query verbatim: {response}"
+    );
+    let hits = response["stats"]["hits"]
+        .as_u64()
+        .expect("stats.hits present");
+    assert!(
+        hits as usize >= docs.len(),
+        "stats.hits ({hits}) must count at least one raw hit per returned doc ({})",
+        docs.len()
+    );
     for (path, doc) in docs {
         assert_eq!(
             doc["corpus"], "fixtures",
@@ -143,9 +155,18 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
         let chunks = doc["chunks"].as_array().expect("CLI document chunks");
         assert!(!chunks.is_empty(), "doc at {path} has chunks");
         for chunk in chunks {
+            let chunk_id = chunk["chunk_id"].as_str().expect("chunk_id string");
             assert!(
-                chunk.get("source_text").is_none(),
-                "CLI JSON must not expose internal source_text: {chunk}"
+                !chunk_id.is_empty(),
+                "chunk at {path} must carry a chunk_id"
+            );
+            let range = chunk["line_range"].as_array().expect("line_range array");
+            assert_eq!(range.len(), 2, "line_range is [start, end]: {chunk}");
+            let start = range[0].as_u64().expect("line_range start");
+            let end = range[1].as_u64().expect("line_range end");
+            assert!(
+                start >= 1 && end >= start,
+                "line_range must be 1-based and non-inverted, got [{start}, {end}] at {path}"
             );
         }
     }

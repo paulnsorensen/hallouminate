@@ -373,24 +373,10 @@ impl WatchRegistry {
         for obsolete_id in obsolete {
             guard.regs.remove(&obsolete_id);
             guard.queue.retain(|queued| queued != &obsolete_id);
-            if let Some(position) = guard
-                .active_group
-                .iter()
-                .position(|active| active == &obsolete_id)
-            {
-                guard.active_group.remove(position);
-            }
-            if guard.active_leader.as_ref() == Some(&obsolete_id) {
-                guard.active_leader_valid = false;
-            }
+            release_admission(&mut guard, &obsolete_id);
         }
         guard.regs.remove(&id);
-        if let Some(position) = guard.active_group.iter().position(|active| active == &id) {
-            guard.active_group.remove(position);
-        }
-        if guard.active_leader.as_ref() == Some(&id) {
-            guard.active_leader_valid = false;
-        }
+        release_admission(&mut guard, &id);
         guard.queue.retain(|queued| queued != &id);
         guard.regs.insert(
             id.clone(),
@@ -499,16 +485,7 @@ impl WatchRegistry {
             registration.roots = roots;
             if registration.catch_up == CatchUpState::InFlight {
                 registration.catch_up = CatchUpState::Queued;
-                if let Some(position) = guard
-                    .active_group
-                    .iter()
-                    .position(|active| active == &old_id)
-                {
-                    guard.active_group.remove(position);
-                }
-                if guard.active_leader.as_ref() == Some(&old_id) {
-                    guard.active_leader_valid = false;
-                }
+                release_admission(&mut guard, &old_id);
                 guard.queue.push_back(new_id.clone());
             }
             guard.regs.insert(new_id.clone(), registration);
@@ -605,12 +582,7 @@ impl WatchRegistry {
             .collect();
         for id in &removed {
             guard.regs.remove(id);
-            if let Some(position) = guard.active_group.iter().position(|active| active == id) {
-                guard.active_group.remove(position);
-            }
-            if guard.active_leader.as_ref() == Some(id) {
-                guard.active_leader_valid = false;
-            }
+            release_admission(&mut guard, id);
         }
         guard.queue.retain(|id| !removed.contains(id));
         for (id, corpus, roots) in candidates {
@@ -626,12 +598,7 @@ impl WatchRegistry {
                 .get(&id)
                 .is_some_and(|existing| existing.catch_up == CatchUpState::InFlight)
             {
-                if let Some(position) = guard.active_group.iter().position(|active| active == &id) {
-                    guard.active_group.remove(position);
-                }
-                if guard.active_leader.as_ref() == Some(&id) {
-                    guard.active_leader_valid = false;
-                }
+                release_admission(&mut guard, &id);
             }
             guard.queue.retain(|queued| queued != &id);
             guard.regs.insert(
@@ -884,7 +851,13 @@ impl WatchRegistry {
     }
 
     /// Marks catch-up finished for `id`, releasing the daemon-wide slot and
-    /// returning (clearing) whatever pending work accumulated while it ran.
+    /// returning (clearing) whatever pending work accumulated while `id` ran.
+    /// The returned `PendingWork` is always `id`'s own. When `id` leads a
+    /// group of compatible registrations, finishing releases the group's
+    /// shared admission slot and re-queues every member that has pending
+    /// work, but each member keeps its own pending/`last_error` state and
+    /// none of it is folded into the return value.
+    ///
     /// A non-`Idle` return means events arrived mid-catch-up (or the pass
     /// itself failed) and `id` has already been re-queued for a follow-up
     /// pass; it does not re-run inline here, so a failing pass cannot
@@ -971,6 +944,17 @@ impl WatchRegistry {
             .regs
             .get(id)
             .map(|reg| (reg.corpus.clone(), reg.cfg.clone()))
+    }
+}
+
+/// Drops `id` from the in-flight admission group, invalidating the leader slot
+/// when `id` was leading it so the next `begin_next_catch_up` can re-admit.
+fn release_admission(guard: &mut Inner, id: &RegistrationId) {
+    if let Some(position) = guard.active_group.iter().position(|active| active == id) {
+        guard.active_group.remove(position);
+    }
+    if guard.active_leader.as_ref() == Some(id) {
+        guard.active_leader_valid = false;
     }
 }
 
@@ -1277,6 +1261,48 @@ mod tests {
             registry.pending(&source_id),
             Some(PendingWork::Paths(HashSet::from([PathBuf::from(
                 "/repo/mid.md"
+            )])))
+        );
+    }
+
+    #[test]
+    fn group_leader_finish_returns_only_its_own_pending() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let roots = vec![root("/repo", corpus("wiki"))];
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            cfg.clone(),
+            roots.clone(),
+        );
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate"));
+        registry.register(source.clone(), corpus("wiki"), cfg, roots);
+        let baseline_id = RegistrationId {
+            source: ConfigSource::Baseline,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/repo"),
+            },
+        };
+        let source_id = RegistrationId {
+            source,
+            corpus_key: baseline_id.corpus_key.clone(),
+        };
+
+        assert_eq!(registry.begin_next_catch_up(), Some(baseline_id.clone()));
+        registry.record_pending(&baseline_id, [PathBuf::from("/repo/leader.md")]);
+        registry.record_pending(&source_id, [PathBuf::from("/repo/member.md")]);
+
+        assert_eq!(
+            registry.finish_catch_up(&baseline_id, Ok(())),
+            PendingWork::Paths(HashSet::from([PathBuf::from("/repo/leader.md")]))
+        );
+        assert_eq!(registry.pending(&baseline_id), Some(PendingWork::Idle));
+        assert_eq!(
+            registry.pending(&source_id),
+            Some(PendingWork::Paths(HashSet::from([PathBuf::from(
+                "/repo/member.md"
             )])))
         );
     }

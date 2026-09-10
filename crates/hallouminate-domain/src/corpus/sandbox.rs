@@ -41,7 +41,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::common::{CorpusConfig, expand_tilde};
+use crate::common::{CorpusConfig, best_effort_canonical, expand_tilde};
 use crate::corpus::scan;
 use crate::corpus::walker;
 
@@ -177,49 +177,6 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
     Ok(path.to_path_buf())
 }
 
-/// Resolve `path`'s ancestors as far as the filesystem allows, so a corpus
-/// root reached through a symlinked ancestor still canonicalizes even when
-/// the leaf itself does not exist yet (e.g. `add_markdown` creating a new
-/// page). Walks up to the longest existing ancestor, canonicalizes that
-/// ancestor, then re-appends the remaining components literally. Falls back
-/// to `path` unchanged when no ancestor can be canonicalized.
-///
-/// The final component is never dereferenced, even when it exists and is a
-/// symlink. Resolving it would let a symlink that escapes the corpus be
-/// rejected here, as a glob mismatch, instead of by the no-follow guards
-/// that own symlink containment (`atomic_write_no_follow`,
-/// `delete_no_follow`, `read_no_follow`). Keeping the leaf literal preserves
-/// that division of labor and the error each layer reports.
-fn best_effort_canonical(path: &Path) -> PathBuf {
-    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
-        return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    };
-    let mut ancestor = parent;
-    let mut tail: Vec<&OsStr> = vec![file_name];
-    loop {
-        if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
-            let mut result = canonical_ancestor;
-            for component in tail.iter().rev() {
-                result.push(component);
-            }
-            return result;
-        }
-        let Some(next) = ancestor.parent() else {
-            return path.to_path_buf();
-        };
-        tail.push(ancestor.file_name().unwrap_or_default());
-        ancestor = next;
-    }
-}
-
-fn configured_root(raw: &str) -> PathBuf {
-    let expanded = expand_tilde(raw);
-    match std::fs::canonicalize(&expanded) {
-        Ok(canonical) => canonical,
-        Err(_) => best_effort_canonical(&expanded),
-    }
-}
-
 /// The directory include/exclude patterns anchor to for a corpus root. A
 /// configured root usually names a directory, so patterns anchor to it. A
 /// root may instead name one file, so patterns then anchor to that file's
@@ -267,18 +224,15 @@ pub fn ensure_corpus_allows_relative(
 /// instead of matching against the absolute path. `path` need not exist yet.
 pub fn ensure_corpus_allows_file(corpus: &CorpusConfig, path: &Path) -> Result<(), SandboxError> {
     let resolved = best_effort_canonical(path);
-    let root = corpus
-        .paths
-        .iter()
-        .map(|raw| configured_root(raw))
-        .filter(|candidate| resolved.starts_with(candidate))
-        .max_by_key(|candidate| candidate.components().count())
+    let key = corpus
+        .corpus_key_for_resolved_path(&resolved)
         .ok_or_else(|| {
             SandboxError::new(format!(
                 "path {} is not under any configured corpus root",
                 path.display()
             ))
         })?;
+    let root = best_effort_canonical(&key.canonical_root);
     let base = corpus_match_base(&root);
     let relative = resolved.strip_prefix(&base).unwrap_or(resolved.as_path());
     ensure_corpus_allows_relative(corpus, relative)

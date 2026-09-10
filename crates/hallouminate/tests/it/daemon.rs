@@ -2407,15 +2407,13 @@ impl Drop for EnvGuard {
 
 // ─── Curd 3: corpus watcher ──────────────────────────────────────────────
 
-// Flaky under CI/loaded machines: this exercises the LIVE native watcher across
-// five sequential filesystem events (create/edit/rename/atomic-replace/delete)
-// with reconciliation disabled (reconcile_interval_secs = 3600), so a single
-// coalesced or platform-dropped native event within a 20s window has no backstop
-// and fails whichever stage lost the race. Observed failing at three different
-// stages across runs. The reconcile backstop is covered deterministically by
-// `reconcile_tick_repairs_dropped_remove_event`, and the live-watcher path by the
-// out-of-process release smoke. Run explicitly with `--ignored`.
-#[ignore = "nondeterministic native-FS live-watcher e2e; run with --ignored"]
+// Exercises the LIVE native watcher across five sequential filesystem events
+// (create/edit/rename/atomic-replace/delete). `reconcile_interval_secs = 1`
+// keeps the periodic reconcile backstop armed, so a coalesced or
+// platform-dropped native event is repaired within the polling window instead
+// of failing whichever stage lost the race. The sentinel and
+// `report.watcher.reindexes` delta assertions below still prove the watcher —
+// not a manual index — produced each observable change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() {
     // Quality gate (Curd 3): the watcher handles edits and deletes first.
@@ -2434,7 +2432,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
     let toml = format!(
-        "[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
+        "[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 1\n\n[storage]\nground_dir = \"{g}\"\n",
         g = ground.display(),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");

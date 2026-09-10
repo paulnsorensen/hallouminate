@@ -20,9 +20,13 @@
 //! those callers hold only `lock_corpus` across scan + plan and call
 //! `acquire_write_lane` themselves just before `apply`, once there is
 //! confirmed work to do. The corpus lock is held continuously from scan
-//! through apply, so no other writer to that corpus can interleave; only
+//! through apply, so no other *corpus-locked* writer can interleave; only
 //! the lane acquisition — the part that actually needs cross-corpus
-//! serialization — moves later.
+//! serialization — moves later. The GC sweep in `maintenance::gc_delete` is
+//! the deliberate exception: it takes only the write lane, so its row
+//! deletions can land between another writer's scan and apply. That is safe
+//! because GC only removes rows already proven unreferenced by the scan that
+//! produced its candidate list.
 //!
 //! The maintenance-debt gate (`backpressure::await_debt_gate`) runs before
 //! any of this: every catch-up call site clears the gate before calling

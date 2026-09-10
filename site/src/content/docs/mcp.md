@@ -11,19 +11,22 @@ validates and canonicalizes `cwd` before it loads configuration or contacts the
 daemon. It does not use the server startup directory, MCP roots, or a session
 working directory as a fallback.
 
-## Default corpus
+## Corpus scoping
 
-Read-side tools (`ground`, `list_files`, `list_tree`, `backlinks`,
-`corpus_stats`) that omit `corpus`
-default to the wiki for the repository containing the request's `cwd` —
-`repo:<NAME>:wiki` for the deepest `[[repository]]` whose `path` is an ancestor
-of `cwd`. When `cwd` sits under no configured repo, the caller must name a
-corpus explicitly.
+`ground` with no `corpus` searches **every** effective corpus and merges the
+results into a single ranked set. The wiki for the repository containing the
+request's `cwd` is the priority corpus: its pages win score ties and are ranked
+first. Every hit carries its own source corpus, and passing `corpus` explicitly
+pins the search to that one corpus.
+
+The other read-side tools (`read_markdown`, `list_files`, `list_tree`,
+`backlinks`, `corpus_stats`) that omit `corpus` default to the wiki for the
+repository containing `cwd` — `repo:<NAME>:wiki` for the deepest
+`[[repository]]` whose `path` is an ancestor of `cwd`. When `cwd` sits under no
+configured repo, the caller must name a corpus explicitly.
 
 The mutating tools (`add_markdown`, `delete_markdown`) **always** require an
-explicit `corpus`, to avoid accidental writes to the wrong wiki. `read_markdown`
-is a read-side tool and defaults to the wiki for the repository containing
-`cwd`.
+explicit `corpus`, to avoid accidental writes to the wrong wiki.
 
 ## The ten tools
 

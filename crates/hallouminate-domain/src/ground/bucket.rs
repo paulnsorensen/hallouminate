@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::common::Result;
 use crate::corpus::make_snippet;
-use crate::footnotes::FootnoteMode;
+use crate::footnotes::{FootnoteMode, apply_footnote_mode};
 use crate::indexer::SearchHit;
 
 use super::types::{ChunkProvenance, DocChunk, DocFile};
@@ -93,12 +93,7 @@ impl FileBucket {
                 line_range: [h.line_start as u32, h.line_end as u32],
                 score: h.score as f64,
                 z_score: h.z_score,
-                snippet: make_snippet(&h.text),
-                source_text: if footnote_mode == FootnoteMode::Include {
-                    String::new()
-                } else {
-                    h.text.clone()
-                },
+                snippet: make_snippet(&apply_footnote_mode(&h.text, footnote_mode)),
                 // `corpus` is stamped by the orchestrator from its corpus arg
                 // (the LanceDB row implies corpus by query scope and doesn't
                 // carry it per-row); `claim_marks` is per-row, so it flows from
@@ -222,6 +217,33 @@ mod tests {
         let docs = build_docs(&[poisoned], 1, 1, FootnoteMode::Include).expect("build docs");
         let chunk = &docs.get("/display.md").expect("display doc").chunks[0];
         assert_eq!(chunk.snippet, "display evidence");
+    }
+
+    #[test]
+    fn footnote_mode_filters_the_snippet_before_it_leaves_the_domain() {
+        // WHY: `footnote_mode` rides the IPC request; if filtering lived only in
+        // the MCP adapter, CLI and any other IPC client would get unfiltered
+        // snippets. Filtering in `build_docs` is the single enforcement point.
+        let mut h = hit("/notes.md", 0, 0.9);
+        h.text = "claim with a marker[^a]\n\n[^a]: the footnote body".into();
+
+        let excluded = build_docs(&[h.clone()], 1, 1, FootnoteMode::Exclude).expect("build");
+        let snippet = &excluded.get("/notes.md").expect("doc").chunks[0].snippet;
+        assert!(
+            !snippet.contains("[^a]") && !snippet.contains("the footnote body"),
+            "Exclude must drop marker and definition, got {snippet:?}"
+        );
+        assert!(
+            snippet.contains("claim with a marker"),
+            "Exclude must keep body prose, got {snippet:?}"
+        );
+
+        let only = build_docs(&[h], 1, 1, FootnoteMode::Only).expect("build");
+        let snippet = &only.get("/notes.md").expect("doc").chunks[0].snippet;
+        assert!(
+            snippet.contains("the footnote body") && !snippet.contains("claim with a marker"),
+            "Only must keep just the definition, got {snippet:?}"
+        );
     }
 
     #[test]
