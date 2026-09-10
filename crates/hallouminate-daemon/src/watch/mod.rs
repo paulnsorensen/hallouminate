@@ -2724,7 +2724,7 @@ body
         // its create/rename events and never surface the temp path. Asserting on
         // the transient temp is a flaky over-assertion; reindexing the target is
         // the behaviour that matters.
-        let atomic_events = wait_for_paths(&pending_for_test, &[renamed.clone()]).await;
+        let atomic_events = wait_for_paths(&pending_for_test, std::slice::from_ref(&renamed)).await;
         assert!(
             atomic_events.contains(&renamed),
             "atomic save must report target path"
