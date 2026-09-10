@@ -17,16 +17,41 @@ traversal remain rejected.[^workspace-path]
 
 ## Default corpus
 
-Tool calls that omit `corpus` default to the wiki for the repository
-containing the request's `cwd` — `repo:<NAME>:wiki` for the deepest
-`[[repository]]` whose `path` is an ancestor of cwd. When cwd doesn't
-sit under any configured repo, the daemon falls back to the existing
-single-corpus / ambiguity error and the caller must name a corpus
-explicitly. This applies to every read-side tool — `ground`, `list_files`,
-`list_tree`, `corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown`,
-which now defaults `corpus` to wiki-for-cwd like its peers. Only the mutating
-tools (`add_markdown`, `delete_markdown`) still require an explicit `corpus`,
-to prevent an accidental write to the wrong wiki.
+`ground` and the other read tools resolve an omitted `corpus` differently.
+Do not describe them as one rule.
+
+**`ground` unions.** With no `corpus`, `handle_ground`
+(`crates/hallouminate-daemon/src/dispatch.rs`, `let union = req.corpus.is_none()`)
+searches every effective corpus — the repo's own wiki, every `[[corpus]]`
+entry, every `[[repository]]` wiki, and `repo:<name>:corpus` source corpora
+when configured. The wiki for the repository containing `cwd` becomes
+`priority_corpus`; `ground_union` reserves the first result slots for it
+(`RESERVED_LOCAL_SLOTS`, PR #425) and ranks the rest by fused score. Each hit
+carries `provenance.corpus`, and the response adds a `cross-repo-union`
+advisory warning. Passing an explicit `corpus` pins the search to that one
+corpus. This union default shipped in #117/#426; `cwd` feeds
+`priority_corpus`, not scope.
+
+**Other read tools default to wiki-for-cwd.** `list_files`, `list_tree`,
+`corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown` resolve an
+omitted `corpus` to `repo:<NAME>:wiki` for the deepest `[[repository]]`
+whose `path` is an ancestor of cwd. When cwd doesn't sit under any
+configured repo, the daemon falls back to the single-corpus / ambiguity
+error and the caller must name a corpus explicitly.
+
+**Mutating tools require `corpus`.** `add_markdown` and `delete_markdown`
+never default, to prevent an accidental write to the wrong wiki.
+
+Gotcha (2026-09, review of PR #492/#493): `SERVER_INSTRUCTIONS` in
+`crates/hallouminate/src/mcp/tools.rs` told every connected agent that
+`ground` defaults to wiki-for-cwd while the `ground` tool description in
+the same file and the daemon both unioned. Agents omitted `corpus`, expected
+local scope, got cross-repo hits, and filed them as "wrong wiki results".
+That text mismatch — not scoping or ranking — was the mechanism. The fix
+lands in PR #493. If `ground` still surfaces the wrong repo first, tune
+`RESERVED_LOCAL_SLOTS` or use the `inherit_global_corpora = false` repo
+opt-out from PR #492 (see [config-layering](config-layering.md)); do not
+reintroduce a wiki-for-cwd scope default for `ground`.
 
 ## Tools
 
@@ -59,7 +84,8 @@ reading every `index.md` first.
 Semantic search. Embeds the query with the configured embeddings model
 (default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from LanceDB,
 rolls up per-file with breadcrumb context. Params: `query` (required),
-`corpus` (defaults to wiki-for-cwd), `top_files`, `chunks_per_file`,
+`corpus` (omit to union every effective corpus with wiki-for-cwd ranked
+first; see Default corpus), `top_files`, `chunks_per_file`,
 `limit`, `snippet_chars`, `footnotes`. Returns a ripgrep-style outline in
 `content` and the full structured response in `structuredContent.docs`.
 
