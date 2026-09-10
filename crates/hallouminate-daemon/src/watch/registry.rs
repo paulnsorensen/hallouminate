@@ -70,12 +70,15 @@ fn cfg_binding_differs(left: &Config, right: &Config) -> bool {
         || left.embeddings.enabled != right.embeddings.enabled
 }
 
-fn binding_relevant_fields_changed(
+fn registration_equivalent(
     existing: &Registration,
-    cfg: &Arc<Config>,
+    corpus: &CorpusConfig,
+    cfg: &Config,
     roots: &[WatchRoot],
 ) -> bool {
-    existing.roots.as_slice() != roots || cfg_binding_differs(&existing.cfg, cfg)
+    existing.corpus == *corpus
+        && existing.roots.as_slice() == roots
+        && !cfg_binding_differs(&existing.cfg, cfg)
 }
 
 /// Whether a candidate `(id, cfg, roots)` binding conflicts with an existing
@@ -214,23 +217,17 @@ pub(crate) struct RetiredRegistration {
 /// Fair-scheduling and admission state shared by every registration.
 /// `queue` holds ids that are `Queued`, in FIFO order; at most one
 /// registration may be `InFlight` at a time, enforcing at most one running
-/// catch-up pass across the whole daemon (see `any_in_flight`).
+/// catch-up pass across the whole daemon.
 struct Inner {
     regs: HashMap<RegistrationId, Registration>,
     queue: VecDeque<RegistrationId>,
+    active_group: Vec<RegistrationId>,
+    active_leader: Option<RegistrationId>,
+    active_leader_valid: bool,
     /// Bumped on every mutation that already notifies `changed`, plus every
     /// `refresh_roots` re-key. Lets the pump's per-iteration reconcile skip
     /// work when nothing in the registry moved since its last pass.
     generation: u64,
-}
-
-/// Whether any registration in `guard` currently holds the single
-/// daemon-wide catch-up slot.
-fn any_in_flight(guard: &Inner) -> bool {
-    guard
-        .regs
-        .values()
-        .any(|reg| reg.catch_up == CatchUpState::InFlight)
 }
 
 /// The live-registration ledger backing the watcher pump. Lives on
@@ -248,6 +245,9 @@ impl WatchRegistry {
             inner: Mutex::new(Inner {
                 regs: HashMap::new(),
                 queue: VecDeque::new(),
+                active_group: Vec::new(),
+                active_leader: None,
+                active_leader_valid: false,
                 generation: 0,
             }),
             changed: tokio::sync::Notify::new(),
@@ -295,7 +295,7 @@ impl WatchRegistry {
         );
         guard.generation += 1;
         drop(guard);
-        self.changed.notify_waiters();
+        self.signal_changed();
     }
 
     /// Register a runtime-discovered (e.g. repo-layer) corpus. `catch_up`
@@ -324,19 +324,15 @@ impl WatchRegistry {
             })
             .cloned()
             .collect();
-        for obsolete_id in obsolete {
-            guard.regs.remove(&obsolete_id);
-            guard.queue.retain(|queued| queued != &obsolete_id);
-        }
-        if let Some(existing) = guard.regs.get_mut(&id) {
-            if binding_relevant_fields_changed(existing, &cfg, &roots) {
-                guard.regs.remove(&id);
-                guard.queue.retain(|queued| queued != &id);
-            } else {
-                existing.corpus = corpus;
-                existing.cfg = cfg;
-                return RegisterOutcome::AlreadyRegistered;
-            }
+        let unchanged = guard
+            .regs
+            .get(&id)
+            .is_some_and(|existing| registration_equivalent(existing, &corpus, &cfg, &roots));
+        if unchanged {
+            let existing = guard.regs.get_mut(&id).expect("checked above");
+            existing.corpus = corpus;
+            existing.cfg = cfg;
+            return RegisterOutcome::AlreadyRegistered;
         }
         if let Some(message) = binding_conflict(&guard, &id, &cfg, &roots) {
             return RegisterOutcome::Conflict(message);
@@ -357,10 +353,36 @@ impl WatchRegistry {
                     !existing_is_baseline
                 })
                 .count();
-            if runtime_count >= MAX_RUNTIME_REGISTRATIONS {
+            let replaces_runtime = guard.regs.contains_key(&id)
+                || obsolete
+                    .iter()
+                    .any(|existing| matches!(existing.source, ConfigSource::RepoLayer(_)));
+            if runtime_count >= MAX_RUNTIME_REGISTRATIONS && !replaces_runtime {
                 return RegisterOutcome::LimitReached;
             }
         }
+        for obsolete_id in obsolete {
+            guard.regs.remove(&obsolete_id);
+            guard.queue.retain(|queued| queued != &obsolete_id);
+            if let Some(position) = guard
+                .active_group
+                .iter()
+                .position(|active| active == &obsolete_id)
+            {
+                guard.active_group.remove(position);
+            }
+            if guard.active_leader.as_ref() == Some(&obsolete_id) {
+                guard.active_leader_valid = false;
+            }
+        }
+        guard.regs.remove(&id);
+        if let Some(position) = guard.active_group.iter().position(|active| active == &id) {
+            guard.active_group.remove(position);
+        }
+        if guard.active_leader.as_ref() == Some(&id) {
+            guard.active_leader_valid = false;
+        }
+        guard.queue.retain(|queued| queued != &id);
         guard.regs.insert(
             id.clone(),
             Registration {
@@ -377,37 +399,42 @@ impl WatchRegistry {
         guard.queue.push_back(id);
         guard.generation += 1;
         drop(guard);
-        self.changed.notify_waiters();
+        self.signal_changed();
         RegisterOutcome::New
     }
 
-    /// Whether `(source, corpus.name)` already has a registration whose
-    /// binding-relevant fields match `cfg`. Checked before roots are known
-    /// (only `ground_dir` and `embeddings.*`, not `roots` — a real
-    /// `register()` call also compares roots, but this lets callers
-    /// short-circuit the expensive root-probing that `register()` needs
-    /// only to detect the no-op case).
+    /// Whether `(source, corpus.name)` already has an equivalent registration.
+    ///
+    /// Equivalence includes corpus paths, selection rules, watched roots,
+    /// storage settings, and embedding settings.
     pub(crate) fn is_registered_unchanged(
         &self,
         source: &ConfigSource,
         corpus: &CorpusConfig,
         cfg: &Config,
+        roots: &[WatchRoot],
     ) -> bool {
         self.lock().regs.iter().any(|(id, existing)| {
             id.source == *source
                 && id.corpus_key.name == corpus.name
-                && existing.cfg.storage.ground_dir == cfg.storage.ground_dir
-                && existing.cfg.embeddings.model == cfg.embeddings.model
-                && existing.cfg.embeddings.quantized == cfg.embeddings.quantized
-                && existing.cfg.embeddings.enabled == cfg.embeddings.enabled
+                && registration_equivalent(existing, corpus, cfg, roots)
         })
     }
 
-    /// Notified whenever a registration is added or a catch-up pass becomes
-    /// due; the pump races this future each loop iteration to reconcile
-    /// promptly instead of only on its periodic backstop pass.
+    /// Wakes the pump so it reconciles promptly instead of waiting for its
+    /// periodic backstop pass. Uses `notify_one` (permit-carrying), not
+    /// `notify_waiters`: the registry has exactly one consumer (the watcher
+    /// pump's `run_pump` select loop), and a signal fired while that loop is
+    /// busy elsewhere must be observed on its next iteration rather than
+    /// lost, which `notify_waiters` would do because it has no permit
+    /// memory for a task that isn't parked on `.notified()` at the moment
+    /// the signal fires.
     pub(crate) fn changed(&self) -> &tokio::sync::Notify {
         &self.changed
+    }
+
+    fn signal_changed(&self) {
+        self.changed.notify_one();
     }
 
     /// Monotonic counter bumped on every registry mutation that notifies
@@ -463,6 +490,16 @@ impl WatchRegistry {
             registration.roots = roots;
             if registration.catch_up == CatchUpState::InFlight {
                 registration.catch_up = CatchUpState::Queued;
+                if let Some(position) = guard
+                    .active_group
+                    .iter()
+                    .position(|active| active == &old_id)
+                {
+                    guard.active_group.remove(position);
+                }
+                if guard.active_leader.as_ref() == Some(&old_id) {
+                    guard.active_leader_valid = false;
+                }
                 guard.queue.push_back(new_id.clone());
             }
             guard.regs.insert(new_id.clone(), registration);
@@ -559,16 +596,35 @@ impl WatchRegistry {
             .collect();
         for id in &removed {
             guard.regs.remove(id);
+            if let Some(position) = guard.active_group.iter().position(|active| active == id) {
+                guard.active_group.remove(position);
+            }
+            if guard.active_leader.as_ref() == Some(id) {
+                guard.active_leader_valid = false;
+            }
         }
         guard.queue.retain(|id| !removed.contains(id));
         for (id, corpus, roots) in candidates {
             if let Some(existing) = guard.regs.get_mut(&id)
-                && !binding_relevant_fields_changed(existing, &cfg, &roots)
+                && registration_equivalent(existing, &corpus, &cfg, &roots)
             {
                 existing.corpus = corpus;
                 existing.cfg = cfg.clone();
                 continue;
             }
+            if guard
+                .regs
+                .get(&id)
+                .is_some_and(|existing| existing.catch_up == CatchUpState::InFlight)
+            {
+                if let Some(position) = guard.active_group.iter().position(|active| active == &id) {
+                    guard.active_group.remove(position);
+                }
+                if guard.active_leader.as_ref() == Some(&id) {
+                    guard.active_leader_valid = false;
+                }
+            }
+            guard.queue.retain(|queued| queued != &id);
             guard.regs.insert(
                 id.clone(),
                 Registration {
@@ -586,7 +642,7 @@ impl WatchRegistry {
         }
         guard.generation += 1;
         drop(guard);
-        self.changed.notify_waiters();
+        self.signal_changed();
         Ok(retired)
     }
 
@@ -617,7 +673,7 @@ impl WatchRegistry {
         Self::mark_dirty_locked(&mut guard, id);
         guard.generation += 1;
         drop(guard);
-        self.changed.notify_waiters();
+        self.signal_changed();
     }
 
     pub(crate) fn mark_degraded(&self, id: &RegistrationId, error: String) {
@@ -695,6 +751,12 @@ impl WatchRegistry {
                 if !reg.pending.is_idle() {
                     clauses.push("reconciliation pending".to_string());
                 }
+                // A queued or in-flight pass with no dirty paths and no
+                // error is still incomplete work: the caller cannot rely on
+                // the index, or on a notify watch, until it finishes.
+                if clauses.is_empty() && reg.catch_up != CatchUpState::Done {
+                    clauses.push("reconciliation not complete".to_string());
+                }
                 if clauses.is_empty() {
                     return None;
                 }
@@ -725,7 +787,7 @@ impl WatchRegistry {
         }
         guard.generation += 1;
         drop(guard);
-        self.changed.notify_waiters();
+        self.signal_changed();
     }
 
     /// Promotes `NotStarted`/`Done` to `Queued` and appends `id` to the
@@ -754,7 +816,7 @@ impl WatchRegistry {
     /// failing pass from busy-looping.
     pub(crate) fn begin_next_catch_up(&self) -> Option<RegistrationId> {
         let mut guard = self.lock();
-        if any_in_flight(&guard) {
+        if guard.active_leader.is_some() {
             return None;
         }
         let mut gated: Vec<RegistrationId> = Vec::new();
@@ -772,7 +834,40 @@ impl WatchRegistry {
                 gated.push(id);
                 continue;
             }
-            reg.catch_up = CatchUpState::InFlight;
+            let Some(leader) = guard.regs.get(&id) else {
+                continue;
+            };
+            let leader_corpus = leader.corpus.clone();
+            let leader_roots = leader.roots.clone();
+            let leader_cfg = leader.cfg.clone();
+            guard
+                .regs
+                .get_mut(&id)
+                .expect("queued registration must exist")
+                .catch_up = CatchUpState::InFlight;
+            guard.active_leader = Some(id.clone());
+            guard.active_leader_valid = true;
+            guard.active_group.push(id.clone());
+            let group_members: Vec<RegistrationId> = guard
+                .queue
+                .iter()
+                .filter(|candidate| {
+                    guard.regs.get(*candidate).is_some_and(|member| {
+                        member.catch_up == CatchUpState::Queued
+                            && member.corpus == leader_corpus
+                            && member.roots == leader_roots
+                            && !cfg_binding_differs(&member.cfg, &leader_cfg)
+                    })
+                })
+                .cloned()
+                .collect();
+            for member_id in group_members {
+                if let Some(member) = guard.regs.get_mut(&member_id) {
+                    member.catch_up = CatchUpState::InFlight;
+                }
+                guard.queue.retain(|candidate| candidate != &member_id);
+                guard.active_group.push(member_id);
+            }
             break Some(id);
         };
         guard.queue.extend(gated);
@@ -797,34 +892,69 @@ impl WatchRegistry {
         outcome: Result<(), String>,
     ) -> PendingWork {
         let mut guard = self.lock();
-        let Some(reg) = guard.regs.get_mut(id) else {
+        let members: Vec<RegistrationId> = if guard.active_leader.as_ref() == Some(id) {
+            let leader_valid = guard.active_leader_valid;
+            guard.active_leader = None;
+            guard.active_leader_valid = false;
+            if guard.active_group.is_empty() {
+                if leader_valid && guard.regs.contains_key(id) {
+                    vec![id.clone()]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                std::mem::take(&mut guard.active_group)
+            }
+        } else if guard.regs.contains_key(id) {
+            vec![id.clone()]
+        } else {
             return PendingWork::Idle;
         };
-        let pending = match outcome {
-            Ok(()) => {
-                reg.last_error = None;
-                let pending = std::mem::take(&mut reg.pending);
-                if pending.is_idle() {
+        let mut returned = PendingWork::Idle;
+        for member_id in members {
+            let Some(reg) = guard.regs.get_mut(&member_id) else {
+                continue;
+            };
+            if member_id != *id {
+                // A group member other than the one `finish_catch_up` was
+                // called for didn't itself just run a catch-up pass; only
+                // its admission slot is released here, not its logical
+                // state (pending/last_error stay per registration).
+                if reg.pending.is_idle() {
                     reg.catch_up = CatchUpState::Done;
                 } else {
                     reg.catch_up = CatchUpState::Queued;
-                    guard.queue.push_back(id.clone());
+                    guard.queue.push_back(member_id.clone());
                 }
-                pending
+                continue;
             }
-            Err(error) => {
-                reg.last_error = Some(error);
-                reg.retry_on_tick = true;
-                reg.pending = PendingWork::FullRoot;
-                reg.catch_up = CatchUpState::Queued;
-                guard.queue.push_back(id.clone());
-                PendingWork::FullRoot
-            }
-        };
+            let pending = match &outcome {
+                Ok(()) => {
+                    reg.last_error = None;
+                    let pending = std::mem::take(&mut reg.pending);
+                    if pending.is_idle() {
+                        reg.catch_up = CatchUpState::Done;
+                    } else {
+                        reg.catch_up = CatchUpState::Queued;
+                        guard.queue.push_back(member_id.clone());
+                    }
+                    pending
+                }
+                Err(error) => {
+                    reg.last_error = Some(error.clone());
+                    reg.retry_on_tick = true;
+                    reg.pending = PendingWork::FullRoot;
+                    reg.catch_up = CatchUpState::Queued;
+                    guard.queue.push_back(member_id.clone());
+                    PendingWork::FullRoot
+                }
+            };
+            returned = pending;
+        }
         guard.generation += 1;
         drop(guard);
-        self.changed.notify_waiters();
-        pending
+        self.signal_changed();
+        returned
     }
 
     pub(crate) fn config_for(&self, id: &RegistrationId) -> Option<(CorpusConfig, Arc<Config>)> {
@@ -888,6 +1018,27 @@ mod tests {
         assert_eq!(outcome1, RegisterOutcome::New);
         assert_eq!(outcome2, RegisterOutcome::AlreadyRegistered);
         assert_eq!(registry.snapshot_roots().len(), 1);
+    }
+
+    #[test]
+    fn same_id_replacement_is_admitted_at_runtime_cap() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        for i in 0..MAX_RUNTIME_REGISTRATIONS {
+            registry.register(
+                ConfigSource::RepoLayer(PathBuf::from(format!("/repo-{i}"))),
+                corpus(&format!("corpus-{i}")),
+                cfg.clone(),
+                vec![],
+            );
+        }
+        let outcome = registry.register(
+            ConfigSource::RepoLayer(PathBuf::from("/repo-0")),
+            corpus("corpus-0"),
+            Arc::new(Config::default()),
+            vec![root("/replacement", corpus("corpus-0"))],
+        );
+        assert_eq!(outcome, RegisterOutcome::New);
     }
 
     #[test]
@@ -1010,6 +1161,53 @@ mod tests {
     }
 
     #[test]
+    fn rejected_replacement_preserves_previous_registration_and_pending_work() {
+        let registry = WatchRegistry::new();
+        let mut baseline_config = Config::default();
+        baseline_config.embeddings.model = "model-a".into();
+        let cfg = Arc::new(baseline_config);
+        let repo_source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            cfg.clone(),
+            vec![root("/b", corpus("wiki"))],
+        );
+        registry.register(
+            repo_source.clone(),
+            corpus("wiki"),
+            cfg.clone(),
+            vec![root("/a", corpus("wiki"))],
+        );
+        let old_id = RegistrationId {
+            source: repo_source.clone(),
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/a"),
+            },
+        };
+        registry.record_pending(&old_id, [PathBuf::from("/a/changed.md")]);
+
+        let mut replacement_config = (*cfg).clone();
+        replacement_config.embeddings.model = "model-b".into();
+        let outcome = registry.register(
+            repo_source,
+            corpus("wiki"),
+            Arc::new(replacement_config),
+            vec![root("/b", corpus("wiki"))],
+        );
+
+        assert!(matches!(outcome, RegisterOutcome::Conflict(_)));
+        assert_eq!(
+            registry.pending(&old_id),
+            Some(PendingWork::Paths(HashSet::from([PathBuf::from(
+                "/a/changed.md"
+            )]))),
+            "a rejected replacement must preserve the old registration state"
+        );
+    }
+
+    #[test]
     fn seed_baseline_is_idempotent_and_preserves_pending_across_reseeding() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
@@ -1026,6 +1224,200 @@ mod tests {
             Some(PendingWork::Paths(HashSet::from([path]))),
             "re-seeding an existing baseline registration must not reset its pending work"
         );
+    }
+
+    #[test]
+    fn compatible_registrations_share_one_admission_and_finish_independently() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let roots = vec![root("/repo", corpus("wiki"))];
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            cfg.clone(),
+            roots.clone(),
+        );
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate"));
+        registry.register(source.clone(), corpus("wiki"), cfg, roots);
+        let baseline_id = RegistrationId {
+            source: ConfigSource::Baseline,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/repo"),
+            },
+        };
+        let source_id = RegistrationId {
+            source,
+            corpus_key: baseline_id.corpus_key.clone(),
+        };
+
+        assert_eq!(registry.begin_next_catch_up(), Some(baseline_id.clone()));
+        assert_eq!(registry.begin_next_catch_up(), None);
+        registry.record_pending(&source_id, [PathBuf::from("/repo/mid.md")]);
+        registry.finish_catch_up(&baseline_id, Ok(()));
+
+        assert_eq!(
+            registry.catch_up_state(&baseline_id),
+            Some(CatchUpState::Done)
+        );
+        assert_eq!(
+            registry.catch_up_state(&source_id),
+            Some(CatchUpState::Queued)
+        );
+        assert_eq!(
+            registry.pending(&source_id),
+            Some(PendingWork::Paths(HashSet::from([PathBuf::from(
+                "/repo/mid.md"
+            )])))
+        );
+    }
+
+    #[test]
+    fn retired_group_member_keeps_slot_until_leader_finishes() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let roots = vec![root("/repo", corpus("wiki"))];
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            cfg.clone(),
+            roots.clone(),
+        );
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate"));
+        registry.register(source.clone(), corpus("wiki"), cfg.clone(), roots);
+        registry.register(ConfigSource::Baseline, corpus("other"), cfg, vec![]);
+        let leader = RegistrationId {
+            source: ConfigSource::Baseline,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/repo"),
+            },
+        };
+        let member = RegistrationId {
+            source: source.clone(),
+            corpus_key: leader.corpus_key.clone(),
+        };
+        let other = baseline_id("other");
+
+        assert_eq!(registry.begin_next_catch_up(), Some(leader.clone()));
+        registry
+            .replace_source(source, vec![], Arc::new(Config::default()), |_| vec![])
+            .unwrap();
+        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.finish_catch_up(&leader, Ok(())), PendingWork::Idle);
+        assert_eq!(registry.catch_up_state(&member), None);
+        assert_eq!(registry.begin_next_catch_up(), Some(other));
+    }
+
+    #[test]
+    fn replaced_group_member_does_not_receive_old_leader_failure() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let roots = vec![root("/repo", corpus("wiki"))];
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            cfg.clone(),
+            roots.clone(),
+        );
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate"));
+        registry.register(source.clone(), corpus("wiki"), cfg.clone(), roots.clone());
+        let leader = RegistrationId {
+            source: ConfigSource::Baseline,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/repo"),
+            },
+        };
+        let member = RegistrationId {
+            source: source.clone(),
+            corpus_key: leader.corpus_key.clone(),
+        };
+        assert_eq!(registry.begin_next_catch_up(), Some(leader.clone()));
+
+        registry
+            .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
+            .unwrap();
+        let replacement = corpus("wiki");
+        let replacement_roots = vec![root("/repo", replacement.clone())];
+        assert_eq!(
+            registry.register(source, replacement, cfg, replacement_roots),
+            RegisterOutcome::New
+        );
+        assert_eq!(registry.begin_next_catch_up(), None);
+        registry.finish_catch_up(&leader, Err("old failure".into()));
+        assert_eq!(registry.catch_up_state(&member), Some(CatchUpState::Queued));
+        assert_eq!(registry.pending(&member), Some(PendingWork::Idle));
+    }
+
+    #[test]
+    fn same_source_selection_change_replaces_registration_state() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let initial = corpus("wiki");
+        let initial_root = root("/repo", initial.clone());
+        assert_eq!(
+            registry.register(source.clone(), initial, cfg.clone(), vec![initial_root]),
+            RegisterOutcome::New
+        );
+        let id = RegistrationId {
+            source: source.clone(),
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/repo"),
+            },
+        };
+        registry.record_pending(&id, [PathBuf::from("/repo/old.md")]);
+        let mut changed = corpus("wiki");
+        changed.globs = vec!["**/*.rs".into()];
+        let changed_root = root("/repo", changed.clone());
+        assert_eq!(
+            registry.register(source, changed, cfg, vec![changed_root]),
+            RegisterOutcome::New
+        );
+        assert_eq!(registry.pending(&id), Some(PendingWork::Idle));
+    }
+
+    #[test]
+    fn incompatible_selection_rules_do_not_share_admission() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let roots = vec![root("/repo", corpus("wiki"))];
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            cfg.clone(),
+            roots.clone(),
+        );
+        let mut selected = corpus("wiki");
+        selected.globs = vec!["**/*.rs".into()];
+        let selected_roots = vec![root("/repo", selected.clone())];
+        let outcome = registry.register(
+            ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate")),
+            selected,
+            cfg,
+            selected_roots,
+        );
+
+        assert_eq!(
+            outcome,
+            RegisterOutcome::Conflict(
+                "corpus \"wiki\" has an incompatible watcher registration; use one root binding per corpus"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            registry.begin_next_catch_up(),
+            Some(RegistrationId {
+                source: ConfigSource::Baseline,
+                corpus_key: CorpusKey {
+                    name: "wiki".into(),
+                    canonical_root: PathBuf::from("/repo"),
+                },
+            })
+        );
+        assert_eq!(registry.begin_next_catch_up(), None);
     }
 
     #[test]
@@ -1238,6 +1630,18 @@ mod tests {
         registry.mark_reconcile_due_all();
         assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
         registry.finish_catch_up(&id, Ok(()));
+        // The failed pass left FullRoot pending, so the successful pass
+        // conservatively re-queues one more pass; the warning stays until
+        // that pass finishes.
+        assert_eq!(
+            registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
+            vec![(
+                "wiki".into(),
+                "root <no root>; recovery state queued; reconciliation not complete".into()
+            )]
+        );
+        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        registry.finish_catch_up(&id, Ok(()));
         assert!(
             registry
                 .recovery_warnings_for(&ConfigSource::Baseline, &queried)
@@ -1277,10 +1681,12 @@ mod tests {
         registry.record_pending(&repo_id, [PathBuf::from("/b/changed.md")]);
         let queried = [corpus("wiki")];
 
-        assert!(
-            registry
-                .recovery_warnings_for(&ConfigSource::Baseline, &queried)
-                .is_empty(),
+        assert_eq!(
+            registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
+            vec![(
+                "wiki".into(),
+                "root <no root>; recovery state queued; reconciliation not complete".into()
+            )],
             "Baseline must not see RepoLayer(/b)'s pending-work warning"
         );
         assert_eq!(
@@ -1288,6 +1694,38 @@ mod tests {
             1
         );
         assert!(registry.pending(&baseline_id).unwrap().is_idle());
+    }
+
+    #[test]
+    fn recovery_warnings_report_incomplete_catch_up_without_pending_paths() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
+        let id = baseline_id("wiki");
+        let queried = [corpus("wiki")];
+        assert_eq!(
+            registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
+            vec![(
+                "wiki".into(),
+                "root <no root>; recovery state queued; reconciliation not complete".into()
+            )],
+            "a freshly registered corpus has not been reconciled yet"
+        );
+        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(
+            registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
+            vec![(
+                "wiki".into(),
+                "root <no root>; recovery state in-flight; reconciliation not complete".into()
+            )]
+        );
+        registry.finish_catch_up(&id, Ok(()));
+        assert!(
+            registry
+                .recovery_warnings_for(&ConfigSource::Baseline, &queried)
+                .is_empty(),
+            "a completed pass with no dirty paths or errors has nothing to report"
+        );
     }
 
     #[test]
@@ -1381,14 +1819,11 @@ mod tests {
         };
         assert_eq!(
             registry.begin_next_catch_up(),
-            Some(new_id),
-            "the re-keyed registration must be queued so the slot isn't stuck in-flight forever"
+            None,
+            "the re-keyed registration must wait for the old in-flight pass"
         );
-        assert_eq!(
-            registry.finish_catch_up(&old_id, Ok(())),
-            PendingWork::Idle,
-            "the orphaned task's finish_catch_up on the stale id must be a harmless no-op"
-        );
+        assert_eq!(registry.finish_catch_up(&old_id, Ok(())), PendingWork::Idle);
+        assert_eq!(registry.begin_next_catch_up(), Some(new_id));
     }
 
     #[test]

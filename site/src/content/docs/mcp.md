@@ -3,30 +3,35 @@ title: "MCP surface"
 ---
 
 `hallouminate serve` starts a stdio MCP server. It is stateless beyond its
-tool router and a startup-captured working directory; every tool call dials
-the local daemon over a Unix domain socket, and `serve` auto-spawns the daemon
-if none is up.
+tool router; every tool call dials the local daemon over a Unix domain socket,
+and `serve` auto-spawns the daemon if none is up.
+
+Every tool call requires an absolute `cwd` for the active checkout. The server
+validates and canonicalizes `cwd` before it loads configuration or contacts the
+daemon. It does not use the server startup directory, MCP roots, or a session
+working directory as a fallback.
 
 ## Default corpus
 
 Read-side tools (`ground`, `list_files`, `list_tree`, `backlinks`,
 `corpus_stats`) that omit `corpus`
-default to the wiki for the repository containing the daemon's working
-directory — `repo:<NAME>:wiki` for the deepest `[[repository]]` whose `path`
-is an ancestor of the cwd. When the cwd sits under no configured repo, the
-caller must name a corpus explicitly.
+default to the wiki for the repository containing the request's `cwd` —
+`repo:<NAME>:wiki` for the deepest `[[repository]]` whose `path` is an ancestor
+of `cwd`. When `cwd` sits under no configured repo, the caller must name a
+corpus explicitly.
 
-The mutating tools (`add_markdown`, `delete_markdown`) and `read_markdown`
-**always** require an explicit `corpus`, to avoid accidental writes to the
-wrong wiki or ambiguous reads.
+The mutating tools (`add_markdown`, `delete_markdown`) **always** require an
+explicit `corpus`, to avoid accidental writes to the wrong wiki. `read_markdown`
+is a read-side tool and defaults to the wiki for the repository containing
+`cwd`.
 
 ## The ten tools
 
 ### `list_corpora`
 
 Every corpus the daemon knows about — explicit `[[corpus]]` entries plus
-derived `repo:NAME:wiki` and `repo:NAME:corpus` corpora. No params. Call this
-first to learn what's available.
+derived `repo:NAME:wiki` and `repo:NAME:corpus` corpora. Param: `cwd` (required
+absolute path). Call this first to learn what's available.
 
 ### `list_files`
 
@@ -97,6 +102,26 @@ Corpus-relative paths of every page that links to the given page via a
 path, backlinks }`; `content` is a newline-joined list of backlink paths, or a
 message noting there are none. Use this to find which pages reference a page
 before renaming or deleting it.
+
+## Migrating from the startup-cwd contract
+
+Pass the active checkout as `cwd` on every request, including `list_corpora`:
+
+```json
+{"name":"list_corpora","arguments":{"cwd":"/workspaces/project"}}
+{"name":"ground","arguments":{"cwd":"/workspaces/project","query":"release process"}}
+```
+
+Use corpus-relative document paths. Resolve each `globs` pattern from every
+configured corpus root, not from the daemon startup directory or the filesystem
+root:
+
+```toml
+[[corpus]]
+name = "docs"
+paths = ["/workspaces/project/docs"]
+globs = ["guides/**/*.md"]
+```
 
 ## Conventions for LLM authors
 

@@ -175,6 +175,7 @@ mod tests {
                         score: 0.91,
                         z_score: None,
                         snippet: "Three research rounds on planning LLMs handling code.".into(),
+                        source_text: String::new(),
                         provenance: ChunkProvenance {
                             corpus: "cheese".into(),
                             ..Default::default()
@@ -187,6 +188,7 @@ mod tests {
                         score: 0.84,
                         z_score: None,
                         snippet: "Signature-graph planning is unexplored in detail.".into(),
+                        source_text: String::new(),
                         provenance: ChunkProvenance {
                             corpus: "cheese".into(),
                             ..Default::default()

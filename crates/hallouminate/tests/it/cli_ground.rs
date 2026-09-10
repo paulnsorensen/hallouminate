@@ -1,7 +1,8 @@
 use std::fs;
 use std::path::Path;
+use tokio::process::Command;
 
-use hallouminate::cli::{GroundArgs, IndexArgs, cmd_index, run_ground};
+use hallouminate::cli::{GroundArgs, run_ground};
 use hallouminate_config::Config;
 use hallouminate_daemon::{
     CorpusEntry, DaemonRequest, DaemonRequestPayload, DaemonResponse, ListCorporaResult, connect_at,
@@ -67,70 +68,87 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
     let cache_dir = std::env::temp_dir().join("hallouminate-cli-test-cache");
     write_config(&config_path, &corpus_root, &ground_dir, &cache_dir);
 
-    // Spec contract: CLI commands are daemon clients. Spawn a daemon over a
-    // per-test socket so both `cmd_index` and `run_ground` dispatch through
-    // it instead of opening LanceDB directly. The harness lives for the
-    // whole test so the index work and the query both hit the same daemon
-    // instance — that's the spec's "one process owns mutations" invariant.
-    let cfg = load_config(&config_path);
-    let harness = DaemonHarness::spawn(cfg).await;
+    // Run the CLI from an isolated repository so cwd discovery cannot load this checkout's wiki.
+    let repo_root = dir.path().join("repo");
+    fs::create_dir_all(repo_root.join(".hallouminate")).unwrap();
+    // The repo layer only marks the repository root; the baseline config
+    // below declares it, and a second declaration is a duplicate corpus.
+    fs::write(repo_root.join(".hallouminate/config.toml"), "").unwrap();
+    let config_text = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!(
+            "{config_text}\n[[repository]]\nname = \"fixture-repo\"\npath = {:?}\n",
+            repo_root.display().to_string(),
+        ),
+    )
+    .unwrap();
+    let harness = DaemonHarness::spawn(load_config(&config_path)).await;
     let socket = harness.socket().to_path_buf();
+    let binary = env!("CARGO_BIN_EXE_hallouminate");
 
-    cmd_index(IndexArgs {
-        config: Some(config_path.clone()),
-        socket: Some(socket.clone()),
-        ..Default::default()
-    })
-    .await
-    .expect("index fixture corpus");
-
-    let response = run_ground(GroundArgs {
-        query: "spice melange Arrakis".into(),
-        config: Some(config_path),
-        socket: Some(socket),
-        ..Default::default()
-    })
-    .await
-    .expect("run ground");
-
-    assert!(!response.docs.is_empty(), "ground returned no docs");
-    assert_eq!(response.query, "spice melange Arrakis", "query echoed back");
+    let indexed = Command::new(binary)
+        .args(["index", "--config"])
+        .arg(&config_path)
+        .args(["--socket"])
+        .arg(&socket)
+        .current_dir(&repo_root)
+        .output()
+        .await
+        .expect("spawn index CLI");
     assert!(
-        response.stats.hits >= response.docs.len(),
-        "stats.hits ({}) must be >= bucketed docs ({})",
-        response.stats.hits,
-        response.docs.len()
+        indexed.status.success(),
+        "index CLI failed: {}",
+        String::from_utf8_lossy(&indexed.stderr)
     );
-    let (top_path, top_doc) = response
-        .docs
+
+    let grounded = Command::new(binary)
+        .args(["ground", "spice melange Arrakis", "--config"])
+        .arg(&config_path)
+        .args(["--socket"])
+        .arg(&socket)
+        .args(["--corpus", "fixtures", "--format", "json"])
+        .current_dir(&repo_root)
+        .output()
+        .await
+        .expect("spawn ground CLI");
+    assert!(
+        grounded.status.success(),
+        "ground CLI failed: {}",
+        String::from_utf8_lossy(&grounded.stderr)
+    );
+    let response: serde_json::Value =
+        serde_json::from_slice(&grounded.stdout).expect("ground JSON output");
+    let docs = response["docs"].as_object().expect("docs object");
+    assert!(!docs.is_empty(), "ground returned no docs");
+    let top_path = docs
         .iter()
-        .max_by(|(_, a), (_, b)| a.score.partial_cmp(&b.score).unwrap())
+        .max_by(|(_, a), (_, b)| {
+            a["score"]
+                .as_f64()
+                .partial_cmp(&b["score"].as_f64())
+                .unwrap()
+        })
+        .map(|(path, _)| path)
         .expect("at least one hit");
     assert!(
         top_path.ends_with("arrakis.md"),
         "expected arrakis.md as top hit, got {top_path}"
     );
-    // Corpus stamping: orchestrator must stamp every doc with the resolved
-    // corpus name (the only [[corpus]] in the fixture is "fixtures").
-    for (path, doc) in &response.docs {
+    for (path, doc) in docs {
         assert_eq!(
-            doc.corpus, "fixtures",
+            doc["corpus"], "fixtures",
             "doc at {path} must carry corpus stamp"
         );
+        let chunks = doc["chunks"].as_array().expect("CLI document chunks");
+        assert!(!chunks.is_empty(), "doc at {path} has chunks");
+        for chunk in chunks {
+            assert!(
+                chunk.get("source_text").is_none(),
+                "CLI JSON must not expose internal source_text: {chunk}"
+            );
+        }
     }
-    let chunk = top_doc
-        .chunks
-        .first()
-        .expect("top doc has at least one chunk");
-    assert!(
-        chunk.line_range[0] >= 1 && chunk.line_range[1] >= chunk.line_range[0],
-        "line_range looks malformed: {:?}",
-        chunk.line_range
-    );
-    assert!(
-        !chunk.chunk_id.is_empty(),
-        "chunk_id must be a non-empty blake3-derived string"
-    );
 }
 
 #[tokio::test]

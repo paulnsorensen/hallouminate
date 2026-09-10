@@ -21,7 +21,7 @@ use hallouminate_daemon::{
     AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonClient, DaemonRequest,
     DaemonRequestPayload, DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind,
     GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListFilesResult,
-    Position, ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
+    Position, ReadMarkdownRequest, StatusReport, connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
@@ -2408,7 +2408,7 @@ impl Drop for EnvGuard {
 // ─── Curd 3: corpus watcher ──────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
+async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() {
     // Quality gate (Curd 3): the watcher handles edits and deletes first.
     // Periodic reconciliation recovers any remove event that the platform drops.
     // Both legs are asserted via `ground` — the watcher's *unique* observable effect on the
@@ -2424,25 +2424,27 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     // precisely this file and nothing else.
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
-    let corpus_root = tmp.path().join("corpus");
-    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 1\n\n[storage]\nground_dir = \"{g}\"\n",
-        c = corpus_root.display(),
+        "[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
         g = ground.display(),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
 
-    // Write a NON-EMPTY file directly on disk (outside the add_markdown lane)
-    // with a unique token. Only the background watcher can index it — the test
-    // never calls `index`, so a hit in `ground` proves the watcher reindexed.
-    let watched = corpus_root.join("watched.md");
+    // Discover the repository after daemon startup, then register its corpus on the first request.
+    let repo_root = tmp.path().join("runtime-repo");
+    let corpus_root = repo_root.join("docs");
+    std::fs::create_dir_all(repo_root.join(".git")).expect("mkdir repo marker");
+    std::fs::create_dir_all(repo_root.join(".hallouminate")).expect("mkdir repo config");
     std::fs::write(
-        &watched,
-        "# Spice\n\nthe rarespiceword melange flows here\n",
+        repo_root.join(".hallouminate/config.toml"),
+        format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            corpus_root.display()
+        ),
     )
-    .expect("write watched file");
+    .expect("write runtime repo config");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
 
     let ground_hits = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
         let res: hallouminate_daemon::GroundResult = client
@@ -2462,19 +2464,158 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
         res.response.docs.len()
     };
 
+    let recovery_ready = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let res: hallouminate_daemon::GroundResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                    query: "rarespiceword".into(),
+                    corpus: Some("docs".into()),
+                    top_files: None,
+                    chunks_per_file: None,
+                    limit: None,
+                    snippet_chars: None,
+                }),
+            })
+            .await
+            .expect("ground ok");
+        !res.response
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "index-reconciliation")
+    };
+    let watcher_reindexes = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let value: serde_json::Value = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Status,
+            })
+            .await
+            .expect("status ok");
+        let report: StatusReport = serde_json::from_value(value).expect("status payload");
+        report.watcher.reindexes
+    };
+
+    let ground_matches =
+        |query: &'static str, client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+            let res: hallouminate_daemon::GroundResult = client
+                .call(DaemonRequest {
+                    cwd,
+                    payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                        query: query.into(),
+                        corpus: Some("docs".into()),
+                        top_files: None,
+                        chunks_per_file: None,
+                        limit: None,
+                        snippet_chars: None,
+                    }),
+                })
+                .await
+                .expect("ground ok");
+            res.response
+                .docs
+                .into_iter()
+                .flat_map(|(path, doc)| {
+                    doc.chunks
+                        .into_iter()
+                        .map(move |chunk| (path.clone(), chunk.snippet))
+                })
+                .collect::<Vec<_>>()
+        };
+
+    // Register the runtime-discovered corpus and wait for its initial catch-up.
+    // The watcher event assertions below must not pass through provisioner catch-up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if recovery_ready(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        ready,
+        "runtime corpus registration must finish before watcher assertions"
+    );
+    // Prime the native watcher with a sentinel event before the target file.
+    let sentinel = corpus_root.join("sentinel.md");
+    let sentinel_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::write(&sentinel, "# Sentinel\n\n sentinelwatcherready\n").expect("write sentinel");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut watcher_ready = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "sentinelwatcherready",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        let reindexes = watcher_reindexes(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if reindexes > sentinel_reindexes_before
+            && matches.iter().any(|(path, snippet)| {
+                path.ends_with("sentinel.md") && snippet.contains("sentinelwatcherready")
+            })
+        {
+            watcher_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        watcher_ready,
+        "native watcher must index the sentinel event"
+    );
+    std::fs::remove_file(&sentinel).expect("remove sentinel");
+
+    let reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+
+    // Write a NON-EMPTY file directly on disk (outside the add_markdown lane).
+    // Only the background watcher can index it because the corpus was empty at registration.
+    let watched = corpus_root.join("watched.md");
+    std::fs::write(
+        &watched,
+        "# Spice\n\nthe rarespiceword melange flows here\n",
+    )
+    .expect("write watched file");
+
     // The watcher must reindex the created file within a few debounce windows.
-    // Assert a `ground` hit appears that could only come from the watcher.
-    // 20s ceiling: free in the passing case (loop exits on condition); guards against
-    // parallel-suite CPU contention slowing the watcher event → reindex → ground path.
+    // Require its native reindex counter and the exact stored path and content.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut indexed = false;
     while std::time::Instant::now() < deadline {
-        if ground_hits(
+        let matches = ground_matches(
+            "rarespiceword",
             connect_at(harness.socket()).await.expect("connect"),
-            harness.cwd().to_path_buf(),
+            repo_root.clone(),
         )
-        .await
-            >= 1
+        .await;
+        let reindexes = watcher_reindexes(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if reindexes > reindexes_before
+            && matches.iter().any(|(path, snippet)| {
+                path.ends_with("watched.md") && snippet.contains("rarespiceword")
+            })
         {
             indexed = true;
             break;
@@ -2483,20 +2624,95 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     }
     assert!(
         indexed,
-        "watcher must reindex watched.md so `ground` returns it (no manual index was issued)"
+        "native watcher reindex must store watched.md with its exact content"
+    );
+
+    // RENAME → reindex: move the file outside the watcher callback's original path.
+    let renamed = corpus_root.join("renamed.md");
+    let rename_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::rename(&watched, &renamed).expect("rename watched file");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut renamed_indexed = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "rarespiceword",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        let reindexes = watcher_reindexes(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        let has_renamed = matches.iter().any(|(path, _)| path.ends_with("renamed.md"));
+        let has_old = matches.iter().any(|(path, _)| path.ends_with("watched.md"));
+        if reindexes > rename_reindexes_before && has_renamed && !has_old {
+            renamed_indexed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        renamed_indexed,
+        "watcher must replace the old indexed path with renamed.md"
+    );
+
+    // ATOMIC REPLACE → the replacement event must reach storage without reconciliation.
+    let replacement = corpus_root.join("replacement.tmp");
+    std::fs::write(
+        &replacement,
+        "# Spice\n\nthe rarespiceword atomicreplacementverified flows here\n",
+    )
+    .expect("write replacement");
+    let replace_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::rename(&replacement, &renamed).expect("replace renamed file atomically");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut replaced = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "atomicreplacementverified",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        let reindexes = watcher_reindexes(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if reindexes > replace_reindexes_before
+            && matches.iter().any(|(path, snippet)| {
+                path.ends_with("renamed.md") && snippet.contains("atomicreplacementverified")
+            })
+        {
+            replaced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        replaced,
+        "watcher must store the exact atomic replacement content"
     );
 
     // DELETE → prune: remove the file and let the debounced watcher observe it.
-    // The rows must disappear from `ground` — proving the prune ran, not merely
-    // that the daemon survived.
-    std::fs::remove_file(&watched).expect("remove watched file");
+    std::fs::remove_file(&renamed).expect("remove renamed file");
     // 20s ceiling: same load-tolerant margin for the prune leg.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut pruned = false;
     while std::time::Instant::now() < deadline {
         if ground_hits(
             connect_at(harness.socket()).await.expect("connect"),
-            harness.cwd().to_path_buf(),
+            repo_root.clone(),
         )
         .await
             == 0
@@ -2754,6 +2970,9 @@ fn assert_ground_result_wire_shape(value: &serde_json::Value) {
                     "provenance",
                     "score",
                     "snippet",
+                    // Raw source crosses the internal daemon IPC only; the MCP
+                    // and CLI transports clear it before their public output.
+                    "source_text",
                     "z_score",
                 ],
                 "ground chunk",

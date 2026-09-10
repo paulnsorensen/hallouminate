@@ -212,6 +212,14 @@ fn best_effort_canonical(path: &Path) -> PathBuf {
     }
 }
 
+fn configured_root(raw: &str) -> PathBuf {
+    let expanded = expand_tilde(raw);
+    match std::fs::canonicalize(&expanded) {
+        Ok(canonical) => canonical,
+        Err(_) => best_effort_canonical(&expanded),
+    }
+}
+
 /// The directory include/exclude patterns anchor to for a corpus root. A
 /// configured root usually names a directory, so patterns anchor to it. A
 /// root may instead name one file, so patterns then anchor to that file's
@@ -253,22 +261,25 @@ pub fn ensure_corpus_allows_relative(
 
 /// Confirm `path` matches the corpus's include globs and isn't excluded.
 ///
-/// Resolves the most specific owning root via
-/// [`CorpusConfig::corpus_key_for_resolved_path`] and matches include/exclude
-/// patterns against `path` relative to that root, so a root-anchored
-/// pattern like `docs/**/*.md` means what it says instead of being matched
-/// against the absolute path. `path` need not exist yet.
+/// Resolves the most specific owning root with the same longest-existing-ancestor
+/// policy as `path`, then matches include/exclude patterns relative to that root.
+/// A root-anchored pattern like `docs/**/*.md` therefore means what it says
+/// instead of matching against the absolute path. `path` need not exist yet.
 pub fn ensure_corpus_allows_file(corpus: &CorpusConfig, path: &Path) -> Result<(), SandboxError> {
     let resolved = best_effort_canonical(path);
-    let key = corpus
-        .corpus_key_for_resolved_path(&resolved)
+    let root = corpus
+        .paths
+        .iter()
+        .map(|raw| configured_root(raw))
+        .filter(|candidate| resolved.starts_with(candidate))
+        .max_by_key(|candidate| candidate.components().count())
         .ok_or_else(|| {
             SandboxError::new(format!(
                 "path {} is not under any configured corpus root",
                 path.display()
             ))
         })?;
-    let base = corpus_match_base(&key.canonical_root);
+    let base = corpus_match_base(&root);
     let relative = resolved.strip_prefix(&base).unwrap_or(resolved.as_path());
     ensure_corpus_allows_relative(corpus, relative)
 }
@@ -1373,6 +1384,22 @@ mod tests {
 
         ensure_corpus_allows_file(&corpus, &dest)
             .expect("a new file under a symlinked corpus root must be allowed");
+    }
+
+    #[test]
+    fn ensure_corpus_allows_file_accepts_missing_root_under_symlinked_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let parent_link = tmp.path().join("parent-link");
+        std::os::unix::fs::symlink(&real_parent, &parent_link).unwrap();
+
+        let root = parent_link.join("missing").join("root");
+        let corpus = cfg("docs", vec![root.to_str().unwrap()]);
+        let dest = root.join("new-page.md");
+
+        ensure_corpus_allows_file(&corpus, &dest)
+            .expect("a new file under a missing root with a symlinked ancestor must be allowed");
     }
 
     // ── first_corpus_root ────────────────────────────────────────────────

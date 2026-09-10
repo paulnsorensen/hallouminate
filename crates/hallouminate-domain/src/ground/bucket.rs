@@ -88,6 +88,7 @@ impl FileBucket {
                 score: h.score as f64,
                 z_score: h.z_score,
                 snippet: make_snippet(&h.text),
+                source_text: h.text.clone(),
                 // `corpus` is stamped by the orchestrator from its corpus arg
                 // (the LanceDB row implies corpus by query scope and doesn't
                 // carry it per-row); `claim_marks` is per-row, so it flows from

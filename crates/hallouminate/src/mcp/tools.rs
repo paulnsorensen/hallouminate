@@ -27,8 +27,9 @@ use hallouminate_daemon::{
     Position, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
+use hallouminate_domain::corpus::make_snippet;
 use hallouminate_domain::footnotes::{FootnoteMode, apply_footnote_mode};
-use hallouminate_domain::ground::{Format, RenderOpts, render};
+use hallouminate_domain::ground::{Format, RenderOpts, render, trim_snippets};
 
 const SERVER_INSTRUCTIONS: &str = "\
 Hallouminate stores per-repository markdown wikis on disk and exposes them \
@@ -605,10 +606,27 @@ impl HallouminateTools {
         if params.footnotes != FootnoteMode::Include {
             for doc in result.response.docs.values_mut() {
                 for chunk in &mut doc.chunks {
-                    chunk.snippet = apply_footnote_mode(&chunk.snippet, params.footnotes);
+                    if chunk.source_text.is_empty() {
+                        chunk.snippet = apply_footnote_mode(&chunk.snippet, params.footnotes);
+                    } else {
+                        chunk.snippet = make_snippet(&apply_footnote_mode(
+                            &chunk.source_text,
+                            params.footnotes,
+                        ));
+                    }
+                    chunk.source_text.clear();
                 }
             }
+            if let Some(limit) = params.snippet_chars {
+                result.response = trim_snippets(&result.response, limit);
+            }
             result.outline = render(&result.response, Format::Outline, &RenderOpts::default());
+        } else {
+            for doc in result.response.docs.values_mut() {
+                for chunk in &mut doc.chunks {
+                    chunk.source_text.clear();
+                }
+            }
         }
         let structured = to_structured(&result.response)?;
         Ok(tool_ok(result.outline, structured))

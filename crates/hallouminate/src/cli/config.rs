@@ -536,9 +536,7 @@ fn selection_advisories(cfg: &Config) -> anyhow::Result<Vec<String>> {
     for corpus in &corpora {
         let warnings = hallouminate_domain::corpus::selection_warnings(corpus)
             .map_err(|e| anyhow!("validate corpus {:?} selection rules: {e}", corpus.name))?;
-        for warning in warnings {
-            out.push(format!("corpus {:?}: {warning}", corpus.name));
-        }
+        out.extend(warnings.into_iter().map(|warning| warning.to_string()));
     }
     Ok(out)
 }
@@ -792,11 +790,11 @@ mod tests {
             selection_advisories(&cfg).expect("valid rules"),
             vec![
                 format!(
-                    "corpus \"wiki\": corpus \"wiki\" root {}: include pattern \"**/*.md\" matched no files",
+                    "corpus \"wiki\" root {}: include pattern \"**/*.md\" matched no files",
                     canon(&root).display()
                 ),
                 format!(
-                    "corpus \"wiki\": corpus \"wiki\" root {}: exclude pattern \"tmp/**\" matched no files",
+                    "corpus \"wiki\" root {}: exclude pattern \"tmp/**\" matched no files",
                     canon(&root).display()
                 ),
             ]

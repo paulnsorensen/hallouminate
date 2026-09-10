@@ -121,3 +121,15 @@ Verified request-concurrency model (2026-07-13 audit):
   (`crates/hallouminate-daemon/src/client.rs:183-254`).
 
 _Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-30 · Supersedes: —_
+
+
+Catch-up split (2026-09-09): `dispatch::catch_up_corpus` holds only the per-corpus lock while it scans the filesystem, lists stored files, and plans.
+It acquires the global write lane through a caller-supplied closure (`DaemonState::acquire_write_lane` → `backpressure::acquire_lane`) only when the plan is non-empty, immediately before `apply`.
+A no-work scan never touches the lane, so a slow scan of one corpus no longer blocks writes to other corpora.
+The per-corpus lock held across scan and apply keeps the plan valid; every corpus writer (`handle_index`, `handle_add_markdown`, `provision_corpus`, boot `catch_up_index`, `spawn_registration_catch_up`) still takes the corpus lock first.
+`handle_index` is not split: it calls the domain `index_corpus` directly and does not have the scan/plan/apply shape.
+Tests: `catch_up_slow_scan_does_not_hold_write_lane`, `catch_up_scan_in_flight_blocks_same_corpus_guard`, `catch_up_apply_holds_lane_until_released`, `catch_up_no_work_never_acquires_the_lane` in `state.rs`.
+
+Watcher-pump wake contract (2026-09-09): `WatchRegistry` signals the pump with `notify_one()` (`signal_changed`), not `notify_waiters()`.
+The pump is the single consumer, and the permit survives a signal that fires while the pump is not parked in its `select!` (spawned but not yet polled, or busy in `reconcile`/a change batch).
+With `notify_waiters` a runtime-discovered corpus could wait a full `reconcile_interval_secs` (3600 s in tests) for its watch install and catch-up. Regression: `registry_signal_wakes_pump_before_it_is_first_polled`.

@@ -120,7 +120,13 @@ pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
         }),
     };
     let result: GroundResult = client.call(req).await?;
-    Ok(result.response)
+    let mut response = result.response;
+    for doc in response.docs.values_mut() {
+        for chunk in &mut doc.chunks {
+            chunk.source_text.clear();
+        }
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

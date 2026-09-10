@@ -1056,7 +1056,7 @@ async fn mcp_tool_call_fails_loudly_when_daemon_unreachable() {
     mcp.shutdown().await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the real embedder and may download a model on first run"]
 async fn mcp_add_markdown_writes_reindexes_and_rejects_unsafe_inputs() {
     // End-to-end coverage of the `add_markdown` JSON-RPC handler — write
@@ -2016,7 +2016,7 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
     let ground = tempfile::tempdir().expect("ground tempdir");
 
     // Seed a markdown file with a footnote reference and definition.
-    let body = "# Evidence\n\nThe sky is blue.[^src]\n\n[^src]: physics/optics.rs:42\n";
+    let body = "# Evidence\n\nThe sky is blue.[^src] and remains visible.\n\nInline literal `[^literal]`.\n\n~~~\nFenced literal [^fenced]\n~~~\n\n[^src]: physics/optics.rs:42\n\nAfter the citation.";
     std::fs::write(corpus.path().join("evidence.md"), body).expect("seed");
 
     let cfg = write_config_with_corpus_and_ground(
@@ -2050,7 +2050,7 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
         .await;
     assert!(idx.get("error").is_none(), "index errored: {idx}");
 
-    // Case 1: footnotes:"exclude" — no [^...] in snippets or outline.
+    // Case 1: footnotes:"exclude" — real markers are removed, while code literals survive.
     let call = mcp
         .rpc(
             3,
@@ -2070,28 +2070,81 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
         .as_str()
         .expect("ground text content");
     assert!(
-        !text.contains("[^"),
-        "footnote markers must be absent from exclude outline: {text:?}"
+        !text.contains("[^src]"),
+        "real footnote markers must be absent from exclude outline: {text:?}"
     );
-    let docs = &call["result"]["structuredContent"]["docs"];
-    if let Some(obj) = docs.as_object() {
-        for (_path, doc) in obj {
-            if let Some(chunks) = doc["chunks"].as_array() {
-                for chunk in chunks {
-                    let snippet = chunk["snippet"].as_str().unwrap_or("");
-                    assert!(
-                        !snippet.contains("[^"),
-                        "footnote marker must be absent from exclude snippet: {snippet:?}"
-                    );
+    assert!(
+        text.contains("remains visible") && text.contains("After the citation"),
+        "body after marker and definition must survive exclude: {text:?}"
+    );
+    assert!(
+        text.contains("`[^literal]`") && text.contains("[^fenced]"),
+        "inline-code and fenced-code markers must survive exclude: {text:?}"
+    );
+    let docs = call["result"]["structuredContent"]["docs"]
+        .as_object()
+        .expect("exclude docs object");
+    assert!(!docs.is_empty(), "exclude must return the fixture document");
+    let exclude_doc = docs.values().next().expect("exclude fixture document");
+    let exclude_chunks = exclude_doc["chunks"]
+        .as_array()
+        .expect("exclude chunks array");
+    assert!(
+        !exclude_chunks.is_empty(),
+        "exclude must return fixture chunks"
+    );
+    for chunk in exclude_chunks {
+        assert!(
+            chunk.get("source_text").is_none(),
+            "internal source_text must not cross MCP response boundary: {chunk}"
+        );
+        let snippet = chunk["snippet"].as_str().expect("exclude snippet");
+        assert!(
+            !snippet.contains("[^src]"),
+            "real footnote marker must be absent from exclude snippet: {snippet:?}"
+        );
+    }
+
+    // Case 1b: the same exclusion with a small limit proves trimming follows filtering.
+    let call = mcp
+        .rpc(
+            4,
+            "tools/call",
+            json!({
+                "name": "ground",
+                "arguments": {
+                    "query": "sky is blue",
+                    "corpus": "wiki",
+                    "footnotes": "exclude",
+                    "snippet_chars": 24
                 }
-            }
+            }),
+        )
+        .await;
+    assert!(
+        call.get("error").is_none(),
+        "trimmed ground errored: {call}"
+    );
+    let trimmed_docs = call["result"]["structuredContent"]["docs"]
+        .as_object()
+        .expect("trimmed exclude docs object");
+    assert!(!trimmed_docs.is_empty(), "trimmed exclude must return docs");
+    for doc in trimmed_docs.values() {
+        let chunks = doc["chunks"].as_array().expect("trimmed chunks array");
+        assert!(!chunks.is_empty(), "trimmed exclude must return chunks");
+        for chunk in chunks {
+            let snippet = chunk["snippet"].as_str().expect("trimmed snippet");
+            assert_eq!(
+                snippet, "# Evidence The sky is b…",
+                "snippet_chars must trim the filtered snippet at the exact boundary"
+            );
         }
     }
 
     // Case 2: footnotes omitted (default = include) — markers present.
     let call = mcp
         .rpc(
-            4,
+            5,
             "tools/call",
             json!({
                 "name": "ground",
@@ -2103,19 +2156,70 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
         )
         .await;
     assert!(call.get("error").is_none(), "ground errored: {call}");
-    let docs = &call["result"]["structuredContent"]["docs"];
-    let found_marker = docs.as_object().is_some_and(|obj| {
-        obj.values().any(|doc| {
-            doc["chunks"].as_array().is_some_and(|chunks| {
-                chunks
-                    .iter()
-                    .any(|c| c["snippet"].as_str().unwrap_or("").contains("[^"))
-            })
-        })
-    });
+    let docs = call["result"]["structuredContent"]["docs"]
+        .as_object()
+        .expect("include docs object");
+    assert!(!docs.is_empty(), "include must return the fixture document");
+    let mut found_marker = false;
+    for doc in docs.values() {
+        let chunks = doc["chunks"].as_array().expect("include chunks array");
+        assert!(!chunks.is_empty(), "include must return fixture chunks");
+        for chunk in chunks {
+            assert!(
+                chunk.get("source_text").is_none(),
+                "internal source_text must not cross include response boundary: {chunk}"
+            );
+            let snippet = chunk["snippet"].as_str().expect("include snippet");
+            found_marker |= snippet.contains("[^src]");
+        }
+    }
     assert!(
         found_marker,
-        "footnote marker must appear in default (include) ground result: {docs}"
+        "footnote marker must appear in default (include) ground result: {docs:?}"
+    );
+
+    // Case 3: footnotes:"only" — definitions remain while body text is removed.
+    let call = mcp
+        .rpc(
+            6,
+            "tools/call",
+            json!({
+                "name": "ground",
+                "arguments": {
+                    "query": "sky is blue",
+                    "corpus": "wiki",
+                    "footnotes": "only"
+                }
+            }),
+        )
+        .await;
+    assert!(call.get("error").is_none(), "ground only errored: {call}");
+    let only_docs = call["result"]["structuredContent"]["docs"]
+        .as_object()
+        .expect("only docs object");
+    assert!(
+        !only_docs.is_empty(),
+        "only must return the fixture document"
+    );
+    let only_doc = only_docs.values().next().expect("only fixture document");
+    let only_chunks = only_doc["chunks"].as_array().expect("only chunks array");
+    assert!(!only_chunks.is_empty(), "only must return fixture chunks");
+    let mut found_definition = false;
+    for chunk in only_chunks {
+        assert!(
+            chunk.get("source_text").is_none(),
+            "internal source_text must not cross only response boundary: {chunk}"
+        );
+        let snippet = chunk["snippet"].as_str().expect("only snippet");
+        found_definition |= snippet.contains("[^src]: physics/optics.rs:42");
+        assert!(
+            !snippet.contains("remains visible"),
+            "only snippets must not contain body text: {snippet:?}"
+        );
+    }
+    assert!(
+        found_definition,
+        "only snippets must contain the definition: {only_chunks:?}"
     );
 
     mcp.shutdown().await;

@@ -402,18 +402,15 @@ mod tests {
 
     // --- efficiency: ground_union fans roots out concurrently ---
 
-    /// A `ChunkStore` double whose `retrieve_signals` sleeps a fixed delay
-    /// per call before returning an empty (no-hit) result. Used to prove
-    /// `ground_union` awaits per-root searches concurrently: if the roots
-    /// were still awaited sequentially, N roots would take >= N * delay;
-    /// concurrent awaits take roughly one delay regardless of N.
-    struct SleepyChunkStore {
-        delay: Duration,
+    /// A `ChunkStore` double that waits until every root starts retrieval.
+    /// Used to prove `ground_union` admits all corpus roots concurrently.
+    struct BarrierChunkStore {
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
         calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
-    impl ChunkRetrieval for SleepyChunkStore {
+    impl ChunkRetrieval for BarrierChunkStore {
         async fn retrieve_signals(
             &self,
             _corpus_key: &CorpusKey,
@@ -421,7 +418,7 @@ mod tests {
             _limit: usize,
         ) -> Result<SignalLists> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
+            self.barrier.wait().await;
             Ok(SignalLists::default())
         }
     }
@@ -429,7 +426,6 @@ mod tests {
     #[tokio::test]
     async fn ground_union_searches_corpus_roots_concurrently() {
         const ROOTS: usize = 5;
-        const DELAY: Duration = Duration::from_millis(80);
 
         let root_dirs: Vec<tempfile::TempDir> = (0..ROOTS)
             .map(|_| tempfile::tempdir().expect("root dir"))
@@ -444,23 +440,25 @@ mod tests {
             exclude: Vec::new(),
             global: false,
         };
-        let store = SleepyChunkStore {
-            delay: DELAY,
+        let store = BarrierChunkStore {
+            barrier: std::sync::Arc::new(tokio::sync::Barrier::new(ROOTS)),
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let started = Instant::now();
-        let resp = ground_union(
-            "spice",
-            &[corpus],
-            &store,
-            None,
-            GroundOpts::default(),
-            None,
+        let resp = tokio::time::timeout(
+            Duration::from_secs(1),
+            ground_union(
+                "spice",
+                &[corpus],
+                &store,
+                None,
+                GroundOpts::default(),
+                None,
+            ),
         )
         .await
+        .expect("all roots must be admitted concurrently")
         .expect("concurrent ground_union must succeed");
-        let elapsed = started.elapsed();
 
         assert_eq!(
             store.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -468,15 +466,6 @@ mod tests {
             "every corpus root must be searched exactly once"
         );
         assert!(resp.docs.is_empty(), "no-hit store yields no docs");
-        assert!(
-            elapsed < DELAY * 2,
-            "expected {ROOTS} roots x {DELAY:?} delay each to run concurrently and finish \
-             in roughly one delay; took {elapsed:?}. A sequential loop would take >= \
-             {:?} (the sum over roots) — this margin (2x one delay) is generous enough \
-             that it cannot pass by accident on a loaded machine, yet fails if the \
-             per-root loop reverts to sequential awaits.",
-            DELAY * ROOTS as u32
-        );
     }
 
     // --- #137: relative_path_for ---

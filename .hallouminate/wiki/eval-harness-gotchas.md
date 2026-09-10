@@ -130,6 +130,28 @@ periodically hits its 5s rerank timeout on the small runner (historically on
 query `footnote-inversion`), and the partial artifact's completed baseline
 arm is still sufficient for a baseline update.
 
+
+
+Absolute corpus paths are another diagnostic variable. Keep the binary, model, content, and machine fixed when testing this variable.
+A September 2026 release-readiness experiment uses three fresh stores with identical frozen wiki content under different absolute roots.
+The `outside-root-refused` query changes its top chunk between the expected sandbox section and `corpus-walker.md`.
+A separate comparison of ripgrep 14.1 and 15.2 produces identical scores for this query.
+
+The cause is the lexical signal tie break.
+`chunk_id_for` hashes the absolute file reference and chunk ordinal.
+Before 2026-09-09, `ranked_by_term_count` ordered equal term counts by chunk ID, so the ripgrep and contains-term RRF ranks depended on the absolute root.
+It now orders equal counts by root-relative path, then `line_start`, then chunk ID (`crates/hallouminate-domain/src/search.rs`, `tie_break_key`).
+Five diagnostic runs across three absolute roots then produce identical per-signal ranks and fused scores.
+The `#[ignore]` test `diagnose_outside_root_refused_signal_ranks` in `crates/hallouminate/tests/eval_ground_recall.rs` prints the four pre-fusion lists for that query; set `HALLOUMINATE_DIAG_ROOT` to point it at a copied fixture.
+
+Consequence: the committed baseline was measured under the old hash-dependent tie order, so `outside-root-refused` now lands at rank 2 deterministically (expected chunk: fts 2, vector 1, ripgrep absent, contains 6; `corpus-walker.md:19`: fts 8, vector 12, ripgrep 6, contains absent; fused gap 0.0005).
+The expected chunk is absent from the ripgrep list because the file's earlier lines consume the per-file `--max-count` cap — the documented per-file-versus-per-chunk limit in `search/ripgrep.rs`.
+Re-measure the baseline on CI (`mode=measure`) after the tie-break change lands. Do not edit the baseline locally.
+Do not infer hardware or dependency drift from a baseline mismatch alone.
+The earlier ADR-001 investigation concerns a different baseline divergence; its rejected path hypothesis does not exclude this later observation.
+
+Evidence: `.cheese/research/release-retrieval-dependencies/release-retrieval-dependencies.md`; local measurements `.context/cure-ranking-path-comparison.json` and `.context/cure-ranking-rg-comparison.json`.
+
 ## lance major bumps reorder near-tie ranks; expect a re-baseline
 
 The Aug 2026 weekly failures (MRR 0.76682 → 0.75584) came from the

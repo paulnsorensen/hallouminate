@@ -1227,6 +1227,26 @@ fn compare_against_baseline(committed: &EvalArtifact, current: &EvalArtifact) ->
     Ok(())
 }
 
+fn persist_current_measurement_and_compare(
+    baseline: &EvalArtifact,
+    current: &EvalArtifact,
+    output: Option<&Path>,
+    baseline_path: &Path,
+    baseline_bytes: &[u8],
+) -> Result<()> {
+    if let Some(output) = output {
+        write_measurement_artifact(output, baseline_path, current)
+            .context("persist current measurement before baseline comparison")?;
+        let baseline_after = fs::read(baseline_path).context("re-read eval/baseline.json")?;
+        ensure!(
+            baseline_bytes == baseline_after,
+            "measurement modified eval/baseline.json"
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(current)?);
+    compare_against_baseline(baseline, current)
+}
+
 fn normalize_path_for_comparison(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1848,6 +1868,44 @@ fn comparator_rejects_metric_and_top_chunk_regressions() {
 }
 
 #[test]
+fn failed_comparison_preserves_current_measurement_artifact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let baseline_path = temp.path().join("eval/baseline.json");
+    let output = temp.path().join(".context/current.json");
+    fs::create_dir_all(baseline_path.parent().expect("baseline parent")).expect("mkdir eval");
+    let baseline_bytes =
+        serde_json::to_vec(&synthetic_baseline_artifact()).expect("serialize baseline");
+    fs::write(&baseline_path, &baseline_bytes).expect("write baseline");
+    let current = {
+        let mut artifact = synthetic_baseline_artifact();
+        artifact.measurements[0].queries[0].actual_top = None;
+        artifact.measurements[0].queries[0].top_chunk_pass = false;
+        artifact
+    };
+
+    let error = persist_current_measurement_and_compare(
+        &synthetic_baseline_artifact(),
+        &current,
+        Some(&output),
+        &baseline_path,
+        &baseline_bytes,
+    )
+    .expect_err("comparison must fail for the regressed top chunk");
+
+    assert!(error.to_string().contains("top-chunk pass to fail"));
+    let mut expected_output = serde_json::to_vec_pretty(&current).expect("serialize current");
+    expected_output.push(b'\n');
+    assert_eq!(
+        fs::read(&output).expect("read current artifact"),
+        expected_output
+    );
+    assert_eq!(
+        fs::read(&baseline_path).expect("read baseline"),
+        baseline_bytes
+    );
+}
+
+#[test]
 fn artifact_write_isolated_to_requested_output() {
     let temp = tempfile::tempdir().expect("tempdir");
     let baseline = temp.path().join("eval/baseline.json");
@@ -1959,7 +2017,13 @@ fn ensure_baseline_schema_current(bytes: &[u8]) -> Result<()> {
 #[tokio::test]
 #[ignore = "loads production embeddings and enforces the committed baseline"]
 async fn eval_ground_recall_enforce() -> Result<()> {
-    let baseline_bytes = fs::read(baseline_path()).context("read eval/baseline.json")?;
+    let output = env::var_os("HALLOUMINATE_EVAL_OUTPUT")
+        .map(|output| measurement_output_path(Path::new(&output)));
+    let baseline_path = baseline_path();
+    if let Some(output) = output.as_deref() {
+        ensure_measurement_output_is_not_baseline(output, &baseline_path)?;
+    }
+    let baseline_bytes = fs::read(&baseline_path).context("read eval/baseline.json")?;
     ensure_baseline_schema_current(&baseline_bytes)?;
     let baseline: EvalArtifact =
         serde_json::from_slice(&baseline_bytes).context("parse eval/baseline.json")?;
@@ -1971,8 +2035,13 @@ async fn eval_ground_recall_enforce() -> Result<()> {
         "query-set digest disagrees with eval/baseline.json"
     );
     let current = measure_baseline(&queries, query_set_digest).await?;
-    compare_against_baseline(&baseline, &current)?;
-    println!("{}", serde_json::to_string_pretty(&current)?);
+    persist_current_measurement_and_compare(
+        &baseline,
+        &current,
+        output.as_deref(),
+        &baseline_path,
+        &baseline_bytes,
+    )?;
     Ok(())
 }
 
@@ -2119,4 +2188,119 @@ fn stale_baseline_schema_is_reported_as_a_version_mismatch() {
     );
     ensure_baseline_schema_current(br#"{"schema_version": 4}"#)
         .expect("the current schema must pass the probe");
+}
+
+/// Diagnostic capture for `outside-root-refused` (issue: verify-release-
+/// readiness). Not a correctness assertion — prints, for the two
+/// competing chunks (`sandbox-and-workspace-roots.md`§"A path outside every
+/// configured root is refused, not indexed" and `corpus-walker.md`§"Explicit-
+/// root opt-in"), their 1-based rank in each of the four RRF signal lists
+/// plus the fused score, by capturing the `hallouminate::search` debug log
+/// `search.rs` emits just before fusion.
+///
+/// `HALLOUMINATE_DIAG_ROOT` overrides the corpus root (default: the
+/// committed fixture) so the same query can be run against copies of the
+/// fixture at different absolute paths.
+#[tokio::test]
+#[ignore = "diagnostic only: prints per-signal ranks, asserts nothing"]
+async fn diagnose_outside_root_refused_signal_ranks() -> Result<()> {
+    let root = match env::var_os("HALLOUMINATE_DIAG_ROOT") {
+        Some(root) => {
+            fs::canonicalize(PathBuf::from(root)).context("canonicalize HALLOUMINATE_DIAG_ROOT")?
+        }
+        None => fixture_root(),
+    };
+    let corpus = CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![root.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    };
+    let arm = BASELINE_ARM;
+    cold_load_models(arm).await?;
+    let tmp = tempfile::tempdir().context("create diag tempdir")?;
+    let ground_dir = tmp.path().join("ground");
+    let config = Config {
+        corpora: vec![corpus],
+        search: SearchConfig {
+            crossencoder: arm.model.map(|model| model.to_string()),
+            rerank_timeout_ms: rerank_timeout_ms(arm),
+            ..Default::default()
+        },
+        embeddings: EmbeddingsConfig::default(),
+        storage: StorageConfig {
+            ground_dir: ground_dir.to_string_lossy().into_owned(),
+        },
+        ..Default::default()
+    };
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket())
+        .await
+        .context("connect diag daemon")?;
+    index_fixture(&client, harness.cwd(), arm).await?;
+
+    let (queries, _digest) = load_queries()?;
+    let query = queries
+        .iter()
+        .find(|q| q.id == "outside-root-refused")
+        .context("outside-root-refused query missing from eval/queries.json")?;
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer_buf = std::sync::Arc::clone(&buf);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || DiagCaptureWriter(std::sync::Arc::clone(&writer_buf)))
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let response = ground_query(&client, harness.cwd(), arm, query).await?;
+    drop(guard);
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).context("captured logs are utf8")?;
+
+    drop(client);
+    harness.shutdown().await.context("shutdown diag daemon")?;
+
+    let signal_line = logs
+        .lines()
+        .find(|line| line.contains("pre-fusion signal order"))
+        .context("pre-fusion signal order debug log missing; is RUST_LOG suppressing DEBUG?")?;
+
+    let ranked = ranked_docs(&response.docs);
+    println!("root={}", root.display());
+    println!("signals: {signal_line}");
+    for (path, doc) in ranked.iter().take(5) {
+        let chunk = doc.chunks.first();
+        println!(
+            "fused rank={} score={} path={} chunk_line={:?}",
+            ranked
+                .iter()
+                .position(|(p, _)| p == path)
+                .map(|i| i + 1)
+                .unwrap_or(0),
+            doc.score,
+            path,
+            chunk.map(|c| c.line_range)
+        );
+    }
+    Ok(())
+}
+
+/// Bounded in-memory `io::Write` sink for the tracing subscriber in
+/// [`diagnose_outside_root_refused_signal_ranks`]; mirrors
+/// `tests/it/daemon.rs`'s `CaptureWriter` (a separate test binary, not
+/// importable from here).
+struct DiagCaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for DiagCaptureWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        const MAX_CAPTURED_LOG_BYTES: usize = 64 * 1024;
+        let mut buf = self.0.lock().unwrap();
+        let remaining = MAX_CAPTURED_LOG_BYTES.saturating_sub(buf.len());
+        buf.extend_from_slice(&data[..data.len().min(remaining)]);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

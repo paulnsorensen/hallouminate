@@ -12,6 +12,23 @@
 //! LanceDB commit so we never hit LanceDB's retry-limit warning around
 //! many simultaneous writers.
 //!
+//! `acquire_mutation_guard` still hands out both locks together for
+//! read-modify-write handlers (`handle_add_markdown`, `handle_index`) where
+//! the whole operation is cheap and atomic. The catch-up scan/plan/apply
+//! path (`dispatch::catch_up_corpus`) is different: scanning disk and
+//! diffing against the store can be slow and touches nothing shared, so
+//! those callers hold only `lock_corpus` across scan + plan and call
+//! `acquire_write_lane` themselves just before `apply`, once there is
+//! confirmed work to do. The corpus lock is held continuously from scan
+//! through apply, so no other writer to that corpus can interleave; only
+//! the lane acquisition — the part that actually needs cross-corpus
+//! serialization — moves later.
+//!
+//! The maintenance-debt gate (`backpressure::await_debt_gate`) runs before
+//! any of this: every catch-up call site clears the gate before calling
+//! `lock_corpus`, so a bounded Hard-debt block never holds a corpus lock
+//! that would head-of-line-block an unrelated mutation on the same corpus.
+//!
 //! Stores, tokenizers, and embedders are cached by effective request config.
 //! A baseline embedder that fails during startup remains retryable: the next
 //! normal request for that resource key initializes and installs it in place.
@@ -1309,6 +1326,15 @@ impl DaemonState {
     ) -> Result<MutationGuard, &'static str> {
         super::backpressure::acquire(self, corpus).await
     }
+
+    /// Acquire only the global write-lane permit, without a corpus lock or
+    /// the debt gate. Callers must already hold `lock_corpus` for the
+    /// corpus being written and must have already cleared
+    /// `backpressure::await_debt_gate` *before* taking that lock (the
+    /// catch-up scan/plan/apply split calls this just before `apply`).
+    pub async fn acquire_write_lane(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        super::backpressure::acquire_lane(self).await
+    }
 }
 
 /// Move the stale ground store aside atomically so a fresh store can be
@@ -2114,6 +2140,191 @@ mod tests {
         assert!(
             baseline_files.is_empty(),
             "provisioning must not write to the baseline store when the request config overrides storage",
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_slow_scan_does_not_hold_write_lane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                reached_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                lane_state.acquire_write_lane().await
+            })
+            .await
+        });
+
+        reached_rx.await.expect("scan reached the lane hook");
+        {
+            let lane = state.write_lane();
+            let permit = lane
+                .try_acquire()
+                .expect("lane must be free while scan/plan is in flight");
+            drop(permit);
+        }
+        release_tx.send(()).unwrap();
+        let result = task.await.expect("task join");
+        assert!(matches!(result, Ok(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn catch_up_scan_in_flight_blocks_same_corpus_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let corpus_name = corpus.name.clone();
+
+        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                reached_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                lane_state.acquire_write_lane().await
+            })
+            .await
+        });
+        reached_rx.await.expect("scan reached the lane hook");
+
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            let _guard = second_state.lock_corpus(&corpus_name).await;
+            second_tx.send(()).unwrap();
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            second_rx.try_recv().is_err(),
+            "second lock_corpus must not complete while the outer guard is held",
+        );
+
+        release_tx.send(()).unwrap();
+        task.await.expect("task join").expect("catch_up_corpus");
+        drop(_corpus_guard);
+        second.await.expect("second task join");
+    }
+
+    #[tokio::test]
+    async fn catch_up_apply_holds_lane_until_released() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                let permit = lane_state.acquire_write_lane().await?;
+                reached_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(permit)
+            })
+            .await
+        });
+
+        reached_rx.await.expect("lane acquired before apply");
+        assert!(
+            state.write_lane().try_acquire().is_err(),
+            "lane must be held once acquired, before apply starts",
+        );
+        release_tx.send(()).unwrap();
+        let result = task.await.expect("task join");
+        assert!(matches!(result, Ok(Some(_))));
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be released once apply completes",
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_no_work_never_acquires_the_lane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let lane_touched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let touched = lane_touched.clone();
+        let result =
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                touched.store(true, Ordering::Relaxed);
+                panic!("no-work plan must never acquire the write lane");
+            })
+            .await;
+
+        assert!(matches!(result, Ok(None)));
+        assert!(!lane_touched.load(Ordering::Relaxed));
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be untouched when the plan has no work",
         );
     }
 
