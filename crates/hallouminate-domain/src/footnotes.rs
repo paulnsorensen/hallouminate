@@ -6,10 +6,10 @@
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Controls how footnote definitions and inline markers appear in a response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FootnoteMode {
     /// Verbatim — current behavior. Footnotes pass through unchanged.

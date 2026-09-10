@@ -473,8 +473,23 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                 Ok(res) => {
                     let reg = state.make_registry();
                     let lane_state = state.clone();
+                    let shutdown = state.shutdown_token().clone();
+                    // Race the lane wait against shutdown so a catch-up
+                    // parked behind another writer's permit bails out as
+                    // soon as shutdown is requested, instead of holding the
+                    // corpus lock (and thus this task) open indefinitely.
                     match super::dispatch::catch_up_corpus(&res, &reg, &corpus, || {
-                        lane_state.acquire_write_lane()
+                        let lane_state = lane_state.clone();
+                        let shutdown = shutdown.clone();
+                        async move {
+                            tokio::select! {
+                                biased;
+                                () = shutdown.cancelled() => {
+                                    Err("daemon shutting down; catch-up cancelled before taking the write lane")
+                                }
+                                permit = lane_state.acquire_write_lane() => permit,
+                            }
+                        }
                     })
                     .await
                     {
@@ -808,25 +823,8 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     })
 }
 
-/// Insert every markdown path from one debounced batch into the shared
-/// pending set, coalescing duplicates within *and across* batches — a burst
-/// that touches one file many times (or arrives in several batches before the
-/// consumer next drains) still reindexes it once per drain.
-///
-/// Filters by event *kind* first: `notify` 8.x's inotify backend subscribes
-/// `WatchMask::OPEN`, so read-opens (including the reads reindexing itself
-/// performs) surface as `EventKind::Access(_)`. Admitting those would make the
-/// watcher feed itself — boot catch-up reads every corpus file, each read
-/// emits an Access event, each Access event schedules a reindex, forever.
-/// Only actual mutations schedule reindexing: `Create`, `Modify` (data,
-/// metadata, or a rename's `Name(RenameMode::_)`), and `Remove`. The
-/// catch-all `EventKind::Any` (used in tests and by backends that can't
-/// distinguish, e.g. `PollWatcher`) is admitted too — dropping it risks
-/// discarding a real mutation the backend just couldn't classify, and a
-/// spurious reindex is cheap. `EventKind::Other` is admitted-by-default here
-/// as well: notify's inotify backend only emits it for an inotify queue
-/// overflow forcing a directory rescan (`Flag::Rescan`), never for a
-/// non-mutating access, so treating it like `Any` is the conservative call.
+/// Upper bound on distinct pending paths tracked between catch-up drains,
+/// before `record_pending` starts marking `overflow` instead of inserting.
 const MAX_PENDING_PATHS: usize = 4096;
 
 #[derive(Default)]
@@ -849,6 +847,25 @@ impl std::ops::DerefMut for PendingPaths {
     }
 }
 
+/// Insert every markdown path from one debounced batch into the shared
+/// pending set, coalescing duplicates within *and across* batches — a burst
+/// that touches one file many times (or arrives in several batches before the
+/// consumer next drains) still reindexes it once per drain.
+///
+/// Filters by event *kind* first: `notify` 8.x's inotify backend subscribes
+/// `WatchMask::OPEN`, so read-opens (including the reads reindexing itself
+/// performs) surface as `EventKind::Access(_)`. Admitting those would make the
+/// watcher feed itself — boot catch-up reads every corpus file, each read
+/// emits an Access event, each Access event schedules a reindex, forever.
+/// Only actual mutations schedule reindexing: `Create`, `Modify` (data,
+/// metadata, or a rename's `Name(RenameMode::_)`), and `Remove`. The
+/// catch-all `EventKind::Any` (used in tests and by backends that can't
+/// distinguish, e.g. `PollWatcher`) is admitted too — dropping it risks
+/// discarding a real mutation the backend just couldn't classify, and a
+/// spurious reindex is cheap. `EventKind::Other` is admitted-by-default here
+/// as well: notify's inotify backend only emits it for an inotify queue
+/// overflow forcing a directory rescan (`Flag::Rescan`), never for a
+/// non-mutating access, so treating it like `Any` is the conservative call.
 fn record_pending(
     pending: &std::sync::Mutex<PendingPaths>,
     events: &[notify_debouncer_full::DebouncedEvent],
@@ -2328,7 +2345,9 @@ body
     /// `record_pending` coalesces duplicate paths within one batch and across
     /// multiple batches recorded before a drain — the fix for the unbounded
     /// channel: paths accumulate in a bounded shared set instead of every
-    /// debounced batch queuing separately.
+    /// debounced batch queuing separately. `record_pending` does not filter
+    /// by extension at all (only by `EventKind`), so an unsupported `.docx`
+    /// path is coalesced and retained the same as any `.md` path.
     #[test]
     fn record_pending_coalesces_across_batches() {
         let pending: std::sync::Mutex<PendingPaths> =
@@ -2369,14 +2388,13 @@ body
         );
     }
 
-    /// `record_pending` must admit every extension `format_from_extension`
-    /// (the indexer's own admission rule) accepts, case-insensitively — not a
-    /// second, narrower `.md`-only rule the watcher used to maintain
-    /// separately from `domain::indexer::format`. An uppercase `.MD` and a
-    /// `.csv` (spreadsheet) must both be admitted; a known-unsupported `.docx`
-    /// must still be dropped.
+    /// `record_pending` does not filter by file extension at all — that is
+    /// the indexer's job via `format_from_extension` during actual reindex.
+    /// It filters only by event *kind*, dropping `EventKind::Access` and
+    /// admitting everything else. An uppercase `.MD`, a `.csv`, and even a
+    /// known-unsupported `.docx` are all retained here.
     #[test]
-    fn record_pending_admits_every_indexer_supported_extension() {
+    fn record_pending_is_extension_agnostic_filters_by_event_kind_only() {
         let pending: std::sync::Mutex<PendingPaths> =
             std::sync::Mutex::new(PendingPaths::default());
         let uppercase_md = PathBuf::from("/srv/wiki/README.MD");
@@ -3154,5 +3172,74 @@ body
             live_task.is_finished(),
             "live watcher shutdown must await its pump task"
         );
+    }
+
+    /// Regression test for finding 1: a catch-up pass parked on the write
+    /// lane (held externally) must observe `shutdown_token().cancel()`
+    /// instead of hanging until the lane frees up. Mirrors the
+    /// select!-wrapped `acquire_lane` closure built inline in
+    /// `spawn_registration_catch_up`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_lane_wait_observes_shutdown_cancellation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let corpus_cfg = corpus("docs", root.to_str().unwrap(), &["**/*.md"]);
+        cfg.corpora.push(corpus_cfg.clone());
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
+
+        // Hold the sole write-lane permit externally so `acquire_write_lane`
+        // blocks once the scan/plan phase finds work to apply.
+        let held_permit = state
+            .write_lane()
+            .try_acquire_owned()
+            .expect("acquire the sole write-lane permit");
+
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let lane_state = state.clone();
+        let shutdown = state.shutdown_token().clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus_cfg, || {
+                let lane_state = lane_state.clone();
+                let shutdown = shutdown.clone();
+                async move {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => {
+                            Err("daemon shutting down; catch-up cancelled before taking the write lane")
+                        }
+                        permit = lane_state.acquire_write_lane() => permit,
+                    }
+                }
+            })
+            .await
+        });
+
+        // Let the scan/plan phase run and reach the lane wait, blocked on
+        // the externally-held permit.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        state.shutdown_token().cancel();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled catch-up must not hang on the held write-lane permit")
+            .expect("task join");
+        assert!(
+            outcome.is_err(),
+            "cancelled catch-up must return an error instead of applying the plan"
+        );
+        drop(held_permit);
     }
 }

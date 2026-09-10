@@ -122,7 +122,15 @@ async fn serve_with_config(
     // await the probe before the supervised factory creates the live instance.
     let watcher_enabled = match super::watch::spawn_corpus_watcher(&state) {
         Some(handle) => {
-            handle.abort().await;
+            if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.abort())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    "startup watcher probe teardown exceeded {SHUTDOWN_DRAIN_TIMEOUT:?}; continuing boot",
+                );
+            }
             true
         }
         None => false,
@@ -484,10 +492,19 @@ pub async fn serve_with_idle_timeout(
             Ok(deadline) => (Ok(()), deadline),
             Err(error) => (Err(error), Instant::now() + SHUTDOWN_DRAIN_TIMEOUT),
         };
-    if let Some(watcher) = watcher {
-        watcher.abort().await;
-    }
     state.shutdown_token().cancel();
+    if let Some(watcher) = watcher {
+        let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+        if tokio::time::timeout(remaining, watcher.abort())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                "watcher teardown exceeded the shutdown drain budget; abandoning it",
+            );
+        }
+    }
     let maintenance = state.take_maintenance_task().await;
     finish_shutdown(maintenance, lock, socket_path, shutdown_deadline).await;
     result

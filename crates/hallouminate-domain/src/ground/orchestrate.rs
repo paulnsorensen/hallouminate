@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use futures_util::{StreamExt, TryStreamExt};
 
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
+use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
 use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
 
@@ -95,6 +96,7 @@ pub struct GroundOpts {
     /// real OS-thread boundary (not a bare `tokio::time::timeout`) is
     /// required to preempt the synchronous crossencoder.
     pub rerank_timeout: Duration,
+    pub footnote_mode: FootnoteMode,
 }
 
 impl Default for GroundOpts {
@@ -104,6 +106,7 @@ impl Default for GroundOpts {
             chunks_per_file: 3,
             limit: 50,
             rerank_timeout: Duration::from_secs(2),
+            footnote_mode: FootnoteMode::Include,
         }
     }
 }
@@ -244,7 +247,12 @@ pub async fn ground_union(
 
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
     for (corpus_key, corpus_hits) in by_key {
-        let mut built = build_docs(&corpus_hits, usize::MAX, opts.chunks_per_file)?;
+        let mut built = build_docs(
+            &corpus_hits,
+            usize::MAX,
+            opts.chunks_per_file,
+            opts.footnote_mode,
+        )?;
         let root = corpus_key.canonical_root.to_string_lossy().into_owned();
         for (absolute_path, doc) in built.iter_mut() {
             doc.corpus = corpus_key.name.clone();

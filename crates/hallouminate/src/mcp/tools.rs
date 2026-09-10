@@ -600,6 +600,7 @@ impl HallouminateTools {
                 chunks_per_file: params.chunks_per_file,
                 limit: params.limit,
                 snippet_chars: params.snippet_chars,
+                footnote_mode: params.footnotes,
             }),
         };
         let mut result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
@@ -621,12 +622,6 @@ impl HallouminateTools {
                 result.response = trim_snippets(&result.response, limit);
             }
             result.outline = render(&result.response, Format::Outline, &RenderOpts::default());
-        } else {
-            for doc in result.response.docs.values_mut() {
-                for chunk in &mut doc.chunks {
-                    chunk.source_text.clear();
-                }
-            }
         }
         let structured = to_structured(&result.response)?;
         Ok(tool_ok(result.outline, structured))

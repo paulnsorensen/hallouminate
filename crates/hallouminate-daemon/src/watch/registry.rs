@@ -36,6 +36,15 @@ pub(crate) enum ConfigSource {
     RepoLayer(PathBuf),
 }
 
+impl std::fmt::Display for ConfigSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigSource::Baseline => write!(f, "baseline"),
+            ConfigSource::RepoLayer(path) => write!(f, "repo layer {}", path.display()),
+        }
+    }
+}
+
 /// Identifies one logical registration by source and semantic corpus identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RegistrationId {

@@ -412,6 +412,7 @@ fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
             .unwrap_or(cfg.search.limit_default)
             .min(MAX_GROUND_LIMIT),
         rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
+        footnote_mode: req.footnote_mode,
     }
 }
 
@@ -629,7 +630,7 @@ async fn handle_ground(
         response.warnings.push(Warning {
             code: "index-reconciliation".to_string(),
             message: format!(
-                "watcher registration limit reached for source {source:?}; one or more corpora are not watched"
+                "watcher registration limit reached for source {source}; one or more corpora are not watched"
             ),
         });
     }

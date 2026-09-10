@@ -582,6 +582,7 @@ async fn ground_query(
                     chunks_per_file: Some(1),
                     limit: Some(50),
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             },
             ground_rpc_timeout(arm),

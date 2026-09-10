@@ -117,16 +117,11 @@ pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
             chunks_per_file: args.chunks_per_file,
             limit: args.limit.or(Some(DEFAULT_LIMIT)),
             snippet_chars: args.snippet_chars,
+            footnote_mode: hallouminate_domain::footnotes::FootnoteMode::Include,
         }),
     };
     let result: GroundResult = client.call(req).await?;
-    let mut response = result.response;
-    for doc in response.docs.values_mut() {
-        for chunk in &mut doc.chunks {
-            chunk.source_text.clear();
-        }
-    }
-    Ok(response)
+    Ok(result.response)
 }
 
 #[cfg(test)]

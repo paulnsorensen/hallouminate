@@ -437,18 +437,19 @@ fn ranked_by_term_count(
     hits: &HashMap<String, SearchHit>,
     canonical_root: &Path,
 ) -> Vec<String> {
-    let mut ranked: Vec<(String, usize)> =
-        counts.into_iter().filter(|(_, count)| *count > 0).collect();
-    ranked.sort_by(|a, b| {
-        b.1.cmp(&a.1).then_with(|| {
-            tie_break_key(&a.0, hits, canonical_root).cmp(&tie_break_key(
-                &b.0,
-                hits,
-                canonical_root,
-            ))
+    let mut decorated: Vec<((String, usize, String), usize, String)> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(chunk_id, count)| {
+            let key = tie_break_key(&chunk_id, hits, canonical_root);
+            (key, count, chunk_id)
         })
-    });
-    ranked.into_iter().map(|(chunk_id, _)| chunk_id).collect()
+        .collect();
+    decorated.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    decorated
+        .into_iter()
+        .map(|(_, _, chunk_id)| chunk_id)
+        .collect()
 }
 
 /// Deterministic, root-relative sort key for a chunk_id tie: the file's

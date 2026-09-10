@@ -2457,6 +2457,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     chunks_per_file: None,
                     limit: None,
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             })
             .await
@@ -2475,6 +2476,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     chunks_per_file: None,
                     limit: None,
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             })
             .await
@@ -2508,6 +2510,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                         chunks_per_file: None,
                         limit: None,
                         snippet_chars: None,
+                        footnote_mode: Default::default(),
                     }),
                 })
                 .await
@@ -2763,6 +2766,7 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
                     chunks_per_file: None,
                     limit: None,
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             })
             .await
@@ -2889,6 +2893,7 @@ async fn ground_through_ipc(
                     chunks_per_file: Some(3),
                     limit: Some(50),
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             })
             .await
@@ -2970,9 +2975,6 @@ fn assert_ground_result_wire_shape(value: &serde_json::Value) {
                     "provenance",
                     "score",
                     "snippet",
-                    // Raw source crosses the internal daemon IPC only; the MCP
-                    // and CLI transports clear it before their public output.
-                    "source_text",
                     "z_score",
                 ],
                 "ground chunk",
@@ -3837,6 +3839,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
             }),
         })
         .await
@@ -3867,6 +3870,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
             }),
         })
         .await
