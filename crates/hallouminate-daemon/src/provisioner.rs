@@ -111,19 +111,17 @@ pub(super) async fn provisioning_loop(state: DaemonState) {
 }
 
 async fn provision_corpus(state: &DaemonState, corpus: &CorpusConfig, cfg: &Config) {
-    let _guard = match state.acquire_mutation_guard(&corpus.name).await {
-        Ok(g) => g,
-        Err(e) => {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                corpus = %corpus.name,
-                error = %e,
-                "provisioning: could not acquire mutation guard; will retry on next ground",
-            );
-            clear_seen_keys(state, corpus);
-            return;
-        }
-    };
+    // Debt gate before the corpus lock: see `backpressure::await_debt_gate`.
+    if let Err(e) = crate::backpressure::await_debt_gate(state).await {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            corpus = %corpus.name,
+            error = %e,
+            "provisioner: debt gate blocked catch-up; skipped",
+        );
+        return;
+    }
+    let _guard = state.lock_corpus(&corpus.name).await;
     let res = match state.resources_for(cfg).await {
         Ok(r) => r,
         Err(e) => {
@@ -138,7 +136,9 @@ async fn provision_corpus(state: &DaemonState, corpus: &CorpusConfig, cfg: &Conf
         }
     };
     let registry = HandlerRegistry::new(res.tokenizer.clone(), CHUNK_BUDGET_TOKENS);
-    match super::dispatch::catch_up_corpus(&res, &registry, corpus).await {
+    match super::dispatch::catch_up_corpus(&res, &registry, corpus, || state.acquire_write_lane())
+        .await
+    {
         Ok(Some(stats)) => tracing::info!(
             target: "hallouminate::daemon",
             corpus = %corpus.name,

@@ -21,7 +21,7 @@ use hallouminate_daemon::{
     AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonClient, DaemonRequest,
     DaemonRequestPayload, DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind,
     GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListFilesResult,
-    Position, ReadMarkdownRequest, connect_at, serve, spawn_signal_handlers,
+    Position, ReadMarkdownRequest, StatusReport, connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
@@ -2405,10 +2405,86 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Quiet window held after each filesystem mutation before the test speaks to
+/// the daemon again. Every request carries a `cwd` and re-resolves its config
+/// layers, which re-arms the registration catch-up lane; a request that lands
+/// inside the watcher's debounce window therefore races the native event and
+/// can win, leaving `watcher.reindexes` stuck (see the module comment on
+/// `watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root`).
+/// Comfortably larger than the test's `debounce_ms = 100` so the native lane
+/// gets its turn uncontended.
+const WATCH_QUIESCE: Duration = Duration::from_secs(2);
+
+/// Poll cadence once the quiet window has elapsed. Deliberately slow: each
+/// poll is itself a perturbation, so a tight loop would re-open the race the
+/// quiet window just closed.
+const WATCH_POLL_EVERY: Duration = Duration::from_millis(250);
+
+/// Waits until the daemon's native-watcher reindex counter passes `before`,
+/// polling **`Status` only**.
+///
+/// `ground` must never be used to wait for a watcher event. Two lanes can
+/// index a changed file: the native watcher, and the registration catch-up
+/// lane that a `ground` request itself provokes. Whichever writes first wins,
+/// and the loser is then shed by the watcher's stage-1 mtime gate
+/// (`hallouminate-daemon/src/watch/mod.rs:1027`, "watcher: skipped event,
+/// mtime matches last-indexed snapshot") — which deliberately does **not**
+/// call `record_watcher_reindex`. Polling `ground` every 50ms is therefore not
+/// a passive observation: it races the lane under test and can permanently
+/// stall `watcher.reindexes` even though the rows land correctly. `Status`
+/// touches no corpus, so this wait leaves the debounce window uncontended.
+///
+/// Returns the observed counter (unchanged if the deadline expired).
+async fn await_watcher_reindex(
+    socket: &std::path::Path,
+    cwd: &std::path::Path,
+    before: u64,
+    timeout: Duration,
+) -> u64 {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut observed = before;
+    while std::time::Instant::now() < deadline {
+        let value: serde_json::Value = connect_at(socket)
+            .await
+            .expect("connect")
+            .call(DaemonRequest {
+                cwd: cwd.to_path_buf(),
+                payload: DaemonRequestPayload::Status,
+            })
+            .await
+            .expect("status ok");
+        let report: StatusReport = serde_json::from_value(value).expect("status payload");
+        observed = report.watcher.reindexes;
+        if observed > before {
+            return observed;
+        }
+        tokio::time::sleep(WATCH_POLL_EVERY).await;
+    }
+    observed
+}
 // ─── Curd 3: corpus watcher ──────────────────────────────────────────────
 
+// Exercises the LIVE native watcher across five sequential filesystem events
+// (create/edit/rename/atomic-replace/delete). Every stage asserts a
+// `report.watcher.reindexes` delta, which is what proves the *native* lane —
+// not a manual `index` and not the reconcile backstop — produced each
+// observable change. That attribution only holds when the native lane is the
+// only writer, so the periodic backstop is disarmed here
+// (`reconcile_interval_secs = 3600`) and each stage waits on the counter via
+// `await_watcher_reindex` (`Status` only) BEFORE it touches `ground`.
+//
+// Both of those matter for the same reason. The daemon has a second lane that
+// indexes a changed file: the registration catch-up pass, which the reconcile
+// tick schedules and which a `ground` request also provokes. When that lane
+// writes first, the watcher correctly sheds its own debounced event on the
+// stage-1 mtime gate (`hallouminate-daemon/src/watch/mod.rs:1027`) without
+// calling `record_watcher_reindex`. The rows still land, so the content
+// assertions pass — but the counter never moves, and a loop that polls
+// `ground` while waiting on the counter re-arms the very lane that steals the
+// event, so it can never converge. Reconciliation-based recovery is covered
+// separately by `reconcile_tick_repairs_dropped_remove_event`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
+async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() {
     // Quality gate (Curd 3): the watcher handles edits and deletes first.
     // Periodic reconciliation recovers any remove event that the platform drops.
     // Both legs are asserted via `ground` — the watcher's *unique* observable effect on the
@@ -2424,25 +2500,27 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     // precisely this file and nothing else.
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
-    let corpus_root = tmp.path().join("corpus");
-    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 1\n\n[storage]\nground_dir = \"{g}\"\n",
-        c = corpus_root.display(),
+        "[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
         g = ground.display(),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
 
-    // Write a NON-EMPTY file directly on disk (outside the add_markdown lane)
-    // with a unique token. Only the background watcher can index it — the test
-    // never calls `index`, so a hit in `ground` proves the watcher reindexed.
-    let watched = corpus_root.join("watched.md");
+    // Discover the repository after daemon startup, then register its corpus on the first request.
+    let repo_root = tmp.path().join("runtime-repo");
+    let corpus_root = repo_root.join("docs");
+    std::fs::create_dir_all(repo_root.join(".git")).expect("mkdir repo marker");
+    std::fs::create_dir_all(repo_root.join(".hallouminate")).expect("mkdir repo config");
     std::fs::write(
-        &watched,
-        "# Spice\n\nthe rarespiceword melange flows here\n",
+        repo_root.join(".hallouminate/config.toml"),
+        format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            corpus_root.display()
+        ),
     )
-    .expect("write watched file");
+    .expect("write runtime repo config");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
 
     let ground_hits = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
         let res: hallouminate_daemon::GroundResult = client
@@ -2455,6 +2533,7 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
                     chunks_per_file: None,
                     limit: None,
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             })
             .await
@@ -2462,20 +2541,174 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
         res.response.docs.len()
     };
 
+    let recovery_ready = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let res: hallouminate_daemon::GroundResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                    query: "rarespiceword".into(),
+                    corpus: Some("docs".into()),
+                    top_files: None,
+                    chunks_per_file: None,
+                    limit: None,
+                    snippet_chars: None,
+                    footnote_mode: Default::default(),
+                }),
+            })
+            .await
+            .expect("ground ok");
+        !res.response
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "index-reconciliation")
+    };
+    let watcher_reindexes = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let value: serde_json::Value = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Status,
+            })
+            .await
+            .expect("status ok");
+        let report: StatusReport = serde_json::from_value(value).expect("status payload");
+        report.watcher.reindexes
+    };
+
+    let ground_matches =
+        |query: &'static str, client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+            let res: hallouminate_daemon::GroundResult = client
+                .call(DaemonRequest {
+                    cwd,
+                    payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                        query: query.into(),
+                        corpus: Some("docs".into()),
+                        top_files: None,
+                        chunks_per_file: None,
+                        limit: None,
+                        snippet_chars: None,
+                        footnote_mode: Default::default(),
+                    }),
+                })
+                .await
+                .expect("ground ok");
+            res.response
+                .docs
+                .into_iter()
+                .flat_map(|(path, doc)| {
+                    doc.chunks
+                        .into_iter()
+                        .map(move |chunk| (path.clone(), chunk.snippet))
+                })
+                .collect::<Vec<_>>()
+        };
+
+    // Register the runtime-discovered corpus and wait for its initial catch-up.
+    // The watcher event assertions below must not pass through provisioner catch-up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if recovery_ready(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        ready,
+        "runtime corpus registration must finish before watcher assertions"
+    );
+    // Prime the native watcher with a sentinel event before the target file.
+    let sentinel = corpus_root.join("sentinel.md");
+    let sentinel_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::write(&sentinel, "# Sentinel\n\n sentinelwatcherready\n").expect("write sentinel");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        sentinel_reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > sentinel_reindexes_before,
+        "native watcher must index the sentinel event (counter stuck at {reindexes})"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut watcher_ready = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "sentinelwatcherready",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if matches.iter().any(|(path, snippet)| {
+            path.ends_with("sentinel.md") && snippet.contains("sentinelwatcherready")
+        }) {
+            watcher_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        watcher_ready,
+        "native watcher must index the sentinel event"
+    );
+    std::fs::remove_file(&sentinel).expect("remove sentinel");
+
+    let reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+
+    // Write a NON-EMPTY file directly on disk (outside the add_markdown lane).
+    // Only the background watcher can index it because the corpus was empty at registration.
+    let watched = corpus_root.join("watched.md");
+    std::fs::write(
+        &watched,
+        "# Spice\n\nthe rarespiceword melange flows here\n",
+    )
+    .expect("write watched file");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+
     // The watcher must reindex the created file within a few debounce windows.
-    // Assert a `ground` hit appears that could only come from the watcher.
-    // 20s ceiling: free in the passing case (loop exits on condition); guards against
-    // parallel-suite CPU contention slowing the watcher event → reindex → ground path.
+    // Require its native reindex counter and the exact stored path and content.
+    // The counter is awaited via `Status` FIRST (see `await_watcher_reindex`):
+    // polling `ground` here would provoke the catch-up lane, which indexes the
+    // file first and makes the watcher shed its own event on the mtime gate.
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > reindexes_before,
+        "native watcher must reindex watched.md, not the catch-up lane (counter stuck at {reindexes})"
+    );
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut indexed = false;
     while std::time::Instant::now() < deadline {
-        if ground_hits(
+        let matches = ground_matches(
+            "rarespiceword",
             connect_at(harness.socket()).await.expect("connect"),
-            harness.cwd().to_path_buf(),
+            repo_root.clone(),
         )
-        .await
-            >= 1
-        {
+        .await;
+        if matches.iter().any(|(path, snippet)| {
+            path.ends_with("watched.md") && snippet.contains("rarespiceword")
+        }) {
             indexed = true;
             break;
         }
@@ -2483,20 +2716,108 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     }
     assert!(
         indexed,
-        "watcher must reindex watched.md so `ground` returns it (no manual index was issued)"
+        "native watcher reindex must store watched.md with its exact content"
+    );
+
+    // RENAME → reindex: move the file outside the watcher callback's original path.
+    let renamed = corpus_root.join("renamed.md");
+    let rename_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::rename(&watched, &renamed).expect("rename watched file");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        rename_reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > rename_reindexes_before,
+        "native watcher must reindex the rename destination (counter stuck at {reindexes})"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut renamed_indexed = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "rarespiceword",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        let has_renamed = matches.iter().any(|(path, _)| path.ends_with("renamed.md"));
+        let has_old = matches.iter().any(|(path, _)| path.ends_with("watched.md"));
+        if has_renamed && !has_old {
+            renamed_indexed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        renamed_indexed,
+        "watcher must replace the old indexed path with renamed.md"
+    );
+
+    // ATOMIC REPLACE → the replacement event must reach storage without reconciliation.
+    let replacement = corpus_root.join("replacement.tmp");
+    std::fs::write(
+        &replacement,
+        "# Spice\n\nthe rarespiceword atomicreplacementverified flows here\n",
+    )
+    .expect("write replacement");
+    let replace_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::rename(&replacement, &renamed).expect("replace renamed file atomically");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        replace_reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > replace_reindexes_before,
+        "native watcher must reindex the atomic replacement (counter stuck at {reindexes})"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut replaced = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "atomicreplacementverified",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if matches.iter().any(|(path, snippet)| {
+            path.ends_with("renamed.md") && snippet.contains("atomicreplacementverified")
+        }) {
+            replaced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        replaced,
+        "watcher must store the exact atomic replacement content"
     );
 
     // DELETE → prune: remove the file and let the debounced watcher observe it.
-    // The rows must disappear from `ground` — proving the prune ran, not merely
-    // that the daemon survived.
-    std::fs::remove_file(&watched).expect("remove watched file");
+    std::fs::remove_file(&renamed).expect("remove renamed file");
+    tokio::time::sleep(WATCH_QUIESCE).await;
     // 20s ceiling: same load-tolerant margin for the prune leg.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut pruned = false;
     while std::time::Instant::now() < deadline {
         if ground_hits(
             connect_at(harness.socket()).await.expect("connect"),
-            harness.cwd().to_path_buf(),
+            repo_root.clone(),
         )
         .await
             == 0
@@ -2547,6 +2868,7 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
                     chunks_per_file: None,
                     limit: None,
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             })
             .await
@@ -2673,6 +2995,7 @@ async fn ground_through_ipc(
                     chunks_per_file: Some(3),
                     limit: Some(50),
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             })
             .await
@@ -3618,6 +3941,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
             }),
         })
         .await
@@ -3648,6 +3972,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
             }),
         })
         .await
@@ -4643,7 +4968,12 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
 
     let state = DaemonState::open(cfg, None).await.expect("open state");
     let socket_clone = socket.clone();
-    let idle_timeout = Duration::from_millis(500);
+    // Generous drain window: the assertion below checks the socket still exists
+    // ~150ms after the shutdown ack, so the in-flight handler must not drain
+    // before then even under heavy CI parallelism that stretches wall-clock
+    // sleeps. 2s keeps a wide margin over the ~150ms check without slowing the
+    // test meaningfully (serve returns as soon as the handler drains).
+    let idle_timeout = Duration::from_secs(2);
     let handle =
         tokio::spawn(
             async move { serve_with_idle_timeout(&state, &socket_clone, idle_timeout).await },

@@ -103,6 +103,7 @@ async fn ground(client: &hallouminate_daemon::DaemonClient, cwd: &Path) -> Groun
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
             }),
         })
         .await

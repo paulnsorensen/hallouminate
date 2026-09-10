@@ -41,7 +41,7 @@ use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use serde::{Deserialize, Serialize};
 
-use crate::common::{CorpusConfig, expand_tilde};
+use crate::common::{CorpusConfig, best_effort_canonical, expand_tilde};
 use crate::corpus::scan;
 use crate::corpus::walker;
 
@@ -177,41 +177,6 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
     Ok(path.to_path_buf())
 }
 
-/// Resolve `path`'s ancestors as far as the filesystem allows, so a corpus
-/// root reached through a symlinked ancestor still canonicalizes even when
-/// the leaf itself does not exist yet (e.g. `add_markdown` creating a new
-/// page). Walks up to the longest existing ancestor, canonicalizes that
-/// ancestor, then re-appends the remaining components literally. Falls back
-/// to `path` unchanged when no ancestor can be canonicalized.
-///
-/// The final component is never dereferenced, even when it exists and is a
-/// symlink. Resolving it would let a symlink that escapes the corpus be
-/// rejected here, as a glob mismatch, instead of by the no-follow guards
-/// that own symlink containment (`atomic_write_no_follow`,
-/// `delete_no_follow`, `read_no_follow`). Keeping the leaf literal preserves
-/// that division of labor and the error each layer reports.
-fn best_effort_canonical(path: &Path) -> PathBuf {
-    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
-        return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    };
-    let mut ancestor = parent;
-    let mut tail: Vec<&OsStr> = vec![file_name];
-    loop {
-        if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
-            let mut result = canonical_ancestor;
-            for component in tail.iter().rev() {
-                result.push(component);
-            }
-            return result;
-        }
-        let Some(next) = ancestor.parent() else {
-            return path.to_path_buf();
-        };
-        tail.push(ancestor.file_name().unwrap_or_default());
-        ancestor = next;
-    }
-}
-
 /// The directory include/exclude patterns anchor to for a corpus root. A
 /// configured root usually names a directory, so patterns anchor to it. A
 /// root may instead name one file, so patterns then anchor to that file's
@@ -253,11 +218,10 @@ pub fn ensure_corpus_allows_relative(
 
 /// Confirm `path` matches the corpus's include globs and isn't excluded.
 ///
-/// Resolves the most specific owning root via
-/// [`CorpusConfig::corpus_key_for_resolved_path`] and matches include/exclude
-/// patterns against `path` relative to that root, so a root-anchored
-/// pattern like `docs/**/*.md` means what it says instead of being matched
-/// against the absolute path. `path` need not exist yet.
+/// Resolves the most specific owning root with the same longest-existing-ancestor
+/// policy as `path`, then matches include/exclude patterns relative to that root.
+/// A root-anchored pattern like `docs/**/*.md` therefore means what it says
+/// instead of matching against the absolute path. `path` need not exist yet.
 pub fn ensure_corpus_allows_file(corpus: &CorpusConfig, path: &Path) -> Result<(), SandboxError> {
     let resolved = best_effort_canonical(path);
     let key = corpus
@@ -268,7 +232,8 @@ pub fn ensure_corpus_allows_file(corpus: &CorpusConfig, path: &Path) -> Result<(
                 path.display()
             ))
         })?;
-    let base = corpus_match_base(&key.canonical_root);
+    let root = best_effort_canonical(&key.canonical_root);
+    let base = corpus_match_base(&root);
     let relative = resolved.strip_prefix(&base).unwrap_or(resolved.as_path());
     ensure_corpus_allows_relative(corpus, relative)
 }
@@ -1373,6 +1338,22 @@ mod tests {
 
         ensure_corpus_allows_file(&corpus, &dest)
             .expect("a new file under a symlinked corpus root must be allowed");
+    }
+
+    #[test]
+    fn ensure_corpus_allows_file_accepts_missing_root_under_symlinked_ancestor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_parent = tmp.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let parent_link = tmp.path().join("parent-link");
+        std::os::unix::fs::symlink(&real_parent, &parent_link).unwrap();
+
+        let root = parent_link.join("missing").join("root");
+        let corpus = cfg("docs", vec![root.to_str().unwrap()]);
+        let dest = root.join("new-page.md");
+
+        ensure_corpus_allows_file(&corpus, &dest)
+            .expect("a new file under a missing root with a symlinked ancestor must be allowed");
     }
 
     // ── first_corpus_root ────────────────────────────────────────────────

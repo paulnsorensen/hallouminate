@@ -94,6 +94,8 @@ pub struct GroundRequest {
     pub chunks_per_file: Option<usize>,
     pub limit: Option<usize>,
     pub snippet_chars: Option<usize>,
+    #[serde(default)]
+    pub footnote_mode: hallouminate_domain::footnotes::FootnoteMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -56,6 +56,9 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Boot the daemon and serve until SIGINT/SIGTERM (or stdin close on the
 /// rare debug invocations). Returns `Err` if another daemon is already
 /// holding the single-instance lock on the configured socket directory.
+///
+/// The Tokio runtime must use the multi-thread scheduler because request
+/// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn run_daemon(cfg: Config, args: DaemonArgs) -> anyhow::Result<()> {
     // `cfg` is the startup config the caller already loaded (once, in
     // `lib::run`) to initialize logging before dispatch — loading it a
@@ -115,13 +118,23 @@ async fn serve_with_config(
     let lock = acquire_single_instance(&lock_path)?;
     let state = DaemonState::open_with_socket(cfg, xdg_path, socket_path.to_path_buf()).await?;
     remove_stale_socket(socket_path).await;
-    // One-shot probe to learn whether the watcher is enabled: whether the
-    // watcher backend itself initialized (debouncer construction succeeded),
-    // not whether any roots exist yet -- `spawn_corpus_watcher` starts live
-    // even with zero baseline roots, since runtime registrations may arrive
-    // later. The probe handle is dropped before the supervised factory
-    // creates the long-lived instance, so two debouncers never run at once.
-    let watcher_enabled = super::watch::spawn_corpus_watcher(&state).is_some();
+    // One-shot probe to learn whether the watcher backend is enabled. Stop and
+    // await the probe before the supervised factory creates the live instance.
+    let watcher_enabled = match super::watch::spawn_corpus_watcher(&state) {
+        Some(handle) => {
+            if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.abort())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    "startup watcher probe teardown exceeded {SHUTDOWN_DRAIN_TIMEOUT:?}; continuing boot",
+                );
+            }
+            true
+        }
+        None => false,
+    };
     {
         let sup = state.supervisor().clone();
         let factory_state = state.clone();
@@ -445,6 +458,9 @@ async fn remove_stale_socket(socket_path: &Path) {
 /// `state.shutdown_token()` is cancelled — the IPC `Shutdown` request
 /// cancels that token. Before returning, the server drains connection handlers
 /// and periodic maintenance, then removes the socket and releases the flock.
+///
+/// The Tokio runtime must use the multi-thread scheduler because request
+/// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
     serve_with_idle_timeout(state, socket_path, IDLE_READ_TIMEOUT).await
 }
@@ -453,6 +469,9 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
 /// timeout instead of the production [`IDLE_READ_TIMEOUT`] default. Public
 /// so integration tests can exercise the timeout behavior without waiting
 /// out the real 30s default.
+///
+/// The Tokio runtime must use the multi-thread scheduler because request
+/// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn serve_with_idle_timeout(
     state: &DaemonState,
     socket_path: &Path,
@@ -473,8 +492,19 @@ pub async fn serve_with_idle_timeout(
             Ok(deadline) => (Ok(()), deadline),
             Err(error) => (Err(error), Instant::now() + SHUTDOWN_DRAIN_TIMEOUT),
         };
-    drop(watcher);
     state.shutdown_token().cancel();
+    if let Some(watcher) = watcher {
+        let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+        if tokio::time::timeout(remaining, watcher.abort())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                "watcher teardown exceeded the shutdown drain budget; abandoning it",
+            );
+        }
+    }
     let maintenance = state.take_maintenance_task().await;
     finish_shutdown(maintenance, lock, socket_path, shutdown_deadline).await;
     result

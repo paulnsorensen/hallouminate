@@ -3,12 +3,20 @@
 //! each mutation with `debt_soft_delay_ms`; `Hard` blocks mutations until
 //! debt drops below Hard (the forced maintenance pass completing), bounded
 //! by `hard_block_wait_secs`, then fails with [`RETRYABLE_HARD_DEBT`]. The
-//! gate runs BEFORE the corpus lock and write-lane permit, so a blocked
-//! mutation holds nothing the forced maintenance pass needs (the spec's
-//! no-cycle rule).
+//! gate always runs BEFORE any corpus lock: [`acquire`] calls
+//! [`await_debt_gate`] before `lock_corpus`, and the catch-up scan/plan/
+//! apply split's three call sites (`dispatch::catch_up_index`,
+//! `watch::spawn_registration_catch_up`, `provisioner::provision_corpus`)
+//! call [`await_debt_gate`] themselves before their own `lock_corpus`, so a
+//! Hard-debt block never holds a corpus lock that would head-of-line-block
+//! an unrelated mutation on the same corpus. [`acquire_lane`] only takes the
+//! write-lane permit -- callers reaching it already cleared the gate and
+//! hold the corpus lock the catch-up split documents.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::debt::{self, DebtLevel, MaintenanceDebt};
 use super::state::{DaemonState, MutationGuard};
@@ -26,6 +34,24 @@ pub(super) async fn acquire(
     state: &DaemonState,
     corpus: &str,
 ) -> Result<MutationGuard, &'static str> {
+    await_debt_gate(state).await?;
+    let corpus_guard = state.lock_corpus(corpus).await;
+    let permit = state
+        .write_lane()
+        .acquire_owned()
+        .await
+        .map_err(|_| "write lane closed")?;
+    Ok(MutationGuard::new(permit, corpus_guard))
+}
+
+/// The debt-graduated gate alone, with no lock or permit acquired. Callers
+/// that will hold a corpus lock across a scan/plan/apply span (the catch-up
+/// split: `dispatch::catch_up_index`, `watch::spawn_registration_catch_up`,
+/// `provisioner::provision_corpus`) must call this *before* `lock_corpus`,
+/// not after -- a Hard-debt block must never run while a corpus lock is
+/// held, or an unrelated mutation on the same corpus head-of-line-blocks
+/// behind it for up to `hard_block_wait_secs`.
+pub(super) async fn await_debt_gate(state: &DaemonState) -> Result<(), &'static str> {
     let daemon_cfg = &state.baseline().daemon;
     let maintenance_disabled = daemon_cfg.maintenance_interval_secs == 0;
     gate(
@@ -34,14 +60,21 @@ pub(super) async fn acquire(
         Duration::from_secs(daemon_cfg.hard_block_wait_secs),
         Duration::from_secs(daemon_cfg.debt_cache_ttl_secs.max(1)),
     )
-    .await?;
-    let corpus_guard = state.lock_corpus(corpus).await;
-    let permit = state
+    .await
+}
+
+/// The write-lane permit alone, for a caller that already cleared
+/// [`await_debt_gate`] and holds `lock_corpus` for the corpus it is about to
+/// mutate (the catch-up scan/plan/apply split -- see
+/// `DaemonState::acquire_write_lane`).
+pub(super) async fn acquire_lane(
+    state: &DaemonState,
+) -> Result<OwnedSemaphorePermit, &'static str> {
+    state
         .write_lane()
         .acquire_owned()
         .await
-        .map_err(|_| "write lane closed")?;
-    Ok(MutationGuard::new(permit, corpus_guard))
+        .map_err(|_| "write lane closed")
 }
 
 /// Wraps [`observed_level`] so `gate` never enters its bounded Hard block
