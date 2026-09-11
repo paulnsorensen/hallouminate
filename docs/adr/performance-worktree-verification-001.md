@@ -26,7 +26,7 @@ Then run the full `just verify` gate.
 ## Wiki destination
 
 This note extends `worktree-dev-gotchas.md`.
-The wiki mutation gate returns a Hard-debt timeout during this repair.
+The original repair deferred wiki writeback after a Hard-debt timeout.
 This tracked note preserves the measured recovery instead of treating a shared-target result as valid evidence.
 
 [^1]: scripts/verify.py::run_leased; AGENTS.md::Local verification

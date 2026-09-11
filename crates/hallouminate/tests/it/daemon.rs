@@ -2079,7 +2079,7 @@ async fn status_reports_running_then_not_running_across_shutdown() {
         hallouminate_daemon::DaemonStatus::Running(report) => {
             assert_eq!(
                 report.per_task.len(),
-                6,
+                5,
                 "W1 wiring lists every task name in per_task, got {:?}",
                 report.per_task,
             );
@@ -2603,7 +2603,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
         };
 
     // Register the runtime-discovered corpus and wait for its initial catch-up.
-    // The watcher event assertions below must not pass through provisioner catch-up.
+    // The watcher event assertions below must not pass through a second catch-up path.
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut ready = false;
     while std::time::Instant::now() < deadline {

@@ -346,7 +346,6 @@ fn render_status_report(report: &hallouminate_daemon::StatusReport) -> String {
             TaskName::WatcherPump => "watcher_pump",
             TaskName::IdleExit => "idle_exit",
             TaskName::Signal => "signal",
-            TaskName::Provision => "provision",
         }
     }
 

@@ -9,6 +9,14 @@ for each release window.
 
 ## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.10.0...HEAD)
 
+### Fixed
+
+- Daemon: keep runtime discovery and periodic reconciliation active when the native watcher cannot start.
+
+### Changed
+
+- Daemon: remove the separate Provisioner loop and its status entry; the watcher registry owns runtime catch-up.
+
 ## [0.10.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.10.0) - 2026-09-01
 
 ### Added

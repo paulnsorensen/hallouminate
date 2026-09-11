@@ -5,11 +5,11 @@
 //! by `hard_block_wait_secs`, then fails with [`RETRYABLE_HARD_DEBT`]. The
 //! gate always runs BEFORE any corpus lock: [`acquire`] calls
 //! [`await_debt_gate`] before `lock_corpus`, and the catch-up scan/plan/
-//! apply split's three call sites (`dispatch::catch_up_index`,
-//! `watch::spawn_registration_catch_up`, `provisioner::provision_corpus`)
-//! call [`await_debt_gate`] themselves before their own `lock_corpus`, so a
-//! Hard-debt block never holds a corpus lock that would head-of-line-block
-//! an unrelated mutation on the same corpus. [`acquire_lane`] only takes the
+//! apply split's two call sites (`dispatch::catch_up_index`,
+//! `watch::spawn_registration_catch_up`) call [`await_debt_gate`] themselves
+//! before their own `lock_corpus`, so a Hard-debt block never holds a corpus
+//! lock that would head-of-line-block an unrelated mutation on the same corpus.
+//! [`acquire_lane`] only takes the
 //! write-lane permit -- callers reaching it already cleared the gate and
 //! hold the corpus lock the catch-up split documents.
 
@@ -45,12 +45,11 @@ pub(super) async fn acquire(
 }
 
 /// The debt-graduated gate alone, with no lock or permit acquired. Callers
-/// that will hold a corpus lock across a scan/plan/apply span (the catch-up
-/// split: `dispatch::catch_up_index`, `watch::spawn_registration_catch_up`,
-/// `provisioner::provision_corpus`) must call this *before* `lock_corpus`,
-/// not after -- a Hard-debt block must never run while a corpus lock is
-/// held, or an unrelated mutation on the same corpus head-of-line-blocks
-/// behind it for up to `hard_block_wait_secs`.
+/// that will hold a corpus lock across a scan/plan/apply span -- the
+/// `dispatch::catch_up_index` and `watch::spawn_registration_catch_up` call
+/// sites -- must call this *before* `lock_corpus`, not after. A Hard-debt block
+/// must never run while a corpus lock is held, or an unrelated mutation on the
+/// same corpus head-of-line-blocks behind it for up to `hard_block_wait_secs`.
 pub(super) async fn await_debt_gate(state: &DaemonState) -> Result<(), &'static str> {
     let daemon_cfg = &state.baseline().daemon;
     let maintenance_disabled = daemon_cfg.maintenance_interval_secs == 0;

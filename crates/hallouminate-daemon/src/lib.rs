@@ -32,9 +32,6 @@ mod ladder;
 mod lifecycle;
 mod maintenance;
 mod pressure;
-#[cfg(test)]
-#[allow(dead_code)]
-mod provisioner;
 mod report;
 mod server;
 mod socket;

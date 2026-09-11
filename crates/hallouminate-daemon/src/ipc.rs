@@ -355,7 +355,7 @@ pub struct StatusReport {
     pub trips: TripState,
 }
 
-/// One of the six long-lived daemon loops a watchdog can monitor. Mirrors
+/// One of the five long-lived daemon loops a watchdog can monitor. Mirrors
 /// `heartbeat::TaskName`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -365,7 +365,6 @@ pub enum TaskName {
     WatcherPump,
     IdleExit,
     Signal,
-    Provision,
 }
 
 /// A task's heartbeat health. Mirrors `heartbeat::TaskStatus`.

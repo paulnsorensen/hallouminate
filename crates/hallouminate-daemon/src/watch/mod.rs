@@ -9,11 +9,12 @@
 //! Live registration: `spawn_corpus_watcher` seeds the boot baseline's
 //! `[[corpus]]`/`[[repository]]` roots into `state.watch_registry()`, then
 //! the pump task reconciles against that registry every loop iteration —
-//! new registrations get `debouncer.watch()`'d and catch-up'd without a
-//! watcher restart. `register_runtime_corpora` (called from
-//! `dispatch::handle_ground`) registers request-resolved repo-layer corpora,
-//! and `reload_repo_layer` (driven by the reconcile tick) re-resolves and
-//! replaces a repo-layer source's registrations as its config changes.
+//! new registrations get `debouncer.watch()`'d when available, or are marked
+//! degraded, and get catch-up'd without a watcher restart.
+//! `register_runtime_corpora` (called from `dispatch::handle_ground`) registers
+//! request-resolved repo-layer corpora, and `reload_repo_layer` (driven by the
+//! reconcile tick) re-resolves and replaces a repo-layer source's registrations
+//! as its config changes.
 //!
 //! Concurrency (spec Risk): every reindex takes the same per-corpus lock +
 //! global write-lane (`acquire_mutation_guard`) that `handle_index` /
@@ -354,22 +355,22 @@ async fn cleanup_retired_registration(
     }
 }
 
-/// Bundles the watcher pump's live-reconcile state: the installed
+/// Bundles the watcher pump's live-reconcile state: the optional
 /// debouncer, the set of paths currently `debouncer.watch()`'d, and the
 /// flattened current root list used by `process_change_batch`.
 struct PumpState {
-    debouncer: notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
+    debouncer: Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>>,
     installed: HashMap<PathBuf, RecursiveMode>,
     roots: Vec<WatchRoot>,
 }
 
 impl PumpState {
     /// Reconcile the live debouncer against the registry's current
-    /// registrations: newly-registered roots get `debouncer.watch()`'d (or
-    /// `mark_degraded` on failure), any registration whose catch-up hasn't
-    /// started gets one spawned, and `self.roots` is refreshed to the
-    /// flattened current root list for the caller's subsequent
-    /// `process_change_batch` call.
+    /// registrations: newly-registered roots get `debouncer.watch()`'d when
+    /// available (or `mark_degraded` when unavailable), any registration
+    /// whose catch-up hasn't started gets one spawned, and `self.roots` is
+    /// refreshed to the flattened current root list for the caller's
+    /// subsequent `process_change_batch` call.
     fn reconcile(&mut self, state: &DaemonState, tracker: &TaskTracker) {
         let registry = state.watch_registry();
         registry.refresh_roots(watch_roots_for);
@@ -392,7 +393,9 @@ impl PumpState {
             .map(|(path, _)| path.clone())
             .collect();
         for path in obsolete {
-            if let Err(error) = self.debouncer.unwatch(&path) {
+            if let Some(debouncer) = self.debouncer.as_mut()
+                && let Err(error) = debouncer.unwatch(&path)
+            {
                 tracing::debug!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: obsolete watch removal failed");
             }
             self.installed.remove(&path);
@@ -413,7 +416,13 @@ impl PumpState {
                     Some(registry::Observation::Degraded { .. })
                 )
             });
-            match self.debouncer.watch(&path, mode) {
+            let Some(debouncer) = self.debouncer.as_mut() else {
+                for id in ids {
+                    registry.mark_degraded(id, "notify debouncer unavailable".to_owned());
+                }
+                continue;
+            };
+            match debouncer.watch(&path, mode) {
                 Ok(()) => {
                     self.installed.insert(path.clone(), mode);
                     for id in ids {
@@ -574,8 +583,8 @@ pub(crate) fn register_runtime_corpora(
 
 /// Builds the notify debouncer that reindexes changed markdown files: each
 /// debounced batch is folded into `pending` and `wake` is notified so the
-/// pump loop picks it up on its next iteration. Returns `None` only when
-/// the watcher backend itself fails to initialize.
+/// pump loop picks it up on its next iteration. Returns `None` when the
+/// watcher backend fails to initialize; reconciliation continues without it.
 fn build_debouncer(
     cfg: &hallouminate_config::Config,
     state: &DaemonState,
@@ -631,7 +640,7 @@ fn build_debouncer(
             tracing::warn!(
                 target: "hallouminate::daemon",
                 error = %e,
-                "watcher: failed to create debouncer; auto-reindex disabled",
+                "watcher: failed to create debouncer; reconciliation continues in degraded mode",
             );
             None
         }
@@ -752,12 +761,10 @@ async fn run_pump(
 }
 
 /// Watch every corpus root the `WatchRegistry` knows about and spawn a task
-/// that reindexes changed markdown files (debounced by `cfg.watch.debounce_ms`)
-/// and reconciles newly-registered roots. Seeds the boot baseline's corpora
-/// into `state.watch_registry()` before installing any watches. Returns
-/// `None` only when the watcher backend itself fails to initialize — an
-/// empty baseline root set is not a failure, since runtime registrations may
-/// arrive later.
+/// that reindexes changed markdown files when a debouncer is available.
+/// Reconciliation still catches up newly-registered roots when the watcher
+/// backend cannot initialize. Seeds the boot baseline's corpora into
+/// `state.watch_registry()`.
 pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     let cfg = state.baseline();
     let failure_reminder = Duration::from_secs(cfg.watch.failure_reminder_secs);
@@ -787,7 +794,7 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
     let pending: std::sync::Arc<std::sync::Mutex<PendingPaths>> =
         std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
     let wake = std::sync::Arc::new(tokio::sync::Notify::new());
-    let debouncer = build_debouncer(cfg, state, wake.clone(), pending.clone())?;
+    let debouncer = build_debouncer(cfg, state, wake.clone(), pending.clone());
     let tracker = TaskTracker::new();
 
     // Reconciled once here (installing the baseline watches just seeded
@@ -1839,6 +1846,150 @@ mod tests {
         );
     }
 
+    /// A missing notify debouncer must leave reconciliation available. The
+    /// first pass indexes the registration, an immediate second pass does not
+    /// admit a duplicate while that pass is active, and a later reconciliation
+    /// indexes a changed file as the degraded correctness backstop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_without_debouncer_indexes_without_hot_retry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let root = root.canonicalize().expect("canonicalize wiki");
+        let file = root.join("note.md");
+        std::fs::write(&file, "# First\n\nbody\n").expect("write initial note");
+        let live_corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        let key = live_corpus.primary_corpus_key().expect("corpus key");
+        register_runtime_corpora(&state, None, &[live_corpus], &cfg)
+            .expect("register runtime corpus");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("runtime registration root");
+
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: None,
+            installed: HashMap::new(),
+            roots: Vec::new(),
+        };
+        let first_permit = state
+            .write_lane()
+            .try_acquire_owned()
+            .expect("acquire sole write-lane permit");
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::InFlight),
+            "the unavailable debouncer must still admit one catch-up pass",
+        );
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::InFlight),
+            "an immediate reconcile must not admit a hot duplicate pass",
+        );
+        drop(first_permit);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.watch_registry().catch_up_state(&id) != Some(registry::CatchUpState::Done) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial degraded catch-up must complete");
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::Done),
+            "an immediate reconcile after completion must not queue a retry",
+        );
+        let file_ref = file.to_str().unwrap();
+        let first_hash = state
+            .store()
+            .get_file_snapshot(&key, file_ref)
+            .await
+            .expect("initial snapshot query")
+            .expect("degraded reconciliation must index the initial file")
+            .content_hash;
+
+        std::fs::write(&file, "# Second\n\nchanged\n").expect("write changed note");
+        set_mtime(&file, std::time::SystemTime::now() + Duration::from_secs(1));
+        let second_permit = state
+            .write_lane()
+            .try_acquire_owned()
+            .expect("reacquire sole write-lane permit");
+        state.watch_registry().mark_reconcile_due_all();
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::InFlight),
+            "a later reconciliation must admit changed work",
+        );
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::InFlight),
+            "a later immediate reconcile must not admit a duplicate pass",
+        );
+        drop(second_permit);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.watch_registry().catch_up_state(&id) != Some(registry::CatchUpState::Done) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("later degraded catch-up must complete");
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::Done),
+            "an immediate reconcile after completion must not queue a retry",
+        );
+        let second_snapshot = state
+            .store()
+            .get_file_snapshot(&key, file_ref)
+            .await
+            .expect("changed snapshot query")
+            .expect("later reconciliation must retain the changed file");
+        assert_ne!(
+            second_snapshot.content_hash, first_hash,
+            "later reconciliation must index changed content without notify",
+        );
+        assert!(
+            matches!(
+                state.watch_registry().observation(&id),
+                Some(registry::Observation::Degraded { .. })
+            ),
+            "the registration must retain its degraded observation",
+        );
+
+        let shared = corpus("shared", root.to_str().unwrap(), &["**/*.md"]);
+        let shared_id = RegistrationId {
+            source: registry::ConfigSource::Baseline,
+            corpus_key: shared.primary_corpus_key().expect("shared corpus key"),
+        };
+        register_runtime_corpora(&state, None, &[shared], &cfg)
+            .expect("register later corpus at the same root");
+        pump.reconcile(&state, &tracker);
+        let Some(registry::Observation::Degraded { .. }) =
+            state.watch_registry().observation(&shared_id)
+        else {
+            panic!("a later shared-root registration must report the unavailable watcher");
+        };
+        tracker.close();
+        tracker.wait().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handle_changed_path_records_watcher_reindex_counters() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2823,7 +2974,7 @@ body
             .expect("build production watcher");
         let tracker = TaskTracker::new();
         let pump = PumpState {
-            debouncer,
+            debouncer: Some(debouncer),
             installed: HashMap::new(),
             roots: Vec::new(),
         };
@@ -2949,7 +3100,7 @@ body
         let task = tokio::spawn(run_pump(
             state.clone(),
             PumpState {
-                debouncer,
+                debouncer: Some(debouncer),
                 installed: HashMap::new(),
                 roots: Vec::new(),
             },
@@ -3013,7 +3164,7 @@ body
         let task = tokio::spawn(run_pump(
             state.clone(),
             PumpState {
-                debouncer,
+                debouncer: Some(debouncer),
                 installed: HashMap::new(),
                 roots: Vec::new(),
             },
@@ -3093,7 +3244,7 @@ body
         let task = tokio::spawn(run_pump(
             state.clone(),
             PumpState {
-                debouncer,
+                debouncer: Some(debouncer),
                 installed: HashMap::new(),
                 roots: Vec::new(),
             },
@@ -3173,6 +3324,65 @@ body
             live_task.is_finished(),
             "live watcher shutdown must await its pump task"
         );
+    }
+
+    /// `WatcherHandle::abort` must stop the old pump before a replacement is
+    /// started; otherwise both pumps would continue scheduling reconciliations.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_abort_stops_pump_before_replacement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.reconcile_interval_secs = Some(1);
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
+
+        let first = spawn_corpus_watcher(&state).expect("initial watcher");
+        let first_task = first._task.abort_handle();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let previous = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::WatcherPump);
+        assert!(
+            previous > 0,
+            "initial watcher must complete a reconcile tick before replacement",
+        );
+
+        first.abort().await;
+        assert!(
+            first_task.is_finished(),
+            "aborting the initial watcher must await its pump task",
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::WatcherPump),
+            previous,
+            "an aborted watcher must not complete further pump cycles",
+        );
+        let replacement = spawn_corpus_watcher(&state).expect("replacement watcher");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::WatcherPump)
+                > previous,
+            "the replacement watcher must complete pump cycles",
+        );
+
+        state.shutdown_token().cancel();
+        replacement.join().await;
     }
 
     /// Regression test for finding 1: a catch-up pass parked on the write

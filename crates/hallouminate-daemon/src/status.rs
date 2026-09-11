@@ -23,7 +23,6 @@ pub(super) fn report(state: &DaemonState) -> ipc::StatusReport {
         heartbeat::TaskName::WatcherPump,
         heartbeat::TaskName::IdleExit,
         heartbeat::TaskName::Signal,
-        heartbeat::TaskName::Provision,
     ] {
         per_task.push(ipc::TaskStatus {
             task: wire_task(task),
@@ -73,7 +72,6 @@ fn wire_task(task: heartbeat::TaskName) -> ipc::TaskName {
         heartbeat::TaskName::WatcherPump => ipc::TaskName::WatcherPump,
         heartbeat::TaskName::IdleExit => ipc::TaskName::IdleExit,
         heartbeat::TaskName::Signal => ipc::TaskName::Signal,
-        heartbeat::TaskName::Provision => ipc::TaskName::Provision,
     }
 }
 
@@ -103,7 +101,7 @@ mod tests {
         // zero/none shape, not an invented value.
         let state = test_state().await;
         let report = report(&state);
-        assert_eq!(report.per_task.len(), 6);
+        assert_eq!(report.per_task.len(), 5);
         assert!(
             report
                 .per_task
