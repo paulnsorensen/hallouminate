@@ -138,13 +138,9 @@ _Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-7
 
 <certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). The code is **implemented in PR #430**. PR #430 is open. A person did not merge it yet. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
 
-**Provisioner** — A supervised task in the daemon. The task has a seen-set and a queue. The task continues while the daemon operates. When the daemon finds a new corpus root, the task starts a catch-up pass immediately. The task does the pass away from the request path.
-_Avoid_: index scheduler, background indexer
-_Code_: `Provisioner`, `crates/hallouminate-daemon/src/provisioner.rs:26-31`; `provisioning_loop`, same file line 89; `DaemonState.provisioner`, `crates/hallouminate-daemon/src/state.rs:250`; `handle_ground` calls `observe` at `dispatch.rs:391`
-
-**Seen-set** — A `HashSet<CorpusKey>` in the Provisioner. The set continues while the daemon operates. The set prevents a second provisioning trigger for the same corpus. If a pass fails, the Provisioner removes the key. Then a subsequent `ground` request starts a new pass.
-_Avoid_: cache, registry
-_Code_: `Provisioner.seen`, `crates/hallouminate-daemon/src/provisioner.rs:28`
+**WatchRegistry** — A registry in the daemon. The registry owns runtime corpus discovery and reconciliation. The registry continues while the daemon operates. `handle_ground` registers each resolved corpus through `register_runtime_corpora`. A catch-up pass for a new registration runs in `spawn_registration_catch_up`. The pump stays active in degraded mode when the native debouncer cannot start (`mark_degraded`).
+_Avoid_: Provisioner, index scheduler, background indexer
+_Code_: `WatchRegistry`, `crates/hallouminate-daemon/src/watch/registry.rs`; `register_runtime_corpora`, `spawn_registration_catch_up`, `crates/hallouminate-daemon/src/watch/mod.rs`
 
 **Donor** — A group of stored rows with the same file-level `content_hash` as an upserted file. The group can be in any root or corpus in the store. If the donor has the same number of chunks as the new file, the store copies the donor vectors in `ord` sequence. If the counts are different, the store makes new embeddings.
 _Avoid_: cache entry

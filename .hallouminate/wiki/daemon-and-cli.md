@@ -91,7 +91,7 @@ negotiation handshake.
 | `hallouminate index [--corpus NAME]` | bulk index one or all corpora |
 | `hallouminate ground "<query>" [...]` | semantic search; `--format outline\|json\|json-pretty`, `--full`, `--top-files N`, `--chunks-per-file N`, `--limit N`, `--snippet-chars N` |
 | `hallouminate serve` | stdio MCP server (auto-spawns daemon if down) |
-| `hallouminate daemon [--config PATH]` | run the daemon in the foreground; `daemon status` renders per-task `restarts=N` — see [supervisor-restart-ladder](supervisor-restart-ladder.md) |
+| `hallouminate daemon [--config PATH]` | run the daemon in the foreground; `daemon status` renders per-task `restarts=N` — see [supervisor-restart-ladder](supervisor-restart-ladder.md) — and one `watcher: N registration(s) degraded` line when `StatusReport.degraded_watch_roots > 0`, which means the native watcher never started and those roots reindex on the periodic reconcile tick only |
 | `hallouminate config init\|show\|validate\|download` | config inspection / scaffolding |
 | `hallouminate hook install\|uninstall [--repo PATH]` | per-repo discovery hook install |
 
@@ -126,7 +126,7 @@ _Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` 
 Catch-up split (2026-09-09): `dispatch::catch_up_corpus` holds only the per-corpus lock while it scans the filesystem, lists stored files, and plans.
 It acquires the global write lane through a caller-supplied closure (`DaemonState::acquire_write_lane` → `backpressure::acquire_lane`) only when the plan is non-empty, immediately before `apply`.
 A no-work scan never touches the lane, so a slow scan of one corpus no longer blocks writes to other corpora.
-The per-corpus lock held across scan and apply keeps the plan valid; every corpus writer (`handle_index`, `handle_add_markdown`, `provision_corpus`, boot `catch_up_index`, `spawn_registration_catch_up`) still takes the corpus lock first.
+The per-corpus lock held across scan and apply keeps the plan valid; every corpus writer (`handle_index`, `handle_add_markdown`, `dispatch::catch_up_corpus` invoked from `watch::spawn_registration_catch_up`, boot `catch_up_index`) still takes the corpus guard first and the global write lane only when the plan mutates ([performance-catch-up-write-lane-001](../../docs/adr/performance-catch-up-write-lane-001.md)).
 `handle_index` is not split: it calls the domain `index_corpus` directly and does not have the scan/plan/apply shape.
 Tests: `catch_up_slow_scan_does_not_hold_write_lane`, `catch_up_scan_in_flight_blocks_same_corpus_guard`, `catch_up_apply_holds_lane_until_released`, `catch_up_no_work_never_acquires_the_lane` in `state.rs`.
 

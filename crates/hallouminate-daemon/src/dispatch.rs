@@ -429,8 +429,7 @@ fn register_for_request(
 
 /// Runs the per-corpus coverage check concurrently and renders
 /// "index-coverage" warnings for any corpus whose index trails its on-disk
-/// listing (#427 part 2). Must be called before `Provisioner::observe` so the
-/// snapshot reflects the index state at request time, not after provisioning.
+/// listing (#427 part 2). The snapshot reflects the index state at request time.
 type CoverageSlot = Option<(CorpusConfig, anyhow::Result<(u64, u64)>)>;
 
 async fn collect_coverage_warnings(
@@ -543,7 +542,6 @@ async fn handle_ground(
         None => corpora.clone(),
     };
     let coverage_warnings = collect_coverage_warnings(state, store, &coverage_targets).await;
-    state.provisioner().observe(&corpora, cfg);
     let opts = ground_opts(cfg, &req);
 
     // Union ground (#106, #425): every corpus-less request fans the query
@@ -3845,5 +3843,111 @@ mod tests {
             baseline.total_chunks,
             "chunk rows must be untouched by a noop reindex"
         );
+    }
+
+    /// Ground discovery must schedule one initial catch-up through the live
+    /// watcher pump, and a later registry change must schedule another pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ground_discovery_runs_initial_and_later_pump_catch_up_passes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        std::fs::write(corpus_dir.join("initial.md"), "# Initial\n\ncontent\n")
+            .expect("write initial");
+        let repo_config = format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            corpus_dir.display()
+        );
+        write_repo_layer(tmp.path(), &repo_config);
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state =
+            state_with_ground(&tmp.path().join("ground"), "[embeddings]\nenabled = false").await;
+        let watcher = crate::watch::spawn_corpus_watcher(&state).expect("watcher starts");
+
+        let response = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Ground(
+                    serde_json::from_value(serde_json::json!({
+                        "query": "content",
+                        "corpus": "docs",
+                    }))
+                    .expect("ground request"),
+                ),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = response else {
+            panic!("ground must succeed: {response:?}");
+        };
+
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![corpus_dir.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "initial runtime catch-up must complete",
+            || async {
+                !state
+                    .store()
+                    .list_files(&corpus_key)
+                    .await
+                    .expect("list initial files")
+                    .is_empty()
+            },
+        )
+        .await;
+        assert_eq!(
+            state
+                .store()
+                .list_files(&corpus_key)
+                .await
+                .expect("list initial files")
+                .len(),
+            1,
+            "Ground discovery must index one initial file"
+        );
+
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("runtime registration root");
+        let later = corpus_dir.join("later.md");
+        std::fs::write(&later, "# Later\n\ncontent\n").expect("write later");
+        state.watch_registry().record_pending(&id, [later]);
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "later registry change must complete a second catch-up",
+            || async {
+                state
+                    .store()
+                    .list_files(&corpus_key)
+                    .await
+                    .expect("list later files")
+                    .len()
+                    >= 2
+            },
+        )
+        .await;
+        assert_eq!(
+            state
+                .store()
+                .list_files(&corpus_key)
+                .await
+                .expect("list later files")
+                .len(),
+            2,
+            "a later registry change must index the new file"
+        );
+        state.shutdown_token().cancel();
+        watcher.join().await;
     }
 }

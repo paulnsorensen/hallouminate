@@ -120,7 +120,7 @@ async fn serve_with_config(
     remove_stale_socket(socket_path).await;
     // One-shot probe to learn whether the watcher backend is enabled. Stop and
     // await the probe before the supervised factory creates the live instance.
-    let watcher_enabled = match super::watch::spawn_corpus_watcher(&state) {
+    let watcher_enabled = match super::watch::spawn_corpus_watcher_probe(&state) {
         Some(handle) => {
             if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.abort())
                 .await
