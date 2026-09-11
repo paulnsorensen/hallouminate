@@ -32,6 +32,7 @@ toml = "1.1"
 # graph, so this direct dep adds zero new compilation and keeps a single YAML
 # crate in the tree.
 serde_yaml_ng = "0.10"
+cap-tempfile = "4"
 
 hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.10.0" }
 hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.10.0" }
