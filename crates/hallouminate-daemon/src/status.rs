@@ -46,6 +46,7 @@ pub(super) fn report(state: &DaemonState) -> ipc::StatusReport {
                 at_secs: trip.at_secs,
             },
         },
+        degraded_watch_roots: state.watch_registry().degraded_count(),
     }
 }
 
@@ -126,6 +127,7 @@ mod tests {
             ipc::TripState::None => {}
             other => panic!("fresh state has no recorded ladder trip, got: {other:?}"),
         }
+        assert_eq!(report.degraded_watch_roots, 0);
     }
 
     #[tokio::test]

@@ -116,7 +116,13 @@ fn binding_conflict(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Observation {
     Watched,
-    Degraded { error: String },
+    /// `retrying` distinguishes a per-root install failure (the pump keeps
+    /// retrying on every reconcile) from native backend unavailability (no
+    /// retry ever happens; only a daemon restart recovers).
+    Degraded {
+        error: String,
+        retrying: bool,
+    },
 }
 
 /// Upper bound on the number of distinct paths a registration's
@@ -375,7 +381,20 @@ impl WatchRegistry {
             guard.queue.retain(|queued| queued != &obsolete_id);
             release_admission(&mut guard, &obsolete_id);
         }
-        guard.regs.remove(&id);
+        // Backend unavailability is a pump-lifetime condition, not a property
+        // of the replaced registration. A changed re-registration keeps that
+        // observation so the pump's per-id cache and the registry stay in
+        // agreement; every other observation resets and the pump re-derives it.
+        let observation = match guard.regs.remove(&id).map(|reg| reg.observation) {
+            Some(Observation::Degraded {
+                retrying: false,
+                error,
+            }) => Observation::Degraded {
+                retrying: false,
+                error,
+            },
+            _ => Observation::Watched,
+        };
         release_admission(&mut guard, &id);
         guard.queue.retain(|queued| queued != &id);
         guard.regs.insert(
@@ -384,7 +403,7 @@ impl WatchRegistry {
                 corpus,
                 cfg,
                 roots,
-                observation: Observation::Watched,
+                observation,
                 pending: PendingWork::Idle,
                 catch_up: CatchUpState::Queued,
                 last_error: None,
@@ -654,7 +673,22 @@ impl WatchRegistry {
 
     pub(crate) fn mark_degraded(&self, id: &RegistrationId, error: String) {
         if let Some(reg) = self.lock().regs.get_mut(id) {
-            reg.observation = Observation::Degraded { error };
+            reg.observation = Observation::Degraded {
+                error,
+                retrying: true,
+            };
+        }
+    }
+
+    /// Marks `id` degraded because the native watcher backend never
+    /// initialized. Unlike [`WatchRegistry::mark_degraded`], this state
+    /// never clears itself on a retry: recovery needs a daemon restart.
+    pub(crate) fn mark_backend_unavailable(&self, id: &RegistrationId) {
+        if let Some(reg) = self.lock().regs.get_mut(id) {
+            reg.observation = Observation::Degraded {
+                error: "notify debouncer unavailable".to_owned(),
+                retrying: false,
+            };
         }
     }
 
@@ -676,6 +710,18 @@ impl WatchRegistry {
             .regs
             .get(id)
             .is_some_and(|reg| reg.last_error.is_some())
+    }
+
+    /// Count of registrations currently observed as [`Observation::Degraded`]
+    /// — i.e. `notify` never established (or lost) native watching for their
+    /// roots, so they run on periodic reconciliation only. Surfaced on
+    /// `daemon status` so degraded watching isn't invisible.
+    pub(crate) fn degraded_count(&self) -> usize {
+        self.lock()
+            .regs
+            .values()
+            .filter(|reg| matches!(reg.observation, Observation::Degraded { .. }))
+            .count()
     }
 
     #[cfg(test)]
@@ -719,10 +765,16 @@ impl WatchRegistry {
                 if let Some(error) = &reg.last_error {
                     clauses.push(format!("failed reconciliation: {error}"));
                 }
-                if let Observation::Degraded { error } = &reg.observation {
-                    clauses.push(format!(
-                        "watcher backend error: {error}; retry will continue"
-                    ));
+                if let Observation::Degraded { error, retrying } = &reg.observation {
+                    if *retrying {
+                        clauses.push(format!(
+                            "watcher backend error: {error}; retry will continue"
+                        ));
+                    } else {
+                        clauses.push(
+                            "native watcher unavailable; periodic reconciliation only".to_string(),
+                        );
+                    }
                 }
                 if !reg.pending.is_idle() {
                     clauses.push("reconciliation pending".to_string());
@@ -1469,7 +1521,8 @@ mod tests {
         assert_eq!(
             registry.observation(&id),
             Some(Observation::Degraded {
-                error: "watch failed".into()
+                error: "watch failed".into(),
+                retrying: true,
             })
         );
         assert!(
@@ -1480,6 +1533,75 @@ mod tests {
             registry.pending(&id),
             Some(PendingWork::Paths(HashSet::from([path]))),
             "marking a registration degraded must not disturb its pending work"
+        );
+    }
+
+    #[test]
+    fn recovery_warning_for_install_failure_says_retry_will_continue() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
+        let id = baseline_id("wiki");
+        let queried = [corpus("wiki")];
+
+        registry.mark_degraded(&id, "watch failed".into());
+
+        assert_eq!(
+            registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
+            vec![(
+                "wiki".into(),
+                "root <no root>; recovery state queued; watcher backend error: watch failed; retry will continue".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn recovery_warning_for_backend_unavailable_says_periodic_reconciliation_only() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
+        let id = baseline_id("wiki");
+        let queried = [corpus("wiki")];
+
+        registry.mark_backend_unavailable(&id);
+
+        assert_eq!(
+            registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
+            vec![(
+                "wiki".into(),
+                "root <no root>; recovery state queued; native watcher unavailable; periodic reconciliation only".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn changed_re_registration_keeps_backend_unavailable_but_resets_install_failure() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let id = baseline_id("wiki");
+        let changed = CorpusConfig {
+            globs: vec!["*.md".into()],
+            ..corpus("wiki")
+        };
+
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg.clone(), vec![]);
+        registry.mark_backend_unavailable(&id);
+        registry.register(ConfigSource::Baseline, changed.clone(), cfg.clone(), vec![]);
+        assert_eq!(
+            registry.observation(&id),
+            Some(Observation::Degraded {
+                error: "notify debouncer unavailable".into(),
+                retrying: false,
+            }),
+            "backend unavailability outlives a changed re-registration"
+        );
+
+        registry.mark_degraded(&id, "watch failed".into());
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
+        assert_eq!(
+            registry.observation(&id),
+            Some(Observation::Watched),
+            "a per-root install failure resets; the pump re-attempts the install"
         );
     }
 
@@ -2065,5 +2187,25 @@ mod tests {
             gen3,
             "pending/observation reads must not move the generation"
         );
+    }
+
+    #[test]
+    fn degraded_count_reflects_registrations_marked_degraded() {
+        // WHY: `daemon status` derives degraded_watch_roots from this count
+        // — it must move from 0 to 1 the moment a registration is marked
+        // degraded, and back down once recovered, or status silently hides
+        // periodic-reconciliation-only mode.
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg.clone(), vec![]);
+        registry.register(ConfigSource::Baseline, corpus("other"), cfg, vec![]);
+        assert_eq!(registry.degraded_count(), 0);
+
+        let id = baseline_id("wiki");
+        registry.mark_degraded(&id, "watch failed".into());
+        assert_eq!(registry.degraded_count(), 1);
+
+        registry.mark_watched(&id);
+        assert_eq!(registry.degraded_count(), 0);
     }
 }

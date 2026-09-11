@@ -1,5 +1,5 @@
 //! Integration tests for Ground discovery and non-Ground read behavior in the
-//! worktree index provisioning spec (`.cheese/specs/worktree-index-provisioning.md`):
+//! worktree index provisioning spec (`.hallouminate/wiki/worktree-index-provisioning-adr.md` § ADR-004):
 //! Ground over an unseen root registers it with the live WatchRegistry; the
 //! watcher pump catches it up in the background. Non-ground reads do not
 //! register roots or enqueue catch-up work.
@@ -13,8 +13,13 @@
 //! this corpus's `CorpusKey` is absent from the boot-time registry and Ground's
 //! runtime registration routes it to the live pump.
 //!
-//! AC-2 (lock-before-write ordering) and AC-4..AC-6 (vector reuse) are
-//! covered by daemon catch-up and adapter tests.
+//! AC-2 (lock-before-write ordering) is covered by
+//! `state::tests::catch_up_scan_in_flight_blocks_same_corpus_guard` in the
+//! daemon crate; AC-4..AC-6 (vector reuse) are covered by daemon catch-up
+//! and adapter tests. AC-3 (a failed pass is retried once the root is
+//! readable again) is covered by
+//! `a_failed_catch_up_pass_indexes_once_the_root_is_readable_and_reconciled`
+//! below.
 
 use std::path::Path;
 use std::time::Duration;
@@ -133,6 +138,89 @@ async fn ground_over_an_unseen_root_catches_it_up_in_the_background() {
     assert_eq!(
         stats.indexed_files, 1,
         "the background catch-up pass must index the unseen root's file"
+    );
+
+    harness.shutdown().await.expect("daemon shutdown");
+}
+
+// ── AC-3: a failed pass is retried once the root is readable again ───────
+
+#[cfg(unix)]
+fn nix_getuid_is_zero() -> bool {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status")
+        && let Some(line) = s.lines().find(|l| l.starts_with("Uid:"))
+    {
+        return line.split_whitespace().nth(1) == Some("0");
+    }
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn a_failed_catch_up_pass_indexes_once_the_root_is_readable_and_reconciled() {
+    use std::os::unix::fs::PermissionsExt;
+    if nix_getuid_is_zero() {
+        return; // root reads through 0o000; the negative assertion is meaningless.
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground_dir = tmp.path().join("ground");
+    let repo_root = tmp.path().join("worktree");
+    std::fs::create_dir_all(&repo_root).expect("mkdir worktree");
+    let wiki_dir = seed_repo_layer_root(&repo_root, "proj");
+
+    let mut cfg = cfg_baseline(&ground_dir);
+    // A short reconcile interval so the timer-driven retry (the only path
+    // that re-admits a failed registration; a second `ground()` is a no-op
+    // because `register_runtime_corpora` short-circuits on
+    // `is_registered_unchanged`) fires within this test's timeout.
+    cfg.watch.reconcile_interval_secs = Some(1);
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    std::fs::set_permissions(&wiki_dir, std::fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    struct RestorePerms(std::path::PathBuf);
+    impl Drop for RestorePerms {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = RestorePerms(wiki_dir.clone());
+
+    let _first_ground: GroundResult = ground(&client, &repo_root).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // `CorpusStats` walks the root itself, so while the directory is 0o000 it
+    // either reports zero indexed files or fails on the same permission
+    // error that made the catch-up pass fail. Both prove nothing was indexed.
+    match client
+        .call::<CorpusStatsResult>(DaemonRequest {
+            cwd: repo_root.clone(),
+            payload: DaemonRequestPayload::CorpusStats { corpus: None },
+        })
+        .await
+    {
+        Ok(stats) => assert_eq!(
+            stats.indexed_files, 0,
+            "the failed pass must not have indexed anything before the retry"
+        ),
+        Err(err) => {
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains("Permission denied"),
+                "corpus_stats failed for a reason other than the unreadable root: {msg}"
+            );
+        }
+    }
+
+    std::fs::set_permissions(&wiki_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    let stats = poll_indexed_files_above_zero(&client, &repo_root).await;
+    assert_eq!(
+        stats.indexed_files, 1,
+        "the timer-driven retry must index the now-readable root's file"
     );
 
     harness.shutdown().await.expect("daemon shutdown");

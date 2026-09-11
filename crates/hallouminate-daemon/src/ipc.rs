@@ -353,6 +353,12 @@ pub struct StatusReport {
     pub defer_count: u32,
     pub watcher: WatcherCounters,
     pub trips: TripState,
+    /// Count of watch registrations observed as degraded (native watching
+    /// never established or was lost), so their corpora fall back to
+    /// periodic reconciliation only. `#[serde(default)]` so payloads from
+    /// an older daemon build (with no such field) still deserialize.
+    #[serde(default)]
+    pub degraded_watch_roots: usize,
 }
 
 /// One of the five long-lived daemon loops a watchdog can monitor. Mirrors

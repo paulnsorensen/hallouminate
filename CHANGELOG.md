@@ -11,11 +11,15 @@ for each release window.
 
 ### Fixed
 
-- Daemon: keep runtime discovery and periodic reconciliation active when the native watcher cannot start.
+- Daemon: keep runtime discovery and periodic reconciliation active when the native watcher cannot start
 
-### Changed
+### Added
 
-- Daemon: remove the separate Provisioner loop and its status entry; the watcher registry owns runtime catch-up.
+- Daemon: `daemon status` reports `degraded_watch_roots`, the count of watch registrations that run on periodic reconciliation only, on the wire and in the CLI render
+
+### Removed
+
+- **Breaking**: `TaskName::Provision` and the separate Provisioner loop; `daemon status` `per_task` drops from six rows to five; the watcher registry owns runtime catch-up
 
 ## [0.10.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.10.0) - 2026-09-01
 

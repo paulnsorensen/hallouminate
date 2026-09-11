@@ -3890,21 +3890,19 @@ mod tests {
             global: false,
         };
         let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let files = state
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "initial runtime catch-up must complete",
+            || async {
+                !state
                     .store()
                     .list_files(&corpus_key)
                     .await
-                    .expect("list initial files");
-                if !files.is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("initial runtime catch-up must complete");
+                    .expect("list initial files")
+                    .is_empty()
+            },
+        )
+        .await;
         assert_eq!(
             state
                 .store()
@@ -3925,21 +3923,20 @@ mod tests {
         let later = corpus_dir.join("later.md");
         std::fs::write(&later, "# Later\n\ncontent\n").expect("write later");
         state.watch_registry().record_pending(&id, [later]);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let files = state
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "later registry change must complete a second catch-up",
+            || async {
+                state
                     .store()
                     .list_files(&corpus_key)
                     .await
-                    .expect("list later files");
-                if files.len() >= 2 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("later registry change must complete a second catch-up");
+                    .expect("list later files")
+                    .len()
+                    >= 2
+            },
+        )
+        .await;
         assert_eq!(
             state
                 .store()
