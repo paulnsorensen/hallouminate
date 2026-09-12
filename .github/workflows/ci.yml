@@ -4,11 +4,34 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  setup:
+    name: setup
+    # Pick the build & test OS matrix: ubuntu on every event, macOS only on
+    # main pushes or a PR labeled `ci:macos`. Keeps PR wall-clock and macOS
+    # runner minutes down while preserving full macOS coverage on main and on
+    # demand.
+    runs-on: ubuntu-latest
+    outputs:
+      os: ${{ steps.pick.outputs.os }}
+    steps:
+      - id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ] || printf '%s' "$LABELS" | jq -e 'index("ci:macos")' >/dev/null; then
+            echo 'os=["ubuntu-latest","macos-latest"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'os=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   fmt:
     name: fmt
     runs-on: ubuntu-latest
@@ -46,10 +69,13 @@ jobs:
     name: build & test (${{ matrix.os }})
     # Unix only: the crate is unix-only (libc path handling won't compile on
     # Windows — tracked in #48).
+    needs: setup
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # OS set is computed by `setup`: ubuntu on every event, macOS only on
+        # main pushes or a `ci:macos`-labeled PR.
+        os: ${{ fromJSON(needs.setup.outputs.os) }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -103,6 +129,12 @@ jobs:
           fi
           echo "LIBRARY_PATH=$runtime_dir${LIBRARY_PATH:+:$LIBRARY_PATH}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install nextest
+        uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
+        with:
+          # Pin the exact nextest version for reproducible CI installs; bump
+          # deliberately (Dependabot tracks the action SHA, not this string).
+          tool: nextest@0.9.144
       - name: Cache Hugging Face tokenizer downloads
         # DaemonState::open hard-loads the HF tokenizer (chunking needs it
         # regardless of embedding mode), so non-ignored tests fetch it from
@@ -136,7 +168,13 @@ jobs:
         # #[ignore]-gated and is not run here.
         env:
           HF_HUB_OFFLINE: "1"
-        run: cargo test --workspace --locked
+        run: cargo nextest run --workspace --locked
+      - name: Doctests
+        # nextest does not run doctests; run them separately so the doc
+        # examples in hallouminate-domain stay covered.
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: cargo test --workspace --locked --doc
 
   # Aggregation gate: the branch ruleset requires a single status check named
   # "build & test", but the matrix expands to "build & test (ubuntu-latest)" etc.
