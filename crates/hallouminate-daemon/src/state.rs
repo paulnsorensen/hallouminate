@@ -42,7 +42,7 @@ use std::hash::Hash;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
@@ -986,11 +986,13 @@ impl DaemonState {
             return Ok(None);
         };
         let canonical = canonical_crossencoder_model(model_name)?;
+        // The map holds no invariant a poisoned lock could corrupt, and the
+        // slot below already recovers from native panics. Keep the map alive.
         let model = self
             .inner
             .crossencoders
             .lock()
-            .expect("crossencoder map lock")
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(canonical)
             .or_insert_with(|| {
                 let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
