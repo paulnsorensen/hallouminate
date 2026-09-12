@@ -2,4 +2,4 @@
 # Must stay in sync with `rust-version` in Cargo.toml. The floor is set by
 # lancedb 0.29 / lance 6.0.0, which require rustc 1.91.
 [toolchain]
-channel = "1.97"
+channel = "1.98"
