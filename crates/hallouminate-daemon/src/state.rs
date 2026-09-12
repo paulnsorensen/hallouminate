@@ -271,7 +271,7 @@ impl ResourceKey {
 }
 
 type CrossencoderInitializer =
-    Arc<dyn Fn() -> hallouminate_domain::common::Result<Box<dyn Crossencoder>> + Send + Sync>;
+    Box<dyn Fn() -> hallouminate_domain::common::Result<Box<dyn Crossencoder>> + Send + Sync>;
 
 struct CrossencoderSlot {
     model: Option<Box<dyn Crossencoder>>,
@@ -279,7 +279,7 @@ struct CrossencoderSlot {
 }
 
 fn crossencoder_initializer(model_name: String, cache_dir: PathBuf) -> CrossencoderInitializer {
-    Arc::new(move || {
+    Box::new(move || {
         FastembedCrossencoder::try_new(&model_name, &cache_dir)
             .map(|model| Box::new(model) as Box<dyn Crossencoder>)
             .map_err(|error| {
@@ -346,7 +346,8 @@ struct DaemonStateInner {
     coverage_probe: Arc<CoverageProbe>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
     /// Each model has an independent slot, constructed on its first rerank.
-    crossencoders: Mutex<HashMap<&'static str, Arc<StdMutex<CrossencoderSlot>>>>,
+    /// The map lock guards only a synchronous entry lookup, never an await.
+    crossencoders: StdMutex<HashMap<&'static str, Arc<StdMutex<CrossencoderSlot>>>>,
     /// Monotonic (`Instant`-based) seconds-since-process-start timestamp of
     /// completion (handle_connection) plus embedder/crossencoder acquire and
     /// guard drop. Idle-exit (server.rs) fires when this is quiet for
@@ -634,7 +635,7 @@ impl DaemonState {
         }
         // Keep model construction lazy. The rerank blocking-pool task owns
         // construction and the per-model slot for the configured deadline.
-        let crossencoders = Mutex::new(HashMap::new());
+        let crossencoders = StdMutex::new(HashMap::new());
         let shutdown = CancellationToken::new();
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
@@ -977,7 +978,7 @@ impl DaemonState {
     /// The model is constructed lazily on the blocking pool and cached by name.
     /// Resolving from per-request `cfg.search.crossencoder` lets repo-layer
     /// `[search].crossencoder` overrides take effect without daemon restart.
-    pub async fn crossencoder(
+    pub fn crossencoder(
         &self,
         model_name: Option<&str>,
     ) -> anyhow::Result<Option<CrossencoderGuard>> {
@@ -989,7 +990,7 @@ impl DaemonState {
             .inner
             .crossencoders
             .lock()
-            .await
+            .expect("crossencoder map lock")
             .entry(canonical)
             .or_insert_with(|| {
                 let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
@@ -1473,7 +1474,7 @@ mod tests {
     use async_trait::async_trait;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
     use hallouminate_domain::common::{CorpusConfig, CorpusKey};
-    use hallouminate_domain::ground::{GroundOpts, ground};
+    use hallouminate_domain::ground::{GroundOpts, GroundResponse, ground};
     use hallouminate_domain::indexer::SignalLists;
     use hallouminate_domain::search::{ChunkRetrieval, NoopCrossencoder};
     use std::sync::atomic::AtomicBool;
@@ -2398,7 +2399,7 @@ mod tests {
         let initializations = Arc::new(AtomicUsize::new(0));
         let initialize: CrossencoderInitializer = {
             let initializations = Arc::clone(&initializations);
-            Arc::new(move || {
+            Box::new(move || {
                 if initializations.fetch_add(1, Ordering::SeqCst) == 0 {
                     Ok(Box::new(PanicCrossencoder) as Box<dyn Crossencoder>)
                 } else {
@@ -2406,10 +2407,9 @@ mod tests {
                 }
             })
         };
-        install_test_crossencoder(&state, "bge-reranker-base", initialize).await;
+        install_test_crossencoder(&state, "bge-reranker-base", initialize);
         let mut first = state
             .crossencoder(Some("bge-reranker-base"))
-            .await
             .expect("first")
             .expect("configured");
         let panic_result =
@@ -2419,7 +2419,6 @@ mod tests {
 
         let mut second = state
             .crossencoder(Some("bge-reranker-base"))
-            .await
             .expect("second")
             .expect("configured");
         assert!(second.rerank("q", &mut []).is_ok());
@@ -2430,7 +2429,7 @@ mod tests {
         let last_use_secs = Arc::new(AtomicU64::new(u64::MAX));
         let before_drop = monotonic_secs();
         let initialize: CrossencoderInitializer =
-            Arc::new(|| Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>));
+            Box::new(|| Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>));
         let model = Arc::new(StdMutex::new(CrossencoderSlot {
             model: None,
             initialize,
@@ -3126,12 +3125,41 @@ mod tests {
             hits: &mut [SearchHit],
         ) -> hallouminate_domain::common::Result<()> {
             self.started.store(true, Ordering::SeqCst);
-            while !self.release.load(Ordering::SeqCst) {
-                std::thread::yield_now();
-            }
+            spin_until(&self.release);
             hits.reverse();
             Ok(())
         }
+    }
+
+    fn spin_until(flag: &AtomicBool) {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Initializer that counts each entry in `entered` and blocks until `release`.
+    fn blocking_initializer(
+        entered: &Arc<AtomicUsize>,
+        release: &Arc<AtomicBool>,
+    ) -> CrossencoderInitializer {
+        let entered = Arc::clone(entered);
+        let release = Arc::clone(release);
+        Box::new(move || {
+            entered.fetch_add(1, Ordering::SeqCst);
+            spin_until(&release);
+            Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
+        })
+    }
+
+    /// Yield the runtime until `ready` holds; fail with `what` after one second.
+    async fn await_until(ready: impl Fn() -> bool, what: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(what);
     }
 
     #[derive(Clone)]
@@ -3171,19 +3199,24 @@ mod tests {
         }
     }
 
-    async fn install_test_crossencoder(
+    fn install_test_crossencoder(
         state: &DaemonState,
         model_name: &str,
         initialize: CrossencoderInitializer,
     ) {
         let key = canonical_crossencoder_model(model_name).expect("test model name");
-        state.inner.crossencoders.lock().await.insert(
-            key,
-            Arc::new(StdMutex::new(CrossencoderSlot {
-                model: None,
-                initialize,
-            })),
-        );
+        state
+            .inner
+            .crossencoders
+            .lock()
+            .expect("crossencoder map lock")
+            .insert(
+                key,
+                Arc::new(StdMutex::new(CrossencoderSlot {
+                    model: None,
+                    initialize,
+                })),
+            );
     }
 
     fn rerank_corpus() -> CorpusConfig {
@@ -3219,6 +3252,15 @@ mod tests {
         }
     }
 
+    fn rerank_store(corpus: &CorpusConfig) -> TestChunkStore {
+        TestChunkStore {
+            hits: vec![
+                rerank_hit(corpus, "/tmp/a.md", 0.5),
+                rerank_hit(corpus, "/tmp/b.md", 0.4),
+            ],
+        }
+    }
+
     fn rerank_opts() -> GroundOpts {
         GroundOpts {
             top_files: 10,
@@ -3227,6 +3269,25 @@ mod tests {
             rerank_timeout: Duration::from_millis(10),
             ..GroundOpts::default()
         }
+    }
+
+    fn spawn_ground(
+        corpus: &CorpusConfig,
+        store: &TestChunkStore,
+        crossencoder: CrossencoderGuard,
+    ) -> JoinHandle<hallouminate_domain::common::Result<GroundResponse>> {
+        let corpus = corpus.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            ground(
+                "q",
+                &corpus,
+                &store,
+                Some(Box::new(crossencoder)),
+                rerank_opts(),
+            )
+            .await
+        })
     }
 
     #[tokio::test]
@@ -3238,47 +3299,33 @@ mod tests {
         let initialize: CrossencoderInitializer = {
             let started = Arc::clone(&started);
             let release = Arc::clone(&release);
-            Arc::new(move || {
+            Box::new(move || {
                 Ok(Box::new(BlockingCrossencoder {
                     started: Arc::clone(&started),
                     release: Arc::clone(&release),
                 }) as Box<dyn Crossencoder>)
             })
         };
-        install_test_crossencoder(&state, "bge-reranker-base", initialize).await;
+        install_test_crossencoder(&state, "bge-reranker-base", initialize);
 
         let corpus = rerank_corpus();
-        let store = TestChunkStore {
-            hits: vec![
-                rerank_hit(&corpus, "/tmp/a.md", 0.5),
-                rerank_hit(&corpus, "/tmp/b.md", 0.4),
-            ],
-        };
+        let store = rerank_store(&corpus);
         let first = state
             .crossencoder(Some("bge-reranker-base"))
-            .await
             .expect("admit first crossencoder")
             .expect("configured crossencoder");
-        let first_task = tokio::spawn({
-            let corpus = corpus.clone();
-            let store = store.clone();
-            async move { ground("q", &corpus, &store, Some(Box::new(first)), rerank_opts()).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !started.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first native rerank starts");
+        let first_task = spawn_ground(&corpus, &store, first);
+        await_until(
+            || started.load(Ordering::SeqCst),
+            "first native rerank starts",
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
         let mut second = state
             .crossencoder(Some("bge-reranker-base"))
-            .await
             .expect("admit second crossencoder")
             .expect("configured crossencoder");
-        let mut probe_hits = Vec::new();
-        assert!(second.rerank("q", &mut probe_hits).is_err());
+        assert!(second.rerank("q", &mut []).is_err());
         let second_started = Instant::now();
         let second = ground("q", &corpus, &store, Some(Box::new(second)), rerank_opts())
             .await
@@ -3327,48 +3374,26 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn crossencoder_concurrent_reranks_initialize_once() {
         let state = test_state().await;
-        let initializations = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(AtomicBool::new(false));
         let release_guard = ReleaseOnDrop(Arc::clone(&release));
-        let initialize: CrossencoderInitializer = {
-            let initializations = Arc::clone(&initializations);
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            Arc::new(move || {
-                initializations.fetch_add(1, Ordering::SeqCst);
-                entered.store(true, Ordering::SeqCst);
-                while !release.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-                Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
-            })
-        };
-        install_test_crossencoder(&state, "bge-reranker-base", initialize).await;
+        install_test_crossencoder(
+            &state,
+            "bge-reranker-base",
+            blocking_initializer(&entered, &release),
+        );
         let corpus = rerank_corpus();
-        let store = TestChunkStore {
-            hits: vec![
-                rerank_hit(&corpus, "/tmp/a.md", 0.5),
-                rerank_hit(&corpus, "/tmp/b.md", 0.4),
-            ],
-        };
+        let store = rerank_store(&corpus);
         let first = state
             .crossencoder(Some("bge-reranker-base"))
-            .await
             .expect("first")
             .expect("configured");
-        let first_task = tokio::spawn({
-            let corpus = corpus.clone();
-            let store = store.clone();
-            async move { ground("q", &corpus, &store, Some(Box::new(first)), rerank_opts()).await }
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !entered.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("lazy constructor starts on the blocking pool");
+        let first_task = spawn_ground(&corpus, &store, first);
+        await_until(
+            || entered.load(Ordering::SeqCst) == 1,
+            "lazy constructor starts on the blocking pool",
+        )
+        .await;
         tokio::time::timeout(
             Duration::from_millis(100),
             tokio::time::sleep(Duration::from_millis(10)),
@@ -3377,7 +3402,6 @@ mod tests {
         .expect("the current-thread runtime stays responsive during construction");
         let second = state
             .crossencoder(Some("bge-reranker-base"))
-            .await
             .expect("second")
             .expect("configured");
         let second_started = Instant::now();
@@ -3402,8 +3426,9 @@ mod tests {
                 .iter()
                 .any(|warning| warning.code == "rerank-timeout")
         );
-        assert_eq!(initializations.load(Ordering::SeqCst), 1);
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
     }
+
     #[tokio::test]
     async fn crossencoder_different_models_initialize_independently() {
         let state = test_state().await;
@@ -3411,37 +3436,24 @@ mod tests {
         let release = Arc::new(AtomicBool::new(false));
         let release_guard = ReleaseOnDrop(Arc::clone(&release));
         for model_name in ["bge-reranker-base", "bge-reranker-v2-m3"] {
-            let entered = Arc::clone(&entered);
-            let release = Arc::clone(&release);
-            let initialize: CrossencoderInitializer = Arc::new(move || {
-                entered.fetch_add(1, Ordering::SeqCst);
-                while !release.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-                Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
-            });
-            install_test_crossencoder(&state, model_name, initialize).await;
+            install_test_crossencoder(&state, model_name, blocking_initializer(&entered, &release));
         }
         let mut first = state
             .crossencoder(Some("bge-reranker-base"))
-            .await
             .expect("first")
             .expect("configured");
         let mut second = state
             .crossencoder(Some("bge-reranker-v2-m3"))
-            .await
             .expect("second")
             .expect("configured");
         let first_task = tokio::task::spawn_blocking(move || first.rerank("q", &mut []));
         let second_task = tokio::task::spawn_blocking(move || second.rerank("q", &mut []));
-        let entered_result = tokio::time::timeout(Duration::from_secs(1), async {
-            while entered.load(Ordering::SeqCst) < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
+        await_until(
+            || entered.load(Ordering::SeqCst) == 2,
+            "different models must initialize concurrently",
+        )
         .await;
         drop(release_guard);
-        entered_result.expect("different models must initialize concurrently");
         tokio::time::timeout(Duration::from_secs(1), async {
             first_task
                 .await

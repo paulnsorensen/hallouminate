@@ -566,7 +566,7 @@ async fn handle_ground(
     // inside the ground timeout, and busy or failed slots use fusion fallback.
     // Unconfigured paths return Ok(None) and skip reranking entirely.
     let mut crossencoder_unavailable = false;
-    let crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()).await {
+    let crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()) {
         Ok(g) => g,
         Err(e) => {
             crossencoder_unavailable = true;

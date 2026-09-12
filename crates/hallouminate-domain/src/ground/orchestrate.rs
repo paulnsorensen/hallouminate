@@ -11,29 +11,22 @@ use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats, Warning};
 
-/// Result of one bounded crossencoder attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why one bounded crossencoder attempt kept fusion order.
+#[derive(Debug, PartialEq, Eq)]
 enum RerankFallback {
     Timeout,
     Unavailable,
 }
 
-enum RerankResult {
-    Applied(Vec<SearchHit>),
-    Fallback {
-        hits: Vec<SearchHit>,
-        reason: RerankFallback,
-    },
-}
-
 /// Run reranking on a blocking-pool thread within `timeout`.
 /// Construction, admission, and native execution share this deadline.
+/// Returns the hits plus `Some(reason)` when fusion order was kept.
 async fn rerank_with_timeout(
     mut crossencoder: Box<dyn Crossencoder>,
     query: String,
     hits: Vec<SearchHit>,
     timeout: Duration,
-) -> Result<RerankResult> {
+) -> (Vec<SearchHit>, Option<RerankFallback>) {
     let fallback = hits.clone();
     let query_len = query.len();
     let handle = tokio::task::spawn_blocking(move || {
@@ -41,17 +34,14 @@ async fn rerank_with_timeout(
         crossencoder.rerank(&query, &mut hits)?;
         Ok::<Vec<SearchHit>, HallouminateError>(hits)
     });
-    match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(Ok(reranked))) => Ok(RerankResult::Applied(reranked)),
+    let reason = match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(Ok(reranked))) => return (reranked, None),
         Ok(Ok(Err(error))) => {
             tracing::warn!(
                 error = %error,
                 "crossencoder rerank unavailable; falling back to fusion order",
             );
-            Ok(RerankResult::Fallback {
-                hits: fallback,
-                reason: RerankFallback::Unavailable,
-            })
+            RerankFallback::Unavailable
         }
         Ok(Err(join_err)) => {
             let cause = if join_err.is_panic() {
@@ -64,10 +54,7 @@ async fn rerank_with_timeout(
                 cause,
                 "crossencoder task failed; falling back to fusion order",
             );
-            Ok(RerankResult::Fallback {
-                hits: fallback,
-                reason: RerankFallback::Unavailable,
-            })
+            RerankFallback::Unavailable
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -75,12 +62,10 @@ async fn rerank_with_timeout(
                 query_len,
                 "crossencoder rerank timed out; falling back to fusion order"
             );
-            Ok(RerankResult::Fallback {
-                hits: fallback,
-                reason: RerankFallback::Timeout,
-            })
+            RerankFallback::Timeout
         }
-    }
+    };
+    (fallback, Some(reason))
 }
 /// Strip the first matching corpus root prefix from `abs_path`, returning
 /// a corpus-relative path string accepted by `safe_relative_path`.
@@ -240,34 +225,30 @@ pub async fn ground_union(
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
-        match rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await? {
-            RerankResult::Applied(reranked) => {
-                hits = reranked;
+        let (reranked, fallback) =
+            rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await;
+        hits = reranked;
+        match fallback {
+            None => {
                 let z_scores = normalize_scores(&hits);
                 for (hit, z_score) in hits.iter_mut().zip(z_scores) {
                     hit.z_score = z_score;
                 }
             }
-            RerankResult::Fallback {
-                hits: fallback,
-                reason,
-            } => {
-                hits = fallback;
-                match reason {
-                    RerankFallback::Timeout => warnings.push(Warning {
-                        code: "rerank-timeout".to_string(),
-                        message: format!(
-                            "crossencoder rerank timed out after {} ms; falling back to fusion order",
-                            opts.rerank_timeout.as_millis()
-                        ),
-                    }),
-                    RerankFallback::Unavailable => warnings.push(Warning {
-                        code: "crossencoder-unavailable".to_string(),
-                        message: "crossencoder rerank unavailable; falling back to fusion order"
-                            .to_string(),
-                    }),
-                }
-            }
+            // Keep each code as a string literal on the `code` field: the eval
+            // gate scans sources for that shape to classify producer warnings.
+            Some(RerankFallback::Timeout) => warnings.push(Warning {
+                code: "rerank-timeout".to_string(),
+                message: format!(
+                    "crossencoder rerank timed out after {} ms; falling back to fusion order",
+                    opts.rerank_timeout.as_millis()
+                ),
+            }),
+            Some(RerankFallback::Unavailable) => warnings.push(Warning {
+                code: "crossencoder-unavailable".to_string(),
+                message: "crossencoder rerank unavailable; falling back to fusion order"
+                    .to_string(),
+            }),
         }
     }
 
@@ -602,22 +583,14 @@ mod tests {
         ];
         let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
 
-        let result = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(SleepingCrossencoder),
             "q".to_string(),
             hits,
             Duration::from_millis(20),
         )
-        .await
-        .expect("timeout path must not error");
-        let RerankResult::Fallback {
-            hits: result,
-            reason,
-        } = result
-        else {
-            panic!("timeout path must use fallback");
-        };
-        assert_eq!(reason, RerankFallback::Timeout);
+        .await;
+        assert_eq!(reason, Some(RerankFallback::Timeout));
         let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
         assert_eq!(
             observed, fusion_order,
@@ -640,17 +613,14 @@ mod tests {
             hit_for_timeout_test("/b.md", 0.9),
         ];
 
-        let result = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(ReversingCrossencoderStub),
             "q".to_string(),
             hits,
             Duration::from_secs(2),
         )
-        .await
-        .expect("fast path must not error");
-        let RerankResult::Applied(result) = result else {
-            panic!("fast path must apply reranking");
-        };
+        .await;
+        assert_eq!(reason, None, "fast path must apply reranking");
         let observed: Vec<&str> = result.iter().map(|h| h.file_ref.as_str()).collect();
         assert_eq!(
             observed,
@@ -942,22 +912,18 @@ mod tests {
         ];
         let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
 
-        let result = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(SleepingCrossencoder),
             "q".to_string(),
             hits,
             Duration::from_millis(0),
         )
-        .await
-        .expect("zero timeout must not error, only fall back to fusion order");
-        let RerankResult::Fallback {
-            hits: result,
+        .await;
+        assert_eq!(
             reason,
-        } = result
-        else {
-            panic!("zero timeout must use fallback");
-        };
-        assert_eq!(reason, RerankFallback::Timeout);
+            Some(RerankFallback::Timeout),
+            "zero timeout must fall back to fusion order"
+        );
         let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
         assert_eq!(
             observed, fusion_order,

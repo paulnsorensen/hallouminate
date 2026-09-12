@@ -3,7 +3,7 @@
 ## Decision
 
 Each canonical crossencoder model has one independent lazy slot.
-The async state lookup validates the model name and returns a handle without native construction.
+The synchronous state lookup validates the model name and returns a handle without native construction.
 The existing Ground blocking task acquires the slot with `try_lock`.
 That task constructs the model on first use and then runs native reranking.
 The rerank deadline therefore includes native construction and slot admission.[^1]
