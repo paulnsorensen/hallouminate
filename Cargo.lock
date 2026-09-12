@@ -2430,8 +2430,7 @@ checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 [[package]]
 name = "fastembed"
 version = "6.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cba9e2163602348eff03af6e9a7b24c63edc1529de4239fde99a5178621d2fbe"
+source = "git+https://github.com/paulnsorensen/fastembed-rs?rev=e6494add09b840ef1dc20efd8506a9f3aeee836f#e6494add09b840ef1dc20efd8506a9f3aeee836f"
 dependencies = [
  "hf-hub 0.5.0",
  "image",
@@ -2866,6 +2865,7 @@ dependencies = [
  "hallouminate-domain",
  "lancedb",
  "openssl",
+ "ort",
  "rustix",
  "serde",
  "serde_json",

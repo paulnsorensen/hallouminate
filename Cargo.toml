@@ -47,3 +47,10 @@ debug = "line-tables-only"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# fastembed 6.0.3 cannot set ONNX Runtime session config entries. The fork
+# adds `with_session_config`, which the adapters use to set
+# `mlas.disable_kleidiai` (see .hallouminate/wiki/ort-arena-retention.md).
+# Remove this patch when Anush008/fastembed-rs#292 (issue #291) ships in a release.
+[patch.crates-io]
+fastembed = { git = "https://github.com/paulnsorensen/fastembed-rs", rev = "e6494add09b840ef1dc20efd8506a9f3aeee836f" }
