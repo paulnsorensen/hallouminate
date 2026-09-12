@@ -59,10 +59,15 @@ async fn rerank_with_timeout(
             } else {
                 "was cancelled"
             };
-            tracing::error!(error = %join_err, cause, "crossencoder task failed");
-            Err(HallouminateError::Embed(format!(
-                "crossencoder task {cause}: {join_err}"
-            )))
+            tracing::warn!(
+                error = %join_err,
+                cause,
+                "crossencoder task failed; falling back to fusion order",
+            );
+            Ok(RerankResult::Fallback {
+                hits: fallback,
+                reason: RerankFallback::Unavailable,
+            })
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -652,6 +657,48 @@ mod tests {
             vec!["/b.md", "/a.md"],
             "fast path must apply the crossencoder ordering"
         );
+    }
+
+    #[tokio::test]
+    async fn ground_preserves_fusion_results_when_crossencoder_panics() {
+        struct PanickingCrossencoder;
+        impl Crossencoder for PanickingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                hits.reverse();
+                for hit in hits {
+                    hit.score = 999.0;
+                }
+                panic!("native reranker failed after modifying hits");
+            }
+        }
+
+        let store = FakeChunkStore {
+            hits: fixture_hits(),
+        };
+        let corpus = fixture_corpus();
+        let baseline = ground("spice", &corpus, &store, None, GroundOpts::default())
+            .await
+            .expect("fusion search succeeds");
+        let response = ground(
+            "spice",
+            &corpus,
+            &store,
+            Some(Box::new(PanickingCrossencoder)),
+            GroundOpts::default(),
+        )
+        .await
+        .expect("a reranker panic must preserve the search response");
+
+        assert_eq!(response.stats.hits, 5);
+        assert_eq!(
+            serde_json::to_value(&response.docs).unwrap(),
+            serde_json::to_value(&baseline.docs).unwrap()
+        );
+        let mut warnings = Vec::new();
+        for warning in &response.warnings {
+            warnings.push(warning.code.as_str());
+        }
+        assert_eq!(warnings, vec!["crossencoder-unavailable"]);
     }
 
     // --- #139: GroundOpts.rerank_timeout wiring ---

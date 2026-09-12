@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(test)]
-use std::sync::{Condvar, Mutex as StdMutex};
+use std::sync::Condvar;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -288,8 +288,7 @@ fn crossencoder_initializer(model_name: String, cache_dir: PathBuf) -> Crossenco
     })
 }
 
-/// Resources effective for one repo-layer config. Keyed cache entry —
-/// mirrors the `crossencoders: Arc<Mutex<HashMap<..>>>` cache precedent.
+/// Resources effective for one repo-layer config, cached by resource key.
 pub struct RequestResources {
     pub store: Arc<LanceStore>,
     pub tokenizer: Tokenizer,
@@ -346,12 +345,8 @@ struct DaemonStateInner {
     #[cfg(test)]
     coverage_probe: Arc<CoverageProbe>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
-    /// A per-model cache (rather than a single slot) so that repos
-    /// selecting different `[search].crossencoder` models via repo-layer
-    /// config each get their own loaded model instead of clobbering a
-    /// shared one. Empty until the first `ground` request that resolves a
-    /// configured model names each get a lazily initialized, independently locked slot.
-    crossencoders: Arc<Mutex<HashMap<String, Arc<StdMutex<CrossencoderSlot>>>>>,
+    /// Each model has an independent slot, constructed on its first rerank.
+    crossencoders: Mutex<HashMap<&'static str, Arc<StdMutex<CrossencoderSlot>>>>,
     /// Monotonic (`Instant`-based) seconds-since-process-start timestamp of
     /// completion (handle_connection) plus embedder/crossencoder acquire and
     /// guard drop. Idle-exit (server.rs) fires when this is quiet for
@@ -639,7 +634,7 @@ impl DaemonState {
         }
         // Keep model construction lazy. The rerank blocking-pool task owns
         // construction and the per-model slot for the configured deadline.
-        let crossencoders = Arc::new(Mutex::new(HashMap::new()));
+        let crossencoders = Mutex::new(HashMap::new());
         let shutdown = CancellationToken::new();
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
@@ -990,16 +985,15 @@ impl DaemonState {
             return Ok(None);
         };
         let canonical = canonical_crossencoder_model(model_name)?;
-        let key = canonical.to_owned();
-        let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
-        let initialize = crossencoder_initializer(key.clone(), cache_dir);
         let model = self
             .inner
             .crossencoders
             .lock()
             .await
-            .entry(key)
+            .entry(canonical)
             .or_insert_with(|| {
+                let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
+                let initialize = crossencoder_initializer(canonical.to_owned(), cache_dir);
                 Arc::new(StdMutex::new(CrossencoderSlot {
                     model: None,
                     initialize,
@@ -1480,7 +1474,7 @@ mod tests {
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
     use hallouminate_domain::common::{CorpusConfig, CorpusKey};
     use hallouminate_domain::ground::{GroundOpts, ground};
-    use hallouminate_domain::indexer::{ChunkStore, SignalLists};
+    use hallouminate_domain::indexer::SignalLists;
     use hallouminate_domain::search::{ChunkRetrieval, NoopCrossencoder};
     use std::sync::atomic::AtomicBool;
 
@@ -2433,7 +2427,7 @@ mod tests {
     }
     #[test]
     fn crossencoder_guard_updates_last_use_on_drop() {
-        let last_use_secs = Arc::new(AtomicU64::new(1));
+        let last_use_secs = Arc::new(AtomicU64::new(u64::MAX));
         let before_drop = monotonic_secs();
         let initialize: CrossencoderInitializer =
             Arc::new(|| Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>));
@@ -2448,6 +2442,7 @@ mod tests {
         });
 
         let observed = last_use_secs.load(Ordering::Relaxed);
+        assert_ne!(observed, u64::MAX);
         assert!(
             observed >= before_drop,
             "drop should stamp crossencoder use at or after guard lifetime start: observed {observed}, before {before_drop}",
@@ -3181,9 +3176,7 @@ mod tests {
         model_name: &str,
         initialize: CrossencoderInitializer,
     ) {
-        let key = canonical_crossencoder_model(model_name)
-            .expect("test model name")
-            .to_owned();
+        let key = canonical_crossencoder_model(model_name).expect("test model name");
         state.inner.crossencoders.lock().await.insert(
             key,
             Arc::new(StdMutex::new(CrossencoderSlot {
@@ -3232,6 +3225,7 @@ mod tests {
             chunks_per_file: 10,
             limit: 10,
             rerank_timeout: Duration::from_millis(10),
+            ..GroundOpts::default()
         }
     }
 

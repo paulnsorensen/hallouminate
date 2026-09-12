@@ -9,7 +9,8 @@ That task constructs the model on first use and then runs native reranking.
 The rerank deadline therefore includes native construction and slot admission.[^1]
 
 A busy slot returns immediately instead of adding a waiting blocking task.
-Ground keeps the original fusion order after busy, initialization, or timeout failures.
+Ground keeps the original fusion order after busy, initialization, worker, or timeout failures.
+Worker failures emit `crossencoder-unavailable`; deadline failures emit `rerank-timeout`.
 A timed-out native call can continue; Rust task cancellation does not stop native execution.
 Its slot remains occupied until the call returns.
 Requests for different models use different slots.[^2]
