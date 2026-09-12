@@ -132,7 +132,9 @@ jobs:
       - name: Install nextest
         uses: taiki-e/install-action@9534c84618278caac52cb373bb164ed464dbd8af # v2.87.11
         with:
-          tool: nextest
+          # Pin the exact nextest version for reproducible CI installs; bump
+          # deliberately (Dependabot tracks the action SHA, not this string).
+          tool: nextest@0.9.144
       - name: Cache Hugging Face tokenizer downloads
         # DaemonState::open hard-loads the HF tokenizer (chunking needs it
         # regardless of embedding mode), so non-ignored tests fetch it from
