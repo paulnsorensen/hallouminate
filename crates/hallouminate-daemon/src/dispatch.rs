@@ -562,12 +562,11 @@ async fn handle_ground(
         }
     };
 
-    // crossencoder is best-effort: if it's configured but failed to
-    // load (e.g. model file vanished), log and ground without it
-    // rather than refusing the request. Unconfigured paths return
-    // Ok(None) and the rerank step is skipped entirely.
+    // Crossencoder admission is best-effort. Construction and rerank run
+    // inside the ground timeout, and busy or failed slots use fusion fallback.
+    // Unconfigured paths return Ok(None) and skip reranking entirely.
     let mut crossencoder_unavailable = false;
-    let crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()).await {
+    let crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()) {
         Ok(g) => g,
         Err(e) => {
             crossencoder_unavailable = true;
