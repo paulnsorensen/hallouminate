@@ -315,7 +315,7 @@ impl Default for StorageConfig {
 /// Assembled by merging the XDG baseline layer with the discovered per-repo
 /// layer; every nested section falls back to its `Default` when omitted, so an
 /// empty config decodes to a fully-defaulted `Config`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// User-defined corpora, declared as `[[corpus]]` entries.
     #[serde(rename = "corpus", default)]
@@ -327,6 +327,10 @@ pub struct Config {
     // key so users have a clear nudge to migrate.
     #[serde(rename = "repository", alias = "code_repo", default)]
     pub repositories: Vec<RepositoryConfig>,
+    /// Include baseline corpora and repositories when this repository config merges.
+    /// The repository layer controls this policy; baseline values do not control it.
+    #[serde(default = "default_inherit_global_corpora")]
+    pub inherit_global_corpora: bool,
     /// Search and ranking defaults.
     #[serde(default)]
     pub search: SearchConfig,
@@ -345,6 +349,26 @@ pub struct Config {
     /// Daemon-wide runtime settings.
     #[serde(default)]
     pub daemon: DaemonConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            corpora: Vec::new(),
+            repositories: Vec::new(),
+            inherit_global_corpora: true,
+            search: SearchConfig::default(),
+            embeddings: EmbeddingsConfig::default(),
+            logging: LoggingConfig::default(),
+            watch: WatchConfig::default(),
+            storage: StorageConfig::default(),
+            daemon: DaemonConfig::default(),
+        }
+    }
+}
+
+fn default_inherit_global_corpora() -> bool {
+    true
 }
 
 impl Config {
@@ -644,9 +668,10 @@ pub fn load_repo_layer(config_path: &Path) -> Result<Config> {
 
 /// Merge a baseline `Config` with a repo-layer `Config`.
 ///
-/// List sections (`corpora`, `repositories`) are appended baseline-first
-/// then repo-layer; cross-layer name collisions surface via
-/// `effective_corpora`'s duplicate-name detection on the combined list.
+/// List sections (`corpora`, `repositories`) inherit baseline entries unless
+/// the repo layer sets `inherit_global_corpora = false`, then append repo entries.
+/// Cross-layer name collisions surface via `effective_corpora`'s duplicate-name
+/// detection on the combined list.
 ///
 /// Scalar sections (`search`, `embeddings`, `watch`, `storage`) merge field
 /// by field. "Explicitly set" is determined by comparison against
@@ -669,9 +694,17 @@ fn merge_layers_with_sources(
     repo_path: Option<&Path>,
 ) -> Result<Config> {
     let defaults = Config::default();
-    let mut corpora = baseline.corpora.clone();
+    let mut corpora = if repo.inherit_global_corpora {
+        baseline.corpora.clone()
+    } else {
+        Vec::new()
+    };
     corpora.extend(repo.corpora.iter().cloned());
-    let mut repositories = baseline.repositories.clone();
+    let mut repositories = if repo.inherit_global_corpora {
+        baseline.repositories.clone()
+    } else {
+        Vec::new()
+    };
     repositories.extend(repo.repositories.iter().cloned());
 
     let search = SearchConfig {
@@ -975,6 +1008,7 @@ fn merge_layers_with_sources(
         watch,
         storage,
         daemon,
+        inherit_global_corpora: repo.inherit_global_corpora,
     };
     // Re-run cross-layer validation on the combined lists; the inner
     // `effective_corpora` call covers duplicate-name detection across
@@ -2669,6 +2703,71 @@ paths = ["/local"]
         let merged = merge_layers(&baseline, &repo).expect("merge");
         let names: Vec<&str> = merged.corpora.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["global", "local"]);
+    }
+
+    #[test]
+    fn local_corpus_inheritance_defaults_to_true() {
+        let cfg = parse("", None).expect("empty config parses");
+        assert_eq!(cfg, Config::default());
+        assert!(cfg.inherit_global_corpora);
+
+        let baseline = parse("inherit_global_corpora = false", None).expect("baseline parses");
+        let repo = parse("", None).expect("repo parses");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert!(merged.inherit_global_corpora);
+    }
+
+    #[test]
+    fn local_false_excludes_baseline_corpora_and_repositories() {
+        let baseline = parse(
+            "[[corpus]]\nname = \"global\"\npaths = [\"/global\"]\n[[repository]]\nname = \"base\"\npath = \"/base\"\n[embeddings]\ncache_dir = \"/cache\"\n",
+            None,
+        )
+        .expect("baseline parses");
+        let repo = parse(
+            "inherit_global_corpora = false\n[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n[[repository]]\nname = \"local-repo\"\npath = \"/local-repo\"\n",
+            None,
+        )
+        .expect("repo parses");
+
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.corpora.len(), 1);
+        assert_eq!(merged.corpora[0].name, "local");
+        assert_eq!(merged.repositories.len(), 1);
+        assert_eq!(merged.repositories[0].name, "local-repo");
+        assert_eq!(merged.embeddings.cache_dir, "/cache");
+        assert!(!merged.inherit_global_corpora);
+        assert!(baseline.inherit_global_corpora);
+        assert_eq!(baseline.corpora[0].name, "global");
+        assert_eq!(baseline.repositories[0].name, "base");
+    }
+
+    #[test]
+    fn plain_baseline_corpus_needs_no_global_wiki() {
+        let baseline = parse(
+            "[[corpus]]\nname = \"shared-docs\"\npaths = [\"/shared-docs\"]\n",
+            None,
+        )
+        .expect("plain baseline corpus parses without a wiki");
+        let effective = baseline
+            .effective_corpora()
+            .expect("derive effective corpora");
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].name, "shared-docs");
+    }
+    #[test]
+    fn local_true_preserves_baseline_corpora_and_repositories() {
+        let baseline = parse(
+            "[[corpus]]\nname = \"global\"\npaths = [\"/global\"]\n[[repository]]\nname = \"base\"\npath = \"/base\"\n",
+            None,
+        )
+        .expect("baseline parses");
+        let repo = parse("inherit_global_corpora = true", None).expect("repo parses");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.corpora.len(), 1);
+        assert_eq!(merged.corpora[0].name, "global");
+        assert_eq!(merged.repositories.len(), 1);
+        assert_eq!(merged.repositories[0].name, "base");
     }
 
     #[test]

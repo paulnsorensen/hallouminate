@@ -1,5 +1,8 @@
 # Hallouminate configuration. Edit corpus and repository entries to point at
 # the markdown trees and repositories you want indexed.
+# Repository configs inherit global corpora and repositories by default.
+# Set this to false in a repo's `.hallouminate/config.toml` for local-only search.
+inherit_global_corpora = true
 
 # [[corpus]]
 # name = "claude-config"

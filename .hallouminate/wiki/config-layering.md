@@ -66,11 +66,42 @@ A wiki corpus is **not** auto-discovered just because a
 `.hallouminate/wiki/` directory exists under `cwd` — the corpus only
 exists once a `[[repository]]` (baseline or repo layer) declares it.
 
+
+### Optional global corpus inheritance
+
+Set this top-level key in `<repo>/.hallouminate/config.toml` to exclude
+inherited global corpus and repository declarations:
+
+```toml
+inherit_global_corpora = false
+
+[[repository]]
+name = "myrepo"
+path = "."
+```
+
+Omitting the key or setting it to `true` preserves inheritance.
+The repository layer controls this policy; the baseline value does not
+control repository requests. Global search, embedding, storage, watch,
+logging, and daemon settings retain their existing merge rules.[^corpus-policy]
+
+This policy changes the effective corpus set, not only search results.
+It does not delete globally indexed documents. A corpus-less `ground`
+request searches the remaining effective corpora.[^corpus-policy-ground]
+
+Global `[[corpus]]` entries need neither a wiki nor a `global = true`
+marker. A `[[repository]]` entry still derives its repository wiki.[^optional-global-wiki]
+
+[^corpus-policy]: crates/hallouminate-config/src/lib.rs::Config; crates/hallouminate-config/src/lib.rs::merge_layers_with_sources
+[^corpus-policy-ground]: crates/hallouminate-daemon/src/dispatch.rs::handle_ground
+[^optional-global-wiki]: crates/hallouminate-config/src/lib.rs::validate; crates/hallouminate-domain/src/repository.rs::effective_corpora
+
 ## Merge semantics
 
 Implemented in `crates/hallouminate-config/src/lib.rs::merge_layers`. Rules:
 
-- Arrays (`[[corpus]]`, `[[repository]]`) — repo entries are appended after baseline entries. Duplicate names error.
+- Arrays (`[[corpus]]`, `[[repository]]`) append repository entries after baseline entries by default. Duplicate names error.
+- Repository `inherit_global_corpora = false` excludes both baseline declaration arrays before the merge. Local declarations remain.[^corpus-policy]
 - Scalars (`top_files_default`, etc.) — repo wins if it sets a non-default value; otherwise baseline. Conflicting non-default values error with both source paths named.
 
 Conflict messages always name the source path of the offending value:
