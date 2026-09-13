@@ -1908,7 +1908,7 @@ mod tests {
     /// and `umask(2)` is per-process, not per-thread; the `Restore` guard also
     /// repairs the umask if `body` panics.
     #[cfg(unix)]
-    fn with_umask<R>(mask: u16, body: impl FnOnce() -> R) -> R {
+    fn with_umask<R>(mask: rustix::fs::RawMode, body: impl FnOnce() -> R) -> R {
         use rustix::fs::Mode;
         use rustix::process::umask;
         use std::sync::Mutex;
