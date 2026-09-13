@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
+use tokio::sync::OwnedSemaphorePermit;
+
 use crate::report::{CorpusReport, IndexReport};
 use hallouminate_adapters::LanceStore;
 use hallouminate_config::{Config, ResolvedLayers, resolve_for_cwd};
@@ -410,6 +412,7 @@ fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
             .unwrap_or(cfg.search.limit_default)
             .min(MAX_GROUND_LIMIT),
         rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
+        footnote_mode: req.footnote_mode,
     }
 }
 
@@ -420,14 +423,13 @@ fn register_for_request(
     layers: &ResolvedLayers,
     corpora: &[CorpusConfig],
     cfg: &Config,
-) -> Result<ConfigSource, String> {
+) -> Result<(ConfigSource, bool), String> {
     register_runtime_corpora(state, layers.repo_path.as_deref(), corpora, cfg)
 }
 
 /// Runs the per-corpus coverage check concurrently and renders
 /// "index-coverage" warnings for any corpus whose index trails its on-disk
-/// listing (#427 part 2). Must be called before `Provisioner::observe` so the
-/// snapshot reflects the index state at request time, not after provisioning.
+/// listing (#427 part 2). The snapshot reflects the index state at request time.
 type CoverageSlot = Option<(CorpusConfig, anyhow::Result<(u64, u64)>)>;
 
 async fn collect_coverage_warnings(
@@ -522,10 +524,11 @@ async fn handle_ground(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let source = match register_for_request(state, layers, &corpora, cfg) {
-        Ok(source) => source,
-        Err(error) => return DaemonResponse::invalid_params(error),
-    };
+    let (source, registration_limit_reached) =
+        match register_for_request(state, layers, &corpora, cfg) {
+            Ok(result) => result,
+            Err(error) => return DaemonResponse::invalid_params(error),
+        };
     let res = match state.resources_for(cfg).await {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
@@ -539,7 +542,6 @@ async fn handle_ground(
         None => corpora.clone(),
     };
     let coverage_warnings = collect_coverage_warnings(state, store, &coverage_targets).await;
-    state.provisioner().observe(&corpora, cfg);
     let opts = ground_opts(cfg, &req);
 
     // Union ground (#106, #425): every corpus-less request fans the query
@@ -622,6 +624,14 @@ async fn handle_ground(
     }
 
     response.warnings.extend(coverage_warnings);
+    if registration_limit_reached {
+        response.warnings.push(Warning {
+            code: "index-reconciliation".to_string(),
+            message: format!(
+                "watcher registration limit reached for source {source}; one or more corpora are not watched"
+            ),
+        });
+    }
 
     response
         .warnings
@@ -1613,15 +1623,13 @@ pub(super) async fn catch_up_index(state: DaemonState) {
         if !hallouminate_domain::corpus::missing_roots(&corpus).is_empty() {
             continue; // absent root; watcher skips it too, later boot picks it up
         }
-        let _guard = match state.acquire_mutation_guard(&corpus.name).await {
-            Ok(g) => g,
-            Err(e) => {
-                tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
-                    error = %e, "boot catch-up: could not lock corpus; skipped");
-                continue;
-            }
-        };
-        match catch_up_corpus(&res, &registry, &corpus).await {
+        if let Err(e) = super::backpressure::await_debt_gate(&state).await {
+            tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
+                error = %e, "boot catch-up: debt gate blocked reindex; skipped");
+            continue;
+        }
+        let _guard = state.lock_corpus(&corpus.name).await;
+        match catch_up_corpus(&res, &registry, &corpus, || state.acquire_write_lane()).await {
             Ok(Some(stats)) => tracing::info!(target: "hallouminate::daemon",
                 corpus = %corpus.name, files_upserted = stats.files_upserted,
                 files_touched = stats.files_touched, files_deleted = stats.files_deleted,
@@ -1634,13 +1642,24 @@ pub(super) async fn catch_up_index(state: DaemonState) {
     state.heartbeat().bump(super::heartbeat::TaskName::CatchUp);
 }
 
-/// Plan + apply one corpus's down-window diff. `Ok(None)` = nothing changed
-/// (no work, no model load); `Ok(Some(stats))` = reindexed.
-pub(super) async fn catch_up_corpus(
+/// Plan + apply one corpus's down-window diff. Callers hold `lock_corpus`
+/// for `corpus.name` across this whole call (scan through apply) so no other
+/// writer to the corpus interleaves; `acquire_lane` is invoked only once a
+/// non-empty plan confirms there is real work, and only then does this
+/// function acquire the global write-lane permit (`state.acquire_write_lane`)
+/// -- preserving the documented `corpus -> write_lane` order without holding
+/// the lane for the scan/list_files/plan work. `Ok(None)` = nothing changed
+/// (no work, no model load, lane never touched).
+pub(super) async fn catch_up_corpus<F, Fut>(
     res: &RequestResources,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
-) -> anyhow::Result<Option<hallouminate_domain::indexer::ApplyStats>> {
+    acquire_lane: F,
+) -> anyhow::Result<Option<hallouminate_domain::indexer::ApplyStats>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<OwnedSemaphorePermit, &'static str>>,
+{
     let mut disk_by_key = HashMap::new();
     for scanned in scan(corpus)? {
         disk_by_key
@@ -1668,6 +1687,7 @@ pub(super) async fn catch_up_corpus(
     {
         return Ok(None);
     }
+    let _permit = acquire_lane().await.map_err(|e| anyhow::anyhow!(e))?;
     let stats = apply(
         combined,
         res.store.as_ref(),
@@ -2471,10 +2491,12 @@ mod tests {
             .resources_for(state.baseline())
             .await
             .expect("resources_for");
-        let stats = catch_up_corpus(&res, &state.make_registry(), &corpus)
-            .await
-            .expect("catch_up_corpus")
-            .expect("secondary-root deletion needs work");
+        let stats = catch_up_corpus(&res, &state.make_registry(), &corpus, || {
+            state.acquire_write_lane()
+        })
+        .await
+        .expect("catch_up_corpus")
+        .expect("secondary-root deletion needs work");
         assert_eq!(stats.files_deleted, 1, "secondary root row must be pruned");
         assert_eq!(
             state
@@ -2496,10 +2518,12 @@ mod tests {
             "root B deletion must remove only its exact rows",
         );
         assert!(
-            catch_up_corpus(&res, &state.make_registry(), &corpus)
-                .await
-                .expect("no-work catch_up_corpus")
-                .is_none(),
+            catch_up_corpus(&res, &state.make_registry(), &corpus, || {
+                state.acquire_write_lane()
+            })
+            .await
+            .expect("no-work catch_up_corpus")
+            .is_none(),
             "an unchanged multi-root corpus must produce Ok(None)",
         );
     }
@@ -3819,5 +3843,111 @@ mod tests {
             baseline.total_chunks,
             "chunk rows must be untouched by a noop reindex"
         );
+    }
+
+    /// Ground discovery must schedule one initial catch-up through the live
+    /// watcher pump, and a later registry change must schedule another pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ground_discovery_runs_initial_and_later_pump_catch_up_passes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
+        std::fs::write(corpus_dir.join("initial.md"), "# Initial\n\ncontent\n")
+            .expect("write initial");
+        let repo_config = format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            corpus_dir.display()
+        );
+        write_repo_layer(tmp.path(), &repo_config);
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state =
+            state_with_ground(&tmp.path().join("ground"), "[embeddings]\nenabled = false").await;
+        let watcher = crate::watch::spawn_corpus_watcher(&state).expect("watcher starts");
+
+        let response = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Ground(
+                    serde_json::from_value(serde_json::json!({
+                        "query": "content",
+                        "corpus": "docs",
+                    }))
+                    .expect("ground request"),
+                ),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = response else {
+            panic!("ground must succeed: {response:?}");
+        };
+
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![corpus_dir.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "initial runtime catch-up must complete",
+            || async {
+                !state
+                    .store()
+                    .list_files(&corpus_key)
+                    .await
+                    .expect("list initial files")
+                    .is_empty()
+            },
+        )
+        .await;
+        assert_eq!(
+            state
+                .store()
+                .list_files(&corpus_key)
+                .await
+                .expect("list initial files")
+                .len(),
+            1,
+            "Ground discovery must index one initial file"
+        );
+
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("runtime registration root");
+        let later = corpus_dir.join("later.md");
+        std::fs::write(&later, "# Later\n\ncontent\n").expect("write later");
+        state.watch_registry().record_pending(&id, [later]);
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "later registry change must complete a second catch-up",
+            || async {
+                state
+                    .store()
+                    .list_files(&corpus_key)
+                    .await
+                    .expect("list later files")
+                    .len()
+                    >= 2
+            },
+        )
+        .await;
+        assert_eq!(
+            state
+                .store()
+                .list_files(&corpus_key)
+                .await
+                .expect("list later files")
+                .len(),
+            2,
+            "a later registry change must index the new file"
+        );
+        state.shutdown_token().cancel();
+        watcher.join().await;
     }
 }

@@ -17,6 +17,7 @@ strsim.workspace = true
 # the corpus root capability and is the symlink-safe replacement for the
 # rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
 cap-std = "4"
+cap-tempfile.workspace = true
 rustix.workspace = true
 # Concurrency fan-out for ground_union's per-corpus-root searches (efficiency
 # finding: sequential awaits made wall time the sum over roots, not the max).

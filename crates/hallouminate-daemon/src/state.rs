@@ -12,6 +12,27 @@
 //! LanceDB commit so we never hit LanceDB's retry-limit warning around
 //! many simultaneous writers.
 //!
+//! `acquire_mutation_guard` still hands out both locks together for
+//! read-modify-write handlers (`handle_add_markdown`, `handle_index`) where
+//! the whole operation is cheap and atomic. The catch-up scan/plan/apply
+//! path (`dispatch::catch_up_corpus`) is different: scanning disk and
+//! diffing against the store can be slow and touches nothing shared, so
+//! those callers hold only `lock_corpus` across scan + plan and call
+//! `acquire_write_lane` themselves just before `apply`, once there is
+//! confirmed work to do. The corpus lock is held continuously from scan
+//! through apply, so no other *corpus-locked* writer can interleave; only
+//! the lane acquisition — the part that actually needs cross-corpus
+//! serialization — moves later. The GC sweep in `maintenance::gc_delete` is
+//! the deliberate exception: it takes only the write lane, so its row
+//! deletions can land between another writer's scan and apply. That is safe
+//! because GC only removes rows already proven unreferenced by the scan that
+//! produced its candidate list.
+//!
+//! The maintenance-debt gate (`backpressure::await_debt_gate`) runs before
+//! any of this: every catch-up call site clears the gate before calling
+//! `lock_corpus`, so a bounded Hard-debt block never holds a corpus lock
+//! that would head-of-line-block an unrelated mutation on the same corpus.
+//!
 //! Stores, tokenizers, and embedders are cached by effective request config.
 //! A baseline embedder that fails during startup remains retryable: the next
 //! normal request for that resource key initializes and installs it in place.
@@ -47,7 +68,6 @@ use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
 use super::ladder::LadderAction;
 use super::maintenance::{DeferReason, maintenance_loop};
-use super::provisioner::{Provisioner, provisioning_loop};
 use super::supervisor::SupervisorAction;
 
 pub(crate) const CHUNK_BUDGET_TOKENS: usize = 384;
@@ -361,7 +381,6 @@ struct DaemonStateInner {
     heartbeat: Arc<super::heartbeat::HeartbeatRegistry>,
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
-    provisioner: Provisioner,
     /// Live-registration ledger backing the watcher pump (baseline +
     /// runtime-discovered corpus roots). See `watch::registry`.
     watch_registry: Arc<super::watch::WatchRegistry>,
@@ -670,20 +689,6 @@ impl DaemonState {
         let restart_cap = cfg.daemon.restart_intensity_cap;
         let restart_window = Duration::from_secs(cfg.daemon.restart_intensity_window_secs);
         let heartbeat = Arc::new(super::heartbeat::HeartbeatRegistry::default());
-        // Boot catch-up (`catch_up_index`, spawned by the server after `open`)
-        // covers every baseline corpus; pre-seed the provisioner so `observe`
-        // does not redundantly re-provision them and race the watcher. If
-        // `catch_up_index` itself fails for a corpus, that corpus self-heals
-        // via the maintenance tick or the watcher, not the provisioner —
-        // the seed here is deliberately one-shot, not a retry guarantee.
-        let baseline_corpora_for_seed = cfg.effective_corpora().unwrap_or_else(|e| {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "could not enumerate baseline corpora for provisioner seed; provisioning may redundantly re-index them",
-            );
-            Vec::new()
-        });
         // Invented defaults, no existing analog in debt.rs.
         let ladder = super::ladder::Ladder {
             warn_at: 3,
@@ -745,11 +750,6 @@ impl DaemonState {
                     heartbeat,
                     maintenance_task: Mutex::new(None),
                     watch_registry: Arc::new(super::watch::WatchRegistry::new()),
-                    provisioner: {
-                        let provisioner = Provisioner::new();
-                        provisioner.seed(&baseline_corpora_for_seed);
-                        provisioner
-                    },
                     shutdown,
                 }
             }),
@@ -791,16 +791,6 @@ impl DaemonState {
             *state.inner.maintenance_task.lock().await = Some(maintenance_task);
         }
 
-        {
-            let loop_state = state.clone();
-            state
-                .inner
-                .supervisor
-                .spawn(super::heartbeat::TaskName::Provision, move || {
-                    provisioning_loop(loop_state.clone())
-                });
-        }
-
         Ok(state)
     }
 
@@ -823,11 +813,6 @@ impl DaemonState {
     /// Heartbeat registry the supervised loops bump and the watchdog polls.
     pub(crate) fn heartbeat(&self) -> &Arc<super::heartbeat::HeartbeatRegistry> {
         &self.inner.heartbeat
-    }
-
-    /// Provisioner queuing newly discovered corpus roots for background catch-up.
-    pub(crate) fn provisioner(&self) -> &Provisioner {
-        &self.inner.provisioner
     }
 
     /// Live-registration ledger backing the watcher pump.
@@ -1309,6 +1294,15 @@ impl DaemonState {
     ) -> Result<MutationGuard, &'static str> {
         super::backpressure::acquire(self, corpus).await
     }
+
+    /// Acquire only the global write-lane permit, without a corpus lock or
+    /// the debt gate. Callers must already hold `lock_corpus` for the
+    /// corpus being written and must have already cleared
+    /// `backpressure::await_debt_gate` *before* taking that lock (the
+    /// catch-up scan/plan/apply split calls this just before `apply`).
+    pub async fn acquire_write_lane(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        super::backpressure::acquire_lane(self).await
+    }
 }
 
 /// Move the stale ground store aside atomically so a fresh store can be
@@ -1495,7 +1489,6 @@ mod tests {
     use super::*;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
     use hallouminate_domain::common::CorpusConfig;
-    use hallouminate_domain::indexer::ChunkStore;
 
     use std::fmt;
     use tracing::Subscriber;
@@ -1995,17 +1988,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisioning_holds_the_mutation_lock_before_writing() {
+    async fn catch_up_slow_scan_does_not_hold_write_lane() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("docs");
         std::fs::create_dir_all(&root).expect("mkdir docs");
         std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
-        let ground = tmp.path().join("ground");
-        let mut cfg = Config::default();
-        cfg.embeddings.enabled = false;
-        cfg.storage.ground_dir = ground.to_string_lossy().into_owned();
-        let state = DaemonState::open(cfg, None).await.expect("open");
-
+        let state = test_state().await;
         let corpus = CorpusConfig {
             name: "docs".to_string(),
             paths: vec![root.to_string_lossy().into_owned()],
@@ -2013,107 +2001,174 @@ mod tests {
             exclude: Vec::new(),
             global: false,
         };
-        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
 
-        let guard = state.lock_corpus("docs").await;
-        state
-            .provisioner()
-            .observe(std::slice::from_ref(&corpus), state.baseline());
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let files = state
-            .store()
-            .list_files(&corpus_key)
+        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let res = state
+            .resources_for(state.baseline())
             .await
-            .expect("list files while locked");
-        assert!(
-            files.is_empty(),
-            "provisioning must not write while the corpus lock is externally held",
-        );
-        drop(guard);
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                reached_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                lane_state.acquire_write_lane().await
+            })
+            .await
+        });
 
-        let mut indexed = false;
-        for _ in 0..100 {
-            let files = state
-                .store()
-                .list_files(&corpus_key)
-                .await
-                .expect("list files after unlock");
-            if !files.is_empty() {
-                indexed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+        reached_rx.await.expect("scan reached the lane hook");
+        {
+            let lane = state.write_lane();
+            let permit = lane
+                .try_acquire()
+                .expect("lane must be free while scan/plan is in flight");
+            drop(permit);
         }
-        assert!(
-            indexed,
-            "provisioning must index the corpus once the external lock releases",
-        );
+        release_tx.send(()).unwrap();
+        let result = task.await.expect("task join");
+        assert!(matches!(result, Ok(Some(_))));
     }
 
     #[tokio::test]
-    async fn provisioning_resolves_resources_from_the_enqueued_config_not_baseline() {
+    async fn catch_up_scan_in_flight_blocks_same_corpus_guard() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().join("wiki");
-        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
         std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
-        let baseline_ground = tmp.path().join("baseline-ground");
-        let repo_ground = tmp.path().join("repo-ground");
-        let mut cfg = Config::default();
-        cfg.embeddings.enabled = false;
-        cfg.storage.ground_dir = baseline_ground.to_string_lossy().into_owned();
-        let state = DaemonState::open(cfg, None).await.expect("open");
-
-        // A request-resolved config whose repo layer overrides where the
-        // store lives (#427 taste-test fix): provisioning must index into
-        // the store resolved from the enqueued config, never the baseline's.
-        let mut resolved_cfg = state.baseline().clone();
-        resolved_cfg.storage.ground_dir = repo_ground.to_string_lossy().into_owned();
-
+        let state = test_state().await;
         let corpus = CorpusConfig {
-            name: "repo:worktree:wiki".to_string(),
+            name: "docs".to_string(),
             paths: vec![root.to_string_lossy().into_owned()],
             globs: vec!["**/*.md".to_string()],
             exclude: Vec::new(),
             global: false,
         };
-        let corpus_key = corpus.corpus_keys().into_iter().next().expect("corpus key");
+        let corpus_name = corpus.name.clone();
 
-        state
-            .provisioner()
-            .observe(std::slice::from_ref(&corpus), &resolved_cfg);
-
-        let repo_res = state
-            .resources_for(&resolved_cfg)
+        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let res = state
+            .resources_for(state.baseline())
             .await
-            .expect("repo-layer resources");
-        let mut indexed = false;
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                reached_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                lane_state.acquire_write_lane().await
+            })
+            .await
+        });
+        reached_rx.await.expect("scan reached the lane hook");
+
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            let _guard = second_state.lock_corpus(&corpus_name).await;
+            second_tx.send(()).unwrap();
+        });
         for _ in 0..100 {
-            let files = repo_res
-                .store
-                .list_files(&corpus_key)
-                .await
-                .expect("list repo-layer store");
-            if !files.is_empty() {
-                indexed = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::task::yield_now().await;
         }
         assert!(
-            indexed,
-            "provisioning must write to the store resolved from the enqueued request config",
+            second_rx.try_recv().is_err(),
+            "second lock_corpus must not complete while the outer guard is held",
         );
-        let baseline_files = state
-            .store()
-            .list_files(&corpus_key)
+
+        release_tx.send(()).unwrap();
+        task.await.expect("task join").expect("catch_up_corpus");
+        drop(_corpus_guard);
+        second.await.expect("second task join");
+    }
+
+    #[tokio::test]
+    async fn catch_up_apply_holds_lane_until_released() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let res = state
+            .resources_for(state.baseline())
             .await
-            .expect("list baseline store");
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                let permit = lane_state.acquire_write_lane().await?;
+                reached_tx.send(()).unwrap();
+                release_rx.await.unwrap();
+                Ok(permit)
+            })
+            .await
+        });
+
+        reached_rx.await.expect("lane acquired before apply");
         assert!(
-            baseline_files.is_empty(),
-            "provisioning must not write to the baseline store when the request config overrides storage",
+            state.write_lane().try_acquire().is_err(),
+            "lane must be held once acquired, before apply starts",
+        );
+        release_tx.send(()).unwrap();
+        let result = task.await.expect("task join");
+        assert!(matches!(result, Ok(Some(_))));
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be released once apply completes",
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_no_work_never_acquires_the_lane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let lane_touched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let touched = lane_touched.clone();
+        let result =
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+                touched.store(true, Ordering::Relaxed);
+                panic!("no-work plan must never acquire the write lane");
+            })
+            .await;
+
+        assert!(matches!(result, Ok(None)));
+        assert!(!lane_touched.load(Ordering::Relaxed));
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be untouched when the plan has no work",
         );
     }
 

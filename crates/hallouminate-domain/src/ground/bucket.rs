@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::common::Result;
 use crate::corpus::make_snippet;
+use crate::footnotes::{FootnoteMode, apply_footnote_mode};
 use crate::indexer::SearchHit;
 
 use super::types::{ChunkProvenance, DocChunk, DocFile};
@@ -15,6 +16,7 @@ pub(super) fn build_docs(
     hits: &[SearchHit],
     top_files: usize,
     chunks_per_file: usize,
+    footnote_mode: FootnoteMode,
 ) -> Result<BTreeMap<String, DocFile>> {
     let mut buckets: HashMap<String, FileBucket> = HashMap::new();
     for hit in hits {
@@ -33,7 +35,7 @@ pub(super) fn build_docs(
     files.truncate(top_files);
     let mut out = BTreeMap::new();
     for f in files {
-        let (key, doc) = f.into_doc(chunks_per_file);
+        let (key, doc) = f.into_doc(chunks_per_file, footnote_mode);
         out.insert(key, doc);
     }
     Ok(out)
@@ -70,7 +72,11 @@ impl FileBucket {
         self.chunks.push(hit);
     }
 
-    fn into_doc(mut self, chunks_per_file: usize) -> (String, DocFile) {
+    fn into_doc(
+        mut self,
+        chunks_per_file: usize,
+        footnote_mode: FootnoteMode,
+    ) -> (String, DocFile) {
         self.chunks.sort_by(|a, b| {
             (b.score)
                 .partial_cmp(&a.score)
@@ -87,7 +93,7 @@ impl FileBucket {
                 line_range: [h.line_start as u32, h.line_end as u32],
                 score: h.score as f64,
                 z_score: h.z_score,
-                snippet: make_snippet(&h.text),
+                snippet: make_snippet(&apply_footnote_mode(&h.text, footnote_mode)),
                 // `corpus` is stamped by the orchestrator from its corpus arg
                 // (the LanceDB row implies corpus by query scope and doesn't
                 // carry it per-row); `claim_marks` is per-row, so it flows from
@@ -191,7 +197,7 @@ mod tests {
             hit("/a.md", 1, 0.5),
             hit("/b.md", 0, 0.7),
         ];
-        let docs = build_docs(&hits, 10, 10).expect("build");
+        let docs = build_docs(&hits, 10, 10, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 2);
         let a = docs.get("/a.md").expect("a present");
         assert!((a.score - 0.9_f64).abs() < 1e-6, "{} != 0.9", a.score);
@@ -208,9 +214,36 @@ mod tests {
         poisoned.text = "display evidence".into();
         poisoned.search_text = "retrieval poison".into();
 
-        let docs = build_docs(&[poisoned], 1, 1).expect("build docs");
+        let docs = build_docs(&[poisoned], 1, 1, FootnoteMode::Include).expect("build docs");
         let chunk = &docs.get("/display.md").expect("display doc").chunks[0];
         assert_eq!(chunk.snippet, "display evidence");
+    }
+
+    #[test]
+    fn footnote_mode_filters_the_snippet_before_it_leaves_the_domain() {
+        // WHY: `footnote_mode` rides the IPC request; if filtering lived only in
+        // the MCP adapter, CLI and any other IPC client would get unfiltered
+        // snippets. Filtering in `build_docs` is the single enforcement point.
+        let mut h = hit("/notes.md", 0, 0.9);
+        h.text = "claim with a marker[^a]\n\n[^a]: the footnote body".into();
+
+        let excluded = build_docs(&[h.clone()], 1, 1, FootnoteMode::Exclude).expect("build");
+        let snippet = &excluded.get("/notes.md").expect("doc").chunks[0].snippet;
+        assert!(
+            !snippet.contains("[^a]") && !snippet.contains("the footnote body"),
+            "Exclude must drop marker and definition, got {snippet:?}"
+        );
+        assert!(
+            snippet.contains("claim with a marker"),
+            "Exclude must keep body prose, got {snippet:?}"
+        );
+
+        let only = build_docs(&[h], 1, 1, FootnoteMode::Only).expect("build");
+        let snippet = &only.get("/notes.md").expect("doc").chunks[0].snippet;
+        assert!(
+            snippet.contains("the footnote body") && !snippet.contains("claim with a marker"),
+            "Only must keep just the definition, got {snippet:?}"
+        );
     }
 
     #[test]
@@ -223,7 +256,7 @@ mod tests {
             reference: Some("old.md".into()),
             note: None,
         }];
-        let docs = build_docs(&[h], 5, 5).expect("build");
+        let docs = build_docs(&[h], 5, 5, FootnoteMode::Include).expect("build");
         let chunk = &docs.get("/a.md").expect("a present").chunks[0];
         assert_eq!(
             chunk.provenance.claim_marks,
@@ -244,7 +277,7 @@ mod tests {
             hit("/a.md", 0, 0.5), // tied, lex smaller wins tie
             hit("/b.md", 0, 0.9),
         ];
-        let docs = build_docs(&hits, 2, 5).expect("build");
+        let docs = build_docs(&hits, 2, 5, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 2);
         assert!(docs.contains_key("/b.md"));
         assert!(
@@ -262,7 +295,7 @@ mod tests {
             hit("/x.md", 1, 0.5),
             hit("/x.md", 2, 0.7),
         ];
-        let docs = build_docs(&hits, 5, 2).expect("build");
+        let docs = build_docs(&hits, 5, 2, FootnoteMode::Include).expect("build");
         let x = docs.get("/x.md").expect("x present");
         assert_eq!(x.chunks.len(), 2);
         assert!(
@@ -279,14 +312,14 @@ mod tests {
 
     #[test]
     fn empty_hits_yield_empty_docs() {
-        let docs = build_docs(&[], 10, 10).expect("build");
+        let docs = build_docs(&[], 10, 10, FootnoteMode::Include).expect("build");
         assert!(docs.is_empty());
     }
 
     #[test]
     fn top_files_zero_yields_empty_docs_even_when_hits_present() {
         let hits = vec![hit("/a.md", 0, 0.9), hit("/b.md", 0, 0.5)];
-        let docs = build_docs(&hits, 0, 5).expect("build");
+        let docs = build_docs(&hits, 0, 5, FootnoteMode::Include).expect("build");
         assert!(
             docs.is_empty(),
             "top_files=0 must drop every bucket; got {:?}",
@@ -297,7 +330,7 @@ mod tests {
     #[test]
     fn chunks_per_file_zero_keeps_files_but_drops_all_chunks() {
         let hits = vec![hit("/a.md", 0, 0.9), hit("/a.md", 1, 0.5)];
-        let docs = build_docs(&hits, 5, 0).expect("build");
+        let docs = build_docs(&hits, 5, 0, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 1, "file bucket survives top-files cut");
         let a = docs.get("/a.md").expect("a present");
         assert!(a.chunks.is_empty(), "chunks_per_file=0 drops all chunks");
@@ -313,7 +346,7 @@ mod tests {
         // DocFile.summary so JSON consumers see `null`, not `""`.
         let mut h = hit("/a.md", 0, 0.5);
         h.summary = String::new();
-        let docs = build_docs(&[h], 5, 5).expect("build");
+        let docs = build_docs(&[h], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert_eq!(
             a.summary, None,
@@ -326,7 +359,7 @@ mod tests {
         // Regression for PR #7 Copilot review: DocFile.mtime must reflect
         // the file's stored mtime_ms, not an empty string. Use the fixture
         // hit's mtime_ms (2024-01-01T00:00:00Z) so the round-trip is exact.
-        let docs = build_docs(&[hit("/a.md", 0, 0.5)], 5, 5).expect("build");
+        let docs = build_docs(&[hit("/a.md", 0, 0.5)], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert_eq!(
             a.mtime, "2024-01-01T00:00:00Z",
@@ -341,7 +374,7 @@ mod tests {
         // None and the formatter returns Default (empty string).
         let mut h = hit("/a.md", 0, 0.5);
         h.mtime_ms = i64::MAX;
-        let docs = build_docs(&[h], 5, 5).expect("build");
+        let docs = build_docs(&[h], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert!(
             a.mtime.is_empty(),
@@ -359,7 +392,7 @@ mod tests {
             hit("/x.md", 0, 0.5), // chunk_id "/x.md#0"
             hit("/x.md", 1, 0.5), // chunk_id "/x.md#1"
         ];
-        let docs = build_docs(&hits, 5, 5).expect("build");
+        let docs = build_docs(&hits, 5, 5, FootnoteMode::Include).expect("build");
         let x = docs.get("/x.md").expect("x present");
         let ids: Vec<&str> = x.chunks.iter().map(|c| c.chunk_id.as_str()).collect();
         assert_eq!(
@@ -468,7 +501,7 @@ mod tests {
         ];
         // No z stamping — simulates the RRF/OFF path (crossencoder: None, so the
         // `if let Some(rerank)` gate in the orchestrator never fires).
-        let docs = build_docs(&hits, 10, 10).expect("build");
+        let docs = build_docs(&hits, 10, 10, FootnoteMode::Include).expect("build");
         for (path, doc) in &docs {
             assert!(
                 doc.z_score.is_none(),
@@ -512,7 +545,7 @@ mod tests {
         let expected_top_z = (0.9_f32 as f64 - mu) / sigma;
         let expected_second_z = (0.8_f32 as f64 - mu) / sigma;
         // Now build docs with top_files=2 — only top-2 survive.
-        let docs = build_docs(&hits, 2, 5).expect("build");
+        let docs = build_docs(&hits, 2, 5, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 2);
         let top = docs.get("/f0.md").expect("/f0.md present");
         assert!(
@@ -623,7 +656,7 @@ mod tests {
         let mut high = hit("/a.md", 1, 0.9);
         high.z_score = Some(1.5); // z for the higher-score chunk
         // Push low first, then high — FileBucket.push should adopt high's z.
-        let docs = build_docs(&[low, high], 5, 5).expect("build");
+        let docs = build_docs(&[low, high], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert!(
             (a.z_score.expect("file z must be Some") - 1.5).abs() < 1e-9,
@@ -641,7 +674,7 @@ mod tests {
         h0.z_score = Some(1.2);
         let mut h1 = hit("/a.md", 1, 0.5);
         h1.z_score = Some(-0.3);
-        let docs = build_docs(&[h0, h1], 5, 5).expect("build");
+        let docs = build_docs(&[h0, h1], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         // Chunks are sorted by score desc: h0 (0.9) first, h1 (0.5) second.
         assert_eq!(a.chunks.len(), 2);

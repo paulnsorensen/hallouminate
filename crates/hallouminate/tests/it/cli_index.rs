@@ -80,11 +80,11 @@ async fn cmd_index_indexes_fixture_corpus_end_to_end() {
     })
     .await
     .expect("first index run");
+    // Stop and await the daemon before reopening its exclusively owned store.
+    harness.shutdown().await.expect("daemon shutdown");
 
     // Re-open the LanceStore at the same ground dir the daemon used and
-    // assert chunks landed. (Reading the store directly is safe here
-    // because the daemon doesn't hold an exclusive lock — it just owns
-    // mutations. Listing rows is a read.)
+    // assert chunks landed after ownership ends.
     let store = LanceStore::open_or_create(&ground_dir, MODEL, false, true, None)
         .await
         .expect("reopen ground dir");

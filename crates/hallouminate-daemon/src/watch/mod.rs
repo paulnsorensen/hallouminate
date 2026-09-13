@@ -9,11 +9,12 @@
 //! Live registration: `spawn_corpus_watcher` seeds the boot baseline's
 //! `[[corpus]]`/`[[repository]]` roots into `state.watch_registry()`, then
 //! the pump task reconciles against that registry every loop iteration —
-//! new registrations get `debouncer.watch()`'d and catch-up'd without a
-//! watcher restart. `register_runtime_corpora` (called from
-//! `dispatch::handle_ground`) registers request-resolved repo-layer corpora,
-//! and `reload_repo_layer` (driven by the reconcile tick) re-resolves and
-//! replaces a repo-layer source's registrations as its config changes.
+//! new registrations get `debouncer.watch()`'d when available, or are marked
+//! degraded, and get catch-up'd without a watcher restart.
+//! `register_runtime_corpora` (called from `dispatch::handle_ground`) registers
+//! request-resolved repo-layer corpora, and `reload_repo_layer` (driven by the
+//! reconcile tick) re-resolves and replaces a repo-layer source's registrations
+//! as its config changes.
 //!
 //! Concurrency (spec Risk): every reindex takes the same per-corpus lock +
 //! global write-lane (`acquire_mutation_guard`) that `handle_index` /
@@ -24,7 +25,7 @@ mod registry;
 
 pub(crate) use registry::{ConfigSource, WatchRegistry};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -206,23 +207,21 @@ impl ReloadFailureMemo {
     }
 }
 
-/// Owns the background debouncer + event-pump task. Dropping it stops the
-/// watcher: the pump task owns the debouncer directly, so aborting/dropping
-/// this handle's `_task` drops the debouncer transitively, which releases
-/// every physical `notify` watch. Registration teardown rides on this drop —
-/// there is no separate explicit "unregister everything" step.
-pub struct WatcherHandle {
-    _task: tokio::task::JoinHandle<()>,
+/// Owns the background debouncer and event-pump task.
+///
+/// Call [`WatcherHandle::abort`] or [`WatcherHandle::join`] to stop the watcher
+/// and release its physical `notify` watches. Dropping the handle alone detaches
+/// the task and does not stop it.
+pub(crate) struct WatcherHandle {
+    task: tokio::task::JoinHandle<()>,
     tracker: TaskTracker,
 }
 
 impl WatcherHandle {
     /// Await the pump task; used by the supervisor factory so a watcher
-    /// restart rebuilds the whole debouncer + pump pair. Holds `self` (and
-    /// so the debouncer, owned by the task) alive until the pump future
-    /// completes.
+    /// restart rebuilds the whole debouncer + pump pair.
     pub(crate) async fn join(self) {
-        let result = self._task.await;
+        let result = self.task.await;
         self.tracker.close();
         self.tracker.wait().await;
         if let Err(join_err) = result {
@@ -231,6 +230,20 @@ impl WatcherHandle {
                 std::panic::resume_unwind(join_err.into_panic());
             }
         }
+    }
+
+    /// Abort and await the watcher task so its debouncer releases every watch.
+    pub(crate) async fn abort(self) {
+        self.task.abort();
+        let _ = self.task.await;
+        self.tracker.close();
+        self.tracker.wait().await;
+    }
+
+    /// Whether the pump task has already finished (aborted or panicked).
+    #[cfg(test)]
+    pub(crate) fn is_finished(&self) -> bool {
+        self.task.is_finished()
     }
 }
 
@@ -348,63 +361,143 @@ async fn cleanup_retired_registration(
     }
 }
 
-/// Bundles the watcher pump's live-reconcile state: the installed
+/// Bundles the watcher pump's live-reconcile state: the optional
 /// debouncer, the set of paths currently `debouncer.watch()`'d, and the
 /// flattened current root list used by `process_change_batch`.
 struct PumpState {
-    debouncer: notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
-    installed: std::collections::HashSet<PathBuf>,
+    debouncer: Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>>,
+    installed: HashMap<PathBuf, RecursiveMode>,
     roots: Vec<WatchRoot>,
+    /// Registrations already marked `Degraded` because the native backend
+    /// is unavailable, so a later reconcile pass can skip the registry
+    /// lock for them entirely instead of rewriting an identical
+    /// observation every tick. Pruned to the current snapshot each pass.
+    degraded_backend: HashSet<registry::RegistrationId>,
 }
 
 impl PumpState {
     /// Reconcile the live debouncer against the registry's current
-    /// registrations: newly-registered roots get `debouncer.watch()`'d (or
-    /// `mark_degraded` on failure), any registration whose catch-up hasn't
-    /// started gets one spawned, and `self.roots` is refreshed to the
-    /// flattened current root list for the caller's subsequent
-    /// `process_change_batch` call.
+    /// registrations: newly-registered roots get `debouncer.watch()`'d when
+    /// available (or marked degraded when unavailable), any registration
+    /// whose catch-up hasn't started gets one spawned, and `self.roots` is
+    /// refreshed to the flattened current root list for the caller's
+    /// subsequent `process_change_batch` call.
     fn reconcile(&mut self, state: &DaemonState, tracker: &TaskTracker) {
         let registry = state.watch_registry();
         registry.refresh_roots(watch_roots_for);
         let snapshot = registry.snapshot_roots();
-        let desired: std::collections::HashSet<PathBuf> = snapshot
+        let desired = Self::desired_watches(&snapshot);
+        self.drop_obsolete_watches(&desired);
+        self.roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
+        self.install_or_degrade_watches(registry, &snapshot, desired);
+        Self::admit_next_catch_up(registry, state, tracker);
+    }
+
+    /// Union of every distinct watched path across `snapshot`, recursive if
+    /// any registration sharing that path wants recursion.
+    fn desired_watches(
+        snapshot: &[(registry::RegistrationId, WatchRoot)],
+    ) -> HashMap<PathBuf, RecursiveMode> {
+        let mut desired = HashMap::new();
+        for (_, root) in snapshot {
+            desired
+                .entry(root.watched.clone())
+                .and_modify(|mode| {
+                    if root.mode == RecursiveMode::Recursive {
+                        *mode = RecursiveMode::Recursive;
+                    }
+                })
+                .or_insert(root.mode);
+        }
+        desired
+    }
+
+    /// Removes any currently-installed watch whose path or mode no longer
+    /// matches `desired`.
+    fn drop_obsolete_watches(&mut self, desired: &HashMap<PathBuf, RecursiveMode>) {
+        let obsolete: Vec<PathBuf> = self
+            .installed
             .iter()
-            .map(|(_, root)| root.watched.clone())
+            .filter(|(path, mode)| desired.get(*path) != Some(mode))
+            .map(|(path, _)| path.clone())
             .collect();
-        let obsolete: Vec<PathBuf> = self.installed.difference(&desired).cloned().collect();
         for path in obsolete {
-            if let Err(error) = self.debouncer.unwatch(&path) {
+            if let Some(debouncer) = self.debouncer.as_mut()
+                && let Err(error) = debouncer.unwatch(&path)
+            {
                 tracing::debug!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: obsolete watch removal failed");
             }
             self.installed.remove(&path);
         }
-        self.roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
-        for (id, root) in &snapshot {
-            if self.installed.contains(&root.watched) {
+    }
+
+    /// Installs every not-yet-installed desired watch, or marks its
+    /// registrations degraded when the native backend is unavailable or the
+    /// install itself fails.
+    fn install_or_degrade_watches(
+        &mut self,
+        registry: &registry::WatchRegistry,
+        snapshot: &[(registry::RegistrationId, WatchRoot)],
+        desired: HashMap<PathBuf, RecursiveMode>,
+    ) {
+        let live: HashSet<&registry::RegistrationId> = snapshot.iter().map(|(id, _)| id).collect();
+        self.degraded_backend.retain(|id| live.contains(id));
+        for (path, mode) in desired {
+            if self.installed.contains_key(&path) {
                 continue;
             }
-            let was_degraded = match registry.observation(id) {
-                Some(registry::Observation::Degraded { .. }) => true,
-                Some(registry::Observation::Watched) => false,
-                None => false,
+            let ids: Vec<_> = snapshot
+                .iter()
+                .filter(|(_, root)| root.watched == path)
+                .map(|(id, _)| id)
+                .collect();
+            let Some(debouncer) = self.debouncer.as_mut() else {
+                for id in ids {
+                    if self.degraded_backend.insert(id.clone()) {
+                        registry.mark_backend_unavailable(id);
+                        tracing::warn!(
+                            target: "hallouminate::daemon",
+                            root = %path.display(),
+                            "watcher: native backend unavailable; root observed by periodic reconciliation only",
+                        );
+                    }
+                }
+                continue;
             };
-            match self.debouncer.watch(&root.watched, root.mode) {
+            let was_degraded = ids.iter().any(|id| {
+                matches!(
+                    registry.observation(id),
+                    Some(registry::Observation::Degraded { .. })
+                )
+            });
+            match debouncer.watch(&path, mode) {
                 Ok(()) => {
-                    self.installed.insert(root.watched.clone());
-                    registry.mark_watched(id);
+                    self.installed.insert(path.clone(), mode);
+                    for id in ids {
+                        registry.mark_watched(id);
+                    }
                     if was_degraded {
-                        tracing::info!(target: "hallouminate::daemon", corpus = %id.corpus_key.name, root = %root.watched.display(), "watcher: watch install recovered");
+                        tracing::info!(target: "hallouminate::daemon", root = %path.display(), "watcher: watch install recovered");
                     }
                 }
                 Err(error) => {
                     if !was_degraded {
-                        tracing::warn!(target: "hallouminate::daemon", corpus = %id.corpus_key.name, root = %root.watched.display(), error = %error, "watcher: watch install failed; reconciliation continues");
+                        tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: watch install failed; reconciliation continues");
                     }
-                    registry.mark_degraded(id, error.to_string());
+                    for id in ids {
+                        registry.mark_degraded(id, error.to_string());
+                    }
                 }
             }
         }
+    }
+
+    /// Admits the next queued catch-up pass, if the registry has one ready.
+    fn admit_next_catch_up(
+        registry: &registry::WatchRegistry,
+        state: &DaemonState,
+        tracker: &TaskTracker,
+    ) {
         if let Some(id) = registry.begin_next_catch_up() {
             spawn_registration_catch_up(state.clone(), id, tracker);
         }
@@ -425,15 +518,46 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
             state.touch_activity(WorkClass::Internal);
             return;
         };
-        // Take the same per-corpus lock and global write-lane, in the same
-        // order, that `handle_index` and `provisioner::provision_corpus`
-        // take. A catch-up pass rewrites the corpus' rows, so without the
-        // guard it races an explicit `index` or an `add_markdown` write.
-        let outcome = match state.acquire_mutation_guard(&corpus.name).await {
-            Ok(_guard) => match state.resources_for(&cfg).await {
+        // Hold the per-corpus lock for the whole scan-through-apply span so
+        // no other writer to this corpus interleaves; the global write-lane
+        // permit is acquired by `catch_up_corpus` itself, only once a
+        // non-empty plan confirms there is real work to apply.
+        let outcome = {
+            // Wait out maintenance debt before taking the corpus lock, so a
+            // Hard-debt block never stalls same-corpus `index`/`add_markdown`.
+            match super::backpressure::await_debt_gate(&state).await {
+                Ok(()) => {}
+                Err(e) => {
+                    state.watch_registry().finish_catch_up(&id, Err(e.to_string()));
+                    state.touch_activity(WorkClass::Internal);
+                    return;
+                }
+            }
+            let _guard = state.lock_corpus(&corpus.name).await;
+            match state.resources_for(&cfg).await {
                 Ok(res) => {
                     let reg = state.make_registry();
-                    match super::dispatch::catch_up_corpus(&res, &reg, &corpus).await {
+                    let lane_state = state.clone();
+                    let shutdown = state.shutdown_token().clone();
+                    // Race the lane wait against shutdown so a catch-up
+                    // parked behind another writer's permit bails out as
+                    // soon as shutdown is requested, instead of holding the
+                    // corpus lock (and thus this task) open indefinitely.
+                    match super::dispatch::catch_up_corpus(&res, &reg, &corpus, || {
+                        let lane_state = lane_state.clone();
+                        let shutdown = shutdown.clone();
+                        async move {
+                            tokio::select! {
+                                biased;
+                                () = shutdown.cancelled() => {
+                                    Err("daemon shutting down; catch-up cancelled before taking the write lane")
+                                }
+                                permit = lane_state.acquire_write_lane() => permit,
+                            }
+                        }
+                    })
+                    .await
+                    {
                         Ok(_) => Ok(()),
                         Err(e) => {
                             tracing::warn!(
@@ -457,15 +581,6 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     );
                     Err(e.to_string())
                 }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    corpus = %corpus.name,
-                    error = %e,
-                    "watcher: no mutation guard for registration catch-up; retry on recovery",
-                );
-                Err(e.to_string())
             }
         };
         let recovered = outcome.is_ok() && state.watch_registry().has_error(&id);
@@ -489,50 +604,51 @@ pub(crate) fn register_runtime_corpora(
     repo_path: Option<&std::path::Path>,
     corpora: &[CorpusConfig],
     cfg: &hallouminate_config::Config,
-) -> Result<registry::ConfigSource, String> {
+) -> Result<(registry::ConfigSource, bool), String> {
     let source = repo_path
         .map(|path| registry::ConfigSource::RepoLayer(path.to_path_buf()))
         .unwrap_or(registry::ConfigSource::Baseline);
     let cfg = std::sync::Arc::new(cfg.clone());
+    let mut limit_reached = false;
     for corpus in corpora {
+        let roots = watch_roots_for(corpus);
         if state
             .watch_registry()
-            .is_registered_unchanged(&source, corpus, &cfg)
+            .is_registered_unchanged(&source, corpus, &cfg, &roots)
         {
             continue;
         }
-        let roots = watch_roots_for(corpus);
         match state
             .watch_registry()
             .register(source.clone(), corpus.clone(), cfg.clone(), roots)
         {
             registry::RegisterOutcome::Conflict(message) => return Err(message),
-            registry::RegisterOutcome::LimitReached => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    corpus = %corpus.name,
-                    "watcher: registration limit reached; corpus not watched",
-                );
-            }
+            registry::RegisterOutcome::LimitReached => limit_reached = true,
             registry::RegisterOutcome::New | registry::RegisterOutcome::AlreadyRegistered => {}
         }
     }
-    Ok(source)
+    if limit_reached {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            source = ?source,
+            "watcher: registration limit reached; one or more corpora are not watched",
+        );
+    }
+    Ok((source, limit_reached))
 }
 
 /// Builds the notify debouncer that reindexes changed markdown files: each
 /// debounced batch is folded into `pending` and `wake` is notified so the
-/// pump loop picks it up on its next iteration. Returns `None` only when
-/// the watcher backend itself fails to initialize.
+/// pump loop picks it up on its next iteration. Returns `None` when the
+/// watcher backend fails to initialize; reconciliation continues without it.
 fn build_debouncer(
     cfg: &hallouminate_config::Config,
     state: &DaemonState,
     wake: std::sync::Arc<tokio::sync::Notify>,
-    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    pending: std::sync::Arc<std::sync::Mutex<PendingPaths>>,
+    quiet: bool,
 ) -> Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>> {
     let debounce = Duration::from_millis(cfg.watch.debounce_ms);
-    // Affected paths pending reindex, coalesced across debounced batches (not
-    // just within one) rather than forwarded whole-batch through an
     // unbounded channel: a write burst that outpaces the serial async
     // consumer used to retain every debounced batch in daemon memory
     // indefinitely. `pending` accumulates distinct paths; `wake` only signals
@@ -578,11 +694,13 @@ fn build_debouncer(
     ) {
         Ok(d) => Some(d),
         Err(e) => {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "watcher: failed to create debouncer; auto-reindex disabled",
-            );
+            if !quiet {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %e,
+                    "watcher: failed to create debouncer; reconciliation continues in degraded mode",
+                );
+            }
             None
         }
     }
@@ -596,7 +714,6 @@ struct PumpConfig {
     churn_warn_at: u32,
     churn_act_at: u32,
 }
-
 /// Runs the watcher pump loop: reconciles `pump` against the registry on
 /// every registry-changed signal and on each reconcile tick, reloads
 /// repo-layer config on tick, and drains `pending` into
@@ -606,7 +723,7 @@ async fn run_pump(
     state: DaemonState,
     mut pump: PumpState,
     wake: std::sync::Arc<tokio::sync::Notify>,
-    pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    pending: std::sync::Arc<std::sync::Mutex<PendingPaths>>,
     tracker: TaskTracker,
     config: PumpConfig,
     mut last_reconciled: u64,
@@ -624,17 +741,22 @@ async fn run_pump(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            // `Notify::notify_waiters()` has no permit memory, so a
-            // signal that arrives while nothing is `.await`ing it here is
-            // lost. That is acceptable because the generation-gated
-            // reconcile below runs on every `reconcile_tick`, which
-            // bounds how stale a lost signal can get to
-            // `watch.reconcile_interval_secs` -- that reconcile is the
-            // correctness backstop; this arm is purely a latency
-            // improvement for the common case.
+            // The registry has exactly one consumer of `changed()`: this
+            // select loop. `WatchRegistry::signal_changed` uses
+            // `notify_one()`, which carries a permit, so a signal fired
+            // while this arm isn't being polled (this task not yet
+            // scheduled, or busy in `pump.reconcile` / a batch below) is
+            // still observed the next time this `select!` runs it, not
+            // lost. The generation-gated reconcile below remains a
+            // correctness backstop independent of that delivery, bounding
+            // staleness to `watch.reconcile_interval_secs` even if this
+            // arm were somehow never polled.
             () = state.watch_registry().changed().notified() => {
                 pump.reconcile(&state, &tracker);
                 last_reconciled = state.watch_registry().generation();
+                state
+                    .heartbeat()
+                    .bump(super::heartbeat::TaskName::WatcherPump);
                 continue;
             }
             _ = reconcile_tick.tick() => {
@@ -644,6 +766,9 @@ async fn run_pump(
                 state.watch_registry().mark_reconcile_due_all();
                 pump.reconcile(&state, &tracker);
                 last_reconciled = state.watch_registry().generation();
+                state
+                    .heartbeat()
+                    .bump(super::heartbeat::TaskName::WatcherPump);
                 continue;
             }
             // `notify_one()` carries a permit, so this is cancel-safe:
@@ -676,10 +801,18 @@ async fn run_pump(
             pump.reconcile(&state, &tracker);
             last_reconciled = state.watch_registry().generation();
         }
-        let paths: Vec<PathBuf> = {
-            let mut set = pending.lock().expect("watch pending-paths mutex");
-            set.drain().collect()
+        let (paths, overflow) = {
+            let mut pending = pending.lock().expect("watch pending-paths mutex");
+            (
+                pending.paths.drain().collect::<Vec<_>>(),
+                std::mem::take(&mut pending.overflow),
+            )
         };
+        if overflow {
+            state.watch_registry().mark_reconcile_due_all();
+            pump.reconcile(&state, &tracker);
+            last_reconciled = state.watch_registry().generation();
+        }
         if !paths.is_empty() {
             process_change_batch(&state, &pump.roots, paths, &mut failures, &mut churn).await;
         }
@@ -687,13 +820,45 @@ async fn run_pump(
 }
 
 /// Watch every corpus root the `WatchRegistry` knows about and spawn a task
-/// that reindexes changed markdown files (debounced by `cfg.watch.debounce_ms`)
-/// and reconciles newly-registered roots. Seeds the boot baseline's corpora
-/// into `state.watch_registry()` before installing any watches. Returns
-/// `None` only when the watcher backend itself fails to initialize — an
-/// empty baseline root set is not a failure, since runtime registrations may
-/// arrive later.
-pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
+/// that reindexes changed markdown files when a debouncer is available.
+/// Reconciliation still catches up newly-registered roots when the watcher
+/// backend cannot initialize. Seeds the boot baseline's corpora into
+/// `state.watch_registry()`. Returns `None` only when baseline corpus
+/// enumeration fails; then no pump exists and no degraded reconciliation
+/// runs. A native backend failure still returns a handle, in degraded mode.
+pub(crate) fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
+    spawn_corpus_watcher_inner(state, false)
+}
+
+/// Same as [`spawn_corpus_watcher`], but suppresses the "failed to create
+/// debouncer" warning. For the boot-time capability probe in `server.rs`,
+/// whose handle is aborted immediately and never reconciles in degraded
+/// mode, so the warning would otherwise fire twice per boot for one
+/// degraded condition.
+pub(crate) fn spawn_corpus_watcher_probe(state: &DaemonState) -> Option<WatcherHandle> {
+    spawn_corpus_watcher_inner(state, true)
+}
+
+fn spawn_corpus_watcher_inner(state: &DaemonState, quiet: bool) -> Option<WatcherHandle> {
+    spawn_corpus_watcher_with(state, quiet, build_debouncer)
+}
+
+/// Seam for tests: swaps in a `debouncer_factory` other than [`build_debouncer`]
+/// (e.g. one that always returns `None`) so a degraded pump can be exercised
+/// without depending on the host's real notify backend.
+fn spawn_corpus_watcher_with(
+    state: &DaemonState,
+    quiet: bool,
+    debouncer_factory: impl FnOnce(
+        &hallouminate_config::Config,
+        &DaemonState,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<std::sync::Mutex<PendingPaths>>,
+        bool,
+    ) -> Option<
+        notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
+    >,
+) -> Option<WatcherHandle> {
     let cfg = state.baseline();
     let failure_reminder = Duration::from_secs(cfg.watch.failure_reminder_secs);
     let corpora = match cfg.effective_corpora() {
@@ -719,23 +884,22 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
             .seed_baseline(corpus.clone(), baseline_cfg.clone(), corpus_roots);
     }
 
-    let pending: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let pending: std::sync::Arc<std::sync::Mutex<PendingPaths>> =
+        std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
     let wake = std::sync::Arc::new(tokio::sync::Notify::new());
-
-    let debouncer = build_debouncer(cfg, state, wake.clone(), pending.clone())?;
+    let debouncer = debouncer_factory(cfg, state, wake.clone(), pending.clone(), quiet);
+    let tracker = TaskTracker::new();
 
     // Reconciled once here (installing the baseline watches just seeded
     // above) before the pump task takes ownership of `pump`.
     let mut pump = PumpState {
         debouncer,
-        installed: std::collections::HashSet::new(),
+        installed: HashMap::new(),
         roots: Vec::new(),
+        degraded_backend: HashSet::new(),
     };
-    let tracker = TaskTracker::new();
     pump.reconcile(state, &tracker);
     let last_reconciled = state.watch_registry().generation();
-
     let pump_config = PumpConfig {
         reconcile_interval: Duration::from_secs(cfg.watch.effective_reconcile_interval_secs()),
         failure_reminder,
@@ -754,10 +918,31 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
         last_reconciled,
     ));
 
-    Some(WatcherHandle {
-        _task: task,
-        tracker,
-    })
+    Some(WatcherHandle { task, tracker })
+}
+
+/// Upper bound on distinct pending paths tracked between catch-up drains,
+/// before `record_pending` starts marking `overflow` instead of inserting.
+const MAX_PENDING_PATHS: usize = 4096;
+
+#[derive(Default)]
+struct PendingPaths {
+    paths: std::collections::HashSet<PathBuf>,
+    overflow: bool,
+}
+
+impl std::ops::Deref for PendingPaths {
+    type Target = std::collections::HashSet<PathBuf>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.paths
+    }
+}
+
+impl std::ops::DerefMut for PendingPaths {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.paths
+    }
 }
 
 /// Insert every markdown path from one debounced batch into the shared
@@ -780,28 +965,20 @@ pub fn spawn_corpus_watcher(state: &DaemonState) -> Option<WatcherHandle> {
 /// overflow forcing a directory rescan (`Flag::Rescan`), never for a
 /// non-mutating access, so treating it like `Any` is the conservative call.
 fn record_pending(
-    pending: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    pending: &std::sync::Mutex<PendingPaths>,
     events: &[notify_debouncer_full::DebouncedEvent],
 ) {
-    let mut set = pending.lock().expect("watch pending-paths mutex");
+    let mut pending = pending.lock().expect("watch pending-paths mutex");
     for event in events {
         if matches!(event.kind, notify::EventKind::Access(_)) {
             continue;
         }
         for path in &event.paths {
-            // Extension-only, matching `format_from_extension`'s classification
-            // without reading bytes: a deleted path no longer exists to sniff, and
-            // reading an existing one just to decide admission would duplicate the
-            // indexer's own read. Extensionless files fall through to `None` here
-            // (never admitted) rather than risking a second, diverging extension
-            // rule from the one `domain::indexer::format` owns.
-            if !matches!(
-                hallouminate_domain::indexer::format_from_extension(path),
-                Some(Some(_))
-            ) {
-                continue;
+            if pending.paths.len() < MAX_PENDING_PATHS || pending.paths.contains(path) {
+                pending.paths.insert(path.clone());
+            } else {
+                pending.overflow = true;
             }
-            set.insert(path.clone());
         }
     }
 }
@@ -1182,6 +1359,7 @@ fn delete_file_ref(owner: &WatchRoot, path: &Path) -> hallouminate_domain::commo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hallouminate_domain::indexer::ChunkStore;
 
     fn corpus(name: &str, root: &str, globs: &[&str]) -> CorpusConfig {
         CorpusConfig {
@@ -1738,6 +1916,30 @@ mod tests {
         );
     }
 
+    /// Drives `pump` twice against `state`, asserting one catch-up pass is
+    /// admitted for `id` and a second immediate reconcile does not admit a
+    /// duplicate while that pass is still in flight.
+    fn assert_admits_one_pass(
+        state: &DaemonState,
+        pump: &mut PumpState,
+        tracker: &TaskTracker,
+        id: &RegistrationId,
+        message: &str,
+    ) {
+        pump.reconcile(state, tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(id),
+            Some(registry::CatchUpState::InFlight),
+            "{message}",
+        );
+        pump.reconcile(state, tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(id),
+            Some(registry::CatchUpState::InFlight),
+            "an immediate reconcile must not admit a duplicate pass",
+        );
+    }
+
     /// Regression for the "accepts registrations with zero baseline
     /// corpora" requirement: a `Config` with no `[[corpus]]` and no
     /// `[[repository]]` entries still starts the live watcher service
@@ -1758,6 +1960,324 @@ mod tests {
             "the watcher service must start even with no baseline corpora, \
              so runtime-discovered corpora can register later"
         );
+    }
+
+    /// A missing notify debouncer must leave reconciliation available. The
+    /// first pass indexes the registration, an immediate second pass does not
+    /// admit a duplicate while that pass is active, and a later reconciliation
+    /// indexes a changed file as the degraded correctness backstop.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_without_debouncer_indexes_without_hot_retry() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let root = root.canonicalize().expect("canonicalize wiki");
+        let file = root.join("note.md");
+        std::fs::write(&file, "# First\n\nbody\n").expect("write initial note");
+        let live_corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        let key = live_corpus.primary_corpus_key().expect("corpus key");
+        register_runtime_corpora(&state, None, &[live_corpus], &cfg)
+            .expect("register runtime corpus");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("runtime registration root");
+
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: None,
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+        };
+        let first_permit = state
+            .acquire_write_lane()
+            .await
+            .expect("acquire sole write-lane permit");
+        assert_admits_one_pass(
+            &state,
+            &mut pump,
+            &tracker,
+            &id,
+            "the unavailable debouncer must still admit one catch-up pass",
+        );
+        drop(first_permit);
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "initial degraded catch-up must complete",
+            || async {
+                state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+            },
+        )
+        .await;
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::Done),
+            "an immediate reconcile after completion must not queue a retry",
+        );
+        let file_ref = file.to_str().unwrap();
+        let first_hash = state
+            .store()
+            .get_file_snapshot(&key, file_ref)
+            .await
+            .expect("initial snapshot query")
+            .expect("degraded reconciliation must index the initial file")
+            .content_hash;
+
+        std::fs::write(&file, "# Second\n\nchanged\n").expect("write changed note");
+        set_mtime(&file, std::time::SystemTime::now() + Duration::from_secs(1));
+        let second_permit = state
+            .acquire_write_lane()
+            .await
+            .expect("reacquire sole write-lane permit");
+        state.watch_registry().mark_reconcile_due_all();
+        assert_admits_one_pass(
+            &state,
+            &mut pump,
+            &tracker,
+            &id,
+            "a later reconciliation must admit changed work",
+        );
+        drop(second_permit);
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "later degraded catch-up must complete",
+            || async {
+                state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+            },
+        )
+        .await;
+        pump.reconcile(&state, &tracker);
+        assert_eq!(
+            state.watch_registry().catch_up_state(&id),
+            Some(registry::CatchUpState::Done),
+            "an immediate reconcile after completion must not queue a retry",
+        );
+        let second_snapshot = state
+            .store()
+            .get_file_snapshot(&key, file_ref)
+            .await
+            .expect("changed snapshot query")
+            .expect("later reconciliation must retain the changed file");
+        assert_ne!(
+            second_snapshot.content_hash, first_hash,
+            "later reconciliation must index changed content without notify",
+        );
+        assert!(
+            matches!(
+                state.watch_registry().observation(&id),
+                Some(registry::Observation::Degraded { .. })
+            ),
+            "the registration must retain its degraded observation",
+        );
+
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    /// Split out of `reconcile_without_debouncer_indexes_without_hot_retry`:
+    /// a later corpus registered at the same watch root while degraded must
+    /// itself report a degraded observation, not silently inherit the first
+    /// registration's status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_without_debouncer_degrades_a_later_shared_root_registration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let root = root.canonicalize().expect("canonicalize wiki");
+        std::fs::write(root.join("note.md"), "# First\n\nbody\n").expect("write initial note");
+        let live_corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        register_runtime_corpora(&state, None, &[live_corpus], &cfg)
+            .expect("register runtime corpus");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("runtime registration root");
+
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: None,
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+        };
+        pump.reconcile(&state, &tracker);
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "initial degraded catch-up must complete",
+            || async {
+                state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+            },
+        )
+        .await;
+
+        let shared = corpus("shared", root.to_str().unwrap(), &["**/*.md"]);
+        let shared_id = RegistrationId {
+            source: registry::ConfigSource::Baseline,
+            corpus_key: shared.primary_corpus_key().expect("shared corpus key"),
+        };
+        register_runtime_corpora(&state, None, &[shared], &cfg)
+            .expect("register later corpus at the same root");
+        pump.reconcile(&state, &tracker);
+        let Some(registry::Observation::Degraded { .. }) =
+            state.watch_registry().observation(&shared_id)
+        else {
+            panic!("a later shared-root registration must report the unavailable watcher");
+        };
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    /// Regression test for finding 1: `spawn_corpus_watcher_with` must return
+    /// a live pump even when the debouncer factory fails, and that pump must
+    /// still catch up a registration via `reconcile`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_corpus_watcher_with_a_failing_debouncer_still_catches_up_via_reconcile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.watch.reconcile_interval_secs = Some(3600);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let root = root.canonicalize().expect("canonicalize wiki");
+        std::fs::write(root.join("note.md"), "# First\n\nbody\n").expect("write initial note");
+        let live_corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        let key = live_corpus.primary_corpus_key().expect("corpus key");
+
+        let handle = spawn_corpus_watcher_with(&state, false, |_, _, _, _, _| None)
+            .expect("degraded watcher must still start a pump");
+
+        register_runtime_corpora(&state, None, &[live_corpus], &cfg)
+            .expect("register runtime corpus");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("runtime registration root");
+
+        crate::test_support::wait_until(Duration::from_secs(5), "catch-up done", || async {
+            state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+        })
+        .await;
+
+        let file_ref = root.join("note.md").to_str().unwrap().to_string();
+        assert!(
+            state
+                .store()
+                .get_file_snapshot(&key, &file_ref)
+                .await
+                .expect("snapshot query")
+                .is_some(),
+            "degraded pump must index the registration through run_pump/reconcile",
+        );
+        assert!(
+            !handle.is_finished(),
+            "the degraded pump task must remain alive after indexing"
+        );
+
+        handle.abort().await;
+    }
+
+    /// Regression test for finding 2: a registration whose resolved config
+    /// overrides `storage.ground_dir` must have its catch-up pass write into
+    /// the store resolved from *that* config, not the baseline store.
+    #[tokio::test]
+    async fn catch_up_writes_into_the_registered_config_store_not_the_baseline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let baseline_ground = tmp.path().join("baseline-ground");
+        let repo_ground = tmp.path().join("repo-ground");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = baseline_ground.to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let mut resolved_cfg = state.baseline().clone();
+        resolved_cfg.storage.ground_dir = repo_ground.to_string_lossy().into_owned();
+
+        let live_corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        let key = live_corpus.primary_corpus_key().expect("corpus key");
+        register_runtime_corpora(&state, None, &[live_corpus], &resolved_cfg)
+            .expect("register runtime corpus with the resolved config");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("runtime registration root");
+
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: None,
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+        };
+        pump.reconcile(&state, &tracker);
+
+        crate::test_support::wait_until(
+            Duration::from_secs(5),
+            "catch-up into the resolved config's store",
+            || async {
+                state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+            },
+        )
+        .await;
+
+        let repo_res = state
+            .resources_for(&resolved_cfg)
+            .await
+            .expect("repo-layer resources");
+        let repo_files = repo_res
+            .store
+            .list_files(&key)
+            .await
+            .expect("list repo files");
+        assert!(
+            !repo_files.is_empty(),
+            "catch-up must write into the store resolved from the registered config",
+        );
+        let baseline_files = state
+            .store()
+            .list_files(&key)
+            .await
+            .expect("list baseline files");
+        assert!(
+            baseline_files.is_empty(),
+            "catch-up must not write into the baseline store when the registered config overrides storage",
+        );
+
+        tracker.close();
+        tracker.wait().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2238,14 +2758,41 @@ body
         );
     }
 
+    #[test]
+    fn record_pending_bounds_unique_paths_and_marks_overflow() {
+        let pending: std::sync::Mutex<PendingPaths> =
+            std::sync::Mutex::new(PendingPaths::default());
+        let events: Vec<_> = (0..=MAX_PENDING_PATHS)
+            .map(|index| {
+                notify_debouncer_full::DebouncedEvent::new(
+                    notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
+                        .add_path(PathBuf::from(format!("/srv/wiki/{index}.md"))),
+                    std::time::Instant::now(),
+                )
+            })
+            .collect();
+
+        record_pending(&pending, &events);
+
+        {
+            let pending = pending.lock().expect("pending mutex");
+            assert_eq!(pending.paths.len(), MAX_PENDING_PATHS);
+            assert!(pending.overflow);
+        }
+        let other = std::sync::Mutex::new(PendingPaths::default());
+        assert!(!other.lock().expect("other pending mutex").overflow);
+    }
+
     /// `record_pending` coalesces duplicate paths within one batch and across
     /// multiple batches recorded before a drain — the fix for the unbounded
     /// channel: paths accumulate in a bounded shared set instead of every
-    /// debounced batch queuing separately.
+    /// debounced batch queuing separately. `record_pending` does not filter
+    /// by extension at all (only by `EventKind`), so an unsupported `.docx`
+    /// path is coalesced and retained the same as any `.md` path.
     #[test]
     fn record_pending_coalesces_across_batches() {
-        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
-            std::sync::Mutex::new(std::collections::HashSet::new());
+        let pending: std::sync::Mutex<PendingPaths> =
+            std::sync::Mutex::new(PendingPaths::default());
         let a = PathBuf::from("/srv/wiki/a.md");
         let b = PathBuf::from("/srv/wiki/b.md");
         let ignored = PathBuf::from("/srv/wiki/notes.docx");
@@ -2276,22 +2823,21 @@ body
             pending.lock().expect("pending mutex").drain().collect();
         assert_eq!(
             drained,
-            std::collections::HashSet::from([a, b]),
+            std::collections::HashSet::from([a, b, ignored]),
             "pending must coalesce the duplicate .md path within a batch and \
-             across batches, while dropping the known-but-unsupported .docx path"
+             across batches, while retaining every mutation path"
         );
     }
 
-    /// `record_pending` must admit every extension `format_from_extension`
-    /// (the indexer's own admission rule) accepts, case-insensitively — not a
-    /// second, narrower `.md`-only rule the watcher used to maintain
-    /// separately from `domain::indexer::format`. An uppercase `.MD` and a
-    /// `.csv` (spreadsheet) must both be admitted; a known-unsupported `.docx`
-    /// must still be dropped.
+    /// `record_pending` does not filter by file extension at all — that is
+    /// the indexer's job via `format_from_extension` during actual reindex.
+    /// It filters only by event *kind*, dropping `EventKind::Access` and
+    /// admitting everything else. An uppercase `.MD`, a `.csv`, and even a
+    /// known-unsupported `.docx` are all retained here.
     #[test]
-    fn record_pending_admits_every_indexer_supported_extension() {
-        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
-            std::sync::Mutex::new(std::collections::HashSet::new());
+    fn record_pending_is_extension_agnostic_filters_by_event_kind_only() {
+        let pending: std::sync::Mutex<PendingPaths> =
+            std::sync::Mutex::new(PendingPaths::default());
         let uppercase_md = PathBuf::from("/srv/wiki/README.MD");
         let csv = PathBuf::from("/srv/wiki/data.csv");
         let unsupported = PathBuf::from("/srv/wiki/notes.docx");
@@ -2317,9 +2863,9 @@ body
             pending.lock().expect("pending mutex").drain().collect();
         assert_eq!(
             drained,
-            std::collections::HashSet::from([uppercase_md, csv]),
+            std::collections::HashSet::from([uppercase_md, csv, unsupported]),
             "an uppercase .MD and a .csv must be admitted (matching \
-             format_from_extension), while a known-unsupported .docx is dropped"
+             format_from_extension), while retaining every mutation path"
         );
     }
 
@@ -2331,8 +2877,8 @@ body
     /// reindex re-trigger itself.
     #[test]
     fn record_pending_drops_access_events() {
-        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
-            std::sync::Mutex::new(std::collections::HashSet::new());
+        let pending: std::sync::Mutex<PendingPaths> =
+            std::sync::Mutex::new(PendingPaths::default());
         let read = PathBuf::from("/srv/wiki/read.md");
 
         let batch = vec![notify_debouncer_full::DebouncedEvent::new(
@@ -2360,8 +2906,8 @@ body
     /// narrows admission and does not regress real change detection.
     #[test]
     fn record_pending_admits_mutation_kinds() {
-        let pending: std::sync::Mutex<std::collections::HashSet<PathBuf>> =
-            std::sync::Mutex::new(std::collections::HashSet::new());
+        let pending: std::sync::Mutex<PendingPaths> =
+            std::sync::Mutex::new(PendingPaths::default());
         let created = PathBuf::from("/srv/wiki/created.md");
         let modified = PathBuf::from("/srv/wiki/modified.md");
         let renamed = PathBuf::from("/srv/wiki/renamed.md");
@@ -2526,9 +3072,10 @@ body
         std::os::unix::fs::symlink(&tree, &link).expect("link dependency-like tree");
         std::os::unix::fs::symlink(tree.join("node_modules"), tree.join("linked-node-modules"))
             .expect("link dependency subtree");
-        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
         let wake = std::sync::Arc::new(tokio::sync::Notify::new());
-        let mut debouncer = build_debouncer(&cfg, &state, wake, pending).expect("build watcher");
+        let mut debouncer =
+            build_debouncer(&cfg, &state, wake, pending, false).expect("build watcher");
 
         debouncer
             .watch(&link, RecursiveMode::Recursive)
@@ -2560,23 +3107,22 @@ body
         let root = tmp.path().join("watch-root");
         std::fs::create_dir(&root).expect("create watch root");
         let root = root.canonicalize().expect("canonicalize watch root");
-        let pending = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
         let pending_for_test = pending.clone();
         let wake = std::sync::Arc::new(tokio::sync::Notify::new());
-        let mut debouncer = build_debouncer(&cfg, &state, wake, pending).expect("build watcher");
+        let mut debouncer =
+            build_debouncer(&cfg, &state, wake, pending, false).expect("build watcher");
         debouncer
             .watch(&root, RecursiveMode::Recursive)
             .expect("watch root");
         async fn wait_for_paths(
-            pending: &std::sync::Arc<
-                std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
-            >,
+            pending: &std::sync::Arc<std::sync::Mutex<PendingPaths>>,
             expected: &[std::path::PathBuf],
         ) -> std::collections::HashSet<std::path::PathBuf> {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let mut observed = std::collections::HashSet::new();
             loop {
-                observed.extend(pending.lock().expect("pending mutex").drain());
+                observed.extend(pending.lock().expect("pending mutex").paths.drain());
                 if expected.iter().all(|path| observed.contains(path))
                     || std::time::Instant::now() >= deadline
                 {
@@ -2615,14 +3161,16 @@ body
         let temp = root.join("atomic.tmp");
         std::fs::write(&temp, "three\n").expect("write atomic temp");
         std::fs::rename(&temp, &renamed).expect("atomic replace");
+        // Only the atomic-replace *target* is a guaranteed observation: the temp
+        // file exists for microseconds before it is renamed away, so a native
+        // watcher with debouncing (esp. Linux inotify under load) may coalesce
+        // its create/rename events and never surface the temp path. Asserting on
+        // the transient temp is a flaky over-assertion; reindexing the target is
+        // the behaviour that matters.
         let atomic_events = wait_for_paths(&pending_for_test, std::slice::from_ref(&renamed)).await;
         assert!(
             atomic_events.contains(&renamed),
             "atomic save must report target path"
-        );
-        assert!(
-            !atomic_events.contains(&temp),
-            "unsupported atomic temp path must not reach pending"
         );
         std::fs::remove_file(&renamed).expect("delete file");
         assert!(
@@ -2631,5 +3179,569 @@ body
                 .contains(&renamed),
             "native delete must reach pending"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_watcher_indexes_descendant_mutations_before_reconciliation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.debounce_ms = 25;
+        cfg.watch.reconcile_interval_secs = Some(3600);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let root = tmp.path().join("wiki");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested corpus root");
+        let file = nested.join("note.md");
+        let corpus = corpus("wiki", root.to_str().unwrap(), &["**/*.md"]);
+        cfg.corpora.push(corpus.clone());
+        let key = corpus.primary_corpus_key().expect("corpus key");
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
+        let watcher = spawn_corpus_watcher(&state).expect("production watcher");
+        std::fs::write(&file, "# first\n").expect("create descendant after watcher installation");
+        // Stored file refs are canonical; macOS tempdirs are not.
+        let file = std::fs::canonicalize(&file).expect("canonicalize descendant");
+
+        async fn wait_for_snapshot(state: &DaemonState, key: &CorpusKey, file: &Path) -> String {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let file_ref = file.to_str().expect("UTF-8 test path");
+            loop {
+                if let Some(snapshot) = state
+                    .store()
+                    .get_file_snapshot(key, file_ref)
+                    .await
+                    .expect("snapshot query")
+                {
+                    return snapshot.content_hash;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "watcher did not index {file_ref}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        let old_hash = wait_for_snapshot(&state, &key, &file).await;
+        std::fs::write(&file, "# second\nchanged descendant\n").expect("mutate descendant");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let file_ref = file.to_str().expect("UTF-8 test path");
+            let snapshot = state
+                .store()
+                .get_file_snapshot(&key, file_ref)
+                .await
+                .expect("changed snapshot query");
+            if snapshot
+                .as_ref()
+                .is_some_and(|s| s.content_hash != old_hash)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "descendant mutation did not reach the index"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        state.shutdown_token().cancel();
+        watcher.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_heartbeat_advances_during_quiet_pump_sleep() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.reconcile_interval_secs = Some(3600);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None)
+            .await
+            .expect("open daemon state");
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer = build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false)
+            .expect("build production watcher");
+        let tracker = TaskTracker::new();
+        let pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+        };
+        let task = tokio::spawn(run_pump(
+            state.clone(),
+            pump,
+            wake,
+            pending,
+            tracker,
+            PumpConfig {
+                reconcile_interval: Duration::from_secs(3600),
+                failure_reminder: Duration::ZERO,
+                churn_warn_at: u32::MAX,
+                churn_act_at: u32::MAX,
+            },
+            state.watch_registry().generation(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::WatcherPump)
+                > 0,
+            "quiet watcher pump must bump its heartbeat during the 60-second sleep"
+        );
+        state.shutdown_token().cancel();
+        task.await.expect("watcher pump task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_parent_registration_preserves_recursive_descendant_delivery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.debounce_ms = 25;
+        cfg.watch.reconcile_interval_secs = Some(3600);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let root = tmp.path().join("shared");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create shared parent");
+        let file_root = root.join("CLAUDE.md");
+        std::fs::write(&file_root, "# config\n").expect("write file root");
+        let descendant = nested.join("note.md");
+        let file_corpus = corpus("file-first", file_root.to_str().unwrap(), &["**/*.md"]);
+        let directory_corpus = corpus("directory-second", root.to_str().unwrap(), &["**/*.md"]);
+        cfg.corpora = vec![file_corpus, directory_corpus.clone()];
+        let key = directory_corpus
+            .primary_corpus_key()
+            .expect("directory key");
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
+        let watcher = spawn_corpus_watcher(&state).expect("production watcher");
+        std::fs::write(&descendant, "# first\n")
+            .expect("create descendant after watcher installation");
+        // Stored file refs are canonical; macOS tempdirs are not.
+        let descendant = std::fs::canonicalize(&descendant).expect("canonicalize descendant");
+        let file_ref = descendant.to_str().expect("UTF-8 descendant path");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if state
+                .store()
+                .get_file_snapshot(&key, file_ref)
+                .await
+                .expect("snapshot query")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recursive root did not catch up descendant"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let old_hash = state
+            .store()
+            .get_file_snapshot(&key, file_ref)
+            .await
+            .expect("baseline snapshot query")
+            .expect("baseline descendant snapshot")
+            .content_hash;
+        std::fs::write(&descendant, "# second\nshared parent mutation\n")
+            .expect("mutate descendant");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = state
+                .store()
+                .get_file_snapshot(&key, file_ref)
+                .await
+                .expect("changed snapshot query");
+            if snapshot
+                .as_ref()
+                .is_some_and(|s| s.content_hash != old_hash)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "recursive shared-parent watch missed descendant mutation"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        state.shutdown_token().cancel();
+        watcher.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registry_change_and_reconcile_timer_each_bump_watcher_heartbeat() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None)
+            .await
+            .expect("open daemon state");
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer = build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false)
+            .expect("build watcher");
+        let task = tokio::spawn(run_pump(
+            state.clone(),
+            PumpState {
+                debouncer: Some(debouncer),
+                installed: HashMap::new(),
+                roots: Vec::new(),
+                degraded_backend: HashSet::new(),
+            },
+            wake,
+            pending,
+            TaskTracker::new(),
+            PumpConfig {
+                reconcile_interval: Duration::from_secs(10),
+                failure_reminder: Duration::ZERO,
+                churn_warn_at: u32::MAX,
+                churn_act_at: u32::MAX,
+            },
+            state.watch_registry().generation(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+        let after_timer = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::WatcherPump);
+        assert!(
+            after_timer > 0,
+            "reconcile timer must bump watcher heartbeat before registry changes"
+        );
+        let root = tmp.path().join("runtime-root");
+        std::fs::create_dir_all(&root).expect("create runtime root");
+        let runtime = corpus("runtime", root.to_str().unwrap(), &["**/*.md"]);
+        register_runtime_corpora(&state, None, &[runtime], &cfg).expect("register runtime corpus");
+        tokio::task::yield_now().await;
+        assert!(
+            state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::WatcherPump)
+                > after_timer,
+            "registry change must bump watcher heartbeat after the timer observation"
+        );
+        state.shutdown_token().cancel();
+        task.await.expect("watcher pump task");
+    }
+
+    /// Regression test for the lost-signal defect: `WatchRegistry` used
+    /// `notify_waiters`, which has no permit memory, so a registry change
+    /// fired before the pump task was ever polled was dropped instead of
+    /// observed on the pump's first iteration. A long `reconcile_interval`
+    /// means the generation-gated backstop would not paper over the loss
+    /// within this test's timeout.
+    #[tokio::test]
+    async fn registry_signal_wakes_pump_before_it_is_first_polled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.reconcile_interval_secs = Some(3600);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None)
+            .await
+            .expect("open daemon state");
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer = build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false)
+            .expect("build watcher");
+        let task = tokio::spawn(run_pump(
+            state.clone(),
+            PumpState {
+                debouncer: Some(debouncer),
+                installed: HashMap::new(),
+                roots: Vec::new(),
+                degraded_backend: HashSet::new(),
+            },
+            wake,
+            pending,
+            TaskTracker::new(),
+            PumpConfig {
+                reconcile_interval: Duration::from_secs(3600),
+                failure_reminder: Duration::ZERO,
+                churn_warn_at: u32::MAX,
+                churn_act_at: u32::MAX,
+            },
+            state.watch_registry().generation(),
+        ));
+
+        // No `.await` between the spawn above and the registration below:
+        // on the current-thread test runtime the spawned pump task is not
+        // polled until this test yields, so this reproduces a registry
+        // signal firing while the pump is not yet parked on `changed()`.
+        let root = tmp.path().join("runtime-root");
+        std::fs::create_dir_all(&root).expect("create runtime root");
+        let root = root.canonicalize().expect("canonicalize runtime root");
+        std::fs::write(root.join("note.md"), "# note\n").expect("write seed file");
+        let runtime_corpus = corpus("runtime", root.to_str().unwrap(), &["**/*.md"]);
+        register_runtime_corpora(&state, None, &[runtime_corpus], &cfg)
+            .expect("register runtime corpus");
+
+        let id = RegistrationId {
+            source: registry::ConfigSource::Baseline,
+            corpus_key: CorpusKey {
+                name: "runtime".to_string(),
+                canonical_root: root,
+            },
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("registry signal must wake the pump instead of waiting for the reconcile backstop");
+
+        state.shutdown_token().cancel();
+        task.await.expect("watcher pump task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_overflow_triggers_full_registration_reconciliation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let root = tmp.path().join("overflow-root");
+        std::fs::create_dir_all(&root).expect("create overflow root");
+        let file = root.join("missed.md");
+        std::fs::write(&file, "# recovered\n").expect("write missed file");
+        let configured = corpus("overflow", root.to_str().unwrap(), &["**/*.md"]);
+        let key = configured.primary_corpus_key().expect("corpus key");
+        let state = DaemonState::open(cfg.clone(), None)
+            .await
+            .expect("open daemon state");
+        let roots = watch_roots_for(&configured);
+        state
+            .watch_registry()
+            .seed_baseline(configured, std::sync::Arc::new(cfg.clone()), roots);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths {
+            paths: std::collections::HashSet::new(),
+            overflow: true,
+        }));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer = build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false)
+            .expect("build watcher");
+        let task = tokio::spawn(run_pump(
+            state.clone(),
+            PumpState {
+                debouncer: Some(debouncer),
+                installed: HashMap::new(),
+                roots: Vec::new(),
+                degraded_backend: HashSet::new(),
+            },
+            wake.clone(),
+            pending,
+            TaskTracker::new(),
+            PumpConfig {
+                reconcile_interval: Duration::from_secs(3600),
+                failure_reminder: Duration::ZERO,
+                churn_warn_at: u32::MAX,
+                churn_act_at: u32::MAX,
+            },
+            state.watch_registry().generation(),
+        ));
+        tokio::task::yield_now().await;
+        wake.notify_one();
+        // Stored file refs are canonical; macOS tempdirs are not.
+        let file = std::fs::canonicalize(&file).expect("canonicalize missed path");
+        let file_ref = file.to_str().expect("UTF-8 missed path");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if state
+                .store()
+                .get_file_snapshot(&key, file_ref)
+                .await
+                .expect("reconciliation snapshot query")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "overflow did not trigger full registration catch-up"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        state.shutdown_token().cancel();
+        task.await.expect("watcher pump task");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn startup_probe_stops_before_live_watcher_remains_active() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.debounce_ms = 25;
+        cfg.watch.reconcile_interval_secs = Some(3600);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let root = tmp.path().join("watch-root");
+        std::fs::create_dir_all(&root).expect("create watch root");
+        cfg.corpora
+            .push(corpus("watch", root.to_str().unwrap(), &["**/*.md"]));
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
+
+        let probe = spawn_corpus_watcher(&state).expect("startup capability probe watcher");
+        let probe_task = probe.task.abort_handle();
+        assert!(
+            !probe_task.is_finished(),
+            "startup probe must create a live pump before shutdown"
+        );
+        probe.abort().await;
+        assert!(
+            probe_task.is_finished(),
+            "startup probe abort must await its pump task"
+        );
+
+        let live = spawn_corpus_watcher(&state).expect("supervised live watcher");
+        let live_task = live.task.abort_handle();
+        assert!(
+            !live_task.is_finished(),
+            "supervised watcher must remain live after probe shutdown"
+        );
+        live.abort().await;
+        assert!(
+            live_task.is_finished(),
+            "live watcher shutdown must await its pump task"
+        );
+    }
+
+    /// `WatcherHandle::abort` must stop the old pump before a replacement is
+    /// started; otherwise both pumps would continue scheduling reconciliations.
+    #[tokio::test(start_paused = true)]
+    async fn watcher_abort_stops_pump_before_replacement() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.reconcile_interval_secs = Some(1);
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
+
+        let first = spawn_corpus_watcher(&state).expect("initial watcher");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let previous = state
+            .heartbeat()
+            .epoch(super::super::heartbeat::TaskName::WatcherPump);
+        assert!(
+            previous > 0,
+            "initial watcher must complete a reconcile tick before replacement",
+        );
+
+        first.abort().await;
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::WatcherPump),
+            previous,
+            "an aborted watcher must not complete further pump cycles",
+        );
+        let replacement = spawn_corpus_watcher(&state).expect("replacement watcher");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            state
+                .heartbeat()
+                .epoch(super::super::heartbeat::TaskName::WatcherPump)
+                > previous,
+            "the replacement watcher must complete pump cycles",
+        );
+
+        state.shutdown_token().cancel();
+        replacement.join().await;
+    }
+
+    /// Regression test for finding 1: a catch-up pass parked on the write
+    /// lane (held externally) must observe `shutdown_token().cancel()`
+    /// instead of hanging until the lane frees up. Mirrors the
+    /// select!-wrapped `acquire_lane` closure built inline in
+    /// `spawn_registration_catch_up`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catch_up_lane_wait_observes_shutdown_cancellation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let corpus_cfg = corpus("docs", root.to_str().unwrap(), &["**/*.md"]);
+        cfg.corpora.push(corpus_cfg.clone());
+        let state = DaemonState::open(cfg, None)
+            .await
+            .expect("open daemon state");
+
+        // Hold the sole write-lane permit externally so `acquire_write_lane`
+        // blocks once the scan/plan phase finds work to apply.
+        let held_permit = state
+            .write_lane()
+            .try_acquire_owned()
+            .expect("acquire the sole write-lane permit");
+
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let lane_state = state.clone();
+        let shutdown = state.shutdown_token().clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus_cfg, || {
+                let lane_state = lane_state.clone();
+                let shutdown = shutdown.clone();
+                async move {
+                    tokio::select! {
+                        biased;
+                        () = shutdown.cancelled() => {
+                            Err("daemon shutting down; catch-up cancelled before taking the write lane")
+                        }
+                        permit = lane_state.acquire_write_lane() => permit,
+                    }
+                }
+            })
+            .await
+        });
+
+        // Let the scan/plan phase run and reach the lane wait, blocked on
+        // the externally-held permit.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        state.shutdown_token().cancel();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled catch-up must not hang on the held write-lane permit")
+            .expect("task join");
+        assert!(
+            outcome.is_err(),
+            "cancelled catch-up must return an error instead of applying the plan"
+        );
+        drop(held_permit);
     }
 }

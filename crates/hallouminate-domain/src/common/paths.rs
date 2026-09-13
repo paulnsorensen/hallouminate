@@ -23,6 +23,41 @@ pub fn canonicalize_or_passthrough(path: &Path) -> FileRef {
     }
 }
 
+/// Resolve `path`'s ancestors as far as the filesystem allows, so a corpus
+/// root reached through a symlinked ancestor still canonicalizes even when
+/// the leaf itself does not exist yet (e.g. `add_markdown` creating a new
+/// page). Walks up to the longest existing ancestor, canonicalizes that
+/// ancestor, then re-appends the remaining components literally. Falls back
+/// to `path` unchanged when no ancestor can be canonicalized.
+///
+/// The final component is never dereferenced, even when it exists and is a
+/// symlink. Resolving it would let a symlink that escapes the corpus be
+/// rejected here, as a glob mismatch, instead of by the no-follow guards
+/// that own symlink containment (`atomic_write_no_follow`,
+/// `delete_no_follow`, `read_no_follow`). Keeping the leaf literal preserves
+/// that division of labor and the error each layer reports.
+pub fn best_effort_canonical(path: &Path) -> PathBuf {
+    let (Some(parent), Some(file_name)) = (path.parent(), path.file_name()) else {
+        return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    };
+    let mut ancestor = parent;
+    let mut tail: Vec<&std::ffi::OsStr> = vec![file_name];
+    loop {
+        if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
+            let mut result = canonical_ancestor;
+            for component in tail.iter().rev() {
+                result.push(component);
+            }
+            return result;
+        }
+        let Some(next) = ancestor.parent() else {
+            return path.to_path_buf();
+        };
+        tail.push(ancestor.file_name().unwrap_or_default());
+        ancestor = next;
+    }
+}
+
 /// A root confirmed absent from the filesystem via `io::ErrorKind::NotFound`
 /// -- the entire safety proof `LanceStore::delete_root` accepts. Constructible
 /// only through `retired_roots`, so a caller cannot pass an unverified path.

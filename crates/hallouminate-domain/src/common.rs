@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 mod paths;
 
-pub use paths::{RetiredRoot, canonicalize_or_passthrough, expand_tilde, retired_roots};
+pub use paths::{
+    RetiredRoot, best_effort_canonical, canonicalize_or_passthrough, expand_tilde, retired_roots,
+};
 
 /// A reference to a file on disk, identified by its path.
 ///
@@ -140,11 +142,22 @@ impl CorpusConfig {
     /// root selection. A caller that resolves ancestors but deliberately
     /// leaves a symlinked final component alone uses this, so an escaping
     /// symlink still reaches the guard that owns it.
+    ///
+    /// Ownership is tested against each root's [`best_effort_canonical`]
+    /// form, so a configured root that does not exist yet — or is reached
+    /// through a symlinked ancestor — still matches paths the caller
+    /// resolved the same way. The returned key keeps its own
+    /// `canonical_root` unchanged, so corpus identity is unaffected.
     pub fn corpus_key_for_resolved_path(&self, path: &Path) -> Option<CorpusKey> {
         self.corpus_keys()
             .into_iter()
-            .filter(|key| path.starts_with(&key.canonical_root))
-            .max_by_key(|key| key.canonical_root.components().count())
+            .filter_map(|key| {
+                let owning_root = best_effort_canonical(&key.canonical_root);
+                path.starts_with(&owning_root)
+                    .then(|| (owning_root.components().count(), key))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, key)| key)
     }
 }
 

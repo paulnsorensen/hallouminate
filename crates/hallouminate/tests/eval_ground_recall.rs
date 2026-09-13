@@ -582,6 +582,7 @@ async fn ground_query(
                     chunks_per_file: Some(1),
                     limit: Some(50),
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
                 }),
             },
             ground_rpc_timeout(arm),
@@ -1227,6 +1228,26 @@ fn compare_against_baseline(committed: &EvalArtifact, current: &EvalArtifact) ->
     Ok(())
 }
 
+fn persist_current_measurement_and_compare(
+    baseline: &EvalArtifact,
+    current: &EvalArtifact,
+    output: Option<&Path>,
+    baseline_path: &Path,
+    baseline_bytes: &[u8],
+) -> Result<()> {
+    if let Some(output) = output {
+        write_measurement_artifact(output, baseline_path, current)
+            .context("persist current measurement before baseline comparison")?;
+        let baseline_after = fs::read(baseline_path).context("re-read eval/baseline.json")?;
+        ensure!(
+            baseline_bytes == baseline_after,
+            "measurement modified eval/baseline.json"
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(current)?);
+    compare_against_baseline(baseline, current)
+}
+
 fn normalize_path_for_comparison(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1848,6 +1869,44 @@ fn comparator_rejects_metric_and_top_chunk_regressions() {
 }
 
 #[test]
+fn failed_comparison_preserves_current_measurement_artifact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let baseline_path = temp.path().join("eval/baseline.json");
+    let output = temp.path().join(".context/current.json");
+    fs::create_dir_all(baseline_path.parent().expect("baseline parent")).expect("mkdir eval");
+    let baseline_bytes =
+        serde_json::to_vec(&synthetic_baseline_artifact()).expect("serialize baseline");
+    fs::write(&baseline_path, &baseline_bytes).expect("write baseline");
+    let current = {
+        let mut artifact = synthetic_baseline_artifact();
+        artifact.measurements[0].queries[0].actual_top = None;
+        artifact.measurements[0].queries[0].top_chunk_pass = false;
+        artifact
+    };
+
+    let error = persist_current_measurement_and_compare(
+        &synthetic_baseline_artifact(),
+        &current,
+        Some(&output),
+        &baseline_path,
+        &baseline_bytes,
+    )
+    .expect_err("comparison must fail for the regressed top chunk");
+
+    assert!(error.to_string().contains("top-chunk pass to fail"));
+    let mut expected_output = serde_json::to_vec_pretty(&current).expect("serialize current");
+    expected_output.push(b'\n');
+    assert_eq!(
+        fs::read(&output).expect("read current artifact"),
+        expected_output
+    );
+    assert_eq!(
+        fs::read(&baseline_path).expect("read baseline"),
+        baseline_bytes
+    );
+}
+
+#[test]
 fn artifact_write_isolated_to_requested_output() {
     let temp = tempfile::tempdir().expect("tempdir");
     let baseline = temp.path().join("eval/baseline.json");
@@ -1959,7 +2018,13 @@ fn ensure_baseline_schema_current(bytes: &[u8]) -> Result<()> {
 #[tokio::test]
 #[ignore = "loads production embeddings and enforces the committed baseline"]
 async fn eval_ground_recall_enforce() -> Result<()> {
-    let baseline_bytes = fs::read(baseline_path()).context("read eval/baseline.json")?;
+    let output = env::var_os("HALLOUMINATE_EVAL_OUTPUT")
+        .map(|output| measurement_output_path(Path::new(&output)));
+    let baseline_path = baseline_path();
+    if let Some(output) = output.as_deref() {
+        ensure_measurement_output_is_not_baseline(output, &baseline_path)?;
+    }
+    let baseline_bytes = fs::read(&baseline_path).context("read eval/baseline.json")?;
     ensure_baseline_schema_current(&baseline_bytes)?;
     let baseline: EvalArtifact =
         serde_json::from_slice(&baseline_bytes).context("parse eval/baseline.json")?;
@@ -1971,8 +2036,13 @@ async fn eval_ground_recall_enforce() -> Result<()> {
         "query-set digest disagrees with eval/baseline.json"
     );
     let current = measure_baseline(&queries, query_set_digest).await?;
-    compare_against_baseline(&baseline, &current)?;
-    println!("{}", serde_json::to_string_pretty(&current)?);
+    persist_current_measurement_and_compare(
+        &baseline,
+        &current,
+        output.as_deref(),
+        &baseline_path,
+        &baseline_bytes,
+    )?;
     Ok(())
 }
 

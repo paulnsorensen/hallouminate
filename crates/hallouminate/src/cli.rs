@@ -346,7 +346,6 @@ fn render_status_report(report: &hallouminate_daemon::StatusReport) -> String {
             TaskName::WatcherPump => "watcher_pump",
             TaskName::IdleExit => "idle_exit",
             TaskName::Signal => "signal",
-            TaskName::Provision => "provision",
         }
     }
 
@@ -380,6 +379,13 @@ fn render_status_report(report: &hallouminate_daemon::StatusReport) -> String {
         "watcher: events={} reindexes={} noop_reindexes={}",
         report.watcher.events, report.watcher.reindexes, report.watcher.noop_reindexes,
     );
+    if report.degraded_watch_roots > 0 {
+        let _ = writeln!(
+            out,
+            "watcher: {} registration(s) degraded \u{2014} periodic reconciliation only",
+            report.degraded_watch_roots,
+        );
+    }
     match &report.trips {
         TripState::None => out.push_str("last ladder trip: none\n"),
         TripState::Tripped { action, at_secs } => {
@@ -804,6 +810,7 @@ mod tests {
                 action: LadderAction::RestartTask(TaskName::WatcherPump),
                 at_secs: 321,
             },
+            degraded_watch_roots: 0,
         };
         let rendered = render_status_report(&report);
         let lines: Vec<&str> = rendered.lines().collect();
@@ -823,6 +830,37 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_render_reports_degraded_watch_roots_when_present() {
+        // WHY: a degraded native watcher must not look healthy on
+        // `daemon status` -- the acceptance criterion is one explicit line
+        // naming the fallback to periodic reconciliation, absent when the
+        // count is zero (covered by the empty-report test below).
+        use hallouminate_daemon::{DebtLevel, StatusReport, TripState, WatcherCounters};
+        let report = StatusReport {
+            per_task: Vec::new(),
+            debt: DebtLevel::Ok,
+            defer_count: 0,
+            watcher: WatcherCounters::default(),
+            trips: TripState::None,
+            degraded_watch_roots: 2,
+        };
+        let rendered = render_status_report(&report);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "running",
+                "tasks: none reported",
+                "debt: ok",
+                "deferred maintenance passes: 0",
+                "watcher: events=0 reindexes=0 noop_reindexes=0",
+                "watcher: 2 registration(s) degraded — periodic reconciliation only",
+                "last ladder trip: none",
+            ],
+        );
+    }
+
+    #[test]
     fn daemon_status_render_handles_empty_tasks_and_no_trip() {
         // WHY: until wiring W1 plumbs the heartbeat registry, per_task is
         // empty and no trip has been recorded — the renderer must say so
@@ -835,6 +873,7 @@ mod tests {
             defer_count: 0,
             watcher: WatcherCounters::default(),
             trips: TripState::None,
+            degraded_watch_roots: 0,
         };
         let rendered = render_status_report(&report);
         let lines: Vec<&str> = rendered.lines().collect();

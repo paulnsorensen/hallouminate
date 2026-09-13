@@ -162,6 +162,7 @@ mod tests {
                     defer_count: 0,
                     watcher: WatcherCounters::default(),
                     trips: TripState::None,
+                    degraded_watch_roots: 0,
                 });
                 let mut response = serde_json::to_string(&response).expect("serialize response");
                 response.push('\n');

@@ -28,7 +28,6 @@ use hallouminate_daemon::{
 };
 
 use hallouminate_domain::footnotes::{FootnoteMode, apply_footnote_mode};
-use hallouminate_domain::ground::{Format, RenderOpts, render};
 
 const SERVER_INSTRUCTIONS: &str = "\
 Hallouminate stores per-repository markdown wikis on disk and exposes them \
@@ -50,13 +49,17 @@ fresh from `cwd` on every request. There is no default, no MCP-roots-derived \
 value, and no server-startup fallback — a missing, relative, or nonexistent \
 `cwd` fails the call before any corpus operation.
 
-Default corpus: READ tools (`ground`, `read_markdown`, `list_files`, \
-`list_tree`, `corpus_stats`, `backlinks`) that omit `corpus` \
-default to the wiki for the repository containing `cwd`. WRITE tools \
-(`add_markdown`, `delete_markdown`) require `corpus` explicitly. Pass \
-`corpus` explicitly to target another wiki, the repo's source corpus \
-(`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry; \
-`list_corpora` enumerates everything available.
+Corpus scoping: `ground` with no `corpus` searches EVERY effective corpus \
+and merges the results into one ranked set; the wiki for the repository \
+containing `cwd` is the priority corpus, so its pages win ties and are \
+ranked first, and each hit names its own source corpus. The other READ \
+tools (`read_markdown`, `list_files`, `list_tree`, `corpus_stats`, \
+`backlinks`) that omit `corpus` default to the wiki for the repository \
+containing `cwd`. WRITE tools (`add_markdown`, `delete_markdown`) require \
+`corpus` explicitly. Pass `corpus` explicitly to pin `ground` to one corpus, \
+or to target another wiki, the repo's source corpus (`repo:{name}:corpus`), \
+or a user-declared `[[corpus]]` entry; `list_corpora` enumerates everything \
+available.
 
 Tools:
 - `list_corpora` — every configured corpus name.
@@ -599,17 +602,13 @@ impl HallouminateTools {
                 chunks_per_file: params.chunks_per_file,
                 limit: params.limit,
                 snippet_chars: params.snippet_chars,
+                footnote_mode: params.footnotes,
             }),
         };
-        let mut result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
-        if params.footnotes != FootnoteMode::Include {
-            for doc in result.response.docs.values_mut() {
-                for chunk in &mut doc.chunks {
-                    chunk.snippet = apply_footnote_mode(&chunk.snippet, params.footnotes);
-                }
-            }
-            result.outline = render(&result.response, Format::Outline, &RenderOpts::default());
-        }
+        // `footnote_mode` rides the IPC request and the daemon filters each
+        // chunk snippet in `build_docs`, so the response is already filtered,
+        // trimmed, and rendered for every transport.
+        let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured = to_structured(&result.response)?;
         Ok(tool_ok(result.outline, structured))
     }

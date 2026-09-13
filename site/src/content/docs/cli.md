@@ -25,8 +25,28 @@ hallouminate serve
 ```
 
 Starts the stdio MCP server an agent connects to. It is stateless beyond its
-tool router and a startup-captured working directory — every tool call dials
-the daemon. If no daemon is running, `serve` spawns one.
+tool router, and every MCP request supplies its own absolute checkout `cwd`.
+The server does not reuse the process startup directory. If no daemon is
+running, `serve` spawns one.
+
+## Selecting a repository
+
+`index` and `ground` use the process current directory for repo-layer
+discovery. Run these commands from the target checkout; a daemon startup
+directory does not select the repository for later requests. `config show` and
+`config validate` accept `--cwd PATH` to select the directory explicitly.
+
+## Migrating MCP clients
+
+Add the active checkout to every MCP request, including `list_corpora`:
+
+```json
+{"name":"list_corpora","arguments":{"cwd":"/workspaces/project"}}
+{"name":"ground","arguments":{"cwd":"/workspaces/project","query":"release process"}}
+```
+
+Keep document paths relative to the corpus root. Keep `globs` relative to each
+configured root, such as `guides/**/*.md`, instead of using absolute patterns.
 
 ## `index`
 

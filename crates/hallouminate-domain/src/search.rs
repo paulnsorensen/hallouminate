@@ -29,6 +29,7 @@ pub mod ripgrep;
 pub mod terms;
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::common::{CorpusKey, Result};
 use crate::ground::Warning;
@@ -146,7 +147,7 @@ pub async fn search_fused(
 
     let (rg_chunk_counts, rg_stats) = resolve_rg_hits_to_chunks(&signals.hits, &rg_hits);
     let resolved_chunks = rg_chunk_counts.len();
-    let rg_list = ranked_by_term_count(rg_chunk_counts);
+    let rg_list = ranked_by_term_count(rg_chunk_counts, &signals.hits, &corpus_key.canonical_root);
 
     tracing::debug!(
         target: "hallouminate::search",
@@ -193,8 +194,20 @@ pub async fn search_fused(
         });
     }
 
-    let fm_list = ranked_by_term_count(contains_term_counts(&signals.hits, &terms));
+    let fm_list = ranked_by_term_count(
+        contains_term_counts(&signals.hits, &terms),
+        &signals.hits,
+        &corpus_key.canonical_root,
+    );
 
+    tracing::debug!(
+        target: "hallouminate::search",
+        fts = %signal_order_log(&signals.fts, &signals.hits),
+        vector = %signal_order_log(&signals.vector, &signals.hits),
+        rg = %signal_order_log(&rg_list, &signals.hits),
+        fm = %signal_order_log(&fm_list, &signals.hits),
+        "pre-fusion signal order"
+    );
     let fused = fuse(
         &[
             RankedList {
@@ -230,6 +243,21 @@ pub async fn search_fused(
         hits: ranked,
         warnings,
     })
+}
+
+/// Diagnostic-only rendering of a ranked chunk-id list as `file:line`
+/// pairs, root-relativized, for the `hallouminate::search` debug log above.
+/// Not read by production ranking — a seam for `#[ignore]`d eval
+/// diagnostics to recover per-signal rank without a schema change.
+fn signal_order_log(list: &[String], hits: &HashMap<String, SearchHit>) -> String {
+    list.iter()
+        .take(20)
+        .map(|chunk_id| match hits.get(chunk_id) {
+            Some(hit) => format!("{}:{}", hit.file_ref, hit.line_start),
+            None => format!("{chunk_id}:?"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Ceiling on how many query terms reach the two literal signals.
@@ -395,12 +423,55 @@ fn resolve_rg_run(
 }
 
 /// Order chunks by how many distinct query terms they matched, best
-/// first, with `chunk_id` settling ties so the list is deterministic.
-fn ranked_by_term_count(counts: HashMap<String, usize>) -> Vec<String> {
-    let mut ranked: Vec<(String, usize)> =
-        counts.into_iter().filter(|(_, count)| *count > 0).collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    ranked.into_iter().map(|(chunk_id, _)| chunk_id).collect()
+/// first. Ties settle on the chunk's path relative to `canonical_root`,
+/// then `line_start`, then `chunk_id` as a last resort.
+///
+/// `chunk_id` alone is unsuitable here: it is blake3 of the *absolute*
+/// `file_ref` (`chunk_id_for` in hallouminate-adapters), so its byte
+/// order -- and therefore which of two near-tied chunks this lexical
+/// signal ranks first -- depends on where the corpus happens to be
+/// checked out, not on its content. Root-relative path is stable across
+/// checkouts of identical content.
+fn ranked_by_term_count(
+    counts: HashMap<String, usize>,
+    hits: &HashMap<String, SearchHit>,
+    canonical_root: &Path,
+) -> Vec<String> {
+    let mut decorated: Vec<((String, usize, String), usize, String)> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(chunk_id, count)| {
+            let key = tie_break_key(&chunk_id, hits, canonical_root);
+            (key, count, chunk_id)
+        })
+        .collect();
+    decorated.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    decorated
+        .into_iter()
+        .map(|(_, _, chunk_id)| chunk_id)
+        .collect()
+}
+
+/// Deterministic, root-relative sort key for a chunk_id tie: the file's
+/// path relative to `canonical_root` (falling back to the full
+/// `file_ref` when it isn't under `canonical_root`, e.g. a canonicalized
+/// mismatch), then `line_start`, then `chunk_id` itself as the final
+/// tiebreak when both are identical.
+fn tie_break_key(
+    chunk_id: &str,
+    hits: &HashMap<String, SearchHit>,
+    canonical_root: &Path,
+) -> (String, usize, String) {
+    match hits.get(chunk_id) {
+        Some(hit) => {
+            let rel = Path::new(&hit.file_ref)
+                .strip_prefix(canonical_root)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| hit.file_ref.clone());
+            (rel, hit.line_start, chunk_id.to_string())
+        }
+        None => (chunk_id.to_string(), 0, chunk_id.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -586,7 +657,15 @@ mod tests {
         counts.insert("few".to_string(), 1);
         counts.insert("many".to_string(), 3);
         counts.insert("some".to_string(), 2);
-        assert_eq!(ranked_by_term_count(counts), vec!["many", "some", "few"]);
+        let hits = pool(vec![
+            hit("few", "/repo/wiki/few.md", 1, 10),
+            hit("many", "/repo/wiki/many.md", 1, 10),
+            hit("some", "/repo/wiki/some.md", 1, 10),
+        ]);
+        assert_eq!(
+            ranked_by_term_count(counts, &hits, &corpus_key().canonical_root),
+            vec!["many", "some", "few"]
+        );
     }
 
     #[test]
@@ -595,7 +674,96 @@ mod tests {
         counts.insert("zzz".to_string(), 2);
         counts.insert("aaa".to_string(), 2);
         counts.insert("none".to_string(), 0);
-        assert_eq!(ranked_by_term_count(counts), vec!["aaa", "zzz"]);
+        // Same root-relative path and line_start: the tie has nothing left
+        // to settle on but chunk_id.
+        let hits = pool(vec![
+            hit("zzz", "/repo/wiki/x.md", 1, 10),
+            hit("aaa", "/repo/wiki/x.md", 1, 10),
+            hit("none", "/repo/wiki/x.md", 1, 10),
+        ]);
+        assert_eq!(
+            ranked_by_term_count(counts, &hits, &corpus_key().canonical_root),
+            vec!["aaa", "zzz"]
+        );
+    }
+
+    #[test]
+    fn ranked_by_term_count_tie_order_is_root_relative_not_absolute_chunk_id() {
+        // chunk_id is blake3 of the ABSOLUTE file_ref (`chunk_id_for` in
+        // hallouminate-adapters), so identical content checked out under
+        // two different roots hashes to a different byte order. Under
+        // root_a below, plain chunk_id order happens to agree with
+        // root-relative order; under root_b it disagrees -- reproducing
+        // the swap measured between corpus-walker.md and
+        // sandbox-and-workspace-roots.md
+        // (.hallouminate/wiki/eval-harness-gotchas.md:135-147) for content
+        // whose root-relative identity never changed.
+        let counts_for = |walker_id: &str, sandbox_id: &str| {
+            let mut c = HashMap::new();
+            c.insert(walker_id.to_string(), 1);
+            c.insert(sandbox_id.to_string(), 1);
+            c
+        };
+
+        let hits_for = |root: &str, walker_id: &str, sandbox_id: &str| {
+            pool(vec![
+                SearchHit {
+                    chunk_id: walker_id.into(),
+                    corpus_key: CorpusKey {
+                        name: "wiki".into(),
+                        canonical_root: PathBuf::from(root),
+                    },
+                    file_ref: format!("{root}/corpus-walker.md"),
+                    ..hit(walker_id, &format!("{root}/corpus-walker.md"), 19, 37)
+                },
+                SearchHit {
+                    chunk_id: sandbox_id.into(),
+                    corpus_key: CorpusKey {
+                        name: "wiki".into(),
+                        canonical_root: PathBuf::from(root),
+                    },
+                    file_ref: format!("{root}/sandbox-and-workspace-roots.md"),
+                    ..hit(
+                        sandbox_id,
+                        &format!("{root}/sandbox-and-workspace-roots.md"),
+                        20,
+                        24,
+                    )
+                },
+            ])
+        };
+
+        let root_a = PathBuf::from("/a/wiki");
+        let root_b = PathBuf::from("/zz/other/wiki");
+
+        // Root A: absolute chunk_id order happens to agree with
+        // root-relative order.
+        let (walker_a, sandbox_a) = ("aaa111", "bbb222");
+        let hits_a = hits_for("/a/wiki", walker_a, sandbox_a);
+        // Root B: absolute chunk_id order disagrees with root-relative
+        // order -- this is the byte-order flip the defect depends on.
+        let (walker_b, sandbox_b) = ("zzz999", "aaa000");
+        let hits_b = hits_for("/zz/other/wiki", walker_b, sandbox_b);
+
+        let order_a = ranked_by_term_count(counts_for(walker_a, sandbox_a), &hits_a, &root_a);
+        let order_b = ranked_by_term_count(counts_for(walker_b, sandbox_b), &hits_b, &root_b);
+
+        assert_eq!(
+            order_a,
+            vec![walker_a, sandbox_a],
+            "root-relative path orders corpus-walker.md before sandbox-and-workspace-roots.md"
+        );
+        assert_eq!(
+            order_a
+                .iter()
+                .map(|id| hits_a[id].file_ref.as_str().rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            order_b
+                .iter()
+                .map(|id| hits_b[id].file_ref.as_str().rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            "identical content's tie order must not depend on the corpus's absolute root"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! corpus is searchable afterward.
 //!
 //! Runs against the domain crust (`index_corpus` — the same scan/plan/apply
-//! pipeline `catch_up_corpus` runs from the provisioning task) and a real
+//! pipeline used by `catch_up_corpus` in the watcher pump) and a real
 //! `LanceStore`, mirroring `cross_repo_union.rs`'s conventions, so it needs
 //! no daemon, socket, or model download.
 
