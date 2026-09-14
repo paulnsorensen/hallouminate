@@ -1,6 +1,6 @@
 ---
 status: reviewed
-last_verified: 2026-09-12
+last_verified: 2026-09-14
 confidence: high
 sources:
   - https://github.com/microsoft/onnxruntime/issues/29538
@@ -52,14 +52,15 @@ that "ORT BFCArena memory released" on session drop. It released nothing.
   `with_session_config("mlas.disable_kleidiai", "1")` on both
   `TextInitOptions` and `RerankInitOptions`.
 
-## Why fastembed is patched
+## fastembed version
 
-fastembed 6.0.3 builds the `SessionBuilder` in a `pub(crate)` function and
-exposes no session config entries. `ort` gives no public way to wrap a
-custom execution provider. The root `Cargo.toml` therefore pins
-`[patch.crates-io] fastembed` to `paulnsorensen/fastembed-rs` at the commit
-that adds `with_session_config`. Upstream: Anush008/fastembed-rs#291 (issue)
-and #292 (PR). Remove the patch when a release ships the method.
+fastembed 6.0.3 built the `SessionBuilder` in a `pub(crate)` function and
+exposed no session config entries. `ort` gives no public way to wrap a
+custom execution provider. This repository pinned a fork through
+`[patch.crates-io]` from 2026-09-12 until upstream shipped the method.
+fastembed 6.1.0 (released 2026-09-12) includes `with_session_config` from
+Anush008/fastembed-rs#292 (issue #291). The adapters crate now requires
+`fastembed = "6.1"` and the patch is gone.
 
 ## Measured (240 markdown files, boot catch-up embed, arctic-embed-s fp32, batch 32, max_length 416)
 
