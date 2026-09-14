@@ -1,8 +1,12 @@
 ---
 status: reviewed
-last_verified: 2026-08-23
+last_verified: 2026-09-14
 confidence: high
 sources:
+  - https://github.com/microsoft/onnxruntime/issues/29538
+  - https://github.com/microsoft/onnxruntime/issues/29538#issuecomment-5643228246
+  - https://github.com/Anush008/fastembed-rs/issues/291
+  - https://github.com/Anush008/fastembed-rs/pull/292
   - https://github.com/microsoft/onnxruntime/issues/26831
   - https://github.com/microsoft/onnxruntime/issues/11627
   - https://github.com/microsoft/onnxruntime/issues/23339
@@ -10,67 +14,87 @@ sources:
   - https://github.com/paulnsorensen/hallouminate/issues/221
   - https://github.com/paulnsorensen/hallouminate/issues/285
 ---
-# ORT BFCArena retention — why session eviction never reclaimed memory
+# ORT memory retention — arena, KleidiAI, and the fix
 
-Dropping the `Embedder` does **not** return memory to the OS. The idle
-session-eviction feature (#161) logged "ORT BFCArena memory released"
-and released nothing — do not re-trust that log line or the feature's
-premise. It is replaced by daemon idle-exit (spec `daemon-idle-exit`;
-rationale in `docs/adr/daemon-idle-exit-001..003.md`).
+The daemon retained gigabytes after one embedding pass. Two ONNX Runtime
+mechanisms cause this. Both are fixed in the adapters as of 2026-09-12.
+The fix is measured, not assumed. Do not re-trust the earlier claim
+that "ORT BFCArena memory released" on session drop. It released nothing.
 
-## The mechanism
+## Mechanism 1: BFCArena (all platforms)
 
-- During an embed run, ONNX Runtime's CPU BFCArena grows in ~128MB
-  extents to fit the inference-scratch high-water mark (attention
-  scores dominate: batch × heads × seq² × 4 bytes). It is a
-  high-water-mark allocator: it never shrinks afterwards.
-- fastembed's internal defaults — 256 sequences × 512 max tokens per
-  ONNX run, memory-pattern preallocation on, no session options
-  exposed — set that high-water mark in the multi-GB range for a
-  128MB-on-disk model (`src/adapters/embedder.rs`, fastembed
-  `common.rs::init_session_builder`).
-- The upstream bug: releasing the session does not return the arena's
-  extents either. ort's `Drop` correctly calls `ReleaseSession`; the
-  retention is inside ONNX Runtime (issues #26831, #11627, #23339;
-  maintainer guidance: "For CPU we recommend disabling the arena all
-  together" — which fastembed gives no way to do).
-- Net effect of evict→reload cycling: each cycle abandons the old
-  arena and grows a fresh one. Measured on a live daemon (v0.2.4,
-  Jul 2026): 15 logged evictions ≈ 12.1GB footprint, peak 18.8GB, 118
-  live `MALLOC_LARGE` regions (many exactly 128MB), still present in
-  `vmmap` minutes after an eviction fired. Eviction is strictly worse
-  than doing nothing.
+- During an embed run, the CPU BFCArena grows in 128 MB extents to the
+  inference-scratch high-water mark. It never shrinks. Dropping the
+  session does not return the extents (ORT #26831, #11627, #23339).
+- Fix: disable the arena. `cpu_no_arena()` in
+  `crates/hallouminate-adapters/src/embedder.rs` passes
+  `ort::ep::CPU::default().with_arena_allocator(false)` through
+  fastembed's `with_execution_providers`. Both the embedder and the
+  crossencoder use it. ORT then uses plain malloc/free for scratch.
 
-## What actually works
+## Mechanism 2: KleidiAI thread-local GEMM buffers (Apple SME only)
 
-- **Process exit.** The OS reclaims everything; the next start pays
-  the same ~4s model load eviction already paid. This is the
-  `daemon-idle-exit` design: exit after `[daemon].idle_exit_secs` of
-  inactivity with zero active connections; clients respawn via
-  `client_for(None)` → `ensure_daemon_running()`.
-  **Caveat (2026-07-13 audit, #222):** idle-exit is starved under
-  multi-instance fleets — `touch_activity()` fires on every request
-  completion and `ConnectionGuard` defers exit while any connection is
-  active (`src/app/daemon/state.rs:743-779`); the 30-min maintenance
-  tick also touches the clock (`state.rs:534-567`). With N concurrent
-  Claude Code instances a true `idle_exit_secs` (default 900s) global
-  gap becomes rare, so the only reclaim mechanism rarely fires exactly
-  when memory pressure is highest.
-- **Smaller high-water mark.** Capping the embed batch
-  (`embed(texts, Some(32))` instead of `None`) shrinks the arena
-  peak roughly proportionally — a separate mitigation, not a fix.
-- **Rerank batch is capped too (#221, fixed).** The crossencoder path
-  once called `rerank(query, &docs, false, None)`, leaving its joint
-  batch uncapped. It now passes `Some(RERANK_BATCH_SIZE)` with
-  `RERANK_BATCH_SIZE = 32`
-  (`crates/hallouminate-adapters/src/crossencoder.rs:56`), the same
-  bounded-batch mitigation as the embedder. Reranks still serialize
-  daemon-wide behind a whole-map mutex.
+- ORT 1.28.0 routes fp32 `MatMul` through KleidiAI when
+  `HasArm_SME()` is true. That is M4-generation Apple Silicon and later.
+  M1–M3 never enter this path.
+- `sgemm_kleidiai.cpp` keeps packed operands in a
+  `static thread_local KaiTlsBuffers`. The vectors `resize()` up and never
+  shrink. One set exists per intra-op thread (fastembed uses
+  `available_parallelism`). `malloc_history` on a live daemon showed three
+  live allocations of 250 MB, 230 MB, 180 MB, zero frees, all from
+  `MatMul<float>::Compute → ArmKleidiAI::MlasGemmBatch → operator new`.
+- Upstream: onnxruntime#29538, stale-closed 2026-09-11 without a fix.
+  Our SGEMM trace is posted there. No env or global switch exists; the
+  cmake flag `onnxruntime_USE_KLEIDIAI` and the per-session config entry
+  `mlas.disable_kleidiai` are the only gates. All macOS-arm64 prebuilts
+  bake KleidiAI in.
+- Fix: `DISABLE_KLEIDIAI` in `embedder.rs` sets
+  `with_session_config("mlas.disable_kleidiai", "1")` on both
+  `TextInitOptions` and `RerankInitOptions`.
 
-## For future agents
+## fastembed version
 
-- `embeddings.idle_evict_secs` is a deprecated no-op after
-  `daemon-idle-exit` lands; the config warns and does nothing.
-- Full cited diagnosis: `.cheese/research/fastembed-ort-arena-leak/`.
+fastembed 6.0.3 built the `SessionBuilder` in a `pub(crate)` function and
+exposed no session config entries. `ort` gives no public way to wrap a
+custom execution provider. This repository pinned a fork through
+`[patch.crates-io]` from 2026-09-12 until upstream shipped the method.
+fastembed 6.1.0 (released 2026-09-12) includes `with_session_config` from
+Anush008/fastembed-rs#292 (issue #291). The adapters crate now requires
+`fastembed = "6.1"` and the patch is gone.
 
-_Source: multi-instance concurrency audit plus issue #288 verification; #221/#285 rerank-cap correction · Updated: 2026-08-23 · Supersedes: the #221 rerank-uncapped gap, now recorded as a landed fix_
+## Measured (240 markdown files, boot catch-up embed, arctic-embed-s fp32, batch 32, max_length 416)
+
+| Build | Settled footprint | Peak | Embed pass |
+|---|---|---|---|
+| 0.10.0 as shipped | 4843 MB | 5041 MB | — |
+| arena off + max_length 416 | 2189 MB | 3860 MB | 10 s |
+| + `mlas.disable_kleidiai` | **217 MB** | 2067 MB | 14–23 s |
+| embeddings disabled (floor) | 170 MB | — | — |
+
+Arena-off alone is not a fix on SME hardware. KleidiAI-off costs about 40 %
+on the embed pass. The peak is transient scratch and returns to the OS.
+
+## How to measure
+
+Use `footprint <pid>` and `vmmap <pid> | grep MALLOC_LARGE`. Do not use RSS.
+macOS compresses idle pages, so RSS read 120 MB while the footprint was
+2.9 GB. To find an owner, start the daemon with `MallocStackLogging=1`,
+then run `malloc_history <pid> <region-start-address>`. The bench scripts
+are throwaway files under `/tmp/hm-bench/` (config with an isolated
+`ground_dir`, `HALLOUMINATE_SOCKET` override, 240-file corpus).
+
+## Still true
+
+- Process exit reclaims everything. `daemon-idle-exit` remains the
+  backstop, but it is starved under multi-instance fleets (#222): with
+  ten MCP `serve` clients attached, a 900 s global gap is rare.
+- `EMBED_BATCH_SIZE = 32` and `RERANK_BATCH_SIZE = 32` bound the transient
+  peak. `EMBED_MAX_LENGTH = 416` (chunk budget 384 + 32 headroom) bounds
+  the seq² term.
+- `embeddings.idle_evict_secs` is a deprecated no-op.
+- Prior diagnosis: `.cheese/research/fastembed-ort-arena-leak/`. This
+  round: `.cheese/research/ort-kleidiai-gemm-retention/`,
+  `ort-kleidiai-fix-status/`, `fastembed-session-options-issue/`,
+  `rust-embedding-alternatives/`.
+
+_Source: live-daemon footprint/vmmap/malloc_history investigation, 2026-09-12 · Supersedes: the arena-only explanation and the eviction-era claims_
