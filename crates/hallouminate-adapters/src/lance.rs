@@ -530,13 +530,25 @@ fn reject_donor_expectation(
     }
 }
 
-fn reject_donor_hash(expectations: &[DonorExpectation], lookup: &mut DonorLookup, hash: &str) {
+fn reject_donor_hash(
+    expectations: &[DonorExpectation],
+    lookup: &mut DonorLookup,
+    hash: &str,
+    active: &mut HashMap<(String, (String, String, String)), DonorCandidate>,
+    completed: &mut HashMap<(String, (String, String, String)), usize>,
+) {
     lookup.rejected_hashes.insert(hash.to_string());
     for (index, expected) in expectations.iter().enumerate() {
         if expected.content_hash == hash {
             lookup.rejected[index] = true;
             lookup.vectors[index] = None;
         }
+    }
+    // Remove active candidates with this hash
+    let keys_to_remove: Vec<_> = active.keys().filter(|k| k.0 == hash).cloned().collect();
+    for key in keys_to_remove {
+        discard_donor_candidate(active, &key, lookup);
+        completed.remove(&key);
     }
 }
 
@@ -636,6 +648,47 @@ fn decode_active_donor_row(
     }
 }
 
+struct DonorColumns<'a> {
+    content_hashes: &'a StringArray,
+    corpora: &'a StringArray,
+    roots: &'a StringArray,
+    file_refs: &'a StringArray,
+    search_texts: &'a StringArray,
+    ords: &'a Int64Array,
+    embedding_column: &'a FixedSizeListArray,
+}
+
+fn donor_columns<'a>(rb: &'a RecordBatch) -> Result<DonorColumns<'a>> {
+    let content_hashes = string_col(rb, "content_hash")?;
+    let corpora = string_col(rb, "corpus")?;
+    let roots = string_col(rb, "root")?;
+    let file_refs = string_col(rb, "file_ref")?;
+    let search_texts = string_col(rb, "search_text")?;
+    let ords = int64_col(rb, "ord")?;
+
+    let embedding_column = rb.column_by_name("embedding").ok_or_else(|| {
+        HallouminateError::Indexer("donor batch missing column embedding".to_string())
+    })?;
+    let embedding_column = embedding_column
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| {
+            HallouminateError::Indexer(
+                "donor batch column embedding is not a fixed-size list".to_string(),
+            )
+        })?;
+
+    Ok(DonorColumns {
+        content_hashes,
+        corpora,
+        roots,
+        file_refs,
+        search_texts,
+        ords,
+        embedding_column,
+    })
+}
+
 fn decode_donor_batch(
     rb: &RecordBatch,
     expectations: &[DonorExpectation],
@@ -646,33 +699,20 @@ fn decode_donor_batch(
     if rb.num_rows() == 0 {
         return Ok(());
     }
-    let Ok(content_hashes) = string_col(rb, "content_hash") else {
-        return Ok(());
+    let columns = match donor_columns(rb) {
+        Ok(cols) => cols,
+        Err(error) => {
+            tracing::warn!(error = %error, "donor batch has unexpected schema; skipping donor reuse for batch");
+            return Ok(());
+        }
     };
-    let Ok(corpora) = string_col(rb, "corpus") else {
-        return Ok(());
-    };
-    let Ok(roots) = string_col(rb, "root") else {
-        return Ok(());
-    };
-    let Ok(file_refs) = string_col(rb, "file_ref") else {
-        return Ok(());
-    };
-    let Ok(search_texts) = string_col(rb, "search_text") else {
-        return Ok(());
-    };
-    let Ok(ords) = int64_col(rb, "ord") else {
-        return Ok(());
-    };
-    let Some(embedding_column) = rb.column_by_name("embedding") else {
-        return Ok(());
-    };
-    let Some(embedding_column) = embedding_column
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
-    else {
-        return Ok(());
-    };
+    let content_hashes = columns.content_hashes;
+    let corpora = columns.corpora;
+    let roots = columns.roots;
+    let file_refs = columns.file_refs;
+    let search_texts = columns.search_texts;
+    let ords = columns.ords;
+    let embedding_column = columns.embedding_column;
     for row in 0..rb.num_rows() {
         let hash = content_hashes.value(row);
         let group_key = (
@@ -693,7 +733,7 @@ fn decode_donor_batch(
             }
         }
         if hash_is_expected && hash_has_out_of_range_ord {
-            reject_donor_hash(expectations, lookup, hash);
+            reject_donor_hash(expectations, lookup, hash, active, completed);
             continue;
         }
         if lookup.rejected_hashes.contains(hash) {
@@ -2968,6 +3008,108 @@ mod tests {
 
         assert!(lookup.rejected[0]);
         assert!(lookup.vectors[0].is_none());
+    }
+
+    #[test]
+    fn donor_columns_missing_column_is_observable() {
+        let donor_key = corpus_key("docs", "/root-donor");
+        let donor = synthetic_prepared_for(&donor_key, "same.md", 1, "shared text", 1, 1);
+        let embeddings = synth_embeddings(donor.chunks.len());
+        let fwe = FileWithEmbeddings {
+            file: &donor,
+            embeddings: Some(&embeddings),
+        };
+        let schema = chunks_schema();
+        let rb = build_record_batch(&[fwe], schema).expect("build batch");
+        let search_text_index = rb
+            .schema()
+            .index_of("search_text")
+            .expect("search_text column");
+        let keep: Vec<usize> = (0..rb.num_columns())
+            .filter(|index| *index != search_text_index)
+            .collect();
+        let rb = rb.project(&keep).expect("project without search_text");
+
+        let Err(error) = donor_columns(&rb) else {
+            panic!("missing search_text must fail");
+        };
+        assert_eq!(error.to_string(), "indexer: missing column search_text");
+
+        let target_key = corpus_key("docs", "/root-target");
+        let target = synthetic_prepared_for(&target_key, "same.md", 1, "shared text", 2, 2);
+        let expectations = vec![donor_expectation(&target)];
+        let mut lookup = DonorLookup::new(expectations.len());
+        let mut active = HashMap::new();
+        let mut completed = HashMap::new();
+        decode_donor_batch(&rb, &expectations, &mut lookup, &mut active, &mut completed)
+            .expect("schema drift falls back instead of failing");
+        assert!(lookup.vectors.iter().all(Option::is_none));
+        assert!(active.is_empty());
+        assert_eq!(lookup.active_rows, 0);
+    }
+
+    #[test]
+    fn reject_donor_hash_clears_active_and_completed() {
+        let donor_key = corpus_key("docs", "/root-donor");
+        let donor = synthetic_prepared_for(&donor_key, "same.md", 3, "shared text", 1, 1);
+        let embeddings = synth_embeddings(donor.chunks.len());
+        let fwe = FileWithEmbeddings {
+            file: &donor,
+            embeddings: Some(&embeddings),
+        };
+        let schema = chunks_schema();
+        let _rb = build_record_batch(&[fwe], schema).expect("build batch");
+
+        let target_key = corpus_key("docs", "/root-target");
+        let target = synthetic_prepared_for(&target_key, "same.md", 3, "shared text", 2, 2);
+        let expectations = vec![donor_expectation(&target)];
+        let mut lookup = DonorLookup::new(expectations.len());
+        let mut active = HashMap::new();
+        let mut completed = HashMap::new();
+
+        // Manually insert an active entry with the donor hash
+        let active_key = (
+            donor.content_hash.clone(),
+            (
+                target_key.name.clone(),
+                target_key.canonical_root.to_string_lossy().to_string(),
+                "same.md".to_string(),
+            ),
+        );
+        active.insert(
+            active_key.clone(),
+            DonorCandidate {
+                expectation: 0,
+                vectors: vec![None, None, None],
+                retained_rows: 1,
+            },
+        );
+        lookup.active_rows = 1;
+        lookup.active_slots = 3;
+
+        // Insert a completed entry with the donor hash
+        completed.insert(active_key.clone(), 0);
+
+        // Call reject_donor_hash with the new signature
+        reject_donor_hash(
+            &expectations,
+            &mut lookup,
+            &donor.content_hash,
+            &mut active,
+            &mut completed,
+        );
+
+        // Verify active and completed are cleaned up
+        assert!(
+            !active.contains_key(&active_key),
+            "active entry should be removed"
+        );
+        assert!(
+            !completed.contains_key(&active_key),
+            "completed entry should be removed"
+        );
+        assert_eq!(lookup.active_rows, 0, "active_rows should be decremented");
+        assert_eq!(lookup.active_slots, 0, "active_slots should be decremented");
     }
 
     #[tokio::test]
