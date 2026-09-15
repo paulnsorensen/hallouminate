@@ -2906,6 +2906,7 @@ name = "hallouminate-daemon"
 version = "0.10.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "fastrand",
  "futures-util",

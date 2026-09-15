@@ -11,27 +11,22 @@ use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
 use super::bucket::{build_docs, normalize_scores};
 use super::types::{DocFile, GroundResponse, Stats, Warning};
 
-/// Run `crossencoder.rerank(query, &mut hits)` on a blocking-pool thread and
-/// bound it with `timeout`. `Crossencoder::rerank` is synchronous CPU-bound
-/// work with no `.await`, so wrapping `tokio::time::timeout` directly around
-/// it cannot preempt a stalled call (#139) — only a real OS-thread boundary
-/// can. `spawn_blocking` gives us that boundary; on timeout the spawned
-/// thread is abandoned (left to finish or die on its own, never joined) and
-/// `hits` (cloned up front) is returned unchanged so the caller falls back
-/// to fusion order. Returns `(hits, applied)`; `applied` is `false` on
-/// timeout so callers gate z-score normalization on it, preserving the
-/// "z-score only when the cross-encoder ran" invariant on the fallback path.
-/// The abandoned thread still owns the boxed crossencoder (on the daemon
-/// path, a `CrossencoderGuard` holding the shared crossencoder mutex), so
-/// that mutex stays locked until the stalled call drains — concurrent rerank
-/// requests serialize behind it, exactly as they did before the timeout
-/// existed (#139 accepted tradeoff).
+/// Why one bounded crossencoder attempt kept fusion order.
+#[derive(Debug, PartialEq, Eq)]
+enum RerankFallback {
+    Timeout,
+    Unavailable,
+}
+
+/// Run reranking on a blocking-pool thread within `timeout`.
+/// Construction, admission, and native execution share this deadline.
+/// Returns the hits plus `Some(reason)` when fusion order was kept.
 async fn rerank_with_timeout(
     mut crossencoder: Box<dyn Crossencoder>,
     query: String,
     hits: Vec<SearchHit>,
     timeout: Duration,
-) -> Result<(Vec<SearchHit>, bool)> {
+) -> (Vec<SearchHit>, Option<RerankFallback>) {
     let fallback = hits.clone();
     let query_len = query.len();
     let handle = tokio::task::spawn_blocking(move || {
@@ -39,19 +34,27 @@ async fn rerank_with_timeout(
         crossencoder.rerank(&query, &mut hits)?;
         Ok::<Vec<SearchHit>, HallouminateError>(hits)
     });
-    match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(Ok(reranked))) => Ok((reranked, true)),
-        Ok(Ok(Err(e))) => Err(e),
+    let reason = match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(Ok(reranked))) => return (reranked, None),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(
+                error = %error,
+                "crossencoder rerank unavailable; falling back to fusion order",
+            );
+            RerankFallback::Unavailable
+        }
         Ok(Err(join_err)) => {
             let cause = if join_err.is_panic() {
                 "panicked"
             } else {
                 "was cancelled"
             };
-            tracing::error!(error = %join_err, cause, "crossencoder task failed");
-            Err(HallouminateError::Embed(format!(
-                "crossencoder task {cause}: {join_err}"
-            )))
+            tracing::warn!(
+                error = %join_err,
+                cause,
+                "crossencoder task failed; falling back to fusion order",
+            );
+            RerankFallback::Unavailable
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -59,9 +62,10 @@ async fn rerank_with_timeout(
                 query_len,
                 "crossencoder rerank timed out; falling back to fusion order"
             );
-            Ok((fallback, false))
+            RerankFallback::Timeout
         }
-    }
+    };
+    (fallback, Some(reason))
 }
 /// Strip the first matching corpus root prefix from `abs_path`, returning
 /// a corpus-relative path string accepted by `safe_relative_path`.
@@ -221,22 +225,30 @@ pub async fn ground_union(
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
-        let (reranked, applied) =
-            rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await?;
+        let (reranked, fallback) =
+            rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await;
         hits = reranked;
-        if applied {
-            let z_scores = normalize_scores(&hits);
-            for (hit, z_score) in hits.iter_mut().zip(z_scores) {
-                hit.z_score = z_score;
+        match fallback {
+            None => {
+                let z_scores = normalize_scores(&hits);
+                for (hit, z_score) in hits.iter_mut().zip(z_scores) {
+                    hit.z_score = z_score;
+                }
             }
-        } else {
-            warnings.push(Warning {
+            // Keep each code as a string literal on the `code` field: the eval
+            // gate scans sources for that shape to classify producer warnings.
+            Some(RerankFallback::Timeout) => warnings.push(Warning {
                 code: "rerank-timeout".to_string(),
                 message: format!(
                     "crossencoder rerank timed out after {} ms; falling back to fusion order",
                     opts.rerank_timeout.as_millis()
                 ),
-            });
+            }),
+            Some(RerankFallback::Unavailable) => warnings.push(Warning {
+                code: "crossencoder-unavailable".to_string(),
+                message: "crossencoder rerank unavailable; falling back to fusion order"
+                    .to_string(),
+            }),
         }
     }
 
@@ -571,19 +583,14 @@ mod tests {
         ];
         let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
 
-        let (result, applied) = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(SleepingCrossencoder),
             "q".to_string(),
             hits,
             Duration::from_millis(20),
         )
-        .await
-        .expect("timeout path must not error");
-
-        assert!(
-            !applied,
-            "a stalled crossencoder must report applied == false"
-        );
+        .await;
+        assert_eq!(reason, Some(RerankFallback::Timeout));
         let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
         assert_eq!(
             observed, fusion_order,
@@ -606,22 +613,62 @@ mod tests {
             hit_for_timeout_test("/b.md", 0.9),
         ];
 
-        let (result, applied) = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(ReversingCrossencoderStub),
             "q".to_string(),
             hits,
             Duration::from_secs(2),
         )
-        .await
-        .expect("fast path must not error");
-
-        assert!(applied, "a fast crossencoder must report applied == true");
+        .await;
+        assert_eq!(reason, None, "fast path must apply reranking");
         let observed: Vec<&str> = result.iter().map(|h| h.file_ref.as_str()).collect();
         assert_eq!(
             observed,
             vec!["/b.md", "/a.md"],
-            "fast path must apply the crossencoder's reordering"
+            "fast path must apply the crossencoder ordering"
         );
+    }
+
+    #[tokio::test]
+    async fn ground_preserves_fusion_results_when_crossencoder_panics() {
+        struct PanickingCrossencoder;
+        impl Crossencoder for PanickingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                hits.reverse();
+                for hit in hits {
+                    hit.score = 999.0;
+                }
+                panic!("native reranker failed after modifying hits");
+            }
+        }
+
+        let store = FakeChunkStore {
+            hits: fixture_hits(),
+        };
+        let corpus = fixture_corpus();
+        let baseline = ground("spice", &corpus, &store, None, GroundOpts::default())
+            .await
+            .expect("fusion search succeeds");
+        let response = ground(
+            "spice",
+            &corpus,
+            &store,
+            Some(Box::new(PanickingCrossencoder)),
+            GroundOpts::default(),
+        )
+        .await
+        .expect("a reranker panic must preserve the search response");
+
+        assert_eq!(response.stats.hits, 5);
+        assert_eq!(
+            serde_json::to_value(&response.docs).unwrap(),
+            serde_json::to_value(&baseline.docs).unwrap()
+        );
+        let mut warnings = Vec::new();
+        for warning in &response.warnings {
+            warnings.push(warning.code.as_str());
+        }
+        assert_eq!(warnings, vec!["crossencoder-unavailable"]);
     }
 
     // --- #139: GroundOpts.rerank_timeout wiring ---
@@ -865,18 +912,17 @@ mod tests {
         ];
         let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
 
-        let (result, applied) = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(SleepingCrossencoder),
             "q".to_string(),
             hits,
             Duration::from_millis(0),
         )
-        .await
-        .expect("zero timeout must not error, only fall back to fusion order");
-
-        assert!(
-            !applied,
-            "a zero-duration timeout must report applied == false"
+        .await;
+        assert_eq!(
+            reason,
+            Some(RerankFallback::Timeout),
+            "zero timeout must fall back to fusion order"
         );
         let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
         assert_eq!(

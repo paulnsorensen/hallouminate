@@ -12,6 +12,7 @@ for each release window.
 ### Fixed
 
 - Daemon: keep runtime discovery and periodic reconciliation active when the native watcher cannot start
+- Ground: preserve fusion results and report `crossencoder-unavailable` when the reranker worker fails
 
 ### Added
 
