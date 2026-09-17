@@ -12,7 +12,7 @@
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorCode, ErrorData, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, ErrorCode, ErrorData, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -920,11 +920,11 @@ impl Default for HallouminateTools {
 
 #[tool_handler]
 impl ServerHandler for HallouminateTools {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` and `Implementation` are both `#[non_exhaustive]` in
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` and `Implementation` are both `#[non_exhaustive]` in
         // `rmcp`; construct via `Default::default()` and mutate the fields
         // we care about so we don't fight the crate's evolution constraints.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.server_info.name = env!("CARGO_PKG_NAME").into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.instructions = Some(SERVER_INSTRUCTIONS.to_string());
