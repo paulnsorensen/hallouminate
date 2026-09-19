@@ -103,6 +103,7 @@ pub fn cmd_wiki_status(args: WikiStatusArgs) -> anyhow::Result<()> {
 
 /// One parsed porcelain record: its XY status code and its path relative to the
 /// git working-tree root.
+#[derive(Debug)]
 struct StatusEntry {
     status: String,
     path: PathBuf,
@@ -116,6 +117,11 @@ fn git_toplevel(cwd: &Path) -> anyhow::Result<PathBuf> {
         .arg("-C")
         .arg(cwd)
         .args(["rev-parse", "--show-toplevel"])
+        // Ambient GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE override `-C`; clear them
+        // so detection targets the repository that encloses `cwd`.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .with_context(|| format!("invoke `git -C {} rev-parse`", cwd.display()))?;
     if !output.status.success() {
@@ -140,13 +146,28 @@ fn git_toplevel(cwd: &Path) -> anyhow::Result<PathBuf> {
 /// committed yet in the wiki", and staged files are already captured.
 fn git_status(git_root: &Path, roots: &[(String, PathBuf)]) -> anyhow::Result<Vec<StatusEntry>> {
     // Deduplicate pathspecs: several corpora can share a root.
-    let mut pathspecs: Vec<&Path> = roots.iter().map(|(_, rel)| rel.as_path()).collect();
+    // A corpus root that equals the git root strips to an empty relative path;
+    // git rejects the empty pathspec, so map it to `.` (the whole tree).
+    let mut pathspecs: Vec<&Path> = roots
+        .iter()
+        .map(|(_, rel)| {
+            if rel.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                rel.as_path()
+            }
+        })
+        .collect();
     pathspecs.sort();
     pathspecs.dedup();
 
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(git_root)
+        // Clear ambient repo env vars so `-C` selects the intended repository.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .args(["status", "--porcelain", "-z", "--untracked-files=all", "--"])
         .args(&pathspecs);
     let output = cmd
@@ -162,7 +183,7 @@ fn git_status(git_root: &Path, roots: &[(String, PathBuf)]) -> anyhow::Result<Ve
 /// Parse `git status --porcelain -z` output.
 ///
 /// Records are NUL-terminated. Each record is `XY <path>`; a rename/copy record
-/// (X is `R` or `C`) carries a second NUL-separated path (the original), which
+/// (`R` or `C` in either status column) carries a second NUL-separated path (the original), which
 /// must be consumed to keep the stream aligned even though such records are
 /// staged (clean worktree column) and thus filtered out. A record is kept when
 /// its worktree column (Y) is non-blank — that covers ` M`, `MM`, `??`
@@ -184,9 +205,12 @@ fn parse_porcelain_z(stdout: &[u8]) -> anyhow::Result<Vec<StatusEntry>> {
         let y = bytes[1];
         let status = record[..2].to_string();
         let path = &record[3..];
-        // A rename/copy record has a trailing original-path token; consume it.
-        if x == b'R' || x == b'C' {
-            tokens.next();
+        // A rename/copy record (in either status column) has a trailing
+        // original-path token; consume it to keep the stream aligned.
+        if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
+            tokens
+                .next()
+                .ok_or_else(|| anyhow!("rename/copy record is missing its original path"))?;
         }
         if y != b' ' {
             out.push(StatusEntry {
@@ -416,5 +440,41 @@ mod tests {
         assert_eq!(entries.len(), 1, "only the worktree-dirty record survives");
         assert_eq!(entries[0].path, PathBuf::from("dirty"));
         assert_eq!(entries[0].status, " M");
+    }
+
+    #[test]
+    fn parse_consumes_rename_token_in_worktree_column() {
+        // A rename/copy marker can also land in the worktree column (Y). Its
+        // trailing original-path token must be consumed so the next record
+        // stays aligned. Here ` R new\0old\0` is worktree-dirty and kept.
+        let raw = b" R new\0old\0 M dirty\0";
+        let entries = parse_porcelain_z(raw).expect("parse");
+        assert_eq!(
+            entries.len(),
+            2,
+            "renamed entry plus dirty entry: {entries:?}"
+        );
+        assert_eq!(entries[0].path, PathBuf::from("new"));
+        assert_eq!(entries[0].status, " R");
+        assert_eq!(entries[1].path, PathBuf::from("dirty"));
+    }
+
+    #[test]
+    fn corpus_root_equal_to_git_root_is_reported() {
+        let dir = seed_repo();
+        // A corpus pointed at the repository root strips to an empty relative
+        // path; it must map to `.` rather than an empty (git-rejected) pathspec.
+        let cfg = dir.path().join(".hallouminate/config.toml");
+        fs::write(
+            &cfg,
+            "[[repository]]\nname = \"demo\"\npath = \".\"\ncorpus_paths = [\".\"]\n",
+        )
+        .expect("rewrite config");
+        fs::write(dir.path().join("root.md"), "# root\n").expect("write");
+        let files = status(dir.path());
+        assert!(
+            files.iter().any(|f| f.path == "root.md"),
+            "a dirty file under the repo-root corpus must be reported: {files:?}"
+        );
     }
 }
