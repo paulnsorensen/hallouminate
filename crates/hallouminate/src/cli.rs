@@ -7,6 +7,7 @@ mod ground;
 mod hook;
 mod index;
 mod init_repo;
+mod wiki;
 
 pub use config::{
     ConfigDownloadArgs, ConfigInitArgs, ConfigShowArgs, ConfigValidateArgs, cmd_config_download,
@@ -17,6 +18,7 @@ pub use hallouminate_daemon::{CorpusReport, IndexReport};
 pub use hook::{HookArgs, cmd_hook_install, cmd_hook_uninstall};
 pub use index::{AD_HOC_CORPUS_NAME, IndexArgs, cmd_index, run_index, select_corpora};
 pub use init_repo::{InitRepoArgs, cmd_init_repo};
+pub use wiki::{WikiStatusArgs, cmd_wiki_status};
 
 /// CLI surface for output format selection. Mirrors `domain::ground::Format`
 /// but kept in the app layer to keep `ValueEnum` (a clap dep) out of the
@@ -73,6 +75,13 @@ pub enum Command {
     /// MCP-aware clients (Claude Desktop, Claude Code, etc.). The process
     /// runs until stdin closes.
     Serve,
+    /// Inspect the repository's hallouminate wiki. `wiki status` lists wiki and
+    /// corpus files with uncommitted git changes (worktree modifications not yet
+    /// staged, plus untracked files). Read-only; runs only inside a git repo.
+    Wiki {
+        #[command(subcommand)]
+        action: WikiAction,
+    },
     /// Manage the local daemon: single owner of the LanceDB ground directory,
     /// repository registry, and per-corpus mutation locks. CLI and MCP
     /// clients talk to it over a Unix domain socket. Bare `daemon` runs it in
@@ -252,6 +261,25 @@ pub enum HookAction {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum WikiAction {
+    /// List wiki and corpus files with uncommitted git changes (worktree
+    /// modifications not yet staged, plus untracked files). Staged-only changes
+    /// are excluded. Roots are read from the repo's `.hallouminate/config.toml`.
+    Status {
+        /// Baseline config override (`--config PATH`).
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Working directory for repo-config discovery and git detection
+        /// (defaults to current dir).
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of the grouped text view.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ConfigAction {
     Init {
         #[arg(long)]
@@ -290,6 +318,11 @@ pub async fn dispatch(cli: Cli, startup: hallouminate_config::Config) -> anyhow:
             HookAction::Uninstall { repo } => cmd_hook_uninstall(HookArgs { repo }),
         },
         Command::InitRepo(args) => cmd_init_repo(args.into()),
+        Command::Wiki { action } => match action {
+            WikiAction::Status { config, cwd, json } => {
+                cmd_wiki_status(WikiStatusArgs { config, cwd, json })
+            }
+        },
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
             ConfigAction::Show { config, cwd } => cmd_config_show(ConfigShowArgs { config, cwd }),
