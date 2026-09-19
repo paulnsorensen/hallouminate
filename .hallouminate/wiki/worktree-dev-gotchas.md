@@ -234,7 +234,7 @@ Git's rename detection carries upstream edits across a file that the branch
 renamed, but verify that rather than assume it: diff the upstream-added and
 upstream-removed lines against the renamed file before you continue.
 
-[^mcpload]: Issue #427 slice-3 resume, 2026-09-05. Host at load average 25-33 with ~12 concurrent worktrees. `READ_TIMEOUT` is `Duration::from_secs(15)` at mcp_serve.rs:30.
+[^mcpload]: Issue #427 slice-3 resume, 2026-09-05. Host at load average 25-33 with ~12 concurrent worktrees. `READ_TIMEOUT` was `Duration::from_secs(15)` at mcp_serve.rs:30. Resolved 2026-09-19: raised to 60 s. Each `mcp_serve` test spawns a fresh `serve` child plus a per-test daemon and libtest runs ~ncpu in parallel, so first-byte latency under concurrent-worktree load overran 15 s though the server replied correctly. The bound only guards a server that never replies, so a generous value removes the flake without hiding a hang.
 [^squash]: Issue #427 rebase, 2026-09-05. Base `a1219fd` versus squash `e745955`; `walker.rs` and `sandbox.rs` blobs identical, detector verdict `not-detected`.
 [^pathorder]: Issue #427 resume, 2026-09-05: `type -a cargo` in the `macau-v1` worktree lists the rustup proxy before the mise shim; `env -u RUSTUP_TOOLCHAIN cargo --version` reports 1.97.1.
 
