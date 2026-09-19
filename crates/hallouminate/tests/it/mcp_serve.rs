@@ -27,7 +27,14 @@ use tokio::time::timeout;
 
 use crate::common::daemon::DaemonHarness;
 
-const READ_TIMEOUT: Duration = Duration::from_secs(15);
+// First-byte budget for one JSON-RPC reply. Each test spawns a fresh
+// `hallouminate serve` child plus a per-test daemon, and libtest runs ~ncpu
+// of these in parallel. Under heavy host load (many concurrent worktrees) the
+// child's first reply after spawn can lag well past a few seconds while it
+// starts and dials the daemon socket. The bound exists only to fail a server
+// that never replies, so it is generous: a slow-but-correct reply must not
+// flake. See .hallouminate/wiki/worktree-dev-gotchas.md ([^mcpload]).
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Mcp {
