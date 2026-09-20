@@ -1,0 +1,17 @@
+# ADR — infrastructure-ownership-002
+
+### ADR-002: Do not adopt service-manager or OS-managed recovery for the restart ladder  [status: accepted]
+
+- **Context:** Spike #477 asks whether launchd and systemd process recovery, installed through the `service-manager` crate (0.11.0), can replace the custom task-restart ladder. The daemon exits with code 0 on idle to reclaim memory (ADR daemon-idle-exit-001, -004). Clients start the daemon on demand, and each worktree can use its own socket through `HALLOUMINATE_SOCKET`.
+- **Decision:** Reject adoption. The daemon keeps the on-demand, idle-exit policy with client spawn. It installs no OS service.
+- **Evidence:**
+  - An OS manager restarts a whole process. It cannot restart one tokio task. A `WatcherPump` panic must not stop in-flight maintenance or catch-up work. `supervisor.rs` and `ladder.rs` stay.
+  - The crate's systemd generator does not write `StartLimitBurst` or `StartLimitIntervalSec`. Its source marks both as TODO items. Neither backend writes `WatchdogSec`, `Type=notify`, `Sockets`, or `MachServices`. The launchd generator writes only the `SuccessfulExit` key, never `Crashed` or `ThrottleInterval`.
+  - launchd has no watchdog primitive. macOS is the primary platform, so the thread-based stall watchdog must stay. Restart-on-exit does not detect a frozen runtime.
+  - Idle exit and restart policy are compatible only in one form: `KeepAlive{SuccessfulExit:false}` on launchd and `Restart=on-failure` on systemd. `KeepAlive: true` and `Restart=always` cause a restart loop after each idle exit.
+  - The single-instance flock, sibling-socket adoption, and socket cleanup order are application invariants. No OS manager supplies them.
+  - One OS unit for each machine conflicts with one daemon for each worktree socket.
+- **launchd and systemd differences:** systemd has a restart delay plus a windowed burst limit; launchd has one flat `ThrottleInterval` (default 10 s) and an undocumented suspend rule. systemd has `WatchdogSec` with `sd_notify`; launchd has no equivalent. systemd has `Type=notify` readiness; launchd has no readiness protocol. Both need more configuration to survive logout (`loginctl enable-linger`, or a LaunchDaemon in place of a LaunchAgent). Any future heartbeat integration is possible on Linux only.
+- **Acceptance criteria not run:** The spike loads no real launchd or systemd service. Restart timing, restart limits, uninstall behavior, and the `status` defect in upstream issue #41 need a live manager. The research report gives an isolated recipe: `launchctl bootstrap gui/$UID` with a temporary label, and `systemd --user` in a container. The rejection rests on absences in the generator source and on documented semantics. It does not rest on runtime results.
+- **Alternatives:** Raw unit text through `ServiceInstallCtx.contents` (rejected: it bypasses the crate's abstraction, so the crate then owns nothing). systemd socket activation (deferred: Linux only, not implemented by the crate, and it changes the client spawn contract).
+- **Consequences:** No code removal. `watchdog.rs` boot backoff stays as the process-level policy. If a persistent service becomes a requirement, the units must use the on-failure forms above. Full claim table: `.cheese/research/spike-477-service-manager/spike-477-service-manager.md`.
