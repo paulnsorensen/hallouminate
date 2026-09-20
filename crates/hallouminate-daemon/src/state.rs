@@ -349,8 +349,9 @@ struct DaemonStateInner {
     /// The map lock guards only a synchronous entry lookup, never an await.
     crossencoders: StdMutex<HashMap<&'static str, Arc<StdMutex<CrossencoderSlot>>>>,
     /// Monotonic (`Instant`-based) seconds-since-process-start timestamp of
-    /// completion (handle_connection) plus embedder/crossencoder acquire and
-    /// guard drop. Idle-exit (server.rs) fires when this is quiet for
+    /// the last inference-bearing work: a completed `IdleClock::Restart`
+    /// unit plus embedder/crossencoder acquire and guard drop. Idle-exit
+    /// (server.rs) fires when this is quiet for
     /// `[daemon].idle_exit_secs` and no connection is active (ADR-003).
     last_activity_secs: Arc<AtomicU64>,
     /// Count of connection handlers in flight. Idle-exit defers while non-zero
@@ -441,6 +442,16 @@ impl MutationGuard {
 pub enum WorkClass {
     External,
     Internal,
+}
+
+/// Effect of one completed unit of work on the idle-exit window (ADR
+/// daemon-idle-exit-004). Idle-exit exists to reclaim inference memory, so
+/// only inference-bearing work restarts the window. Cheap work keeps it;
+/// its `ConnectionGuard` still defers exit while the work is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleClock {
+    Restart,
+    Keep,
 }
 
 /// Decrements the daemon's active-connection count when dropped. Held by a
@@ -1012,11 +1023,15 @@ impl DaemonState {
         }))
     }
 
-    /// Bump the activity clock to now — called at request completion so
-    /// idle-exit keys on real request throughput, not just embed use (ADR-003).
-    pub fn touch_activity(&self, class: WorkClass) {
+    /// Record a completed unit of work. The per-class clock always moves, so
+    /// maintenance-defer sees every external request. The aggregate idle-exit
+    /// clock moves only for `IdleClock::Restart` (ADR daemon-idle-exit-004).
+    pub fn touch_activity(&self, class: WorkClass, idle_clock: IdleClock) {
         let now = monotonic_secs();
-        self.inner.last_activity_secs.store(now, Ordering::Relaxed);
+        match idle_clock {
+            IdleClock::Restart => self.inner.last_activity_secs.store(now, Ordering::Relaxed),
+            IdleClock::Keep => {}
+        }
         match class {
             WorkClass::External => self
                 .inner
@@ -1189,10 +1204,11 @@ impl DaemonState {
     /// connections, activity clock quiet for at least `idle_secs`.
     /// `idle_secs == 0` disables idle-exit.
     ///
-    /// Reads the aggregate counter/clock, which every `WorkClass` stamps, so
-    /// idle-exit gates on BOTH classes (ADR daemon-rework-002 preserving ADR
-    /// daemon-idle-exit-003): housekeeping in flight defers teardown exactly
-    /// like an external request -- never drop the flock mid-write.
+    /// Reads the aggregate counter/clock. Every `WorkClass` holds the counter,
+    /// so work in flight always defers teardown -- never drop the flock
+    /// mid-write (ADR daemon-idle-exit-003). Only `IdleClock::Restart` work
+    /// stamps the clock, so cheap RPCs cannot starve idle-exit (ADR
+    /// daemon-idle-exit-004).
     pub(crate) fn should_idle_exit(&self, idle_secs: u64) -> bool {
         self.should_idle_exit_at(idle_secs, monotonic_secs())
     }
@@ -1743,10 +1759,35 @@ mod tests {
             state.should_idle_exit_at(300, 1000),
             "clock stale at 1 s; now=1000 is well past idle",
         );
-        state.touch_activity(WorkClass::Internal);
+        state.touch_activity(WorkClass::Internal, IdleClock::Restart);
         assert!(
             !state.should_idle_exit_at(300, state.last_activity_secs() + 1),
             "Internal activity must stamp the idle clock (both classes gate idle-exit)",
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_touch_activity_does_not_restart_the_idle_window() {
+        // #222: a fleet of cheap RPCs must not starve idle-exit. A `Keep`
+        // completion moves the External clock (maintenance-defer still sees
+        // the request) but leaves the idle-exit clock stale.
+        let state = test_state().await;
+        // A sentinel far above any real monotonic reading: a stamp lowers it.
+        const STALE: u64 = u64::MAX / 2;
+        state.set_last_activity_secs_for_test(STALE);
+        state.touch_activity(WorkClass::External, IdleClock::Keep);
+        assert_eq!(state.last_activity_secs(), STALE);
+        assert!(
+            state.should_idle_exit_at(300, STALE + 1000),
+            "a Keep completion must leave the daemon eligible for idle-exit",
+        );
+        assert!(
+            state
+                .inner
+                .external_last_activity_secs
+                .load(Ordering::Relaxed)
+                < STALE,
+            "a Keep completion must still stamp the External clock",
         );
     }
 
@@ -2175,7 +2216,7 @@ mod tests {
             state.should_idle_exit_at(300, 1000),
             "clock stale at 1 s; now=1000 is well past idle",
         );
-        state.touch_activity(WorkClass::External);
+        state.touch_activity(WorkClass::External, IdleClock::Restart);
         assert!(
             !state.should_idle_exit_at(300, state.last_activity_secs() + 1),
             "touch_activity must reset the clock so a fresh now is not idle",
@@ -2218,7 +2259,7 @@ mod tests {
         );
         assert_eq!(state.inner.active_connections.load(Ordering::SeqCst), 2);
 
-        state.touch_activity(WorkClass::External);
+        state.touch_activity(WorkClass::External, IdleClock::Restart);
         assert!(
             state
                 .inner
@@ -2235,7 +2276,7 @@ mod tests {
             "External touch must not stamp the Internal clock",
         );
 
-        state.touch_activity(WorkClass::Internal);
+        state.touch_activity(WorkClass::Internal, IdleClock::Restart);
         assert!(
             state
                 .inner

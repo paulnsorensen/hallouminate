@@ -41,7 +41,7 @@ use hallouminate_domain::corpus::ensure_corpus_allows_relative;
 use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
-use super::state::{DaemonState, WorkClass};
+use super::state::{DaemonState, IdleClock, WorkClass};
 use registry::RegistrationId;
 use tokio_util::task::TaskTracker;
 
@@ -310,7 +310,7 @@ fn reload_repo_layer(
                 tracker.spawn(async move {
                     let _conn = state.enter_connection(WorkClass::Internal);
                     cleanup_retired_registration(&state, registration).await;
-                    state.touch_activity(WorkClass::Internal);
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                 });
             }
         }
@@ -515,7 +515,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                 &id,
                 Err("registration vanished before catch-up could start".into()),
             );
-            state.touch_activity(WorkClass::Internal);
+            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
             return;
         };
         // Hold the per-corpus lock for the whole scan-through-apply span so
@@ -529,7 +529,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                 Ok(()) => {}
                 Err(e) => {
                     state.watch_registry().finish_catch_up(&id, Err(e.to_string()));
-                    state.touch_activity(WorkClass::Internal);
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                     return;
                 }
             }
@@ -1089,7 +1089,7 @@ async fn process_change_batch(
     for path in &paths {
         handle_changed_path(state, roots, path, failures, churn).await;
     }
-    state.touch_activity(WorkClass::Internal);
+    state.touch_activity(WorkClass::Internal, IdleClock::Restart);
 }
 
 /// Reindex (or prune) one changed path, resolving its owning registration(s)

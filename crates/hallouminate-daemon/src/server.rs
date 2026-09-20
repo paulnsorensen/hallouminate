@@ -26,7 +26,7 @@ use super::heartbeat::TaskName;
 use super::ipc::{DaemonRequest, DaemonResponse};
 use super::ladder::LadderAction;
 use super::socket::daemon_socket_path;
-use super::state::{DaemonState, WorkClass};
+use super::state::{DaemonState, IdleClock, WorkClass};
 use super::watchdog;
 
 #[derive(Debug, Default, Clone)]
@@ -660,11 +660,15 @@ async fn handle_connection(
     let Some(frame) = frame else {
         return Ok(());
     };
+    let mut idle_clock = IdleClock::Keep;
     let response = match frame {
         Ok(line) => match serde_json::from_str::<DaemonRequest>(&line) {
             Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
                 Some(denied) => denied,
-                None => dispatch(&state, req).await,
+                None => {
+                    idle_clock = idle_clock_for(&req.payload);
+                    dispatch(&state, req).await
+                }
             },
             Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
         },
@@ -683,9 +687,9 @@ async fn handle_connection(
         }
         Err(LinesCodecError::Io(error)) => return Err(error.into()),
     };
-    // Request completed; stamp the activity clock so idle-exit keys on real
-    // request throughput, not just embed use (ADR-003).
-    state.touch_activity(WorkClass::External);
+    // Request completed. Every request stamps the External clock; only
+    // inference-bearing requests restart the idle-exit window (ADR-004).
+    state.touch_activity(WorkClass::External, idle_clock);
     let mut text = serde_json::to_string(&response)?;
     text.push('\n');
     let write_result = tokio::time::timeout(idle_timeout, async {
@@ -704,6 +708,28 @@ async fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// Classify a request for the idle-exit window (ADR daemon-idle-exit-004).
+/// Requests that embed or rerank restart it. Listings, reads, status, and
+/// row pruning keep it, so a fleet of cheap polls cannot starve idle-exit.
+fn idle_clock_for(payload: &super::ipc::DaemonRequestPayload) -> IdleClock {
+    use super::ipc::DaemonRequestPayload;
+    match payload {
+        DaemonRequestPayload::Ground(_)
+        | DaemonRequestPayload::Index(_)
+        | DaemonRequestPayload::AddMarkdown(_) => IdleClock::Restart,
+        DaemonRequestPayload::Ping
+        | DaemonRequestPayload::ListCorpora
+        | DaemonRequestPayload::ListFiles(_)
+        | DaemonRequestPayload::ListTree(_)
+        | DaemonRequestPayload::ReadMarkdown(_)
+        | DaemonRequestPayload::DeleteMarkdown(_)
+        | DaemonRequestPayload::Backlinks(_)
+        | DaemonRequestPayload::CorpusStats { .. }
+        | DaemonRequestPayload::Status
+        | DaemonRequestPayload::Shutdown => IdleClock::Keep,
+    }
 }
 
 fn lock_path_for(socket_path: &Path) -> PathBuf {
@@ -1100,6 +1126,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_inference_bearing_requests_restart_the_idle_window() {
+        use super::super::ipc::{
+            AddMarkdownRequest, DaemonRequestPayload, GroundRequest, IndexRequest,
+        };
+        let restarting = [
+            DaemonRequestPayload::Ground(GroundRequest {
+                query: "cheese".into(),
+                corpus: None,
+                top_files: None,
+                chunks_per_file: None,
+                limit: None,
+                snippet_chars: None,
+                footnote_mode: Default::default(),
+            }),
+            DaemonRequestPayload::Index(IndexRequest {
+                corpus: None,
+                paths_from: None,
+                strict: false,
+            }),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default()),
+        ];
+        for payload in &restarting {
+            assert_eq!(idle_clock_for(payload), IdleClock::Restart, "{payload:?}");
+        }
+        let keeping = [
+            DaemonRequestPayload::Ping,
+            DaemonRequestPayload::ListCorpora,
+            DaemonRequestPayload::Status,
+            DaemonRequestPayload::CorpusStats { corpus: None },
+        ];
+        for payload in &keeping {
+            assert_eq!(idle_clock_for(payload), IdleClock::Keep, "{payload:?}");
+        }
+    }
     #[test]
     fn authorize_peer_allows_different_uid_read_only_request() {
         use super::super::ipc::DaemonRequestPayload;

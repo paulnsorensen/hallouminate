@@ -178,8 +178,10 @@ impl WatchConfig {
 /// embeddings, storage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
-    /// Seconds of no completed activity (and zero active connections) before
-    /// the daemon exits cleanly so the OS reclaims all memory. The next CLI or
+    /// Seconds without inference-bearing work (and zero active connections)
+    /// before the daemon exits cleanly so the OS reclaims all memory. Only
+    /// `ground`, `index`, `add_markdown`, and watcher reindex batches restart
+    /// the window; listings, reads, and status calls do not. The next CLI or
     /// MCP use transparently respawns it (~4 s cold start). `0` disables
     /// idle-exit — the daemon lives until stopped. Default: `900` (15 min).
     #[serde(default = "default_idle_exit_secs")]
