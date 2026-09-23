@@ -82,12 +82,38 @@ const KNOWN_EMBEDDINGS_KEYS: &[&str] = &[
 const KNOWN_SEARCH_KEYS: &[&str] = &[
     "top_files_default",
     "chunks_per_file_default",
+    "limit_default",
     "crossencoder",
+    "rerank_timeout_ms",
 ];
 const KNOWN_LOGGING_KEYS: &[&str] = &["max_file_bytes", "max_total_bytes"];
 const KNOWN_STORAGE_KEYS: &[&str] = &["ground_dir"];
-const KNOWN_DAEMON_KEYS: &[&str] = &["idle_exit_secs", "maintenance_interval_secs"];
-const KNOWN_WATCH_KEYS: &[&str] = &["debounce_ms", "failure_reminder_secs"];
+const KNOWN_DAEMON_KEYS: &[&str] = &[
+    "idle_exit_secs",
+    "maintenance_interval_secs",
+    "defer_bound_secs",
+    "debt_soft_fragments",
+    "debt_hard_fragments",
+    "debt_soft_stale_versions",
+    "debt_hard_stale_versions",
+    "hard_block_wait_secs",
+    "debt_soft_delay_ms",
+    "debt_cache_ttl_secs",
+    "paced_slice_budget",
+    "paced_slice_sleep_ms",
+    "churn_warn_at",
+    "churn_act_at",
+    "restart_intensity_cap",
+    "restart_intensity_window_secs",
+    "watchdog_stall_secs",
+    "boot_backoff_floor_secs",
+    "boot_backoff_cap_secs",
+];
+const KNOWN_WATCH_KEYS: &[&str] = &[
+    "debounce_ms",
+    "failure_reminder_secs",
+    "reconcile_interval_secs",
+];
 
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     let target = args.path.unwrap_or_else(xdg_config_path);
@@ -613,6 +639,50 @@ mod tests {
                 "`{key}` is a Config section missing from KNOWN_TOP_LEVEL_KEYS, so `config validate` falsely warns on it"
             );
         }
+    }
+
+    #[test]
+    fn known_scalar_section_keys_match_config_fields() {
+        let mut cfg = Config::default();
+        cfg.watch.reconcile_interval_secs = Some(60);
+        cfg.search.crossencoder = Some("jina-reranker-v1-turbo-en".to_string());
+        let value = toml::Value::try_from(cfg).expect("serialize config");
+        let table = value.as_table().expect("config serializes to a table");
+        let sections: &[(&str, &[&str])] = &[
+            ("embeddings", KNOWN_EMBEDDINGS_KEYS),
+            ("search", KNOWN_SEARCH_KEYS),
+            ("logging", KNOWN_LOGGING_KEYS),
+            ("storage", KNOWN_STORAGE_KEYS),
+            ("daemon", KNOWN_DAEMON_KEYS),
+            ("watch", KNOWN_WATCH_KEYS),
+        ];
+        for (section, known) in sections {
+            let Some(toml::Value::Table(fields)) = table.get(*section) else {
+                panic!("`[{section}]` must serialize as a table");
+            };
+            for key in fields.keys() {
+                assert!(
+                    known.contains(&key.as_str()),
+                    "`{section}.{key}` is a config field missing from its known-key list, so `config validate` falsely warns on it"
+                );
+            }
+            for key in *known {
+                assert!(
+                    fields.contains_key(*key),
+                    "`{section}.{key}` is in its known-key list but is not a config field"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collect_warnings_accepts_watch_reconcile_and_daemon_debt_keys() {
+        let raw = "[watch]\nreconcile_interval_secs = 30\n\n[daemon]\ndebt_soft_fragments = 1000\ndebt_hard_fragments = 3000\n";
+        let warnings = collect_warnings(Some(raw), &Config::default());
+        assert!(
+            warnings.iter().all(|w| !w.contains("unknown key")),
+            "valid [watch] and [daemon] keys must not be flagged: {warnings:?}"
+        );
     }
 
     #[test]
