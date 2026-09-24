@@ -7,7 +7,20 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.11.0...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.11.1...HEAD)
+
+## [0.11.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.11.1) - 2026-09-23
+
+### Changed
+
+- Daemon: batch each watcher reconcile into one `update_paths` call, so a macOS reconcile rebuilds the FSEvents stream once instead of once per root; pins `notify` 9.0.0-rc.5 and `notify-debouncer-full` 0.8.0-rc.2
+- Dependencies: fastembed 7.1.0, rmcp 3.4.1, thiserror 2.0.21, stop-words 0.10.1, pnpm 12.6.0, Astro 7.3.4, Starlight 0.42.3; CI runners move to Ubuntu 26
+
+### Fixed
+
+- Daemon: skip missing watch roots and retry failed installs on reconcile ticks
+- Daemon: restart the idle-exit window only for inference work
+- Config: `config validate` accepts all `watch`, `daemon`, and `search` keys
 
 ## [0.11.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.11.0) - 2026-09-19
 
