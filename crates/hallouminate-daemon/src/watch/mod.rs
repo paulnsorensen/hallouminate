@@ -361,6 +361,34 @@ async fn cleanup_retired_registration(
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WatchRetry {
+    RegistryChange,
+    ReconcileTick,
+}
+#[cfg(test)]
+struct NativeWatchHook {
+    attempts: HashMap<PathBuf, usize>,
+    failures: HashSet<PathBuf>,
+}
+
+#[cfg(test)]
+fn native_watch(
+    debouncer: &mut notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
+    path: &Path,
+    mode: RecursiveMode,
+    hook: &mut Option<std::sync::Arc<std::sync::Mutex<NativeWatchHook>>>,
+) -> notify::Result<()> {
+    if let Some(hook) = hook {
+        let mut hook = hook.lock().expect("native watch hook mutex");
+        *hook.attempts.entry(path.to_path_buf()).or_default() += 1;
+        if hook.failures.remove(path) {
+            return Err(notify::Error::generic("injected native watch failure"));
+        }
+    }
+    debouncer.watch(path, mode)
+}
+
 /// Bundles the watcher pump's live-reconcile state: the optional
 /// debouncer, the set of paths currently `debouncer.watch()`'d, and the
 /// flattened current root list used by `process_change_batch`.
@@ -373,6 +401,9 @@ struct PumpState {
     /// lock for them entirely instead of rewriting an identical
     /// observation every tick. Pruned to the current snapshot each pass.
     degraded_backend: HashSet<registry::RegistrationId>,
+    watch_retries: HashMap<PathBuf, RecursiveMode>,
+    #[cfg(test)]
+    native_watch_hook: Option<std::sync::Arc<std::sync::Mutex<NativeWatchHook>>>,
 }
 
 impl PumpState {
@@ -382,14 +413,14 @@ impl PumpState {
     /// whose catch-up hasn't started gets one spawned, and `self.roots` is
     /// refreshed to the flattened current root list for the caller's
     /// subsequent `process_change_batch` call.
-    fn reconcile(&mut self, state: &DaemonState, tracker: &TaskTracker) {
+    fn reconcile(&mut self, state: &DaemonState, tracker: &TaskTracker, retry: WatchRetry) {
         let registry = state.watch_registry();
         registry.refresh_roots(watch_roots_for);
         let snapshot = registry.snapshot_roots();
         let desired = Self::desired_watches(&snapshot);
         self.drop_obsolete_watches(&desired);
         self.roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
-        self.install_or_degrade_watches(registry, &snapshot, desired);
+        self.install_or_degrade_watches(registry, &snapshot, desired, retry);
         Self::admit_next_catch_up(registry, state, tracker);
     }
 
@@ -439,9 +470,11 @@ impl PumpState {
         registry: &registry::WatchRegistry,
         snapshot: &[(registry::RegistrationId, WatchRoot)],
         desired: HashMap<PathBuf, RecursiveMode>,
+        retry: WatchRetry,
     ) {
         let live: HashSet<&registry::RegistrationId> = snapshot.iter().map(|(id, _)| id).collect();
         self.degraded_backend.retain(|id| live.contains(id));
+        self.retain_watch_retries(&desired);
         for (path, mode) in desired {
             if self.installed.contains_key(&path) {
                 continue;
@@ -451,6 +484,42 @@ impl PumpState {
                 .filter(|(_, root)| root.watched == path)
                 .map(|(id, _)| id)
                 .collect();
+            if !path.is_dir() {
+                self.note_watch_retry(path.clone(), mode);
+                for id in &ids {
+                    self.degraded_backend.remove(id);
+                }
+                for id in ids {
+                    registry.mark_degraded(id, "watch root is missing".to_owned());
+                }
+                continue;
+            }
+            if !self.should_attempt_watch(&path, mode, retry) {
+                let mut shared_status = None;
+                for id in &ids {
+                    let Some(registry::Observation::Degraded { error, retrying }) =
+                        registry.observation(id)
+                    else {
+                        continue;
+                    };
+                    shared_status = Some((error, retrying));
+                    break;
+                }
+                for id in ids {
+                    match registry.observation(id) {
+                        Some(registry::Observation::Degraded { .. }) => {}
+                        Some(registry::Observation::Watched) | None => {
+                            match shared_status.as_ref() {
+                                Some((_, false)) => registry.mark_backend_unavailable(id),
+                                Some((error, true)) => registry.mark_degraded(id, error.clone()),
+                                None => registry
+                                    .mark_degraded(id, "watch install retry pending".to_owned()),
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             let Some(debouncer) = self.debouncer.as_mut() else {
                 for id in ids {
                     if self.degraded_backend.insert(id.clone()) {
@@ -470,8 +539,13 @@ impl PumpState {
                     Some(registry::Observation::Degraded { .. })
                 )
             });
-            match debouncer.watch(&path, mode) {
+            #[cfg(test)]
+            let watch_result = native_watch(debouncer, &path, mode, &mut self.native_watch_hook);
+            #[cfg(not(test))]
+            let watch_result = debouncer.watch(&path, mode);
+            match watch_result {
                 Ok(()) => {
+                    self.watch_retries.remove(&path);
                     self.installed.insert(path.clone(), mode);
                     for id in ids {
                         registry.mark_watched(id);
@@ -481,6 +555,7 @@ impl PumpState {
                     }
                 }
                 Err(error) => {
+                    self.note_watch_retry(path.clone(), mode);
                     if !was_degraded {
                         tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: watch install failed; reconciliation continues");
                     }
@@ -489,6 +564,35 @@ impl PumpState {
                     }
                 }
             }
+        }
+    }
+
+    fn note_watch_retry(&mut self, path: PathBuf, mode: RecursiveMode) {
+        self.watch_retries.insert(path, mode);
+    }
+
+    fn retain_watch_retries(&mut self, desired: &HashMap<PathBuf, RecursiveMode>) {
+        self.watch_retries
+            .retain(|path, mode| desired.get(path) == Some(mode));
+    }
+
+    fn should_attempt_watch(&self, path: &Path, mode: RecursiveMode, retry: WatchRetry) -> bool {
+        match retry {
+            WatchRetry::RegistryChange => self.watch_retries.get(path) != Some(&mode),
+            WatchRetry::ReconcileTick => true,
+        }
+    }
+
+    #[cfg(test)]
+    fn test_default() -> Self {
+        Self {
+            debouncer: None,
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            #[cfg(test)]
+            native_watch_hook: None,
         }
     }
 
@@ -766,7 +870,7 @@ async fn run_pump(
             // staleness to `watch.reconcile_interval_secs` even if this
             // arm were somehow never polled.
             () = state.watch_registry().changed().notified() => {
-                pump.reconcile(&state, &tracker);
+                pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
                 last_reconciled = state.watch_registry().generation();
                 state
                     .heartbeat()
@@ -778,7 +882,7 @@ async fn run_pump(
                     reload_repo_layer(&state, &path, &tracker, &mut reload_failures);
                 }
                 state.watch_registry().mark_reconcile_due_all();
-                pump.reconcile(&state, &tracker);
+                pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
                 last_reconciled = state.watch_registry().generation();
                 state
                     .heartbeat()
@@ -812,7 +916,7 @@ async fn run_pump(
         // prior work.
         let current_generation = state.watch_registry().generation();
         if current_generation != last_reconciled {
-            pump.reconcile(&state, &tracker);
+            pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
             last_reconciled = state.watch_registry().generation();
         }
         let (paths, overflow) = {
@@ -824,7 +928,7 @@ async fn run_pump(
         };
         if overflow {
             state.watch_registry().mark_reconcile_due_all();
-            pump.reconcile(&state, &tracker);
+            pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
             last_reconciled = state.watch_registry().generation();
         }
         if !paths.is_empty() {
@@ -911,8 +1015,11 @@ fn spawn_corpus_watcher_with(
         installed: HashMap::new(),
         roots: Vec::new(),
         degraded_backend: HashSet::new(),
+        watch_retries: HashMap::new(),
+        #[cfg(test)]
+        native_watch_hook: None,
     };
-    pump.reconcile(state, &tracker);
+    pump.reconcile(state, &tracker, WatchRetry::ReconcileTick);
     let last_reconciled = state.watch_registry().generation();
     let pump_config = PumpConfig {
         reconcile_interval: Duration::from_secs(cfg.watch.effective_reconcile_interval_secs()),
@@ -1691,6 +1798,389 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn missing_root_replaces_backend_unavailable_status_before_recovery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("root", root.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register");
+        let mut id = None;
+        for (candidate_id, watch_root) in state.watch_registry().snapshot_roots() {
+            if watch_root.watched == root {
+                id = Some(candidate_id);
+                break;
+            }
+        }
+        let id = id.expect("registration");
+        let snapshot = state.watch_registry().snapshot_roots();
+        let desired = PumpState::desired_watches(&snapshot);
+        let mut pump = PumpState::test_default();
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired.clone(),
+            WatchRetry::RegistryChange,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "notify debouncer unavailable".to_owned(),
+                retrying: false,
+            })
+        );
+
+        std::fs::remove_dir(&root).expect("remove root");
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired.clone(),
+            WatchRetry::RegistryChange,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "watch root is missing".to_owned(),
+                retrying: true,
+            })
+        );
+
+        std::fs::create_dir(&root).expect("recreate root");
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired.clone(),
+            WatchRetry::ReconcileTick,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "notify debouncer unavailable".to_owned(),
+                retrying: false,
+            })
+        );
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired,
+            WatchRetry::RegistryChange,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "notify debouncer unavailable".to_owned(),
+                retrying: false,
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn native_watch_install_waits_for_tick_after_missing_root_appears() {
+        async fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !ready() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "watcher test condition did not become ready"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.watch.reconcile_interval_secs = Some(1);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let root = tmp.path().join("missing-root");
+        let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
+            attempts: HashMap::new(),
+            failures: HashSet::from([root.clone()]),
+        }));
+        let corpus_cfg = corpus("missing", root.to_str().unwrap(), &["**/*.md"]);
+        register_runtime_corpora(&state, None, &[corpus_cfg], &cfg).expect("register");
+        let original_id = {
+            let mut found = None;
+            for (id, watch_root) in state.watch_registry().snapshot_roots() {
+                if watch_root.watched == root {
+                    found = Some(id);
+                    break;
+                }
+            }
+            found.expect("original registration")
+        };
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer =
+            build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false).expect("debouncer");
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            native_watch_hook: Some(hook.clone()),
+        };
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert_eq!(hook.lock().expect("hook mutex").attempts.get(&root), None);
+        let Some(registry::Observation::Degraded { .. }) =
+            state.watch_registry().observation(&original_id)
+        else {
+            panic!("missing root must be degraded");
+        };
+        let task = tokio::spawn(run_pump(
+            state.clone(),
+            pump,
+            wake.clone(),
+            pending.clone(),
+            tracker.clone(),
+            PumpConfig {
+                reconcile_interval: Duration::from_secs(1),
+                failure_reminder: Duration::from_secs(60),
+                churn_warn_at: 100,
+                churn_act_at: 200,
+            },
+            state.watch_registry().generation(),
+        ));
+        tokio::task::yield_now().await;
+        std::fs::create_dir(&root).expect("create root");
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for(|| hook.lock().expect("hook mutex").attempts.get(&root) == Some(&1)).await;
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&1)
+        );
+
+        let mut selected_extra_id = None;
+        for index in 0..10 {
+            let extra = tmp.path().join(format!("extra-{index}"));
+            std::fs::create_dir(&extra).expect("create extra root");
+            register_runtime_corpora(
+                &state,
+                None,
+                &[corpus(
+                    &format!("extra-{index}"),
+                    extra.to_str().unwrap(),
+                    &["**/*.md"],
+                )],
+                &cfg,
+            )
+            .expect("register extra corpus");
+            let extra_id = {
+                let mut found = None;
+                for (id, watch_root) in state.watch_registry().snapshot_roots() {
+                    if watch_root.watched == extra {
+                        found = Some(id);
+                        break;
+                    }
+                }
+                found.expect("extra registration")
+            };
+            let heartbeat_before = state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump);
+            let mut extra_processed = false;
+            wait_for(|| {
+                let ready = state.watch_registry().catch_up_state(&extra_id)
+                    == Some(registry::CatchUpState::Done)
+                    && state
+                        .heartbeat()
+                        .epoch(crate::heartbeat::TaskName::WatcherPump)
+                        > heartbeat_before;
+                extra_processed |= ready;
+                ready
+            })
+            .await;
+            assert_eq!(
+                state.watch_registry().catch_up_state(&extra_id),
+                Some(registry::CatchUpState::Done)
+            );
+            assert!(
+                extra_processed,
+                "extra registration catch-up was not processed"
+            );
+            assert!(
+                state
+                    .heartbeat()
+                    .epoch(crate::heartbeat::TaskName::WatcherPump)
+                    > heartbeat_before,
+                "extra registration did not advance watcher heartbeat"
+            );
+            assert_eq!(
+                hook.lock().expect("hook mutex").attempts.get(&extra),
+                Some(&1)
+            );
+            selected_extra_id = Some(extra_id);
+        }
+        let selected_extra_id = selected_extra_id.expect("selected extra registration");
+
+        pending.lock().expect("pending mutex").overflow = true;
+        let heartbeat_before_overflow = state
+            .heartbeat()
+            .epoch(crate::heartbeat::TaskName::WatcherPump);
+        wake.notify_one();
+        let mut overflow_processed = false;
+        wait_for(|| {
+            let pending_consumed = !pending.lock().expect("pending mutex").overflow;
+            let catch_up_done = state.watch_registry().catch_up_state(&selected_extra_id)
+                == Some(registry::CatchUpState::Done);
+            let heartbeat_advanced = state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump)
+                > heartbeat_before_overflow;
+            let ready = pending_consumed && catch_up_done && heartbeat_advanced;
+            overflow_processed |= ready;
+            ready
+        })
+        .await;
+        assert!(!pending.lock().expect("pending mutex").overflow);
+        assert!(
+            overflow_processed,
+            "overflow reconciliation was not processed"
+        );
+        assert!(
+            state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump)
+                > heartbeat_before_overflow,
+            "overflow did not advance watcher heartbeat"
+        );
+        assert_eq!(
+            state.watch_registry().catch_up_state(&selected_extra_id),
+            Some(registry::CatchUpState::Done)
+        );
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&1)
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for(|| hook.lock().expect("hook mutex").attempts.get(&root) == Some(&2)).await;
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&2)
+        );
+        let recovered_original_id = {
+            let mut found = None;
+            for (id, watch_root) in state.watch_registry().snapshot_roots() {
+                if watch_root.watched == root {
+                    found = Some(id);
+                    break;
+                }
+            }
+            found.expect("recovered original registration")
+        };
+        assert_eq!(
+            state.watch_registry().observation(&recovered_original_id),
+            Some(registry::Observation::Watched)
+        );
+
+        let recovered_extra = tmp.path().join("recovered-extra");
+        std::fs::create_dir(&recovered_extra).expect("create recovered root");
+        let heartbeat_before_recovery = state
+            .heartbeat()
+            .epoch(crate::heartbeat::TaskName::WatcherPump);
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus(
+                "recovered-extra",
+                recovered_extra.to_str().unwrap(),
+                &["**/*.md"],
+            )],
+            &cfg,
+        )
+        .expect("register recovered corpus");
+        let recovered_id = {
+            let mut found = None;
+            for (id, watch_root) in state.watch_registry().snapshot_roots() {
+                if watch_root.watched == recovered_extra {
+                    found = Some(id);
+                    break;
+                }
+            }
+            found.expect("recovered registration")
+        };
+        let mut recovery_processed = false;
+        wait_for(|| {
+            let ready = state.watch_registry().catch_up_state(&recovered_id)
+                == Some(registry::CatchUpState::Done)
+                && state
+                    .heartbeat()
+                    .epoch(crate::heartbeat::TaskName::WatcherPump)
+                    > heartbeat_before_recovery;
+            recovery_processed |= ready;
+            ready
+        })
+        .await;
+        assert_eq!(
+            state.watch_registry().catch_up_state(&recovered_id),
+            Some(registry::CatchUpState::Done)
+        );
+        assert!(
+            recovery_processed,
+            "post-recovery registry change was not processed"
+        );
+        assert!(
+            state
+                .heartbeat()
+                .epoch(crate::heartbeat::TaskName::WatcherPump)
+                > heartbeat_before_recovery,
+            "post-recovery registry change did not advance watcher heartbeat"
+        );
+        assert_eq!(
+            state.watch_registry().observation(&recovered_original_id),
+            Some(registry::Observation::Watched)
+        );
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&2)
+        );
+
+        state.shutdown_token().cancel();
+        task.await.expect("pump task");
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[test]
+    fn watch_retry_tracking_clears_for_removed_or_mode_changed_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        let mut pump = PumpState::test_default();
+        pump.note_watch_retry(root.clone(), RecursiveMode::Recursive);
+        let removed = HashMap::new();
+        pump.retain_watch_retries(&removed);
+        assert!(
+            pump.should_attempt_watch(&root, RecursiveMode::Recursive, WatchRetry::RegistryChange),
+            "a removed root must not preserve retry suppression"
+        );
+        pump.note_watch_retry(root.clone(), RecursiveMode::Recursive);
+
+        let mut desired = HashMap::new();
+        desired.insert(root.clone(), RecursiveMode::NonRecursive);
+        pump.retain_watch_retries(&desired);
+        assert!(
+            pump.should_attempt_watch(
+                &root,
+                RecursiveMode::NonRecursive,
+                WatchRetry::RegistryChange
+            ),
+            "a mode change must not preserve retry suppression"
+        );
+    }
+
     /// Plain (non-symlinked) root: `canonical_watched == watched`, so the key
     /// is the path itself. Guards against the rebuild altering the common case.
     #[test]
@@ -1944,13 +2434,13 @@ mod tests {
         id: &RegistrationId,
         message: &str,
     ) {
-        pump.reconcile(state, tracker);
+        pump.reconcile(state, tracker, WatchRetry::RegistryChange);
         assert_eq!(
             state.watch_registry().catch_up_state(id),
             Some(registry::CatchUpState::InFlight),
             "{message}",
         );
-        pump.reconcile(state, tracker);
+        pump.reconcile(state, tracker, WatchRetry::RegistryChange);
         assert_eq!(
             state.watch_registry().catch_up_state(id),
             Some(registry::CatchUpState::InFlight),
@@ -2017,6 +2507,9 @@ mod tests {
             installed: HashMap::new(),
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            #[cfg(test)]
+            native_watch_hook: None,
         };
         let first_permit = state
             .acquire_write_lane()
@@ -2038,7 +2531,7 @@ mod tests {
             },
         )
         .await;
-        pump.reconcile(&state, &tracker);
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
         assert_eq!(
             state.watch_registry().catch_up_state(&id),
             Some(registry::CatchUpState::Done),
@@ -2076,7 +2569,7 @@ mod tests {
             },
         )
         .await;
-        pump.reconcile(&state, &tracker);
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
         assert_eq!(
             state.watch_registry().catch_up_state(&id),
             Some(registry::CatchUpState::Done),
@@ -2100,6 +2593,94 @@ mod tests {
             "the registration must retain its degraded observation",
         );
 
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppressed_watch_retry_degrades_new_shared_root_registration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let root = root.canonicalize().expect("canonicalize wiki");
+        let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
+            attempts: HashMap::new(),
+            failures: HashSet::from([root.clone()]),
+        }));
+        let live = corpus("live", root.to_str().unwrap(), &["**/*.md"]);
+        register_runtime_corpora(&state, None, &[live], &cfg).expect("register live corpus");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("live registration root");
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer = build_debouncer(&cfg, &state, wake, pending, false).expect("debouncer");
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            native_watch_hook: Some(hook.clone()),
+        };
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&1)
+        );
+        let Some(registry::Observation::Degraded { error, retrying }) =
+            state.watch_registry().observation(&id)
+        else {
+            panic!("failed install must be degraded");
+        };
+        assert_eq!(error, "injected native watch failure");
+        assert!(retrying);
+
+        let shared = corpus("shared", root.to_str().unwrap(), &["**/*.md"]);
+        let shared_id = RegistrationId {
+            source: registry::ConfigSource::Baseline,
+            corpus_key: shared.primary_corpus_key().expect("shared corpus key"),
+        };
+        register_runtime_corpora(&state, None, &[shared], &cfg).expect("register shared corpus");
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&1),
+            "a registry change must not retry a failed native install"
+        );
+        assert_eq!(
+            state.watch_registry().observation(&shared_id),
+            Some(registry::Observation::Degraded {
+                error: "injected native watch failure".to_owned(),
+                retrying: true,
+            })
+        );
+
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&2),
+            "a reconcile tick retries the failed native install"
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Watched)
+        );
+        assert_eq!(
+            state.watch_registry().observation(&shared_id),
+            Some(registry::Observation::Watched)
+        );
         tracker.close();
         tracker.wait().await;
     }
@@ -2139,8 +2720,11 @@ mod tests {
             installed: HashMap::new(),
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            #[cfg(test)]
+            native_watch_hook: None,
         };
-        pump.reconcile(&state, &tracker);
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
         crate::test_support::wait_until(
             Duration::from_secs(5),
             "initial degraded catch-up must complete",
@@ -2157,7 +2741,7 @@ mod tests {
         };
         register_runtime_corpora(&state, None, &[shared], &cfg)
             .expect("register later corpus at the same root");
-        pump.reconcile(&state, &tracker);
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
         let Some(registry::Observation::Degraded { .. }) =
             state.watch_registry().observation(&shared_id)
         else {
@@ -2259,8 +2843,11 @@ mod tests {
             installed: HashMap::new(),
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            #[cfg(test)]
+            native_watch_hook: None,
         };
-        pump.reconcile(&state, &tracker);
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
 
         crate::test_support::wait_until(
             Duration::from_secs(5),
@@ -3288,6 +3875,9 @@ body
             installed: HashMap::new(),
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            #[cfg(test)]
+            native_watch_hook: None,
         };
         let task = tokio::spawn(run_pump(
             state.clone(),
@@ -3415,6 +4005,9 @@ body
                 installed: HashMap::new(),
                 roots: Vec::new(),
                 degraded_backend: HashSet::new(),
+                watch_retries: HashMap::new(),
+                #[cfg(test)]
+                native_watch_hook: None,
             },
             wake,
             pending,
@@ -3480,6 +4073,9 @@ body
                 installed: HashMap::new(),
                 roots: Vec::new(),
                 degraded_backend: HashSet::new(),
+                watch_retries: HashMap::new(),
+                #[cfg(test)]
+                native_watch_hook: None,
             },
             wake,
             pending,
@@ -3561,6 +4157,9 @@ body
                 installed: HashMap::new(),
                 roots: Vec::new(),
                 degraded_backend: HashSet::new(),
+                watch_retries: HashMap::new(),
+                #[cfg(test)]
+                native_watch_hook: None,
             },
             wake.clone(),
             pending,
