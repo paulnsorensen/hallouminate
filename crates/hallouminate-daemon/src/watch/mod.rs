@@ -1885,6 +1885,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn native_watch_install_waits_for_tick_after_missing_root_appears() {
+        async fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !ready() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "watcher test condition did not become ready"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
@@ -1945,12 +1955,7 @@ mod tests {
         tokio::task::yield_now().await;
         std::fs::create_dir(&root).expect("create root");
         tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..100 {
-            if hook.lock().expect("hook mutex").attempts.get(&root) == Some(&1) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_for(|| hook.lock().expect("hook mutex").attempts.get(&root) == Some(&1)).await;
         assert_eq!(
             hook.lock().expect("hook mutex").attempts.get(&root),
             Some(&1)
@@ -1985,19 +1990,17 @@ mod tests {
                 .heartbeat()
                 .epoch(crate::heartbeat::TaskName::WatcherPump);
             let mut extra_processed = false;
-            for _ in 0..100 {
-                if state.watch_registry().catch_up_state(&extra_id)
+            wait_for(|| {
+                let ready = state.watch_registry().catch_up_state(&extra_id)
                     == Some(registry::CatchUpState::Done)
                     && state
                         .heartbeat()
                         .epoch(crate::heartbeat::TaskName::WatcherPump)
-                        > heartbeat_before
-                {
-                    extra_processed = true;
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
+                        > heartbeat_before;
+                extra_processed |= ready;
+                ready
+            })
+            .await;
             assert_eq!(
                 state.watch_registry().catch_up_state(&extra_id),
                 Some(registry::CatchUpState::Done)
@@ -2027,7 +2030,7 @@ mod tests {
             .epoch(crate::heartbeat::TaskName::WatcherPump);
         wake.notify_one();
         let mut overflow_processed = false;
-        for _ in 0..100 {
+        wait_for(|| {
             let pending_consumed = !pending.lock().expect("pending mutex").overflow;
             let catch_up_done = state.watch_registry().catch_up_state(&selected_extra_id)
                 == Some(registry::CatchUpState::Done);
@@ -2035,12 +2038,11 @@ mod tests {
                 .heartbeat()
                 .epoch(crate::heartbeat::TaskName::WatcherPump)
                 > heartbeat_before_overflow;
-            if pending_consumed && catch_up_done && heartbeat_advanced {
-                overflow_processed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+            let ready = pending_consumed && catch_up_done && heartbeat_advanced;
+            overflow_processed |= ready;
+            ready
+        })
+        .await;
         assert!(!pending.lock().expect("pending mutex").overflow);
         assert!(
             overflow_processed,
@@ -2063,12 +2065,7 @@ mod tests {
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
-        for _ in 0..100 {
-            if hook.lock().expect("hook mutex").attempts.get(&root) == Some(&2) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_for(|| hook.lock().expect("hook mutex").attempts.get(&root) == Some(&2)).await;
         assert_eq!(
             hook.lock().expect("hook mutex").attempts.get(&root),
             Some(&2)
@@ -2115,19 +2112,17 @@ mod tests {
             found.expect("recovered registration")
         };
         let mut recovery_processed = false;
-        for _ in 0..100 {
-            if state.watch_registry().catch_up_state(&recovered_id)
+        wait_for(|| {
+            let ready = state.watch_registry().catch_up_state(&recovered_id)
                 == Some(registry::CatchUpState::Done)
                 && state
                     .heartbeat()
                     .epoch(crate::heartbeat::TaskName::WatcherPump)
-                    > heartbeat_before_recovery
-            {
-                recovery_processed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+                    > heartbeat_before_recovery;
+            recovery_processed |= ready;
+            ready
+        })
+        .await;
         assert_eq!(
             state.watch_registry().catch_up_state(&recovered_id),
             Some(registry::CatchUpState::Done)
