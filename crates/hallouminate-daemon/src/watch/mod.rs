@@ -29,7 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use notify::RecursiveMode;
+#[cfg(test)]
+use notify::UpdatePathsError;
+use notify::{PathOp, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
 
 use hallouminate_adapters::LanceStore;
@@ -366,27 +368,181 @@ enum WatchRetry {
     RegistryChange,
     ReconcileTick,
 }
+
+/// One `notify::PathOp` batched into a single `update_paths` call, carrying
+/// the registry bookkeeping a `Watch` op needs once its outcome is known.
+enum ReconcileOp {
+    Watch {
+        path: PathBuf,
+        mode: RecursiveMode,
+        ids: Vec<registry::RegistrationId>,
+        was_degraded: bool,
+    },
+    Unwatch {
+        path: PathBuf,
+        desired_mode: Option<RecursiveMode>,
+    },
+}
+
+impl ReconcileOp {
+    fn as_path_op(&self) -> PathOp {
+        match self {
+            ReconcileOp::Watch {
+                path,
+                mode,
+                ids: _,
+                was_degraded: _,
+            } => match mode {
+                RecursiveMode::Recursive => PathOp::watch_recursive(path.clone()),
+                RecursiveMode::NonRecursive => PathOp::watch_non_recursive(path.clone()),
+            },
+            ReconcileOp::Unwatch {
+                path,
+                desired_mode: _,
+            } => PathOp::unwatch(path.clone()),
+        }
+    }
+}
+
+/// Whether one `ReconcileOp` from a batch was applied by `update_paths` or
+/// failed: either as the batch's `origin`, or as part of an `origin: None`
+/// batch whose paths applied but whose native stream failed to (re)start.
+enum OpOutcome<'a> {
+    Applied,
+    Failed(&'a notify::Error),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RecordedOp {
+    Watch(PathBuf, RecursiveMode),
+    Unwatch(PathBuf),
+}
+
+#[cfg(test)]
+impl RecordedOp {
+    fn path(&self) -> &Path {
+        match self {
+            RecordedOp::Watch(path, _) => path,
+            RecordedOp::Unwatch(path) => path,
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<&PathOp> for RecordedOp {
+    fn from(op: &PathOp) -> Self {
+        match op {
+            PathOp::Watch(path, config) => RecordedOp::Watch(path.clone(), config.recursive_mode()),
+            PathOp::Unwatch(path) => RecordedOp::Unwatch(path.clone()),
+        }
+    }
+}
+
+#[cfg(test)]
+fn apply_native_effects(registered: &mut HashMap<PathBuf, RecursiveMode>, ops: &[RecordedOp]) {
+    for op in ops {
+        match op {
+            RecordedOp::Watch(path, mode) => {
+                registered.insert(path.clone(), *mode);
+            }
+            RecordedOp::Unwatch(path) => {
+                registered.remove(path);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 struct NativeWatchHook {
     attempts: HashMap<PathBuf, usize>,
     failures: HashSet<PathBuf>,
+    native_restarts: usize,
+    batches: Vec<Vec<RecordedOp>>,
+    registered: HashMap<PathBuf, RecursiveMode>,
+    /// One-shot: the next call applies every path but reports `origin:
+    /// None`, simulating a path update that succeeded while the FSEvents
+    /// stream itself failed to (re)start.
+    restart_failure: bool,
 }
 
+/// Test seam for the single `Debouncer::update_paths` call site: counts
+/// `native_restarts`, records each batch's `PathOp`s, and injects an
+/// `UpdatePathsError` for a configured path or a stream-restart failure.
 #[cfg(test)]
-fn native_watch(
+fn native_update_paths(
     debouncer: &mut notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
-    path: &Path,
-    mode: RecursiveMode,
+    ops: Vec<PathOp>,
     hook: &mut Option<std::sync::Arc<std::sync::Mutex<NativeWatchHook>>>,
-) -> notify::Result<()> {
-    if let Some(hook) = hook {
-        let mut hook = hook.lock().expect("native watch hook mutex");
-        *hook.attempts.entry(path.to_path_buf()).or_default() += 1;
-        if hook.failures.remove(path) {
-            return Err(notify::Error::generic("injected native watch failure"));
-        }
+) -> Result<(), UpdatePathsError> {
+    let Some(hook) = hook else {
+        return debouncer.update_paths(ops);
+    };
+    let mut guard = hook.lock().expect("native watch hook mutex");
+    guard.native_restarts += 1;
+    let mut recorded = Vec::new();
+    for op in &ops {
+        recorded.push(RecordedOp::from(op));
+        *guard
+            .attempts
+            .entry(op.as_path().to_path_buf())
+            .or_default() += 1;
     }
-    debouncer.watch(path, mode)
+    guard.batches.push(recorded.clone());
+    if guard.restart_failure {
+        drop(guard);
+        let result = debouncer.update_paths(ops);
+        let Err(error) = result else {
+            let mut guard = hook.lock().expect("native watch hook mutex");
+            guard.restart_failure = false;
+            apply_native_effects(&mut guard.registered, &recorded);
+            drop(guard);
+            return Err(UpdatePathsError {
+                source: notify::Error::generic("injected native stream restart failure"),
+                origin: None,
+                remaining: Vec::new(),
+            });
+        };
+        return Err(error);
+    }
+    let failed_index = ops
+        .iter()
+        .position(|op| guard.failures.contains(op.as_path()));
+    let Some(index) = failed_index else {
+        drop(guard);
+        let result = debouncer.update_paths(ops);
+        if result.is_ok() {
+            let mut guard = hook.lock().expect("native watch hook mutex");
+            apply_native_effects(&mut guard.registered, &recorded);
+        }
+        return result;
+    };
+    let failed_path = ops[index].as_path().to_path_buf();
+    let keep_failure_for_following_watch = match (&recorded[index], recorded.get(index + 1)) {
+        (RecordedOp::Unwatch(path), Some(RecordedOp::Watch(next, _))) => path == next,
+        (RecordedOp::Unwatch(_), Some(RecordedOp::Unwatch(_))) => false,
+        (RecordedOp::Watch(_, _), _) | (RecordedOp::Unwatch(_), None) => false,
+    };
+    drop(guard);
+    let mut applied = ops;
+    let tail = applied.split_off(index);
+    if !applied.is_empty() {
+        debouncer.update_paths(applied)?;
+    }
+    let mut guard = hook.lock().expect("native watch hook mutex");
+    if !keep_failure_for_following_watch {
+        guard.failures.remove(&failed_path);
+    }
+    apply_native_effects(&mut guard.registered, &recorded[..index]);
+    drop(guard);
+    let mut tail = tail.into_iter();
+    let origin = tail.next();
+    let remaining: Vec<_> = tail.collect();
+    Err(UpdatePathsError {
+        source: notify::Error::generic("injected native watch failure"),
+        origin,
+        remaining,
+    })
 }
 
 /// Bundles the watcher pump's live-reconcile state: the optional
@@ -402,25 +558,27 @@ struct PumpState {
     /// observation every tick. Pruned to the current snapshot each pass.
     degraded_backend: HashSet<registry::RegistrationId>,
     watch_retries: HashMap<PathBuf, RecursiveMode>,
+    /// Obsolete native removals that failed, keyed by their desired intent.
+    unwatch_retries: HashMap<PathBuf, Option<RecursiveMode>>,
     #[cfg(test)]
     native_watch_hook: Option<std::sync::Arc<std::sync::Mutex<NativeWatchHook>>>,
 }
 
 impl PumpState {
     /// Reconcile the live debouncer against the registry's current
-    /// registrations: newly-registered roots get `debouncer.watch()`'d when
-    /// available (or marked degraded when unavailable), any registration
-    /// whose catch-up hasn't started gets one spawned, and `self.roots` is
-    /// refreshed to the flattened current root list for the caller's
-    /// subsequent `process_change_batch` call.
+    /// registrations: the whole delta (installs, removals, and retries)
+    /// is built into one `Vec<ReconcileOp>` and applied through at most a
+    /// handful of `update_paths` calls, and `self.roots` is refreshed to
+    /// the flattened current root list for the caller's subsequent
+    /// `process_change_batch` call.
     fn reconcile(&mut self, state: &DaemonState, tracker: &TaskTracker, retry: WatchRetry) {
         let registry = state.watch_registry();
         registry.refresh_roots(watch_roots_for);
         let snapshot = registry.snapshot_roots();
         let desired = Self::desired_watches(&snapshot);
-        self.drop_obsolete_watches(&desired);
         self.roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
-        self.install_or_degrade_watches(registry, &snapshot, desired, retry);
+        let ops = self.build_reconcile_ops(registry, &snapshot, &desired, retry);
+        self.apply_reconcile_ops(registry, &snapshot, ops);
         Self::admit_next_catch_up(registry, state, tracker);
     }
 
@@ -443,53 +601,64 @@ impl PumpState {
         desired
     }
 
-    /// Removes any currently-installed watch whose path or mode no longer
-    /// matches `desired`.
-    fn drop_obsolete_watches(&mut self, desired: &HashMap<PathBuf, RecursiveMode>) {
-        let obsolete: Vec<PathBuf> = self
+    /// Builds one batch of unwatch-then-watch operations for this reconcile
+    /// pass: unwatch ops for installed paths no longer desired, then watch
+    /// ops for desired paths not yet installed. Keeps every non-native
+    /// filter from before batching: a missing root or an unavailable
+    /// backend gets no operation and its registrations are marked
+    /// directly, and failed native removals wait for a reconcile tick.
+    fn build_reconcile_ops(
+        &mut self,
+        registry: &registry::WatchRegistry,
+        snapshot: &[(registry::RegistrationId, WatchRoot)],
+        desired: &HashMap<PathBuf, RecursiveMode>,
+        retry: WatchRetry,
+    ) -> Vec<ReconcileOp> {
+        let mut ops = Vec::new();
+        self.unwatch_retries
+            .retain(|path, intent| desired.get(path).copied() == *intent);
+
+        let mut obsolete: Vec<PathBuf> = self
             .installed
             .iter()
             .filter(|(path, mode)| desired.get(*path) != Some(mode))
             .map(|(path, _)| path.clone())
             .collect();
+        obsolete.sort();
         for path in obsolete {
-            if let Some(debouncer) = self.debouncer.as_mut()
-                && let Err(error) = debouncer.unwatch(&path)
-            {
-                tracing::debug!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: obsolete watch removal failed");
+            let desired_mode = desired.get(&path).copied();
+            let retry_pending = self.unwatch_retries.get(&path) == Some(&desired_mode);
+            if self.debouncer.is_some() && (retry == WatchRetry::ReconcileTick || !retry_pending) {
+                ops.push(ReconcileOp::Unwatch { path, desired_mode });
+            } else if self.debouncer.is_none() {
+                self.installed.remove(&path);
+                self.unwatch_retries.remove(&path);
             }
-            self.installed.remove(&path);
         }
-    }
 
-    /// Installs every not-yet-installed desired watch, or marks its
-    /// registrations degraded when the native backend is unavailable or the
-    /// install itself fails.
-    fn install_or_degrade_watches(
-        &mut self,
-        registry: &registry::WatchRegistry,
-        snapshot: &[(registry::RegistrationId, WatchRoot)],
-        desired: HashMap<PathBuf, RecursiveMode>,
-        retry: WatchRetry,
-    ) {
         let live: HashSet<&registry::RegistrationId> = snapshot.iter().map(|(id, _)| id).collect();
         self.degraded_backend.retain(|id| live.contains(id));
-        self.retain_watch_retries(&desired);
-        for (path, mode) in desired {
-            if self.installed.contains_key(&path) {
+        self.retain_watch_retries(desired);
+        let mut wanted: Vec<(&PathBuf, &RecursiveMode)> = desired.iter().collect();
+        wanted.sort();
+        for (path, mode) in wanted {
+            let path = path.clone();
+            let mode = *mode;
+            let retry_pending = self.watch_retries.get(&path) == Some(&mode);
+            if self.installed.get(&path) == Some(&mode) && !retry_pending {
                 continue;
             }
-            let ids: Vec<_> = snapshot
+            let ids: Vec<registry::RegistrationId> = snapshot
                 .iter()
                 .filter(|(_, root)| root.watched == path)
-                .map(|(id, _)| id)
+                .map(|(id, _)| id.clone())
                 .collect();
             if !path.is_dir() {
                 self.note_watch_retry(path.clone(), mode);
                 for id in &ids {
                     self.degraded_backend.remove(id);
                 }
-                for id in ids {
+                for id in &ids {
                     registry.mark_degraded(id, "watch root is missing".to_owned());
                 }
                 continue;
@@ -505,7 +674,7 @@ impl PumpState {
                     shared_status = Some((error, retrying));
                     break;
                 }
-                for id in ids {
+                for id in &ids {
                     match registry.observation(id) {
                         Some(registry::Observation::Degraded { .. }) => {}
                         Some(registry::Observation::Watched) | None => {
@@ -520,8 +689,8 @@ impl PumpState {
                 }
                 continue;
             }
-            let Some(debouncer) = self.debouncer.as_mut() else {
-                for id in ids {
+            if self.debouncer.is_none() {
+                for id in &ids {
                     if self.degraded_backend.insert(id.clone()) {
                         registry.mark_backend_unavailable(id);
                         tracing::warn!(
@@ -532,38 +701,141 @@ impl PumpState {
                     }
                 }
                 continue;
-            };
-            let was_degraded = ids.iter().any(|id| {
-                matches!(
-                    registry.observation(id),
-                    Some(registry::Observation::Degraded { .. })
-                )
+            }
+            let was_degraded = ids.iter().any(|id| match registry.observation(id) {
+                Some(registry::Observation::Degraded { .. }) => true,
+                Some(registry::Observation::Watched) | None => false,
             });
+            ops.push(ReconcileOp::Watch {
+                path,
+                mode,
+                ids,
+                was_degraded,
+            });
+        }
+
+        ops
+    }
+
+    /// Applies `ops` through `update_paths`, one native call per attempt.
+    /// A failed operation is recorded and its remainder resubmitted in a
+    /// following call. An `origin: None` failure means every path update
+    /// applied but the native stream failed to (re)start, so no root is
+    /// observed: the batch and every installed root are degraded and
+    /// re-issued on the next reconcile tick.
+    fn apply_reconcile_ops(
+        &mut self,
+        registry: &registry::WatchRegistry,
+        snapshot: &[(registry::RegistrationId, WatchRoot)],
+        ops: Vec<ReconcileOp>,
+    ) {
+        let mut pending = ops;
+        while !pending.is_empty() {
+            let path_ops: Vec<PathOp> = pending.iter().map(ReconcileOp::as_path_op).collect();
+            let Some(debouncer) = self.debouncer.as_mut() else {
+                return;
+            };
             #[cfg(test)]
-            let watch_result = native_watch(debouncer, &path, mode, &mut self.native_watch_hook);
+            let result = native_update_paths(debouncer, path_ops, &mut self.native_watch_hook);
             #[cfg(not(test))]
-            let watch_result = debouncer.watch(&path, mode);
-            match watch_result {
-                Ok(()) => {
+            let result = debouncer.update_paths(path_ops);
+            let Err(error) = result else {
+                for op in pending {
+                    self.apply_op(registry, op, OpOutcome::Applied);
+                }
+                return;
+            };
+            let applied_len = match error.origin {
+                Some(_) => pending.len().checked_sub(error.remaining.len() + 1),
+                None => None,
+            };
+            let Some(applied_len) = applied_len else {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %error.source,
+                    "watcher: native stream restart failed; retrying every root next tick",
+                );
+                for op in pending {
+                    self.apply_op(registry, op, OpOutcome::Applied);
+                }
+                self.degrade_installed(registry, snapshot, &error.source);
+                return;
+            };
+            let mut rest = pending.split_off(applied_len);
+            for op in pending {
+                self.apply_op(registry, op, OpOutcome::Applied);
+            }
+            let failed = rest.remove(0);
+            self.apply_op(registry, failed, OpOutcome::Failed(&error.source));
+            pending = rest;
+        }
+    }
+
+    fn apply_op(
+        &mut self,
+        registry: &registry::WatchRegistry,
+        op: ReconcileOp,
+        outcome: OpOutcome,
+    ) {
+        match op {
+            ReconcileOp::Watch {
+                path,
+                mode,
+                ids,
+                was_degraded,
+            } => match outcome {
+                OpOutcome::Applied => {
                     self.watch_retries.remove(&path);
                     self.installed.insert(path.clone(), mode);
-                    for id in ids {
+                    for id in &ids {
                         registry.mark_watched(id);
                     }
                     if was_degraded {
                         tracing::info!(target: "hallouminate::daemon", root = %path.display(), "watcher: watch install recovered");
                     }
                 }
-                Err(error) => {
+                OpOutcome::Failed(error) => {
                     self.note_watch_retry(path.clone(), mode);
                     if !was_degraded {
                         tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: watch install failed; reconciliation continues");
                     }
-                    for id in ids {
+                    for id in &ids {
                         registry.mark_degraded(id, error.to_string());
                     }
                 }
+            },
+            ReconcileOp::Unwatch { path, desired_mode } => match outcome {
+                OpOutcome::Applied => {
+                    self.installed.remove(&path);
+                    self.unwatch_retries.remove(&path);
+                }
+                OpOutcome::Failed(error) => {
+                    tracing::debug!(target: "hallouminate::daemon", path = %path.display(), error = %error, "watcher: obsolete watch removal failed");
+                    self.unwatch_retries.insert(path, desired_mode);
+                }
+            },
+        }
+    }
+
+    /// Marks installed watches degraded after the native stream failed to
+    /// start, so the next reconcile tick re-issues all surviving roots.
+    fn degrade_installed(
+        &mut self,
+        registry: &registry::WatchRegistry,
+        snapshot: &[(registry::RegistrationId, WatchRoot)],
+        error: &notify::Error,
+    ) {
+        let mut installed = Vec::new();
+        for (path, mode) in &self.installed {
+            installed.push((path.clone(), *mode));
+        }
+        for (path, mode) in installed {
+            for (id, root) in snapshot {
+                if root.watched == path {
+                    registry.mark_degraded(id, error.to_string());
+                }
             }
+            self.note_watch_retry(path, mode);
         }
     }
 
@@ -591,6 +863,7 @@ impl PumpState {
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
             watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
             #[cfg(test)]
             native_watch_hook: None,
         }
@@ -1016,6 +1289,7 @@ fn spawn_corpus_watcher_with(
         roots: Vec::new(),
         degraded_backend: HashSet::new(),
         watch_retries: HashMap::new(),
+        unwatch_retries: HashMap::new(),
         #[cfg(test)]
         native_watch_hook: None,
     };
@@ -1209,7 +1483,8 @@ async fn process_change_batch(
     let _conn = state.enter_connection(WorkClass::Internal);
     let mut restarts_idle_clock = false;
     for path in &paths {
-        restarts_idle_clock |= handle_changed_path(state, roots, path, failures, churn).await;
+        let path = canonical_event_path(roots, path);
+        restarts_idle_clock |= handle_changed_path(state, roots, &path, failures, churn).await;
     }
     let idle_clock = if restarts_idle_clock {
         IdleClock::Restart
@@ -1424,6 +1699,40 @@ async fn mtime_matches_last_index(store: &LanceStore, corpus: &CorpusConfig, pat
             false
         }
     }
+}
+
+/// Re-roots an event path reported in its watched form under that root's
+/// `canonical_watched`. notify 9 reports FSEvents paths in the form the path
+/// was watched with (e.g. `/var/...`), while ownership and stored file refs
+/// use the canonical form (e.g. `/private/var/...`). A path already under a
+/// canonical root, or under no root, passes through unchanged.
+fn canonical_event_path(roots: &[WatchRoot], path: &Path) -> PathBuf {
+    let mut best: Option<(usize, PathBuf)> = None;
+    for root in roots {
+        let candidate = match path.strip_prefix(&root.canonical_watched) {
+            Ok(_) => Some((
+                root.canonical_watched.components().count(),
+                path.to_path_buf(),
+            )),
+            Err(_) => match path.strip_prefix(&root.watched) {
+                Ok(relative) => Some((
+                    root.watched.components().count(),
+                    root.canonical_watched.join(relative),
+                )),
+                Err(_) => None,
+            },
+        };
+        let Some((depth, rerooted)) = candidate else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(current, _)| depth > *current) {
+            best = Some((depth, rerooted));
+        }
+    }
+    let Some((_, path)) = best else {
+        return path.to_path_buf();
+    };
+    path
 }
 
 /// Find the baseline corpus that owns `path`: the deepest configured root that
@@ -1721,6 +2030,50 @@ mod tests {
     /// would miss the event entirely (the create/modify reindex never fires),
     /// which is the macOS `/var → /private/var` breakage this fix closes.
     #[test]
+    fn canonical_event_path_reroots_watched_form_under_canonical_root() {
+        let root = WatchRoot {
+            watched: PathBuf::from("/var/tmp/wiki"),
+            canonical_watched: PathBuf::from("/private/var/tmp/wiki"),
+            corpus: corpus("wiki", "/var/tmp/wiki", &["**/*.md"]),
+            canonical_file_root: None,
+            mode: RecursiveMode::Recursive,
+        };
+        let roots = [root];
+        assert_eq!(
+            canonical_event_path(&roots, Path::new("/var/tmp/wiki/a/note.md")),
+            PathBuf::from("/private/var/tmp/wiki/a/note.md")
+        );
+        assert_eq!(
+            canonical_event_path(&roots, Path::new("/private/var/tmp/wiki/note.md")),
+            PathBuf::from("/private/var/tmp/wiki/note.md")
+        );
+        assert_eq!(
+            canonical_event_path(&roots, Path::new("/elsewhere/note.md")),
+            PathBuf::from("/elsewhere/note.md")
+        );
+
+        let plain = WatchRoot {
+            watched: PathBuf::from("/a"),
+            canonical_watched: PathBuf::from("/a"),
+            corpus: corpus("plain", "/a", &["**/*.md"]),
+            canonical_file_root: None,
+            mode: RecursiveMode::Recursive,
+        };
+        let linked = WatchRoot {
+            watched: PathBuf::from("/a/link"),
+            canonical_watched: PathBuf::from("/b/real"),
+            corpus: corpus("linked", "/a/link", &["**/*.md"]),
+            canonical_file_root: None,
+            mode: RecursiveMode::Recursive,
+        };
+        assert_eq!(
+            canonical_event_path(&[plain, linked], Path::new("/a/link/x.md")),
+            PathBuf::from("/b/real/x.md"),
+            "a deeper symlinked root's watched form must win over a shallower canonical match"
+        );
+    }
+
+    #[test]
     fn owning_corpus_matches_canonical_event_path_under_symlinked_root() {
         let owner = WatchRoot {
             watched: PathBuf::from("/link/wiki"),
@@ -1825,12 +2178,11 @@ mod tests {
         let snapshot = state.watch_registry().snapshot_roots();
         let desired = PumpState::desired_watches(&snapshot);
         let mut pump = PumpState::test_default();
-        pump.install_or_degrade_watches(
-            state.watch_registry(),
-            &snapshot,
-            desired.clone(),
-            WatchRetry::RegistryChange,
-        );
+        let mut apply = |retry| {
+            let ops = pump.build_reconcile_ops(state.watch_registry(), &snapshot, &desired, retry);
+            pump.apply_reconcile_ops(state.watch_registry(), &snapshot, ops);
+        };
+        apply(WatchRetry::RegistryChange);
         assert_eq!(
             state.watch_registry().observation(&id),
             Some(registry::Observation::Degraded {
@@ -1840,12 +2192,7 @@ mod tests {
         );
 
         std::fs::remove_dir(&root).expect("remove root");
-        pump.install_or_degrade_watches(
-            state.watch_registry(),
-            &snapshot,
-            desired.clone(),
-            WatchRetry::RegistryChange,
-        );
+        apply(WatchRetry::RegistryChange);
         assert_eq!(
             state.watch_registry().observation(&id),
             Some(registry::Observation::Degraded {
@@ -1855,12 +2202,7 @@ mod tests {
         );
 
         std::fs::create_dir(&root).expect("recreate root");
-        pump.install_or_degrade_watches(
-            state.watch_registry(),
-            &snapshot,
-            desired.clone(),
-            WatchRetry::ReconcileTick,
-        );
+        apply(WatchRetry::ReconcileTick);
         assert_eq!(
             state.watch_registry().observation(&id),
             Some(registry::Observation::Degraded {
@@ -1868,12 +2210,7 @@ mod tests {
                 retrying: false,
             })
         );
-        pump.install_or_degrade_watches(
-            state.watch_registry(),
-            &snapshot,
-            desired,
-            WatchRetry::RegistryChange,
-        );
+        apply(WatchRetry::RegistryChange);
         assert_eq!(
             state.watch_registry().observation(&id),
             Some(registry::Observation::Degraded {
@@ -1905,6 +2242,10 @@ mod tests {
         let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
             attempts: HashMap::new(),
             failures: HashSet::from([root.clone()]),
+            native_restarts: 0,
+            batches: Vec::new(),
+            registered: HashMap::new(),
+            restart_failure: false,
         }));
         let corpus_cfg = corpus("missing", root.to_str().unwrap(), &["**/*.md"]);
         register_runtime_corpora(&state, None, &[corpus_cfg], &cfg).expect("register");
@@ -1929,10 +2270,19 @@ mod tests {
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
             watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
             native_watch_hook: Some(hook.clone()),
         };
         pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
         assert_eq!(hook.lock().expect("hook mutex").attempts.get(&root), None);
+        assert!(
+            hook.lock()
+                .expect("hook mutex")
+                .batches
+                .iter()
+                .all(|batch| batch.iter().all(|op| op.path() != root)),
+            "a missing root must never reach a native batch"
+        );
         let Some(registry::Observation::Degraded { .. }) =
             state.watch_registry().observation(&original_id)
         else {
@@ -2179,6 +2529,586 @@ mod tests {
             ),
             "a mode change must not preserve retry suppression"
         );
+    }
+
+    #[tokio::test]
+    async fn reconcile_batches_mixed_delta_into_one_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let removed_root = tmp.path().join("removed");
+        std::fs::create_dir(&removed_root).expect("create removed root");
+        let new_root_a = tmp.path().join("new-a");
+        std::fs::create_dir(&new_root_a).expect("create new-a root");
+        let new_root_b = tmp.path().join("new-b");
+        std::fs::create_dir(&new_root_b).expect("create new-b root");
+
+        register_runtime_corpora(
+            &state,
+            None,
+            &[
+                corpus("new-a", new_root_a.to_str().unwrap(), &["**/*.md"]),
+                corpus("new-b", new_root_b.to_str().unwrap(), &["**/*.md"]),
+            ],
+            &cfg,
+        )
+        .expect("register new corpora");
+
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let mut debouncer =
+            build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false).expect("debouncer");
+        debouncer
+            .watch(&removed_root, RecursiveMode::Recursive)
+            .expect("install removed root natively");
+        let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
+            attempts: HashMap::new(),
+            failures: HashSet::new(),
+            native_restarts: 0,
+            batches: Vec::new(),
+            registered: HashMap::new(),
+            restart_failure: false,
+        }));
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::from([(removed_root.clone(), RecursiveMode::Recursive)]),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
+            native_watch_hook: Some(hook.clone()),
+        };
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").native_restarts,
+            1,
+            "two new roots and one removed root must apply through one native call"
+        );
+        assert_eq!(
+            hook.lock().expect("hook mutex").batches,
+            vec![vec![
+                RecordedOp::Unwatch(removed_root.clone()),
+                RecordedOp::Watch(new_root_a.clone(), RecursiveMode::Recursive),
+                RecordedOp::Watch(new_root_b.clone(), RecursiveMode::Recursive),
+            ]],
+            "unwatch ops must precede watch ops in one batch"
+        );
+        assert!(!pump.installed.contains_key(&removed_root));
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_without_delta_makes_no_native_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let root = tmp.path().join("stable");
+        std::fs::create_dir(&root).expect("create stable root");
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("stable", root.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register stable corpus");
+
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer =
+            build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false).expect("debouncer");
+        let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
+            attempts: HashMap::new(),
+            failures: HashSet::new(),
+            native_restarts: 0,
+            batches: Vec::new(),
+            registered: HashMap::new(),
+            restart_failure: false,
+        }));
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
+            native_watch_hook: Some(hook.clone()),
+        };
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(hook.lock().expect("hook mutex").native_restarts, 1);
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert_eq!(
+            hook.lock().expect("hook mutex").native_restarts,
+            1,
+            "an unchanged watch set must make no native call"
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    fn registration_for(state: &DaemonState, watched: &Path) -> registry::RegistrationId {
+        for (id, watch_root) in state.watch_registry().snapshot_roots() {
+            if watch_root.watched == watched {
+                return id;
+            }
+        }
+        panic!("no registration for {}", watched.display());
+    }
+
+    #[tokio::test]
+    async fn batch_failure_degrades_only_failed_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let root_a = tmp.path().join("root-a");
+        let root_b = tmp.path().join("root-b");
+        let root_c = tmp.path().join("root-c");
+        for root in [&root_a, &root_b, &root_c] {
+            std::fs::create_dir(root).expect("create root");
+        }
+        register_runtime_corpora(
+            &state,
+            None,
+            &[
+                corpus("root-a", root_a.to_str().unwrap(), &["**/*.md"]),
+                corpus("root-b", root_b.to_str().unwrap(), &["**/*.md"]),
+                corpus("root-c", root_c.to_str().unwrap(), &["**/*.md"]),
+            ],
+            &cfg,
+        )
+        .expect("register corpora");
+
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer =
+            build_debouncer(&cfg, &state, wake.clone(), pending.clone(), false).expect("debouncer");
+        let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
+            attempts: HashMap::new(),
+            failures: HashSet::from([root_b.clone()]),
+            native_restarts: 0,
+            batches: Vec::new(),
+            registered: HashMap::new(),
+            restart_failure: false,
+        }));
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
+            native_watch_hook: Some(hook.clone()),
+        };
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        {
+            let guard = hook.lock().expect("hook mutex");
+            assert_eq!(
+                guard.native_restarts, 2,
+                "the ops after the failed root must be resubmitted in one more call"
+            );
+            assert_eq!(
+                guard.batches.last().expect("resubmitted batch"),
+                &vec![RecordedOp::Watch(root_c.clone(), RecursiveMode::Recursive)]
+            );
+            assert_eq!(
+                guard.registered,
+                HashMap::from([
+                    (root_a.clone(), RecursiveMode::Recursive),
+                    (root_c.clone(), RecursiveMode::Recursive),
+                ]),
+                "the test seam must mirror applied prefix and successful remainder"
+            );
+        }
+        let registry = state.watch_registry();
+        assert_eq!(
+            registry.observation(&registration_for(&state, &root_a)),
+            Some(registry::Observation::Watched)
+        );
+        assert_eq!(
+            registry.observation(&registration_for(&state, &root_c)),
+            Some(registry::Observation::Watched)
+        );
+        let Some(registry::Observation::Degraded { .. }) =
+            registry.observation(&registration_for(&state, &root_b))
+        else {
+            panic!("the failed root must be degraded");
+        };
+        assert!(!pump.installed.contains_key(&root_b));
+
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").native_restarts,
+            2,
+            "a failed root must not retry on a registry change"
+        );
+
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert_eq!(hook.lock().expect("hook mutex").native_restarts, 3);
+        assert_eq!(
+            state
+                .watch_registry()
+                .observation(&registration_for(&state, &root_b)),
+            Some(registry::Observation::Watched)
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    type SharedHook = std::sync::Arc<std::sync::Mutex<NativeWatchHook>>;
+
+    fn hooked_pump(
+        cfg: &hallouminate_config::Config,
+        state: &DaemonState,
+    ) -> (PumpState, SharedHook) {
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer = build_debouncer(cfg, state, wake, pending, false).expect("debouncer");
+        let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
+            attempts: HashMap::new(),
+            failures: HashSet::new(),
+            native_restarts: 0,
+            batches: Vec::new(),
+            registered: HashMap::new(),
+            restart_failure: false,
+        }));
+        let pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
+            native_watch_hook: Some(hook.clone()),
+        };
+        (pump, hook)
+    }
+
+    fn assert_degraded(state: &DaemonState, id: &registry::RegistrationId, why: &str) {
+        let Some(registry::Observation::Degraded { .. }) = state.watch_registry().observation(id)
+        else {
+            panic!("{why}");
+        };
+    }
+
+    #[tokio::test]
+    async fn batch_stream_restart_failure_retries_every_root_next_tick() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let stable = tmp.path().join("stable");
+        let added = tmp.path().join("added");
+        for root in [&stable, &added] {
+            std::fs::create_dir(root).expect("create root");
+        }
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("stable", stable.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register stable corpus");
+        let (mut pump, hook) = hooked_pump(&cfg, &state);
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert!(pump.installed.contains_key(&stable));
+
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("added", added.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register added corpus");
+        hook.lock().expect("hook mutex").restart_failure = true;
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(hook.lock().expect("hook mutex").native_restarts, 2);
+        assert_eq!(
+            pump.installed,
+            HashMap::from([
+                (stable.clone(), RecursiveMode::Recursive),
+                (added.clone(), RecursiveMode::Recursive),
+            ]),
+            "native path updates apply before the stream restart failure"
+        );
+        assert_eq!(
+            hook.lock().expect("hook mutex").registered,
+            pump.installed,
+            "the test seam must mirror native registrations"
+        );
+        let stable_id = registration_for(&state, &stable);
+        let added_id = registration_for(&state, &added);
+        assert_degraded(
+            &state,
+            &stable_id,
+            "a stopped stream must degrade installed roots",
+        );
+        assert_degraded(&state, &added_id, "a stopped stream must degrade the batch");
+
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(hook.lock().expect("hook mutex").native_restarts, 2);
+
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        {
+            let guard = hook.lock().expect("hook mutex");
+            assert_eq!(guard.native_restarts, 3);
+            assert_eq!(
+                guard.batches.last().expect("retry batch"),
+                &vec![
+                    RecordedOp::Watch(added.clone(), RecursiveMode::Recursive),
+                    RecordedOp::Watch(stable.clone(), RecursiveMode::Recursive),
+                ],
+                "the tick must re-issue every root in one batch"
+            );
+        }
+        for id in [&stable_id, &added_id] {
+            assert_eq!(
+                state.watch_registry().observation(id),
+                Some(registry::Observation::Watched)
+            );
+        }
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn unwatch_only_stream_restart_failure_retries_installed_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let stable = tmp.path().join("stable");
+        let removed = tmp.path().join("removed");
+        for root in [&stable, &removed] {
+            std::fs::create_dir(root).expect("create root");
+        }
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("stable", stable.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register stable corpus");
+        let (mut pump, hook) = hooked_pump(&cfg, &state);
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        pump.debouncer
+            .as_mut()
+            .expect("debouncer")
+            .watch(&removed, RecursiveMode::Recursive)
+            .expect("install removed root natively");
+        pump.installed
+            .insert(removed.clone(), RecursiveMode::Recursive);
+
+        hook.lock().expect("hook mutex").restart_failure = true;
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock()
+                .expect("hook mutex")
+                .batches
+                .last()
+                .expect("unwatch batch"),
+            &vec![RecordedOp::Unwatch(removed.clone())]
+        );
+        assert_eq!(
+            pump.installed,
+            HashMap::from([(stable.clone(), RecursiveMode::Recursive)]),
+            "the native unwatch applies while surviving registrations remain owned"
+        );
+        assert_eq!(
+            hook.lock().expect("hook mutex").registered,
+            pump.installed,
+            "the test seam must apply the native unwatch"
+        );
+        let stable_id = registration_for(&state, &stable);
+        assert_degraded(
+            &state,
+            &stable_id,
+            "an unwatch-only batch that stops the stream must degrade installed roots",
+        );
+
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert_eq!(
+            hook.lock()
+                .expect("hook mutex")
+                .batches
+                .last()
+                .expect("retry batch"),
+            &vec![RecordedOp::Watch(stable.clone(), RecursiveMode::Recursive)],
+            "the tick must restart the stream by re-issuing installed roots"
+        );
+        assert_eq!(
+            state.watch_registry().observation(&stable_id),
+            Some(registry::Observation::Watched)
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn failed_unwatch_retries_only_on_reconcile_tick() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let stable = tmp.path().join("stable");
+        let removed = tmp.path().join("removed");
+        for root in [&stable, &removed] {
+            std::fs::create_dir(root).expect("create root");
+        }
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("stable", stable.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register stable corpus");
+        let (mut pump, hook) = hooked_pump(&cfg, &state);
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        pump.debouncer
+            .as_mut()
+            .expect("debouncer")
+            .watch(&removed, RecursiveMode::Recursive)
+            .expect("install removed root natively");
+        pump.installed
+            .insert(removed.clone(), RecursiveMode::Recursive);
+        hook.lock()
+            .expect("hook mutex")
+            .registered
+            .insert(removed.clone(), RecursiveMode::Recursive);
+        hook.lock()
+            .expect("hook mutex")
+            .failures
+            .insert(removed.clone());
+
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").native_restarts,
+            2,
+            "the first obsolete-root removal must be attempted"
+        );
+        assert!(
+            pump.installed.contains_key(&removed),
+            "a failed native unwatch must retain ownership for retry"
+        );
+        assert!(
+            hook.lock()
+                .expect("hook mutex")
+                .registered
+                .contains_key(&removed),
+            "the injected failure must leave the native registration in place"
+        );
+
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").native_restarts,
+            2,
+            "an unwatch failure must not retry on a registry change"
+        );
+
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert_eq!(hook.lock().expect("hook mutex").native_restarts, 3);
+        assert!(!pump.installed.contains_key(&removed));
+        assert!(
+            !hook
+                .lock()
+                .expect("hook mutex")
+                .registered
+                .contains_key(&removed),
+            "the tick retry must remove the stale native registration"
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test]
+    async fn mode_change_rewatches_path_in_one_batch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let dir = tmp.path().join("shared");
+        std::fs::create_dir(&dir).expect("create shared dir");
+        let file = dir.join("CLAUDE.md");
+        std::fs::write(&file, "# config\n").expect("write file root");
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("file", file.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register file corpus");
+        let (mut pump, hook) = hooked_pump(&cfg, &state);
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(pump.installed.get(&dir), Some(&RecursiveMode::NonRecursive));
+
+        hook.lock()
+            .expect("hook mutex")
+            .failures
+            .insert(dir.clone());
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("dir", dir.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register dir corpus");
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        {
+            let guard = hook.lock().expect("hook mutex");
+            assert_eq!(guard.native_restarts, 3);
+            assert_eq!(
+                guard.batches.last().expect("failed watch retry"),
+                &vec![RecordedOp::Watch(dir.clone(), RecursiveMode::Recursive)]
+            );
+            assert_eq!(
+                guard.registered.get(&dir),
+                Some(&RecursiveMode::NonRecursive),
+                "both failed operations must preserve the old native mode"
+            );
+        }
+        assert_eq!(pump.installed.get(&dir), Some(&RecursiveMode::NonRecursive));
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(hook.lock().expect("hook mutex").native_restarts, 3);
+
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        {
+            let guard = hook.lock().expect("hook mutex");
+            assert_eq!(guard.native_restarts, 4);
+            assert_eq!(
+                guard.batches.last().expect("mode retry batch"),
+                &vec![
+                    RecordedOp::Unwatch(dir.clone()),
+                    RecordedOp::Watch(dir.clone(), RecursiveMode::Recursive),
+                ]
+            );
+            assert_eq!(
+                guard.registered.get(&dir),
+                Some(&RecursiveMode::Recursive),
+                "the tick must apply the changed native mode"
+            );
+        }
+        assert_eq!(pump.installed.get(&dir), Some(&RecursiveMode::Recursive));
+        tracker.close();
+        tracker.wait().await;
     }
 
     /// Plain (non-symlinked) root: `canonical_watched == watched`, so the key
@@ -2508,6 +3438,7 @@ mod tests {
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
             watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
             #[cfg(test)]
             native_watch_hook: None,
         };
@@ -2613,6 +3544,10 @@ mod tests {
         let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
             attempts: HashMap::new(),
             failures: HashSet::from([root.clone()]),
+            native_restarts: 0,
+            batches: Vec::new(),
+            registered: HashMap::new(),
+            restart_failure: false,
         }));
         let live = corpus("live", root.to_str().unwrap(), &["**/*.md"]);
         register_runtime_corpora(&state, None, &[live], &cfg).expect("register live corpus");
@@ -2632,6 +3567,7 @@ mod tests {
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
             watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
             native_watch_hook: Some(hook.clone()),
         };
         pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
@@ -2721,6 +3657,7 @@ mod tests {
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
             watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
             #[cfg(test)]
             native_watch_hook: None,
         };
@@ -2844,6 +3781,7 @@ mod tests {
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
             watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
             #[cfg(test)]
             native_watch_hook: None,
         };
@@ -3876,6 +4814,7 @@ body
             roots: Vec::new(),
             degraded_backend: HashSet::new(),
             watch_retries: HashMap::new(),
+            unwatch_retries: HashMap::new(),
             #[cfg(test)]
             native_watch_hook: None,
         };
@@ -4006,6 +4945,7 @@ body
                 roots: Vec::new(),
                 degraded_backend: HashSet::new(),
                 watch_retries: HashMap::new(),
+                unwatch_retries: HashMap::new(),
                 #[cfg(test)]
                 native_watch_hook: None,
             },
@@ -4074,6 +5014,7 @@ body
                 roots: Vec::new(),
                 degraded_backend: HashSet::new(),
                 watch_retries: HashMap::new(),
+                unwatch_retries: HashMap::new(),
                 #[cfg(test)]
                 native_watch_hook: None,
             },
@@ -4158,6 +5099,7 @@ body
                 roots: Vec::new(),
                 degraded_backend: HashSet::new(),
                 watch_retries: HashMap::new(),
+                unwatch_retries: HashMap::new(),
                 #[cfg(test)]
                 native_watch_hook: None,
             },

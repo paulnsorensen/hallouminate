@@ -14,8 +14,8 @@ hallouminate-config.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-notify = "8"
-notify-debouncer-full = "0.7"
+notify = "=9.0.0-rc.5"
+notify-debouncer-full = "=0.8.0-rc.2"
 rustix.workspace = true
 strsim.workspace = true
 libc = "0.2"
