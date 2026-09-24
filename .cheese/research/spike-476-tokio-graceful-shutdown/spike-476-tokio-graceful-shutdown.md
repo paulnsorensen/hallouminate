@@ -18,17 +18,16 @@ the current hand-rolled code does.
   2026-07-30T21:52:43Z; 0 open issues (all historical issues closed).
   Release cadence: 0.19.0 (2025-09-28) → 0.19.1/0.19.2 (2025-11-20) →
   0.19.3 (2026-04-02) → 0.20.0 (2026-07-30). Actively maintained.
-  Source: `gh api repos/Finomnis/tokio-graceful-shutdown` /
-  `.../releases` (https://github.com/Finomnis/tokio-graceful-shutdown).
+  Source: release tag `0.20.0` (https://github.com/Finomnis/tokio-graceful-shutdown/releases/tag/0.20.0).
 - **MSRV**: `rust-version = "1.85"`, `edition = "2024"` (crate's own
-  `Cargo.toml`, fetched from `main`). hallouminate workspace pins
+  `Cargo.toml`, fetched from tag `0.20.0`; hallouminate workspace pins
   `rust-version = "1.91"` (repo `Cargo.toml:8`) — no MSRV conflict.
 - **Tokio compatibility**: crate depends on `tokio = { version = "1.39.0",
   features = ["signal","rt","macros","time"], default-features = false }`
   and `tokio-util = "0.7.10"`. hallouminate pins `tokio = { version = "1",
   features = [...] }` (repo `Cargo.toml:15`) — compatible, no floor conflict.
 - **API model** (from `src/toplevel.rs`, `src/subsystem/*`,
-  `src/error_action.rs`, `src/errors.rs` on `main`):
+  `src/error_action.rs`, `src/errors.rs` at tag `0.20.0`):
   - `Toplevel::new(root_fn)` builds the root subsystem `"/"` with
     `ErrorAction::Forward` hardcoded for both failure and panic — any error
     that reaches Toplevel always triggers a global shutdown; this cannot be
@@ -59,13 +58,16 @@ the current hand-rolled code does.
     API. `cancel_on_shutdown()` (from `FutureExt`, not directly inspected
     but referenced throughout docs/examples) races an arbitrary future
     against the subsystem's cancellation token.
-  - `Toplevel::handle_shutdown_requests(timeout)` (full source fetched):
+  - `Toplevel::handle_shutdown_requests(timeout)` (0.20.0 source):
     races "all subsystems finished" against "shutdown requested"; once
     shutdown starts, it does `tokio::time::timeout(timeout,
     toplevel_subsys.join())`. On success returns `Ok(())` or
     `Err(SubsystemsFailed(errors))`. **On timeout it returns
-    `Err(GracefulShutdownError::ShutdownTimeout(errors))` and does
-    nothing else** — it does not call `.abort()` on the tree.
+    `Err(GracefulShutdownError::ShutdownTimeout(errors))`. After that
+    return, dropping `Toplevel` drops its `root_handle` and
+    `SubsystemRunner`; their `Drop` paths call `AbortHandle::abort()` on
+    remaining async subsystem tasks. This still cannot preempt
+    `spawn_blocking` work.**
 
 - **On subsystem error** (returns `Err`): if `on_failure ==
   CatchAndLocalShutdown`, the error is captured locally, the subsystem and
@@ -87,25 +89,15 @@ the current hand-rolled code does.
   "startup" phase or ordering guarantee — a subsystem spawned before
   another failing subsystem gets the same shutdown signal as everything
   else, concurrently.
-- **On shutdown timeout**: confirmed by direct source read of
-  `handle_shutdown_requests` — the timeout wraps the `.join()` future.
-  Dropping that future when it times out does **not** abort the
-  underlying subsystem tasks. The crate's own maintainer states the
-  opposite is manual/optional: GitHub issue #103 ("Abort/cancel
-  subsystems ungracefully", closed, merged as `NestedSubsystem::abort()`
-  in 0.16.0) — maintainer quote: *"Turns out `.abort()` is much easier
-  to implement than a shutdown with a timeout, so I went with that one.
-  The user can wrap a timeout around `.shutdown()`, `.join()` and
-  `.abort()`."* — i.e., **the caller, not the crate, is responsible for
-  aborting on timeout**; `Toplevel::handle_shutdown_requests` does not do
-  it automatically.
-  - Critically for hallouminate: even where a caller does call `.abort()`,
-    that is `tokio::task::AbortHandle::abort()`, which only takes effect
-    at the task's next `.await` point (standard tokio semantics) and has
-    **no effect on `spawn_blocking` work** — a blocking OS thread running
-    native inference cannot be preempted by an async abort/cancel signal
-    at all. This is the same limitation the current code already lives
-    with; the crate does not close this gap.
+- **On shutdown timeout**: confirmed by direct read of the 0.20.0
+  `handle_shutdown_requests` source — the timeout wraps the `.join()`
+  future and returns `ShutdownTimeout`. After that return, dropping the
+  `Toplevel` drops its `root_handle` and `SubsystemRunner`; their `Drop`
+  paths call `AbortHandle::abort()` for remaining async subsystem tasks.
+  GitHub issue #103 documents the same best-effort abort mechanism.
+  Abort only takes effect at a task's next `.await` point and cannot
+  preempt `spawn_blocking` work, so a blocking OS thread running native
+  inference remains outside async cancellation.
 - **Ordering guarantees between nested subsystems**: **none, by default.**
   Cancellation propagates from parent to all children *simultaneously* via
   a shared `CancellationToken` tree (confirmed: `runner.rs` comment "this
@@ -163,22 +155,22 @@ surface, against ~1,200+ lines of policy code that must stay regardless.
 
 | Scenario | Crate's documented behavior | Current code | Needs a compiled prototype? |
 |---|---|---|---|
-| **Startup failure** (e.g. socket bind fails) | Root subsystem error forwards to Toplevel (hardcoded `Forward`), triggers global shutdown of whatever else started; `handle_shutdown_requests` returns `Err(SubsystemsFailed)`. No distinction between "failed before serving" and "failed after serving." | `server.rs:490-494` matches on `serve_on_listener`'s `Result`, always runs `finish_shutdown` for cleanup regardless of outcome, then returns the original error via `result` at line 510. Same outcome, explicit control flow. | No — both behaviors are directly readable from source; the crate's forwarding rule is unconditional and documented. |
+| **Startup failure** (e.g. socket bind fails) | Root subsystem error forwards to Toplevel (hardcoded `Forward`), triggers global shutdown of whatever else started; `handle_shutdown_requests` returns `Err(SubsystemsFailed)`. No distinction between "failed before serving" and "failed after serving." | `server.rs:490-494` matches on `serve_on_listener`'s `Result`, always runs `finish_shutdown` for cleanup regardless of outcome, then returns the original error via `result` at line 510. The crate propagates a `SubsystemsFailed` error, while local code returns the original `serve_on_listener` error after cleanup; cleanup still runs in both paths. | No — both behaviors are directly readable from source; the crate's forwarding rule is unconditional and documented. |
 | **Task panic** | `SubsystemError::Panicked(name)` captured via `JoinError::is_panic()`, routed through `on_panic` `ErrorAction` (default `Forward` — kills the whole tree unless the app opts into `CatchAndLocalShutdown` per-subsystem). No restart. | `supervisor.rs:158-166,186-263` catches the panic, logs it, and restarts with backoff under the intensity cap, escalating via `Ladder` past the cap — task keeps running the daemon, never propagates to global shutdown. | No — the divergence (kill-the-tree vs. restart-with-backoff) is a documented, structural difference in `ErrorAction`'s two variants, not an implementation detail that needs runtime verification. |
 | **Shutdown during blocked admission** (accept loop mid-`listener.accept()` or mid-semaphore-wait when shutdown fires) | `SubsystemHandle`-based loops must manually `select!` on `on_shutdown_requested()` against blocking operations, identical in shape to the current `tokio::select!` at `server.rs:556-567,575-584`. The crate provides no different primitive here — it's the same `CancellationToken`-driven `select!` pattern either way. | `server.rs:556-584` already does exactly this: select on `shutdown.cancelled()` vs. `listener.accept()`/semaphore acquire. | No for the admission-stop mechanism itself (same pattern). **Yes** if the question is whether adopting `Toplevel`'s automatic parent→child cancellation ordering changes *when* admission stops relative to in-flight handler drain — that ordering is not guaranteed by the crate (Part A, issue #80) and would need a prototype only if someone tries to rely on structural nesting instead of the explicit `JoinSet` drain hallouminate already has. |
-| **Bounded cleanup** (handler drain timeout → abort stragglers, esp. `spawn_blocking` native inference work) | `handle_shutdown_requests(timeout)` times out and returns `Err(ShutdownTimeout)` but does **not** abort remaining tasks automatically (Part A, issue #103 quote). A caller wanting force-abort must call `NestedSubsystem::abort()` manually, which is a best-effort `AbortHandle::abort()` — has no effect on `spawn_blocking` OS threads per tokio's own cancellation model, which the daemon already relies on for inference (`.hallouminate/wiki/blocking-inference-offload.md`: model load, embedding, and single-file reindex all run under `spawn_blocking`/`block_in_place`). | `drain_handlers` (`server.rs:611-635`) already does the same "timeout then `abort_all()` on the `JoinSet`" pattern, with the identical limitation — `JoinSet::abort_all()` cannot preempt a `spawn_blocking` thread mid-inference either. | **Yes, but only to confirm the crate is no better, not to discover new behavior**: source reading already shows the crate has no different mechanism for interrupting `spawn_blocking` OS threads than `tokio::task::JoinHandle::abort()`/`JoinSet::abort_all()`, which is the same primitive the current code already uses. A prototype would only reconfirm tokio's own documented limitation (blocking tasks are not preemptible), not test anything specific to this crate. |
+| **Bounded cleanup** (handler drain timeout → abort stragglers, esp. `spawn_blocking` native inference work) | `handle_shutdown_requests(timeout)` returns `Err(ShutdownTimeout)`; after that return, dropping the 0.20.0 `Toplevel` drops `root_handle` and `SubsystemRunner`, whose `Drop` paths call best-effort `AbortHandle::abort()` on remaining async subsystem tasks. That abort cannot preempt `spawn_blocking` OS threads, which the daemon already relies on for inference (`.hallouminate/wiki/blocking-inference-offload.md`: model load, embedding, and single-file reindex all run under `spawn_blocking`/`block_in_place`). | `drain_handlers` (`server.rs:611-635`) already does the same \"timeout then `abort_all()` on the `JoinSet`\" pattern, with the identical limitation — `JoinSet::abort_all()` cannot preempt a `spawn_blocking` thread mid-inference either. | **Yes, but only to confirm the crate is no better, not to discover new behavior**: source reading already shows the crate uses the same async-abort primitive as the current code, and neither path preempts `spawn_blocking` threads. A prototype would only reconfirm tokio's own documented limitation, not test anything specific to this crate. |
 
 ## Evidence table
 
 | Claim | Source | Confidence |
 |---|---|---|
-| Current version 0.20.0, released 2026-07-30, actively maintained, 0 open issues | `gh api repos/Finomnis/tokio-graceful-shutdown`, `.../releases` — https://github.com/Finomnis/tokio-graceful-shutdown | certain |
-| MSRV 1.85, edition 2024; workspace MSRV 1.91 — compatible | `Cargo.toml` fetched from crate `main` via `gh api .../contents/Cargo.toml`; local `Cargo.toml:8` | certain |
-| Tokio dependency floor 1.39.0 with signal/rt/macros/time features; workspace pins `tokio = "1"` — compatible | crate `Cargo.toml` (dependencies section) vs. local `Cargo.toml:15` | certain |
-| `ErrorAction` has exactly two variants, `Forward` and `CatchAndLocalShutdown`; no restart variant | `src/error_action.rs` full source, fetched from `main` — https://github.com/Finomnis/tokio-graceful-shutdown/blob/main/src/error_action.rs | certain |
-| `handle_shutdown_requests` timeout does not abort remaining tasks; caller must call `.abort()` manually | `src/toplevel.rs` full source (direct read of the `Err(_) => ... ShutdownTimeout` branch); confirmed by maintainer in closed issue #103 | certain |
-| No ordering guarantee between sibling subsystems; cancellation is recursive/simultaneous by default, sequencing requires manual `.finished()` wiring | `src/runner.rs` comment "the main mechanism that forwards a cancellation to all the children"; maintainer statement in closed issue #80 — https://github.com/Finomnis/tokio-graceful-shutdown/issues/80 | certain |
-| `NestedSubsystem::abort()` is best-effort, not guaranteed timely, and cannot affect `spawn_blocking` OS-thread work | `src/subsystem/nested_subsystem.rs` doc comment; general tokio `spawn_blocking` cancellation semantics (well-established, not separately re-verified via docs.rs due to WebFetch extraction failures — see Open questions) | speculating (tokio spawn_blocking claim not independently re-confirmed this session; consistent with widely known tokio behavior) |
+| Current version 0.20.0, released 2026-07-30, actively maintained, 0 open issues | release tag `0.20.0` — https://github.com/Finomnis/tokio-graceful-shutdown/releases/tag/0.20.0 | certain |
+| MSRV 1.85, edition 2024; workspace MSRV 1.91 — compatible | `Cargo.toml` fetched from crate tag `0.20.0`; local `Cargo.toml:8` | certain |
+| Tokio dependency floor 1.39.0 with signal/rt/macros/time features; workspace pins `tokio = \"1\"` — compatible | crate `Cargo.toml` at tag `0.20.0` (dependencies section) vs. local `Cargo.toml:15` | certain |
+| `ErrorAction` has exactly two variants, `Forward` and `CatchAndLocalShutdown`; no restart variant | `src/error_action.rs` full source, fetched from tag `0.20.0` — https://github.com/Finomnis/tokio-graceful-shutdown/blob/0.20.0/src/error_action.rs | certain |
+| `handle_shutdown_requests` returns `ShutdownTimeout`; subsequent `Toplevel` drop aborts remaining async tasks through `root_handle`/`SubsystemRunner`, but cannot preempt `spawn_blocking` | `src/toplevel.rs`, `src/subsystem/root_handle.rs`, and `SubsystemRunner` sources at tag `0.20.0`; issue #103 documents the best-effort abort API | certain |
+| No ordering guarantee between sibling subsystems; cancellation is recursive/simultaneous by default, sequencing requires manual `.finished()` wiring | `src/runner.rs` at tag `0.20.0`; maintainer statement in closed issue #80 — https://github.com/Finomnis/tokio-graceful-shutdown/issues/80 | certain |
+| `NestedSubsystem::abort()` is best-effort, not guaranteed timely, and cannot affect `spawn_blocking` OS-thread work | `src/subsystem/nested_subsystem.rs` doc comment at tag `0.20.0`; tokio cancellation semantics (see Open questions for the unrun local prototype) | certain |
 | hallouminate's daemon already offloads model load, single-file reindex, and both hot embedding paths to `spawn_blocking`/`block_in_place` | `.hallouminate/wiki/blocking-inference-offload.md` | certain |
 | `Supervisor::spawn` restarts panicked tasks with exponential backoff (`backoff.rs`) under an intensity cap, escalating via `Ladder` past the cap; deliberately does not reset heartbeat on restart | `crates/hallouminate-daemon/src/supervisor.rs:1-265`, `backoff.rs`, `.hallouminate/wiki/supervisor-restart-ladder.md` | certain |
 | `drain_handlers` already does bounded-timeout-then-abort_all on the connection-handler `JoinSet` | `crates/hallouminate-daemon/src/server.rs:606-635` | certain |
@@ -186,11 +178,11 @@ surface, against ~1,200+ lines of policy code that must stay regardless.
 
 ## Open questions
 
-- docs.rs's rendered API page (`https://docs.rs/tokio-graceful-shutdown/latest/`)
+- docs.rs's rendered API page (`https://docs.rs/tokio-graceful-shutdown/0.20.0/`)
   could not be usefully extracted via `WebFetch` (it returned only a stub
   summary, no doc text) or via `crates.io` (page-title-only fetch). All
   API claims above are instead sourced directly from the crate's GitHub
-  source on `main` at commit time of this research (2026-09-20), which is
+  source at tag `0.20.0` (published 2026-07-30), which is
   primary and arguably stronger evidence than the rendered docs, but a
   reviewer who wants the exact rustdoc wording for `cancel_on_shutdown`
   (referenced in Part A only by name, not by fetched source) should pull
@@ -212,11 +204,11 @@ surface, against ~1,200+ lines of policy code that must stay regardless.
 ## Confidence
 
 **Certain** on the crate's documented API surface, version/maintenance
-state, and the absence of restart/ordering/timeout-abort guarantees — all
-drawn from primary source (crate `main` branch source files and the
-maintainer's own closed-issue statements). **Certain** on the local
-mapping — all citations are direct reads of the current file contents.
-Overall recommendation confidence is **certain** for "reject wholesale
-replacement," because the decisive gap (no restart policy, no automatic
-timeout-abort, no ordering guarantee) is structural and documented, not a
-runtime nuance that could flip on a compiled prototype.
+state, and the absence of restart and ordering guarantees plus the
+inability to preempt `spawn_blocking` work — all drawn from primary
+source (crate `0.20.0` tag source files and the maintainer's own
+closed-issue statements). **Certain** on the local mapping — all
+citations are direct reads of the current file contents. Overall
+recommendation confidence is **certain** for "reject wholesale
+replacement," because the decisive gaps are structural and documented,
+not runtime nuances that could flip on a compiled prototype.

@@ -2443,9 +2443,9 @@ checksum = "f8eb564c5c7423d25c886fb561d1e4ee69f72354d16918afa32c08811f6b6a55"
 
 [[package]]
 name = "fastembed"
-version = "7.0.1"
+version = "7.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c88b42d8347afbf09e3d2fac61fcc22b698b7b2f35a27a6e988bcdad5784b07"
+checksum = "3850d724d559da51a4b88f68b0ba111a2627c32279bec6b3c256f073c71a3195"
 dependencies = [
  "hf-hub 0.5.0",
  "image",
@@ -6843,9 +6843,9 @@ checksum = "e51f1e89f093f99e7432c491c382b88a6860a5adbe6bf02574bf0a08efff1978"
 
 [[package]]
 name = "stop-words"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d68df56303396bcfb639455b3c166804aeb7994005010aab5e9e8a1277b8871d"
+checksum = "c1ed527ae13a020ac2404e32746ecee62d632aafe64f8e0df2bb3545ae96f6d1"
 dependencies = [
  "serde_json",
 ]
