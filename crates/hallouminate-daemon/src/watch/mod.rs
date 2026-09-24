@@ -41,7 +41,7 @@ use hallouminate_domain::corpus::ensure_corpus_allows_relative;
 use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
-use super::state::{DaemonState, WorkClass};
+use super::state::{DaemonState, IdleClock, WorkClass};
 use registry::RegistrationId;
 use tokio_util::task::TaskTracker;
 
@@ -310,7 +310,7 @@ fn reload_repo_layer(
                 tracker.spawn(async move {
                     let _conn = state.enter_connection(WorkClass::Internal);
                     cleanup_retired_registration(&state, registration).await;
-                    state.touch_activity(WorkClass::Internal);
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                 });
             }
         }
@@ -486,12 +486,38 @@ impl PumpState {
                 .collect();
             if !path.is_dir() {
                 self.note_watch_retry(path.clone(), mode);
+                for id in &ids {
+                    self.degraded_backend.remove(id);
+                }
                 for id in ids {
                     registry.mark_degraded(id, "watch root is missing".to_owned());
                 }
                 continue;
             }
             if !self.should_attempt_watch(&path, mode, retry) {
+                let mut shared_status = None;
+                for id in &ids {
+                    let Some(registry::Observation::Degraded { error, retrying }) =
+                        registry.observation(id)
+                    else {
+                        continue;
+                    };
+                    shared_status = Some((error, retrying));
+                    break;
+                }
+                for id in ids {
+                    match registry.observation(id) {
+                        Some(registry::Observation::Degraded { .. }) => {}
+                        Some(registry::Observation::Watched) | None => {
+                            match shared_status.as_ref() {
+                                Some((_, false)) => registry.mark_backend_unavailable(id),
+                                Some((error, true)) => registry.mark_degraded(id, error.clone()),
+                                None => registry
+                                    .mark_degraded(id, "watch install retry pending".to_owned()),
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             let Some(debouncer) = self.debouncer.as_mut() else {
@@ -593,7 +619,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                 &id,
                 Err("registration vanished before catch-up could start".into()),
             );
-            state.touch_activity(WorkClass::Internal);
+            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
             return;
         };
         // Hold the per-corpus lock for the whole scan-through-apply span so
@@ -607,7 +633,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                 Ok(()) => {}
                 Err(e) => {
                     state.watch_registry().finish_catch_up(&id, Err(e.to_string()));
-                    state.touch_activity(WorkClass::Internal);
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                     return;
                 }
             }
@@ -636,7 +662,19 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     })
                     .await
                     {
-                        Ok(_) => Ok(()),
+                        Ok(Some(stats)) => {
+                            let idle_clock = if stats.embeddings_inserted > 0 {
+                                IdleClock::Restart
+                            } else {
+                                IdleClock::Keep
+                            };
+                            state.touch_activity(WorkClass::Internal, idle_clock);
+                            Ok(())
+                        }
+                        Ok(None) => {
+                            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
+                            Ok(())
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 target: "hallouminate::daemon",
@@ -645,6 +683,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                                 error = %e,
                                 "watcher: reconcile pass failed; will retry on the next reconcile tick",
                             );
+                            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                             Err(e.to_string())
                         }
                     }
@@ -657,6 +696,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                         error = %e,
                         "watcher: reconcile pass failed; will retry on the next reconcile tick",
                     );
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                     Err(e.to_string())
                 }
             }
@@ -1167,10 +1207,16 @@ async fn process_change_batch(
     churn: &mut ChurnTracker,
 ) {
     let _conn = state.enter_connection(WorkClass::Internal);
+    let mut restarts_idle_clock = false;
     for path in &paths {
-        handle_changed_path(state, roots, path, failures, churn).await;
+        restarts_idle_clock |= handle_changed_path(state, roots, path, failures, churn).await;
     }
-    state.touch_activity(WorkClass::Internal);
+    let idle_clock = if restarts_idle_clock {
+        IdleClock::Restart
+    } else {
+        IdleClock::Keep
+    };
+    state.touch_activity(WorkClass::Internal, idle_clock);
 }
 
 /// Reindex (or prune) one changed path, resolving its owning registration(s)
@@ -1184,9 +1230,9 @@ async fn handle_changed_path(
     path: &Path,
     failures: &mut FailureCoalescer,
     churn: &mut ChurnTracker,
-) {
+) -> bool {
     let Some(owner) = owning_corpus(roots, path) else {
-        return;
+        return false;
     };
     let matches = state.watch_registry().registrations_for_root(owner);
     let (corpus, cfg) = resolve_registration_config(state, owner, matches, path);
@@ -1194,7 +1240,7 @@ async fn handle_changed_path(
         Ok(resources) => resources,
         Err(error) => {
             tracing::warn!(target: "hallouminate::daemon", error = %error, "watcher: resources unavailable");
-            return;
+            return false;
         }
     };
     let store = resources.store.clone();
@@ -1210,15 +1256,16 @@ async fn handle_changed_path(
             path = %path.display(),
             "watcher: skipped event, mtime matches last-indexed snapshot",
         );
-        return;
+        return false;
     }
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(target: "hallouminate::daemon", error = %e, "watcher: lock failed");
-            return;
+            return false;
         }
     };
+    let mut restarts_idle_clock = false;
     let exists = path.is_file();
     if exists {
         // `path.is_file()` above follows symlinks, so a symlinked leaf whose
@@ -1241,7 +1288,7 @@ async fn handle_changed_path(
                     error = ?e,
                     "watcher: skipping reindex, no-follow read failed",
                 );
-                return;
+                return false;
             }
         };
         let registry = state.make_registry();
@@ -1249,6 +1296,7 @@ async fn handle_changed_path(
         {
             Ok(stats) => {
                 let noop = stats.files_upserted == 0;
+                restarts_idle_clock = stats.embeddings_inserted > 0;
                 state.record_watcher_reindex(noop);
                 let effect = if noop {
                     ReindexEffect::NoOp
@@ -1322,6 +1370,7 @@ async fn handle_changed_path(
         }
     }
     drop(guard);
+    restarts_idle_clock
 }
 
 /// Stage-1 change gate (ADR daemon-rework-003): does `path`'s on-disk mtime
@@ -1746,6 +1795,91 @@ mod tests {
         assert!(
             build_watch_root(&cfg, absent.to_str().unwrap()).is_some(),
             "an absent root remains registered for recovery"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_root_replaces_backend_unavailable_status_before_recovery() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).expect("create root");
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus("root", root.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register");
+        let mut id = None;
+        for (candidate_id, watch_root) in state.watch_registry().snapshot_roots() {
+            if watch_root.watched == root {
+                id = Some(candidate_id);
+                break;
+            }
+        }
+        let id = id.expect("registration");
+        let snapshot = state.watch_registry().snapshot_roots();
+        let desired = PumpState::desired_watches(&snapshot);
+        let mut pump = PumpState::test_default();
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired.clone(),
+            WatchRetry::RegistryChange,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "notify debouncer unavailable".to_owned(),
+                retrying: false,
+            })
+        );
+
+        std::fs::remove_dir(&root).expect("remove root");
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired.clone(),
+            WatchRetry::RegistryChange,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "watch root is missing".to_owned(),
+                retrying: true,
+            })
+        );
+
+        std::fs::create_dir(&root).expect("recreate root");
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired.clone(),
+            WatchRetry::ReconcileTick,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "notify debouncer unavailable".to_owned(),
+                retrying: false,
+            })
+        );
+        pump.install_or_degrade_watches(
+            state.watch_registry(),
+            &snapshot,
+            desired,
+            WatchRetry::RegistryChange,
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Degraded {
+                error: "notify debouncer unavailable".to_owned(),
+                retrying: false,
+            })
         );
     }
 
@@ -2260,14 +2394,11 @@ mod tests {
         );
     }
 
-    /// ADR-003 regression: the delete/prune branch of `handle_changed_path`
-    /// acquired no connection guard and never touched the activity clock, so
-    /// idle-exit could tear down the daemon (and release the single-instance
-    /// flock) mid-write. Batch processing must hold a guard for the whole
-    /// batch and stamp the clock afterward, exactly like `catch_up_index`
-    /// (dispatch.rs) and `handle_connection` (server.rs).
+    /// ADR-004 regression: delete-only watcher work must keep the idle window
+    /// unchanged while the batch guard protects the in-flight prune. Batch
+    /// processing still stamps the Internal clock for maintenance-defer.
     #[tokio::test]
-    async fn process_change_batch_touches_activity_after_a_stale_clock() {
+    async fn process_change_batch_keeps_idle_after_delete_only_work() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
@@ -2284,19 +2415,17 @@ mod tests {
             corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
             None,
         )];
-        // Never created on disk: `handle_changed_path` takes the delete/prune
-        // branch — the branch that acquired no guard and stamped no clock
-        // before the fix.
+        // Never created on disk: the delete/prune branch does not run
+        // inference and must not reset the idle-exit window.
         let deleted = corpus_dir.join("gone.md");
 
         let mut failures = disabled_coalescer();
         let mut churn = disabled_churn();
         process_change_batch(&state, &roots, vec![deleted], &mut failures, &mut churn).await;
-        assert_ne!(
+        assert_eq!(
             state.last_activity_secs(),
             u64::MAX,
-            "batch processing must stamp the activity clock so idle-exit does \
-             not fire immediately after a delete-branch write",
+            "delete-only watcher work must not reset the idle-exit window",
         );
     }
 
@@ -2469,6 +2598,94 @@ mod tests {
             "the registration must retain its degraded observation",
         );
 
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn suppressed_watch_retry_degrades_new_shared_root_registration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let root = tmp.path().join("wiki");
+        std::fs::create_dir_all(&root).expect("mkdir wiki");
+        let root = root.canonicalize().expect("canonicalize wiki");
+        let hook = std::sync::Arc::new(std::sync::Mutex::new(NativeWatchHook {
+            attempts: HashMap::new(),
+            failures: HashSet::from([root.clone()]),
+        }));
+        let live = corpus("live", root.to_str().unwrap(), &["**/*.md"]);
+        register_runtime_corpora(&state, None, &[live], &cfg).expect("register live corpus");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("live registration root");
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default()));
+        let wake = std::sync::Arc::new(tokio::sync::Notify::new());
+        let debouncer = build_debouncer(&cfg, &state, wake, pending, false).expect("debouncer");
+        let tracker = TaskTracker::new();
+        let mut pump = PumpState {
+            debouncer: Some(debouncer),
+            installed: HashMap::new(),
+            roots: Vec::new(),
+            degraded_backend: HashSet::new(),
+            watch_retries: HashMap::new(),
+            native_watch_hook: Some(hook.clone()),
+        };
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&1)
+        );
+        let Some(registry::Observation::Degraded { error, retrying }) =
+            state.watch_registry().observation(&id)
+        else {
+            panic!("failed install must be degraded");
+        };
+        assert_eq!(error, "injected native watch failure");
+        assert!(retrying);
+
+        let shared = corpus("shared", root.to_str().unwrap(), &["**/*.md"]);
+        let shared_id = RegistrationId {
+            source: registry::ConfigSource::Baseline,
+            corpus_key: shared.primary_corpus_key().expect("shared corpus key"),
+        };
+        register_runtime_corpora(&state, None, &[shared], &cfg).expect("register shared corpus");
+        pump.reconcile(&state, &tracker, WatchRetry::RegistryChange);
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&1),
+            "a registry change must not retry a failed native install"
+        );
+        assert_eq!(
+            state.watch_registry().observation(&shared_id),
+            Some(registry::Observation::Degraded {
+                error: "injected native watch failure".to_owned(),
+                retrying: true,
+            })
+        );
+
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert_eq!(
+            hook.lock().expect("hook mutex").attempts.get(&root),
+            Some(&2),
+            "a reconcile tick retries the failed native install"
+        );
+        assert_eq!(
+            state.watch_registry().observation(&id),
+            Some(registry::Observation::Watched)
+        );
+        assert_eq!(
+            state.watch_registry().observation(&shared_id),
+            Some(registry::Observation::Watched)
+        );
         tracker.close();
         tracker.wait().await;
     }
