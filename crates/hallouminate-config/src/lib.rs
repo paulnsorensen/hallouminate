@@ -178,10 +178,15 @@ impl WatchConfig {
 /// embeddings, storage).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonConfig {
-    /// Seconds of no completed activity (and zero active connections) before
-    /// the daemon exits cleanly so the OS reclaims all memory. The next CLI or
-    /// MCP use transparently respawns it (~4 s cold start). `0` disables
-    /// idle-exit — the daemon lives until stopped. Default: `900` (15 min).
+    /// Seconds without inference-bearing work (and zero active connections)
+    /// before the daemon exits cleanly so the OS reclaims all memory. Successful
+    /// `ground`, `index`, and `add_markdown` calls restart the window;
+    /// dispatch errors, watcher no-ops, delete-only work, and catch-up passes
+    /// with zero `ApplyStats::embeddings_inserted` keep it. Crossencoder
+    /// acquisition and guard drops stamp the clock independently, including
+    /// after a timed-out rerank. The next CLI or MCP use transparently respawns
+    /// it (~4 s cold start). `0` disables idle-exit — the daemon lives until
+    /// stopped. Default: `900` (15 min).
     #[serde(default = "default_idle_exit_secs")]
     pub idle_exit_secs: u64,
     /// Seconds between automatic LanceDB maintenance passes (compaction +
