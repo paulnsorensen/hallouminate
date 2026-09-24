@@ -350,8 +350,9 @@ struct DaemonStateInner {
     crossencoders: StdMutex<HashMap<&'static str, Arc<StdMutex<CrossencoderSlot>>>>,
     /// Monotonic (`Instant`-based) seconds-since-process-start timestamp of
     /// the last inference-bearing work: a completed `IdleClock::Restart`
-    /// unit plus embedder/crossencoder acquire and guard drop. Idle-exit
-    /// (server.rs) fires when this is quiet for
+    /// unit plus crossencoder acquire and guard drop. A timed-out rerank can
+    /// drop its blocking task's guard later and stamp the clock after the
+    /// request response. Idle-exit (server.rs) fires when this is quiet for
     /// `[daemon].idle_exit_secs` and no connection is active (ADR-003).
     last_activity_secs: Arc<AtomicU64>,
     /// Count of connection handlers in flight. Idle-exit defers while non-zero

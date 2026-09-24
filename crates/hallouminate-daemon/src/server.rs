@@ -666,8 +666,10 @@ async fn handle_connection(
             Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
                 Some(denied) => denied,
                 None => {
-                    idle_clock = idle_clock_for(&req.payload);
-                    dispatch(&state, req).await
+                    let candidate_idle_clock = idle_clock_for(&req.payload);
+                    let response = dispatch(&state, req).await;
+                    idle_clock = idle_clock_for_response(candidate_idle_clock, &response);
+                    response
                 }
             },
             Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
@@ -729,6 +731,16 @@ fn idle_clock_for(payload: &super::ipc::DaemonRequestPayload) -> IdleClock {
         | DaemonRequestPayload::CorpusStats { .. }
         | DaemonRequestPayload::Status
         | DaemonRequestPayload::Shutdown => IdleClock::Keep,
+    }
+}
+
+fn idle_clock_for_response(
+    candidate_idle_clock: IdleClock,
+    response: &DaemonResponse,
+) -> IdleClock {
+    match response {
+        DaemonResponse::Ok { .. } => candidate_idle_clock,
+        DaemonResponse::Err { .. } => IdleClock::Keep,
     }
 }
 
@@ -1160,6 +1172,26 @@ mod tests {
         for payload in &keeping {
             assert_eq!(idle_clock_for(payload), IdleClock::Keep, "{payload:?}");
         }
+    }
+
+    #[test]
+    fn failed_inference_request_keeps_the_idle_window() {
+        use super::super::ipc::{DaemonRequestPayload, GroundRequest};
+        let payload = DaemonRequestPayload::Ground(GroundRequest {
+            query: "cheese".into(),
+            corpus: None,
+            top_files: None,
+            chunks_per_file: None,
+            limit: None,
+            snippet_chars: None,
+            footnote_mode: Default::default(),
+        });
+        let response = DaemonResponse::invalid_params("invalid corpus");
+        assert_eq!(
+            idle_clock_for_response(idle_clock_for(&payload), &response),
+            IdleClock::Keep,
+            "a failed inference-capable request must not reset idle-exit"
+        );
     }
     #[test]
     fn authorize_peer_allows_different_uid_read_only_request() {

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
-use stop_words::{LANGUAGE, get};
+use stop_words::{Language, get};
 use unicode_segmentation::UnicodeSegmentation;
 
 const TOP_K: usize = 8;
@@ -10,7 +10,7 @@ const MIN_LEN: usize = 2;
 
 static STOPWORDS: LazyLock<HashSet<String>> = LazyLock::new(|| {
     let mut set = HashSet::new();
-    for word in get(LANGUAGE::English) {
+    for word in get(Language::English) {
         set.insert(word.to_string());
     }
     set

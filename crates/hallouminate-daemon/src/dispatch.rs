@@ -61,7 +61,7 @@ use super::ipc::{
 };
 #[cfg(test)]
 use super::state::MAX_CONCURRENT_COVERAGE_CHECKS;
-use super::state::{DaemonState, RequestResources, WorkClass};
+use super::state::{DaemonState, IdleClock, RequestResources, WorkClass};
 use super::status;
 use super::watch::{ConfigSource, register_runtime_corpora};
 
@@ -1606,6 +1606,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
         Err(e) => {
             tracing::warn!(target: "hallouminate::daemon", error = %e,
                 "boot catch-up: could not enumerate baseline corpora; skipped");
+            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
             return;
         }
     };
@@ -1614,28 +1615,42 @@ pub(super) async fn catch_up_index(state: DaemonState) {
         Err(e) => {
             tracing::warn!(target: "hallouminate::daemon", error = %e,
                 "boot catch-up: could not resolve baseline resources; skipped");
+            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
             return;
         }
     };
     let registry = state.make_registry();
     for corpus in corpora {
         if !hallouminate_domain::corpus::missing_roots(&corpus).is_empty() {
+            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
             continue; // absent root; watcher skips it too, later boot picks it up
         }
         if let Err(e) = super::backpressure::await_debt_gate(&state).await {
             tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
                 error = %e, "boot catch-up: debt gate blocked reindex; skipped");
+            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
             continue;
         }
         let _guard = state.lock_corpus(&corpus.name).await;
         match catch_up_corpus(&res, &registry, &corpus, || state.acquire_write_lane()).await {
-            Ok(Some(stats)) => tracing::info!(target: "hallouminate::daemon",
-                corpus = %corpus.name, files_upserted = stats.files_upserted,
-                files_touched = stats.files_touched, files_deleted = stats.files_deleted,
-                "boot catch-up: reindexed corpus changed during down-window"),
-            Ok(None) => {}
-            Err(e) => tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
-                error = %e, "boot catch-up: reindex failed; skipped"),
+            Ok(Some(stats)) => {
+                let idle_clock = if stats.embeddings_inserted > 0 {
+                    IdleClock::Restart
+                } else {
+                    IdleClock::Keep
+                };
+                state.touch_activity(WorkClass::Internal, idle_clock);
+                tracing::info!(target: "hallouminate::daemon",
+                    corpus = %corpus.name, files_upserted = stats.files_upserted,
+                    files_touched = stats.files_touched, files_deleted = stats.files_deleted,
+                    "boot catch-up: reindexed corpus changed during down-window");
+            }
+            Ok(None) => state.touch_activity(WorkClass::Internal, IdleClock::Keep),
+            Err(e) => {
+                state.touch_activity(WorkClass::Internal, IdleClock::Keep);
+                tracing::warn!(target: "hallouminate::daemon", corpus = %corpus.name,
+                    error = %e, "boot catch-up: reindex failed; skipped");
+            }
         }
     }
     state.heartbeat().bump(super::heartbeat::TaskName::CatchUp);
@@ -2456,7 +2471,13 @@ mod tests {
         let secondary = root_b.join("b.md");
         std::fs::write(&secondary, "# Root B\n\nbody b\n").expect("write b.md");
 
+        state.set_last_activity_secs_for_test(u64::MAX);
         catch_up_index(state.clone()).await;
+        assert_eq!(
+            state.last_activity_secs(),
+            u64::MAX,
+            "boot catch-up without embeddings must not reset idle-exit",
+        );
         let corpus = state
             .baseline()
             .effective_corpora()

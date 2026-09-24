@@ -29,6 +29,10 @@ arena's control — so arena shrinkage is **not a reliable non-exit
 alternative** for this daemon's memory-reclaim problem; exit-based recycling
 remains the primary lever.
 
+## Implementation note
+
+The daemon applies this policy only after successful inference-capable RPCs. Dispatch errors, watcher cleanup, no-op or delete-only batches, and catch-up passes with `ApplyStats::embeddings_inserted == 0` keep the idle window. Watcher and boot catch-up use the embedding count rather than file-upsert counts because donor reuse and deletion can mutate index state without running inference. Crossencoder acquisition and guard drop stamp the clock independently; a timed-out rerank can drop its blocking task's guard after the request response. The adapter's embedder mutex is not a daemon idle-clock guard.
+
 ## Evidence
 
 | # | Claim | Source | Quote/paraphrase | Confidence |
