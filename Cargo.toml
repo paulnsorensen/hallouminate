@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -34,10 +34,10 @@ toml = "1.1"
 serde_yaml_ng = "0.10"
 cap-tempfile = "4"
 
-hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.11.0" }
-hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.11.0" }
-hallouminate-config = { path = "crates/hallouminate-config", version = "0.11.0" }
-hallouminate-daemon = { path = "crates/hallouminate-daemon", version = "0.11.0" }
+hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.11.1" }
+hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.11.1" }
+hallouminate-config = { path = "crates/hallouminate-config", version = "0.11.1" }
+hallouminate-daemon = { path = "crates/hallouminate-daemon", version = "0.11.1" }
 
 [profile.dev]
 # Slim debug info: smaller target dir + lower build memory for parallel agent
