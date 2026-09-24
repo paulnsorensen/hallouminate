@@ -59,3 +59,8 @@
 - 2026-09-05 · aed65466a6521ab0 · merged · corpus-walker.md · Root-relative patterns, ownership, and independent selection warnings.
 - 2026-09-05 · aed65466a6521ab0 · merged · worktree-dev-gotchas.md · Mise shims override the pinned verification toolchain.
 
+
+
+- 2026-09-23 · a04b1c4258c1a688 · merged · supervisor-restart-ladder.md · Record source-backed shutdown and actor-framework rejections from landed PRs #524 and #526.
+- 2026-09-23 · a04b1c4258c1a688 · merged · daemon-and-cli.md · Record the OS-service rejection and inference idle policy from landed PRs #525 and #527.
+
