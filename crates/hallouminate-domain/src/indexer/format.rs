@@ -36,6 +36,12 @@ fn build_search_text(heading_path: &[String], summary: &str, text: &str) -> Stri
     format!("{breadcrumb}\n{summary}\n{body}")
 }
 
+fn build_record_search_text(heading_path: &[String], text: &str) -> String {
+    let breadcrumb = heading_path.join(" > ");
+    let body = apply_footnote_mode(text, FootnoteMode::Exclude);
+    format!("{breadcrumb}\n{body}")
+}
+
 /// The set of formats the indexer can ingest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
@@ -295,14 +301,9 @@ impl<S: ChunkSizer> TextHandler<S> {
             splitter: TextSplitter::new(config),
         }
     }
-}
 
-impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
-    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+    fn prepare_body(&self, ctx: &PrepareCtx<'_>, body: &str) -> Result<PreparedFile> {
         let path = ctx.file.as_path();
-        let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
-            HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
-        })?;
         let fallback = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -324,18 +325,25 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
     }
 }
 
-// ── JSON ───────────────────────────────────────────────────────────────────
+impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
+            HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
+        })?;
+        self.prepare_body(ctx, body)
+    }
+}
 
 /// JSON handler: validate the document, then preserve its original UTF-8 text.
 pub struct JsonHandler<S: ChunkSizer> {
-    splitter: TextSplitter<S>,
+    text: TextHandler<S>,
 }
 
 impl<S: ChunkSizer> JsonHandler<S> {
     pub fn new(sizer: S, budget_tokens: usize) -> Self {
-        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
         Self {
-            splitter: TextSplitter::new(config),
+            text: TextHandler::new(sizer, budget_tokens),
         }
     }
 }
@@ -348,24 +356,7 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for JsonHandler<S> {
         })?;
         serde_json::from_str::<serde_json::Value>(body)
             .map_err(|error| extract_err(path, &error))?;
-        let fallback = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let summary = extract_summary(body, &fallback);
-        let mut chunks = Vec::new();
-        split_into_chunks(&self.splitter, body, &[], &summary, &mut chunks);
-        Ok(PreparedFile {
-            file_ref: file_ref_string(ctx.file)?,
-            corpus_key: ctx.corpus_key.clone(),
-            mtime_ms: ctx.mtime.0,
-            content_hash: ctx.content_hash.clone(),
-            summary,
-            keywords: extract_keywords(body),
-            frontmatter: None,
-            indexed_at_ms: ctx.indexed_at_ms,
-            chunks,
-        })
+        self.text.prepare_body(ctx, body)
     }
 }
 
@@ -410,7 +401,6 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for JsonlHandler<S> {
                 &self.splitter,
                 record,
                 &heading_path,
-                &summary,
                 physical_line,
                 &mut chunks,
             );
@@ -433,7 +423,6 @@ fn split_record_into_chunks<S: ChunkSizer>(
     splitter: &TextSplitter<S>,
     text: &str,
     heading_path: &[String],
-    summary: &str,
     physical_line: usize,
     chunks: &mut Vec<PreparedChunk>,
 ) {
@@ -443,7 +432,7 @@ fn split_record_into_chunks<S: ChunkSizer>(
         }
         chunks.push(PreparedChunk {
             ord: chunks.len(),
-            search_text: build_search_text(heading_path, summary, slice),
+            search_text: build_record_search_text(heading_path, slice),
             heading_path: heading_path.to_vec(),
             line_start: physical_line,
             line_end: physical_line,

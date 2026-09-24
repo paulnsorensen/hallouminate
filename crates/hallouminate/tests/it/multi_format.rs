@@ -1170,8 +1170,6 @@ async fn corrupt_and_empty_pdfs_skip_without_blocking_valid_siblings() {
     );
 }
 
-// ── JSON ────────────────────────────────────────────────────────────────────
-
 #[test]
 fn json_and_jsonl_extensions_are_case_insensitive() {
     assert_eq!(
@@ -1219,10 +1217,16 @@ async fn json_and_jsonl_index_search_and_preserve_metadata() {
     .await
     .expect("search JSON")
     .hits;
-    let json_hit = json_hits
-        .iter()
-        .find(|hit| hit.file_ref.ends_with("payload.json"))
-        .expect("JSON value must be retrievable");
+    let mut json_hit = None;
+    for hit in &json_hits {
+        if hit.file_ref.ends_with("payload.json") {
+            json_hit = Some(hit);
+            break;
+        }
+    }
+    let Some(json_hit) = json_hit else {
+        panic!("JSON value must be retrievable");
+    };
     assert!(json_hit.text.contains("account_name"));
     assert_eq!((json_hit.line_start, json_hit.line_end), (1, 4));
 
@@ -1236,13 +1240,88 @@ async fn json_and_jsonl_index_search_and_preserve_metadata() {
     .await
     .expect("search JSONL")
     .hits;
-    let jsonl_hit = jsonl_hits
-        .iter()
-        .find(|hit| hit.file_ref.ends_with("events.jsonl"))
-        .expect("JSONL value must be retrievable");
+    let mut jsonl_hit = None;
+    for hit in &jsonl_hits {
+        if hit.file_ref.ends_with("events.jsonl") {
+            jsonl_hit = Some(hit);
+            break;
+        }
+    }
+    let Some(jsonl_hit) = jsonl_hit else {
+        panic!("JSONL value must be retrievable");
+    };
     assert!(jsonl_hit.text.contains("event_name"));
     assert_eq!(jsonl_hit.heading_path, vec!["jsonl:row-2".to_string()]);
     assert_eq!((jsonl_hit.line_start, jsonl_hit.line_end), (4, 4));
+    assert!(
+        !jsonl_hit.search_text.contains("createdevent"),
+        "a JSONL row must not inherit another row's search terms"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_json_skips_file_and_valid_sibling_remains_searchable() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("broken.json"),
+        "{\"event\":\"badjsonmarker\"",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("valid.json"),
+        "{\"event\":\"validjsonsibling\"}\n",
+    )
+    .unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.json"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("malformed JSON must not abort siblings");
+    assert_eq!(stats.files_upserted, 1);
+    assert_eq!(stats.files_skipped_unreadable, 1);
+
+    let valid_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "validjsonsibling",
+        &corpus.globs,
+        10,
+    )
+    .await
+    .expect("search valid JSON sibling")
+    .hits;
+    let mut valid_sibling_found = false;
+    for hit in &valid_hits {
+        if hit.file_ref.ends_with("valid.json") {
+            valid_sibling_found = true;
+            break;
+        }
+    }
+    assert!(
+        valid_sibling_found,
+        "the valid JSON sibling remains searchable"
+    );
+
+    let bad_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "badjsonmarker",
+        &corpus.globs,
+        10,
+    )
+    .await
+    .expect("search malformed JSON marker")
+    .hits;
+    for hit in &bad_hits {
+        assert!(
+            !hit.file_ref.ends_with("broken.json"),
+            "malformed JSON must not be searchable"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1281,14 +1360,14 @@ async fn malformed_jsonl_skips_file_and_oversized_records_keep_row_metadata() {
     .await
     .expect("search oversized JSONL record")
     .hits;
-    let row_hits: Vec<_> = hits
-        .iter()
-        .filter(|hit| hit.file_ref.ends_with("valid.jsonl"))
-        .collect();
-    assert!(!row_hits.is_empty());
-    assert!(row_hits.iter().all(|hit| {
-        hit.heading_path == vec!["jsonl:row-1".to_string()]
-            && hit.line_start == 2
-            && hit.line_end == 2
-    }));
+    let mut row_hit_count = 0;
+    for hit in &hits {
+        if !hit.file_ref.ends_with("valid.jsonl") {
+            continue;
+        }
+        row_hit_count += 1;
+        assert_eq!(hit.heading_path, vec!["jsonl:row-1".to_string()]);
+        assert_eq!((hit.line_start, hit.line_end), (2, 2));
+    }
+    assert!(row_hit_count > 0, "valid JSONL record must be searchable");
 }
