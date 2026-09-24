@@ -81,6 +81,23 @@ type with an explicit match.[^6]
 - Put the supervisor thresholds in configuration. Rejected for this change
   because there was no operational requirement for more settings.
 
+
+
+### Lifecycle frameworks
+
+The daemon retains application-owned restart and shutdown policy after the infrastructure-ownership spikes.[^frameworks]
+
+- `tokio-graceful-shutdown` propagates shutdown but does not restart failed tasks. Ordered cleanup and blocking inference remain application responsibilities.
+- Its timeout teardown aborts asynchronous subsystem tasks. It cannot preempt an already-running `spawn_blocking` closure.
+- `ractor-supervisor` stops on restart-window exhaustion. The daemon instead continues retries with backoff and sticky escalation.
+- An adapter would retain these policies and add an actor runtime. The source-backed rejection does not claim these libraries are generally unsuitable.
+
+The spikes do not execute replacement prototypes. Their rejection rests on the documented policy mismatch.[^frameworks]
+
+[^frameworks]: `docs/adr/infrastructure-ownership-001.md:5-16`; `docs/adr/infrastructure-ownership-003.md:5-17`.
+
+_Source: landed PRs #524 and #526 · Updated: 2026-09-23 · Supersedes: —_
+
 ## Consequences
 
 `daemon status` shows a lifetime `restarts=N` count for each task. It also

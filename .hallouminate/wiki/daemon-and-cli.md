@@ -9,6 +9,16 @@ owner of the LanceDB ground directory, per-corpus mutation locks, and
 the repository registry. Every other caller — CLI subcommand, MCP
 tool, future agent — dials the daemon over a Unix domain socket.
 
+
+
+The daemon keeps client-triggered startup and idle exit. It installs no OS service.[^service-policy]
+An OS manager restarts a process, not an individual Tokio task. It does not replace task recovery, socket ownership, or cleanup order.
+`service-manager` also leaves application policy in place. Its generic API differs from backend-specific capabilities, including systemd restart limits and raw launchd crash policy.
+The rejection covers the current lifecycle. A future persistent-service requirement needs a new decision.
+The spike does not run live launchd or systemd service tests.[^service-policy]
+
+[^service-policy]: `docs/adr/infrastructure-ownership-002.md:5-17`.
+
 ## Socket location
 
 Resolved in this order (`crates/hallouminate-daemon/src/socket.rs`):
@@ -133,3 +143,20 @@ Tests: `catch_up_slow_scan_does_not_hold_write_lane`, `catch_up_scan_in_flight_b
 Watcher-pump wake contract (2026-09-09): `WatchRegistry` signals the pump with `notify_one()` (`signal_changed`), not `notify_waiters()`.
 The pump is the single consumer, and the permit survives a signal that fires while the pump is not parked in its `select!` (spawned but not yet polled, or busy in `reconcile`/a change batch).
 With `notify_waiters` a runtime-discovered corpus could wait a full `reconcile_interval_secs` (3600 s in tests) for its watch install and catch-up. Regression: `registry_signal_wakes_pump_before_it_is_first_polled`.
+
+
+## Inference idle policy
+
+The idle-exit clock ignores cheap polling traffic. Successful `ground`, `index`, and `add_markdown` RPCs restart its window.[^idle-policy]
+Dispatch errors keep the window. Watcher and boot catch-up restart it only when `ApplyStats::embeddings_inserted > 0`.
+No-op, delete-only, cleanup, and failed passes keep the window. Every external request still updates its work-class clock for maintenance deferral.
+Connection guards protect in-flight work from idle exit. Crossencoder acquisition and guard drop independently stamp the idle clock.
+A timed-out rerank can stamp the clock when its blocking task finishes. No embedder guard stamps the daemon clock.[^idle-policy]
+
+This policy permits memory reclamation under a polling fleet. It does not impose a memory limit during continuous inference.
+The next request after exit still pays eager baseline-model startup. Lazy startup is a separate change.[^idle-policy]
+
+[^idle-policy]: `docs/adr/daemon-idle-exit-004.md:5-9`; `crates/hallouminate-daemon/src/server.rs::idle_clock_for_response`; `crates/hallouminate-daemon/src/watch/mod.rs::process_change_batch`.
+
+_Source: landed PRs #525 and #527 · Updated: 2026-09-23 · Supersedes: every completed request restarts the idle window._
+
