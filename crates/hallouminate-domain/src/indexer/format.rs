@@ -44,6 +44,8 @@ pub enum Format {
     Rst,
     Spreadsheet,
     Pdf,
+    Json,
+    Jsonl,
 }
 
 /// Resolve a file's [`Format`] from its extension first, falling back to a
@@ -76,6 +78,8 @@ pub fn format_from_extension(path: &Path) -> Option<Option<Format>> {
         "rst" => Some(Format::Rst),
         "csv" | "xlsx" | "xls" | "ods" => Some(Format::Spreadsheet),
         "pdf" => Some(Format::Pdf),
+        "json" => Some(Format::Json),
+        "jsonl" => Some(Format::Jsonl),
         // A known-but-unsupported extension is decisive: do NOT fall through
         // to a magic-byte sniff that might mislabel it (e.g. a `.docx` is a
         // ZIP and could be mistaken for a spreadsheet container).
@@ -317,6 +321,135 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
         })
+    }
+}
+
+// ── JSON ───────────────────────────────────────────────────────────────────
+
+/// JSON handler: validate the document, then preserve its original UTF-8 text.
+pub struct JsonHandler<S: ChunkSizer> {
+    splitter: TextSplitter<S>,
+}
+
+impl<S: ChunkSizer> JsonHandler<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
+        Self {
+            splitter: TextSplitter::new(config),
+        }
+    }
+}
+
+impl<S: ChunkSizer + Send + Sync> FormatHandler for JsonHandler<S> {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let body = std::str::from_utf8(ctx.bytes).map_err(|error| {
+            HallouminateError::Indexer(format!("non-utf8 file {}: {error}", path.display()))
+        })?;
+        serde_json::from_str::<serde_json::Value>(body)
+            .map_err(|error| extract_err(path, &error))?;
+        let fallback = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let summary = extract_summary(body, &fallback);
+        let mut chunks = Vec::new();
+        split_into_chunks(&self.splitter, body, &[], &summary, &mut chunks);
+        Ok(PreparedFile {
+            file_ref: file_ref_string(ctx.file)?,
+            corpus_key: ctx.corpus_key.clone(),
+            mtime_ms: ctx.mtime.0,
+            content_hash: ctx.content_hash.clone(),
+            summary,
+            keywords: extract_keywords(body),
+            frontmatter: None,
+            indexed_at_ms: ctx.indexed_at_ms,
+            chunks,
+        })
+    }
+}
+
+/// JSON Lines handler: validate each nonblank record and retain its line.
+pub struct JsonlHandler<S: ChunkSizer> {
+    splitter: TextSplitter<S>,
+}
+
+impl<S: ChunkSizer> JsonlHandler<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
+        Self {
+            splitter: TextSplitter::new(config),
+        }
+    }
+}
+
+impl<S: ChunkSizer + Send + Sync> FormatHandler for JsonlHandler<S> {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let body = std::str::from_utf8(ctx.bytes).map_err(|error| {
+            HallouminateError::Indexer(format!("non-utf8 file {}: {error}", path.display()))
+        })?;
+        let fallback = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let summary = extract_summary(body, &fallback);
+        let mut chunks = Vec::new();
+        let mut ordinal = 0;
+        for (line_index, line) in body.split('\n').enumerate() {
+            let physical_line = line_index + 1;
+            let record = line.strip_suffix('\r').unwrap_or(line);
+            if record.trim().is_empty() {
+                continue;
+            }
+            serde_json::from_str::<serde_json::Value>(record)
+                .map_err(|error| extract_err(path, &error))?;
+            ordinal += 1;
+            let heading_path = vec![format!("jsonl:row-{ordinal}")];
+            split_record_into_chunks(
+                &self.splitter,
+                record,
+                &heading_path,
+                &summary,
+                physical_line,
+                &mut chunks,
+            );
+        }
+        Ok(PreparedFile {
+            file_ref: file_ref_string(ctx.file)?,
+            corpus_key: ctx.corpus_key.clone(),
+            mtime_ms: ctx.mtime.0,
+            content_hash: ctx.content_hash.clone(),
+            summary,
+            keywords: extract_keywords(body),
+            frontmatter: None,
+            indexed_at_ms: ctx.indexed_at_ms,
+            chunks,
+        })
+    }
+}
+
+fn split_record_into_chunks<S: ChunkSizer>(
+    splitter: &TextSplitter<S>,
+    text: &str,
+    heading_path: &[String],
+    summary: &str,
+    physical_line: usize,
+    chunks: &mut Vec<PreparedChunk>,
+) {
+    for (_, slice) in splitter.chunk_indices(text) {
+        if slice.is_empty() {
+            continue;
+        }
+        chunks.push(PreparedChunk {
+            ord: chunks.len(),
+            search_text: build_search_text(heading_path, summary, slice),
+            heading_path: heading_path.to_vec(),
+            line_start: physical_line,
+            line_end: physical_line,
+            text: slice.to_string(),
+            claim_marks: None,
+        });
     }
 }
 
@@ -626,6 +759,8 @@ pub struct HandlerRegistry {
     rst: Box<dyn FormatHandler>,
     spreadsheet: Box<dyn FormatHandler>,
     pdf: Box<dyn FormatHandler>,
+    json: Box<dyn FormatHandler>,
+    jsonl: Box<dyn FormatHandler>,
 }
 
 impl HandlerRegistry {
@@ -646,7 +781,9 @@ impl HandlerRegistry {
             rst: Box::new(RstHandler::new(rst_chunker)),
             spreadsheet: Box::new(SpreadsheetHandler),
             text: Box::new(TextHandler::new(sizer.clone(), budget_tokens)),
-            pdf: Box::new(PdfHandler::new(sizer, budget_tokens)),
+            pdf: Box::new(PdfHandler::new(sizer.clone(), budget_tokens)),
+            json: Box::new(JsonHandler::new(sizer.clone(), budget_tokens)),
+            jsonl: Box::new(JsonlHandler::new(sizer, budget_tokens)),
         }
     }
 
@@ -658,6 +795,8 @@ impl HandlerRegistry {
             Format::Rst => self.rst.as_ref(),
             Format::Spreadsheet => self.spreadsheet.as_ref(),
             Format::Pdf => self.pdf.as_ref(),
+            Format::Json => self.json.as_ref(),
+            Format::Jsonl => self.jsonl.as_ref(),
         }
     }
 }

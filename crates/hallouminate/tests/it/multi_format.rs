@@ -1169,3 +1169,126 @@ async fn corrupt_and_empty_pdfs_skip_without_blocking_valid_siblings() {
         "the valid sibling remains retrievable"
     );
 }
+
+// ── JSON ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn json_and_jsonl_extensions_are_case_insensitive() {
+    assert_eq!(
+        detect_format(Path::new("payload.JSON"), br#"{"field":"value"}"#),
+        Some(Format::Json)
+    );
+    assert_eq!(
+        detect_format(Path::new("events.JsOnL"), br#"{"event":"created"}"#),
+        Some(Format::Jsonl)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_and_jsonl_index_search_and_preserve_metadata() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("payload.json"),
+        "{\n  \"account_name\": \"amberaccount\",\n  \"status\": \"active\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("events.jsonl"),
+        "\n{\"event_name\":\"createdevent\",\"value\":1}\n\n{\"event_name\":\"updatedevent\",\"value\":2}\n",
+    )
+    .unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.json", "**/*.jsonl"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index JSON and JSONL");
+    assert_eq!(stats.files_upserted, 2);
+    assert_eq!(stats.chunks_inserted, 3);
+
+    let json_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "amberaccount",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search JSON")
+    .hits;
+    let json_hit = json_hits
+        .iter()
+        .find(|hit| hit.file_ref.ends_with("payload.json"))
+        .expect("JSON value must be retrievable");
+    assert!(json_hit.text.contains("account_name"));
+    assert_eq!((json_hit.line_start, json_hit.line_end), (1, 4));
+
+    let jsonl_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "updatedevent",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search JSONL")
+    .hits;
+    let jsonl_hit = jsonl_hits
+        .iter()
+        .find(|hit| hit.file_ref.ends_with("events.jsonl"))
+        .expect("JSONL value must be retrievable");
+    assert!(jsonl_hit.text.contains("event_name"));
+    assert_eq!(jsonl_hit.heading_path, vec!["jsonl:row-2".to_string()]);
+    assert_eq!((jsonl_hit.line_start, jsonl_hit.line_end), (4, 4));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_jsonl_skips_file_and_oversized_records_keep_row_metadata() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("broken.jsonl"),
+        "{\"ok\":true}\n{malformed json}\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("valid.jsonl"),
+        "\n{\"event\":\"oversizedevent\",\"payload\":\"longvalue-longvalue-longvalue-longvalue\"}\n",
+    )
+    .unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.jsonl"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 20);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("malformed JSONL must not abort siblings");
+    assert_eq!(stats.files_upserted, 1);
+    assert_eq!(stats.files_skipped_unreadable, 1);
+    assert!(stats.chunks_inserted > 1, "oversized record must split");
+
+    let hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "oversizedevent",
+        &corpus.globs,
+        10,
+    )
+    .await
+    .expect("search oversized JSONL record")
+    .hits;
+    let row_hits: Vec<_> = hits
+        .iter()
+        .filter(|hit| hit.file_ref.ends_with("valid.jsonl"))
+        .collect();
+    assert!(!row_hits.is_empty());
+    assert!(row_hits.iter().all(|hit| {
+        hit.heading_path == vec!["jsonl:row-1".to_string()]
+            && hit.line_start == 2
+            && hit.line_end == 2
+    }));
+}
