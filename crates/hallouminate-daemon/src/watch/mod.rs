@@ -41,7 +41,7 @@ use hallouminate_domain::corpus::ensure_corpus_allows_relative;
 use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
-use super::state::{DaemonState, WorkClass};
+use super::state::{DaemonState, IdleClock, WorkClass};
 use registry::RegistrationId;
 use tokio_util::task::TaskTracker;
 
@@ -310,7 +310,7 @@ fn reload_repo_layer(
                 tracker.spawn(async move {
                     let _conn = state.enter_connection(WorkClass::Internal);
                     cleanup_retired_registration(&state, registration).await;
-                    state.touch_activity(WorkClass::Internal);
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                 });
             }
         }
@@ -515,7 +515,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                 &id,
                 Err("registration vanished before catch-up could start".into()),
             );
-            state.touch_activity(WorkClass::Internal);
+            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
             return;
         };
         // Hold the per-corpus lock for the whole scan-through-apply span so
@@ -529,7 +529,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                 Ok(()) => {}
                 Err(e) => {
                     state.watch_registry().finish_catch_up(&id, Err(e.to_string()));
-                    state.touch_activity(WorkClass::Internal);
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                     return;
                 }
             }
@@ -558,7 +558,19 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     })
                     .await
                     {
-                        Ok(_) => Ok(()),
+                        Ok(Some(stats)) => {
+                            let idle_clock = if stats.embeddings_inserted > 0 {
+                                IdleClock::Restart
+                            } else {
+                                IdleClock::Keep
+                            };
+                            state.touch_activity(WorkClass::Internal, idle_clock);
+                            Ok(())
+                        }
+                        Ok(None) => {
+                            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
+                            Ok(())
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 target: "hallouminate::daemon",
@@ -567,6 +579,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                                 error = %e,
                                 "watcher: reconcile pass failed; will retry on the next reconcile tick",
                             );
+                            state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                             Err(e.to_string())
                         }
                     }
@@ -579,6 +592,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                         error = %e,
                         "watcher: reconcile pass failed; will retry on the next reconcile tick",
                     );
+                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                     Err(e.to_string())
                 }
             }
@@ -1086,10 +1100,16 @@ async fn process_change_batch(
     churn: &mut ChurnTracker,
 ) {
     let _conn = state.enter_connection(WorkClass::Internal);
+    let mut restarts_idle_clock = false;
     for path in &paths {
-        handle_changed_path(state, roots, path, failures, churn).await;
+        restarts_idle_clock |= handle_changed_path(state, roots, path, failures, churn).await;
     }
-    state.touch_activity(WorkClass::Internal);
+    let idle_clock = if restarts_idle_clock {
+        IdleClock::Restart
+    } else {
+        IdleClock::Keep
+    };
+    state.touch_activity(WorkClass::Internal, idle_clock);
 }
 
 /// Reindex (or prune) one changed path, resolving its owning registration(s)
@@ -1103,9 +1123,9 @@ async fn handle_changed_path(
     path: &Path,
     failures: &mut FailureCoalescer,
     churn: &mut ChurnTracker,
-) {
+) -> bool {
     let Some(owner) = owning_corpus(roots, path) else {
-        return;
+        return false;
     };
     let matches = state.watch_registry().registrations_for_root(owner);
     let (corpus, cfg) = resolve_registration_config(state, owner, matches, path);
@@ -1113,7 +1133,7 @@ async fn handle_changed_path(
         Ok(resources) => resources,
         Err(error) => {
             tracing::warn!(target: "hallouminate::daemon", error = %error, "watcher: resources unavailable");
-            return;
+            return false;
         }
     };
     let store = resources.store.clone();
@@ -1129,15 +1149,16 @@ async fn handle_changed_path(
             path = %path.display(),
             "watcher: skipped event, mtime matches last-indexed snapshot",
         );
-        return;
+        return false;
     }
     let guard = match state.acquire_mutation_guard(&corpus.name).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(target: "hallouminate::daemon", error = %e, "watcher: lock failed");
-            return;
+            return false;
         }
     };
+    let mut restarts_idle_clock = false;
     let exists = path.is_file();
     if exists {
         // `path.is_file()` above follows symlinks, so a symlinked leaf whose
@@ -1160,7 +1181,7 @@ async fn handle_changed_path(
                     error = ?e,
                     "watcher: skipping reindex, no-follow read failed",
                 );
-                return;
+                return false;
             }
         };
         let registry = state.make_registry();
@@ -1168,6 +1189,7 @@ async fn handle_changed_path(
         {
             Ok(stats) => {
                 let noop = stats.files_upserted == 0;
+                restarts_idle_clock = stats.embeddings_inserted > 0;
                 state.record_watcher_reindex(noop);
                 let effect = if noop {
                     ReindexEffect::NoOp
@@ -1241,6 +1263,7 @@ async fn handle_changed_path(
         }
     }
     drop(guard);
+    restarts_idle_clock
 }
 
 /// Stage-1 change gate (ADR daemon-rework-003): does `path`'s on-disk mtime
@@ -1876,14 +1899,11 @@ mod tests {
         );
     }
 
-    /// ADR-003 regression: the delete/prune branch of `handle_changed_path`
-    /// acquired no connection guard and never touched the activity clock, so
-    /// idle-exit could tear down the daemon (and release the single-instance
-    /// flock) mid-write. Batch processing must hold a guard for the whole
-    /// batch and stamp the clock afterward, exactly like `catch_up_index`
-    /// (dispatch.rs) and `handle_connection` (server.rs).
+    /// ADR-004 regression: delete-only watcher work must keep the idle window
+    /// unchanged while the batch guard protects the in-flight prune. Batch
+    /// processing still stamps the Internal clock for maintenance-defer.
     #[tokio::test]
-    async fn process_change_batch_touches_activity_after_a_stale_clock() {
+    async fn process_change_batch_keeps_idle_after_delete_only_work() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mut cfg = hallouminate_config::Config::default();
         cfg.embeddings.enabled = false;
@@ -1900,19 +1920,17 @@ mod tests {
             corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
             None,
         )];
-        // Never created on disk: `handle_changed_path` takes the delete/prune
-        // branch — the branch that acquired no guard and stamped no clock
-        // before the fix.
+        // Never created on disk: the delete/prune branch does not run
+        // inference and must not reset the idle-exit window.
         let deleted = corpus_dir.join("gone.md");
 
         let mut failures = disabled_coalescer();
         let mut churn = disabled_churn();
         process_change_batch(&state, &roots, vec![deleted], &mut failures, &mut churn).await;
-        assert_ne!(
+        assert_eq!(
             state.last_activity_secs(),
             u64::MAX,
-            "batch processing must stamp the activity clock so idle-exit does \
-             not fire immediately after a delete-branch write",
+            "delete-only watcher work must not reset the idle-exit window",
         );
     }
 
