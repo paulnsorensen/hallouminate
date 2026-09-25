@@ -963,6 +963,46 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     Ok(())
 }
 
+/// Scalar index kinds [`LanceStore::ensure_search_indexes`] builds for the
+/// hot filter columns.
+#[derive(Clone, Copy)]
+enum ScalarIndexKind {
+    Bitmap,
+    BTree,
+}
+
+impl ScalarIndexKind {
+    fn index_type(self) -> lancedb::index::IndexType {
+        match self {
+            Self::Bitmap => lancedb::index::IndexType::Bitmap,
+            Self::BTree => lancedb::index::IndexType::BTree,
+        }
+    }
+
+    fn index(self) -> lancedb::index::Index {
+        match self {
+            Self::Bitmap => lancedb::index::Index::Bitmap(Default::default()),
+            Self::BTree => lancedb::index::Index::BTree(Default::default()),
+        }
+    }
+}
+
+/// Every read scopes by [`corpus_key_filter`] (`corpus` and `root`, both
+/// low-cardinality, so Bitmap). Donor reuse filters `content_hash IN (..)`,
+/// which is high-cardinality, so BTree.
+const SCALAR_INDEXES: [(&str, ScalarIndexKind); 3] = [
+    ("corpus", ScalarIndexKind::Bitmap),
+    ("root", ScalarIndexKind::Bitmap),
+    ("content_hash", ScalarIndexKind::BTree),
+];
+
+/// Whether every optional index a pass tried to build is now present.
+#[derive(Clone, Copy)]
+enum IndexCoverage {
+    Complete,
+    Incomplete,
+}
+
 fn file_ref_in_filter(refs: &[String]) -> String {
     let quoted: Vec<String> = refs
         .iter()
@@ -1875,8 +1915,8 @@ impl LanceStore {
         .await
     }
 
-    /// Build the FTS index on `search_text` (and the ANN index on `embedding`) if
-    /// they don't already exist. LanceDB requires data to be present before
+    /// Build the FTS index on `search_text`, the [`SCALAR_INDEXES`], and the
+    /// ANN index on `embedding` if they don't already exist. LanceDB requires data to be present before
     /// some indexes can be created, so this runs after `merge_insert` —
     /// idempotent via `list_indices()`.
     ///
@@ -1930,13 +1970,13 @@ impl LanceStore {
         // index below), so it is guaranteed present at this point — latch it
         // so `has_text_index` callers skip the `list_indices()` round-trip.
         self.text_index_present.store(true, Ordering::Release);
+        let scalar_coverage = self.ensure_scalar_indexes(&existing).await;
         // Embeddings-OFF: the `embedding` column is all nulls, so there is
         // nothing to ANN-index. Skip entirely (spec: OFF mode builds no
         // vector index). The FTS index above is still built — it is the only
-        // dense-independent signal the OFF path ranks on. Nothing else will
-        // ever build, so latch.
+        // dense-independent signal the OFF path ranks on.
         if !self.embeddings_enabled {
-            self.indexes_ensured.store(true, Ordering::Release);
+            self.latch_indexes_ensured(scalar_coverage);
             return Ok(());
         }
         // Vector index is optional — small corpora work fine without it via
@@ -1946,8 +1986,7 @@ impl LanceStore {
             .iter()
             .any(|i| i.columns.iter().any(|c| c == "embedding"));
         if has_vec_index {
-            // Both FTS and ANN are present; no further index work remains.
-            self.indexes_ensured.store(true, Ordering::Release);
+            self.latch_indexes_ensured(scalar_coverage);
             return Ok(());
         }
         let rows = self.table.count_rows(None).await.map_err(map_lance_err)? as u64;
@@ -1958,7 +1997,7 @@ impl LanceStore {
                 .execute()
                 .await
             {
-                Ok(()) => self.indexes_ensured.store(true, Ordering::Release),
+                Ok(()) => self.latch_indexes_ensured(scalar_coverage),
                 Err(e) => {
                     // ANN index is an optimization, not a correctness
                     // requirement — brute-force scan still works. Log so
@@ -1973,6 +2012,48 @@ impl LanceStore {
             }
         }
         Ok(())
+    }
+
+    /// Builds each missing [`SCALAR_INDEXES`] entry. A scalar index is an
+    /// optimization, like the ANN index: a failed build logs a warning and
+    /// reports [`IndexCoverage::Incomplete`] so a later batch retries it.
+    async fn ensure_scalar_indexes(
+        &self,
+        existing: &[lancedb::index::IndexConfig],
+    ) -> IndexCoverage {
+        let mut coverage = IndexCoverage::Complete;
+        for (column, kind) in SCALAR_INDEXES {
+            let present = existing.iter().any(|i| {
+                i.index_type == kind.index_type() && i.columns.iter().any(|c| c == column)
+            });
+            if present {
+                continue;
+            }
+            let Err(e) = self
+                .table
+                .create_index(&[column], kind.index())
+                .execute()
+                .await
+            else {
+                continue;
+            };
+            tracing::warn!(
+                target: "hallouminate::lance",
+                column,
+                error = %e,
+                "failed to create scalar index; filters on this column will full-scan"
+            );
+            coverage = IndexCoverage::Incomplete;
+        }
+        coverage
+    }
+
+    /// Latches `indexes_ensured` once the optional indexes are all present.
+    fn latch_indexes_ensured(&self, coverage: IndexCoverage) {
+        match coverage {
+            IndexCoverage::Complete => self.indexes_ensured.store(true, Ordering::Release),
+            IndexCoverage::Incomplete => {}
+        }
     }
 
     /// True once the FTS (inverted) index on `search_text` exists. A full-text
@@ -4722,6 +4803,109 @@ schema_version = 1
                 .all(|index| !index.columns.iter().any(|column| column == "text")),
             "display text must not be indexed: {indices:?}"
         );
+    }
+
+    /// Asserts every [`SCALAR_INDEXES`] entry exists with its kind, is one
+    /// segment, and covers every row. A delta or unindexed rows would make
+    /// the `maintain` merge guard rewrite indexes on every pass.
+    async fn assert_scalar_indexes_cover_all_rows(store: &LanceStore) {
+        let indices = store.table.list_indices().await.expect("list indices");
+        for (column, kind) in SCALAR_INDEXES {
+            let Some(index) = indices.iter().find(|index| {
+                index.index_type == kind.index_type() && index.columns.iter().any(|c| c == column)
+            }) else {
+                panic!(
+                    "missing {} index on `{column}`: {indices:?}",
+                    kind.index_type()
+                );
+            };
+            let stats = store
+                .table
+                .index_stats(&index.name)
+                .await
+                .expect("index stats")
+                .expect("stats for a listed index");
+            assert_eq!(
+                stats.num_unindexed_rows, 0,
+                "`{column}` index lags: {stats:?}"
+            );
+            assert_eq!(
+                stats.num_indices,
+                Some(1),
+                "`{column}` index has deltas: {stats:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_indexes_stay_current_and_scope_filtered_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let key_a = corpus_key("docs", "/tmp/scalar-root-a");
+        let key_b = corpus_key("docs", "/tmp/scalar-root-b");
+        let key_c = corpus_key("notes", "/tmp/scalar-root-a");
+        for (i, key) in [&key_a, &key_b, &key_c].into_iter().enumerate() {
+            let file = synthetic_prepared_for(key, "/tmp/same.md", 2, "scalartoken", 1, 1);
+            store.apply_batch(vec![file]).await.unwrap_or_else(|e| {
+                panic!("batch {i}: {e}");
+            });
+        }
+        assert_scalar_indexes_cover_all_rows(&store).await;
+
+        store
+            .delete_file(&key_a, "/tmp/same.md")
+            .await
+            .expect("delete in root A");
+        assert!(store.list_files(&key_a).await.expect("list A").is_empty());
+        for key in [&key_b, &key_c] {
+            let files = store.list_files(key).await.expect("list sibling");
+            let refs: Vec<_> = files.iter().map(|f| f.file_ref.as_str()).collect();
+            assert_eq!(refs, ["/tmp/same.md"], "sibling {key:?} must keep its file");
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_indexes_backfill_on_a_store_built_without_them() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = LanceStore::open_or_create(
+                dir.path(),
+                "BAAI/bge-small-en-v1.5",
+                false,
+                false,
+                None,
+            )
+            .await
+            .expect("open store");
+            store
+                .apply_batch(vec![synthetic_prepared("/tmp/a.md", 2)])
+                .await
+                .expect("seed");
+            let indices = store.table.list_indices().await.expect("list indices");
+            for index in &indices {
+                let scalar = SCALAR_INDEXES.iter().any(|(column, kind)| {
+                    index.index_type == kind.index_type()
+                        && index.columns.iter().any(|c| c == column)
+                });
+                if scalar {
+                    store.table.drop_index(&index.name).await.expect("drop");
+                }
+            }
+        }
+
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("reopen store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/b.md", 2)])
+            .await
+            .expect("batch after reopen");
+        assert_scalar_indexes_cover_all_rows(&store).await;
+        assert!(store.indexes_ensured.load(Ordering::Acquire));
     }
 
     #[tokio::test]
