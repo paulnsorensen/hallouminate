@@ -898,6 +898,23 @@ fn decode_claim_marks(col: &StringArray, row: usize) -> Vec<ClaimMark> {
     }
 }
 
+/// Columns `decode_hits` reads. `fts_scan` and `vector_scan` project to
+/// exactly this set so a hit never deserializes the `embedding` vector,
+/// which no caller reads after retrieval.
+const HIT_COLUMNS: [&str; 11] = [
+    "chunk_id",
+    "file_ref",
+    "summary",
+    "text",
+    "search_text",
+    "line_start",
+    "line_end",
+    "mtime_ms",
+    "heading_path",
+    "keywords",
+    "claim_marks",
+];
+
 fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit>) -> Result<()> {
     // A zero-row batch contributes no hits and may carry a projected-away
     // schema (LanceDB can return an empty result whose columns are absent when
@@ -2237,6 +2254,7 @@ impl LanceStore {
             let stream = table
                 .query()
                 .only_if(filter)
+                .select(lancedb::query::Select::columns(&HIT_COLUMNS))
                 .full_text_search(lancedb::index::scalar::FullTextSearchQuery::new(query))
                 .limit(limit)
                 .execute()
@@ -2272,6 +2290,7 @@ impl LanceStore {
                 .only_if(filter)
                 .nearest_to(&query_vec[..])
                 .map_err(map_lance_err)?
+                .select(lancedb::query::Select::columns(&HIT_COLUMNS))
                 .limit(limit)
                 .execute()
                 .await
