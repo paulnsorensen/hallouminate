@@ -49,4 +49,4 @@ hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
 blake3.workspace = true
 serde_yaml_ng.workspace = true
-text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
+text-splitter = { version = "0.33", features = ["markdown", "tokenizers"] }
