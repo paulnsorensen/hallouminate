@@ -32,5 +32,5 @@ chrono.workspace = true
 tempfile = "3"
 async-trait.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
+text-splitter = { version = "0.33", features = ["markdown", "tokenizers"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
