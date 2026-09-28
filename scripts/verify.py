@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -33,6 +34,25 @@ FIX_COMMANDS = [
     FMT_CHECK,
     *HEAVY_COMMANDS,
 ]
+
+WRAPPER_VARIABLES = (
+    "RUSTC_WRAPPER",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+)
+
+
+def configure_sccache(environment: dict[str, str]) -> None:
+    if any(name in environment for name in WRAPPER_VARIABLES):
+        return
+    if environment.get("CARGO_INCREMENTAL") == "1":
+        return
+    wrapper = shutil.which("sccache", path=environment.get("PATH"))
+    if wrapper is None:
+        return
+    environment["RUSTC_WRAPPER"] = str(Path(wrapper).absolute())
+    environment["CARGO_INCREMENTAL"] = "0"
 
 
 def git_output(*args: str) -> bytes:
@@ -185,6 +205,7 @@ def run_leased(commands: list[list[str]], command_record: object) -> int:
         status = 0
         environment = os.environ.copy()
         environment["CARGO_BUILD_JOBS"] = str(JOBS)
+        configure_sccache(environment)
         try:
             for command in commands:
                 status = subprocess.run(command, env=environment).returncode

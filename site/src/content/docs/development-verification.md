@@ -12,6 +12,36 @@ With no arguments, the gate runs `cargo fmt --all --check`, then holds one
 exclusive lease across clippy, build, and test. The leased commands run with
 `CARGO_BUILD_JOBS=1`.
 
+## Optional local compiler caching
+
+Install `sccache` to enable local compiler caching:
+
+```sh
+brew install sccache
+```
+
+The verification entrypoint detects `sccache` on `PATH` for leased Cargo
+commands. It passes the absolute wrapper path and sets `CARGO_INCREMENTAL=0`
+only when automatic caching is enabled. Missing `sccache` preserves the
+current behavior.
+
+Use `sccache --show-stats` to inspect requests, cache hits, and cache misses.
+Set `RUSTC_WRAPPER=` to opt out. Any explicit Rust wrapper variable, including
+an empty value, or `CARGO_INCREMENTAL=1` also disables automatic setup. Direct
+`cargo` invocations remain unchanged. Wrappers configured only in Cargo config
+are not visible to this check; export the wrapper variable to preserve one, or opt out
+explicitly.
+
+By default, `just verify` uses the toolchain selected by
+`rust-toolchain.toml`. PATH or `RUSTUP_TOOLCHAIN` overrides can select another
+toolchain and change compiler inputs and cache keys. The CI workflows pin the
+sccache action and version separately. This local behavior does not modify
+machine-wide Cargo configuration, stop a shared sccache server, or clear cache
+data.
+
+The generated release workflow and publishing jobs are outside this cache
+configuration.
+
 ## Targeted checks and fixes
 
 Use the same lease for a focused Cargo command:

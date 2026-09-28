@@ -685,3 +685,210 @@ if command[0] != "fmt" and "VERIFY_TEST_SLEEP" in os.environ:
         "rejected commands must not invoke Cargo"
     );
 }
+
+#[test]
+fn verification_gate_configures_available_sccache_without_overriding_opt_outs() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let primary = temp.path().join("primary");
+    fs::create_dir(&primary).expect("create primary worktree");
+    assert_success(run_git(&primary, &["init", "-b", "main"]), "git init");
+    assert_success(
+        run_git(&primary, &["config", "user.email", "verify@example.test"]),
+        "configure git email",
+    );
+    assert_success(
+        run_git(&primary, &["config", "user.name", "Verification Test"]),
+        "configure git name",
+    );
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    fs::create_dir(primary.join("scripts")).expect("create scripts directory");
+    fs::copy(
+        repo_root.join("scripts/verify.py"),
+        primary.join("scripts/verify.py"),
+    )
+    .expect("copy verification script");
+    fs::write(primary.join("README.md"), "verification fixture\n").expect("write fixture");
+    assert_success(run_git(&primary, &["add", "."]), "git add");
+    assert_success(
+        run_git(&primary, &["commit", "-m", "fixture"]),
+        "git commit",
+    );
+
+    let common = common_dir(&primary);
+    let lock = common.join("hallouminate-verify.lock");
+    let marker = temp.path().join("cargo-running");
+    let invocations = temp.path().join("invocations.jsonl");
+    let python = String::from_utf8(
+        Command::new("python3")
+            .args(["-c", "import sys; print(sys.executable)"])
+            .output()
+            .expect("locate python3")
+            .stdout,
+    )
+    .expect("python path is UTF-8")
+    .trim()
+    .to_owned();
+    let git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(
+        git.status.success(),
+        "locate git failed: {}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    let git = String::from_utf8(git.stdout)
+        .expect("git path is UTF-8")
+        .trim()
+        .to_owned();
+    let bin = temp.path().join("bin");
+    let no_sccache_bin = temp.path().join("no-sccache-bin");
+    fs::create_dir(&bin).expect("create fake bin");
+    fs::create_dir(&no_sccache_bin).expect("create no-sccache bin");
+    for directory in [&bin, &no_sccache_bin] {
+        std::os::unix::fs::symlink(&python, directory.join("python3")).expect("link python3");
+        std::os::unix::fs::symlink(&git, directory.join("git")).expect("link git");
+    }
+    let cargo = bin.join("cargo");
+    let cargo_script = format!(
+        r##"#!{}
+import json
+import os
+import sys
+
+record = {{
+    "command": sys.argv[1:],
+    "wrapper_present": "RUSTC_WRAPPER" in os.environ,
+    "wrapper": os.environ.get("RUSTC_WRAPPER"),
+    "incremental_present": "CARGO_INCREMENTAL" in os.environ,
+    "incremental": os.environ.get("CARGO_INCREMENTAL"),
+}}
+with open(os.environ["VERIFY_TEST_INVOCATIONS"], "a") as stream:
+    stream.write(json.dumps(record) + "\n")
+if os.environ.get("VERIFY_TEST_FAIL") == "1":
+    raise SystemExit(42)
+"##,
+        python
+    );
+    fs::write(&cargo, cargo_script).expect("write fake cargo");
+    let mut permissions = fs::metadata(&cargo)
+        .expect("fake cargo metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&cargo, permissions).expect("make fake cargo executable");
+    fs::copy(&cargo, no_sccache_bin.join("cargo")).expect("copy fake cargo");
+    fs::set_permissions(
+        no_sccache_bin.join("cargo"),
+        fs::metadata(&cargo)
+            .expect("fake cargo metadata")
+            .permissions(),
+    )
+    .expect("make copied fake cargo executable");
+    let sccache = bin.join("sccache");
+    fs::write(&sccache, format!("#!{}\n", python)).expect("write fake sccache");
+    fs::set_permissions(
+        &sccache,
+        fs::metadata(&cargo)
+            .expect("fake cargo metadata")
+            .permissions(),
+    )
+    .expect("make fake sccache executable");
+
+    let path = bin.clone().into_os_string();
+    let no_sccache_path = no_sccache_bin.clone().into_os_string();
+    let run = |path: &OsString, variables: &[(&str, &str)]| -> serde_json::Value {
+        fs::write(&invocations, "").expect("reset invocation log");
+        let mut command = verification_command(
+            &repo_root,
+            &primary,
+            path,
+            &lock,
+            &marker,
+            &invocations,
+            &["cargo", "check"],
+        );
+        for key in [
+            "RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_INCREMENTAL",
+        ] {
+            command.env_remove(key);
+        }
+        for (key, value) in variables {
+            command.env(key, value);
+        }
+        let output = command.output().expect("run cache probe");
+        assert_success(output, "cache probe");
+        let records = parse_jsonl(&invocations);
+        assert_eq!(records.len(), 1);
+        records.first().cloned().expect("cache probe record")
+    };
+
+    let enabled = run(&path, &[]);
+    assert_eq!(enabled["wrapper_present"], true);
+    assert_eq!(
+        enabled["wrapper"],
+        serde_json::json!(sccache.to_string_lossy().to_string())
+    );
+    assert_eq!(enabled["incremental_present"], true);
+    assert_eq!(enabled["incremental"], "0");
+
+    let unavailable = run(&no_sccache_path, &[]);
+    assert_eq!(unavailable["wrapper_present"], false);
+    assert_eq!(unavailable["wrapper"], serde_json::Value::Null);
+    assert_eq!(unavailable["incremental_present"], false);
+
+    for key in [
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        let opted_out = run(&path, &[(key, "")]);
+        assert_eq!(opted_out["wrapper_present"], key == "RUSTC_WRAPPER");
+        assert_eq!(opted_out["incremental_present"], false);
+    }
+
+    let explicit_wrapper = run(&path, &[("RUSTC_WRAPPER", "explicit-wrapper")]);
+    assert_eq!(explicit_wrapper["wrapper_present"], true);
+    assert_eq!(explicit_wrapper["wrapper"], "explicit-wrapper");
+    assert_eq!(explicit_wrapper["incremental_present"], false);
+
+    let explicit_incremental = run(&path, &[("CARGO_INCREMENTAL", "1")]);
+    assert_eq!(explicit_incremental["wrapper_present"], false);
+    assert_eq!(explicit_incremental["incremental"], "1");
+
+    fs::write(&invocations, "").expect("reset invocation log");
+    let mut failed = verification_command(
+        &repo_root,
+        &primary,
+        &path,
+        &lock,
+        &marker,
+        &invocations,
+        &["cargo", "check"],
+    );
+    for key in [
+        "RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_INCREMENTAL",
+    ] {
+        failed.env_remove(key);
+    }
+    let failed = failed
+        .env("VERIFY_TEST_FAIL", "1")
+        .output()
+        .expect("run failing cache probe");
+    assert_eq!(failed.status.code(), Some(42));
+    let records = parse_jsonl(&invocations);
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0]["wrapper"],
+        serde_json::json!(sccache.to_string_lossy().to_string())
+    );
+    assert_eq!(records[0]["incremental"], "0");
+}
