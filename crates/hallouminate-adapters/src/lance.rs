@@ -996,6 +996,29 @@ const SCALAR_INDEXES: [(&str, ScalarIndexKind); 3] = [
     ("content_hash", ScalarIndexKind::BTree),
 ];
 
+/// Whether `apply_batch` refreshes an index of this type after each write.
+/// A refresh rebuilds the FTS and FM indexes over the whole table, so they
+/// catch up in [`LanceStore::maintain`] instead (issue #555). Full-text
+/// queries still find the rows they do not cover: Lance flat-scans
+/// unindexed fragments.
+fn refreshed_per_batch(index_type: &lancedb::index::IndexType) -> bool {
+    use lancedb::index::IndexType;
+    match index_type {
+        IndexType::FTS | IndexType::Fm => false,
+        IndexType::IvfFlat
+        | IndexType::IvfSq
+        | IndexType::IvfPq
+        | IndexType::IvfRq
+        | IndexType::IvfHnswPq
+        | IndexType::IvfHnswSq
+        | IndexType::IvfHnswFlat
+        | IndexType::BTree
+        | IndexType::Bitmap
+        | IndexType::LabelList
+        | IndexType::Unknown => true,
+    }
+}
+
 /// Whether every optional index a pass tried to build is now present.
 #[derive(Clone, Copy)]
 enum IndexCoverage {
@@ -1447,8 +1470,10 @@ impl LanceStore {
     /// Returns an error if the LanceDB index-delta merge, compaction, or
     /// version-cleanup fails.
     pub async fn maintain(&self, options: MaintenanceOptions) -> Result<MaintenanceStats> {
-        // `apply_batch` refreshes the search indexes after every merge_insert,
-        // which appends one delta index per batch. Lance's compaction planner
+        // `apply_batch` refreshes the ANN and scalar indexes after every
+        // merge_insert, which appends one delta index per batch, and leaves
+        // the FTS and FM indexes with unindexed rows (issue #555). The merge
+        // below folds both in. Lance's compaction planner
         // never bins fragments covered by different index sets, so with one
         // delta per fragment every bin holds a single fragment and compaction
         // is a no-op -- fragment debt then grows without bound (issue #463).
@@ -1812,10 +1837,12 @@ impl LanceStore {
         }
         let scope = corpus_and_file_ref_filter(&corpus_key, &file_refs)?;
         let existing_indices = self.table.list_indices().await.map_err(map_lance_err)?;
-        let had_text_index = existing_indices.iter().any(|index| {
-            index.index_type == lancedb::index::IndexType::FTS
-                && index.columns.iter().any(|column| column == "search_text")
-        });
+        let mut refreshed_indices: Vec<String> = Vec::new();
+        for index in existing_indices {
+            if refreshed_per_batch(&index.index_type) {
+                refreshed_indices.push(index.name);
+            }
+        }
         let reader = RecordBatchIterator::new(std::iter::once(Ok(record_batch)), schema);
         let reader: Box<dyn arrow::array::RecordBatchReader + Send> = Box::new(reader);
         let mut builder = self.table.merge_insert(&["corpus", "root", "chunk_id"]);
@@ -1834,10 +1861,12 @@ impl LanceStore {
             );
             return Err(map_lance_err(e));
         }
-        if had_text_index
+        if !refreshed_indices.is_empty()
             && let Err(e) = self
                 .table
-                .optimize(lancedb::table::OptimizeAction::Index(Default::default()))
+                .optimize(lancedb::table::OptimizeAction::Index(
+                    lancedb::table::OptimizeOptions::new().index_names(refreshed_indices),
+                ))
                 .await
         {
             tracing::error!(
@@ -3887,6 +3916,115 @@ mod tests {
             debt_before.fragments, debt_after.fragments,
             "steady state must not change fragment count on a second maintain call"
         );
+    }
+
+    async fn unindexed_rows(store: &LanceStore, index_name: &str) -> usize {
+        store
+            .table
+            .index_stats(index_name)
+            .await
+            .expect("index stats")
+            .unwrap_or_else(|| panic!("index {index_name} must exist"))
+            .num_unindexed_rows
+    }
+
+    async fn fm_index_uuid(store: &LanceStore) -> Option<String> {
+        let indices = store.table.list_indices().await.expect("list indices");
+        let Some(fm) = indices
+            .into_iter()
+            .find(|index| index.index_type == lancedb::index::IndexType::Fm)
+        else {
+            panic!("FM index must exist");
+        };
+        fm.index_uuid
+    }
+
+    #[tokio::test]
+    async fn apply_batch_defers_text_index_refresh_to_maintain() {
+        // Issue #555: a refresh rebuilds the FTS and FM indexes in full, so
+        // `apply_batch` leaves them to `maintain`. Rows they do not cover yet
+        // must stay searchable through Lance's flat scan of unindexed rows.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let key = docs_key();
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/first.md",
+                1,
+                "firstbatchtoken",
+                7,
+                11,
+            )])
+            .await
+            .expect("apply first batch");
+        let fm_before = fm_index_uuid(&store).await;
+        assert!(fm_before.is_some(), "local tables report the FM index UUID");
+
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/second.md",
+                1,
+                "secondbatchtoken",
+                7,
+                11,
+            )])
+            .await
+            .expect("apply second batch");
+
+        assert_eq!(
+            unindexed_rows(&store, "search_text_idx").await,
+            1,
+            "apply_batch must not rebuild the FTS index"
+        );
+        assert_eq!(
+            fm_index_uuid(&store).await,
+            fm_before,
+            "apply_batch must not rebuild the FM index"
+        );
+        assert_eq!(
+            unindexed_rows(&store, "content_hash_idx").await,
+            0,
+            "apply_batch must still refresh the scalar indexes"
+        );
+        let signals = store
+            .retrieve_signals(&key, "secondbatchtoken", 10)
+            .await
+            .expect("search before maintain");
+        assert_eq!(
+            signals.fts.len(),
+            1,
+            "FTS must find a row the index does not cover yet"
+        );
+
+        store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 1,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
+            })
+            .await
+            .expect("maintain");
+
+        assert_eq!(
+            unindexed_rows(&store, "search_text_idx").await,
+            0,
+            "maintain must fold the new rows into the FTS index"
+        );
+        assert_ne!(
+            fm_index_uuid(&store).await,
+            fm_before,
+            "maintain must rebuild the FM index"
+        );
+        let signals = store
+            .retrieve_signals(&key, "secondbatchtoken", 10)
+            .await
+            .expect("search after maintain");
+        assert_eq!(signals.fts.len(), 1, "FTS must find the row after maintain");
     }
 
     #[tokio::test]
