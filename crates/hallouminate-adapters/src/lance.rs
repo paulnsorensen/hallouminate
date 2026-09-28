@@ -1000,7 +1000,8 @@ const SCALAR_INDEXES: [(&str, ScalarIndexKind); 3] = [
 /// A refresh rebuilds the FTS and FM indexes over the whole table, so they
 /// catch up in [`LanceStore::maintain`] instead (issue #555). Full-text
 /// queries still find the rows they do not cover: Lance flat-scans
-/// unindexed fragments.
+/// unindexed fragments. [`FTS_REFRESH_DIVISOR`] bounds that flat scan.
+/// Nothing reads the FM index, so it has no bound.
 fn refreshed_per_batch(index_type: &lancedb::index::IndexType) -> bool {
     use lancedb::index::IndexType;
     match index_type {
@@ -1018,6 +1019,12 @@ fn refreshed_per_batch(index_type: &lancedb::index::IndexType) -> bool {
         | IndexType::Unknown => true,
     }
 }
+
+/// `apply_batch` refreshes the FTS index when its unindexed rows reach
+/// `1 / FTS_REFRESH_DIVISOR` of its indexed rows. A full-text query then
+/// flat-scans at most that share of the table, even when no maintenance
+/// pass runs. The geometric bound keeps rebuilds rare on a large table.
+const FTS_REFRESH_DIVISOR: usize = 10;
 
 /// Whether every optional index a pass tried to build is now present.
 #[derive(Clone, Copy)]
@@ -1471,14 +1478,15 @@ impl LanceStore {
     /// version-cleanup fails.
     pub async fn maintain(&self, options: MaintenanceOptions) -> Result<MaintenanceStats> {
         // `apply_batch` refreshes the ANN and scalar indexes after every
-        // merge_insert, which appends one delta index per batch, and leaves
-        // the FTS and FM indexes with unindexed rows (issue #555). The merge
-        // below folds both in. Lance's compaction planner
-        // never bins fragments covered by different index sets, so with one
-        // delta per fragment every bin holds a single fragment and compaction
-        // is a no-op -- fragment debt then grows without bound (issue #463).
-        // Merging every delta into one index per name first puts all
-        // fragments under the same index set, so the planner can coalesce them.
+        // merge_insert, which appends one delta index per batch. It leaves
+        // the FTS and FM indexes with unindexed rows (issue #555). This merge
+        // folds both the ANN deltas and the unindexed text rows in. Lance's
+        // compaction planner never bins fragments covered by different index
+        // sets, so with one delta per fragment every bin holds a single
+        // fragment and compaction is a no-op -- fragment debt then grows
+        // without bound (issue #463). Merging every delta into one index per
+        // name first puts all fragments under the same index set, so the
+        // planner can coalesce them.
         // The merge is skipped when nothing needs merging: `merge(usize::MAX)`
         // always rewrites the index files, and a paced pass calls `maintain`
         // once per slice, so an unconditional merge would rewrite every index
@@ -1587,6 +1595,29 @@ impl LanceStore {
         })
     }
 
+    /// Whether the FTS index's unindexed rows reached the
+    /// [`FTS_REFRESH_DIVISOR`] bound after a write. The refresh is an
+    /// optimization, so a missing or unreadable statistics report is not due:
+    /// the rows stay searchable, and `maintain` folds them in.
+    async fn fts_refresh_due(&self, fts_index: &str) -> bool {
+        match self.table.index_stats(fts_index).await {
+            Ok(Some(stats)) => {
+                stats.num_unindexed_rows > 0
+                    && stats.num_unindexed_rows.saturating_mul(FTS_REFRESH_DIVISOR)
+                        >= stats.num_indexed_rows
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "hallouminate::lance",
+                    index = fts_index,
+                    error = %error,
+                    "FTS index statistics read failed; skipping the bounded refresh"
+                );
+                false
+            }
+        }
+    }
     /// The largest segment count (base plus deltas) across the indexes when
     /// any index has more than one segment or leaves rows unindexed, i.e. when fragments are
     /// covered by differing index sets and compaction would refuse to bin
@@ -1838,9 +1869,12 @@ impl LanceStore {
         let scope = corpus_and_file_ref_filter(&corpus_key, &file_refs)?;
         let existing_indices = self.table.list_indices().await.map_err(map_lance_err)?;
         let mut refreshed_indices: Vec<String> = Vec::new();
+        let mut fts_index: Option<String> = None;
         for index in existing_indices {
             if refreshed_per_batch(&index.index_type) {
                 refreshed_indices.push(index.name);
+            } else if index.index_type == lancedb::index::IndexType::FTS {
+                fts_index = Some(index.name);
             }
         }
         let reader = RecordBatchIterator::new(std::iter::once(Ok(record_batch)), schema);
@@ -1860,6 +1894,11 @@ impl LanceStore {
                 "LanceDB merge_insert failed; batch not written"
             );
             return Err(map_lance_err(e));
+        }
+        if let Some(fts_index) = fts_index
+            && self.fts_refresh_due(&fts_index).await
+        {
+            refreshed_indices.push(fts_index);
         }
         if !refreshed_indices.is_empty()
             && let Err(e) = self
@@ -3919,31 +3958,42 @@ mod tests {
     }
 
     async fn unindexed_rows(store: &LanceStore, index_name: &str) -> usize {
-        store
+        let stats = store
             .table
             .index_stats(index_name)
             .await
-            .expect("index stats")
-            .unwrap_or_else(|| panic!("index {index_name} must exist"))
-            .num_unindexed_rows
+            .expect("index stats");
+        let Some(stats) = stats else {
+            panic!("index {index_name} must exist");
+        };
+        stats.num_unindexed_rows
     }
 
     async fn fm_index_uuid(store: &LanceStore) -> Option<String> {
         let indices = store.table.list_indices().await.expect("list indices");
-        let Some(fm) = indices
-            .into_iter()
-            .find(|index| index.index_type == lancedb::index::IndexType::Fm)
-        else {
-            panic!("FM index must exist");
-        };
-        fm.index_uuid
+        for index in indices {
+            if index.index_type == lancedb::index::IndexType::Fm {
+                return index.index_uuid;
+            }
+        }
+        panic!("FM index must exist");
+    }
+
+    async fn fts_hits(store: &LanceStore, key: &CorpusKey, query: &str) -> usize {
+        store
+            .retrieve_signals(key, query, 10)
+            .await
+            .expect("retrieve signals")
+            .fts
+            .len()
     }
 
     #[tokio::test]
     async fn apply_batch_defers_text_index_refresh_to_maintain() {
         // Issue #555: a refresh rebuilds the FTS and FM indexes in full, so
         // `apply_batch` leaves them to `maintain`. Rows they do not cover yet
-        // must stay searchable through Lance's flat scan of unindexed rows.
+        // must stay searchable through Lance's flat scan of unindexed rows,
+        // and a replaced row's stale index entry must not match.
         let dir = tempfile::tempdir().unwrap();
         let store =
             LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
@@ -3951,14 +4001,10 @@ mod tests {
                 .expect("open store");
         let key = docs_key();
         store
-            .apply_batch(vec![synthetic_prepared_for(
-                &key,
-                "/tmp/first.md",
-                1,
-                "firstbatchtoken",
-                7,
-                11,
-            )])
+            .apply_batch(vec![
+                synthetic_prepared_for(&key, "/tmp/filler.md", 40, "fillertoken", 7, 11),
+                synthetic_prepared_for(&key, "/tmp/first.md", 1, "firstbatchtoken", 7, 11),
+            ])
             .await
             .expect("apply first batch");
         let fm_before = fm_index_uuid(&store).await;
@@ -3975,11 +4021,22 @@ mod tests {
             )])
             .await
             .expect("apply second batch");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/first.md",
+                1,
+                "replacedtoken",
+                8,
+                12,
+            )])
+            .await
+            .expect("replace first file");
 
         assert_eq!(
             unindexed_rows(&store, "search_text_idx").await,
-            1,
-            "apply_batch must not rebuild the FTS index"
+            2,
+            "apply_batch must not rebuild the FTS index below the refresh bound"
         );
         assert_eq!(
             fm_index_uuid(&store).await,
@@ -3991,14 +4048,20 @@ mod tests {
             0,
             "apply_batch must still refresh the scalar indexes"
         );
-        let signals = store
-            .retrieve_signals(&key, "secondbatchtoken", 10)
-            .await
-            .expect("search before maintain");
         assert_eq!(
-            signals.fts.len(),
+            fts_hits(&store, &key, "secondbatchtoken").await,
             1,
             "FTS must find a row the index does not cover yet"
+        );
+        assert_eq!(
+            fts_hits(&store, &key, "replacedtoken").await,
+            1,
+            "FTS must find the replacement row"
+        );
+        assert_eq!(
+            fts_hits(&store, &key, "firstbatchtoken").await,
+            0,
+            "a stale index entry for a replaced row must not match"
         );
 
         store
@@ -4020,11 +4083,79 @@ mod tests {
             fm_before,
             "maintain must rebuild the FM index"
         );
-        let signals = store
-            .retrieve_signals(&key, "secondbatchtoken", 10)
+        assert_eq!(
+            fts_hits(&store, &key, "secondbatchtoken").await,
+            1,
+            "FTS must find the row after maintain"
+        );
+        assert_eq!(
+            fts_hits(&store, &key, "firstbatchtoken").await,
+            0,
+            "the replaced row must stay gone after maintain"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_batch_refreshes_fts_once_unindexed_rows_reach_a_tenth_of_indexed_rows() {
+        // Issue #555 bound: without maintenance, the flat scan that
+        // full-text queries pay must not grow past a tenth of the index.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let key = docs_key();
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/base.md",
+                20,
+                "basetoken",
+                7,
+                11,
+            )])
             .await
-            .expect("search after maintain");
-        assert_eq!(signals.fts.len(), 1, "FTS must find the row after maintain");
+            .expect("apply base batch");
+        let fm_before = fm_index_uuid(&store).await;
+
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/a.md",
+                1,
+                "atoken",
+                7,
+                11,
+            )])
+            .await
+            .expect("apply first small batch");
+        assert_eq!(
+            unindexed_rows(&store, "search_text_idx").await,
+            1,
+            "one row in twenty is below the refresh bound"
+        );
+
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/b.md",
+                1,
+                "btoken",
+                7,
+                11,
+            )])
+            .await
+            .expect("apply second small batch");
+        assert_eq!(
+            unindexed_rows(&store, "search_text_idx").await,
+            0,
+            "two rows in twenty reach the refresh bound"
+        );
+        assert_eq!(
+            fm_index_uuid(&store).await,
+            fm_before,
+            "the bounded refresh must not rebuild the FM index"
+        );
     }
 
     #[tokio::test]
