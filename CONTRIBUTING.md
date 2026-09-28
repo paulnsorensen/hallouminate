@@ -24,6 +24,26 @@ cd hallouminate
 just verify cargo build --locked --all-targets
 ```
 
+## Optional local compiler caching
+
+Install `sccache` if you want local compiler caching:
+
+```sh
+brew install sccache
+```
+
+`just verify` detects `sccache` on `PATH` and uses its absolute path for
+leased Cargo commands. It sets `CARGO_INCREMENTAL=0` only when it enables this
+automatic cache. Run `sccache --show-stats` to inspect cache activity.
+
+Set `RUSTC_WRAPPER=` to opt out. Any explicit Rust wrapper variable or
+`CARGO_INCREMENTAL=1` also disables automatic setup. Direct `cargo` commands
+remain unchanged. Wrappers configured only in Cargo config are not visible to
+this check; export the wrapper variable to preserve one, or opt out explicitly.
+By default, `just verify` uses the toolchain selected by
+`rust-toolchain.toml`. PATH or `RUSTUP_TOOLCHAIN` overrides can select another
+toolchain and change cache keys.
+
 ## Running tests
 
 Run the full local gate before opening a PR:
