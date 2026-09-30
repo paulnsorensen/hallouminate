@@ -94,6 +94,9 @@ fn render_outline(response: &GroundResponse, strip_prefix: Option<&str>) -> Stri
     }
 
     writeln!(buf).expect("blank");
+    for warning in &response.warnings {
+        writeln!(buf, "warning [{}]: {}", warning.code, warning.message).expect("warning");
+    }
     // Render in relevance order (score desc, path asc tiebreak) — `docs` is a
     // `BTreeMap` keyed by path for O(log n) lookup, so its iteration order is
     // alphabetical and must not be used directly for display.
@@ -107,10 +110,6 @@ fn render_outline(response: &GroundResponse, strip_prefix: Option<&str>) -> Stri
     });
     for (path, doc) in ranked {
         write_doc_block(&mut buf, path, doc, strip_prefix);
-    }
-
-    for warning in &response.warnings {
-        writeln!(buf, "warning [{}]: {}", warning.code, warning.message).expect("warning");
     }
 
     buf
@@ -209,27 +208,17 @@ mod tests {
     fn outline_format_renders_header_path_and_chunks() {
         let response = fixture();
         let out = render(&response, Format::Outline, &RenderOpts::default());
-
-        assert!(out.starts_with("planner cognition  48ms  50 hits\n"));
-        assert!(
-            out.contains("/home/u/.cheese/research/cheese-flow/INDEX.md  (0.873)"),
-            "full path with score: {out}"
-        );
-        assert!(
-            out.contains("  Planner Cognition Research\n"),
-            "summary indented two spaces: {out}"
-        );
-        assert!(
-            out.contains("  L26-28  Planner Cognition Research  (0.910)"),
-            "chunk heading line: {out}"
-        );
-        assert!(
-            out.contains("    Three research rounds on planning LLMs handling code."),
-            "snippet indented four spaces: {out}"
-        );
-        assert!(
-            out.contains("  L44-52  Planner Cognition Research > Open Gaps  (0.840)"),
-            "joined heading path: {out}"
+        assert_eq!(
+            out,
+            concat!(
+                "planner cognition  48ms  50 hits\n\n",
+                "/home/u/.cheese/research/cheese-flow/INDEX.md  (0.873)\n",
+                "  Planner Cognition Research\n",
+                "  L26-28  Planner Cognition Research  (0.910)\n",
+                "    Three research rounds on planning LLMs handling code.\n",
+                "  L44-52  Planner Cognition Research > Open Gaps  (0.840)\n",
+                "    Signature-graph planning is unexplored in detail.\n\n",
+            )
         );
     }
 
@@ -328,17 +317,89 @@ mod tests {
     }
 
     #[test]
-    fn outline_renders_warnings_after_doc_blocks() {
+    fn outline_renders_warnings_before_doc_blocks() {
+        let mut response = fixture();
+        response.warnings = vec![
+            Warning {
+                code: "code-repos-empty".into(),
+                message: "no [[code_repo]] configured".into(),
+            },
+            Warning {
+                code: "index-coverage".into(),
+                message: "/home/u/.cheese/research/wiki has no indexed files".into(),
+            },
+        ];
+        for doc in response.docs.values_mut() {
+            for chunk in &mut doc.chunks {
+                chunk.snippet = "Long document snippet. ".repeat(100);
+            }
+        }
+        let doc = response
+            .docs
+            .values()
+            .next()
+            .expect("fixture document")
+            .clone();
+        response
+            .docs
+            .insert("/home/u/.cheese/research/second.md".into(), doc);
+        let expected = concat!(
+            "planner cognition  48ms  50 hits\n\n",
+            "warning [code-repos-empty]: no [[code_repo]] configured\n",
+            "warning [index-coverage]: /home/u/.cheese/research/wiki has no indexed files\n",
+        );
+        for snippet_chars in [None, Some(0), Some(20)] {
+            for path_prefix_strip in [None, Some("/home/u/.cheese/research/".into())] {
+                let opts = RenderOpts {
+                    snippet_chars,
+                    path_prefix_strip,
+                };
+                let out = render(&response, Format::Outline, &opts);
+                assert!(out.starts_with(expected), "warnings follow header: {out}");
+                for warning in &response.warnings {
+                    let line = format!("warning [{}]: {}\n", warning.code, warning.message);
+                    assert_eq!(out.matches(&line).count(), 1, "one warning line");
+                    let warning_position = out.find(&line).expect("warning line");
+                    for path in response.docs.keys() {
+                        let path = match &opts.path_prefix_strip {
+                            Some(prefix) => path.strip_prefix(prefix).expect("fixture prefix"),
+                            None => path.as_str(),
+                        };
+                        let document_position =
+                            out.find(&format!("{path}  (")).expect("document header");
+                        assert!(
+                            warning_position < document_position,
+                            "warning precedes document"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outline_rendering_preserves_structured_response_and_json() {
         let mut response = fixture();
         response.warnings.push(Warning {
             code: "code-repos-empty".into(),
             message: "no [[code_repo]] configured".into(),
         });
-        let out = render(&response, Format::Outline, &RenderOpts::default());
-        assert!(
-            out.contains("warning [code-repos-empty]: no [[code_repo]] configured"),
-            "warning line: {out}"
+        let expected = serde_json::to_value(&response).expect("response value");
+        let opts = RenderOpts {
+            path_prefix_strip: Some("/home/u/.cheese/research/".into()),
+            ..Default::default()
+        };
+        let outline = render(&response, Format::Outline, &opts);
+        assert!(outline.contains("warning [code-repos-empty]: no [[code_repo]] configured"));
+        assert_eq!(
+            serde_json::to_value(&response).expect("response value"),
+            expected
         );
+        for format in [Format::Json, Format::JsonPretty] {
+            let out = render(&response, format, &opts);
+            let actual: serde_json::Value = serde_json::from_str(&out).expect("parse json");
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -370,9 +431,9 @@ mod tests {
             }],
         };
         let out = render(&response, Format::Outline, &RenderOpts::default());
-        assert!(
-            out.contains("warning [code-repos-empty]: no [[code_repo]] configured"),
-            "warnings must render even when docs is empty: {out:?}"
+        assert_eq!(
+            out,
+            "no hits  5ms  0 hits\n\nwarning [code-repos-empty]: no [[code_repo]] configured\n"
         );
     }
 
