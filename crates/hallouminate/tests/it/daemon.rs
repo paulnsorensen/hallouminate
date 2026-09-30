@@ -3501,6 +3501,201 @@ async fn read_miss_message(client: &DaemonClient, cwd: &Path, path: &str) -> Str
 }
 
 #[tokio::test]
+async fn daemon_read_markdown_citation_miss_suggests_bare_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("other.md"), "other").expect("seed other");
+    let harness =
+        DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for path in ["notes.md:12", "notes.md:12-30", "notes.md:12-12"] {
+        let message = read_miss_message(&client, harness.cwd(), path).await;
+        assert!(
+            message.contains("Use path=\"notes.md\" with line_numbers=true; line ranges belong in citations, not path."),
+            "{message}"
+        );
+        assert!(
+            message.starts_with(&format!("{path} does not exist")),
+            "{message}"
+        );
+        assert!(!message.contains("private-content-sentinel"), "{message}");
+        assert!(
+            message.contains("corpus root contains: other.md"),
+            "{message}"
+        );
+        assert_eq!(message.matches("notes.md").count(), 2, "{message}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_deduplicates_repeated_separators() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("sub")).expect("mkdir sub");
+    std::fs::write(root.join("sub/notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("sub/other.md"), "other").expect("seed other");
+    let harness =
+        DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "sub//notes.md:12").await;
+    assert!(
+        message.contains("Use path=\"sub//notes.md\" with line_numbers=true"),
+        "{message}"
+    );
+    assert!(message.contains("other.md"), "{message}");
+    assert_eq!(message.matches("notes.md").count(), 2, "{message}");
+    assert!(!message.contains("private-content-sentinel"), "{message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_rejects_invalid_suffixes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("notes.txt"), "private-content-sentinel").expect("seed text");
+    let harness =
+        DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for path in [
+        "missing.md:12",
+        "notes.txt:12",
+        "notes.md:",
+        "notes.md:0",
+        "notes.md:0-12",
+        "notes.md:12-0",
+        "notes.md:30-12",
+        "notes.md:-12",
+        "notes.md:+12",
+        "notes.md:12-",
+        "notes.md:12-30-40",
+        "notes.md:1.2",
+        "notes.md: 12",
+        "notes.md:12 ",
+        "notes.md:１２",
+        "notes.md:12x",
+        "notes.md:18446744073709551616",
+        "notes.md:1-18446744073709551616",
+    ] {
+        let message = read_miss_message(&client, harness.cwd(), path).await;
+        assert!(
+            message.starts_with(&format!("{path} does not exist")),
+            "{message}"
+        );
+        assert!(!message.contains("Use path="), "{message}");
+        assert!(!message.contains("private-content-sentinel"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_exact_colon_filename_wins() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "bare content").expect("seed bare");
+    std::fs::write(root.join("notes.md:12-30"), "exact colon content").expect("seed exact");
+    let mut cfg = cfg_single_root_corpus(&tmp.path().join("ground"), &root);
+    cfg.corpora[0].globs = vec!["**/*".into()];
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for (path, content) in [
+        ("notes.md", "bare content"),
+        ("notes.md:12-30", "exact colon content"),
+    ] {
+        let result: serde_json::Value = client
+            .call(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                    corpus: Some("wiki".into()),
+                    path: path.into(),
+                }),
+            })
+            .await
+            .expect("exact read");
+        assert_eq!(result["path"], path);
+        assert_eq!(result["content"], content);
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_preserves_path_protections() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("excluded.md"), "private-content-sentinel").expect("seed excluded");
+    let mut cfg = cfg_single_root_corpus(&tmp.path().join("ground"), &root);
+    cfg.corpora[0].exclude = vec!["**/excluded.md".into()];
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let absolute = format!("{}:12", root.join("notes.md").display());
+    for (path, expected) in [
+        (absolute.as_str(), "path must be a non-empty relative path"),
+        (
+            "../notes.md:12",
+            "path must contain only normal file components",
+        ),
+        (
+            "./notes.md:12",
+            "path must contain only normal file components",
+        ),
+    ] {
+        let message = read_miss_message(&client, harness.cwd(), path).await;
+        assert_eq!(message, expected);
+    }
+    let message = read_miss_message(&client, harness.cwd(), "excluded.md:12").await;
+    assert!(
+        message.starts_with("excluded.md:12 does not exist"),
+        "{message}"
+    );
+    assert!(!message.contains("Use path="), "{message}");
+    assert!(!message.contains("private-content-sentinel"), "{message}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_rejects_symlinks_and_respects_root_order() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).expect("mkdir a");
+    std::fs::create_dir_all(&root_b).expect("mkdir b");
+    std::fs::write(root_b.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root_b.join("blocked.md"), "private-content-sentinel").expect("seed blocked");
+    std::os::unix::fs::symlink(root_b.join("blocked.md"), root_a.join("blocked.md"))
+        .expect("symlink");
+    std::os::unix::fs::symlink(&root_b, root_a.join("linked")).expect("symlink directory");
+    let mut cfg = cfg_two_root_corpus(&tmp.path().join("ground"), &root_a, &root_b);
+    cfg.corpora[0].name = "wiki".into();
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "notes.md:12").await;
+    assert!(
+        message.contains("Use path=\"notes.md\" with line_numbers=true"),
+        "{message}"
+    );
+    assert!(!message.contains("private-content-sentinel"), "{message}");
+    let message = read_miss_message(&client, harness.cwd(), "blocked.md:12").await;
+    assert!(
+        message.starts_with("blocked.md:12 does not exist"),
+        "{message}"
+    );
+    assert!(!message.contains("Use path="), "{message}");
+    let message = read_miss_message(&client, harness.cwd(), "linked/notes.md:12").await;
+    assert!(message.contains("symlink"), "{message}");
+    assert!(!message.contains("Use path="), "{message}");
+    assert!(!message.contains("contains:"), "{message}");
+}
+
+#[tokio::test]
 async fn daemon_read_markdown_miss_lists_parent_directory_entries() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");

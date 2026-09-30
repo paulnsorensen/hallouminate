@@ -18,7 +18,7 @@
 //! `tokio::fs::write` while MCP used `atomic_write_no_follow`).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
 use tokio::sync::OwnedSemaphorePermit;
@@ -1971,6 +1971,36 @@ const READ_MISS_LISTING_CAP: usize = 20;
 /// Cap on fuzzy filename suggestions appended to a read miss.
 const READ_MISS_SUGGESTION_CAP: usize = 3;
 
+fn citation_bare_path(path: &str) -> Option<&str> {
+    let (path, suffix) = path.rsplit_once(':')?;
+    if !path.ends_with(".md") {
+        return None;
+    }
+    let (start, end) = match suffix.split_once('-') {
+        Some((start, end)) => (start, end),
+        None => (suffix, suffix),
+    };
+    let mut lines = [0_u64; 2];
+    for (index, value) in [start, end].into_iter().enumerate() {
+        if value.is_empty() {
+            return None;
+        }
+        for digit in value.bytes() {
+            if !digit.is_ascii_digit() {
+                return None;
+            }
+        }
+        lines[index] = value.parse().ok()?;
+        if lines[index] == 0 {
+            return None;
+        }
+    }
+    if lines[1] < lines[0] {
+        return None;
+    }
+    Some(path)
+}
+
 /// Enrich the bare `<path> does not exist` read miss with the nearest
 /// existing directory's entries and top fuzzy filename matches so a miss
 /// resolves in zero extra round trips. Every other error — symlink,
@@ -1995,10 +2025,18 @@ fn enrich_read_not_found(
     let relative = Path::new(req_path);
     let mut msg = bare;
     let mut shown = Vec::new();
-    if let Some((listing, listed)) = read_miss_ancestor_listing(corpus, relative) {
+    if let Some(candidate) = citation_bare_path(req_path)
+        && validate_wiki_read_path(corpora, corpus_name, candidate).is_ok()
+    {
+        msg.push_str(&format!(
+            "; Use path={candidate:?} with line_numbers=true; line ranges belong in citations, not path."
+        ));
+        shown.push(PathBuf::from(candidate));
+    }
+    if let Some((listing, listed)) = read_miss_ancestor_listing(corpus, relative, &shown) {
         msg.push_str("; ");
         msg.push_str(&listing);
-        shown = listed;
+        shown.extend(listed);
     }
     if let Some(matches) = read_miss_closest_matches(corpus, relative, &shown) {
         msg.push_str("; ");
@@ -2015,13 +2053,14 @@ fn enrich_read_not_found(
 fn read_miss_ancestor_listing(
     corpus: &CorpusConfig,
     relative: &Path,
-) -> Option<(String, Vec<String>)> {
+    shown: &[PathBuf],
+) -> Option<(String, Vec<PathBuf>)> {
     for raw in &corpus.paths {
         let root = expand_tilde(raw);
         let mut dir = relative.parent();
         while let Some(d) = dir {
             if root.join(d).is_dir() {
-                return describe_read_miss_dir(&root.join(d), d);
+                return describe_read_miss_dir(&root.join(d), d, shown);
             }
             dir = d.parent();
         }
@@ -2032,7 +2071,11 @@ fn read_miss_ancestor_listing(
 /// Describe one existing directory for a read miss: markdown files plus
 /// subdirectory names (trailing `/`), sorted, capped at
 /// [`READ_MISS_LISTING_CAP`] with an `… and N more` tail.
-fn describe_read_miss_dir(abs: &Path, rel_dir: &Path) -> Option<(String, Vec<String>)> {
+fn describe_read_miss_dir(
+    abs: &Path,
+    rel_dir: &Path,
+    shown: &[PathBuf],
+) -> Option<(String, Vec<PathBuf>)> {
     let entries = std::fs::read_dir(abs).ok()?;
     let mut names = Vec::new();
     for entry in entries {
@@ -2043,6 +2086,9 @@ fn describe_read_miss_dir(abs: &Path, rel_dir: &Path) -> Option<(String, Vec<Str
             continue;
         };
         let name = entry.file_name().to_string_lossy().into_owned();
+        if shown.contains(&rel_dir.join(&name)) {
+            continue;
+        }
         if file_type.is_dir() {
             names.push(format!("{name}/"));
         } else if file_type.is_file() && name.ends_with(".md") {
@@ -2067,7 +2113,7 @@ fn describe_read_miss_dir(abs: &Path, rel_dir: &Path) -> Option<(String, Vec<Str
     let mut listed = Vec::new();
     for name in &names {
         if !name.ends_with('/') {
-            listed.push(rel_dir.join(name).to_string_lossy().into_owned());
+            listed.push(rel_dir.join(name));
         }
     }
     Some((fragment, listed))
@@ -2079,13 +2125,13 @@ fn describe_read_miss_dir(abs: &Path, rel_dir: &Path) -> Option<(String, Vec<Str
 fn read_miss_closest_matches(
     corpus: &CorpusConfig,
     relative: &Path,
-    shown: &[String],
+    shown: &[PathBuf],
 ) -> Option<String> {
     let stem = relative.file_stem()?.to_string_lossy();
     let entries = list_corpus_files(corpus).ok()?;
     let mut ranked: Vec<(f64, String)> = Vec::new();
     for entry in entries {
-        if shown.contains(&entry.path) {
+        if shown.contains(&PathBuf::from(&entry.path)) {
             continue;
         }
         let Some(candidate_stem) = Path::new(&entry.path).file_stem() else {

@@ -754,7 +754,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim.",
+        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. `path` is a corpus-relative filename without citation suffixes such as `:12` or `:12-30`. `line_numbers` only affects display; it does not select a line range. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
