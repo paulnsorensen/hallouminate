@@ -5497,3 +5497,144 @@ async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
          instead of res.embedder()) regressed: {warnings:?}"
     );
 }
+
+#[tokio::test]
+async fn daemon_markdown_batch_enforces_bounds_before_side_effects() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("corpus");
+    std::fs::create_dir(&root).expect("root");
+    let cfg: Config = toml::from_str(&format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{}"]
+globs = ["**/*.md"]
+[storage]
+ground_dir = "{}"
+[embeddings]
+enabled = false
+"#,
+        root.display(),
+        tmp.path().join("ground").display()
+    ))
+    .expect("config");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("client");
+    for count in [0, 21] {
+        let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "cwd": harness.cwd(),
+            "payload": {"op": "add_markdown_batch", "corpus": "docs", "items":
+                vec![serde_json::json!({"path": "never.md", "content": ""}); count]
+            }
+        }))
+        .expect("request");
+        let response = client.call_raw(request).await.expect("response");
+        let DaemonResponse::Err { kind, message } = response else {
+            panic!("invalid count succeeded");
+        };
+        assert_eq!(kind, ErrorKind::InvalidParams);
+        assert!(message.contains("1–20"), "{message}");
+        assert_eq!(std::fs::read_dir(&root).expect("entries").count(), 0);
+    }
+    let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+        "cwd": harness.cwd(),
+        "payload": {"op": "add_markdown_batch", "corpus": "docs", "items": [
+            {"path": "never.md", "content": ""},
+            {"path": "bad.md", "content": "", "replace_match": "x", "under_heading": "x"}
+        ]}
+    }))
+    .expect("request");
+    let response = client.call_raw(request).await.expect("response");
+    let DaemonResponse::Err { kind, message } = response else {
+        panic!("mixed modes succeeded");
+    };
+    assert_eq!(kind, ErrorKind::InvalidParams);
+    assert!(message.contains("at most one"), "{message}");
+    assert_eq!(std::fs::read_dir(&root).expect("entries").count(), 0);
+
+    let mut items = Vec::new();
+    for index in 0..20 {
+        items.push(serde_json::json!({"path": format!("item-{index}.md"), "content": ""}));
+    }
+    let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+        "cwd": harness.cwd(),
+        "payload": {"op": "add_markdown_batch", "corpus": "docs", "items": items}
+    }))
+    .expect("request");
+    let response = client.call_raw(request).await.expect("response");
+    let DaemonResponse::Ok { result } = response else {
+        panic!("20 items rejected");
+    };
+    let results = result["results"].as_array().expect("results");
+    assert_eq!(results.len(), 20);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["result"]["path"], format!("item-{index}.md"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(format!("item-{index}.md"))).expect("written"),
+            ""
+        );
+    }
+    harness.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_markdown_batch_retains_exclusion_and_multi_root_guards() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    std::fs::create_dir(&first).expect("first");
+    std::fs::create_dir(&second).expect("second");
+    let cfg: Config = toml::from_str(&format!(
+        r#"
+[[corpus]]
+name = "excluded"
+paths = ["{}"]
+globs = ["**/*.md"]
+exclude = ["private/**"]
+[[corpus]]
+name = "multi"
+paths = ["{}", "{}"]
+globs = ["**/*.md"]
+[storage]
+ground_dir = "{}"
+[embeddings]
+enabled = false
+"#,
+        first.display(),
+        first.display(),
+        second.display(),
+        tmp.path().join("ground").display()
+    ))
+    .expect("config");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("client");
+    for (corpus, path, expected) in [
+        ("excluded", "private/secret.md", "exclude"),
+        ("multi", "never.md", "single"),
+    ] {
+        let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "cwd": harness.cwd(),
+            "payload": {"op": "add_markdown_batch", "corpus": corpus, "items": [{"path": path, "content": ""}]}
+        })).expect("request");
+        let response = client.call_raw(request).await.expect("response");
+        let DaemonResponse::Ok { result } = response else {
+            panic!("batch handler failed");
+        };
+        assert_eq!(result["results"][0]["status"], "err");
+        assert_eq!(result["results"][0]["kind"], "invalid_params");
+        assert!(
+            result["results"][0]["message"]
+                .as_str()
+                .expect("message")
+                .contains(expected),
+            "{result}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(&first).expect("first entries").count(), 0);
+    assert_eq!(
+        std::fs::read_dir(&second).expect("second entries").count(),
+        0
+    );
+    harness.shutdown().await.expect("shutdown");
+}

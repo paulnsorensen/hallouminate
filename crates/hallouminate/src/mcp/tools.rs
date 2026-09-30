@@ -1,7 +1,6 @@
-//! Tool registrations for the hallouminate MCP server. Every stateful tool
-//! is a proxy to the local daemon: opening a `DaemonClient` and dispatching
-//! one RPC per call. Keeps the daemon as the canonical owner of the LanceDB
-//! ground directory and per-corpus mutation locks per the spec's Approach.
+//! Proxies stateful MCP tools through the local daemon.
+//! Read batches use one RPC per item; write batches use one ordered daemon RPC.
+//! The daemon owns the LanceDB ground directory and per-corpus mutation locks.
 //!
 //! When the daemon is unreachable (e.g. no `hallouminate daemon` running),
 //! tool calls return JSON-RPC `-32603 internal_error` with the documented
@@ -20,8 +19,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use hallouminate_daemon::{
-    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusStatsResult,
-    DaemonClient, DaemonRequest, DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
+    BacklinksRequest, BacklinksResult, CorpusStatsResult, DaemonClient, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DaemonRpcError, DeleteMarkdownRequest,
     DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
     ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
     Position, ReadMarkdownRequest, ReadMarkdownResult, client_for,
@@ -277,6 +277,59 @@ fn render_corpus_stats_text(result: &CorpusStatsResult) -> String {
     text
 }
 
+fn render_add_markdown(response: &AddMarkdownResult) -> String {
+    let mut text = format!(
+        "wrote {} and refreshed corpus {}",
+        response.path, response.corpus
+    );
+    if !response.warnings.is_empty() {
+        text.push_str("\n\nlint warnings (advisory, file was written as-is):");
+        for warning in &response.warnings {
+            text.push_str(&format!("\n- {warning}"));
+        }
+    }
+    text
+}
+
+fn batch_item(
+    index: usize,
+    path: &str,
+    outcome: Result<(String, serde_json::Value), ErrorData>,
+) -> (String, serde_json::Value) {
+    match outcome {
+        Ok((text, result)) => (
+            format!("[{index}] {path}\n{text}"),
+            serde_json::json!({ "index": index, "path": path, "result": result }),
+        ),
+        Err(error) => (
+            format!(
+                "[{index}] {path}\nerror {}: {}",
+                error.code.0, error.message
+            ),
+            serde_json::json!({ "index": index, "path": path, "error": error }),
+        ),
+    }
+}
+
+fn validate_batch_count(count: usize) -> Result<(), ErrorData> {
+    if !(1..=20).contains(&count) {
+        return Err(invalid_params("items must contain 1–20 entries"));
+    }
+    Ok(())
+}
+
+fn map_batch_write_error(error: anyhow::Error) -> ErrorData {
+    if error.downcast_ref::<DaemonRpcError>().is_some() {
+        return map_daemon_err(error);
+    }
+    let mut error = map_daemon_err(error);
+    error.message = format!(
+        "Batch completion is uncertain; inspect files before retrying. No automatic retry or rollback occurred. {}",
+        error.message,
+    ).into();
+    error
+}
+
 fn internal_error(msg: impl Into<String>) -> ErrorData {
     ErrorData::internal_error(msg.into(), None)
 }
@@ -451,8 +504,102 @@ pub struct ListTreeParams {
     pub corpus: Option<String>,
 }
 
+#[derive(Debug, JsonSchema)]
+#[schemars(untagged, extend("type" = "object", "required" = ["cwd", "corpus"]))]
+pub enum AddMarkdownParams {
+    #[schemars(extend("not" = {"required": ["items"]}))]
+    Single(AddMarkdownSingleParams),
+    Batch(AddMarkdownBatchParams),
+}
+
+impl<'de> Deserialize<'de> for AddMarkdownParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("items").is_some() {
+            serde_json::from_value(value)
+                .map(Self::Batch)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Single)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct AddMarkdownParams {
+#[serde(deny_unknown_fields)]
+pub struct AddMarkdownBatchParams {
+    cwd: String,
+    corpus: String,
+    /// One to twenty writes, in order. Earlier successful writes remain after item errors.
+    #[schemars(length(min = 1, max = 20))]
+    items: Vec<AddMarkdownItemParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddMarkdownItemParams {
+    path: String,
+    content: String,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    under_heading: Option<String>,
+    #[serde(default)]
+    position: Position,
+    #[serde(default)]
+    replace_lines: Option<LineRange>,
+    #[serde(default)]
+    replace_match: Option<String>,
+}
+
+#[derive(Debug, JsonSchema)]
+#[schemars(untagged, extend("type" = "object", "required" = ["cwd"]))]
+pub enum ReadMarkdownParams {
+    #[schemars(extend("not" = {"required": ["items"]}))]
+    Single(ReadMarkdownSingleParams),
+    Batch(ReadMarkdownBatchParams),
+}
+
+impl<'de> Deserialize<'de> for ReadMarkdownParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("items").is_some() {
+            serde_json::from_value(value)
+                .map(Self::Batch)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Single)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadMarkdownBatchParams {
+    cwd: String,
+    #[serde(default)]
+    corpus: Option<String>,
+    /// One to twenty reads with independent display settings.
+    #[schemars(length(min = 1, max = 20))]
+    items: Vec<ReadMarkdownItemParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadMarkdownItemParams {
+    path: String,
+    #[serde(default)]
+    line_numbers: bool,
+    #[serde(default)]
+    footnotes: FootnoteMode,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddMarkdownSingleParams {
     /// Absolute path of the directory this request applies to.
     pub cwd: String,
     /// Corpus that owns the markdown file.
@@ -498,7 +645,7 @@ pub struct AddMarkdownParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadMarkdownParams {
+pub struct ReadMarkdownSingleParams {
     /// Absolute path of the directory this request applies to.
     pub cwd: String,
     /// Corpus that owns the markdown file. Defaults to the wiki for the repo
@@ -580,7 +727,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), repo-local pages ranked first; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set.",
+        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), repo-local pages ranked first; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. Inspect `index-coverage` and `index-reconciliation` warnings for the selected corpus before treating zero hits as absence. Incomplete retrieval does not establish missing knowledge; foreign-corpus hits do not establish selected-corpus coverage. Complete file coverage does not prove freshness or reconciliation completion. Keep the original `cwd` and selected `corpus` fixed during recovery. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -712,7 +859,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams.",
+        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Alternatively pass items (1–20), sharing cwd and corpus, with each item's path, content, overwrite and edit fields. Never mix items with single-file fields. Batch results are ordered {results:[{index,path,result}|{index,path,error:{code,message,data?}}]}. Writes run sequentially; item errors do not undo successes or stop later items. Duplicate paths observe earlier writes. Other clients can interleave. Transport failures leave completion uncertain: inspect files before retrying; no automatic retry or rollback. Serialized batches must fit the 4 MiB IPC frame. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -724,6 +871,10 @@ impl HallouminateTools {
         &self,
         Parameters(params): Parameters<AddMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let params = match params {
+            AddMarkdownParams::Single(params) => params,
+            AddMarkdownParams::Batch(params) => return self.add_markdown_batch(params).await,
+        };
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
@@ -739,22 +890,13 @@ impl HallouminateTools {
             }),
         };
         let response: AddMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let mut text = format!(
-            "wrote {} and refreshed corpus {}",
-            response.path, response.corpus
-        );
-        if !response.warnings.is_empty() {
-            text.push_str("\n\nlint warnings (advisory, file was written as-is):");
-            for warning in &response.warnings {
-                text.push_str(&format!("\n- {warning}"));
-            }
-        }
+        let text = render_add_markdown(&response);
         let structured = to_structured(&response)?;
         Ok(tool_ok(text, structured))
     }
 
     #[tool(
-        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. `path` is a corpus-relative filename without citation suffixes such as `:12` or `:12-30`. `line_numbers` only affects display; it does not select a line range. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim.",
+        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. Alternatively pass items (1–20), sharing cwd and optional corpus, with each item's path, line_numbers and footnotes. Never mix items with single-file fields. Batch results are ordered {results:[{index,path,result}|{index,path,error:{code,message,data?}}]}, with labeled text per item. Item errors do not stop later reads. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. `path` is a corpus-relative filename without citation suffixes such as `:12` or `:12-30`. `line_numbers` only affects display; it does not select a line range. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -766,6 +908,10 @@ impl HallouminateTools {
         &self,
         Parameters(params): Parameters<ReadMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let params = match params {
+            ReadMarkdownParams::Single(params) => params,
+            ReadMarkdownParams::Batch(params) => return self.read_markdown_batch(params).await,
+        };
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
@@ -905,6 +1051,136 @@ impl HallouminateTools {
             response.backlinks.join("\n")
         };
         Ok(tool_ok(text, structured))
+    }
+}
+
+impl HallouminateTools {
+    async fn read_markdown_batch(
+        &self,
+        params: ReadMarkdownBatchParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ReadMarkdownBatchParams { cwd, corpus, items } = params;
+        validate_batch_count(items.len())?;
+        let (client, cwd) = self.tool_setup(&cwd).await?;
+        let mut results = Vec::with_capacity(items.len());
+        let mut texts = Vec::with_capacity(items.len());
+        for (
+            index,
+            ReadMarkdownItemParams {
+                path,
+                line_numbers,
+                footnotes,
+            },
+        ) in items.into_iter().enumerate()
+        {
+            let response = client
+                .call::<ReadMarkdownResult>(DaemonRequest {
+                    cwd: cwd.clone(),
+                    payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                        corpus: corpus.clone(),
+                        path: path.clone(),
+                    }),
+                })
+                .await
+                .map_err(map_daemon_err);
+            let outcome = response.and_then(|response| {
+                let structured = to_structured(&response)?;
+                let body = apply_footnote_mode(&response.content, footnotes);
+                let text = if line_numbers {
+                    number_lines(&body)
+                } else {
+                    body
+                };
+                Ok((text, structured))
+            });
+            let (text, result) = batch_item(index, &path, outcome);
+            texts.push(text);
+            results.push(result);
+        }
+        Ok(tool_ok(
+            texts.join("\n\n"),
+            serde_json::json!({ "results": results }),
+        ))
+    }
+
+    async fn add_markdown_batch(
+        &self,
+        params: AddMarkdownBatchParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let AddMarkdownBatchParams { cwd, corpus, items } = params;
+        validate_batch_count(items.len())?;
+        let mut paths = Vec::with_capacity(items.len());
+        let mut requests = Vec::with_capacity(items.len());
+        for AddMarkdownItemParams {
+            path,
+            content,
+            overwrite,
+            under_heading,
+            position,
+            replace_lines,
+            replace_match,
+        } in items
+        {
+            let selectors = usize::from(under_heading.is_some())
+                + usize::from(replace_lines.is_some())
+                + usize::from(replace_match.is_some());
+            if selectors > 1 {
+                return Err(invalid_params(
+                    "set at most one of under_heading / replace_lines / replace_match",
+                ));
+            }
+            paths.push(path.clone());
+            requests.push(AddMarkdownItem {
+                path,
+                content,
+                overwrite,
+                under_heading,
+                position,
+                replace_lines,
+                replace_match,
+            });
+        }
+        let (client, cwd) = self.tool_setup(&cwd).await?;
+        let response: AddMarkdownBatchResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::AddMarkdownBatch {
+                    corpus,
+                    items: requests,
+                },
+            })
+            .await
+            .map_err(map_batch_write_error)?;
+        if response.results.len() != paths.len() {
+            return Err(internal_error(
+                "Batch completion is uncertain: daemon returned an incorrect result count; inspect files before retrying.",
+            ));
+        }
+        let mut results = Vec::with_capacity(paths.len());
+        let mut texts = Vec::with_capacity(paths.len());
+        for (index, (path, response)) in paths.into_iter().zip(response.results).enumerate() {
+            let outcome = match response {
+                DaemonResponse::Ok { result } => {
+                    let response: AddMarkdownResult = serde_json::from_value(result.clone())
+                        .map_err(|error| {
+                            internal_error(format!(
+                                "Batch completion is uncertain: invalid item response: {error}"
+                            ))
+                        })?;
+                    Ok((render_add_markdown(&response), result))
+                }
+                DaemonResponse::Err { kind, message } => {
+                    Err(map_daemon_err(DaemonRpcError { kind, message }.into()))
+                }
+            };
+            let (text, result) = batch_item(index, &path, outcome);
+            texts.push(text);
+            results.push(result);
+        }
+        Ok(tool_ok(
+            texts.join("\n\n"),
+            serde_json::json!({ "results": results }),
+        ))
     }
 }
 

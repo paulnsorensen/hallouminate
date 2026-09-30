@@ -53,11 +53,11 @@ use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
 use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 
 use super::ipc::{
-    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusEntry,
-    CorpusStatsResult, DaemonRequest, DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest,
-    DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
-    ListFilesRequest, ListTreeRequest, ListTreeResult, PongResult, Position, ReadMarkdownRequest,
-    ReadMarkdownResult,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
+    BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
+    ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
 #[cfg(test)]
 use super::state::MAX_CONCURRENT_COVERAGE_CHECKS;
@@ -111,6 +111,9 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::ListFiles(req) => handle_list_files(&effective, &req_cwd, req).await,
         DaemonRequestPayload::ListTree(req) => handle_list_tree(&effective, &req_cwd, req).await,
         DaemonRequestPayload::AddMarkdown(req) => handle_add_markdown(state, &effective, req).await,
+        DaemonRequestPayload::AddMarkdownBatch { corpus, items } => {
+            handle_add_markdown_batch(state, &effective, corpus, items).await
+        }
         DaemonRequestPayload::ReadMarkdown(req) => {
             handle_read_markdown(&effective, &req_cwd, req).await
         }
@@ -833,6 +836,48 @@ async fn read_existing_text(
     };
     String::from_utf8(raw)
         .map_err(|_| DaemonResponse::invalid_params("existing file is not valid UTF-8".to_string()))
+}
+
+async fn handle_add_markdown_batch(
+    state: &DaemonState,
+    cfg: &Config,
+    corpus: String,
+    items: Vec<AddMarkdownItem>,
+) -> DaemonResponse {
+    if !(1..=20).contains(&items.len()) {
+        return DaemonResponse::invalid_params("items must contain 1–20 entries");
+    }
+    let mut requests = Vec::with_capacity(items.len());
+    for AddMarkdownItem {
+        path,
+        content,
+        overwrite,
+        under_heading,
+        position,
+        replace_lines,
+        replace_match,
+    } in items
+    {
+        let request = AddMarkdownRequest {
+            corpus: corpus.clone(),
+            path,
+            content,
+            overwrite,
+            under_heading,
+            position,
+            replace_lines,
+            replace_match,
+        };
+        if let Err(response) = classify_edit_mode(&request) {
+            return response;
+        }
+        requests.push(request);
+    }
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        results.push(handle_add_markdown(state, cfg, request).await);
+    }
+    DaemonResponse::ok(&AddMarkdownBatchResult { results })
 }
 
 async fn handle_add_markdown(
