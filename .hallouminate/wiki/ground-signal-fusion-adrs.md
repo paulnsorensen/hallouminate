@@ -64,4 +64,16 @@ The decisions shipped. Verified against the tree at 2026-08-09: `WeightedRRFRera
 - **Alternatives:** Making the literal signals peer retrieval paths, rejected for this pass because it requires two new retrieval paths, not one round trip, and would change ranking output. Resolving a ripgrep `(file, line)` hit to a chunk id independent of the pool requires a store lookup by `(file_ref, line)` containment — chunk line ranges are only known for chunks already retrieved — which is a new query shape, not a resolve-in-place function. The FM signal would need a corpus-wide `contains()` scan rather than a scan over the pooled `search_text`, which is also a new retrieval path. Both changes would move ranking output and therefore invalidate the hand-committed `eval/baseline.json`, which ADR-005 requires be regenerated only after human review — an unreviewed baseline invalidation is not acceptable inside a documentation-accuracy fix.
 - **Consequences:** The pool constraint stands as shipped behavior, now documented rather than overstated. A chunk that only the ripgrep or FM-Index signal would find, and that lies outside the FTS/vector top-`limit` pool, is not retrieved. Making the two literal signals true independent retrieval paths — the union case ADR-001 gestures at when it says peers — is filed as follow-up work, not fixed here.
 
+### Ripgrep resolution diagnostics
+
+Ground emits `ripgrep-unresolved` only when the candidate pool and ripgrep hits are nonempty, but no hits resolve to chunks.
+This warning reports hits dropped because their path is outside the retrieved candidate pool.
+It separately reports hits whose line falls outside that path's retrieved chunk ranges.
+The warning also states whether ripgrep output is truncated.
+These diagnostics reuse resolver counters; they do not add candidates, change ranking, or change the literal-signal weights.[^diagnostics]
+
+[^diagnostics]: crates/hallouminate-domain/src/search.rs::search_fused; crates/hallouminate-domain/src/search/ripgrep.rs
+
+_Source: PR #561 diagnostics · Updated: 2026-10-01 · Supersedes: —_
+
 _Source: ranking audit session 2026-07-25 · Spec: .cheese/specs/ground-signal-fusion.md · Supersedes: —_

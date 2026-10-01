@@ -64,3 +64,7 @@
 - 2026-09-23 · a04b1c4258c1a688 · merged · supervisor-restart-ladder.md · Record source-backed shutdown and actor-framework rejections from landed PRs #524 and #526.
 - 2026-09-23 · a04b1c4258c1a688 · merged · daemon-and-cli.md · Record the OS-service rejection and inference idle policy from landed PRs #525 and #527.
 
+
+
+- 2026-10-01 · ff7f2b737f3afff6 · merged · mcp-surface.md, not-found-suggestions.md, ground-signal-fusion-adrs.md · Record landed PR #561 batch contracts, bounded retrieval recovery, citation hints, and diagnostic counters. Nine frozen retrieval probes pass after one bounded heading repair.
+

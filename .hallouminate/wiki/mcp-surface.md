@@ -98,7 +98,7 @@ cheap way to pull a page's citation targets without reading the page.
 
 ### `add_markdown`
 
-Atomic-write a markdown file to the corpus' first configured root, then
+Atomic-write a markdown file to the corpus's single configured root, then
 refresh just that file's LanceDB rows. For `repo:*:wiki` corpora, also
 walks ancestor directories from the corpus root down to the new file's
 parent and rebuilds the link list inside each `index.md` between
@@ -158,6 +158,28 @@ The dedicated `get_footnote` tool was **removed in 0.7.0** (breaking); its job
 is now `read_markdown` with `footnotes: "only"`, which returns just the
 definition lines. This shrank the surface from eleven tools to ten.
 
+### Markdown batches
+
+The existing `read_markdown` and `add_markdown` tools also accept an `items` array containing 1–20 items.
+Each batch shares one absolute `cwd` and one corpus selection.
+Writes require `corpus`; reads retain the wiki-for-cwd default.
+Do not mix singular fields with `items`, or place checkout and corpus selectors inside items.
+Results preserve input order and contain each item's index, path, and result or error.[^batches]
+
+Read items retain independent `line_numbers` and `footnotes` settings.
+The MCP adapter sends separate sequential read RPCs to avoid the aggregate 4 MiB response limit.
+Write batches use one daemon request.
+The daemon runs existing write handlers sequentially, without an outer mutation lock.
+Each handler retains its existing path checks and mutation guards.[^batches]
+
+Batch writes are not transactions.
+An item failure does not stop later items or undo earlier writes.
+The daemon does not isolate the batch from other clients.
+Envelope, item-count, selector, and request-frame checks occur before writes.
+A malformed successful item response becomes an item-local uncertainty error; other known outcomes remain available.
+Transport failures, malformed response envelopes, and incorrect result counts can leave batch completion uncertain.
+Inspect affected files before retrying; the client does not replay writes automatically.[^batches]
+
 ### `delete_markdown`
 
 Unlink a file from the corpus' first root and prune its rows from the
@@ -206,6 +228,21 @@ case-insensitively with `.md` stripped, `[[target|alias]]` matches on the
 target, and links inside fenced code blocks are ignored so an example in a
 doc isn't mistaken for a real link. A file the scan cannot read produces a
 `warnings` entry and a partial result rather than an error.
+
+## Wiki-query recovery from incomplete index reconciliation
+
+Wiki-query recovery remains bounded when index reconciliation is incomplete.
+Ground outline warnings appear immediately after the query summary, before document snippets.
+Warning-free outlines and structured responses retain their existing shape.
+Ripgrep diagnostics explain candidate-pool drops and truncation without changing ranking.[^retrieval]
+
+The wiki-query workflow distinguishes incomplete retrieval from missing knowledge.
+Keep the original `cwd` and corpus throughout recovery.
+For reconciliation warnings, read corpus statistics once.
+Retry the identical Ground query once only when those statistics show complete coverage.
+Otherwise, use one tree listing and at most five fallback page reads.
+Do not poll, index, write, or broaden the corpus during this recovery.
+Retain any unresolved reconciliation warning in the answer.[^retrieval]
 
 ## Error mapping
 
@@ -264,4 +301,7 @@ that's exactly the multi-process race the daemon exists to prevent.
 [^workspace-path]: crates/hallouminate-domain/src/corpus/sandbox.rs; crates/hallouminate/src/mcp/tools.rs::SERVER_INSTRUCTIONS
 [^selection]: crates/hallouminate-daemon/src/dispatch.rs::handle_corpus_stats; crates/hallouminate/src/mcp/tools.rs::corpus_stats
 
-_Source: issue #453 workspace path contract · Updated: 2026-09-05 · Supersedes: startup-captured MCP directory and parameterless list_corpora_
+[^batches]: crates/hallouminate/src/mcp/tools.rs::add_markdown_batch and ::read_markdown_batch; crates/hallouminate-daemon/src/dispatch.rs::handle_add_markdown_batch; crates/hallouminate-daemon/src/client.rs::DaemonClient::call_raw and ::call_raw_with_timeout
+[^retrieval]: crates/hallouminate-domain/src/ground/format.rs::render_outline; crates/hallouminate-domain/src/search.rs::search_fused; plugins/hallouminate/skills/wiki-query/SKILL.md
+
+_Source: PR #561 and issue #453 · Updated: 2026-10-01 · Supersedes: singular-only markdown call documentation and first-root write wording_
