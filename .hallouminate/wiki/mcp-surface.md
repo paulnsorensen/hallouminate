@@ -176,6 +176,8 @@ Batch writes are not transactions.
 An item failure does not stop later items or undo earlier writes.
 The daemon does not isolate the batch from other clients.
 Envelope, item-count, selector, and request-frame checks occur before writes.
+A serialized write batch, including its newline, must not exceed the 4 MiB IPC frame limit.
+Larger requests fail before any write, even when they contain no more than 20 items.
 A malformed successful item response becomes an item-local uncertainty error; other known outcomes remain available.
 Transport failures, malformed response envelopes, and incorrect result counts can leave batch completion uncertain.
 Inspect affected files before retrying; the client does not replay writes automatically.[^batches]
@@ -238,9 +240,12 @@ Ripgrep diagnostics explain candidate-pool drops and truncation without changing
 
 The wiki-query workflow distinguishes incomplete retrieval from missing knowledge.
 Keep the original `cwd` and corpus throughout recovery.
-For reconciliation warnings, read corpus statistics once.
-Retry the identical Ground query once only when those statistics show complete coverage.
-Otherwise, use one tree listing and at most five fallback page reads.
+When evidence is insufficient, allow at most one corpus statistics call per sub-question.
+Allow at most one identical Ground retry only when file coverage is complete.
+If evidence remains insufficient, use at most one tree listing and five fallback page reads.
+This fallback also applies after a permitted retry leaves insufficient evidence.
+Reuse a tree already supplied by the root; do not request it again.
+Count fallback pages, not batch calls. Normal citation verification reads are outside this recovery budget.
 Do not poll, index, write, or broaden the corpus during this recovery.
 Retain any unresolved reconciliation warning in the answer.[^retrieval]
 
