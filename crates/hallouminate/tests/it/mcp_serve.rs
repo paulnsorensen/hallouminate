@@ -2623,11 +2623,25 @@ async fn mcp_markdown_batch_transport_failure_is_uncertain_and_never_replayed() 
 }
 
 #[tokio::test]
-async fn mcp_markdown_batch_preserves_retryable_item_metadata() {
+async fn mcp_markdown_batch_preserves_outcomes_after_malformed_success() {
     let xdg = tempfile::tempdir().expect("config");
     write_minimal_config(xdg.path());
     let socket = xdg.path().join("retryable.sock");
     let listener = tokio::net::UnixListener::bind(&socket).expect("listener");
+    let first = json!({
+        "corpus": "wiki", "path": "first.md", "absolute_path": "/wiki/first.md",
+        "indexed": {"corpora": []}, "warnings": ["first warning"]
+    });
+    let last = json!({
+        "corpus": "wiki", "path": "last.md", "absolute_path": "/wiki/last.md",
+        "indexed": {"corpora": []}
+    });
+    let response = json!({"status": "ok", "result": {"results": [
+        {"status": "ok", "result": first},
+        {"status": "ok", "result": null},
+        {"status": "err", "kind": "retryable", "message": "hard-debt wait expired"},
+        {"status": "ok", "result": last}
+    ]}});
     let server = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -2638,14 +2652,26 @@ async fn mcp_markdown_batch_preserves_retryable_item_metadata() {
             }
             let request: Value = serde_json::from_str(&line).expect("request");
             assert_eq!(request["payload"]["op"], "add_markdown_batch");
-            let response = json!({"status": "ok", "result": {"results": [
-                {"status": "err", "kind": "retryable", "message": "hard-debt wait expired"}
-            ]}});
+            let items = request["payload"]["items"].as_array().expect("items");
+            for (index, path) in ["first.md", "unknown.md", "later.md", "last.md"]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(items[index]["path"], path);
+            }
+            assert_eq!(items.len(), 4);
             stream
                 .get_mut()
                 .write_all(format!("{response}\n").as_bytes())
                 .await
                 .expect("response");
+            drop(stream);
+            assert!(
+                timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "no automatic replay"
+            );
             break;
         }
     });
@@ -2656,18 +2682,46 @@ async fn mcp_markdown_batch_preserves_retryable_item_metadata() {
             "tools/call",
             json!({
                 "name": "add_markdown", "arguments": {"corpus": "wiki", "items": [
-                    {"path": "later.md", "content": ""}
+                    {"path": "first.md", "content": ""},
+                    {"path": "unknown.md", "content": ""},
+                    {"path": "later.md", "content": ""},
+                    {"path": "last.md", "content": ""}
                 ]}
             }),
         )
         .await;
     assert_eq!(
         call["result"]["structuredContent"]["results"],
-        json!([{
-            "index": 0, "path": "later.md", "error": {
+        json!([
+            {"index": 0, "path": "first.md", "result": first},
+            {"index": 1, "path": "unknown.md", "error": {
+                "code": -32603,
+                "message": "Item completion is uncertain: invalid item response: invalid type: null, expected struct AddMarkdownResult; inspect the file before retrying."
+            }},
+            {"index": 2, "path": "later.md", "error": {
                 "code": -32603, "message": "hard-debt wait expired", "data": {"retryable": true}
-            }
-        }])
+            }},
+            {"index": 3, "path": "last.md", "result": last}
+        ]),
+        "{call}"
+    );
+    let text = call["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(
+        text.contains("[0] first.md\nwrote first.md and refreshed corpus wiki"),
+        "{text}"
+    );
+    assert!(text.contains("first warning"), "{text}");
+    assert!(
+        text.contains("[1] unknown.md\nerror -32603: Item completion is uncertain"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[2] later.md\nerror -32603: hard-debt wait expired"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[3] last.md\nwrote last.md and refreshed corpus wiki"),
+        "{text}"
     );
     server.await.expect("server");
     mcp.shutdown().await;

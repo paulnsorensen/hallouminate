@@ -153,16 +153,23 @@ pub struct AddMarkdownRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AddMarkdownItem {
+    /// Identifies the file relative to the shared corpus root.
     pub path: String,
+    /// Supplies the whole file or the selected edit fragment.
     pub content: String,
+    /// Permits replacement of an existing file in whole-file mode.
     #[serde(default)]
     pub overwrite: bool,
+    /// Selects the heading whose section receives the content.
     #[serde(default)]
     pub under_heading: Option<String>,
+    /// Selects where to insert content within the selected section.
     #[serde(default)]
     pub position: Position,
+    /// Selects an inclusive, one-based line range to replace.
     #[serde(default)]
     pub replace_lines: Option<LineRange>,
+    /// Selects a unique literal substring to replace.
     #[serde(default)]
     pub replace_match: Option<String>,
 }
@@ -170,6 +177,7 @@ pub struct AddMarkdownItem {
 /// Carries each completed item handler's response in input order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AddMarkdownBatchResult {
+    /// Contains one success or error per input item, in input order.
     pub results: Vec<DaemonResponse>,
 }
 

@@ -504,11 +504,14 @@ pub struct ListTreeParams {
     pub corpus: Option<String>,
 }
 
+/// Selects a single markdown write or an ordered batch.
 #[derive(Debug, JsonSchema)]
 #[schemars(untagged, extend("type" = "object", "required" = ["cwd", "corpus"]))]
 pub enum AddMarkdownParams {
+    /// Carries one markdown write.
     #[schemars(extend("not" = {"required": ["items"]}))]
     Single(AddMarkdownSingleParams),
+    /// Carries ordered writes in one corpus.
     Batch(AddMarkdownBatchParams),
 }
 
@@ -527,6 +530,7 @@ impl<'de> Deserialize<'de> for AddMarkdownParams {
     }
 }
 
+/// Carries one to twenty ordered markdown writes in one corpus.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddMarkdownBatchParams {
@@ -554,11 +558,14 @@ struct AddMarkdownItemParams {
     replace_match: Option<String>,
 }
 
+/// Selects a single markdown read or an ordered batch.
 #[derive(Debug, JsonSchema)]
 #[schemars(untagged, extend("type" = "object", "required" = ["cwd"]))]
 pub enum ReadMarkdownParams {
+    /// Carries one markdown read.
     #[schemars(extend("not" = {"required": ["items"]}))]
     Single(ReadMarkdownSingleParams),
+    /// Carries reads with independent display settings.
     Batch(ReadMarkdownBatchParams),
 }
 
@@ -577,6 +584,7 @@ impl<'de> Deserialize<'de> for ReadMarkdownParams {
     }
 }
 
+/// Carries one to twenty markdown reads with shared corpus selection.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadMarkdownBatchParams {
@@ -1161,13 +1169,12 @@ impl HallouminateTools {
         for (index, (path, response)) in paths.into_iter().zip(response.results).enumerate() {
             let outcome = match response {
                 DaemonResponse::Ok { result } => {
-                    let response: AddMarkdownResult = serde_json::from_value(result.clone())
-                        .map_err(|error| {
-                            internal_error(format!(
-                                "Batch completion is uncertain: invalid item response: {error}"
-                            ))
-                        })?;
-                    Ok((render_add_markdown(&response), result))
+                    match serde_json::from_value::<AddMarkdownResult>(result.clone()) {
+                        Ok(response) => Ok((render_add_markdown(&response), result)),
+                        Err(error) => Err(internal_error(format!(
+                            "Item completion is uncertain: invalid item response: {error}; inspect the file before retrying."
+                        ))),
+                    }
                 }
                 DaemonResponse::Err { kind, message } => {
                     Err(map_daemon_err(DaemonRpcError { kind, message }.into()))

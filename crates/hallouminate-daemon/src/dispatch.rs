@@ -2175,9 +2175,11 @@ fn read_miss_closest_matches(
     let stem = relative.file_stem()?.to_string_lossy();
     let entries = list_corpus_files(corpus).ok()?;
     let mut ranked: Vec<(f64, String)> = Vec::new();
-    for entry in entries {
-        if shown.contains(&PathBuf::from(&entry.path)) {
-            continue;
+    'candidates: for entry in entries {
+        for path in shown {
+            if path.as_path() == Path::new(&entry.path) {
+                continue 'candidates;
+            }
         }
         let Some(candidate_stem) = Path::new(&entry.path).file_stem() else {
             continue;
