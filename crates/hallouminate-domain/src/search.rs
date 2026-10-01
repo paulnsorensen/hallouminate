@@ -86,6 +86,10 @@ pub trait ChunkRetrieval: Send + Sync {
 
 /// Outcome of [`search_fused`]: the fused hits plus any warnings raised
 /// while assembling the four signals (e.g. a degraded ripgrep pass).
+///
+/// The `ripgrep-unresolved` warning retains the hit count and corpus root.
+/// It also reports `dropped_file_not_in_pool`, `dropped_line_out_of_range`,
+/// and `truncated` from the same ripgrep resolver pass.
 pub struct FusedSearch {
     pub hits: Vec<SearchHit>,
     pub warnings: Vec<Warning>,
@@ -171,9 +175,12 @@ pub async fn search_fused(
         warnings.push(Warning {
             code: "ripgrep-unresolved".to_string(),
             message: format!(
-                "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}",
+                "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}; dropped_file_not_in_pool={}, dropped_line_out_of_range={}, truncated={}",
                 rg_hits.len(),
-                corpus_key.canonical_root.display()
+                corpus_key.canonical_root.display(),
+                rg_stats.dropped_file_not_in_pool,
+                rg_stats.dropped_line_out_of_range,
+                rg_truncated
             ),
         });
     }
@@ -573,6 +580,23 @@ mod tests {
         assert_eq!(stats.dropped_line_out_of_range, 0);
     }
 
+    #[test]
+    fn rg_drop_counts_separate_mixed_causes() {
+        let candidates = pool(vec![hit("a", "/repo/wiki/x.md", 10, 20)]);
+        let (counts, stats) = resolve_rg_hits_to_chunks(
+            &candidates,
+            &[
+                rg_hit("/repo/wiki/missing.md", 1, &["alpha", "beta"]),
+                rg_hit("/repo/wiki/other.md", 1, &["alpha"]),
+                rg_hit("/repo/wiki/x.md", 1, &["alpha"]),
+                rg_hit("/repo/wiki/x.md", 15, &["alpha"]),
+            ],
+        );
+        assert_eq!(counts, HashMap::from([("a".to_string(), 1)]));
+        assert_eq!(stats.dropped_file_not_in_pool, 2);
+        assert_eq!(stats.dropped_line_out_of_range, 1);
+    }
+
     /// Term count sizes both the rg argument list and the rg budget, so an
     /// arbitrarily long query must not steer either.
     #[test]
@@ -898,6 +922,100 @@ mod tests {
             vec!["a", "b", "d", "c"],
             "fused order must reflect FTS_WEIGHT/VECTOR_WEIGHT/CONTAINS_WEIGHT applied to their own lists, not swapped"
         );
+    }
+
+    #[tokio::test]
+    async fn unresolved_warning_reports_exact_drop_counts_and_truncation() {
+        for (file_drops, line_drops, limit, truncated) in [
+            (2, 0, 10, false),
+            (0, 3, 10, false),
+            (2, 3, 10, false),
+            (2, 0, 2, true),
+            (50, 0, 100, false),
+        ] {
+            let root = tempfile::tempdir().expect("ripgrep fixture root");
+            let corpus_key = CorpusKey {
+                name: "fixtures".into(),
+                canonical_root: root.path().canonicalize().expect("canonical fixture root"),
+            };
+            let mut candidates = vec![
+                hit("first", "/outside/first.md", 1, 1),
+                hit("second", "/outside/second.md", 1, 1),
+            ];
+            for index in 0..file_drops + line_drops {
+                let path = corpus_key
+                    .canonical_root
+                    .join(format!("match-{index:03}.md"));
+                std::fs::write(&path, "distinctiveterm private matched text\n")
+                    .expect("write real ripgrep match");
+                if index >= file_drops {
+                    candidates.push(hit(
+                        &format!("range-{index}"),
+                        path.to_str().expect("UTF-8 fixture path"),
+                        2,
+                        3,
+                    ));
+                }
+            }
+            let store = FakeFusionStore {
+                fts: vec!["first".into(), "second".into()],
+                vector: vec!["second".into()],
+                hits: pool(candidates),
+            };
+            let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], limit)
+                .await
+                .expect("search with unresolved real ripgrep hits");
+
+            assert_eq!(result.hits.len(), 2);
+            assert_eq!(result.hits[0].chunk_id, "second");
+            assert_eq!(result.hits[0].score, 2.0 / 61.0 + 1.0 / 60.0);
+            assert_eq!(result.hits[1].chunk_id, "first");
+            assert_eq!(result.hits[1].score, 2.0 / 60.0);
+            assert_eq!(result.warnings.len(), 1);
+            assert_eq!(result.warnings[0].code, "ripgrep-unresolved");
+            assert_eq!(
+                result.warnings[0].message,
+                format!(
+                    "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}; dropped_file_not_in_pool={file_drops}, dropped_line_out_of_range={line_drops}, truncated={truncated}",
+                    file_drops + line_drops,
+                    corpus_key.canonical_root.display(),
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_or_absent_ripgrep_hits_do_not_warn() {
+        for (contents, expected_score) in [
+            ("distinctiveterm\n", 2.0 / 60.0 + 0.5 / 60.0),
+            ("unrelated\n", 2.0 / 60.0),
+        ] {
+            let root = tempfile::tempdir().expect("ripgrep fixture root");
+            let corpus_key = CorpusKey {
+                name: "fixtures".into(),
+                canonical_root: root.path().canonicalize().expect("canonical fixture root"),
+            };
+            let path = corpus_key.canonical_root.join("candidate.md");
+            std::fs::write(&path, contents).expect("write real ripgrep candidate");
+            let store = FakeFusionStore {
+                fts: vec!["candidate".into()],
+                vector: Vec::new(),
+                hits: pool(vec![hit(
+                    "candidate",
+                    path.to_str().expect("UTF-8 fixture path"),
+                    1,
+                    1,
+                )]),
+            };
+            let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
+                .await
+                .expect("search with resolved or absent real ripgrep hits");
+
+            assert!(result.warnings.is_empty());
+            assert_eq!(result.hits.len(), 1);
+            assert_eq!(result.hits[0].chunk_id, "candidate");
+            assert_eq!(result.hits[0].score, expected_score);
+        }
     }
 
     #[tokio::test]

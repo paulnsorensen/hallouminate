@@ -1379,6 +1379,21 @@ async fn mcp_read_markdown_defaults_corpus_to_repo_wiki_when_omitted() {
     assert_eq!(structured["path"].as_str(), Some("cheeses/halloumi.md"));
     assert_eq!(structured["content"].as_str(), Some(body));
 
+    let batch = mcp
+        .rpc(
+            3,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"cwd": workspace, "items": [{"path": "cheeses/halloumi.md"}]}
+            }),
+        )
+        .await;
+    assert_eq!(
+        batch["result"]["structuredContent"]["results"][0]["result"],
+        *structured
+    );
+
     mcp.shutdown().await;
 }
 
@@ -2222,4 +2237,584 @@ async fn mcp_ground_footnotes_exclude_strips_markers() {
     );
 
     mcp.shutdown().await;
+}
+
+async fn markdown_batch_mcp(config: &Path, socket: &Path) -> Mcp {
+    let mut mcp = Mcp::spawn(config, Some(socket)).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "markdown-batches", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+    mcp
+}
+
+#[tokio::test]
+async fn mcp_markdown_batch_reads_keep_order_formatting_and_item_errors() {
+    let xdg = tempfile::tempdir().expect("config");
+    let corpus = tempfile::tempdir().expect("corpus");
+    let body = "# Cheese\n\nBody[^1].\n\n[^1]: source\n";
+    std::fs::write(corpus.path().join("cheese.md"), body).expect("seed");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+    let mut mcp = markdown_batch_mcp(xdg.path(), harness.socket()).await;
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown",
+                "arguments": {"corpus": "wiki", "items": [
+                    {"path": "cheese.md", "line_numbers": true, "footnotes": "exclude"},
+                    {"path": "missing.md"},
+                    {"path": "cheese.md", "footnotes": "only"}
+                ]}
+            }),
+        )
+        .await;
+    assert_eq!(call.get("error"), None, "{call}");
+    assert_ne!(call["result"]["isError"], true, "{call}");
+    let results = call["result"]["structuredContent"]["results"]
+        .as_array()
+        .expect("ordered results");
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["index"], 0);
+    assert_eq!(results[0]["path"], "cheese.md");
+    assert_eq!(results[0]["result"]["content"], body);
+    assert_eq!(results[1]["index"], 1);
+    assert_eq!(results[1]["error"]["code"], -32602);
+    assert!(
+        results[1]["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("missing.md")
+    );
+    assert_eq!(results[2]["index"], 2);
+    assert_eq!(results[2]["result"]["content"], body);
+    let text = call["result"]["content"][0]["text"].as_str().expect("text");
+    let (first, rest) = text
+        .split_once("\n\n[1] missing.md\n")
+        .expect("item 1 label");
+    assert_eq!(
+        first,
+        "[0] cheese.md\n     1\t# Cheese\n     2\t\n     3\tBody.\n     4\t\n"
+    );
+    let (error, last) = rest
+        .split_once("\n\n[2] cheese.md\n")
+        .expect("item 2 label");
+    assert_eq!(
+        error,
+        format!(
+            "error -32602: {}",
+            results[1]["error"]["message"].as_str().expect("message")
+        )
+    );
+    assert_eq!(last, "[^1]: source\n");
+    mcp.shutdown().await;
+    harness.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn mcp_markdown_batch_writes_keep_successes_and_duplicate_path_order() {
+    let xdg = tempfile::tempdir().expect("config");
+    let corpus = tempfile::tempdir().expect("corpus");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+    let mut mcp = markdown_batch_mcp(xdg.path(), harness.socket()).await;
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "add_markdown",
+                "arguments": {"corpus": "wiki", "items": [
+                    {"path": "first.md", "content": "\n"},
+                    {"path": "first.md", "content": " "},
+                    {"path": "first.md", "content": "\t", "replace_lines": {"start": 1, "end": 1}},
+                    {"path": "last.md", "content": ""}
+                ]}
+            }),
+        )
+        .await;
+    assert_eq!(call.get("error"), None, "{call}");
+    assert_ne!(call["result"]["isError"], true, "{call}");
+    let results = call["result"]["structuredContent"]["results"]
+        .as_array()
+        .expect("results");
+    assert_eq!(results.len(), 4);
+    for index in [0, 2, 3] {
+        assert_eq!(results[index]["index"], index);
+        assert_eq!(results[index]["result"]["corpus"], "wiki");
+        assert_eq!(results[index].get("error"), None);
+    }
+    assert_eq!(results[1]["error"]["code"], -32602);
+    assert!(
+        results[1]["error"]["message"]
+            .as_str()
+            .expect("error")
+            .contains("already exists")
+    );
+    assert_eq!(
+        std::fs::read_to_string(corpus.path().join("first.md")).expect("first"),
+        "\t\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(corpus.path().join("last.md")).expect("last"),
+        ""
+    );
+    mcp.shutdown().await;
+    harness.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn mcp_markdown_batch_rejects_invalid_envelopes_before_writing() {
+    let xdg = tempfile::tempdir().expect("config");
+    let corpus = tempfile::tempdir().expect("corpus");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+    let mut mcp = markdown_batch_mcp(xdg.path(), harness.socket()).await;
+    let first = json!({"path": "never.md", "content": ""});
+    let cases = [
+        (json!({"items": []}), "1–20"),
+        (json!({"items": vec![first.clone(); 21]}), "1–20"),
+        (
+            json!({"items": [first.clone()], "overwrite": false}),
+            "unknown field",
+        ),
+        (
+            json!({"items": [first.clone()], "path": "single.md", "content": ""}),
+            "unknown field",
+        ),
+        (
+            json!({"items": [first.clone(), {"path": "broken.md"}]}),
+            "missing field",
+        ),
+        (
+            json!({"items": [first.clone(), {"path": "broken.md", "content": "", "overwrite": "false"}]}),
+            "invalid type",
+        ),
+        (
+            json!({"items": [first.clone(), {"path": "broken.md", "content": "", "corpus": "other"}]}),
+            "unknown field",
+        ),
+        (
+            json!({"items": [first.clone(), {"path": "broken.md", "content": "", "replace_match": "x", "under_heading": "x"}]}),
+            "at most one",
+        ),
+        (
+            json!({"items": null, "path": "single.md", "content": ""}),
+            "unknown field",
+        ),
+        (json!({"items": null}), "invalid type"),
+        (
+            json!({"items": [{"path": "never.md", "content": "\n".repeat(2 * 1024 * 1024)}]}),
+            "4 MiB",
+        ),
+    ];
+    for (index, (mut arguments, expected)) in cases.into_iter().enumerate() {
+        arguments["corpus"] = json!("wiki");
+        let call = mcp
+            .rpc(
+                index as u64 + 2,
+                "tools/call",
+                json!({
+                    "name": "add_markdown", "arguments": arguments
+                }),
+            )
+            .await;
+        let message = match call.get("error") {
+            Some(error) => {
+                assert_eq!(error["code"], -32602, "{error}");
+                error["message"].as_str().expect("error message")
+            }
+            None => {
+                assert_eq!(call["result"]["isError"], true, "{call}");
+                call["result"]["content"][0]["text"]
+                    .as_str()
+                    .expect("validation text")
+            }
+        };
+        assert!(
+            message.contains(expected),
+            "expected {expected:?}: {message}"
+        );
+        assert_eq!(
+            std::fs::read_dir(corpus.path()).expect("entries").count(),
+            0
+        );
+    }
+    for (index, arguments) in [
+        json!({"items": [{"path": "never.md"}], "line_numbers": false}),
+        json!({"items": [{"path": "never.md"}, {"path": 1}]}),
+        json!({"items": [{"path": "never.md", "cwd": "/"}]}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let call = mcp
+            .rpc(
+                index as u64 + 30,
+                "tools/call",
+                json!({
+                    "name": "read_markdown", "arguments": arguments
+                }),
+            )
+            .await;
+        assert_eq!(call["result"]["isError"], true, "{call}");
+        assert!(
+            call["result"]["content"][0]["text"]
+                .as_str()
+                .expect("error")
+                .contains("failed to deserialize")
+        );
+    }
+    mcp.shutdown().await;
+    harness.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn mcp_markdown_batch_reads_exceed_aggregate_ipc_frame_limit() {
+    let xdg = tempfile::tempdir().expect("config");
+    let corpus = tempfile::tempdir().expect("corpus");
+    let body = "x".repeat(2 * 1024 * 1024 + 1024);
+    std::fs::write(corpus.path().join("large.md"), &body).expect("seed");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+    let mut mcp = markdown_batch_mcp(xdg.path(), harness.socket()).await;
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "read_markdown", "arguments": {"corpus": "wiki", "items": [
+                    {"path": "large.md"}, {"path": "large.md"}
+                ]}
+            }),
+        )
+        .await;
+    let results = call["result"]["structuredContent"]["results"]
+        .as_array()
+        .expect("results");
+    assert_eq!(results.len(), 2);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["index"], index);
+        assert_eq!(result["result"]["content"].as_str(), Some(body.as_str()));
+    }
+    mcp.shutdown().await;
+    harness.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn mcp_markdown_batch_preserves_path_safety_and_continues() {
+    let xdg = tempfile::tempdir().expect("config");
+    let corpus = tempfile::tempdir().expect("corpus");
+    let outside = tempfile::tempdir().expect("outside");
+    let secret = "outside secret";
+    std::fs::write(outside.path().join("secret.md"), secret).expect("secret");
+    std::os::unix::fs::symlink(outside.path(), corpus.path().join("link")).expect("symlink");
+    std::fs::write(corpus.path().join("safe.md"), "").expect("safe");
+    let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    let harness = DaemonHarness::spawn(cfg).await;
+    let mut mcp = markdown_batch_mcp(xdg.path(), harness.socket()).await;
+    for (id, name, items) in [
+        (
+            2,
+            "read_markdown",
+            json!([
+                {"path": "../secret.md"}, {"path": "link/secret.md"}, {"path": "safe.md"}
+            ]),
+        ),
+        (
+            3,
+            "add_markdown",
+            json!([
+                {"path": "../secret.md", "content": "", "overwrite": true},
+                {"path": "link/secret.md", "content": "", "overwrite": true},
+                {"path": "created.md", "content": ""}
+            ]),
+        ),
+    ] {
+        let call = mcp
+            .rpc(
+                id,
+                "tools/call",
+                json!({
+                    "name": name, "arguments": {"corpus": "wiki", "items": items}
+                }),
+            )
+            .await;
+        let results = call["result"]["structuredContent"]["results"]
+            .as_array()
+            .expect("results");
+        assert_eq!(results.len(), 3);
+        for result in &results[..2] {
+            assert_eq!(result["error"]["code"], -32602, "{result}");
+            assert_eq!(result.get("result"), None);
+        }
+        assert_eq!(results[2]["result"]["corpus"], "wiki");
+        assert!(!call.to_string().contains(secret));
+    }
+    assert_eq!(
+        std::fs::read_to_string(outside.path().join("secret.md")).expect("secret"),
+        secret
+    );
+    assert_eq!(
+        std::fs::read_to_string(corpus.path().join("created.md")).expect("created"),
+        ""
+    );
+    mcp.shutdown().await;
+    harness.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn mcp_markdown_batch_transport_failure_is_uncertain_and_never_replayed() {
+    let xdg = tempfile::tempdir().expect("config");
+    write_minimal_config(xdg.path());
+    let socket = xdg.path().join("transport.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("listener");
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            if stream.read_line(&mut line).await.expect("read") == 0 {
+                continue;
+            }
+            let request: Value = serde_json::from_str(&line).expect("request");
+            assert_eq!(request["payload"]["op"], "add_markdown_batch");
+            assert_eq!(request["payload"]["items"][0]["path"], "once.md");
+            drop(stream);
+            assert!(
+                timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "no automatic replay"
+            );
+            break;
+        }
+    });
+    let mut mcp = markdown_batch_mcp(xdg.path(), &socket).await;
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "add_markdown", "arguments": {"corpus": "wiki", "items": [
+                    {"path": "once.md", "content": ""}
+                ]}
+            }),
+        )
+        .await;
+    assert_eq!(call["error"]["code"], -32603, "{call}");
+    let message = call["error"]["message"].as_str().expect("message");
+    assert!(message.contains("completion is uncertain"), "{message}");
+    assert!(
+        message.contains("No automatic retry or rollback occurred"),
+        "{message}"
+    );
+    server.await.expect("transport server");
+    mcp.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_markdown_batch_preserves_outcomes_after_malformed_success() {
+    let xdg = tempfile::tempdir().expect("config");
+    write_minimal_config(xdg.path());
+    let socket = xdg.path().join("retryable.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).expect("listener");
+    let first = json!({
+        "corpus": "wiki", "path": "first.md", "absolute_path": "/wiki/first.md",
+        "indexed": {"corpora": []}, "warnings": ["first warning"]
+    });
+    let last = json!({
+        "corpus": "wiki", "path": "last.md", "absolute_path": "/wiki/last.md",
+        "indexed": {"corpora": []}
+    });
+    let response = json!({"status": "ok", "result": {"results": [
+        {"status": "ok", "result": first},
+        {"status": "ok", "result": null},
+        {"status": "err", "kind": "retryable", "message": "hard-debt wait expired"},
+        {"status": "ok", "result": last}
+    ]}});
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            if stream.read_line(&mut line).await.expect("read") == 0 {
+                continue;
+            }
+            let request: Value = serde_json::from_str(&line).expect("request");
+            assert_eq!(request["payload"]["op"], "add_markdown_batch");
+            let items = request["payload"]["items"].as_array().expect("items");
+            for (index, path) in ["first.md", "unknown.md", "later.md", "last.md"]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(items[index]["path"], path);
+            }
+            assert_eq!(items.len(), 4);
+            stream
+                .get_mut()
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("response");
+            drop(stream);
+            assert!(
+                timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "no automatic replay"
+            );
+            break;
+        }
+    });
+    let mut mcp = markdown_batch_mcp(xdg.path(), &socket).await;
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "add_markdown", "arguments": {"corpus": "wiki", "items": [
+                    {"path": "first.md", "content": ""},
+                    {"path": "unknown.md", "content": ""},
+                    {"path": "later.md", "content": ""},
+                    {"path": "last.md", "content": ""}
+                ]}
+            }),
+        )
+        .await;
+    assert_eq!(
+        call["result"]["structuredContent"]["results"],
+        json!([
+            {"index": 0, "path": "first.md", "result": first},
+            {"index": 1, "path": "unknown.md", "error": {
+                "code": -32603,
+                "message": "Item completion is uncertain: invalid item response: invalid type: null, expected struct AddMarkdownResult; inspect the file before retrying."
+            }},
+            {"index": 2, "path": "later.md", "error": {
+                "code": -32603, "message": "hard-debt wait expired", "data": {"retryable": true}
+            }},
+            {"index": 3, "path": "last.md", "result": last}
+        ]),
+        "{call}"
+    );
+    let text = call["result"]["content"][0]["text"].as_str().expect("text");
+    assert!(
+        text.contains("[0] first.md\nwrote first.md and refreshed corpus wiki"),
+        "{text}"
+    );
+    assert!(text.contains("first warning"), "{text}");
+    assert!(
+        text.contains("[1] unknown.md\nerror -32603: Item completion is uncertain"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[2] later.md\nerror -32603: hard-debt wait expired"),
+        "{text}"
+    );
+    assert!(
+        text.contains("[3] last.md\nwrote last.md and refreshed corpus wiki"),
+        "{text}"
+    );
+    server.await.expect("server");
+    mcp.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_markdown_batch_accepts_twenty_items_and_retains_write_warnings() {
+    let xdg = tempfile::tempdir().expect("config");
+    let corpus = tempfile::tempdir().expect("corpus");
+    let mut cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
+    cfg.embeddings.enabled = false;
+    let harness = DaemonHarness::spawn(cfg).await;
+    let mut mcp = markdown_batch_mcp(xdg.path(), harness.socket()).await;
+
+    let single = json!({"name": "add_markdown", "arguments": {
+        "corpus": "wiki", "path": "legacy.md", "content": "", "overwrite": false
+    }});
+    let legacy = mcp.rpc(40, "tools/call", single.clone()).await;
+    assert_eq!(
+        legacy["result"]["content"][0]["text"],
+        "wrote legacy.md and refreshed corpus wiki"
+    );
+    assert_eq!(legacy["result"]["structuredContent"]["path"], "legacy.md");
+    assert_eq!(legacy["result"]["structuredContent"].get("warnings"), None);
+    assert_eq!(legacy["result"]["structuredContent"].get("results"), None);
+    let repeated = mcp.rpc(41, "tools/call", single).await;
+    assert_eq!(repeated["error"]["code"], -32602);
+    assert_eq!(
+        repeated["error"]["message"],
+        "legacy.md already exists; pass overwrite=true to replace it"
+    );
+    let body = "# Cheese\n\n[missing]()\n";
+    let mut writes = Vec::new();
+    let mut reads = Vec::new();
+    for index in 0..20 {
+        let path = format!("item-{index}.md");
+        writes.push(json!({"path": path, "content": if index == 0 { body } else { "" }}));
+        reads.push(json!({"path": path}));
+    }
+    let call = mcp
+        .rpc(
+            2,
+            "tools/call",
+            json!({
+                "name": "add_markdown", "arguments": {"corpus": "wiki", "items": writes}
+            }),
+        )
+        .await;
+    let results = call["result"]["structuredContent"]["results"]
+        .as_array()
+        .expect("write results");
+    assert_eq!(results.len(), 20);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["index"], index);
+        assert_eq!(result["result"]["path"], format!("item-{index}.md"));
+        assert_eq!(result.get("error"), None, "{result}");
+    }
+    let warnings = results[0]["result"]["warnings"]
+        .as_array()
+        .expect("warnings");
+    assert!(!warnings.is_empty(), "lint warning survives batch");
+    let text = call["result"]["content"][0]["text"].as_str().expect("text");
+    for warning in warnings {
+        assert!(
+            text.contains(warning.as_str().expect("warning text")),
+            "{text}"
+        );
+    }
+    let call = mcp
+        .rpc(
+            3,
+            "tools/call",
+            json!({
+                "name": "read_markdown", "arguments": {"items": reads}
+            }),
+        )
+        .await;
+    let results = call["result"]["structuredContent"]["results"]
+        .as_array()
+        .expect("read results");
+    assert_eq!(results.len(), 20);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["index"], index);
+        assert_eq!(result["result"]["path"], format!("item-{index}.md"));
+        assert_eq!(
+            result["result"]["content"],
+            if index == 0 { body } else { "" }
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(corpus.path().join("item-0.md")).expect("written"),
+        body
+    );
+    mcp.shutdown().await;
+    harness.shutdown().await.expect("shutdown");
 }

@@ -16,7 +16,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
-use super::framing::ipc_lines;
+use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
 use super::socket::daemon_socket_paths;
 
@@ -138,11 +138,19 @@ impl DaemonClient {
     /// Send one request, parse one response. The daemon protocol is
     /// one-shot per connection, so each call opens a new socket.
     pub async fn call_raw(&self, req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
+        let mut text = serde_json::to_string(&req)?;
+        text.push('\n');
+        if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload
+            && text.len() > MAX_IPC_LINE_BYTES
+        {
+            return Err(DaemonRpcError::invalid_params(
+                "serialized markdown batch exceeds the 4 MiB IPC frame limit",
+            )
+            .into());
+        }
         let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
             daemon_client_unavailable(format!("connect to {} failed: {e}", self.socket.display()))
         })?;
-        let mut text = serde_json::to_string(&req)?;
-        text.push('\n');
         // Wrap mid-call I/O errors with the same `daemon unavailable` hint
         // the initial connect uses. Without this, a daemon that dies after
         // the connect succeeds (write fails, read returns EOF, response
@@ -184,6 +192,7 @@ impl DaemonClient {
     /// Deadline expiry is typed [`DaemonRpcError`] with
     /// [`ErrorKind::Retryable`] (#216): the daemon accepted the connection,
     /// so it is likely busy rather than down, and the caller can retry.
+    /// Batch deadlines leave completion uncertain; callers must inspect files before retrying.
     /// Transport failures inside `call_raw` (connect/write/read/EOF) keep
     /// the untyped "daemon unavailable" shape with its restart hint —
     /// retrying against a dead daemon cannot succeed.
@@ -192,10 +201,14 @@ impl DaemonClient {
         req: DaemonRequest,
         timeout: Duration,
     ) -> anyhow::Result<DaemonResponse> {
+        let mut timeout_hint = "the daemon may be busy — retry";
+        if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload {
+            timeout_hint = "batch completion is uncertain; inspect files before retrying. No automatic retry or rollback occurred";
+        }
         match tokio::time::timeout(timeout, self.call_raw(req)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(DaemonRpcError::retryable(format!(
-                "no response from {} within {}s; the daemon may be busy — retry",
+                "no response from {} within {}s; {timeout_hint}",
                 self.socket.display(),
                 timeout.as_secs(),
             ))
@@ -235,6 +248,7 @@ fn timeout_for(payload: &DaemonRequestPayload) -> Duration {
         DaemonRequestPayload::Ground(_) => Duration::from_secs(120),
         DaemonRequestPayload::Index(_)
         | DaemonRequestPayload::AddMarkdown(_)
+        | DaemonRequestPayload::AddMarkdownBatch { .. }
         | DaemonRequestPayload::DeleteMarkdown(_) => Duration::from_secs(15 * 60),
         DaemonRequestPayload::Ping
         | DaemonRequestPayload::ListCorpora
@@ -705,5 +719,108 @@ mod tests {
             .await
             .expect_err("truncated response must fail");
         assert!(error.to_string().contains("invalid daemon response"));
+    }
+
+    fn markdown_batch_request(content: String) -> DaemonRequest {
+        DaemonRequest {
+            cwd: PathBuf::from("/"),
+            payload: DaemonRequestPayload::AddMarkdownBatch {
+                corpus: "wiki".into(),
+                items: vec![crate::ipc::AddMarkdownItem {
+                    path: "once.md".into(),
+                    content,
+                    overwrite: false,
+                    under_heading: None,
+                    position: crate::ipc::Position::default(),
+                    replace_lines: None,
+                    replace_match: None,
+                }],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn markdown_batch_frame_limit_includes_the_newline_before_connect() {
+        let base = serde_json::to_vec(&markdown_batch_request(String::new()))
+            .expect("serialize")
+            .len();
+        let request = markdown_batch_request(" ".repeat(MAX_IPC_LINE_BYTES - base - 1));
+        assert_eq!(
+            serde_json::to_vec(&request).expect("serialize").len() + 1,
+            MAX_IPC_LINE_BYTES
+        );
+        let tmp = tempfile::tempdir().expect("temp");
+        let socket = tmp.path().join("frame.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut lines = ipc_lines(read);
+            let line = lines.next().await.expect("line").expect("valid frame");
+            assert_eq!(line.len() + 1, MAX_IPC_LINE_BYTES);
+            write
+                .write_all(b"{\"status\":\"ok\",\"result\":\"accepted\"}\n")
+                .await
+                .expect("response");
+        });
+        let client = DaemonClient { socket };
+        let response = client.call_raw(request).await.expect("exact cap accepted");
+        let DaemonResponse::Ok { result } = response else {
+            panic!("cap rejected");
+        };
+        assert_eq!(result, "accepted");
+        server.await.expect("server");
+
+        let request = markdown_batch_request(" ".repeat(MAX_IPC_LINE_BYTES - base));
+        let client = DaemonClient {
+            socket: tmp.path().join("missing.sock"),
+        };
+        let error = client
+            .call_raw(request)
+            .await
+            .expect_err("one byte over cap");
+        let error = error
+            .downcast_ref::<DaemonRpcError>()
+            .expect("input error before connection");
+        assert_eq!(error.kind, ErrorKind::InvalidParams);
+        assert!(error.message.contains("4 MiB"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn markdown_batch_timeout_reports_uncertainty_without_replay() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let socket = tmp.path().join("timeout.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut lines = ipc_lines(stream);
+            let line = lines.next().await.expect("request").expect("frame");
+            let request: DaemonRequest = serde_json::from_str(&line).expect("request");
+            assert_eq!(timeout_for(&request.payload), Duration::from_secs(15 * 60));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "no replay"
+            );
+        });
+        let client = DaemonClient { socket };
+        let error = client
+            .call_raw_with_timeout(
+                markdown_batch_request(String::new()),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("timeout");
+        let error = error
+            .downcast_ref::<DaemonRpcError>()
+            .expect("typed timeout");
+        assert_eq!(error.kind, ErrorKind::Retryable);
+        assert!(
+            error.message.contains("completion is uncertain"),
+            "{}",
+            error.message
+        );
+        server.await.expect("server");
     }
 }

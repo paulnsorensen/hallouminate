@@ -48,6 +48,7 @@ pub struct DaemonRequest {
 /// `ReadMarkdown`, `Ground`) skip the write lane; mutating operations
 /// (`Index`, `AddMarkdown`, `DeleteMarkdown`) take the corpus lock and the
 /// write-lane permit in that order.
+/// `AddMarkdownBatch` delegates each item to `AddMarkdown` without an outer lock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DaemonRequestPayload {
@@ -65,6 +66,11 @@ pub enum DaemonRequestPayload {
     ListTree(ListTreeRequest),
     /// Write a markdown file to a corpus root and refresh its index rows.
     AddMarkdown(AddMarkdownRequest),
+    /// Writes items in order without rollback or isolation between items.
+    AddMarkdownBatch {
+        corpus: String,
+        items: Vec<AddMarkdownItem>,
+    },
     /// Read verbatim markdown content from a corpus root.
     ReadMarkdown(ReadMarkdownRequest),
     /// Unlink a markdown file from a corpus root and prune its index rows.
@@ -141,6 +147,38 @@ pub struct AddMarkdownRequest {
     /// substring.
     #[serde(default)]
     pub replace_match: Option<String>,
+}
+
+/// Carries one markdown mutation within a shared-corpus batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddMarkdownItem {
+    /// Identifies the file relative to the shared corpus root.
+    pub path: String,
+    /// Supplies the whole file or the selected edit fragment.
+    pub content: String,
+    /// Permits replacement of an existing file in whole-file mode.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Selects the heading whose section receives the content.
+    #[serde(default)]
+    pub under_heading: Option<String>,
+    /// Selects where to insert content within the selected section.
+    #[serde(default)]
+    pub position: Position,
+    /// Selects an inclusive, one-based line range to replace.
+    #[serde(default)]
+    pub replace_lines: Option<LineRange>,
+    /// Selects a unique literal substring to replace.
+    #[serde(default)]
+    pub replace_match: Option<String>,
+}
+
+/// Carries each completed item handler's response in input order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddMarkdownBatchResult {
+    /// Contains one success or error per input item, in input order.
+    pub results: Vec<DaemonResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

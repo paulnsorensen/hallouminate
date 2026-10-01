@@ -720,7 +720,8 @@ fn idle_clock_for(payload: &super::ipc::DaemonRequestPayload) -> IdleClock {
     match payload {
         DaemonRequestPayload::Ground(_)
         | DaemonRequestPayload::Index(_)
-        | DaemonRequestPayload::AddMarkdown(_) => IdleClock::Restart,
+        | DaemonRequestPayload::AddMarkdown(_)
+        | DaemonRequestPayload::AddMarkdownBatch { .. } => IdleClock::Restart,
         DaemonRequestPayload::Ping
         | DaemonRequestPayload::ListCorpora
         | DaemonRequestPayload::ListFiles(_)
@@ -808,13 +809,22 @@ fn authorize_peer(
 
 fn is_mutating_payload(payload: &super::ipc::DaemonRequestPayload) -> bool {
     use super::ipc::DaemonRequestPayload;
-    matches!(
-        payload,
+    match payload {
         DaemonRequestPayload::AddMarkdown(_)
-            | DaemonRequestPayload::DeleteMarkdown(_)
-            | DaemonRequestPayload::Index(_)
-            | DaemonRequestPayload::Shutdown
-    )
+        | DaemonRequestPayload::AddMarkdownBatch { .. }
+        | DaemonRequestPayload::DeleteMarkdown(_)
+        | DaemonRequestPayload::Index(_)
+        | DaemonRequestPayload::Shutdown => true,
+        DaemonRequestPayload::Ping
+        | DaemonRequestPayload::Ground(_)
+        | DaemonRequestPayload::ListCorpora
+        | DaemonRequestPayload::ListFiles(_)
+        | DaemonRequestPayload::ListTree(_)
+        | DaemonRequestPayload::ReadMarkdown(_)
+        | DaemonRequestPayload::Backlinks(_)
+        | DaemonRequestPayload::CorpusStats { .. }
+        | DaemonRequestPayload::Status => false,
+    }
 }
 
 /// Best-effort peer uid of a connected Unix-domain socket: `SO_PEERCRED` on
@@ -1303,5 +1313,23 @@ mod tests {
         }
 
         sleep_task.await.expect("idle-exit sleep task");
+    }
+
+    #[test]
+    fn markdown_batch_requires_peer_authorization_and_restarts_idle_clock() {
+        let payload = super::super::ipc::DaemonRequestPayload::AddMarkdownBatch {
+            corpus: "wiki".into(),
+            items: Vec::new(),
+        };
+        assert_eq!(idle_clock_for(&payload), IdleClock::Restart);
+        assert!(authorize_peer(Some(501), 501, &payload).is_none());
+        for uid in [None, Some(999)] {
+            let response = authorize_peer(uid, 501, &payload).expect("unauthorized");
+            let DaemonResponse::Err { kind, message } = response else {
+                panic!("unauthorized batch succeeded");
+            };
+            assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams);
+            assert!(message.contains("mutating"), "{message}");
+        }
     }
 }

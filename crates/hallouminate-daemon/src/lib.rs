@@ -48,11 +48,12 @@ pub use client::{
     daemon_client_unavailable,
 };
 pub use ipc::{
-    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusEntry,
-    CorpusStatsResult, DaemonRequest, DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest,
-    DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
-    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
-    Position, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
+    BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest,
+    ListFilesResult, ListTreeRequest, ListTreeResult, Position, ReadMarkdownRequest,
+    ReadMarkdownResult,
 };
 pub use ipc::{
     DebtLevel, LadderAction, StatusReport, TaskName, TaskState, TaskStatus, TripState,
