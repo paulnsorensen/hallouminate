@@ -1,6 +1,7 @@
 ---
 name: wiki-ingest
-description: Fold new knowledge into an existing hallouminate wiki — route each new fact to the page it extends, merge it in, create a page only when genuinely novel, and never blend contradictions. Use when there's source material to absorb or a fact to record — "add this to the wiki", "ingest these docs", "update the wiki with what we learned", "remember this", "record this decision", "/wiki-ingest <path|topic>". Do NOT use to bootstrap an empty wiki (use wiki-init) or to answer a question (use wiki-query).
+description: Folds new source material or a recorded fact into an existing hallouminate wiki, merging each claim into the page it extends. Use when the user says "add this to the wiki", "ingest these docs", "update the wiki with what we learned", "remember this", "record this decision", or invokes /wiki-ingest <path|topic>. Do NOT use to bootstrap an empty wiki (/wiki-init) or to answer a question (/wiki-query).
+argument-hint: "[path|topic]"
 ---
 
 # wiki-ingest — incremental ingest & update
@@ -27,15 +28,21 @@ harness's original directory. Pass the same `cwd` to every call in this skill.
   score, and the relevant existing lines. Retrieval and reading are fanned out;
   decisions are not.
 
-## Phase 1 — Atomize (root / opus)
+## Phase 1 — Hash and atomize (root / opus)
 
-- Take the source (a file path, pasted doc, a conversation takeaway, a decision) and
-  split it into **atomic claims** — one topic each, the same granularity as a wiki
-  page section. Don't ingest a 10-page doc as one blob.
-- Read `wiki-conventions.md` (the wiki's constitution) for slug/voice/merge rules.
-  If absent, fall back to hallouminate's authoring conventions (one topic per file,
-  H1 first line, kebab slug).
-- Pick the corpus (`repo:{name}:wiki` or ask).
+1. Take the source: the text after the skill name (a file path or topic). When that text is
+   empty, use the pasted doc, conversation takeaway, or decision in the current turn.
+2. Pick the corpus (`repo:{name}:wiki` or ask).
+3. Run the Layer 1 hash check (Phase 3) on the whole source. A ledger hit ends the run for this
+   source: write only its `skipped-duplicate-hash` log row (Phase 4), then report (Phase 5).
+4. Split the source into **atomic claims** — one topic each, the same granularity as a wiki
+   page section. Don't ingest a 10-page doc as one blob.
+5. Read `wiki-conventions.md` (the wiki's constitution) for slug/voice/merge rules.
+   If absent, fall back to hallouminate's authoring conventions (one topic per file,
+   H1 first line, kebab slug).
+
+Done when the source passed Layer 1, every claim is atomic, and every page that may change has
+frozen probes (below).
 
 ### Source pages and frozen retrieval probes
 
@@ -72,8 +79,10 @@ from the finished prose.
 
 ## Phase 2 — Locate (haiku, parallel)
 
-Spawn one haiku sub-agent per atomic claim, **in a single message**, each with this
-contract:
+Dispatch one fresh-context, read-only, haiku-tier sub-agent per atomic claim, all **in a single
+message** so they run in parallel (for example Claude `Agent(...)`, Codex `spawn_agent`, OMP
+`task(...)`). When the host has no sub-agent tool, the root runs the same contract inline for
+each claim. Each sub-agent follows this contract:
 
 > Run `ground { query: "<claim topic>", corpus: "<corpus>", top_files: 3, chunks_per_file: 3, cwd }`.
 > Return the best-matching existing page: its **corpus-relative path**, the file-level
@@ -99,24 +108,40 @@ kept *above* the start marker (outside it, so the daemon leaves it alone) and re
 normal `add_markdown` of the prose region; it must not duplicate the auto link list. **Exclude
 `log.md` from routing** — it is a journal, never a merge target.
 
+Done when every claim has a located page (with its read-back section) or `{ match: none }`.
+
 ## Phase 3 — Decide: 3-layer dedup (root / opus)
 
-Run an **ordered, short-circuiting** three-layer pipeline per source/claim. Each layer runs
-only if the previous one did not decide. The bands are **numeric and named**; the units are
-hallouminate `z_score`/`score`, **not raw cosine** — `ground` exposes no cosine between two texts.
+Run an **ordered, short-circuiting** three-layer pipeline. Layer 1 runs once per source in
+Phase 1, before atomize; Layers 2–3 run here per claim. Each layer runs only if the previous one
+did not decide. The bands are **numeric and named**; the units are hallouminate
+`z_score`/`score`, **not raw cosine** — `ground` exposes no cosine between two texts.
 
-### Layer 1 — Hash identity (deterministic; skill-computed; no vector store)
+### Layer 1 — Hash identity (deterministic; bundled CLI; runs in Phase 1)
 
-Catches identical re-ingestion of a whole source before any embedding work.
+Catches identical re-ingestion of a whole source before any embedding work. Run the bundled
+command instead of hashing by hand. Its path is relative to this `SKILL.md` directory:
 
-- **Normalize** the source text: strip leading/trailing whitespace, collapse internal whitespace
-  runs to single spaces, drop a trailing newline. (Don't lowercase or strip markdown — keep it
-  cheap and stable so the same source always hashes identically.)
-- **Hash:** `sha256sum` of the normalized bytes (via the shell — a skill can't call `blake3`
-  in-process); keep the first 16 hex chars as the source id.
-- **Ledger:** `log.md` is the ledger (Phase 4). Scan it for the hash. If `log.md` is absent, treat
-  as no ledger hit and continue (Phase 4 scaffolds it on first write). **Hit → skip the entire
-  source**, append a `skipped-duplicate-hash` row, report it. No `ground`, no page read/merge — the only write is the `skipped-duplicate-hash` log row.
+```bash
+python3 <this-skill-dir>/scripts/ingest-ledger check <source-file> --ledger <corpus-root>/log.md
+```
+
+- `<source-file>` holds the whole source. Save pasted or conversation material to a temporary
+  file first. Omit `--ledger` when the corpus root is not on disk, and save the `read_markdown`
+  content of `log.md` to a file when it exists.
+- Output is one JSON object: `source_id` (16 hex chars), `ledger` (`hit` / `miss` / `absent`),
+  `matches`, and `first_match` (the first matching log row, or `null`). A row matches when its
+  second ` · `-separated field equals `source_id`.
+- The command collapses every whitespace run to one space and trims both ends before it hashes.
+  It keeps case and markdown, so the same source always gets the same id.
+- **`hit` → skip the entire source**, append a `skipped-duplicate-hash` row, report it. No
+  `ground`, no page read/merge — the only write is the `skipped-duplicate-hash` log row.
+  **`miss` or `absent`** → continue (Phase 4 scaffolds `log.md` on first write).
+- Exit 2 means an empty source or a bad argument; fix the call. Exit 3 with a `cannot read`
+  error means an unreadable input file; fix the path. Any other failure means the launcher cannot
+  fetch, verify, or run its archive (it needs Python 3.11+, and network on first run). Then
+  report the error, treat Layer 1 as a miss, and write `—` as the source hash in the log row.
+  Layers 2–3 still dedup each claim.
 - Hash identity is **whole-source**, not per-claim — the cheap exact-dup guard. Per-claim dedup
   is Layers 2–3.
 
@@ -148,14 +173,13 @@ Route claims that reach here (novel / merge-band) using `score` ordering cross-c
 
 - A **merge-band** claim folds into the matched page's section (Phase 4 merge loop).
 - A **novel** claim with no page owning its topic → **new page** (Phase 4 new-page loop). A new
-  page is the **last resort**, unchanged from today.
+  page is the **last resort**.
 - If a merge-band/near-dup claim *conflicts* with the section, hand to the Phase 3a judge — this
   layer routes; it does not re-implement contradiction detection.
 
-**Calibration note (tunable, domain-dependent).** The units are hallouminate `z_score`/`score`,
-**not** raw cosine — no tool exposes a 0–1 cosine between two texts (`ground` returns an
-RRF-fused `score` and a per-query relative `z_score`). The cutoffs (`2.0`, `1.0`) are a
-starting point; adjust them when sampled decisions look mis-banded.
+**Calibration note (tunable, domain-dependent).** `ground` returns an RRF-fused `score` and a
+per-query relative `z_score`. The cutoffs (`2.0`, `1.0`) are a starting point; adjust them when
+sampled decisions look mis-banded.
 
 **Phase 3a — contradiction (LLM-as-judge, root):** When the new claim conflicts with
 an existing page, do NOT average them — blending produces confident wrong answers.
@@ -167,6 +191,9 @@ provenance)?
   <what> · <date>`).
 - **Unclear** → keep both, mark the conflict inline (`> ⚠️ Conflicts with <other>:
   <summary> — needs human resolution`), and flag it to the user. Never silently pick.
+
+Done when every claim has exactly one decision: skip, merge, overwrite, new page, or
+conflict-flagged.
 
 ## Phase 4 — Write (root / opus)
 
@@ -181,7 +208,7 @@ Apply each decision through the safe update loop:
 - **New page:** draft one-topic entry (H1 first line, kebab slug, lead-first,
   ~50–150 lines, code cited as `path:line`, shaped on the pack's
   `../../templates/wiki-entry.md`) → `add_markdown { overwrite: false, cwd }`.
-- **Chunk context:** Every H2/H3 section must open self-contained: give enough subject and purpose for the section to remain clear when retrieved without surrounding sections. Name the domain concept in the opening sentence; do not make a heading, pronoun, or parent page carry all context. Breadcrumbs and file summaries may supplement this authored context, but do not generate index-time or per-chunk LLM context; issue #284 remains deferred.
+- **Chunk context:** Every H2/H3 section must open self-contained: give enough subject and purpose for the section to remain clear when retrieved without surrounding sections. Name the domain concept in the opening sentence; do not make a heading, pronoun, or parent page carry all context. Breadcrumbs and file summaries may supplement this authored context, but do not generate index-time or per-chunk LLM context.
 - **Local links:** if merged or new content links a local file outside the corpus
   (absolute path, `~`, or a relative path escaping the corpus root — the ingest
   source itself is the common case), copy that file into the corpus first
@@ -219,34 +246,21 @@ Log **every** decision — including Layer-1 hash skips (the row *is* the ledger
 Whole-file rewrites of `log.md` are forbidden — the only writes are `under_heading: append` splices.
 
 The daemon reindexes each written file and refreshes ancestor `index.md` link lists
-automatically. **Never hand-edit inside the `index.md` `<!-- HALLOUMINATE:INDEX-START -->` /
-`<!-- HALLOUMINATE:INDEX-END -->` markers** — the daemon maintains that link block on every
-`add_markdown`/`delete_markdown`; an optional human-routing prose paragraph may live *outside* the
-markers (see Phase 2). For edits made **outside** these tools, run `index` to re-embed.
+automatically; the marker rule in Phase 2 still applies. For edits made **outside** these tools,
+run `index` to re-embed.
+
+Done when every probe has a final disposition and every decision has one log row, except
+writes rolled back to `blocked`.
 
 ## Phase 5 — Report (root / opus)
 
-Summarize per claim: **skipped / merged into `path` / new `path` / conflict flagged /
-written-with-retrieval-warning / blocked**. For retrieval warnings, include the query, expected
-page, observed top three, and actual rank. Surface every flagged contradiction to the user by
-name. Note any page that's now large enough to split (one-topic-per-file drift).
+Summarize per claim in one table, then list every flagged contradiction by name:
 
-## Rules
+```markdown
+| Claim | Outcome | Page | Notes |
+|---|---|---|---|
+```
 
-- Route and merge before you create — a new page is the last resort, not the default.
-- Read the target page before overwriting it. Always.
-- Never blend contradictory claims; newer-authoritative wins with recorded
-  provenance, otherwise keep both and flag for human resolution.
-- Root decides route/merge/contradiction; haiku only locates and reads. Don't invert.
-- Fan out the locate step in one message so searches run in parallel.
-- Stamp a provenance/updated footer on every page you touch.
-- Links resolve inside a corpus — copy a local link target in before linking it;
-  never link out to the filesystem.
-- Curate, don't accumulate — skip duplicates, split bloated pages, retire the stale.
-- Dedup is three ordered layers: hash identity (Layer 1) → `z_score` band (Layer 2) → route/create (Layer 3). Each runs only if the prior didn't decide.
-- Log every dedup decision in `log.md` — skips included. The Layer-1 hash ledger only works if skips are recorded.
-- Never rewrite `log.md`; it is append-only (`under_heading: "Log", position: "append"`), and never a routing target.
-- Never hand-edit inside the `index.md` `<!-- HALLOUMINATE:INDEX-START -->` / `INDEX-END` markers — the daemon owns that block.
-- Durable external research uses one deduplicated corpus-local source page with the indexed retrieval spine.
-- Freeze exact and natural probes before drafting; run them after the full write set and before journaling.
-- Revise at most once with unchanged probes; exact failures roll back to `blocked`, natural failures remain `written-with-retrieval-warning` with rank diagnostics.
+`Outcome` is one of: skipped / merged / new / conflict-flagged / written-with-retrieval-warning /
+blocked. For retrieval warnings, `Notes` gives the query, expected page, observed top three, and
+actual rank. Note any page that's now large enough to split (one-topic-per-file drift).
