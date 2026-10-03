@@ -1,0 +1,6 @@
+[project]
+name = "wiki-ingest-ledger"
+version = "0"
+description = "Source-hash ledger CLI bundled with the wiki-ingest skill."
+requires-python = ">=3.11"
+dependencies = ["fromargs>=0.1.0,<0.2"]
