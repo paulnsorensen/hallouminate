@@ -224,6 +224,7 @@ mod tests {
             score,
             mtime_ms: FIXTURE_MTIME_MS,
             claim_marks: vec![],
+            structure: None,
             z_score: None,
         }
     }
@@ -470,6 +471,7 @@ mod tests {
             score,
             mtime_ms: FIXTURE_MTIME_MS,
             claim_marks: vec![],
+            structure: None,
             z_score: None,
         }
     }

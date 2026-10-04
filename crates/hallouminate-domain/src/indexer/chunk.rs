@@ -4,6 +4,18 @@ use crate::corpus::ClaimMark;
 // TEMPORARY (Stage 2b bridge, removed in Stage 2c when PreparedFile.embeddings
 // drops): sourced from the adapter's true home for the embedding dimension.
 
+/// Parsed Markdown evidence for one chunk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChunkStructure {
+    /// Text of the first parsed H1, if the file has one.
+    pub title: Option<String>,
+    /// Active parsed headings as level (1 through 6) and text pairs.
+    pub headings: Vec<(u8, String)>,
+    /// Whether this chunk is generated navigation, including heading-only chunks
+    /// in generated-only files.
+    pub generated_navigation: bool,
+}
+
 /// One chunk of a prepared file, ready to be written as a row in the `chunks`
 /// table.
 #[derive(Debug, Clone)]
@@ -21,6 +33,8 @@ pub struct PreparedChunk {
     /// unlike the page-level `frontmatter` denormalized identically onto every
     /// row. Stored in the nullable `claim_marks` column.
     pub claim_marks: Option<String>,
+    /// Parsed Markdown evidence, or `None` for formats without this metadata.
+    pub structure: Option<ChunkStructure>,
 }
 
 /// A single source file plus all of its chunks, ready for `apply_batch`.
@@ -69,6 +83,8 @@ pub struct SearchHit {
     /// Claim marks decoded from the chunk's `claim_marks` JSON column. Empty
     /// when the chunk carried no marks (a null column value).
     pub claim_marks: Vec<ClaimMark>,
+    /// Stored Markdown evidence, or `None` for neutral and legacy rows.
+    pub structure: Option<ChunkStructure>,
     /// Per-query z-score of `score`, stamped by the orchestrator after rerank.
     /// TRANSIENT: not decoded from or persisted to a Lance column; defaults to
     /// `None` at decode and only the cross-encoder path populates it.

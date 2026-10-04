@@ -26,6 +26,7 @@ use hallouminate_daemon::{
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
 use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
+use hallouminate_domain::search::ChunkRetrieval;
 use tokio::time::timeout;
 
 use crate::common::daemon::DaemonHarness;
@@ -4877,7 +4878,8 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     let ground = tmp.path().join("ground");
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
-    std::fs::write(corpus_root.join("hello.md"), "# Hello\n\nworld\n").expect("seed");
+    let source = "# Hello\n\nworld\n";
+    std::fs::write(corpus_root.join("hello.md"), source).expect("seed");
 
     // Write a stale meta at schema_version = current - 1.
     let current = hallouminate_adapters::default_schema_version_pub();
@@ -4886,7 +4888,7 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
 
     let cfg = cfg_with_corpus(&ground, &corpus_root);
     // DaemonState::open must succeed (no crash).
-    DaemonState::open(cfg, None)
+    let state = DaemonState::open(cfg, None)
         .await
         .expect("stale store must be auto-rebuilt, not fatal");
 
@@ -4909,6 +4911,22 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     assert_eq!(
         fresh_version, current,
         "fresh meta.toml must record the current schema version"
+    );
+    let root = corpus_root.to_str().expect("UTF-8 corpus root");
+    let key = CorpusKey::from_configured_root("docs", root);
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "world", 10)
+        .await
+        .expect("retrieve rebuilt source");
+    let hit = signals.hits.get(&signals.fts[0]).expect("rebuilt hit");
+    let structure = hit.structure.as_ref().expect("rebuilt Markdown structure");
+    assert_eq!(structure.title.as_deref(), Some("Hello"));
+    assert_eq!(structure.headings, [(1, "Hello".into())]);
+    assert!(!structure.generated_navigation);
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("hello.md")).expect("read source"),
+        source
     );
 }
 

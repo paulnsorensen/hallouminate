@@ -26,7 +26,7 @@ use hallouminate_domain::common::{CorpusKey, HallouminateError, Result, RetiredR
 use hallouminate_domain::corpus::ClaimMark;
 use hallouminate_domain::embeddings::canonical_model_name;
 use hallouminate_domain::indexer::{
-    BatchWriteStats, ChunkStore, FileSnapshot, PreparedFile, SearchHit, SignalLists,
+    BatchWriteStats, ChunkStore, ChunkStructure, FileSnapshot, PreparedFile, SearchHit, SignalLists,
 };
 use hallouminate_domain::search::ChunkRetrieval;
 
@@ -150,10 +150,11 @@ struct Meta {
 
 /// The schema version this build reads and writes, bumped whenever the Arrow
 /// `chunks` schema changes shape (v2 added `frontmatter`; v3 added
-/// `claim_marks`; v4 added canonical `root` and derived `search_text`).
+/// `claim_marks`; v4 added canonical `root` and derived `search_text`;
+/// v5 added parsed chunk structure.
 /// Also the serde default, though every managed store records this field.
 fn default_schema_version() -> u32 {
-    4
+    5
 }
 
 #[doc(hidden)]
@@ -288,6 +289,7 @@ pub fn chunks_schema() -> SchemaRef {
         Field::new("search_text", DataType::Utf8, false),
         // Nullable: null = no claim marks anchored within this chunk.
         Field::new("claim_marks", DataType::Utf8, true),
+        Field::new("structure", DataType::Utf8, true),
         Field::new(
             "embedding",
             DataType::FixedSizeList(
@@ -338,6 +340,7 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
     let mut texts: Vec<String> = Vec::new();
     let mut search_texts: Vec<String> = Vec::new();
     let mut claim_marks: Vec<Option<String>> = Vec::new();
+    let mut structures: Vec<Option<String>> = Vec::new();
     let mut embeddings_flat: Vec<f32> = Vec::new();
     // One validity bit per chunk row: true = real vector, false = null
     // (embeddings-OFF mode). Stays all-true on the ON path so the null
@@ -379,6 +382,16 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
             texts.push(chunk.text.clone());
             search_texts.push(chunk.search_text.clone());
             claim_marks.push(chunk.claim_marks.clone());
+            structures.push(
+                chunk
+                    .structure
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| {
+                        HallouminateError::Indexer(format!("encode structure: {error}"))
+                    })?,
+            );
             match &fwe.embeddings {
                 Some(embeddings) => {
                     embeddings_flat.extend_from_slice(&embeddings[idx]);
@@ -428,6 +441,7 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
         Arc::new(StringArray::from(texts)),
         Arc::new(StringArray::from(search_texts)),
         Arc::new(StringArray::from_iter(claim_marks)),
+        Arc::new(StringArray::from_iter(structures)),
         Arc::new(embedding_array),
     ];
     RecordBatch::try_new(schema, columns)
@@ -901,7 +915,7 @@ fn decode_claim_marks(col: &StringArray, row: usize) -> Vec<ClaimMark> {
 /// Columns `decode_hits` reads. `fts_scan` and `vector_scan` project to
 /// exactly this set so a hit never deserializes the `embedding` vector,
 /// which no caller reads after retrieval.
-const HIT_COLUMNS: [&str; 11] = [
+const HIT_COLUMNS: [&str; 12] = [
     "chunk_id",
     "file_ref",
     "summary",
@@ -913,6 +927,7 @@ const HIT_COLUMNS: [&str; 11] = [
     "heading_path",
     "keywords",
     "claim_marks",
+    "structure",
 ];
 
 fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit>) -> Result<()> {
@@ -936,7 +951,25 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     let heading_path = list_utf8_col(rb, "heading_path")?;
     let keywords = list_utf8_col(rb, "keywords")?;
     let claim_marks = string_col(rb, "claim_marks")?;
+    let structures = string_col(rb, "structure")?;
     for i in 0..rb.num_rows() {
+        let structure = if structures.is_null(i) {
+            None
+        } else {
+            match serde_json::from_str::<ChunkStructure>(structures.value(i)) {
+                Ok(structure) => Some(structure),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "hallouminate::lance",
+                        category = ?error.classify(),
+                        line = error.line(),
+                        column = error.column(),
+                        "failed to decode structure JSON; treating chunk as having no structure"
+                    );
+                    None
+                }
+            }
+        };
         out.push(SearchHit {
             chunk_id: chunk_id.value(i).to_string(),
             corpus_key: corpus_key.clone(),
@@ -957,6 +990,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
             score: 0.0,
             mtime_ms: mtime_ms.value(i),
             claim_marks: decode_claim_marks(claim_marks, i),
+            structure,
             z_score: None,
         });
     }
@@ -4401,14 +4435,14 @@ mod tests {
     }
 
     #[test]
-    fn meta_check_or_init_defaults_missing_embedding_fields_on_v4() {
+    fn meta_check_or_init_defaults_missing_embedding_fields_on_v5() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
             &meta_path,
             r#"# auto-managed by hallouminate; do not edit
 embedding_model_name = "BAAI/bge-small-en-v1.5"
-schema_version = 4
+schema_version = 5
 "#,
         )
         .unwrap();
@@ -4431,13 +4465,13 @@ schema_version = 1
         )
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect_err("a v1 store must be rejected by the v4 binary");
+            .expect_err("a v1 store must be rejected by the v5 binary");
         assert!(
             matches!(
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 1,
-                    expected: 4,
+                    expected: 5,
                     ..
                 }
             ),
@@ -4460,13 +4494,13 @@ schema_version = 2
         )
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect_err("a v2 store must be rejected by the v4 binary");
+            .expect_err("a v2 store must be rejected by the v5 binary");
         assert!(
             matches!(
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 2,
-                    expected: 4,
+                    expected: 5,
                     ..
                 }
             ),
@@ -4481,10 +4515,10 @@ schema_version = 2
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
         let meta: Meta = toml::from_str(&text).unwrap();
-        assert_eq!(default_schema_version(), 4);
-        assert_eq!(meta.schema_version, 4);
+        assert_eq!(default_schema_version(), 5);
+        assert_eq!(meta.schema_version, 5);
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect("v4 store must re-open");
+            .expect("v5 store must re-open");
     }
 
     #[test]
@@ -4551,6 +4585,7 @@ schema_version = 1
                 "text",
                 "search_text",
                 "claim_marks",
+                "structure",
                 "embedding",
             ]
         );
@@ -4598,6 +4633,7 @@ schema_version = 1
                 text: format!("chunk-{i}"),
                 search_text: format!("chunk-{i}"),
                 claim_marks: None,
+                structure: None,
             });
         }
         pf
@@ -4645,7 +4681,101 @@ schema_version = 1
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
         assert_eq!(rb.num_rows(), 5);
-        assert_eq!(rb.num_columns(), 18);
+        assert_eq!(rb.num_columns(), 19);
+    }
+
+    #[test]
+    fn decode_hits_keeps_rows_with_invalid_or_null_structure() {
+        use hallouminate_domain::indexer::ChunkStructure;
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        struct WarningCapture(Arc<Mutex<String>>);
+
+        impl Subscriber for WarningCapture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                struct Fields<'a>(&'a mut String);
+
+                impl Visit for Fields<'_> {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{}={value:?};", field.name()));
+                    }
+                }
+
+                event.record(&mut Fields(&mut self.0.lock().expect("warning capture")));
+            }
+
+            fn enter(&self, _: &Id) {}
+
+            fn exit(&self, _: &Id) {}
+        }
+
+        let mut file = synthetic_prepared("/tmp/mixed-structure.md", 4);
+        let structure = ChunkStructure {
+            title: Some("Valid title".into()),
+            headings: vec![(2, "Valid heading".into())],
+            generated_navigation: false,
+        };
+        file.chunks[2].structure = Some(structure.clone());
+        let batch = [FileWithEmbeddings {
+            file: &file,
+            embeddings: None,
+        }];
+        let rb = build_record_batch(&batch, chunks_schema()).expect("build batch");
+        let structure_index = rb.schema().index_of("structure").expect("structure column");
+        let valid = serde_json::to_string(&structure).expect("serialize structure");
+        let wrong_type =
+            r#"{"title":null,"headings":[],"generated_navigation":"private-sentinel-575"}"#;
+        let mut columns = rb.columns().to_vec();
+        columns[structure_index] = Arc::new(StringArray::from(vec![
+            Some("{"),
+            None,
+            Some(valid.as_str()),
+            Some(wrong_type),
+        ]));
+        let rb = RecordBatch::try_new(rb.schema(), columns).expect("mixed structure batch");
+
+        let warnings = Arc::new(Mutex::new(String::new()));
+        let mut hits = Vec::new();
+        tracing::subscriber::with_default(WarningCapture(warnings.clone()), || {
+            decode_hits(&rb, &file.corpus_key, &mut hits).expect("decode mixed structure");
+        });
+        let warnings = warnings.lock().expect("warning capture");
+        assert!(!warnings.contains("private-sentinel-575"));
+        assert!(warnings.contains("category=Eof"));
+        assert!(warnings.contains("category=Data"));
+        assert!(warnings.contains("line=1"));
+        assert!(warnings.contains("column=73"));
+        assert_eq!(hits.len(), 4);
+        for (index, hit) in hits.iter().enumerate() {
+            assert_eq!(hit.chunk_id, chunk_id_for(&file.file_ref, index));
+            assert_eq!(hit.text, format!("chunk-{index}"));
+        }
+        assert_eq!(hits[0].structure, None);
+        assert_eq!(hits[1].structure, None);
+        assert_eq!(hits[2].structure, Some(structure));
+        assert_eq!(hits[3].structure, None);
+
+        let without_chunk_id = rb
+            .project(&(1..rb.num_columns()).collect::<Vec<_>>())
+            .expect("project without chunk_id");
+        let error = decode_hits(&without_chunk_id, &file.corpus_key, &mut Vec::new())
+            .expect_err("required column must fail");
+        assert_eq!(error.to_string(), "indexer: missing column chunk_id");
     }
 
     #[test]
@@ -5040,7 +5170,7 @@ schema_version = 1
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 3,
-                    expected: 4,
+                    expected: 5,
                     ..
                 }
             ),
@@ -5049,24 +5179,7 @@ schema_version = 1
     }
 
     #[test]
-    fn guard_ok_when_stored_version_is_v4() {
-        let dir = tempfile::tempdir().unwrap();
-        let meta_path = dir.path().join("meta.toml");
-        std::fs::write(
-            &meta_path,
-            "# auto-managed by hallouminate; do not edit\n\
-             embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
-             quantized = false\n\
-             embeddings_enabled = false\n\
-             schema_version = 4\n",
-        )
-        .unwrap();
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
-            .expect("v4 store must open");
-    }
-
-    #[test]
-    fn guard_fatal_config_when_stored_version_is_v5() {
+    fn guard_ok_when_stored_version_is_v5() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
@@ -5078,8 +5191,25 @@ schema_version = 1
              schema_version = 5\n",
         )
         .unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect("v5 store must open");
+    }
+
+    #[test]
+    fn guard_fatal_config_when_stored_version_is_v6() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            "# auto-managed by hallouminate; do not edit\n\
+             embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
+             quantized = false\n\
+             embeddings_enabled = false\n\
+             schema_version = 6\n",
+        )
+        .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
-            .expect_err("v5 store must fail fatally");
+            .expect_err("v6 store must fail fatally");
         assert!(
             matches!(err, HallouminateError::Config(_)),
             "expected Config (downgrade fatal), got: {err}"
@@ -5260,6 +5390,79 @@ schema_version = 1
             .await
             .expect("search display-only token");
         assert!(display_signals.fts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn structure_survives_reopen_edit_delete_and_recreate() {
+        use hallouminate_domain::indexer::ChunkStructure;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = docs_key();
+        let file_ref = "/tmp/structure.md";
+        let original = ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into())],
+            generated_navigation: true,
+        };
+        let mut file = synthetic_prepared(file_ref, 1);
+        file.chunks[0].search_text = "structureoriginaltoken".into();
+        file.chunks[0].structure = Some(original.clone());
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        store.apply_batch(vec![file]).await.expect("seed structure");
+        drop(store);
+
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("reopen store");
+        let signals = store
+            .retrieve_signals(&key, "structureoriginaltoken", 10)
+            .await
+            .expect("retrieve after reopen");
+        let hit = signals.hits.get(&signals.fts[0]).expect("original hit");
+        assert_eq!(hit.structure, Some(original));
+
+        let edited = ChunkStructure {
+            title: None,
+            headings: vec![(2, "New section".into())],
+            generated_navigation: false,
+        };
+        let mut file = synthetic_prepared(file_ref, 1);
+        file.content_hash = "edited".into();
+        file.chunks[0].search_text = "structureeditedtoken".into();
+        file.chunks[0].structure = Some(edited.clone());
+        store.apply_batch(vec![file]).await.expect("edit structure");
+        let signals = store
+            .retrieve_signals(&key, "structureeditedtoken", 10)
+            .await
+            .expect("retrieve edited structure");
+        let hit = signals.hits.get(&signals.fts[0]).expect("edited hit");
+        assert_eq!(hit.structure, Some(edited.clone()));
+        store
+            .delete_file(&key, file_ref)
+            .await
+            .expect("delete file");
+        assert!(
+            store
+                .list_files(&key)
+                .await
+                .expect("list after delete")
+                .is_empty()
+        );
+
+        let mut file = synthetic_prepared(file_ref, 1);
+        file.content_hash = "recreated".into();
+        file.chunks[0].search_text = "structurerecreatedtoken".into();
+        file.chunks[0].structure = Some(edited.clone());
+        store.apply_batch(vec![file]).await.expect("recreate file");
+        let signals = store
+            .retrieve_signals(&key, "structurerecreatedtoken", 10)
+            .await
+            .expect("retrieve recreated structure");
+        let hit = signals.hits.get(&signals.fts[0]).expect("recreated hit");
+        assert_eq!(hit.structure, Some(edited));
     }
 
     #[tokio::test]

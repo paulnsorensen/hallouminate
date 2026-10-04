@@ -1,0 +1,6 @@
+[
+  {"id":"title","query":"Lantern Cache Recovery","expected_file":"title.md","max_rank":1},
+  {"id":"near-lead","query":"What does lantern cache recovery do after a node restart?","expected_file":"title.md","max_rank":3,"ahead_of_file":"index.md"},
+  {"id":"h2-answer","query":"How does the cold cache recover after a node restart?","expected_file":"answer.md","max_rank":3,"ahead_of_file":"index.md"},
+  {"id":"navigation","query":"Storage navigation","expected_file":"index.md","max_rank":3}
+]

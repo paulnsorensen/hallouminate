@@ -626,8 +626,37 @@ mod tests {
             score,
             mtime_ms: 0,
             claim_marks: vec![],
+            structure: None,
             z_score: None,
         }
+    }
+
+    #[tokio::test]
+    async fn rerank_with_timeout_keeps_crossencoder_scores_on_success() {
+        struct ReorderingCrossencoder;
+        impl Crossencoder for ReorderingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                hits.reverse();
+                hits[0].score = 0.9;
+                hits[1].score = 0.1;
+                Ok(())
+            }
+        }
+        let hits = vec![
+            hit_for_timeout_test("/first.md", 0.04),
+            hit_for_timeout_test("/second.md", 0.03),
+        ];
+        let (ranked, fallback) = rerank_with_timeout(
+            Box::new(ReorderingCrossencoder),
+            "query".into(),
+            hits,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(fallback, None);
+        assert_eq!(ranked[0].file_ref, "/second.md");
+        assert_eq!(ranked[0].score, 0.9);
+        assert_eq!(ranked[1].score, 0.1);
     }
 
     #[tokio::test]
