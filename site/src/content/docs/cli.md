@@ -74,6 +74,7 @@ hallouminate ground "socket protocol" --corpus repo:hallouminate:wiki --format j
 | `--chunks-per-file N` | Chunks to include per file. |
 | `--limit N` | Hard cap on returned chunks. |
 | `--snippet-chars N` | Snippet length when not using `--full`. |
+| `--match ranked\|phrase` | Retrieval mode. `phrase` returns every chunk that contains the query as a case-insensitive literal substring. |
 
 ## `daemon`
 

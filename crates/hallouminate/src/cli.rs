@@ -31,6 +31,17 @@ pub enum FormatArg {
     JsonPretty,
 }
 
+/// CLI surface for `ground` retrieval mode. Mirrors
+/// `domain::ground::GroundMatch` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum MatchArg {
+    /// Hybrid BM25, vector, and literal retrieval.
+    #[default]
+    Ranked,
+    /// Case-insensitive literal substring match of the whole query.
+    Phrase,
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
@@ -209,6 +220,10 @@ pub struct GroundCli {
     pub chunks_per_file: Option<usize>,
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
+    /// Retrieval mode. `phrase` returns every chunk that contains QUERY as a
+    /// case-insensitive literal substring, ranked by occurrence count.
+    #[arg(long = "match", value_enum, default_value_t = MatchArg::Ranked)]
+    pub match_mode: MatchArg,
     /// Accepted for backward compatibility; same caveat as `hallouminate
     /// index --config`. The daemon owns config resolution (XDG baseline
     /// at startup + repo-layer discovery per request), so this flag is
@@ -224,7 +239,7 @@ pub struct GroundCli {
 
 impl From<GroundCli> for GroundArgs {
     fn from(cli: GroundCli) -> Self {
-        use hallouminate_domain::ground::Format;
+        use hallouminate_domain::ground::{Format, GroundMatch};
         let format = if cli.full {
             Format::JsonPretty
         } else {
@@ -234,6 +249,10 @@ impl From<GroundCli> for GroundArgs {
                 FormatArg::JsonPretty => Format::JsonPretty,
             }
         };
+        let match_mode = match cli.match_mode {
+            MatchArg::Ranked => GroundMatch::Ranked,
+            MatchArg::Phrase => GroundMatch::Phrase,
+        };
         Self {
             query: cli.query,
             corpus: cli.corpus,
@@ -242,6 +261,7 @@ impl From<GroundCli> for GroundArgs {
             top_files: cli.top_files,
             chunks_per_file: cli.chunks_per_file,
             limit: cli.limit,
+            match_mode,
             config: cli.config,
             socket: cli.socket,
         }

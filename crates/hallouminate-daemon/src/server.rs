@@ -1162,6 +1162,7 @@ mod tests {
                 limit: None,
                 snippet_chars: None,
                 footnote_mode: Default::default(),
+                match_mode: Default::default(),
             }),
             DaemonRequestPayload::Index(IndexRequest {
                 corpus: None,
@@ -1195,6 +1196,7 @@ mod tests {
             limit: None,
             snippet_chars: None,
             footnote_mode: Default::default(),
+            match_mode: Default::default(),
         });
         let response = DaemonResponse::invalid_params("invalid corpus");
         assert_eq!(

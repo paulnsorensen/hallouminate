@@ -1,8 +1,21 @@
 use std::collections::BTreeMap;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::corpus::ClaimMark;
+
+/// Selects how `ground` matches the query against indexed chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GroundMatch {
+    /// Hybrid retrieval: BM25, vector, and literal signals fused by RRF.
+    #[default]
+    Ranked,
+    /// Case-insensitive literal substring match of the whole query against
+    /// each chunk's search text, ranked by occurrence count.
+    Phrase,
+}
 
 /// Structured payload of the `ground` MCP tool: one semantic-search query and
 /// its per-file ranked results.

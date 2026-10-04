@@ -10,7 +10,7 @@ use crate::common::{
 use hallouminate_adapters::{LanceStore, chunk_id_for};
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
-use hallouminate_domain::search::{ChunkRetrieval, search_fused};
+use hallouminate_domain::search::{ChunkRetrieval, search_fused, search_phrase};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -640,4 +640,225 @@ async fn apply_batch_uses_deterministic_chunk_ids_so_reapply_is_idempotent() {
 
     // chunk_ids are derived from (file_ref, ord) so 0..4 are the same ids
     let _ = chunk_id_for("/tmp/idem.md", 0);
+}
+
+// ── ground match=phrase: literal substring retrieval on a real store ─────
+
+/// Indexes one single-chunk file per `(file_ref, text)` pair.
+///
+/// Embeddings are off, so the ranked pool is the BM25 list alone and the
+/// pool-gating fixture does not depend on hash-derived stub vectors.
+async fn phrase_store(files: &[(&str, &str)]) -> (tempfile::TempDir, LanceStore, CorpusKey) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = LanceStore::open_or_create(dir.path(), MODEL, false, false, None)
+        .await
+        .expect("open LanceStore");
+    let key = corpus_key("docs");
+    let mut prepared = Vec::new();
+    for (i, (file_ref, text)) in files.iter().enumerate() {
+        prepared.push(prepared_file_with_chunks(
+            file_ref,
+            &key,
+            1,
+            &format!("h{i}"),
+            vec![text],
+        ));
+    }
+    store.apply_batch(prepared).await.expect("apply");
+    (dir, store, key)
+}
+
+/// Sorted file refs of the phrase hits for `phrase`.
+async fn phrase_files(store: &LanceStore, key: &CorpusKey, phrase: &str) -> Vec<String> {
+    let found = search_phrase(store, key, phrase, 50)
+        .await
+        .unwrap_or_else(|e| panic!("phrase {phrase:?} must not error: {e}"));
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+    let mut files = Vec::new();
+    for hit in found.hits {
+        files.push(hit.file_ref);
+    }
+    files.sort();
+    files
+}
+
+#[tokio::test]
+async fn phrase_match_finds_a_chunk_outside_the_ranked_pool_case_insensitively() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let mut files: Vec<(String, String)> = Vec::new();
+    for i in 0..12 {
+        files.push((
+            format!("/tmp/decoy{i:02}.md"),
+            "title source exact title source exact title source exact".to_string(),
+        ));
+    }
+    let filler = "unrelated filler words about harvest logistics ".repeat(40);
+    files.push((
+        "/tmp/target.md".to_string(),
+        format!("{filler} The canonical Exact Source Title appears once. {filler}"),
+    ));
+    let borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(file_ref, text)| (file_ref.as_str(), text.as_str()))
+        .collect();
+    let (_dir, store, key) = phrase_store(&borrowed).await;
+
+    let ranked = search_fused(&store, &key, "exact source title", &[], 5)
+        .await
+        .expect("ranked search");
+    assert!(
+        ranked
+            .hits
+            .iter()
+            .all(|hit| hit.file_ref != "/tmp/target.md"),
+        "fixture must keep the target outside the ranked pool of 5"
+    );
+
+    let found = search_phrase(&store, &key, "exact source title", 5)
+        .await
+        .expect("phrase search");
+    let mut files = Vec::new();
+    for hit in &found.hits {
+        files.push(hit.file_ref.as_str());
+    }
+    assert_eq!(files, vec!["/tmp/target.md"]);
+    assert_eq!(found.hits[0].score, 1.0);
+    assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+}
+
+#[tokio::test]
+async fn phrase_match_counts_stopwords_and_punctuation() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store, key) = phrase_store(&[
+        ("/tmp/full.md", "A review of The Art of X, second edition."),
+        ("/tmp/partial.md", "Notes on art, and on x, and more art."),
+    ])
+    .await;
+    assert_eq!(
+        phrase_files(&store, &key, "The Art of X").await,
+        vec!["/tmp/full.md"]
+    );
+    assert_eq!(
+        phrase_files(&store, &key, "art of x,").await,
+        vec!["/tmp/full.md"]
+    );
+}
+
+#[tokio::test]
+async fn phrase_match_on_a_canonical_url_is_exact() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store, key) = phrase_store(&[
+        (
+            "/tmp/long.md",
+            "Source: https://example.com/a_b?c=1%20d (fetched).",
+        ),
+        ("/tmp/short.md", "See https://example.com/a for more."),
+    ])
+    .await;
+    assert_eq!(
+        phrase_files(&store, &key, "https://example.com/a_b?c=1%20d").await,
+        vec!["/tmp/long.md"]
+    );
+    assert_eq!(
+        phrase_files(&store, &key, "https://example.com/a ").await,
+        vec!["/tmp/short.md"]
+    );
+}
+
+#[tokio::test]
+async fn phrase_match_treats_quotes_and_like_metacharacters_literally() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store, key) = phrase_store(&[
+        ("/tmp/obrien.md", "An interview with O'Brien today."),
+        ("/tmp/obrien_decoy.md", "An interview with OBrien today."),
+        ("/tmp/percent.md", "Growth of 100% this year."),
+        ("/tmp/percent_decoy.md", "Growth of 1000 units this year."),
+        ("/tmp/underscore.md", "Call a_b now."),
+        ("/tmp/underscore_decoy.md", "Call axb now."),
+        ("/tmp/backslash.md", r"Path C:\temp\new here."),
+        ("/tmp/backslash_decoy.md", "Path C:temp here."),
+    ])
+    .await;
+    assert_eq!(
+        phrase_files(&store, &key, "o'brien").await,
+        vec!["/tmp/obrien.md"]
+    );
+    assert_eq!(
+        phrase_files(&store, &key, "100%").await,
+        vec!["/tmp/percent.md"]
+    );
+    assert_eq!(
+        phrase_files(&store, &key, "a_b").await,
+        vec!["/tmp/underscore.md"]
+    );
+    assert_eq!(
+        phrase_files(&store, &key, r"C:\temp\new").await,
+        vec!["/tmp/backslash.md"]
+    );
+    assert_eq!(
+        phrase_files(&store, &key, "%").await,
+        vec!["/tmp/percent.md"]
+    );
+    assert_eq!(
+        phrase_files(&store, &key, "_").await,
+        vec!["/tmp/underscore.md"]
+    );
+}
+
+#[tokio::test]
+async fn phrase_match_with_no_match_returns_empty() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store, key) = phrase_store(&[("/tmp/a.md", "The spice must flow.")]).await;
+    assert!(
+        phrase_files(&store, &key, "spice must not")
+            .await
+            .is_empty()
+    );
+    assert!(
+        phrase_files(&store, &corpus_key("other"), "spice")
+            .await
+            .is_empty(),
+        "a phrase scan must stay inside its corpus key"
+    );
+}
+
+#[tokio::test]
+async fn phrase_match_ranks_every_hit_before_truncating_to_limit() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store, key) = phrase_store(&[
+        ("/tmp/p0.md", "repeat phrase"),
+        ("/tmp/p1.md", "repeat phrase"),
+        ("/tmp/p2.md", "repeat phrase"),
+        ("/tmp/p3.md", "repeat phrase"),
+        ("/tmp/p4.md", "repeat phrase"),
+        ("/tmp/p5.md", "repeat phrase"),
+        ("/tmp/p6.md", "Repeat Phrase, and repeat phrase again"),
+    ])
+    .await;
+
+    let found = search_phrase(&store, &key, "repeat phrase", 3)
+        .await
+        .expect("phrase search");
+    let mut ranked = Vec::new();
+    for hit in &found.hits {
+        ranked.push((hit.file_ref.as_str(), hit.score));
+    }
+    assert_eq!(
+        ranked,
+        vec![
+            ("/tmp/p6.md", 2.0),
+            ("/tmp/p0.md", 1.0),
+            ("/tmp/p1.md", 1.0)
+        ]
+    );
+    let mut codes = Vec::new();
+    for warning in &found.warnings {
+        codes.push(warning.code.as_str());
+    }
+    assert_eq!(codes, vec!["phrase-truncated"]);
+    assert!(
+        found.warnings[0].message.contains("matched 7 chunks"),
+        "{}",
+        found.warnings[0].message
+    );
 }

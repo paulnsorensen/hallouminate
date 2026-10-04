@@ -2449,6 +2449,52 @@ impl LanceStore {
         })
         .await
     }
+
+    /// Retrieve up to `limit` chunks of one corpus key whose `search_text`
+    /// contains `phrase` as a case-insensitive substring, in scan order.
+    ///
+    /// The scan uses no FTS or vector index. The predicate is
+    /// `strpos(lower(search_text), '<lowercased phrase>') > 0`, so `LIKE`
+    /// metacharacters in the phrase match literally. Returns an empty list
+    /// when the table has no text index yet, as `retrieve_signals` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LanceDB scan or row decode fails.
+    async fn retrieve_phrase(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        if !self.has_text_index().await? {
+            return Ok(Vec::new());
+        }
+        let filter = format!(
+            "{} AND strpos(lower(search_text), '{}') > 0",
+            corpus_key_filter(corpus_key)?,
+            escape_sql_str(&phrase.to_lowercase())
+        );
+        let table = self.table.clone();
+        let batches = supervise_scan("phrase_scan", async move {
+            let stream = table
+                .query()
+                .only_if(filter)
+                .select(lancedb::query::Select::columns(&HIT_COLUMNS))
+                .limit(limit)
+                .execute()
+                .await
+                .map_err(map_lance_err)?;
+            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
+            Ok(batches)
+        })
+        .await?;
+        let mut hits = Vec::new();
+        for rb in &batches {
+            decode_hits(rb, corpus_key, &mut hits)?;
+        }
+        Ok(hits)
+    }
 }
 
 /// Index one signal's hits into the shared pool, keyed by `chunk_id`,
@@ -2531,6 +2577,15 @@ impl ChunkRetrieval for LanceStore {
         limit: usize,
     ) -> Result<SignalLists> {
         LanceStore::retrieve_signals(self, corpus_key, query, limit).await
+    }
+
+    async fn retrieve_phrase(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        LanceStore::retrieve_phrase(self, corpus_key, phrase, limit).await
     }
 }
 

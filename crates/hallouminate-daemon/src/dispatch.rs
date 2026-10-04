@@ -41,7 +41,8 @@ use hallouminate_domain::corpus::{
     resolve_read_root, safe_relative_path,
 };
 use hallouminate_domain::ground::{
-    Format, GroundOpts, RenderOpts, Warning, ground, ground_union, render, trim_snippets,
+    Format, GroundMatch, GroundOpts, RenderOpts, Warning, ground, ground_union, render,
+    trim_snippets,
 };
 use hallouminate_domain::indexer::HandlerRegistry;
 use hallouminate_domain::indexer::{
@@ -51,6 +52,7 @@ use hallouminate_domain::indexer::{
 #[cfg(test)]
 use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
 use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
+use hallouminate_domain::search::validate_phrase;
 
 use super::ipc::{
     AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
@@ -416,6 +418,7 @@ fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
             .min(MAX_GROUND_LIMIT),
         rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
         footnote_mode: req.footnote_mode,
+        match_mode: req.match_mode,
     }
 }
 
@@ -523,6 +526,14 @@ async fn handle_ground(
     cwd: &Path,
     req: GroundRequest,
 ) -> DaemonResponse {
+    match req.match_mode {
+        GroundMatch::Ranked => {}
+        GroundMatch::Phrase => {
+            if let Err(error) = validate_phrase(&req.query) {
+                return DaemonResponse::invalid_params(error.to_string());
+            }
+        }
+    }
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -567,19 +578,23 @@ async fn handle_ground(
 
     // Crossencoder admission is best-effort. Construction and rerank run
     // inside the ground timeout, and busy or failed slots use fusion fallback.
-    // Unconfigured paths return Ok(None) and skip reranking entirely.
+    // Unconfigured paths return Ok(None) and skip reranking entirely. Phrase
+    // mode never reranks, so it skips admission and its unavailable warning.
     let mut crossencoder_unavailable = false;
-    let crossencoder = match state.crossencoder(cfg.search.crossencoder.as_deref()) {
-        Ok(g) => g,
-        Err(e) => {
-            crossencoder_unavailable = true;
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "crossencoder unavailable for this request; falling back to fusion-only ranking",
-            );
-            None
-        }
+    let crossencoder = match req.match_mode {
+        GroundMatch::Phrase => None,
+        GroundMatch::Ranked => match state.crossencoder(cfg.search.crossencoder.as_deref()) {
+            Ok(g) => g,
+            Err(e) => {
+                crossencoder_unavailable = true;
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %e,
+                    "crossencoder unavailable for this request; falling back to fusion-only ranking",
+                );
+                None
+            }
+        },
     };
     // #139: moved (not borrowed) into a `Box<dyn Crossencoder>` so `ground`/
     // `ground_union` can hand it to `spawn_blocking` for the rerank timeout.

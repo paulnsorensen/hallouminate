@@ -6,10 +6,10 @@ use futures_util::{StreamExt, TryStreamExt};
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
 use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
-use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
+use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused, search_phrase};
 
 use super::bucket::{build_docs, normalize_scores};
-use super::types::{DocFile, GroundResponse, Stats, Warning};
+use super::types::{DocFile, GroundMatch, GroundResponse, Stats, Warning};
 
 /// Why one bounded crossencoder attempt kept fusion order.
 #[derive(Debug, PartialEq, Eq)]
@@ -101,6 +101,8 @@ pub struct GroundOpts {
     /// required to preempt the synchronous crossencoder.
     pub rerank_timeout: Duration,
     pub footnote_mode: FootnoteMode,
+    /// Retrieval mode. [`GroundMatch::Phrase`] skips fusion and reranking.
+    pub match_mode: GroundMatch,
 }
 
 impl Default for GroundOpts {
@@ -111,6 +113,7 @@ impl Default for GroundOpts {
             limit: 50,
             rerank_timeout: Duration::from_secs(2),
             footnote_mode: FootnoteMode::Include,
+            match_mode: GroundMatch::Ranked,
         }
     }
 }
@@ -141,8 +144,12 @@ async fn search_corpus(
     store: &dyn ChunkRetrieval,
     globs: &[String],
     limit: usize,
+    match_mode: GroundMatch,
 ) -> Result<FusedSearch> {
-    search_fused(store, corpus_key, query, globs, limit).await
+    match match_mode {
+        GroundMatch::Ranked => search_fused(store, corpus_key, query, globs, limit).await,
+        GroundMatch::Phrase => search_phrase(store, corpus_key, query, limit).await,
+    }
 }
 
 /// Cap on concurrent per-root searches fanned out by `ground_union`. Each
@@ -205,7 +212,9 @@ pub async fn ground_union(
     // polls at most MAX_CONCURRENT_CORPUS_SEARCHES of them at a time.
     let searches: Vec<_> = corpus_keys
         .iter()
-        .map(|(corpus_key, globs)| search_corpus(query, corpus_key, store, globs, opts.limit))
+        .map(|(corpus_key, globs)| {
+            search_corpus(query, corpus_key, store, globs, opts.limit, opts.match_mode)
+        })
         .collect();
     // `buffered` (not `buffer_unordered`) preserves per-root result order,
     // which callers rely on for warning ordering; it still propagates the
@@ -222,6 +231,10 @@ pub async fn ground_union(
     }
     let stats = Stats { hits: hits.len() };
 
+    let crossencoder = match opts.match_mode {
+        GroundMatch::Ranked => crossencoder,
+        GroundMatch::Phrase => None,
+    };
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
@@ -375,6 +388,28 @@ mod tests {
                 hits: hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect(),
             })
         }
+
+        async fn retrieve_phrase(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            let needle = phrase.to_lowercase();
+            let mut hits = Vec::new();
+            for hit in &self.hits {
+                if hit.corpus_key != *corpus_key
+                    || !hit.search_text.to_lowercase().contains(&needle)
+                {
+                    continue;
+                }
+                if hits.len() == limit {
+                    break;
+                }
+                hits.push(hit.clone());
+            }
+            Ok(hits)
+        }
     }
 
     /// An empty directory standing in for a corpus root, shared by every
@@ -440,6 +475,15 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.barrier.wait().await;
             Ok(SignalLists::default())
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
         }
     }
 
@@ -752,6 +796,65 @@ mod tests {
             resp.docs.values().any(|d| d.z_score.is_some()),
             "a completed rerank over >=5 spread-score hits must produce Some z_score; \
              all-None means the assertion channel the timeout tests rely on is dead"
+        );
+    }
+
+    #[tokio::test]
+    async fn phrase_mode_ranks_by_occurrence_count_truncates_and_skips_the_crossencoder() {
+        let texts = [
+            "Exact Phrase, then exact phrase again",
+            "one exact phrase",
+            "another exact phrase",
+            "exact words, no phrase",
+        ];
+        let mut hits = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            let file_ref = fixture_root().join(format!("phrase{i}.md"));
+            let mut hit = hit_for_timeout_test(&file_ref.to_string_lossy(), 0.0);
+            hit.search_text = (*text).to_string();
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            limit: 2,
+            rerank_timeout: Duration::from_secs(5),
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+
+        let resp = ground_union(
+            "exact phrase",
+            &[fixture_corpus()],
+            &store,
+            Some(Box::new(ScoringCrossencoder)),
+            opts,
+            None,
+        )
+        .await
+        .expect("phrase mode must succeed");
+
+        assert_eq!(resp.stats.hits, 2);
+        let mut scored = Vec::new();
+        for doc in resp.docs.values() {
+            assert_eq!(doc.z_score, None, "phrase mode must not rerank");
+            scored.push((doc.path.clone(), doc.score));
+        }
+        assert_eq!(
+            scored,
+            vec![
+                (Some("phrase0.md".to_string()), 2.0),
+                (Some("phrase1.md".to_string()), 1.0),
+            ]
+        );
+        let mut codes = Vec::new();
+        for warning in &resp.warnings {
+            codes.push(warning.code.as_str());
+        }
+        assert_eq!(codes, vec!["phrase-truncated"]);
+        assert!(
+            resp.warnings[0].message.contains("matched 3 chunks"),
+            "{}",
+            resp.warnings[0].message
         );
     }
 

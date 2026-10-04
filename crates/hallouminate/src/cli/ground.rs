@@ -7,7 +7,7 @@ use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for,
 };
 use hallouminate_domain::common::{canonicalize_or_passthrough, expand_tilde};
-use hallouminate_domain::ground::{Format, GroundResponse, RenderOpts, render};
+use hallouminate_domain::ground::{Format, GroundMatch, GroundResponse, RenderOpts, render};
 
 const DEFAULT_LIMIT: usize = 50;
 
@@ -20,6 +20,7 @@ pub struct GroundArgs {
     pub top_files: Option<usize>,
     pub chunks_per_file: Option<usize>,
     pub limit: Option<usize>,
+    pub match_mode: GroundMatch,
     pub config: Option<PathBuf>,
     /// Optional daemon socket override. Mirrors `HALLOUMINATE_SOCKET` so
     /// test fixtures can pin the socket per-test without env mutation.
@@ -118,6 +119,7 @@ pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
             limit: args.limit.or(Some(DEFAULT_LIMIT)),
             snippet_chars: args.snippet_chars,
             footnote_mode: hallouminate_domain::footnotes::FootnoteMode::Include,
+            match_mode: args.match_mode,
         }),
     };
     let result: GroundResult = client.call(req).await?;

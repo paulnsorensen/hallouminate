@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::IndexReport;
 use hallouminate_domain::corpus::{FileEntry, TreeNode};
-use hallouminate_domain::ground::GroundResponse;
+use hallouminate_domain::ground::{GroundMatch, GroundResponse};
 
 pub use hallouminate_domain::corpus::{LineRange, Position};
 
@@ -102,6 +102,9 @@ pub struct GroundRequest {
     pub snippet_chars: Option<usize>,
     #[serde(default)]
     pub footnote_mode: hallouminate_domain::footnotes::FootnoteMode,
+    /// Retrieval mode. Older clients omit it and get [`GroundMatch::Ranked`].
+    #[serde(default)]
+    pub match_mode: GroundMatch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,5 +538,17 @@ mod tests {
                 .is_some_and(|m| m.starts_with("serialize response:")),
             "error message must name the serialize failure, got: {wire}"
         );
+    }
+
+    #[test]
+    fn ground_request_without_match_mode_defaults_to_ranked() {
+        let req: GroundRequest = serde_json::from_value(serde_json::json!({ "query": "q" }))
+            .expect("a request from an older client still deserializes");
+        assert_eq!(req.match_mode, GroundMatch::Ranked);
+
+        let req: GroundRequest =
+            serde_json::from_value(serde_json::json!({ "query": "q", "match_mode": "phrase" }))
+                .expect("phrase mode deserializes");
+        assert_eq!(req.match_mode, GroundMatch::Phrase);
     }
 }

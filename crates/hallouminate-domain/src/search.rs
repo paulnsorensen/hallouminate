@@ -25,6 +25,7 @@
 
 pub mod crossencoder;
 pub mod fuse;
+pub mod phrase;
 pub mod ripgrep;
 pub mod terms;
 
@@ -42,6 +43,9 @@ pub use crossencoder::Noop as NoopCrossencoder;
 pub use crossencoder::{
     Crossencoder, DEFAULT_CROSSENCODER_MODEL, SUPPORTED_CROSSENCODER_MODELS,
     canonical_crossencoder_model,
+};
+pub use phrase::{
+    MAX_PHRASE_CHARS, MAX_PHRASE_SCAN_ROWS, PhraseError, search_phrase, validate_phrase,
 };
 pub use ripgrep::RipgrepHit;
 
@@ -82,6 +86,18 @@ pub trait ChunkRetrieval: Send + Sync {
         query: &str,
         limit: usize,
     ) -> Result<SignalLists>;
+
+    /// Retrieves up to `limit` chunks whose `search_text` contains `phrase`
+    /// as a case-insensitive substring, unranked.
+    ///
+    /// The match is literal: no tokenization, no stopword removal, and no
+    /// pattern metacharacters. Returns an empty list when nothing matches.
+    async fn retrieve_phrase(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>>;
 }
 
 /// Outcome of [`search_fused`]: the fused hits plus any warnings raised
@@ -470,15 +486,18 @@ fn tie_break_key(
     canonical_root: &Path,
 ) -> (String, usize, String) {
     match hits.get(chunk_id) {
-        Some(hit) => {
-            let rel = Path::new(&hit.file_ref)
-                .strip_prefix(canonical_root)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| hit.file_ref.clone());
-            (rel, hit.line_start, chunk_id.to_string())
-        }
+        Some(hit) => hit_tie_break_key(hit, canonical_root),
         None => (chunk_id.to_string(), 0, chunk_id.to_string()),
     }
+}
+
+/// The [`tie_break_key`] of one resolved hit.
+fn hit_tie_break_key(hit: &SearchHit, canonical_root: &Path) -> (String, usize, String) {
+    let rel = Path::new(&hit.file_ref)
+        .strip_prefix(canonical_root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| hit.file_ref.clone());
+    (rel, hit.line_start, hit.chunk_id.clone())
 }
 
 #[cfg(test)]
@@ -884,6 +903,15 @@ mod tests {
                 vector: self.vector.clone(),
                 hits: self.hits.clone(),
             })
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
         }
     }
 
