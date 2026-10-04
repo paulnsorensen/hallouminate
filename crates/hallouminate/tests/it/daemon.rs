@@ -2534,6 +2534,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     limit: None,
                     snippet_chars: None,
                     footnote_mode: Default::default(),
+                    match_mode: Default::default(),
                 }),
             })
             .await
@@ -2553,6 +2554,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     limit: None,
                     snippet_chars: None,
                     footnote_mode: Default::default(),
+                    match_mode: Default::default(),
                 }),
             })
             .await
@@ -2587,6 +2589,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                         limit: None,
                         snippet_chars: None,
                         footnote_mode: Default::default(),
+                        match_mode: Default::default(),
                     }),
                 })
                 .await
@@ -2869,6 +2872,7 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
                     limit: None,
                     snippet_chars: None,
                     footnote_mode: Default::default(),
+                    match_mode: Default::default(),
                 }),
             })
             .await
@@ -2996,6 +3000,7 @@ async fn ground_through_ipc(
                     limit: Some(50),
                     snippet_chars: None,
                     footnote_mode: Default::default(),
+                    match_mode: Default::default(),
                 }),
             })
             .await
@@ -4137,6 +4142,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 limit: None,
                 snippet_chars: None,
                 footnote_mode: Default::default(),
+                match_mode: Default::default(),
             }),
         })
         .await
@@ -4168,6 +4174,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 limit: None,
                 snippet_chars: None,
                 footnote_mode: Default::default(),
+                match_mode: Default::default(),
             }),
         })
         .await
@@ -4184,6 +4191,96 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
         !fresh_doc.stale,
         "file unchanged since index must NOT be marked stale"
     );
+}
+
+fn phrase_ground_request(query: String) -> DaemonRequestPayload {
+    DaemonRequestPayload::Ground(GroundRequest {
+        query,
+        corpus: Some("docs".into()),
+        top_files: None,
+        chunks_per_file: None,
+        limit: None,
+        snippet_chars: None,
+        footnote_mode: Default::default(),
+        match_mode: hallouminate_domain::ground::GroundMatch::Phrase,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let full = corpus_root.join("full.md");
+    let partial = corpus_root.join("partial.md");
+    std::fs::write(
+        &full,
+        "# Review\n\nA review of The Art of X, second edition.\n",
+    )
+    .expect("write full");
+    std::fs::write(&partial, "# Notes\n\nNotes on art, and on x.\n").expect("write partial");
+
+    let harness = DaemonHarness::spawn(cfg_stale_corpus(&ground, &corpus_root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("docs".into()),
+                paths_from: None,
+                strict: false,
+            }),
+        })
+        .await
+        .expect("index transport ok");
+    match resp {
+        DaemonResponse::Ok { .. } => {}
+        DaemonResponse::Err { kind, message } => panic!("index failed ({kind:?}): {message}"),
+    }
+
+    let client = connect_at(harness.socket()).await.expect("reconnect");
+    let result: GroundResult = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: phrase_ground_request("the art of x".into()),
+        })
+        .await
+        .expect("phrase ground ok");
+    let abs_full = std::fs::canonicalize(&full).expect("canonical full");
+    let mut paths = Vec::new();
+    for path in result.response.docs.keys() {
+        paths.push(path.clone());
+    }
+    assert_eq!(paths, vec![abs_full.to_string_lossy().into_owned()]);
+    for warning in &result.response.warnings {
+        assert_ne!(warning.code, "phrase-truncated", "{}", warning.message);
+        assert_ne!(
+            warning.code, "crossencoder-unavailable",
+            "{}",
+            warning.message
+        );
+    }
+
+    for query in ["  \t ".to_string(), "x".repeat(513)] {
+        let client = connect_at(harness.socket()).await.expect("reconnect");
+        let resp = client
+            .call_raw(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: phrase_ground_request(query),
+            })
+            .await
+            .expect("transport ok");
+        match resp {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+                assert!(message.contains("phrase match"), "got: {message}");
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("an invalid phrase must error; got Ok({result:?})")
+            }
+        }
+    }
 }
 
 // ─── Issue #134: add_markdown section / range / match-scoped writes ──────────

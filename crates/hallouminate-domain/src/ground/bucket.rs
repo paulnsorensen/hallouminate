@@ -5,7 +5,7 @@ use crate::corpus::make_snippet;
 use crate::footnotes::{FootnoteMode, apply_footnote_mode};
 use crate::indexer::SearchHit;
 
-use super::types::{ChunkProvenance, DocChunk, DocFile};
+use super::types::{ChunkProvenance, DocChunk, DocFile, GroundMatch};
 
 /// Bucket `hits` by `file_ref`, sort by max-score descending (file_ref tiebreak),
 /// truncate to `top_files`, then take the top `chunks_per_file` chunks per
@@ -17,6 +17,37 @@ pub(super) fn build_docs(
     top_files: usize,
     chunks_per_file: usize,
     footnote_mode: FootnoteMode,
+) -> Result<BTreeMap<String, DocFile>> {
+    build_docs_with_match(
+        hits,
+        top_files,
+        chunks_per_file,
+        footnote_mode,
+        GroundMatch::Ranked,
+    )
+}
+
+pub(super) fn build_phrase_docs(
+    hits: &[SearchHit],
+    top_files: usize,
+    chunks_per_file: usize,
+    footnote_mode: FootnoteMode,
+) -> Result<BTreeMap<String, DocFile>> {
+    build_docs_with_match(
+        hits,
+        top_files,
+        chunks_per_file,
+        footnote_mode,
+        GroundMatch::Phrase,
+    )
+}
+
+fn build_docs_with_match(
+    hits: &[SearchHit],
+    top_files: usize,
+    chunks_per_file: usize,
+    footnote_mode: FootnoteMode,
+    match_mode: GroundMatch,
 ) -> Result<BTreeMap<String, DocFile>> {
     let mut buckets: HashMap<String, FileBucket> = HashMap::new();
     for hit in hits {
@@ -35,7 +66,7 @@ pub(super) fn build_docs(
     files.truncate(top_files);
     let mut out = BTreeMap::new();
     for f in files {
-        let (key, doc) = f.into_doc(chunks_per_file, footnote_mode);
+        let (key, doc) = f.into_doc(chunks_per_file, footnote_mode, match_mode);
         out.insert(key, doc);
     }
     Ok(out)
@@ -76,12 +107,19 @@ impl FileBucket {
         mut self,
         chunks_per_file: usize,
         footnote_mode: FootnoteMode,
+        match_mode: GroundMatch,
     ) -> (String, DocFile) {
         self.chunks.sort_by(|a, b| {
-            (b.score)
+            let order = b
+                .score
                 .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+                .unwrap_or(std::cmp::Ordering::Equal);
+            match match_mode {
+                GroundMatch::Ranked => order.then_with(|| a.chunk_id.cmp(&b.chunk_id)),
+                GroundMatch::Phrase => order
+                    .then_with(|| a.line_start.cmp(&b.line_start))
+                    .then_with(|| a.chunk_id.cmp(&b.chunk_id)),
+            }
         });
         self.chunks.truncate(chunks_per_file);
         let chunks = self
@@ -206,6 +244,20 @@ mod tests {
         assert!(a.chunks[0].score >= a.chunks[1].score);
         assert_eq!(a.summary.as_deref(), Some("summary of /a.md"));
         assert_eq!(a.keywords, vec!["docs".to_string(), "test".into()]);
+    }
+
+    #[test]
+    fn phrase_rollup_keeps_line_order_when_chunk_ids_disagree() {
+        let mut earlier = hit("/a.md", 0, 1.0);
+        earlier.chunk_id = "z".into();
+        earlier.line_start = 2;
+        let mut later = hit("/a.md", 1, 1.0);
+        later.chunk_id = "a".into();
+        later.line_start = 20;
+        let docs = build_phrase_docs(&[later, earlier], usize::MAX, 1, FootnoteMode::Include)
+            .expect("build phrase docs");
+        let doc = docs.get("/a.md").expect("one file");
+        assert_eq!(doc.chunks[0].chunk_id, "z");
     }
 
     #[test]

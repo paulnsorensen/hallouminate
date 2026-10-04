@@ -3213,6 +3213,15 @@ mod tests {
 
     #[async_trait]
     impl ChunkRetrieval for TestChunkStore {
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> hallouminate_domain::common::Result<Vec<SearchHit>> {
+            Ok(Vec::new())
+        }
+
         async fn retrieve_signals(
             &self,
             corpus_key: &CorpusKey,

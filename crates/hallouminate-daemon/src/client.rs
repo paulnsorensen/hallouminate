@@ -499,6 +499,7 @@ mod tests {
                 limit: None,
                 snippet_chars: None,
                 footnote_mode: Default::default(),
+                match_mode: Default::default(),
             })),
             ground_class,
         );
