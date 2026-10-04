@@ -4,6 +4,14 @@ use crate::corpus::ClaimMark;
 // TEMPORARY (Stage 2b bridge, removed in Stage 2c when PreparedFile.embeddings
 // drops): sourced from the adapter's true home for the embedding dimension.
 
+/// Parsed Markdown evidence for one chunk. `None` means neutral structure.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChunkStructure {
+    pub title: Option<String>,
+    pub headings: Vec<(u8, String)>,
+    pub generated_navigation: bool,
+}
+
 /// One chunk of a prepared file, ready to be written as a row in the `chunks`
 /// table.
 #[derive(Debug, Clone)]
@@ -21,6 +29,7 @@ pub struct PreparedChunk {
     /// unlike the page-level `frontmatter` denormalized identically onto every
     /// row. Stored in the nullable `claim_marks` column.
     pub claim_marks: Option<String>,
+    pub structure: Option<ChunkStructure>,
 }
 
 /// A single source file plus all of its chunks, ready for `apply_batch`.
@@ -69,6 +78,7 @@ pub struct SearchHit {
     /// Claim marks decoded from the chunk's `claim_marks` JSON column. Empty
     /// when the chunk carried no marks (a null column value).
     pub claim_marks: Vec<ClaimMark>,
+    pub structure: Option<ChunkStructure>,
     /// Per-query z-score of `score`, stamped by the orchestrator after rerank.
     /// TRANSIENT: not decoded from or persisted to a Lance column; defaults to
     /// `None` at decode and only the cross-encoder path populates it.

@@ -26,7 +26,7 @@ use hallouminate_domain::common::{CorpusKey, HallouminateError, Result, RetiredR
 use hallouminate_domain::corpus::ClaimMark;
 use hallouminate_domain::embeddings::canonical_model_name;
 use hallouminate_domain::indexer::{
-    BatchWriteStats, ChunkStore, FileSnapshot, PreparedFile, SearchHit, SignalLists,
+    BatchWriteStats, ChunkStore, ChunkStructure, FileSnapshot, PreparedFile, SearchHit, SignalLists,
 };
 use hallouminate_domain::search::ChunkRetrieval;
 
@@ -150,10 +150,11 @@ struct Meta {
 
 /// The schema version this build reads and writes, bumped whenever the Arrow
 /// `chunks` schema changes shape (v2 added `frontmatter`; v3 added
-/// `claim_marks`; v4 added canonical `root` and derived `search_text`).
+/// `claim_marks`; v4 added canonical `root` and derived `search_text`;
+/// v5 added parsed chunk structure.
 /// Also the serde default, though every managed store records this field.
 fn default_schema_version() -> u32 {
-    4
+    5
 }
 
 #[doc(hidden)]
@@ -288,6 +289,7 @@ pub fn chunks_schema() -> SchemaRef {
         Field::new("search_text", DataType::Utf8, false),
         // Nullable: null = no claim marks anchored within this chunk.
         Field::new("claim_marks", DataType::Utf8, true),
+        Field::new("structure", DataType::Utf8, true),
         Field::new(
             "embedding",
             DataType::FixedSizeList(
@@ -338,6 +340,7 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
     let mut texts: Vec<String> = Vec::new();
     let mut search_texts: Vec<String> = Vec::new();
     let mut claim_marks: Vec<Option<String>> = Vec::new();
+    let mut structures: Vec<Option<String>> = Vec::new();
     let mut embeddings_flat: Vec<f32> = Vec::new();
     // One validity bit per chunk row: true = real vector, false = null
     // (embeddings-OFF mode). Stays all-true on the ON path so the null
@@ -379,6 +382,8 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
             texts.push(chunk.text.clone());
             search_texts.push(chunk.search_text.clone());
             claim_marks.push(chunk.claim_marks.clone());
+            structures.push(chunk.structure.as_ref().map(serde_json::to_string).transpose()
+                .map_err(|error| HallouminateError::Indexer(format!("encode structure: {error}")))?);
             match &fwe.embeddings {
                 Some(embeddings) => {
                     embeddings_flat.extend_from_slice(&embeddings[idx]);
@@ -428,6 +433,7 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
         Arc::new(StringArray::from(texts)),
         Arc::new(StringArray::from(search_texts)),
         Arc::new(StringArray::from_iter(claim_marks)),
+        Arc::new(StringArray::from_iter(structures)),
         Arc::new(embedding_array),
     ];
     RecordBatch::try_new(schema, columns)
@@ -901,7 +907,7 @@ fn decode_claim_marks(col: &StringArray, row: usize) -> Vec<ClaimMark> {
 /// Columns `decode_hits` reads. `fts_scan` and `vector_scan` project to
 /// exactly this set so a hit never deserializes the `embedding` vector,
 /// which no caller reads after retrieval.
-const HIT_COLUMNS: [&str; 11] = [
+const HIT_COLUMNS: [&str; 12] = [
     "chunk_id",
     "file_ref",
     "summary",
@@ -913,6 +919,7 @@ const HIT_COLUMNS: [&str; 11] = [
     "heading_path",
     "keywords",
     "claim_marks",
+    "structure",
 ];
 
 fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit>) -> Result<()> {
@@ -936,7 +943,15 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     let heading_path = list_utf8_col(rb, "heading_path")?;
     let keywords = list_utf8_col(rb, "keywords")?;
     let claim_marks = string_col(rb, "claim_marks")?;
+    let structures = string_col(rb, "structure")?;
     for i in 0..rb.num_rows() {
+        let structure: Option<ChunkStructure> = if structures.is_null(i) {
+            None
+        } else {
+            Some(serde_json::from_str(structures.value(i)).map_err(|error| {
+                HallouminateError::Indexer(format!("decode structure: {error}"))
+            })?)
+        };
         out.push(SearchHit {
             chunk_id: chunk_id.value(i).to_string(),
             corpus_key: corpus_key.clone(),
@@ -957,6 +972,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
             score: 0.0,
             mtime_ms: mtime_ms.value(i),
             claim_marks: decode_claim_marks(claim_marks, i),
+            structure,
             z_score: None,
         });
     }
@@ -4401,14 +4417,14 @@ mod tests {
     }
 
     #[test]
-    fn meta_check_or_init_defaults_missing_embedding_fields_on_v4() {
+    fn meta_check_or_init_defaults_missing_embedding_fields_on_v5() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
             &meta_path,
             r#"# auto-managed by hallouminate; do not edit
 embedding_model_name = "BAAI/bge-small-en-v1.5"
-schema_version = 4
+schema_version = 5
 "#,
         )
         .unwrap();
@@ -4431,13 +4447,13 @@ schema_version = 1
         )
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect_err("a v1 store must be rejected by the v4 binary");
+            .expect_err("a v1 store must be rejected by the v5 binary");
         assert!(
             matches!(
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 1,
-                    expected: 4,
+                    expected: 5,
                     ..
                 }
             ),
@@ -4460,13 +4476,13 @@ schema_version = 2
         )
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect_err("a v2 store must be rejected by the v4 binary");
+            .expect_err("a v2 store must be rejected by the v5 binary");
         assert!(
             matches!(
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 2,
-                    expected: 4,
+                    expected: 5,
                     ..
                 }
             ),
@@ -4551,6 +4567,7 @@ schema_version = 1
                 "text",
                 "search_text",
                 "claim_marks",
+                "structure",
                 "embedding",
             ]
         );
@@ -4598,6 +4615,7 @@ schema_version = 1
                 text: format!("chunk-{i}"),
                 search_text: format!("chunk-{i}"),
                 claim_marks: None,
+                structure: None,
             });
         }
         pf
@@ -5040,7 +5058,7 @@ schema_version = 1
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 3,
-                    expected: 4,
+                    expected: 5,
                     ..
                 }
             ),
@@ -5049,24 +5067,7 @@ schema_version = 1
     }
 
     #[test]
-    fn guard_ok_when_stored_version_is_v4() {
-        let dir = tempfile::tempdir().unwrap();
-        let meta_path = dir.path().join("meta.toml");
-        std::fs::write(
-            &meta_path,
-            "# auto-managed by hallouminate; do not edit\n\
-             embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
-             quantized = false\n\
-             embeddings_enabled = false\n\
-             schema_version = 4\n",
-        )
-        .unwrap();
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
-            .expect("v4 store must open");
-    }
-
-    #[test]
-    fn guard_fatal_config_when_stored_version_is_v5() {
+    fn guard_ok_when_stored_version_is_v5() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
@@ -5078,8 +5079,25 @@ schema_version = 1
              schema_version = 5\n",
         )
         .unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect("v5 store must open");
+    }
+
+    #[test]
+    fn guard_fatal_config_when_stored_version_is_v6() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            "# auto-managed by hallouminate; do not edit\n\
+             embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
+             quantized = false\n\
+             embeddings_enabled = false\n\
+             schema_version = 6\n",
+        )
+        .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
-            .expect_err("v5 store must fail fatally");
+            .expect_err("v6 store must fail fatally");
         assert!(
             matches!(err, HallouminateError::Config(_)),
             "expected Config (downgrade fatal), got: {err}"

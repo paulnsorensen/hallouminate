@@ -81,6 +81,7 @@ pub fn prepared_file_with_chunks(
             text: t.to_string(),
             search_text: t.to_string(),
             claim_marks: None,
+            structure: None,
         })
         .collect();
     PreparedFile {

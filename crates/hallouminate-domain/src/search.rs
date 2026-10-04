@@ -231,8 +231,7 @@ pub async fn search_fused(
         fm = %signal_order_log(&fm_list, &signals.hits),
         "pre-fusion signal order"
     );
-    let fused = fuse(
-        &[
+    let mut lists = vec![
             RankedList {
                 weight: FTS_WEIGHT,
                 chunk_ids: signals.fts,
@@ -249,9 +248,9 @@ pub async fn search_fused(
                 weight: CONTAINS_WEIGHT,
                 chunk_ids: fm_list,
             },
-        ],
-        RRF_K,
-    );
+        ];
+    lists.extend(structural_lists(&signals.hits, &terms));
+    let fused = fuse(&lists, RRF_K);
 
     let mut hits = signals.hits;
     let mut ranked = Vec::with_capacity(fused.len());
@@ -266,6 +265,66 @@ pub async fn search_fused(
         hits: ranked,
         warnings,
     })
+}
+
+fn heading_overlap(terms: &[String], heading: &str) -> usize {
+    let heading_terms = split_terms(heading);
+    if heading_terms.is_empty() {
+        return 0;
+    }
+    let mut overlap = 0;
+    for term in terms {
+        if heading_terms.contains(term) {
+            overlap += 1;
+        }
+    }
+    if terms.len() > 1 && overlap < 2 {
+        return 0;
+    }
+    if overlap * 2 < terms.len() || overlap * 2 < heading_terms.len() {
+        return 0;
+    }
+    overlap
+}
+
+fn structural_lists(hits: &HashMap<String, SearchHit>, terms: &[String]) -> Vec<RankedList> {
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let mut titles = Vec::new();
+    let mut sections = Vec::new();
+    let mut navigation = Vec::new();
+    for hit in hits.values() {
+        let Some(structure) = &hit.structure else {
+            continue;
+        };
+        let title_overlap = structure.title.as_deref()
+            .map(|title| heading_overlap(terms, title))
+            .unwrap_or(0);
+        if title_overlap > 0 {
+            titles.push((hit.chunk_id.clone(), title_overlap));
+        }
+        let mut section_overlap = 0;
+        for (level, heading) in &structure.headings {
+            if *level > 1 {
+                section_overlap = section_overlap.max(heading_overlap(terms, heading));
+            }
+        }
+        if section_overlap > 0 {
+            sections.push((hit.chunk_id.clone(), section_overlap));
+        }
+        if structure.generated_navigation && title_overlap == 0 {
+            navigation.push(hit.chunk_id.clone());
+        }
+    }
+    titles.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    sections.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    navigation.sort();
+    vec![
+        RankedList { weight: 1.0, chunk_ids: titles.into_iter().map(|(id, _)| id).collect() },
+        RankedList { weight: 0.75, chunk_ids: sections.into_iter().map(|(id, _)| id).collect() },
+        RankedList { weight: -0.75, chunk_ids: navigation },
+    ]
 }
 
 /// Diagnostic-only rendering of a ranked chunk-id list as `file:line`
@@ -529,6 +588,7 @@ mod tests {
             score: 0.0,
             mtime_ms: 0,
             claim_marks: Vec::new(),
+            structure: None,
             z_score: None,
         }
     }

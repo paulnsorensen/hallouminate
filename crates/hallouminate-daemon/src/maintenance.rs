@@ -1488,6 +1488,7 @@ mod tests {
                 text: "body".into(),
                 search_text: "body".into(),
                 claim_marks: None,
+                structure: None,
             }],
         }
     }

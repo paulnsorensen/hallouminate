@@ -3301,6 +3301,7 @@ mod tests {
             score,
             mtime_ms: 0,
             claim_marks: Vec::new(),
+            structure: None,
             z_score: None,
         }
     }

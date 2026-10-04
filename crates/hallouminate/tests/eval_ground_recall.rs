@@ -1342,6 +1342,73 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct Issue573Query {
+    id: String,
+    query: String,
+    expected_file: String,
+    max_rank: usize,
+    ahead_of_file: Option<String>,
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_ranked_heading_regressions() -> Result<()> {
+    let fixture = fs::canonicalize(repo_root().join("eval/fixtures/ranked-heading-relevance-573"))?;
+    let bytes = fs::read(repo_root().join("eval/ranked-heading-relevance-573.json"))?;
+    let queries: Vec<Issue573Query> = serde_json::from_slice(&bytes)?;
+    let tmp = tempfile::tempdir()?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let mut failures = Vec::new();
+    for query in queries {
+        let labelled = LabelledQuery {
+            id: query.id.clone(),
+            query: query.query,
+            expected_chunk: ChunkIdentity {
+                file: query.expected_file.clone(),
+                heading_path: Vec::new(),
+                line_start: 0,
+            },
+        };
+        let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &labelled).await?;
+        let ranked = ranked_docs(&response.docs);
+        let rank = rank_of_expected(&ranked, &query.expected_file);
+        println!("issue573 {} rank {:?}, top {:?}", query.id, rank, top_identity(&ranked));
+        if !rank.is_some_and(|rank| rank <= query.max_rank) {
+            failures.push(format!(
+                "{} expected {} by rank {}, got {:?}",
+                query.id, query.expected_file, query.max_rank, rank
+            ));
+        }
+        if let Some(other_file) = &query.ahead_of_file {
+            let other_rank = rank_of_expected(&ranked, other_file);
+            let precedes = match (rank, other_rank) {
+                (Some(target), Some(other)) => target < other,
+                (None, Some(_)) | (Some(_), None) | (None, None) => false,
+            };
+            if !precedes {
+                failures.push(format!(
+                    "{} expected {} ahead of {}, got {:?} versus {:?}",
+                    query.id, query.expected_file, other_file, rank, other_rank
+                ));
+            }
+        }
+    }
+    drop(client);
+    harness.shutdown().await?;
+    ensure!(failures.is_empty(), "issue573 failures: {}", failures.join("; "));
+    Ok(())
+}
+
 #[test]
 fn wiki_authoring_guidance_has_context_and_retrieval_policy() {
     let root = repo_root();

@@ -7,7 +7,7 @@ mod index;
 mod plan;
 mod store;
 
-pub use chunk::{PreparedChunk, PreparedFile, SearchHit};
+pub use chunk::{ChunkStructure, PreparedChunk, PreparedFile, SearchHit};
 pub use format::{Format, HandlerRegistry, PrepareCtx, detect_format, format_from_extension};
 pub use index::*;
 pub use plan::FileSnapshot;
