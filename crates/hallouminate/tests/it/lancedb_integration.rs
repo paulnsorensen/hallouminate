@@ -642,8 +642,6 @@ async fn apply_batch_uses_deterministic_chunk_ids_so_reapply_is_idempotent() {
     let _ = chunk_id_for("/tmp/idem.md", 0);
 }
 
-// ── ground match=phrase: literal substring retrieval on a real store ─────
-
 /// Indexes one single-chunk file per `(file_ref, text)` pair.
 ///
 /// Embeddings are off, so the ranked pool is the BM25 list alone and the
@@ -697,22 +695,21 @@ async fn phrase_match_finds_a_chunk_outside_the_ranked_pool_case_insensitively()
         "/tmp/target.md".to_string(),
         format!("{filler} The canonical Exact Source Title appears once. {filler}"),
     ));
-    let borrowed: Vec<(&str, &str)> = files
-        .iter()
-        .map(|(file_ref, text)| (file_ref.as_str(), text.as_str()))
-        .collect();
+    let mut borrowed = Vec::new();
+    for (file_ref, text) in &files {
+        borrowed.push((file_ref.as_str(), text.as_str()));
+    }
     let (_dir, store, key) = phrase_store(&borrowed).await;
 
     let ranked = search_fused(&store, &key, "exact source title", &[], 5)
         .await
         .expect("ranked search");
-    assert!(
-        ranked
-            .hits
-            .iter()
-            .all(|hit| hit.file_ref != "/tmp/target.md"),
-        "fixture must keep the target outside the ranked pool of 5"
-    );
+    for hit in &ranked.hits {
+        assert_ne!(
+            hit.file_ref, "/tmp/target.md",
+            "fixture must keep the target outside the ranked pool of 5"
+        );
+    }
 
     let found = search_phrase(&store, &key, "exact source title", 5)
         .await

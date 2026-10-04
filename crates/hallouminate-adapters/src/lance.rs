@@ -2476,8 +2476,9 @@ impl LanceStore {
             escape_sql_str(&phrase.to_lowercase())
         );
         let table = self.table.clone();
-        let batches = supervise_scan("phrase_scan", async move {
-            let stream = table
+        let corpus_key = corpus_key.clone();
+        supervise_scan("phrase_scan", async move {
+            let mut stream = table
                 .query()
                 .only_if(filter)
                 .select(lancedb::query::Select::columns(&HIT_COLUMNS))
@@ -2485,15 +2486,13 @@ impl LanceStore {
                 .execute()
                 .await
                 .map_err(map_lance_err)?;
-            let batches: Vec<RecordBatch> = stream.try_collect().await.map_err(map_lance_err)?;
-            Ok(batches)
+            let mut hits = Vec::new();
+            while let Some(batch) = stream.try_next().await.map_err(map_lance_err)? {
+                decode_hits(&batch, &corpus_key, &mut hits)?;
+            }
+            Ok(hits)
         })
-        .await?;
-        let mut hits = Vec::new();
-        for rb in &batches {
-            decode_hits(rb, corpus_key, &mut hits)?;
-        }
-        Ok(hits)
+        .await
     }
 }
 

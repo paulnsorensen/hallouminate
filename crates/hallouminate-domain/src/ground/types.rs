@@ -6,6 +6,14 @@ use serde::{Deserialize, Serialize};
 use crate::corpus::ClaimMark;
 
 /// Selects how `ground` matches the query against indexed chunks.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::GroundMatch;
+/// let mode = GroundMatch::Phrase;
+/// assert_eq!(mode, GroundMatch::Phrase);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum GroundMatch {

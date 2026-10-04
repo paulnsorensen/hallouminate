@@ -8,7 +8,7 @@ use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
 use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused, search_phrase};
 
-use super::bucket::{build_docs, normalize_scores};
+use super::bucket::{build_docs, build_phrase_docs, normalize_scores};
 use super::types::{DocFile, GroundMatch, GroundResponse, Stats, Warning};
 
 /// Why one bounded crossencoder attempt kept fusion order.
@@ -272,7 +272,11 @@ pub async fn ground_union(
 
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
     for (corpus_key, corpus_hits) in by_key {
-        let mut built = build_docs(
+        let build = match opts.match_mode {
+            GroundMatch::Ranked => build_docs,
+            GroundMatch::Phrase => build_phrase_docs,
+        };
+        let mut built = build(
             &corpus_hits,
             usize::MAX,
             opts.chunks_per_file,
@@ -340,6 +344,22 @@ pub async fn ground_union(
             ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
         }
         docs = ranked.into_iter().collect();
+    }
+
+    if opts.match_mode == GroundMatch::Phrase {
+        let mut retained = 0;
+        for doc in docs.values() {
+            retained += doc.chunks.len();
+        }
+        if retained < stats.hits {
+            warnings.push(Warning {
+                code: "phrase-truncated".to_string(),
+                message: format!(
+                    "phrase rollup retained {retained} of {} matched chunks after chunks_per_file and top_files caps",
+                    stats.hits
+                ),
+            });
+        }
     }
 
     Ok(GroundResponse {
@@ -856,6 +876,88 @@ mod tests {
             "{}",
             resp.warnings[0].message
         );
+    }
+
+    #[tokio::test]
+    async fn phrase_rollup_warns_when_chunks_per_file_drops_a_match() {
+        let path = fixture_root().join("phrase-chunks.md");
+        let path = path.to_string_lossy();
+        let mut first = hit_for_timeout_test(&path, 0.0);
+        first.chunk_id = "first".into();
+        first.line_start = 1;
+        first.search_text = "exact phrase".into();
+        let mut second = first.clone();
+        second.chunk_id = "second".into();
+        second.line_start = 20;
+        let store = FakeChunkStore {
+            hits: vec![first, second],
+        };
+        let opts = GroundOpts {
+            chunks_per_file: 1,
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("phrase ground");
+        assert_eq!(resp.stats.hits, 2);
+        assert_eq!(resp.docs.values().next().expect("one file").chunks.len(), 1);
+        assert_eq!(resp.warnings.len(), 1);
+        assert_eq!(resp.warnings[0].code, "phrase-truncated");
+    }
+
+    #[tokio::test]
+    async fn phrase_rollup_warns_when_top_files_drops_a_match() {
+        let mut hits = Vec::new();
+        for name in ["phrase-top-a.md", "phrase-top-b.md"] {
+            let path = fixture_root().join(name);
+            let mut hit = hit_for_timeout_test(&path.to_string_lossy(), 0.0);
+            hit.search_text = "exact phrase".into();
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            top_files: 1,
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("phrase ground");
+        assert_eq!(resp.stats.hits, 2);
+        assert_eq!(resp.docs.len(), 1);
+        assert_eq!(resp.warnings.len(), 1);
+        assert_eq!(resp.warnings[0].code, "phrase-truncated");
+    }
+
+    #[tokio::test]
+    async fn phrase_search_rejects_invalid_queries_before_store_access() {
+        struct PanicStore;
+        #[async_trait]
+        impl ChunkRetrieval for PanicStore {
+            async fn retrieve_signals(
+                &self,
+                _: &CorpusKey,
+                _: &str,
+                _: usize,
+            ) -> Result<SignalLists> {
+                panic!("store accessed")
+            }
+            async fn retrieve_phrase(
+                &self,
+                _: &CorpusKey,
+                _: &str,
+                _: usize,
+            ) -> Result<Vec<SearchHit>> {
+                panic!("store accessed")
+            }
+        }
+        let root = fixture_root().to_string_lossy();
+        let key = CorpusKey::from_configured_root("fixtures", &root);
+        for phrase in [" ", &"x".repeat(513)] {
+            let result = search_phrase(&PanicStore, &key, phrase, 1).await;
+            assert!(result.is_err(), "{phrase:?} must fail before store access");
+        }
     }
 
     #[tokio::test]

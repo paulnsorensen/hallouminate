@@ -6,7 +6,7 @@
 //! many times the phrase occurs. The occurrence count is the only rankable
 //! quantity a literal match produces without an invented scale.
 
-use crate::common::{CorpusKey, Result};
+use crate::common::{CorpusKey, HallouminateError, Result};
 use crate::ground::Warning;
 
 use super::{ChunkRetrieval, FusedSearch, hit_tie_break_key};
@@ -36,6 +36,14 @@ pub enum PhraseError {
 
 /// Checks that `phrase` is a usable phrase-mode query.
 ///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::search::{validate_phrase, PhraseError};
+/// assert_eq!(validate_phrase("exact title"), Ok(()));
+/// assert_eq!(validate_phrase("  "), Err(PhraseError::Blank));
+/// ```
+///
 /// # Errors
 ///
 /// Returns [`PhraseError::Blank`] for an empty or whitespace-only phrase,
@@ -63,15 +71,29 @@ pub fn validate_phrase(phrase: &str) -> std::result::Result<(), PhraseError> {
 /// chunks matched or the scan reached [`MAX_PHRASE_SCAN_ROWS`]. Callers
 /// must not conclude absence or uniqueness from a truncated set.
 ///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example(store: &dyn hallouminate_domain::search::ChunkRetrieval,
+/// #     key: &hallouminate_domain::common::CorpusKey) -> hallouminate_domain::common::Result<()> {
+/// use hallouminate_domain::search::search_phrase;
+/// let found = search_phrase(store, key, "exact title", 50).await?;
+/// assert!(found.hits.len() <= 50);
+/// # Ok(())
+/// # }
+/// ```
+///
 /// # Errors
 ///
-/// Returns an error if the store scan fails.
+/// Returns an error if `phrase` is blank, exceeds [`MAX_PHRASE_CHARS`],
+/// or the store scan fails.
 pub async fn search_phrase(
     store: &dyn ChunkRetrieval,
     corpus_key: &CorpusKey,
     phrase: &str,
     limit: usize,
 ) -> Result<FusedSearch> {
+    validate_phrase(phrase).map_err(|error| HallouminateError::Search(error.to_string()))?;
     let hits = store
         .retrieve_phrase(corpus_key, phrase, MAX_PHRASE_SCAN_ROWS)
         .await?;

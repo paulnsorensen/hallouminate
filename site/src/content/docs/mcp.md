@@ -60,14 +60,15 @@ Returns a ripgrep-style outline in `content` and the full structured response
 in `structuredContent.docs`.
 
 Set `match: "phrase"` for an exact lookup, such as a canonical URL or a
-source title. Phrase mode returns every chunk whose search text contains the
-whole query as a case-insensitive literal substring. It does not use BM25,
+source title. Phrase mode uses bounded case-insensitive literal matching of
+the whole query against chunk search text. It does not use BM25,
 vector search, or the reranker. Stopwords, punctuation, quotes, `%`, and `_`
 match literally. Whitespace is not normalized, so a phrase across a hard line
 break does not match. Hits rank by occurrence count, and `score` is that count.
 The query must hold 1 to 512 characters and must not be only whitespace.
-A `phrase-truncated` warning means that more chunks matched than the response
-holds. Do not conclude absence or uniqueness from a truncated result.
+The `limit`, `chunks_per_file`, `top_files`, and 10,000-match scan cap can
+restrict results. A `phrase-truncated` warning reports these limits. Do not
+conclude absence or uniqueness from a truncated result.
 
 ### `add_markdown`
 
