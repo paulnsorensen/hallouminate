@@ -9,17 +9,19 @@ sources:
 ---
 # Domain model
 
-Derived `search_text`, worktree-specific `CorpusKey`, and automatic older-schema rebuilds **shipped in PR #290** (schema v4). The right-hand column below and the sections that follow describe what landed, not a proposal.[^spec]
+The domain model separates display text, retrieval text, parsed chunk structure, and root-scoped corpus identity. Schema 5 persists optional Markdown structure.[^structure]
+
+PR #290 introduces `search_text`, `CorpusKey`, and older-schema rebuilds in schema 4. PR #575 adds structure metadata and advances the schema to 5.[^spec][^structure]
 
 ## Status matrix
 
-| Concern | Prior baseline | Landed in #290 |
+| Concern | Prior baseline | Current behavior |
 |---|---|---|
 | Search/display text | Prepared display `text` feeds rendering and search; claim comments are stripped, footnotes retained | Preserve display behavior; add search-only `search_text` |
 | Corpus identity | Bare name with paths carried separately | Pair name with canonical root |
 | Delete scope | #215 restricts deletion to active roots | Keep safety; apply pair identity everywhere |
 | Search scope | Sibling-worktree rows may coexist | Read only the requesting root |
-| Schema mismatch | Older schema fails stale | `< 4` rebuilds; `> 4` remains fatal |
+| Schema mismatch | Older schema fails stale | `< 5` rebuilds; `> 5` remains fatal |
 | Source of truth | Filesystem Markdown | Unchanged; Lance remains derived |[^spec][^filesystem]
 
 ## Display `text`
@@ -49,6 +51,20 @@ Source bindings are `PreparedChunk` (`crates/hallouminate-domain/src/indexer/chu
 - Index preparation never rewrites Markdown.
 
 LLM-generated context is excluded; #284 may layer it on later while deterministic context remains the credential-free floor.[^f001]
+
+## Parsed chunk structure
+
+`ChunkStructure` carries parsed Markdown document structure through `PreparedChunk` and `SearchHit`. Lance stores it as optional JSON in a nullable UTF-8 `structure` column.[^structure]
+
+- `title` contains the first nonempty parsed H1, if present. The parser does not invent a title from the filename.
+- `headings` contains active parsed heading levels and text. Levels remain distinct from the existing display breadcrumb.
+- `generated_navigation` identifies generated-marker content, including heading-only chunks in generated-only documents.
+- Non-Markdown formats use `None`. Authored index prose keeps normal per-chunk treatment; the filename alone does not classify navigation.
+
+Malformed stored structure JSON produces a warning and `None`; it does not discard search hits. Valid structure remains intact, and SQL null stays neutral.
+The warning includes only the error category, line, and column. It excludes payload values. Missing required schema columns still fail.[^structure]
+
+This metadata supports [bounded structural ranking](ground-signal-fusion-adrs.md). It does not change display text, retrieval text, phrase semantics, or the public response shape.[^structure]
 
 ## `CorpusKey`
 
@@ -80,13 +96,13 @@ The current walker returns only `(FileRef, Mtime)` and planning deduplicates by 
 
 ## Schema-version semantics
 
-`Meta.schema_version` is the bound marker in `crates/hallouminate-adapters/src/lance.rs:107-124`. Version 4 represents chunks with `search_text`, `root`, and rebuilt search indexes.[^spec]
+`Meta.schema_version` records the derived-store format. Version 5 adds nullable chunk-structure JSON to the existing `search_text`, `root`, and search indexes.[^structure]
 
 | Stored version | Required open behavior |
 |---|---|
-| `< 4` | Log, recreate the derived table, then run existing catch-up indexing |
-| `= 4` | Open normally |
-| `> 4` | Fail with the existing fatal newer-schema error |
+| `< 5` | Log, recreate the derived table, then run existing catch-up indexing |
+| `= 5` | Open normally |
+| `> 5` | Fail with the existing fatal newer-schema error |
 
 ### Migration invariants
 
@@ -160,3 +176,7 @@ LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), co
 [^loop]: [Search reliability loop ADRs](search-reliability-loop-001.md), [production evaluation](search-reliability-loop-002.md), and [reranker representation](search-reliability-loop-003.md).
 
 _Source: issue #288 entity bindings, PR #290 (landed), the approved search-reliability-loop spec, and PR #320 (landed) · Updated: 2026-08-09 · Supersedes: the 2026-07-25 draft that framed `search_text` / `CorpusKey` / schema-v4 as unshipped_
+
+[^structure]: [PR #575](https://github.com/paulnsorensen/hallouminate/pull/575); `crates/hallouminate-domain/src/indexer/chunk.rs:7-92`; `crates/hallouminate-domain/src/indexer/format.rs:46-181`; `crates/hallouminate-adapters/src/lance.rs:151-158,943-996`.
+
+_Source: landed PR #575 · Updated: 2026-10-04 · Supersedes: schema 4 as the current store format; existing rebuild and source-of-truth rules remain unchanged._
