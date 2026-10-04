@@ -68,3 +68,7 @@
 
 - 2026-10-01 · ff7f2b737f3afff6 · merged · mcp-surface.md, not-found-suggestions.md, ground-signal-fusion-adrs.md · Record landed PR #561 batch contracts, bounded retrieval recovery, citation hints, and diagnostic counters. Nine frozen retrieval probes pass after one bounded heading repair.
 
+
+
+- 2026-10-04 · fe76bd3da1e3c731 · merged · domain-model.md, ground-signal-fusion-adrs.md · Record landed PR #575: bounded heading and authored-content ranking, visible navigation, schema 5, and safe optional-metadata decoding. All six frozen retrieval probes pass; the daemon still reports queued reconciliation.
+
