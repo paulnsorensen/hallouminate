@@ -953,12 +953,22 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     let claim_marks = string_col(rb, "claim_marks")?;
     let structures = string_col(rb, "structure")?;
     for i in 0..rb.num_rows() {
-        let structure: Option<ChunkStructure> = if structures.is_null(i) {
+        let structure = if structures.is_null(i) {
             None
         } else {
-            Some(serde_json::from_str(structures.value(i)).map_err(|error| {
-                HallouminateError::Indexer(format!("decode structure: {error}"))
-            })?)
+            match serde_json::from_str::<ChunkStructure>(structures.value(i)) {
+                Ok(structure) => Some(structure),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "hallouminate::lance",
+                        category = ?error.classify(),
+                        line = error.line(),
+                        column = error.column(),
+                        "failed to decode structure JSON; treating chunk as having no structure"
+                    );
+                    None
+                }
+            }
         };
         out.push(SearchHit {
             chunk_id: chunk_id.value(i).to_string(),
@@ -4672,6 +4682,100 @@ schema_version = 1
         let rb = build_record_batch(&batch, schema).expect("build batch");
         assert_eq!(rb.num_rows(), 5);
         assert_eq!(rb.num_columns(), 19);
+    }
+
+    #[test]
+    fn decode_hits_keeps_rows_with_invalid_or_null_structure() {
+        use hallouminate_domain::indexer::ChunkStructure;
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::{Event, Metadata, Subscriber};
+
+        struct WarningCapture(Arc<Mutex<String>>);
+
+        impl Subscriber for WarningCapture {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+            fn event(&self, event: &Event<'_>) {
+                struct Fields<'a>(&'a mut String);
+
+                impl Visit for Fields<'_> {
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        self.0.push_str(&format!("{}={value:?};", field.name()));
+                    }
+                }
+
+                event.record(&mut Fields(&mut self.0.lock().expect("warning capture")));
+            }
+
+            fn enter(&self, _: &Id) {}
+
+            fn exit(&self, _: &Id) {}
+        }
+
+        let mut file = synthetic_prepared("/tmp/mixed-structure.md", 4);
+        let structure = ChunkStructure {
+            title: Some("Valid title".into()),
+            headings: vec![(2, "Valid heading".into())],
+            generated_navigation: false,
+        };
+        file.chunks[2].structure = Some(structure.clone());
+        let batch = [FileWithEmbeddings {
+            file: &file,
+            embeddings: None,
+        }];
+        let rb = build_record_batch(&batch, chunks_schema()).expect("build batch");
+        let structure_index = rb.schema().index_of("structure").expect("structure column");
+        let valid = serde_json::to_string(&structure).expect("serialize structure");
+        let wrong_type =
+            r#"{"title":null,"headings":[],"generated_navigation":"private-sentinel-575"}"#;
+        let mut columns = rb.columns().to_vec();
+        columns[structure_index] = Arc::new(StringArray::from(vec![
+            Some("{"),
+            None,
+            Some(valid.as_str()),
+            Some(wrong_type),
+        ]));
+        let rb = RecordBatch::try_new(rb.schema(), columns).expect("mixed structure batch");
+
+        let warnings = Arc::new(Mutex::new(String::new()));
+        let mut hits = Vec::new();
+        tracing::subscriber::with_default(WarningCapture(warnings.clone()), || {
+            decode_hits(&rb, &file.corpus_key, &mut hits).expect("decode mixed structure");
+        });
+        let warnings = warnings.lock().expect("warning capture");
+        assert!(!warnings.contains("private-sentinel-575"));
+        assert!(warnings.contains("category=Eof"));
+        assert!(warnings.contains("category=Data"));
+        assert!(warnings.contains("line=1"));
+        assert!(warnings.contains("column=73"));
+        assert_eq!(hits.len(), 4);
+        for (index, hit) in hits.iter().enumerate() {
+            assert_eq!(hit.chunk_id, chunk_id_for(&file.file_ref, index));
+            assert_eq!(hit.text, format!("chunk-{index}"));
+        }
+        assert_eq!(hits[0].structure, None);
+        assert_eq!(hits[1].structure, None);
+        assert_eq!(hits[2].structure, Some(structure));
+        assert_eq!(hits[3].structure, None);
+
+        let without_chunk_id = rb
+            .project(&(1..rb.num_columns()).collect::<Vec<_>>())
+            .expect("project without chunk_id");
+        let error = decode_hits(&without_chunk_id, &file.corpus_key, &mut Vec::new())
+            .expect_err("required column must fail");
+        assert_eq!(error.to_string(), "indexer: missing column chunk_id");
     }
 
     #[test]
