@@ -546,8 +546,8 @@ async fn index_fixture(
     client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
     arm: ArmSpec<'_>,
-) -> Result<()> {
-    let _: IndexReport = client
+) -> Result<IndexReport> {
+    let report: IndexReport = client
         .call(DaemonRequest {
             cwd: cwd.to_path_buf(),
             payload: DaemonRequestPayload::Index(IndexRequest {
@@ -558,7 +558,7 @@ async fn index_fixture(
         })
         .await
         .with_context(|| format!("index fixture for {}", arm.id))?;
-    Ok(())
+    Ok(report)
 }
 
 fn ground_rpc_timeout(arm: ArmSpec<'_>) -> Duration {
@@ -1367,7 +1367,19 @@ async fn issue573_ranked_heading_regressions() -> Result<()> {
     }];
     let harness = DaemonHarness::spawn(config).await;
     let client = connect_at(harness.socket()).await?;
-    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let started = Instant::now();
+    let report = index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let elapsed = started.elapsed();
+    let [corpus] = report.corpora.as_slice() else {
+        return Err(anyhow::anyhow!(
+            "expected one indexed issue corpus: {report:?}"
+        ));
+    };
+    println!(
+        "issue573 rebuild estimate: {elapsed:?} for {} files, {} chunks, {} embeddings",
+        corpus.files_upserted, corpus.chunks_inserted, corpus.embeddings_inserted
+    );
+    assert!(corpus.embeddings_inserted > 0);
     let mut failures = Vec::new();
     for query in queries {
         let labelled = LabelledQuery {
@@ -1382,7 +1394,12 @@ async fn issue573_ranked_heading_regressions() -> Result<()> {
         let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &labelled).await?;
         let ranked = ranked_docs(&response.docs);
         let rank = rank_of_expected(&ranked, &query.expected_file);
-        println!("issue573 {} rank {:?}, top {:?}", query.id, rank, top_identity(&ranked));
+        println!(
+            "issue573 {} rank {:?}, top {:?}",
+            query.id,
+            rank,
+            top_identity(&ranked)
+        );
         if !rank.is_some_and(|rank| rank <= query.max_rank) {
             failures.push(format!(
                 "{} expected {} by rank {}, got {:?}",
@@ -1405,7 +1422,184 @@ async fn issue573_ranked_heading_regressions() -> Result<()> {
     }
     drop(client);
     harness.shutdown().await?;
-    ensure!(failures.is_empty(), "issue573 failures: {}", failures.join("; "));
+    ensure!(
+        failures.is_empty(),
+        "issue573 failures: {}",
+        failures.join("; ")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_equal_evidence_heading_order_in_real_store() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir(&fixture)?;
+    let body = "The restart sequence uses the same guarded steps in this guide.\n";
+    fs::write(
+        fixture.join("h1.md"),
+        format!("# Zephyr spindle calibration\n\n{body}"),
+    )?;
+    fs::write(
+        fixture.join("h2.md"),
+        format!("# Reference\n\n## Zephyr spindle calibration\n\n{body}"),
+    )?;
+    fs::write(
+        fixture.join("body.md"),
+        format!("# Reference\n\nZephyr spindle calibration. {body}"),
+    )?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let query = LabelledQuery {
+        id: "equal-heading-evidence".into(),
+        query: "zephyr spindle calibration".into(),
+        expected_chunk: ChunkIdentity {
+            file: "h1.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &query).await?;
+    let ranked = ranked_docs(&response.docs);
+    let h1 = rank_of_expected(&ranked, "h1.md");
+    let h2 = rank_of_expected(&ranked, "h2.md");
+    let body = rank_of_expected(&ranked, "body.md");
+    println!("issue573 equal evidence: H1 {h1:?}, H2 {h2:?}, body {body:?}");
+    assert!(
+        h1.is_some() && h2.is_some() && body.is_some() && h1 < h2 && h2 < body,
+        "expected H1 > H2 > body: {h1:?}, {h2:?}, {body:?}"
+    );
+    drop(client);
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_mixed_index_keeps_authored_prose_in_real_store() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir(&fixture)?;
+    fs::write(
+        fixture.join("answer.md"),
+        "# Ceramic brake isolation register\n\nThe ceramic brake isolates the spindle from drive current during recovery.\n",
+    )?;
+    fs::write(
+        fixture.join("index.md"),
+        "# Field notes\n\nThe ceramic brake isolation register records the recovery current.\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Ceramic brake isolation register](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n",
+    )?;
+    fs::write(
+        fixture.join("nav.md"),
+        "# Navigation\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Ceramic brake isolation register](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n",
+    )?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let query = LabelledQuery {
+        id: "mixed-index-authored-prose".into(),
+        query: "ceramic brake isolation register recovery current".into(),
+        expected_chunk: ChunkIdentity {
+            file: "index.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &query).await?;
+    let ranked = ranked_docs(&response.docs);
+    let authored = rank_of_expected(&ranked, "index.md");
+    let navigation = rank_of_expected(&ranked, "nav.md");
+    println!("issue573 mixed index: authored {authored:?}, navigation {navigation:?}");
+    assert!(
+        authored.is_some() && navigation.is_some() && authored < navigation,
+        "authored index prose must outrank generated-only navigation: {authored:?}, {navigation:?}"
+    );
+    drop(client);
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_generated_only_index_cannot_escape_file_rollup() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir(&fixture)?;
+    fs::write(
+        fixture.join("answer.md"),
+        "# Cache recovery procedure\n\nAfter an interrupted snapshot, cache recovery restores the archive from the last durable checkpoint. Verify the archive checksum before reopening writes.\n",
+    )?;
+    let mut index =
+        String::from("# Cache recovery\n\n## Files\n\n<!-- HALLOUMINATE:INDEX-START -->\n");
+    for number in 0..80 {
+        index.push_str(&format!(
+            "- [After an interrupted snapshot, cache recovery restores the archive from the last durable checkpoint {number}](./answer.md)\n"
+        ));
+    }
+    index.push_str("<!-- HALLOUMINATE:INDEX-END -->\n");
+    fs::write(fixture.join("index.md"), index)?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+
+    let answer_query = LabelledQuery {
+        id: "generated-only-rollup-answer".into(),
+        query: "after interrupted snapshot cache recovery restores archive last durable checkpoint verify checksum".into(),
+        expected_chunk: ChunkIdentity {
+            file: "answer.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &answer_query).await?;
+    let ranked = ranked_docs(&response.docs);
+    let answer = rank_of_expected(&ranked, "answer.md").expect("answer must be retrieved");
+    let index = rank_of_expected(&ranked, "index.md").expect("index must be retrieved");
+    println!("issue573 generated-only rollup: answer {answer}, index {index}");
+    assert!(
+        answer < index,
+        "substantive answer must outrank generated-only index after file rollup: {answer}, {index}"
+    );
+
+    let nav_query = LabelledQuery {
+        id: "generated-only-direct-navigation".into(),
+        query: "Cache recovery Files".into(),
+        expected_chunk: ChunkIdentity {
+            file: "index.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &nav_query).await?;
+    let ranked = ranked_docs(&response.docs);
+    assert!(
+        rank_of_expected(&ranked, "index.md").is_some(),
+        "direct navigation must retrieve the index: {ranked:?}"
+    );
+    drop(client);
+    harness.shutdown().await?;
     Ok(())
 }
 

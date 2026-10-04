@@ -382,8 +382,16 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
             texts.push(chunk.text.clone());
             search_texts.push(chunk.search_text.clone());
             claim_marks.push(chunk.claim_marks.clone());
-            structures.push(chunk.structure.as_ref().map(serde_json::to_string).transpose()
-                .map_err(|error| HallouminateError::Indexer(format!("encode structure: {error}")))?);
+            structures.push(
+                chunk
+                    .structure
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()
+                    .map_err(|error| {
+                        HallouminateError::Indexer(format!("encode structure: {error}"))
+                    })?,
+            );
             match &fwe.embeddings {
                 Some(embeddings) => {
                     embeddings_flat.extend_from_slice(&embeddings[idx]);
@@ -4497,10 +4505,10 @@ schema_version = 2
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
         let meta: Meta = toml::from_str(&text).unwrap();
-        assert_eq!(default_schema_version(), 4);
-        assert_eq!(meta.schema_version, 4);
+        assert_eq!(default_schema_version(), 5);
+        assert_eq!(meta.schema_version, 5);
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect("v4 store must re-open");
+            .expect("v5 store must re-open");
     }
 
     #[test]
@@ -4663,7 +4671,7 @@ schema_version = 1
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
         assert_eq!(rb.num_rows(), 5);
-        assert_eq!(rb.num_columns(), 18);
+        assert_eq!(rb.num_columns(), 19);
     }
 
     #[test]
@@ -5278,6 +5286,79 @@ schema_version = 1
             .await
             .expect("search display-only token");
         assert!(display_signals.fts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn structure_survives_reopen_edit_delete_and_recreate() {
+        use hallouminate_domain::indexer::ChunkStructure;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = docs_key();
+        let file_ref = "/tmp/structure.md";
+        let original = ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into())],
+            generated_navigation: true,
+        };
+        let mut file = synthetic_prepared(file_ref, 1);
+        file.chunks[0].search_text = "structureoriginaltoken".into();
+        file.chunks[0].structure = Some(original.clone());
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        store.apply_batch(vec![file]).await.expect("seed structure");
+        drop(store);
+
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("reopen store");
+        let signals = store
+            .retrieve_signals(&key, "structureoriginaltoken", 10)
+            .await
+            .expect("retrieve after reopen");
+        let hit = signals.hits.get(&signals.fts[0]).expect("original hit");
+        assert_eq!(hit.structure, Some(original));
+
+        let edited = ChunkStructure {
+            title: None,
+            headings: vec![(2, "New section".into())],
+            generated_navigation: false,
+        };
+        let mut file = synthetic_prepared(file_ref, 1);
+        file.content_hash = "edited".into();
+        file.chunks[0].search_text = "structureeditedtoken".into();
+        file.chunks[0].structure = Some(edited.clone());
+        store.apply_batch(vec![file]).await.expect("edit structure");
+        let signals = store
+            .retrieve_signals(&key, "structureeditedtoken", 10)
+            .await
+            .expect("retrieve edited structure");
+        let hit = signals.hits.get(&signals.fts[0]).expect("edited hit");
+        assert_eq!(hit.structure, Some(edited.clone()));
+        store
+            .delete_file(&key, file_ref)
+            .await
+            .expect("delete file");
+        assert!(
+            store
+                .list_files(&key)
+                .await
+                .expect("list after delete")
+                .is_empty()
+        );
+
+        let mut file = synthetic_prepared(file_ref, 1);
+        file.content_hash = "recreated".into();
+        file.chunks[0].search_text = "structurerecreatedtoken".into();
+        file.chunks[0].structure = Some(edited.clone());
+        store.apply_batch(vec![file]).await.expect("recreate file");
+        let signals = store
+            .retrieve_signals(&key, "structurerecreatedtoken", 10)
+            .await
+            .expect("retrieve recreated structure");
+        let hit = signals.hits.get(&signals.fts[0]).expect("recreated hit");
+        assert_eq!(hit.structure, Some(edited));
     }
 
     #[tokio::test]

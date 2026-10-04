@@ -17,16 +17,15 @@ use std::path::Path;
 use calamine::{Data, Reader, open_workbook_auto_from_rs};
 use file_format::FileFormat;
 use pdf_extract::{Document, PlainTextOutput, output_doc_page};
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use text_splitter::{ChunkConfig, ChunkSizer, TextSplitter};
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag};
 
 use super::chunk::{ChunkStructure, PreparedChunk, PreparedFile};
 use crate::common::{CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::{
     Chunk, ClaimMark, CorpusChunker, Frontmatter, INDEX_END_MARKER, INDEX_START_MARKER,
-    build_line_starts, byte_to_line, collect_heading_text, extract_claim_marks,
-    extract_keywords, extract_summary, marks_to_canonical_json, split_frontmatter,
-    strip_claim_marks,
+    build_line_starts, byte_to_line, extract_claim_marks, extract_keywords, extract_summary,
+    marks_to_canonical_json, split_frontmatter, strip_claim_marks,
 };
 use crate::footnotes::{FootnoteMode, apply_footnote_mode};
 
@@ -51,8 +50,18 @@ fn markdown_structures(content: &str, chunks: &[Chunk]) -> Vec<ChunkStructure> {
     let mut events = Vec::new();
     let mut stack: [Option<String>; 6] = Default::default();
     let mut title = None;
+    let mut markers = Vec::new();
     let mut parser = Parser::new(content).into_offset_iter();
     while let Some((event, range)) = parser.next() {
+        if let Event::Html(html) = &event {
+            let marker = html.trim();
+            if marker == INDEX_START_MARKER || marker == INDEX_END_MARKER {
+                markers.push((
+                    byte_to_line(range.start, &line_starts),
+                    marker == INDEX_START_MARKER,
+                ));
+            }
+        }
         let Event::Start(Tag::Heading { level, .. }) = event else {
             continue;
         };
@@ -64,7 +73,21 @@ fn markdown_structures(content: &str, chunks: &[Chunk]) -> Vec<ChunkStructure> {
             HeadingLevel::H5 => 5,
             HeadingLevel::H6 => 6,
         };
-        let text = collect_heading_text(&mut parser);
+        let mut text = String::new();
+        let mut heading_end = range.end;
+        for (event, range) in parser.by_ref() {
+            heading_end = range.end;
+            if let Event::End(TagEnd::Heading(_)) = event {
+                break;
+            }
+            if let Event::SoftBreak | Event::HardBreak = event {
+                text.push(' ');
+            }
+            if let Event::Text(part) | Event::Code(part) = event {
+                text.push_str(&part);
+            }
+        }
+        let text = text.trim().to_string();
         if level == 1 && title.is_none() && !text.is_empty() {
             title = Some(text.clone());
         }
@@ -73,7 +96,10 @@ fn markdown_structures(content: &str, chunks: &[Chunk]) -> Vec<ChunkStructure> {
         }
         stack[level - 1] = Some(text);
         let line = byte_to_line(range.start, &line_starts);
-        heading_lines[line] = true;
+        let end_line = byte_to_line(heading_end.saturating_sub(1), &line_starts);
+        for heading_line in &mut heading_lines[line..=end_line] {
+            *heading_line = true;
+        }
         let mut active = Vec::new();
         for (index, text) in stack.iter().enumerate() {
             if let Some(text) = text {
@@ -86,31 +112,38 @@ fn markdown_structures(content: &str, chunks: &[Chunk]) -> Vec<ChunkStructure> {
     let mut marker_lines = vec![false; lines.len() + 1];
     let mut start = None;
     let mut valid_markers = true;
-    for (index, line) in lines.iter().enumerate() {
-        let line_number = index + 1;
-        match line.trim() {
-            INDEX_START_MARKER => {
-                marker_lines[line_number] = true;
-                if start.replace(line_number).is_some() {
-                    valid_markers = false;
-                }
+    for (line, is_start) in markers {
+        marker_lines[line] = true;
+        if is_start {
+            if start.replace(line).is_some() {
+                valid_markers = false;
             }
-            INDEX_END_MARKER => {
-                marker_lines[line_number] = true;
-                let Some(start_line) = start.take() else {
-                    valid_markers = false;
-                    continue;
-                };
-                for generated in &mut generated_lines[start_line + 1..line_number] {
-                    *generated = true;
-                }
+        } else {
+            let Some(start_line) = start.take() else {
+                valid_markers = false;
+                continue;
+            };
+            for generated in &mut generated_lines[start_line + 1..line] {
+                *generated = true;
             }
-            _ => {}
         }
     }
     if start.is_some() || !valid_markers {
         generated_lines.fill(false);
     }
+    let mut document_generated = false;
+    let mut document_authored = false;
+    for line in 1..=lines.len() {
+        if marker_lines[line] || lines[line - 1].trim().is_empty() {
+            continue;
+        }
+        if generated_lines[line] {
+            document_generated = true;
+        } else if !heading_lines[line] {
+            document_authored = true;
+        }
+    }
+    let generated_only_document = document_generated && !document_authored;
     let mut structures = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         let mut headings = Vec::new();
@@ -118,10 +151,10 @@ fn markdown_structures(content: &str, chunks: &[Chunk]) -> Vec<ChunkStructure> {
             if *line <= chunk.line_start {
                 headings = active.clone();
             } else if *line <= chunk.line_end {
-                if let Some(heading) = active.last() {
-                    if !headings.contains(heading) {
-                        headings.push(heading.clone());
-                    }
+                if let Some(heading) = active.last()
+                    && !headings.contains(heading)
+                {
+                    headings.push(heading.clone());
                 }
             } else {
                 break;
@@ -142,7 +175,7 @@ fn markdown_structures(content: &str, chunks: &[Chunk]) -> Vec<ChunkStructure> {
         structures.push(ChunkStructure {
             title: title.clone(),
             headings,
-            generated_navigation: generated && !authored,
+            generated_navigation: generated_only_document || (generated && !authored),
         });
     }
     structures
@@ -925,15 +958,152 @@ mod tests {
     fn markdown_structure_uses_real_heading_levels_and_full_source_markers() {
         let content = "## H2 only\n\nAuthored answer.\n<!-- HALLOUMINATE:INDEX-START -->\n- [Nav](./nav.md)\n- [More](./more.md)\n<!-- HALLOUMINATE:INDEX-END -->\nAuthored close.\n";
         let chunks = vec![
-            Chunk { ord: 0, heading_path: vec!["H2 only".into()], line_start: 1, line_end: 3, text: String::new() },
-            Chunk { ord: 1, heading_path: vec!["H2 only".into()], line_start: 4, line_end: 5, text: String::new() },
-            Chunk { ord: 2, heading_path: vec!["H2 only".into()], line_start: 6, line_end: 7, text: String::new() },
-            Chunk { ord: 3, heading_path: vec!["H2 only".into()], line_start: 8, line_end: 8, text: String::new() },
+            Chunk {
+                ord: 0,
+                heading_path: vec!["H2 only".into()],
+                line_start: 1,
+                line_end: 3,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 1,
+                heading_path: vec!["H2 only".into()],
+                line_start: 4,
+                line_end: 5,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 2,
+                heading_path: vec!["H2 only".into()],
+                line_start: 6,
+                line_end: 7,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 3,
+                heading_path: vec!["H2 only".into()],
+                line_start: 8,
+                line_end: 8,
+                text: String::new(),
+            },
         ];
         let structures = markdown_structures(content, &chunks);
         assert_eq!(structures[0].title, None);
         assert_eq!(structures[0].headings, vec![(2, "H2 only".into())]);
-        assert_eq!(structures.iter().map(|value| value.generated_navigation).collect::<Vec<_>>(), vec![false, true, true, false]);
+        let expected = [false, true, true, false];
+        for (structure, expected) in structures.iter().zip(expected) {
+            assert_eq!(structure.generated_navigation, expected);
+        }
+    }
+
+    #[test]
+    fn markdown_structure_ignores_code_markers_and_setext_rule() {
+        let content = "Setext title\n============\n\n```html\n<!-- HALLOUMINATE:INDEX-START -->\n```\nAuthored answer.\n<!-- HALLOUMINATE:INDEX-START -->\n- [Nav](./nav.md)\n<!-- HALLOUMINATE:INDEX-END -->\n";
+        let chunks = vec![
+            Chunk {
+                ord: 0,
+                heading_path: vec!["Setext title".into()],
+                line_start: 1,
+                line_end: 2,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 1,
+                heading_path: vec!["Setext title".into()],
+                line_start: 7,
+                line_end: 7,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 2,
+                heading_path: vec!["Setext title".into()],
+                line_start: 8,
+                line_end: 10,
+                text: String::new(),
+            },
+        ];
+        let structures = markdown_structures(content, &chunks);
+        assert_eq!(structures[0].title.as_deref(), Some("Setext title"));
+        assert!(!structures[0].generated_navigation);
+        assert!(!structures[1].generated_navigation);
+        assert!(structures[2].generated_navigation);
+    }
+
+    #[test]
+    fn markdown_handler_marks_every_generated_only_index_chunk() {
+        let bytes = b"# Cache recovery\n\n## Files\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Cache recovery restores the archive](./answer.md)\n- [Cache recovery restores the archive again](./answer.md)\n- [Cache recovery restores the archive safely](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n";
+        let corpus_key = CorpusKey::from_configured_root("docs", "/tmp/docs");
+        let file = FileRef::new(std::path::PathBuf::from("index.md"));
+        let ctx = PrepareCtx {
+            corpus_key: &corpus_key,
+            file: &file,
+            mtime: Mtime(1),
+            bytes,
+            content_hash: "hash".into(),
+            indexed_at_ms: 2,
+        };
+        let handler = MarkdownHandler::new(Box::new(crate::corpus::MarkdownChunker::new(
+            text_splitter::Characters,
+            75,
+        )));
+        let prepared = handler.prepare(&ctx).expect("prepare generated index");
+        let mut title_only_chunk = false;
+        for chunk in &prepared.chunks {
+            if chunk.text.trim() == "# Cache recovery" {
+                title_only_chunk = true;
+            }
+            let Some(structure) = &chunk.structure else {
+                panic!("Markdown chunk lacks structure: {chunk:?}");
+            };
+            assert!(
+                structure.generated_navigation,
+                "a generated-only file must not expose a non-generated chunk: {chunk:?}"
+            );
+        }
+        assert!(
+            title_only_chunk,
+            "the real chunker must produce a title-only chunk: {:?}",
+            prepared.chunks
+        );
+    }
+
+    #[test]
+    fn markdown_handler_multiline_setext_heading_does_not_make_generated_links_authored() {
+        let bytes = b"Cache recovery\nfiles and references\n====================\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Cache recovery guide](./guide.md)\n- [Cache recovery answer](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n";
+        let corpus_key = CorpusKey::from_configured_root("docs", "/tmp/docs");
+        let file = FileRef::new(std::path::PathBuf::from("index.md"));
+        let ctx = PrepareCtx {
+            corpus_key: &corpus_key,
+            file: &file,
+            mtime: Mtime(1),
+            bytes,
+            content_hash: "hash".into(),
+            indexed_at_ms: 2,
+        };
+        let handler = MarkdownHandler::new(Box::new(crate::corpus::MarkdownChunker::new(
+            text_splitter::Characters,
+            90,
+        )));
+        let prepared = handler.prepare(&ctx).expect("prepare Setext index");
+        assert!(
+            prepared.chunks.len() > 1,
+            "fixture must split: {:?}",
+            prepared.chunks
+        );
+        for chunk in &prepared.chunks {
+            let Some(structure) = &chunk.structure else {
+                panic!("Markdown chunk lacks structure: {chunk:?}");
+            };
+            assert_eq!(
+                structure.title.as_deref(),
+                Some("Cache recovery files and references"),
+                "multiline Setext title must preserve word boundaries: {chunk:?}"
+            );
+            assert!(
+                structure.generated_navigation,
+                "multiline Setext heading must not make generated-only index authored: {chunk:?}"
+            );
+        }
     }
 
     #[test]
@@ -997,6 +1167,7 @@ mod tests {
         assert_eq!(chunk.heading_path, vec!["Overview".to_string()]);
         assert!(chunk.text.contains("The melange flows."));
         assert!(chunk.claim_marks.is_none());
+        assert!(chunk.structure.is_none());
     }
 
     #[test]

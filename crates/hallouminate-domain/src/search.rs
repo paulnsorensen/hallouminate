@@ -232,24 +232,25 @@ pub async fn search_fused(
         "pre-fusion signal order"
     );
     let mut lists = vec![
-            RankedList {
-                weight: FTS_WEIGHT,
-                chunk_ids: signals.fts,
-            },
-            RankedList {
-                weight: VECTOR_WEIGHT,
-                chunk_ids: signals.vector,
-            },
-            RankedList {
-                weight: RIPGREP_WEIGHT,
-                chunk_ids: rg_list,
-            },
-            RankedList {
-                weight: CONTAINS_WEIGHT,
-                chunk_ids: fm_list,
-            },
-        ];
-    lists.extend(structural_lists(&signals.hits, &terms));
+        RankedList {
+            weight: FTS_WEIGHT,
+            chunk_ids: signals.fts,
+        },
+        RankedList {
+            weight: VECTOR_WEIGHT,
+            chunk_ids: signals.vector,
+        },
+        RankedList {
+            weight: RIPGREP_WEIGHT,
+            chunk_ids: rg_list,
+        },
+        RankedList {
+            weight: CONTAINS_WEIGHT,
+            chunk_ids: fm_list,
+        },
+    ];
+    let baseline = fuse(&lists, RRF_K);
+    lists.extend(structural_lists(&signals.hits, &terms, &baseline));
     let fused = fuse(&lists, RRF_K);
 
     let mut hits = signals.hits;
@@ -287,22 +288,31 @@ fn heading_overlap(terms: &[String], heading: &str) -> usize {
     overlap
 }
 
-fn structural_lists(hits: &HashMap<String, SearchHit>, terms: &[String]) -> Vec<RankedList> {
+fn structural_lists(
+    hits: &HashMap<String, SearchHit>,
+    terms: &[String],
+    baseline: &[(String, f32)],
+) -> Vec<RankedList> {
     if terms.is_empty() {
         return Vec::new();
     }
     let mut titles = Vec::new();
     let mut sections = Vec::new();
-    let mut navigation = Vec::new();
-    for hit in hits.values() {
-        let Some(structure) = &hit.structure else {
+    let mut authored = Vec::new();
+    for (rank, (chunk_id, _score)) in baseline.iter().enumerate() {
+        let Some(hit) = hits.get(chunk_id) else {
             continue;
         };
-        let title_overlap = structure.title.as_deref()
-            .map(|title| heading_overlap(terms, title))
-            .unwrap_or(0);
+        let Some(structure) = &hit.structure else {
+            authored.push(chunk_id.clone());
+            continue;
+        };
+        let title_overlap = match &structure.title {
+            Some(title) => heading_overlap(terms, title),
+            None => 0,
+        };
         if title_overlap > 0 {
-            titles.push((hit.chunk_id.clone(), title_overlap));
+            titles.push((title_overlap, rank, chunk_id.clone()));
         }
         let mut section_overlap = 0;
         for (level, heading) in &structure.headings {
@@ -310,20 +320,36 @@ fn structural_lists(hits: &HashMap<String, SearchHit>, terms: &[String]) -> Vec<
                 section_overlap = section_overlap.max(heading_overlap(terms, heading));
             }
         }
-        if section_overlap > 0 {
-            sections.push((hit.chunk_id.clone(), section_overlap));
+        if section_overlap > title_overlap {
+            sections.push((section_overlap, rank, chunk_id.clone()));
         }
-        if structure.generated_navigation && title_overlap == 0 {
-            navigation.push(hit.chunk_id.clone());
+        if !structure.generated_navigation {
+            authored.push(chunk_id.clone());
         }
     }
-    titles.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    sections.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    navigation.sort();
+    titles.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    sections.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut title_ids = Vec::new();
+    for (_, _, chunk_id) in titles {
+        title_ids.push(chunk_id);
+    }
+    let mut section_ids = Vec::new();
+    for (_, _, chunk_id) in sections {
+        section_ids.push(chunk_id);
+    }
     vec![
-        RankedList { weight: 1.0, chunk_ids: titles.into_iter().map(|(id, _)| id).collect() },
-        RankedList { weight: 0.75, chunk_ids: sections.into_iter().map(|(id, _)| id).collect() },
-        RankedList { weight: -0.75, chunk_ids: navigation },
+        RankedList {
+            weight: 0.5,
+            chunk_ids: title_ids,
+        },
+        RankedList {
+            weight: 0.35,
+            chunk_ids: section_ids,
+        },
+        RankedList {
+            weight: 0.35,
+            chunk_ids: authored,
+        },
     ]
 }
 
@@ -610,6 +636,283 @@ mod tests {
 
     fn pool(hits: Vec<SearchHit>) -> HashMap<String, SearchHit> {
         hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect()
+    }
+
+    #[test]
+    fn structural_evidence_favors_h1_then_h2_without_repeating_title_or_navigation() {
+        use crate::indexer::ChunkStructure;
+        let mut body = hit("body", "/repo/wiki/body.md", 1, 1);
+        body.structure = Some(ChunkStructure {
+            title: Some("Generic guide".into()),
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut section = hit("section", "/repo/wiki/section.md", 1, 1);
+        section.structure = Some(ChunkStructure {
+            title: None,
+            headings: vec![(2, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut title = hit("title", "/repo/wiki/title.md", 1, 1);
+        title.structure = Some(ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into()), (2, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut navigation = hit("navigation", "/repo/wiki/index.md", 1, 1);
+        navigation.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: true,
+        });
+        let neutral = hit("neutral", "/repo/wiki/record.json", 1, 1);
+        let hits = pool(vec![body, section, title, navigation, neutral]);
+        let baseline = vec![
+            ("body".into(), 1.0),
+            ("section".into(), 1.0),
+            ("title".into(), 1.0),
+            ("navigation".into(), 1.0),
+            ("neutral".into(), 1.0),
+        ];
+        let terms = vec!["lantern".into(), "cache".into()];
+        let lists = structural_lists(&hits, &terms, &baseline);
+        assert_eq!(lists[0].chunk_ids, ["title"]);
+        assert_eq!(lists[1].chunk_ids, ["section"]);
+        assert_eq!(lists[2].chunk_ids, ["body", "section", "title", "neutral"]);
+        for list in &lists {
+            assert!(list.weight >= 0.0);
+        }
+    }
+
+    #[test]
+    fn strong_body_evidence_outweighs_a_heading_only_match() {
+        use crate::indexer::ChunkStructure;
+        let mut body = hit("body", "/repo/wiki/body.md", 1, 1);
+        body.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut title = hit("title", "/repo/wiki/title.md", 1, 1);
+        title.structure = Some(ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let hits = pool(vec![body, title]);
+        let mut ids = vec!["body".to_string()];
+        for index in 0..10 {
+            ids.push(format!("filler-{index}"));
+        }
+        ids.push("title".into());
+        let mut lists = vec![
+            RankedList {
+                weight: FTS_WEIGHT,
+                chunk_ids: ids.clone(),
+            },
+            RankedList {
+                weight: VECTOR_WEIGHT,
+                chunk_ids: ids.clone(),
+            },
+            RankedList {
+                weight: RIPGREP_WEIGHT,
+                chunk_ids: ids.clone(),
+            },
+            RankedList {
+                weight: CONTAINS_WEIGHT,
+                chunk_ids: ids,
+            },
+        ];
+        let baseline = fuse(&lists, RRF_K);
+        let terms = vec!["lantern".into(), "cache".into()];
+        lists.extend(structural_lists(&hits, &terms, &baseline));
+        let ranked = fuse(&lists, RRF_K);
+        assert_eq!(ranked[0].0, "body");
+        let mut body_rank = None;
+        let mut title_rank = None;
+        for (rank, (id, _)) in ranked.iter().enumerate() {
+            if id == "body" {
+                body_rank = Some(rank);
+            }
+            if id == "title" {
+                title_rank = Some(rank);
+            }
+        }
+        let (Some(body_rank), Some(title_rank)) = (body_rank, title_rank) else {
+            panic!("both body and title must be ranked: {ranked:?}");
+        };
+        assert!(body_rank < title_rank);
+    }
+
+    #[test]
+    fn quoted_title_uses_the_same_heading_overlap() {
+        let plain = split_terms("lantern cache");
+        let quoted = split_terms("\"lantern cache\"");
+        assert_eq!(heading_overlap(&plain, "Lantern cache"), 2);
+        assert_eq!(heading_overlap(&quoted, "Lantern cache"), 2);
+    }
+
+    fn calibration_lists(fts: &[String], others: &[String]) -> Vec<RankedList> {
+        vec![
+            RankedList {
+                weight: FTS_WEIGHT,
+                chunk_ids: fts.to_vec(),
+            },
+            RankedList {
+                weight: VECTOR_WEIGHT,
+                chunk_ids: others.to_vec(),
+            },
+            RankedList {
+                weight: RIPGREP_WEIGHT,
+                chunk_ids: others.to_vec(),
+            },
+            RankedList {
+                weight: CONTAINS_WEIGHT,
+                chunk_ids: others.to_vec(),
+            },
+        ]
+    }
+
+    fn calibration_order(
+        hits: &HashMap<String, SearchHit>,
+        lists: &[RankedList],
+        terms: &[String],
+        weights: [f32; 3],
+    ) -> Vec<String> {
+        let baseline = fuse(lists, RRF_K);
+        let mut lists = lists.to_vec();
+        let mut structural = structural_lists(hits, terms, &baseline);
+        for index in 0..3 {
+            structural[index].weight = weights[index];
+        }
+        lists.extend(structural);
+        let mut order = Vec::new();
+        for (id, _) in fuse(&lists, RRF_K) {
+            order.push(id);
+        }
+        order
+    }
+
+    fn before(order: &[String], left: &str, right: &str) -> bool {
+        let mut left_rank = None;
+        let mut right_rank = None;
+        for (rank, id) in order.iter().enumerate() {
+            if id == left {
+                left_rank = Some(rank);
+            }
+            if id == right {
+                right_rank = Some(rank);
+            }
+        }
+        let (Some(left_rank), Some(right_rank)) = (left_rank, right_rank) else {
+            return false;
+        };
+        left_rank < right_rank
+    }
+
+    #[test]
+    fn structural_weight_calibration_on_separate_synthetic_controls() {
+        use crate::indexer::ChunkStructure;
+        let mut h1 = hit("h1", "/repo/wiki/h1.md", 1, 1);
+        h1.structure = Some(ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut h2 = hit("h2", "/repo/wiki/h2.md", 1, 1);
+        h2.structure = Some(ChunkStructure {
+            title: None,
+            headings: vec![(2, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut generic = hit("generic", "/repo/wiki/generic.md", 1, 1);
+        generic.structure = Some(ChunkStructure {
+            title: Some("Generic guide".into()),
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut body = hit("body", "/repo/wiki/body.md", 1, 1);
+        body.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut answer = hit("answer", "/repo/wiki/answer.md", 1, 1);
+        answer.structure = body.structure.clone();
+        let mut navigation = hit("navigation", "/repo/wiki/navigation.md", 1, 1);
+        navigation.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: true,
+        });
+        let hits = pool(vec![h1, h2, generic, body, answer, navigation]);
+        let terms = vec!["lantern".into(), "cache".into()];
+
+        let equal_fts = vec!["body".into(), "h2".into(), "h1".into()];
+        let equal_other = vec!["h1".into(), "h2".into(), "body".into()];
+        let equal = calibration_lists(&equal_fts, &equal_other);
+        let mut h1_deficit = vec!["generic".into()];
+        for index in 0..5 {
+            h1_deficit.push(format!("filler-{index}"));
+        }
+        h1_deficit.push("h1".into());
+        let h1_deficit = calibration_lists(&h1_deficit, &h1_deficit);
+        let mut h2_deficit = vec!["generic".into()];
+        for index in 0..3 {
+            h2_deficit.push(format!("filler-{index}"));
+        }
+        h2_deficit.push("h2".into());
+        let h2_deficit = calibration_lists(&h2_deficit, &h2_deficit);
+        let mut strong_body = vec!["body".into(), "generic".into()];
+        for index in 0..9 {
+            strong_body.push(format!("filler-{index}"));
+        }
+        strong_body.push("h1".into());
+        let strong_body = calibration_lists(&strong_body, &strong_body);
+        let mut content_answer = vec!["navigation".into()];
+        for index in 0..4 {
+            content_answer.push(format!("filler-{index}"));
+        }
+        content_answer.push("answer".into());
+        let content_answer = calibration_lists(&content_answer, &content_answer);
+
+        let candidates = [
+            ("low", [0.25, 0.2, 0.25]),
+            ("medium", [0.35, 0.25, 0.25]),
+            ("bounded", [0.5, 0.35, 0.35]),
+            ("high", [0.75, 0.5, 0.5]),
+            ("draft", [1.0, 0.75, 0.75]),
+        ];
+        let mut passing = Vec::new();
+        for (name, weights) in candidates {
+            let equal_order = calibration_order(&hits, &equal, &terms, weights);
+            let h1_order = calibration_order(&hits, &h1_deficit, &terms, weights);
+            let h2_order = calibration_order(&hits, &h2_deficit, &terms, weights);
+            let body_order = calibration_order(&hits, &strong_body, &terms, weights);
+            let answer_order = calibration_order(&hits, &content_answer, &terms, weights);
+            let equal_ok = before(&equal_order, "h1", "h2") && before(&equal_order, "h2", "body");
+            let h1_ok = before(&h1_order, "h1", "generic");
+            let h2_ok = before(&h2_order, "h2", "generic");
+            let body_ok =
+                before(&body_order, "body", "h1") && before(&body_order, "body", "generic");
+            let answer_ok = before(&answer_order, "answer", "navigation")
+                && answer_order.contains(&"navigation".to_string());
+            println!(
+                "{name} {weights:?}: equal={equal_ok} h1={h1_ok} h2={h2_ok} strong_body={body_ok} answer_navigation={answer_ok}"
+            );
+            if equal_ok && h1_ok && h2_ok && body_ok && answer_ok {
+                passing.push(name);
+            }
+        }
+        assert_eq!(passing, ["bounded"]);
+        let baseline = fuse(&equal, RRF_K);
+        let structural = structural_lists(&hits, &terms, &baseline);
+        let actual = [
+            structural[0].weight,
+            structural[1].weight,
+            structural[2].weight,
+        ];
+        assert_eq!(actual, [0.5, 0.35, 0.35]);
     }
 
     #[test]
@@ -1056,9 +1359,9 @@ mod tests {
 
             assert_eq!(result.hits.len(), 2);
             assert_eq!(result.hits[0].chunk_id, "second");
-            assert_eq!(result.hits[0].score, 2.0 / 61.0 + 1.0 / 60.0);
+            assert_eq!(result.hits[0].score, 2.0 / 61.0 + 1.0 / 60.0 + 0.35 / 60.0);
             assert_eq!(result.hits[1].chunk_id, "first");
-            assert_eq!(result.hits[1].score, 2.0 / 60.0);
+            assert_eq!(result.hits[1].score, 2.0 / 60.0 + 0.35 / 61.0);
             assert_eq!(result.warnings.len(), 1);
             assert_eq!(result.warnings[0].code, "ripgrep-unresolved");
             assert_eq!(
@@ -1075,8 +1378,8 @@ mod tests {
     #[tokio::test]
     async fn resolved_or_absent_ripgrep_hits_do_not_warn() {
         for (contents, expected_score) in [
-            ("distinctiveterm\n", 2.0 / 60.0 + 0.5 / 60.0),
-            ("unrelated\n", 2.0 / 60.0),
+            ("distinctiveterm\n", 2.0 / 60.0 + 0.5 / 60.0 + 0.35 / 60.0),
+            ("unrelated\n", 2.0 / 60.0 + 0.35 / 60.0),
         ] {
             let root = tempfile::tempdir().expect("ripgrep fixture root");
             let corpus_key = CorpusKey {
