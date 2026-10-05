@@ -54,6 +54,7 @@ use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
 use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use hallouminate_domain::search::validate_phrase;
 
+use super::framing::MAX_IPC_LINE_BYTES;
 use super::ipc::{
     AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
     BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
@@ -672,7 +673,25 @@ async fn handle_ground(
             path_prefix_strip: None,
         },
     );
-    DaemonResponse::ok(&GroundResult { outline, response })
+    ground_reply(&GroundResult { outline, response })
+}
+
+/// Bytes the response envelope and the line terminator add around a result.
+const GROUND_FRAME_HEADROOM_BYTES: usize = 64 * 1024;
+
+/// Wraps a ground result, or returns a clear error when the serialized
+/// result cannot fit one IPC frame. The client would otherwise fail on the
+/// frame limit without a reason.
+fn ground_reply(result: &GroundResult) -> DaemonResponse {
+    let limit = MAX_IPC_LINE_BYTES - GROUND_FRAME_HEADROOM_BYTES;
+    match serde_json::to_vec(result) {
+        Ok(bytes) if bytes.len() > limit => DaemonResponse::invalid_params(format!(
+            "ground response is {} bytes; the IPC limit is {limit} bytes. Narrow the query, lower top_files or chunks_per_file, or limit the corpus",
+            bytes.len()
+        )),
+        Ok(_) => DaemonResponse::ok(result),
+        Err(e) => DaemonResponse::internal(format!("serialize response: {e}")),
+    }
 }
 
 /// Map a mutation-guard acquisition failure onto the wire. The Hard-debt
@@ -2255,6 +2274,38 @@ mod tests {
 
     fn ground_request() -> GroundRequest {
         serde_json::from_value(serde_json::json!({ "query": "q" })).expect("minimal ground request")
+    }
+
+    fn ground_result(outline: String) -> GroundResult {
+        GroundResult {
+            outline,
+            response: hallouminate_domain::ground::GroundResponse {
+                query: "q".to_string(),
+                took_ms: 0,
+                stats: hallouminate_domain::ground::Stats::default(),
+                docs: std::collections::BTreeMap::new(),
+                code: std::collections::BTreeMap::new(),
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn ground_reply_turns_an_oversize_result_into_a_clear_error() {
+        let oversize = ground_result("x".repeat(MAX_IPC_LINE_BYTES));
+        let DaemonResponse::Err { kind, message } = ground_reply(&oversize) else {
+            panic!("a result over the IPC limit must become an error");
+        };
+        assert_eq!(kind, ErrorKind::InvalidParams);
+        assert!(message.contains("IPC limit"), "{message}");
+    }
+
+    #[test]
+    fn ground_reply_passes_a_result_inside_the_limit() {
+        let small = ground_result("outline".to_string());
+        let DaemonResponse::Ok { .. } = ground_reply(&small) else {
+            panic!("a small result must stay a success");
+        };
     }
 
     /// The candidate pool must come from configuration, not a hardcoded

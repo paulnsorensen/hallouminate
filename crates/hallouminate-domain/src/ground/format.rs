@@ -120,23 +120,27 @@ fn write_doc_block(buf: &mut String, path: &str, doc: &DocFile, strip_prefix: Op
         Some(p) if path.starts_with(p) => path.trim_start_matches(p).to_string(),
         _ => path.to_string(),
     };
+    if let Some(coverage) = doc.coverage {
+        write!(
+            buf,
+            "{display_path}  ({score:.3})  {chunks} matched chunks",
+            score = doc.score,
+            chunks = coverage.chunks
+        )
+        .expect("counts line");
+        match coverage.pages {
+            Some(pages) => writeln!(buf, " on {pages} pages"),
+            None => writeln!(buf),
+        }
+        .expect("counts line end");
+        return;
+    }
     writeln!(buf, "{display_path}  ({score:.3})", score = doc.score,).expect("doc header");
     if let Some(z) = doc.z_score {
         writeln!(buf, "  z={z:.3}").expect("doc z_score");
     }
     if let Some(summary) = &doc.summary {
         writeln!(buf, "  {summary}").expect("summary");
-    }
-    if let Some(coverage) = doc.coverage {
-        match coverage.pages {
-            Some(pages) => writeln!(
-                buf,
-                "  {chunks} matched chunks on {pages} pages",
-                chunks = coverage.chunks
-            ),
-            None => writeln!(buf, "  {chunks} matched chunks", chunks = coverage.chunks),
-        }
-        .expect("coverage");
     }
     for chunk in &doc.chunks {
         let heading = chunk.heading_path.join(" > ");
@@ -548,6 +552,10 @@ mod tests {
         }
         let out = render(&counted, Format::Outline, &RenderOpts::default());
         assert!(out.contains("  2 matched chunks\n"), "{out}");
+        assert!(
+            !out.contains("Planner Cognition Research"),
+            "a counts doc is one line without the summary: {out}"
+        );
     }
 
     #[test]

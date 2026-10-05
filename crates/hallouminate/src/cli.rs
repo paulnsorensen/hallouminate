@@ -252,8 +252,9 @@ pub struct GroundCli {
     #[arg(long, value_enum, default_value_t = GroupByArg::Chunk)]
     pub group_by: GroupByArg,
     /// Response shape. `counts` needs `--match phrase` and returns matched
-    /// chunk and page counts for every matched file, with no snippets and
-    /// no `--top-files`, `--chunks-per-file`, or `--limit` caps.
+    /// chunk and page counts for each matched file, with no snippets and no
+    /// `--top-files`, `--chunks-per-file`, or `--limit` caps. It lists at most
+    /// 2,000 files and warns when more match.
     #[arg(long, value_enum, default_value_t = OutputArg::Hits)]
     pub output: OutputArg,
     /// Accepted for backward compatibility; same caveat as `hallouminate

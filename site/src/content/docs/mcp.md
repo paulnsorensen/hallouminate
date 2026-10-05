@@ -82,11 +82,13 @@ breadcrumb). The entry is the best chunk of the page, and `chunk_count` gives
 the number of matched chunks on that page. `chunks_per_file` then caps pages.
 Chunks without a page breadcrumb stay single entries.
 
-Set `output: "counts"` with `match: "phrase"` to get complete coverage counts.
-Each matched file carries `coverage: {chunks, pages}` and no chunks or
-snippets. `pages` is `null` for a file without page breadcrumbs. Counts ignore
-`top_files`, `chunks_per_file`, and `limit`; only the 10,000-match scan cap
-applies. `output: "counts"` with `match: "ranked"` is rejected.
+Set `output: "counts"` with `match: "phrase"` to get coverage counts.
+Each matched file carries `coverage: {chunks, pages}` and no chunks, snippets,
+summary, or keywords. `pages` is `null` for a file without page breadcrumbs.
+Counts ignore `top_files`, `chunks_per_file`, and `limit`. The 10,000-match scan
+cap applies. A counts response lists at most 2,000 files and adds a
+`counts-truncated` warning when more files match. A response over the IPC frame
+limit returns an error. `output: "counts"` with `match: "ranked"` is rejected.
 
 ### `add_markdown`
 

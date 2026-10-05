@@ -15,6 +15,10 @@ use super::types::{
     DocFile, GroundGroupBy, GroundMatch, GroundOutput, GroundResponse, Stats, Warning,
 };
 
+/// Maximum number of files a counts response lists. Counts output has no
+/// `top_files` cap, so this bound keeps the response inside the IPC frame.
+pub const MAX_COUNTS_FILES: usize = 2_000;
+
 /// Why one bounded crossencoder attempt kept fusion order.
 #[derive(Debug, PartialEq, Eq)]
 enum RerankFallback {
@@ -111,7 +115,9 @@ pub struct GroundOpts {
     /// entry per PDF page, and `chunks_per_file` then caps pages.
     pub group_by: GroundGroupBy,
     /// Response shape. [`GroundOutput::Counts`] ignores `top_files`,
-    /// `chunks_per_file`, and `limit`, and needs [`GroundMatch::Phrase`].
+    /// `chunks_per_file`, and `limit`, lists at most [`MAX_COUNTS_FILES`]
+    /// files with a `counts-truncated` warning, and needs
+    /// [`GroundMatch::Phrase`].
     pub output: GroundOutput,
 }
 
@@ -398,6 +404,20 @@ pub async fn ground_union(
             ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
         }
         docs = ranked.into_iter().collect();
+    }
+
+    if opts.output == GroundOutput::Counts && docs.len() > MAX_COUNTS_FILES {
+        let matched_files = docs.len();
+        let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
+        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
+        ranked.truncate(MAX_COUNTS_FILES);
+        docs = ranked.into_iter().collect();
+        warnings.push(Warning {
+            code: "counts-truncated".to_string(),
+            message: format!(
+                "counts output lists the first {MAX_COUNTS_FILES} of {matched_files} matched files; narrow the phrase or the corpus to see the rest"
+            ),
+        });
     }
 
     if opts.match_mode == GroundMatch::Phrase && opts.output == GroundOutput::Hits {
@@ -918,6 +938,7 @@ mod tests {
         for (i, text) in texts.iter().enumerate() {
             let file_ref = fixture_root().join(format!("phrase{i}.md"));
             let mut hit = hit_for_timeout_test(&file_ref.to_string_lossy(), 0.0);
+            hit.text = (*text).to_string();
             hit.search_text = (*text).to_string();
             hits.push(hit);
         }
@@ -966,12 +987,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phrase_mode_ignores_a_phrase_that_only_the_file_summary_holds() {
+        let path = fixture_root().join("phrase-summary.md");
+        let path = path.to_string_lossy();
+        let mut summary_only = hit_for_timeout_test(&path, 0.0);
+        summary_only.chunk_id = "summary-only".into();
+        summary_only.text = "plain body".into();
+        summary_only.search_text = "crumb\nexact phrase in summary\nplain body".into();
+        let mut in_body = summary_only.clone();
+        in_body.chunk_id = "in-body".into();
+        in_body.line_start = 20;
+        in_body.text = "the exact phrase".into();
+        in_body.search_text = "crumb\nexact phrase in summary\nthe exact phrase".into();
+        let store = FakeChunkStore {
+            hits: vec![summary_only, in_body],
+        };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("phrase ground");
+        assert_eq!(resp.stats.hits, 1);
+        let doc = resp.docs.values().next().expect("one file");
+        assert_eq!(doc.chunks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn counts_output_caps_the_file_count_and_warns() {
+        let mut hits = Vec::new();
+        for index in 0..=MAX_COUNTS_FILES {
+            let path = fixture_root().join(format!("counts-{index:05}.md"));
+            let mut hit = hit_for_timeout_test(&path.to_string_lossy(), 0.0);
+            hit.text = "exact phrase".into();
+            hit.search_text = "exact phrase".into();
+            hit.summary = "file summary".into();
+            hit.keywords = vec!["keyword".into()];
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("counts ground");
+        assert_eq!(resp.docs.len(), MAX_COUNTS_FILES);
+        assert_eq!(resp.stats.hits, MAX_COUNTS_FILES + 1);
+        let mut codes = Vec::new();
+        for warning in &resp.warnings {
+            codes.push(warning.code.as_str());
+        }
+        assert_eq!(codes, vec!["counts-truncated"]);
+        assert!(
+            resp.warnings[0]
+                .message
+                .contains("2000 of 2001 matched files"),
+            "{}",
+            resp.warnings[0].message
+        );
+        for doc in resp.docs.values() {
+            assert_eq!(doc.summary, None);
+            assert!(doc.keywords.is_empty());
+            assert!(doc.chunks.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn phrase_rollup_warns_when_chunks_per_file_drops_a_match() {
         let path = fixture_root().join("phrase-chunks.md");
         let path = path.to_string_lossy();
         let mut first = hit_for_timeout_test(&path, 0.0);
         first.chunk_id = "first".into();
         first.line_start = 1;
+        first.text = "exact phrase".into();
         first.search_text = "exact phrase".into();
         let mut second = first.clone();
         second.chunk_id = "second".into();
@@ -999,6 +1091,7 @@ mod tests {
         for name in ["phrase-top-a.md", "phrase-top-b.md"] {
             let path = fixture_root().join(name);
             let mut hit = hit_for_timeout_test(&path.to_string_lossy(), 0.0);
+            hit.text = "exact phrase".into();
             hit.search_text = "exact phrase".into();
             hits.push(hit);
         }

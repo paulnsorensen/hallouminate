@@ -82,8 +82,9 @@ Phrase results can omit matches because of `--limit`, `--chunks-per-file`,
 `--top-files`, or the 10,000-match scan cap. A `phrase-truncated` warning
 reports these limits. Do not infer absence or uniqueness from truncated results.
 
-For a complete count, use `--match phrase --output counts`. Counts ignore
-`--limit`, `--chunks-per-file`, and `--top-files`. Only the scan cap applies.
+For a count, use `--match phrase --output counts`. Counts ignore `--limit`,
+`--chunks-per-file`, and `--top-files`. The scan cap applies, and the output
+lists at most 2,000 files with a `counts-truncated` warning when more match.
 With `--group-by page`, `--chunks-per-file` caps pages, not chunks.
 
 ```sh

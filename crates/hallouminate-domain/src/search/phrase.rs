@@ -11,6 +11,7 @@
 //! still matches. All other characters match literally.
 
 use crate::common::{CorpusKey, HallouminateError, Result};
+use crate::footnotes::{FootnoteMode, apply_footnote_mode};
 use crate::ground::Warning;
 use crate::indexer::SearchHit;
 
@@ -112,7 +113,7 @@ pub async fn search_phrase(
     let scanned = hits.len();
     let mut decorated = Vec::with_capacity(scanned);
     for mut hit in hits {
-        let count = occurrence_count(&hit.search_text, &needle)
+        let count = body_occurrence_count(&hit.text, &needle)
             .saturating_sub(overlap_occurrence_count(&hit, &needle));
         if count == 0 {
             continue;
@@ -191,12 +192,19 @@ pub fn collapse_whitespace(text: &str) -> String {
     collapsed
 }
 
-fn occurrence_count(search_text: &str, needle: &str) -> usize {
+fn occurrence_count(text: &str, needle: &str) -> usize {
     let mut count = 0;
-    for _ in collapse_whitespace(&search_text.to_lowercase()).matches(needle) {
+    for _ in collapse_whitespace(&text.to_lowercase()).matches(needle) {
         count += 1;
     }
     count
+}
+
+/// Counts the occurrences of `needle` in the chunk body. The count skips
+/// footnote definitions, the breadcrumb, and the file summary, so a phrase
+/// that only the summary holds does not count for every chunk of the file.
+fn body_occurrence_count(text: &str, needle: &str) -> usize {
+    occurrence_count(&apply_footnote_mode(text, FootnoteMode::Exclude), needle)
 }
 
 /// Counts the occurrences of `needle` that lie whole in the leading
@@ -206,7 +214,7 @@ fn overlap_occurrence_count(hit: &SearchHit, needle: &str) -> usize {
     let Some(prefix) = hit.text.get(..hit.overlap_bytes) else {
         return 0;
     };
-    occurrence_count(prefix, needle)
+    body_occurrence_count(prefix, needle)
 }
 
 #[cfg(test)]
@@ -322,6 +330,26 @@ mod tests {
             overlap_bytes,
             z_score: None,
         }
+    }
+
+    #[test]
+    fn overlap_occurrence_count_skips_footnote_definitions_in_the_prefix() {
+        let prefix = "[^ref]: needle\n\n";
+        let text = format!("{prefix}A new needle occurs.");
+        let hit = overlapping_hit(&text, prefix.len());
+        assert_eq!(overlap_occurrence_count(&hit, "needle"), 0);
+        assert_eq!(
+            body_occurrence_count(&hit.text, "needle")
+                .saturating_sub(overlap_occurrence_count(&hit, "needle")),
+            1
+        );
+    }
+
+    #[test]
+    fn body_occurrence_count_ignores_the_summary_held_in_search_text() {
+        let mut hit = overlapping_hit("plain body", 0);
+        hit.search_text = "page:1\nneedle in summary\nplain body".into();
+        assert_eq!(body_occurrence_count(&hit.text, "needle"), 0);
     }
 
     #[test]

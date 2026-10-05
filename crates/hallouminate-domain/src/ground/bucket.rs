@@ -95,14 +95,23 @@ pub(super) fn roll_up(
 }
 
 /// The `page:N` breadcrumb of a PDF chunk, or `None` for any other chunk.
-fn page_label(heading_path: &[String]) -> Option<&str> {
-    let [label] = heading_path else {
+///
+/// The file must have a `.pdf` extension and `N` must be a positive integer,
+/// so an authored `# page:x` heading in another format is not a page.
+fn page_label(hit: &SearchHit) -> Option<&str> {
+    let [label] = hit.heading_path.as_slice() else {
         return None;
     };
-    if label.starts_with(PAGE_BREADCRUMB_PREFIX) {
-        Some(label)
-    } else {
-        None
+    let is_pdf = std::path::Path::new(&hit.file_ref)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
+    if !is_pdf {
+        return None;
+    }
+    let number = label.strip_prefix(PAGE_BREADCRUMB_PREFIX)?;
+    match number.parse::<usize>() {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(label),
     }
 }
 
@@ -113,7 +122,7 @@ fn group_by_page(hits: Vec<SearchHit>) -> Vec<(SearchHit, Option<usize>)> {
     let mut entries: Vec<(SearchHit, usize)> = Vec::with_capacity(hits.len());
     let mut page_slots: HashMap<String, usize> = HashMap::new();
     for hit in hits {
-        let Some(page) = page_label(&hit.heading_path) else {
+        let Some(page) = page_label(&hit) else {
             entries.push((hit, 1));
             continue;
         };
@@ -136,7 +145,7 @@ fn group_by_page(hits: Vec<SearchHit>) -> Vec<(SearchHit, Option<usize>)> {
 fn coverage_of(hits: &[SearchHit]) -> FileCoverage {
     let mut pages: HashSet<&str> = HashSet::new();
     for hit in hits {
-        if let Some(page) = page_label(&hit.heading_path) {
+        if let Some(page) = page_label(hit) {
             pages.insert(page);
         }
     }
@@ -241,11 +250,15 @@ impl FileBucket {
         let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(self.mtime_ms)
             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_default();
+        let (summary, keywords) = match rollup.output {
+            GroundOutput::Hits => (self.summary, self.keywords),
+            GroundOutput::Counts => (None, Vec::new()),
+        };
         (
             self.file_ref,
             DocFile {
-                summary: self.summary,
-                keywords: self.keywords,
+                summary,
+                keywords,
                 score: self.score,
                 z_score: self.z_score,
                 mtime,
@@ -415,6 +428,42 @@ mod tests {
     }
 
     #[test]
+    fn authored_page_heading_in_markdown_is_not_a_pdf_page() {
+        let mut hits = Vec::new();
+        for (ord, label) in ["page:1", "page:x"].into_iter().enumerate() {
+            let mut authored = hit("/notes.md", ord, 1.0);
+            authored.heading_path = vec![label.into()];
+            hits.push(authored);
+        }
+        let mut zero = hit("/b.pdf", 0, 1.0);
+        zero.heading_path = vec!["page:0".into()];
+        hits.push(zero);
+        let mut word = hit("/b.pdf", 1, 1.0);
+        word.heading_path = vec!["page:x".into()];
+        hits.push(word);
+        for group_by in [GroundGroupBy::Chunk, GroundGroupBy::Page] {
+            let rollup = page_rollup(group_by, GroundOutput::Counts, 1);
+            let docs = roll_up(&hits, usize::MAX, rollup).expect("build");
+            for path in ["/notes.md", "/b.pdf"] {
+                let doc = docs.get(path).expect("file present");
+                assert_eq!(
+                    doc.coverage.as_ref().map(|coverage| coverage.pages),
+                    Some(None),
+                    "{path} must report no pages"
+                );
+            }
+        }
+        let rollup = page_rollup(GroundGroupBy::Page, GroundOutput::Hits, 10);
+        let docs = roll_up(&hits, usize::MAX, rollup).expect("build");
+        let notes = docs.get("/notes.md").expect("markdown present");
+        assert_eq!(
+            notes.chunks.len(),
+            2,
+            "authored headings stay separate entries"
+        );
+    }
+
+    #[test]
     fn counts_output_reports_chunks_and_distinct_pages_without_snippets() {
         let mut hits = pdf_hits();
         hits.push(hit("/b.md", 0, 1.0));
@@ -431,6 +480,8 @@ mod tests {
                 })
             );
             assert!(pdf.chunks.is_empty(), "counts output carries no chunks");
+            assert_eq!(pdf.summary, None, "counts output is compact");
+            assert!(pdf.keywords.is_empty(), "counts output is compact");
             let markdown = docs.get("/b.md").expect("markdown present");
             assert_eq!(
                 markdown.coverage,
@@ -445,13 +496,17 @@ mod tests {
 
     #[test]
     fn page_label_accepts_only_a_single_page_breadcrumb() {
-        assert_eq!(page_label(&["page:7".to_string()]), Some("page:7"));
-        assert_eq!(page_label(&["section".to_string()]), None);
-        assert_eq!(page_label(&[]), None);
-        assert_eq!(
-            page_label(&["page:1".to_string(), "page:2".to_string()]),
-            None
-        );
+        let labelled = |file_ref: &str, path: &[&str]| {
+            let mut hit = hit(file_ref, 0, 1.0);
+            hit.heading_path = path.iter().map(|label| (*label).to_string()).collect();
+            hit
+        };
+        assert_eq!(page_label(&labelled("/a.pdf", &["page:7"])), Some("page:7"));
+        assert_eq!(page_label(&labelled("/A.PDF", &["page:7"])), Some("page:7"));
+        assert_eq!(page_label(&labelled("/a.pdf", &["section"])), None);
+        assert_eq!(page_label(&labelled("/a.pdf", &[])), None);
+        assert_eq!(page_label(&labelled("/a.pdf", &["page:1", "page:2"])), None);
+        assert_eq!(page_label(&labelled("/a.md", &["page:7"])), None);
     }
 
     #[test]

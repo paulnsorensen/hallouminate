@@ -1136,8 +1136,6 @@ async fn pdf_overlap_matches_every_cross_boundary_phrase_exactly_once() {
     let store_dir = tempfile::tempdir().unwrap();
     let corpus_dir = tempfile::tempdir().unwrap();
     let words = numbered_words(120);
-    // Page 1 holds the summary paragraph, so no word pair of page 2 reaches
-    // every chunk through the summary in `search_text`.
     let bytes = pdf_fixture(&[Some("Intro page."), Some(&words)]);
     fs::write(corpus_dir.path().join("numbered.pdf"), bytes).unwrap();
 
