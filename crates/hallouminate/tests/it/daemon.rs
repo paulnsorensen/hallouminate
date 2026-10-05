@@ -3027,20 +3027,32 @@ fn assert_index_report_wire_shape(value: &serde_json::Value) {
         .as_array()
         .expect("index report corpora must be an array");
     for corpus in corpora {
-        assert_exact_object_keys(
-            corpus,
-            &[
-                "chunks_inserted",
-                "embeddings_inserted",
-                "files_deleted",
-                "files_skipped_empty",
-                "files_skipped_unreadable",
-                "files_touched",
-                "files_upserted",
-                "name",
-            ],
-            "index corpus report",
-        );
+        let mut expected = vec![
+            "chunks_inserted",
+            "embeddings_inserted",
+            "files_deleted",
+            "files_skipped_empty",
+            "files_skipped_unreadable",
+            "files_touched",
+            "files_upserted",
+            "name",
+        ];
+        if let Some(skipped) = corpus.get("skipped_unreadable") {
+            expected.push("skipped_unreadable");
+            let entries = skipped
+                .as_array()
+                .expect("skipped_unreadable must be an array");
+            for entry in entries {
+                let reason = entry["reason"].as_str().unwrap_or_default();
+                let entry_keys: &[&str] = if reason == "extraction_failed" {
+                    &["error", "path", "reason"]
+                } else {
+                    &["path", "reason"]
+                };
+                assert_exact_object_keys(entry, entry_keys, "skipped file report");
+            }
+        }
+        assert_exact_object_keys(corpus, &expected, "index corpus report");
     }
 }
 
@@ -3264,7 +3276,7 @@ fn cfg_two_root_corpus(ground: &Path, root_a: &Path, root_b: &Path) -> Config {
 [[corpus]]
 name = "multi"
 paths = ["{a}", "{b}"]
-globs = ["**/*.md"]
+globs = ["**/*.md", "**/*.png"]
 
 [storage]
 ground_dir = "{g}"
@@ -3299,6 +3311,7 @@ async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance()
         "# Beta\n\nmultirootuniontoken relevant beta marker\n",
     )
     .expect("write root B document");
+    std::fs::write(root_a.join("photo.png"), [0x89_u8, 0x50, 0x4e, 0x47]).expect("write photo");
     let cfg = cfg_two_root_corpus(&ground, &root_a, &root_b);
     let model = cfg.embeddings.model.clone();
     let quantized = cfg.embeddings.quantized;
@@ -3309,6 +3322,15 @@ async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance()
     assert_eq!(report.corpora[0].files_upserted, 2, "{report:#?}");
     assert_eq!(report.corpora[0].chunks_inserted, 2, "{report:#?}");
     assert_index_report_wire_shape(&report_wire);
+    let corpus_wire = &report_wire["corpora"][0];
+    assert_eq!(corpus_wire["files_skipped_unreadable"], 1, "{report_wire}");
+    let skipped = corpus_wire["skipped_unreadable"]
+        .as_array()
+        .unwrap_or_else(|| panic!("skipped_unreadable must be on the wire: {report_wire}"));
+    assert_eq!(skipped.len(), 1, "{report_wire}");
+    assert_eq!(skipped[0]["reason"], "unsupported_format", "{report_wire}");
+    let skipped_path = skipped[0]["path"].as_str().unwrap_or_default();
+    assert!(skipped_path.ends_with("photo.png"), "{report_wire}");
 
     let (result, result_wire) =
         ground_through_ipc(&client, harness.cwd(), "multi", "multirootuniontoken").await;
@@ -3352,7 +3374,10 @@ async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance()
     assert_eq!(stats.corpus, "multi");
     assert_eq!(stats.indexed_files, 2);
     assert_eq!(stats.total_chunks, 2);
-    assert_eq!(stats.unindexed_files, 0);
+    assert_eq!(
+        stats.unindexed_files, 1,
+        "the unsupported photo stays unindexed"
+    );
     assert!(stats.last_indexed_ms.is_some());
     assert_ground_result_wire_shape(&result_wire);
     assert_corpus_stats_wire_shape(&stats_wire);

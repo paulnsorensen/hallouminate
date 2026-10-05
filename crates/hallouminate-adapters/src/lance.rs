@@ -2487,10 +2487,13 @@ impl LanceStore {
     /// Retrieve up to `limit` chunks of one corpus key whose `search_text`
     /// contains `phrase` as a case-insensitive substring, in scan order.
     ///
-    /// The scan uses no FTS or vector index. The predicate is
+    /// The scan uses no FTS or vector index. The predicate first requires the
+    /// longest space-free segment of the phrase through a cheap
+    /// `strpos(lower(search_text), '<segment>') > 0`. It then applies
     /// `strpos(regexp_replace(lower(search_text), '\s+', ' ', 'g'),
     /// '<lowercased phrase>') > 0`, so `LIKE` and regex metacharacters in
-    /// the phrase match literally. The regex `\s` is Unicode `White_Space`,
+    /// the phrase match literally. The first test is exact because the fold
+    /// changes only whitespace. The regex `\s` is Unicode `White_Space`,
     /// the same class that `collapse_whitespace` folds for the phrase.
     /// Returns an empty list when the table has no text index yet, as
     /// `retrieve_signals` does.
@@ -2507,10 +2510,26 @@ impl LanceStore {
         if !self.has_text_index().await? {
             return Ok(Vec::new());
         }
+        let needle = phrase.to_lowercase();
+        let mut anchor = "";
+        for segment in needle.split(' ') {
+            if segment.len() > anchor.len() {
+                anchor = segment;
+            }
+        }
+        let prefilter = if anchor.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " AND strpos(lower(search_text), '{}') > 0",
+                escape_sql_str(anchor)
+            )
+        };
         let filter = format!(
-            "{} AND strpos(regexp_replace(lower(search_text), '\\s+', ' ', 'g'), '{}') > 0",
+            "{}{} AND strpos(regexp_replace(lower(search_text), '\\s+', ' ', 'g'), '{}') > 0",
             corpus_key_filter(corpus_key)?,
-            escape_sql_str(&phrase.to_lowercase())
+            prefilter,
+            escape_sql_str(&needle)
         );
         let table = self.table.clone();
         let corpus_key = corpus_key.clone();

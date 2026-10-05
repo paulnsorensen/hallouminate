@@ -64,38 +64,33 @@ impl CorpusReport {
 pub struct SkippedFileReport {
     /// Absolute path of the skipped file.
     pub path: String,
+    /// Why the run skipped the file, with the extraction error when one exists.
+    #[serde(flatten)]
     pub reason: SkippedFileReason,
-    /// The extraction error, when `reason` is `extraction_failed`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// Why an index run skipped a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
 pub enum SkippedFileReason {
     /// No format handler accepts the file type.
     UnsupportedFormat,
     /// The format handler failed to extract content.
-    ExtractionFailed,
+    ExtractionFailed {
+        /// The extraction error text.
+        error: String,
+    },
 }
 
 impl From<SkippedFile> for SkippedFileReport {
     fn from(skipped: SkippedFile) -> Self {
         let SkippedFile { file, reason } = skipped;
         let path = file.as_path().display().to_string();
-        match reason {
-            SkipReason::UnsupportedFormat => Self {
-                path,
-                reason: SkippedFileReason::UnsupportedFormat,
-                error: None,
-            },
-            SkipReason::ExtractionFailed(error) => Self {
-                path,
-                reason: SkippedFileReason::ExtractionFailed,
-                error: Some(error),
-            },
-        }
+        let reason = match reason {
+            SkipReason::UnsupportedFormat => SkippedFileReason::UnsupportedFormat,
+            SkipReason::ExtractionFailed(error) => SkippedFileReason::ExtractionFailed { error },
+        };
+        Self { path, reason }
     }
 }
 
@@ -128,6 +123,26 @@ mod tests {
                 {"path": "/r/scan.pdf", "reason": "extraction_failed", "error": "no text layer"},
             ])
         );
+    }
+
+    #[test]
+    fn skipped_file_report_round_trips_through_json() {
+        let reports = vec![
+            SkippedFileReport {
+                path: "/r/a.html".into(),
+                reason: SkippedFileReason::UnsupportedFormat,
+            },
+            SkippedFileReport {
+                path: "/r/b.pdf".into(),
+                reason: SkippedFileReason::ExtractionFailed {
+                    error: "no text layer".into(),
+                },
+            },
+        ];
+        let wire = serde_json::to_string(&reports).expect("serialize reports");
+        let back: Vec<SkippedFileReport> =
+            serde_json::from_str(&wire).expect("deserialize reports");
+        assert_eq!(back, reports);
     }
 
     #[test]

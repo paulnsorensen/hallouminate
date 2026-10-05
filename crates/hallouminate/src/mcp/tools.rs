@@ -221,37 +221,38 @@ fn index_summary(report: &hallouminate_daemon::IndexReport) -> String {
     use std::fmt::Write as _;
 
     let mut summary = String::new();
-    for corpus in &report.corpora {
+    for hallouminate_daemon::CorpusReport {
+        name,
+        files_upserted,
+        files_touched,
+        files_deleted,
+        files_skipped_empty: _,
+        files_skipped_unreadable,
+        skipped_unreadable,
+        chunks_inserted,
+        embeddings_inserted: _,
+    } in &report.corpora
+    {
         if !summary.is_empty() {
             summary.push('\n');
         }
         let _ = write!(
             summary,
-            "{}: upserted={} touched={} deleted={} unreadable={} chunks+={}",
-            corpus.name,
-            corpus.files_upserted,
-            corpus.files_touched,
-            corpus.files_deleted,
-            corpus.files_skipped_unreadable,
-            corpus.chunks_inserted
+            "{name}: upserted={files_upserted} touched={files_touched} deleted={files_deleted} unreadable={files_skipped_unreadable} chunks+={chunks_inserted}"
         );
-        for skipped in &corpus.skipped_unreadable {
-            let _ = write!(summary, "\n  skipped {}: ", skipped.path);
-            match (skipped.reason, &skipped.error) {
-                (hallouminate_daemon::SkippedFileReason::UnsupportedFormat, _) => {
+        for hallouminate_daemon::SkippedFileReport { path, reason } in skipped_unreadable {
+            let _ = write!(summary, "\n  skipped {path}: ");
+            match reason {
+                hallouminate_daemon::SkippedFileReason::UnsupportedFormat => {
                     summary.push_str("unsupported format");
                 }
-                (hallouminate_daemon::SkippedFileReason::ExtractionFailed, Some(error)) => {
+                hallouminate_daemon::SkippedFileReason::ExtractionFailed { error } => {
+                    let error = hallouminate_domain::search::collapse_whitespace(error);
                     let _ = write!(summary, "extraction failed: {error}");
-                }
-                (hallouminate_daemon::SkippedFileReason::ExtractionFailed, None) => {
-                    summary.push_str("extraction failed");
                 }
             }
         }
-        let unnamed = corpus
-            .files_skipped_unreadable
-            .saturating_sub(corpus.skipped_unreadable.len());
+        let unnamed = files_skipped_unreadable.saturating_sub(skipped_unreadable.len());
         if unnamed > 0 {
             let _ = write!(summary, "\n  and {unnamed} more unreadable files");
         }
@@ -1448,12 +1449,12 @@ mod tests {
                     hallouminate_daemon::SkippedFileReport {
                         path: "/r/brief.html".into(),
                         reason: hallouminate_daemon::SkippedFileReason::UnsupportedFormat,
-                        error: None,
                     },
                     hallouminate_daemon::SkippedFileReport {
                         path: "/r/scan.pdf".into(),
-                        reason: hallouminate_daemon::SkippedFileReason::ExtractionFailed,
-                        error: Some("no text layer".into()),
+                        reason: hallouminate_daemon::SkippedFileReason::ExtractionFailed {
+                            error: "no text layer".into(),
+                        },
                     },
                 ],
                 chunks_inserted: 7,
@@ -1465,5 +1466,44 @@ mod tests {
             index_summary(&report),
             "docs: upserted=2 touched=0 deleted=0 unreadable=3 chunks+=7\n  skipped /r/brief.html: unsupported format\n  skipped /r/scan.pdf: extraction failed: no text layer\n  and 1 more unreadable files"
         );
+    }
+
+    #[test]
+    fn index_summary_folds_a_multi_line_error_onto_one_line() {
+        let report = hallouminate_daemon::IndexReport {
+            corpora: vec![hallouminate_daemon::CorpusReport {
+                name: "docs".into(),
+                files_upserted: 0,
+                files_touched: 0,
+                files_deleted: 0,
+                files_skipped_empty: 0,
+                files_skipped_unreadable: 1,
+                skipped_unreadable: vec![hallouminate_daemon::SkippedFileReport {
+                    path: "/r/scan.pdf".into(),
+                    reason: hallouminate_daemon::SkippedFileReason::ExtractionFailed {
+                        error: "bad xref\n  at offset 12\r\n\tgave up".into(),
+                    },
+                }],
+                chunks_inserted: 0,
+                embeddings_inserted: 0,
+            }],
+            warnings: Vec::new(),
+        };
+        let summary = index_summary(&report);
+        assert_eq!(summary.lines().count(), 2, "{summary}");
+        assert!(
+            summary
+                .ends_with("skipped /r/scan.pdf: extraction failed: bad xref at offset 12 gave up"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn index_tool_description_states_the_skip_cap() {
+        let cap = hallouminate_domain::indexer::MAX_REPORTED_SKIPS.to_string();
+        let description = HallouminateTools::index_tool_attr()
+            .description
+            .expect("index tool has a description");
+        assert!(description.contains(&cap), "{description}");
     }
 }

@@ -1,5 +1,6 @@
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 
 use super::chunk::PreparedFile;
 use crate::common::{CorpusKey, FileRef, HallouminateError, Mtime, Result};
@@ -114,10 +115,26 @@ pub(super) fn prepare_file(
                 "skipping file: extraction failed"
             );
             Ok(Prepared::Skipped(SkipReason::ExtractionFailed(
-                e.to_string(),
+                extraction_cause(path, e),
             )))
         }
     }
+}
+
+/// Returns the extraction error without the file path. `extract_err` adds an
+/// `extract <path>: ` prefix, and the text handlers add `<path>:` inside
+/// messages such as `non-utf8 file <path>: ...`. The skip report already
+/// names the path.
+fn extraction_cause(path: &Path, error: HallouminateError) -> String {
+    let HallouminateError::Indexer(message) = error else {
+        return error.to_string();
+    };
+    let prefix = format!("extract {}: ", path.display());
+    let cause = match message.strip_prefix(&prefix) {
+        Some(cause) => cause,
+        None => &message,
+    };
+    cause.replace(&format!(" {}:", path.display()), ":")
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -230,6 +247,10 @@ mod tests {
         assert!(
             !error.is_empty(),
             "the skip must carry the extraction error"
+        );
+        assert!(
+            !error.contains(&path.display().to_string()),
+            "the stored error must not repeat the path: {error}"
         );
     }
 

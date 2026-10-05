@@ -419,7 +419,8 @@ mod tests {
             let mut hits = Vec::new();
             for hit in &self.hits {
                 if hit.corpus_key != *corpus_key
-                    || !hit.search_text.to_lowercase().contains(&needle)
+                    || !crate::search::collapse_whitespace(&hit.search_text.to_lowercase())
+                        .contains(&needle)
                 {
                     continue;
                 }

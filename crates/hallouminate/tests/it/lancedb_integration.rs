@@ -816,12 +816,22 @@ async fn phrase_match_collapses_whitespace_runs_on_both_sides() {
         ),
         ("/tmp/hyphen.md", "a minority partner in a third-fab today"),
         ("/tmp/joined.md", "a minority partner in a thirdfab today"),
+        (
+            "/tmp/ideographic.md",
+            "a minority partner in a third\u{3000}fab today",
+        ),
+        (
+            "/tmp/linesep.md",
+            "a minority partner in a third\u{2028}fab today",
+        ),
     ])
     .await;
     let wrapped = vec![
         "/tmp/crlf.md",
         "/tmp/double.md",
+        "/tmp/ideographic.md",
         "/tmp/lf.md",
+        "/tmp/linesep.md",
         "/tmp/nbsp.md",
         "/tmp/tab.md",
     ];
@@ -845,6 +855,26 @@ async fn phrase_match_collapses_whitespace_runs_on_both_sides() {
             hit.file_ref
         );
     }
+}
+
+#[tokio::test]
+async fn phrase_match_requires_the_whole_multi_word_phrase_not_its_segments() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store, key) = phrase_store(&[
+        (
+            "/tmp/wrapped.md",
+            "a minority partner in a third\nfab today",
+        ),
+        (
+            "/tmp/decoy.md",
+            "minority holders met a partner; a third party in the fab",
+        ),
+    ])
+    .await;
+    assert_eq!(
+        phrase_files(&store, &key, "minority partner in a third fab").await,
+        vec!["/tmp/wrapped.md"]
+    );
 }
 
 #[tokio::test]

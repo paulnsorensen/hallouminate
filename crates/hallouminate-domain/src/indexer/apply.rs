@@ -83,9 +83,12 @@ impl ApplyStats {
         self.files_deleted += files_deleted;
         self.files_skipped_empty += files_skipped_empty;
         self.files_skipped_unreadable += files_skipped_unreadable;
-        let room = MAX_REPORTED_SKIPS.saturating_sub(self.skipped_unreadable.len());
-        self.skipped_unreadable
-            .extend(skipped_unreadable.into_iter().take(room));
+        for file in skipped_unreadable {
+            if self.skipped_unreadable.len() >= MAX_REPORTED_SKIPS {
+                break;
+            }
+            self.skipped_unreadable.push(file);
+        }
         self.chunks_inserted += chunks_inserted;
         self.embeddings_inserted += embeddings_inserted;
     }

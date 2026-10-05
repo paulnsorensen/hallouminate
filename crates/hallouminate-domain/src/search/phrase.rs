@@ -176,9 +176,11 @@ pub fn collapse_whitespace(text: &str) -> String {
 }
 
 fn occurrence_count(search_text: &str, needle: &str) -> usize {
-    collapse_whitespace(&search_text.to_lowercase())
-        .matches(needle)
-        .count()
+    let mut count = 0;
+    for _ in collapse_whitespace(&search_text.to_lowercase()).matches(needle) {
+        count += 1;
+    }
+    count
 }
 
 #[cfg(test)]

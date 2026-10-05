@@ -985,7 +985,6 @@ async fn phrase_mode_matches_phrases_wrapped_across_source_lines() {
         corpus_dir.path().join("wrapped.pdf"),
         pdf_fixture(&[
             Some("Cover page of the plant report."),
-            // A printed line break: two text runs with a `Td` line move between them.
             Some("The plant says it has commenced) Tj 0 -14 Td (production this year."),
         ]),
     )
@@ -1013,7 +1012,14 @@ async fn phrase_mode_matches_phrases_wrapped_across_source_lines() {
         let found = search_phrase(&store, &key, phrase, 50)
             .await
             .unwrap_or_else(|e| panic!("phrase {phrase:?} must not error: {e}"));
-        let Some(hit) = found.hits.iter().find(|hit| hit.file_ref.ends_with(file)) else {
+        let mut matched = None;
+        for candidate in &found.hits {
+            if candidate.file_ref.ends_with(file) {
+                matched = Some(candidate);
+                break;
+            }
+        }
+        let Some(hit) = matched else {
             panic!(
                 "phrase {phrase:?} must match {file}; hits: {:?}",
                 found.hits
@@ -1238,6 +1244,10 @@ async fn corrupt_and_empty_pdfs_skip_without_blocking_valid_siblings() {
             panic!("a bad PDF is an extraction failure: {skipped:?}");
         };
         assert!(!error.is_empty(), "{skipped:?}");
+        assert!(
+            !error.contains(&skipped.file.as_path().display().to_string()),
+            "the stored error must not repeat the path: {error}"
+        );
         let Some(name) = skipped.file.as_path().file_name() else {
             panic!("skipped file has a name: {skipped:?}");
         };
