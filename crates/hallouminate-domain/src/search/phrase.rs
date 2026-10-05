@@ -147,7 +147,7 @@ fn truncation_warning(
     let root = corpus_key.canonical_root.display();
     let message = if scanned >= MAX_PHRASE_SCAN_ROWS {
         format!(
-            "phrase scan in corpus root {root} stopped at the cap of {MAX_PHRASE_SCAN_ROWS} matched chunks; more chunks can match, and at most {limit} are returned"
+            "phrase scan in corpus root {root} stopped at the cap of {MAX_PHRASE_SCAN_ROWS} scanned chunks; more chunks can match, and at most {limit} are returned"
         )
     } else if matched > limit {
         format!(
@@ -204,6 +204,9 @@ fn occurrence_count(text: &str, needle: &str) -> usize {
 /// footnote definitions, the breadcrumb, and the file summary, so a phrase
 /// that only the summary holds does not count for every chunk of the file.
 fn body_occurrence_count(text: &str, needle: &str) -> usize {
+    if !text.contains("[^") {
+        return occurrence_count(text, needle);
+    }
     occurrence_count(&apply_footnote_mode(text, FootnoteMode::Exclude), needle)
 }
 

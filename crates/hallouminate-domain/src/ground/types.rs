@@ -21,7 +21,7 @@ pub enum GroundMatch {
     #[default]
     Ranked,
     /// Case-insensitive literal substring match of the whole query against
-    /// each chunk's search text, ranked by occurrence count.
+    /// each chunk's body text, ranked by occurrence count.
     Phrase,
 }
 
@@ -136,6 +136,15 @@ pub struct DocFile {
 }
 
 /// Match counts for one file in a counts-only `ground` response.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::FileCoverage;
+/// let coverage = FileCoverage { chunks: 3, pages: Some(2) };
+/// assert_eq!(coverage.chunks, 3);
+/// assert_eq!(coverage.pages, Some(2));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileCoverage {
     /// Number of chunks that match, after overlap deduplication.

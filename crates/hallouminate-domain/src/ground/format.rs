@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 
-use crate::ground::types::{DocFile, GroundResponse};
+use crate::ground::types::{DocFile, FileCoverage, GroundResponse};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
@@ -120,15 +120,14 @@ fn write_doc_block(buf: &mut String, path: &str, doc: &DocFile, strip_prefix: Op
         Some(p) if path.starts_with(p) => path.trim_start_matches(p).to_string(),
         _ => path.to_string(),
     };
-    if let Some(coverage) = doc.coverage {
+    if let Some(FileCoverage { chunks, pages }) = doc.coverage {
         write!(
             buf,
             "{display_path}  ({score:.3})  {chunks} matched chunks",
             score = doc.score,
-            chunks = coverage.chunks
         )
         .expect("counts line");
-        match coverage.pages {
+        match pages {
             Some(pages) => writeln!(buf, " on {pages} pages"),
             None => writeln!(buf),
         }

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::common::Result;
 use crate::corpus::make_snippet;
 use crate::footnotes::{FootnoteMode, apply_footnote_mode};
-use crate::indexer::{PAGE_BREADCRUMB_PREFIX, SearchHit};
+use crate::indexer::{Format, PAGE_BREADCRUMB_PREFIX, SearchHit, format_from_extension};
 
 use super::types::{
     ChunkProvenance, DocChunk, DocFile, FileCoverage, GroundGroupBy, GroundMatch, GroundOutput,
@@ -96,18 +96,20 @@ pub(super) fn roll_up(
 
 /// The `page:N` breadcrumb of a PDF chunk, or `None` for any other chunk.
 ///
-/// The file must have a `.pdf` extension and `N` must be a positive integer,
-/// so an authored `# page:x` heading in another format is not a page.
+/// The file must have a `.pdf` extension, or no extension at all because
+/// `detect_format` sniffs an extensionless PDF. Sniffed text has no
+/// headings, so a `page:N` breadcrumb on an extensionless file comes only
+/// from the PDF handler. `N` must be a positive integer, so an authored
+/// `# page:x` heading in another format is not a page.
 fn page_label(hit: &SearchHit) -> Option<&str> {
     let [label] = hit.heading_path.as_slice() else {
         return None;
     };
-    let is_pdf = std::path::Path::new(&hit.file_ref)
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"));
-    if !is_pdf {
+    let (Some(Some(Format::Pdf)) | None) =
+        format_from_extension(std::path::Path::new(&hit.file_ref))
+    else {
         return None;
-    }
+    };
     let number = label.strip_prefix(PAGE_BREADCRUMB_PREFIX)?;
     match number.parse::<usize>() {
         Ok(0) | Err(_) => None,
@@ -119,27 +121,26 @@ fn page_label(hit: &SearchHit) -> Option<&str> {
 /// chunk of each page with the number of chunks it stands for. A chunk without
 /// a page breadcrumb stays a single entry.
 fn group_by_page(hits: Vec<SearchHit>) -> Vec<(SearchHit, Option<usize>)> {
-    let mut entries: Vec<(SearchHit, usize)> = Vec::with_capacity(hits.len());
+    let mut entries: Vec<(SearchHit, Option<usize>)> = Vec::with_capacity(hits.len());
     let mut page_slots: HashMap<String, usize> = HashMap::new();
     for hit in hits {
         let Some(page) = page_label(&hit) else {
-            entries.push((hit, 1));
+            entries.push((hit, Some(1)));
             continue;
         };
         let existing = page_slots.get(page).copied();
         match existing {
-            Some(slot) => entries[slot].1 += 1,
+            Some(slot) => {
+                let (_, count) = &mut entries[slot];
+                *count = count.map(|stood_for| stood_for + 1);
+            }
             None => {
                 page_slots.insert(page.to_string(), entries.len());
-                entries.push((hit, 1));
+                entries.push((hit, Some(1)));
             }
         }
     }
-    let mut grouped = Vec::with_capacity(entries.len());
-    for (hit, count) in entries {
-        grouped.push((hit, Some(count)));
-    }
-    grouped
+    entries
 }
 
 fn coverage_of(hits: &[SearchHit]) -> FileCoverage {
@@ -191,23 +192,30 @@ impl FileBucket {
     }
 
     fn into_doc(mut self, rollup: Rollup) -> (String, DocFile) {
+        let Rollup {
+            chunks_per_file,
+            footnote_mode,
+            match_mode,
+            group_by,
+            output,
+        } = rollup;
         self.chunks.sort_by(|a, b| {
             let order = b
                 .score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal);
-            match rollup.match_mode {
+            match match_mode {
                 GroundMatch::Ranked => order.then_with(|| a.chunk_id.cmp(&b.chunk_id)),
                 GroundMatch::Phrase => order
                     .then_with(|| a.line_start.cmp(&b.line_start))
                     .then_with(|| a.chunk_id.cmp(&b.chunk_id)),
             }
         });
-        let coverage = match rollup.output {
+        let coverage = match output {
             GroundOutput::Hits => None,
             GroundOutput::Counts => Some(coverage_of(&self.chunks)),
         };
-        let mut entries = match (rollup.output, rollup.group_by) {
+        let mut entries = match (output, group_by) {
             (GroundOutput::Counts, GroundGroupBy::Chunk | GroundGroupBy::Page) => Vec::new(),
             (GroundOutput::Hits, GroundGroupBy::Chunk) => {
                 let mut entries = Vec::with_capacity(self.chunks.len());
@@ -218,11 +226,11 @@ impl FileBucket {
             }
             (GroundOutput::Hits, GroundGroupBy::Page) => group_by_page(self.chunks),
         };
-        entries.truncate(rollup.chunks_per_file);
+        entries.truncate(chunks_per_file);
         let mut chunks = Vec::with_capacity(entries.len());
         for (h, chunk_count) in entries {
             chunks.push(DocChunk {
-                snippet: make_snippet(&apply_footnote_mode(&h.text, rollup.footnote_mode)),
+                snippet: make_snippet(&apply_footnote_mode(&h.text, footnote_mode)),
                 chunk_id: h.chunk_id,
                 heading_path: h.heading_path,
                 line_range: [h.line_start as u32, h.line_end as u32],
@@ -250,7 +258,7 @@ impl FileBucket {
         let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(self.mtime_ms)
             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_default();
-        let (summary, keywords) = match rollup.output {
+        let (summary, keywords) = match output {
             GroundOutput::Hits => (self.summary, self.keywords),
             GroundOutput::Counts => (None, Vec::new()),
         };
@@ -498,7 +506,11 @@ mod tests {
     fn page_label_accepts_only_a_single_page_breadcrumb() {
         let labelled = |file_ref: &str, path: &[&str]| {
             let mut hit = hit(file_ref, 0, 1.0);
-            hit.heading_path = path.iter().map(|label| (*label).to_string()).collect();
+            let mut heading_path = Vec::new();
+            for label in path {
+                heading_path.push((*label).to_string());
+            }
+            hit.heading_path = heading_path;
             hit
         };
         assert_eq!(page_label(&labelled("/a.pdf", &["page:7"])), Some("page:7"));
@@ -507,6 +519,8 @@ mod tests {
         assert_eq!(page_label(&labelled("/a.pdf", &[])), None);
         assert_eq!(page_label(&labelled("/a.pdf", &["page:1", "page:2"])), None);
         assert_eq!(page_label(&labelled("/a.md", &["page:7"])), None);
+        assert_eq!(page_label(&labelled("/scan", &["page:7"])), Some("page:7"));
+        assert_eq!(page_label(&labelled("/scan.docx", &["page:7"])), None);
     }
 
     #[test]

@@ -692,8 +692,7 @@ async fn handle_connection(
     // Request completed. Every request stamps the External clock; only
     // inference-bearing requests restart the idle-exit window (ADR-004).
     state.touch_activity(WorkClass::External, idle_clock);
-    let mut text = serde_json::to_string(&response)?;
-    text.push('\n');
+    let text = response_frame(&response)?;
     let write_result = tokio::time::timeout(idle_timeout, async {
         write_half.write_all(text.as_bytes()).await?;
         write_half.flush().await
@@ -710,6 +709,23 @@ async fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// Serializes one response line. A response that cannot fit one IPC frame
+/// becomes an `invalid_params` error that names the byte counts, because the
+/// client would otherwise fail on the frame limit without a reason.
+fn response_frame(response: &DaemonResponse) -> serde_json::Result<String> {
+    let mut text = serde_json::to_string(response)?;
+    text.push('\n');
+    if text.len() <= MAX_IPC_LINE_BYTES {
+        return Ok(text);
+    }
+    let oversize = text.len();
+    let mut error = serde_json::to_string(&DaemonResponse::invalid_params(format!(
+        "response is {oversize} bytes; the IPC limit is {MAX_IPC_LINE_BYTES} bytes. Narrow the request, for example with a smaller limit or corpus"
+    )))?;
+    error.push('\n');
+    Ok(error)
 }
 
 /// Classify a request for the idle-exit window (ADR daemon-idle-exit-004).
@@ -942,6 +958,35 @@ mod tests {
             }
             DaemonResponse::Ok { result } => panic!("invalid request returned {result:?}"),
         }
+    }
+
+    #[test]
+    fn oversize_response_becomes_an_invalid_params_error_naming_byte_counts() {
+        let oversize = DaemonResponse::ok(&"x".repeat(MAX_IPC_LINE_BYTES));
+        let frame = response_frame(&oversize).expect("frame");
+        assert!(frame.len() <= MAX_IPC_LINE_BYTES, "{}", frame.len());
+        let DaemonResponse::Err { kind, message } =
+            serde_json::from_str(frame.trim_end()).expect("parse frame")
+        else {
+            panic!("a response over the IPC limit must become an error");
+        };
+        assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams);
+        assert!(
+            message.contains(&format!("the IPC limit is {MAX_IPC_LINE_BYTES} bytes")),
+            "{message}"
+        );
+        assert!(message.contains("response is 4194"), "{message}");
+    }
+
+    #[test]
+    fn response_at_the_frame_cap_passes_through() {
+        let text = "x".repeat(MAX_IPC_LINE_BYTES - 64);
+        let frame = response_frame(&DaemonResponse::ok(&text)).expect("frame");
+        assert!(frame.len() <= MAX_IPC_LINE_BYTES);
+        let DaemonResponse::Ok { .. } = serde_json::from_str(frame.trim_end()).expect("parse")
+        else {
+            panic!("a response inside the limit must stay a success");
+        };
     }
 
     #[tokio::test]

@@ -61,7 +61,9 @@ in `structuredContent.docs`.
 
 Set `match: "phrase"` for an exact lookup, such as a canonical URL or a
 source title. Phrase mode uses bounded case-insensitive literal matching of
-the whole query against chunk search text. It does not use BM25,
+the whole query against chunk body text. The match ignores the heading
+breadcrumb and the file summary, so inline markup in a heading, such as
+`## Tax **Abatement**`, does not match as a phrase. It does not use BM25,
 vector search, or the reranker. Stopwords, punctuation, quotes, `%`, and `_`
 match literally. Each run of whitespace, such as a line break, a tab, repeated
 spaces, or a non-breaking space, counts as one space in the query and in the
@@ -72,7 +74,7 @@ The `limit`, `chunks_per_file`, `top_files`, and 10,000-match scan cap can
 restrict results. A `phrase-truncated` warning reports these limits. Do not
 conclude absence or uniqueness from a truncated result.
 
-Plain-text and PDF chunks repeat about 12 percent of the chunk budget from the
+Plain-text, JSON, and PDF chunks repeat about 12 percent of the chunk budget from the
 previous chunk. A short phrase across a split point is then whole in one
 chunk. Phrase mode counts each occurrence once, in the first chunk that holds
 it.

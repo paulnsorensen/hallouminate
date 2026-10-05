@@ -595,16 +595,38 @@ mod tests {
             "2",
             "--limit",
             "20",
+            "--match",
+            "phrase",
+            "--group-by",
+            "page",
+            "--output",
+            "counts",
         ])
         .expect("parse ground with flags");
         match cli.command {
             Command::Ground(args) => {
+                assert_eq!(args.match_mode, MatchArg::Phrase);
+                assert_eq!(args.group_by, GroupByArg::Page);
+                assert_eq!(args.output, OutputArg::Counts);
                 assert_eq!(args.query, "tokio");
                 assert_eq!(args.corpus.as_deref(), Some("docs"));
                 assert_eq!(args.format, FormatArg::JsonPretty);
                 assert_eq!(args.top_files, Some(5));
                 assert_eq!(args.chunks_per_file, Some(2));
                 assert_eq!(args.limit, Some(20));
+                let mapped = GroundArgs::from(args);
+                assert_eq!(
+                    mapped.match_mode,
+                    hallouminate_domain::ground::GroundMatch::Phrase
+                );
+                assert_eq!(
+                    mapped.group_by,
+                    hallouminate_domain::ground::GroundGroupBy::Page
+                );
+                assert_eq!(
+                    mapped.output,
+                    hallouminate_domain::ground::GroundOutput::Counts
+                );
             }
             _ => panic!("wrong variant"),
         }

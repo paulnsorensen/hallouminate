@@ -507,10 +507,12 @@ pub struct GroundParams {
     /// In `phrase` mode, stopwords, punctuation, `%`, `_`, and quotes count
     /// literally. Each run of whitespace (line breaks, tabs, repeated or
     /// non-breaking spaces) counts as one space on both sides, so a phrase
-    /// that wraps across a hard line break matches. The query must hold 1 to 512
-    /// characters and must not be only whitespace. Hits rank by occurrence
-    /// count; a `phrase-truncated` warning means more chunks matched than
-    /// the response holds.
+    /// that wraps across a hard line break matches. The match ignores the
+    /// heading breadcrumb and the file summary, so inline markup in a
+    /// heading, such as `## Tax **Abatement**`, does not match. The query
+    /// must hold 1 to 512 characters and must not be only whitespace. Hits
+    /// rank by occurrence count; a `phrase-truncated` warning means more
+    /// chunks matched than the response holds.
     #[serde(default)]
     pub r#match: GroundMatch,
     /// Unit returned within each file. `chunk` (default) returns one entry
@@ -838,7 +840,7 @@ impl HallouminateTools {
             }),
         };
         // `footnote_mode` rides the IPC request and the daemon filters each
-        // chunk snippet in `build_docs`, so the response is already filtered,
+        // chunk snippet in `roll_up`, so the response is already filtered,
         // trimmed, and rendered for every transport.
         let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured = to_structured(&result.response)?;

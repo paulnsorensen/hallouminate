@@ -137,6 +137,14 @@ impl Default for GroundOpts {
 }
 
 /// Reason a `ground` request shape is rejected before retrieval.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::{GroundMatch, GroundOutput, GroundShapeError, validate_shape};
+/// let error = validate_shape(GroundMatch::Ranked, GroundOutput::Counts).unwrap_err();
+/// assert_eq!(error, GroundShapeError::CountsNeedPhrase);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum GroundShapeError {
     /// Counts need every match, and only phrase mode retrieves every match.
@@ -240,9 +248,15 @@ fn rollup_order(
 /// `priority_corpus`, when `Some`, names the corpus whose docs get ranking
 /// priority in the final `top_files` rollup (#425): equal-score ties favor
 /// it, and up to `RESERVED_LOCAL_SLOTS` of its docs survive the cut even when
-/// their global score falls outside it. `None` (the single-corpus `ground`
-/// wrapper, and an above-all-repos union ground) leaves ranking exactly as
-/// before — pure global score order.
+/// their global score falls outside it. Counts output applies the same
+/// reserve to its `MAX_COUNTS_FILES` cut and ranks files by matched chunks.
+/// `None` (the single-corpus `ground` wrapper, and an above-all-repos union
+/// ground) leaves ranking exactly as before.
+///
+/// # Errors
+///
+/// Returns an error when the request shape is invalid (see
+/// [`validate_shape`]) or when retrieval or rollup fails.
 pub async fn ground_union(
     query: &str,
     corpora: &[CorpusConfig],
@@ -360,82 +374,50 @@ pub async fn ground_union(
         }
     }
 
-    // Repo-local docs (matching `priority_corpus`) get a guaranteed foothold
-    // in the final `top_files` cut even when their global score falls
-    // outside it, so a few high-scoring neighbor-corpus hits can't fully
-    // crowd out the searcher's own repo (#425).
-    const RESERVED_LOCAL_SLOTS: usize = 2;
+    match opts.output {
+        GroundOutput::Hits => {
+            if docs.len() > opts.top_files {
+                docs = cut_with_local_reserve(docs, opts.top_files, priority_corpus, |a, b| {
+                    rollup_order(priority_corpus, a, b)
+                });
+            }
+        }
+        GroundOutput::Counts => {
+            if docs.len() > MAX_COUNTS_FILES {
+                let matched_files = docs.len();
+                docs = cut_with_local_reserve(docs, MAX_COUNTS_FILES, priority_corpus, |a, b| {
+                    counts_order(priority_corpus, a, b)
+                });
+                warnings.push(Warning {
+                    code: "counts-truncated".to_string(),
+                    message: format!(
+                        "counts output lists the first {MAX_COUNTS_FILES} of {matched_files} matched files; narrow the phrase or the corpus to see the rest"
+                    ),
+                });
+            }
+        }
+    }
 
-    if opts.output == GroundOutput::Hits && docs.len() > opts.top_files {
-        let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
-        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
-
-        let mut swapped = false;
-        if let Some(priority) = priority_corpus {
-            let kept_locals = ranked[..opts.top_files]
-                .iter()
-                .filter(|(_, d)| d.corpus == priority)
-                .count();
-            let missing = RESERVED_LOCAL_SLOTS.saturating_sub(kept_locals);
-            if missing > 0 {
-                let promote: Vec<usize> = (opts.top_files..ranked.len())
-                    .filter(|&i| ranked[i].1.corpus == priority)
-                    .take(missing)
-                    .collect();
-                // Evict the lowest-ranked non-priority docs in the kept
-                // window; the zip truncates to however many of those exist,
-                // so promotion can never over-fill the window.
-                let evict: Vec<usize> = (0..opts.top_files)
-                    .rev()
-                    .filter(|&i| ranked[i].1.corpus != priority)
-                    .take(promote.len())
-                    .collect();
-                for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
-                    ranked.swap(evict_idx, promote_idx);
-                    swapped = true;
+    match (opts.match_mode, opts.output) {
+        (GroundMatch::Phrase, GroundOutput::Hits) => {
+            let mut retained = 0;
+            for doc in docs.values() {
+                for chunk in &doc.chunks {
+                    retained += chunk.chunk_count.unwrap_or(1);
                 }
             }
-        }
-
-        ranked.truncate(opts.top_files);
-        // Truncating a sorted vec leaves it sorted; only actual promotion
-        // swaps disturb the order and need the re-sort.
-        if swapped {
-            ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
-        }
-        docs = ranked.into_iter().collect();
-    }
-
-    if opts.output == GroundOutput::Counts && docs.len() > MAX_COUNTS_FILES {
-        let matched_files = docs.len();
-        let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
-        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
-        ranked.truncate(MAX_COUNTS_FILES);
-        docs = ranked.into_iter().collect();
-        warnings.push(Warning {
-            code: "counts-truncated".to_string(),
-            message: format!(
-                "counts output lists the first {MAX_COUNTS_FILES} of {matched_files} matched files; narrow the phrase or the corpus to see the rest"
-            ),
-        });
-    }
-
-    if opts.match_mode == GroundMatch::Phrase && opts.output == GroundOutput::Hits {
-        let mut retained = 0;
-        for doc in docs.values() {
-            for chunk in &doc.chunks {
-                retained += chunk.chunk_count.unwrap_or(1);
+            if retained < stats.hits {
+                warnings.push(Warning {
+                    code: "phrase-truncated".to_string(),
+                    message: format!(
+                        "phrase rollup retained {retained} of {} matched chunks after chunks_per_file and top_files caps",
+                        stats.hits
+                    ),
+                });
             }
         }
-        if retained < stats.hits {
-            warnings.push(Warning {
-                code: "phrase-truncated".to_string(),
-                message: format!(
-                    "phrase rollup retained {retained} of {} matched chunks after chunks_per_file and top_files caps",
-                    stats.hits
-                ),
-            });
-        }
+        (GroundMatch::Phrase, GroundOutput::Counts)
+        | (GroundMatch::Ranked, GroundOutput::Hits | GroundOutput::Counts) => {}
     }
 
     Ok(GroundResponse {
@@ -446,6 +428,73 @@ pub async fn ground_union(
         code: BTreeMap::new(),
         warnings,
     })
+}
+
+/// Keeps up to `RESERVED_LOCAL_SLOTS` docs of `priority_corpus` in the final
+/// cut even when `order` ranks them outside it, so a few high-ranked
+/// neighbor-corpus docs cannot fully crowd out the searcher's own repo (#425).
+fn cut_with_local_reserve(
+    docs: BTreeMap<String, DocFile>,
+    cap: usize,
+    priority_corpus: Option<&str>,
+    order: impl Fn(&(String, DocFile), &(String, DocFile)) -> std::cmp::Ordering,
+) -> BTreeMap<String, DocFile> {
+    let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
+    ranked.sort_by(&order);
+
+    let mut swapped = false;
+    if let Some(priority) = priority_corpus {
+        let kept_locals = ranked[..cap]
+            .iter()
+            .filter(|(_, d)| d.corpus == priority)
+            .count();
+        let missing = RESERVED_LOCAL_SLOTS.saturating_sub(kept_locals);
+        if missing > 0 {
+            let promote: Vec<usize> = (cap..ranked.len())
+                .filter(|&i| ranked[i].1.corpus == priority)
+                .take(missing)
+                .collect();
+            // Evict the lowest-ranked non-priority docs in the kept
+            // window; the zip truncates to however many of those exist,
+            // so promotion can never over-fill the window.
+            let evict: Vec<usize> = (0..cap)
+                .rev()
+                .filter(|&i| ranked[i].1.corpus != priority)
+                .take(promote.len())
+                .collect();
+            for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
+                ranked.swap(evict_idx, promote_idx);
+                swapped = true;
+            }
+        }
+    }
+
+    ranked.truncate(cap);
+    // Truncating a sorted vec leaves it sorted; only actual promotion
+    // swaps disturb the order and need the re-sort.
+    if swapped {
+        ranked.sort_by(&order);
+    }
+    ranked.into_iter().collect()
+}
+
+const RESERVED_LOCAL_SLOTS: usize = 2;
+
+/// Ranks counts-mode files by matched chunks, most first. Occurrence count of
+/// the best chunk does not measure coverage.
+fn counts_order(
+    priority_corpus: Option<&str>,
+    a: &(String, DocFile),
+    b: &(String, DocFile),
+) -> std::cmp::Ordering {
+    let chunks_of = |doc: &DocFile| doc.coverage.as_ref().map_or(0, |coverage| coverage.chunks);
+    chunks_of(&b.1)
+        .cmp(&chunks_of(&a.1))
+        .then_with(|| match priority_corpus {
+            Some(p) => (b.1.corpus == p).cmp(&(a.1.corpus == p)),
+            None => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.0.cmp(&b.0))
 }
 
 #[cfg(test)]
@@ -1526,6 +1575,69 @@ mod tests {
                 .map(|d| (&d.corpus, d.score))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Counts output ranks by matched chunks and keeps the reserved local
+    /// slots, so a flood of neighbor files cannot drop every local file.
+    #[tokio::test]
+    async fn counts_cut_keeps_reserved_local_files_below_the_cap() {
+        let local_root = tempfile::tempdir().expect("local root");
+        let neighbor_root = tempfile::tempdir().expect("neighbor root");
+        let local = priority_corpus_config(local_root.path(), "repo:local:wiki");
+        let neighbor = priority_corpus_config(neighbor_root.path(), "neighbor");
+
+        let mut hits = Vec::new();
+        for index in 0..MAX_COUNTS_FILES {
+            for chunk in 0..2 {
+                let mut hit = priority_hit(
+                    neighbor_root.path(),
+                    "neighbor",
+                    &format!("n{index:05}.md"),
+                    0.0,
+                );
+                hit.chunk_id = format!("n{index:05}-{chunk}");
+                hit.text = "exact phrase".into();
+                hit.search_text = "exact phrase".into();
+                hits.push(hit);
+            }
+        }
+        for index in 0..2 {
+            let mut hit = priority_hit(
+                local_root.path(),
+                "repo:local:wiki",
+                &format!("l{index}.md"),
+                0.0,
+            );
+            hit.chunk_id = format!("l{index}-0");
+            hit.text = "exact phrase".into();
+            hit.search_text = "exact phrase".into();
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        };
+        let resp = ground_union(
+            "exact phrase",
+            &[local, neighbor],
+            &store,
+            None,
+            opts,
+            Some("repo:local:wiki"),
+        )
+        .await
+        .expect("counts ground_union");
+
+        assert_eq!(resp.docs.len(), MAX_COUNTS_FILES);
+        let mut local_kept = 0;
+        for doc in resp.docs.values() {
+            if doc.corpus == "repo:local:wiki" {
+                local_kept += 1;
+            }
+        }
+        assert_eq!(local_kept, 2, "reserved local slots must survive the cut");
     }
 
     /// AC3/no-op: `priority_corpus = None` must reproduce today's pure-score

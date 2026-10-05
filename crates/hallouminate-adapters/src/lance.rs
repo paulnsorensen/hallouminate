@@ -2491,8 +2491,8 @@ impl LanceStore {
         .await
     }
 
-    /// Retrieve up to `limit` chunks of one corpus key whose `search_text`
-    /// contains `phrase` as a case-insensitive substring, in scan order.
+    /// Retrieve up to `limit` chunks of one corpus key whose body text
+    /// can contain `phrase` as a case-insensitive substring, in scan order.
     ///
     /// The scan uses no FTS or vector index. The predicate first requires the
     /// longest space-free segment of the phrase through a cheap
@@ -2502,8 +2502,12 @@ impl LanceStore {
     /// the phrase match literally. The first test is exact because the fold
     /// changes only whitespace. The regex `\s` is Unicode `White_Space`,
     /// the same class that `collapse_whitespace` folds for the phrase.
-    /// Returns an empty list when the table has no text index yet, as
-    /// `retrieve_signals` does.
+    /// A last test requires the same fold of `text` (the body) to hold the
+    /// phrase, or `text` to hold `[^`. Footnote exclusion removes only
+    /// `[^` ranges, so a row without `[^` has a body equal to `text`. This
+    /// keeps rows that match only in the breadcrumb or file summary out of
+    /// the scan cap. Returns an empty list when the table has no text index
+    /// yet, as `retrieve_signals` does.
     ///
     /// # Errors
     ///
@@ -2532,11 +2536,13 @@ impl LanceStore {
                 escape_sql_str(anchor)
             )
         };
+        let needle = escape_sql_str(&needle);
         let filter = format!(
-            "{}{} AND strpos(regexp_replace(lower(search_text), '\\s+', ' ', 'g'), '{}') > 0",
+            "{}{} AND strpos(regexp_replace(lower(search_text), '\\s+', ' ', 'g'), '{needle}') > 0 \
+             AND (strpos(regexp_replace(lower(text), '\\s+', ' ', 'g'), '{needle}') > 0 \
+             OR strpos(text, '[^') > 0)",
             corpus_key_filter(corpus_key)?,
             prefilter,
-            escape_sql_str(&needle)
         );
         let table = self.table.clone();
         let corpus_key = corpus_key.clone();
@@ -5421,6 +5427,38 @@ schema_version = 1
             .await
             .expect("search display-only token");
         assert!(display_signals.fts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retrieve_phrase_scans_body_text_not_summary_only_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let mut file = synthetic_prepared("/tmp/phrase.md", 3);
+        let bodies = [
+            "unrelated words only",
+            "the Tax   Abatement applies",
+            "the tax[^1] abatement applies",
+        ];
+        for (chunk, body) in file.chunks.iter_mut().zip(bodies) {
+            chunk.text = body.into();
+            chunk.search_text = format!("H summary tax abatement {body}");
+        }
+        store.apply_batch(vec![file]).await.expect("apply batch");
+
+        let hits = store
+            .retrieve_phrase(&docs_key(), "tax abatement", 10)
+            .await
+            .expect("scan phrase");
+        let mut texts: Vec<&str> = hits.iter().map(|hit| hit.text.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(
+            texts,
+            vec![bodies[1], bodies[2]],
+            "summary-only row must not match; body and footnote-split rows must"
+        );
     }
 
     #[tokio::test]

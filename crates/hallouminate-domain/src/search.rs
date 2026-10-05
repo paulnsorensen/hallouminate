@@ -88,11 +88,13 @@ pub trait ChunkRetrieval: Send + Sync {
         limit: usize,
     ) -> Result<SignalLists>;
 
-    /// Retrieves up to `limit` chunks whose `search_text` contains `phrase`
+    /// Retrieves up to `limit` chunks whose body text can contain `phrase`
     /// as a case-insensitive substring, unranked.
     ///
-    /// The store lowercases `search_text` and replaces each run of Unicode
+    /// The store lowercases the chunk text and replaces each run of Unicode
     /// whitespace with one ASCII space, as [`collapse_whitespace`] does.
+    /// The result is a superset of the body matches: a chunk that holds the
+    /// phrase only in its breadcrumb or file summary is not returned.
     /// The caller passes `phrase` already collapsed. All other characters
     /// match literally: no tokenization, no stopword removal, and no
     /// pattern metacharacters. Returns an empty list when nothing matches.

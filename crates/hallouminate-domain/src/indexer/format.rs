@@ -588,7 +588,7 @@ fn split_record_into_chunks<S: ChunkSizer>(
     }
 }
 
-/// Share of the chunk budget that consecutive plain-text and PDF chunks
+/// Share of the chunk budget that consecutive plain-text, JSON, and PDF chunks
 /// repeat, as a divisor: 8 gives 12.5 percent. A phrase that crosses a split
 /// point and is shorter than the overlap lies whole in one of the two chunks.
 const CHUNK_OVERLAP_DIVISOR: usize = 8;

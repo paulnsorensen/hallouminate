@@ -1141,9 +1141,10 @@ async fn pdf_overlap_matches_every_cross_boundary_phrase_exactly_once() {
 
     let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf"]);
     let store = open_store(store_dir.path()).await;
-    // 200-character chunks repeat 25 characters, so the 600-character page
-    // splits several times and each 9-character word pair fits the overlap.
-    let registry = HandlerRegistry::new(Characters, 200);
+    // The 600-character page splits several times, and the overlap of one
+    // eighth of the chunk holds each 9-character word pair.
+    const CHUNK_CHARS: usize = 200;
+    let registry = HandlerRegistry::new(Characters, CHUNK_CHARS);
     let stats = index_corpus(&corpus, &store, &registry)
         .await
         .expect("index numbered PDF");
