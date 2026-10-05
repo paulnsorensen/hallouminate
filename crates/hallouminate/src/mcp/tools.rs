@@ -28,7 +28,7 @@ use hallouminate_daemon::{
 };
 
 use hallouminate_domain::footnotes::{FootnoteMode, apply_footnote_mode};
-use hallouminate_domain::ground::GroundMatch;
+use hallouminate_domain::ground::{GroundGroupBy, GroundMatch, GroundOutput};
 
 const SERVER_INSTRUCTIONS: &str = "\
 Hallouminate stores per-repository markdown wikis on disk and exposes them \
@@ -502,17 +502,34 @@ pub struct GroundParams {
     #[serde(default)]
     pub footnotes: FootnoteMode,
     /// Retrieval mode. `ranked` (default) is hybrid BM25, vector, and
-    /// literal retrieval. `phrase` returns every chunk whose search text
+    /// literal retrieval. `phrase` returns every chunk whose body text
     /// contains the whole query as a case-insensitive literal substring.
     /// In `phrase` mode, stopwords, punctuation, `%`, `_`, and quotes count
     /// literally. Each run of whitespace (line breaks, tabs, repeated or
     /// non-breaking spaces) counts as one space on both sides, so a phrase
-    /// that wraps across a hard line break matches. The query must hold 1 to 512
-    /// characters and must not be only whitespace. Hits rank by occurrence
-    /// count; a `phrase-truncated` warning means more chunks matched than
-    /// the response holds.
+    /// that wraps across a hard line break matches. The match ignores the
+    /// heading breadcrumb and the file summary, so inline markup in a
+    /// heading, such as `## Tax **Abatement**`, does not match. The query
+    /// must hold 1 to 512 characters and must not be only whitespace. Hits
+    /// rank by occurrence count; a `phrase-truncated` warning means more
+    /// chunks matched than the response holds.
     #[serde(default)]
     pub r#match: GroundMatch,
+    /// Unit returned within each file. `chunk` (default) returns one entry
+    /// per matched chunk. `page` returns one entry per PDF page (`page:N`
+    /// breadcrumb): the best chunk of the page plus `chunk_count`, the
+    /// number of matched chunks on that page. `chunks_per_file` then caps
+    /// pages. Chunks without a page breadcrumb stay single entries.
+    #[serde(default)]
+    pub group_by: GroundGroupBy,
+    /// Response shape. `hits` (default) returns ranked chunks with snippets.
+    /// `counts` requires `match: "phrase"` and returns each matched file
+    /// with `coverage: {chunks, pages}` and no chunks, snippets, summary, or
+    /// keywords; it ignores `top_files`, `chunks_per_file`, and `limit`. It
+    /// lists at most 2,000 files and adds a `counts-truncated` warning when
+    /// more match.
+    #[serde(default)]
+    pub output: GroundOutput,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -794,7 +811,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), repo-local pages ranked first; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. Inspect `index-coverage` and `index-reconciliation` warnings for the selected corpus before treating zero hits as absence. Incomplete retrieval does not establish missing knowledge; foreign-corpus hits do not establish selected-corpus coverage. Complete file coverage does not prove freshness or reconciliation completion. Keep the original `cwd` and selected `corpus` fixed during recovery. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set. Set `match: \"phrase\"` to return every chunk whose search text contains the whole query as a case-insensitive literal substring, ranked by occurrence count; a `phrase-truncated` warning means that more chunks matched than the response holds.",
+        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), repo-local pages ranked first; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. Inspect `index-coverage` and `index-reconciliation` warnings for the selected corpus before treating zero hits as absence. Incomplete retrieval does not establish missing knowledge; foreign-corpus hits do not establish selected-corpus coverage. Complete file coverage does not prove freshness or reconciliation completion. Keep the original `cwd` and selected `corpus` fixed during recovery. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set. Set `match: \"phrase\"` to return every chunk whose body text contains the whole query as a case-insensitive literal substring, ranked by occurrence count; a `phrase-truncated` warning means that more chunks matched than the response holds. Set `group_by: \"page\"` to return one entry per PDF page with its `chunk_count`. Set `output: \"counts\"` with `match: \"phrase\"` to get each matched file's `coverage: {chunks, pages}` without snippets, summaries, or the file cap of `top_files`; at most 2000 files are listed, and a `counts-truncated` warning means more files matched.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -818,10 +835,12 @@ impl HallouminateTools {
                 snippet_chars: params.snippet_chars,
                 footnote_mode: params.footnotes,
                 match_mode: params.r#match,
+                group_by: params.group_by,
+                output: params.output,
             }),
         };
         // `footnote_mode` rides the IPC request and the daemon filters each
-        // chunk snippet in `build_docs`, so the response is already filtered,
+        // chunk snippet in `roll_up`, so the response is already filtered,
         // trimmed, and rendered for every transport.
         let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured = to_structured(&result.response)?;

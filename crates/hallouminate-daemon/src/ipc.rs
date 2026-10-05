@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::IndexReport;
 use hallouminate_domain::corpus::{FileEntry, TreeNode};
-use hallouminate_domain::ground::{GroundMatch, GroundResponse};
+use hallouminate_domain::ground::{GroundGroupBy, GroundMatch, GroundOutput, GroundResponse};
 
 pub use hallouminate_domain::corpus::{LineRange, Position};
 
@@ -105,6 +105,13 @@ pub struct GroundRequest {
     /// Retrieval mode. Older clients omit it and get [`GroundMatch::Ranked`].
     #[serde(default)]
     pub match_mode: GroundMatch,
+    /// Unit returned within each file. Older clients omit it and get
+    /// [`GroundGroupBy::Chunk`].
+    #[serde(default)]
+    pub group_by: GroundGroupBy,
+    /// Response shape. Older clients omit it and get [`GroundOutput::Hits`].
+    #[serde(default)]
+    pub output: GroundOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -550,5 +557,22 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "query": "q", "match_mode": "phrase" }))
                 .expect("phrase mode deserializes");
         assert_eq!(req.match_mode, GroundMatch::Phrase);
+    }
+
+    #[test]
+    fn ground_request_without_group_by_or_output_defaults_to_chunk_hits() {
+        let req: GroundRequest = serde_json::from_value(serde_json::json!({ "query": "q" }))
+            .expect("a request from an older client still deserializes");
+        assert_eq!(req.group_by, GroundGroupBy::Chunk);
+        assert_eq!(req.output, GroundOutput::Hits);
+
+        let req: GroundRequest = serde_json::from_value(serde_json::json!({
+            "query": "q",
+            "group_by": "page",
+            "output": "counts"
+        }))
+        .expect("page grouping and counts output deserialize");
+        assert_eq!(req.group_by, GroundGroupBy::Page);
+        assert_eq!(req.output, GroundOutput::Counts);
     }
 }

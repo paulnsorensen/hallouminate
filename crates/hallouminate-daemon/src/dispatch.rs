@@ -42,7 +42,7 @@ use hallouminate_domain::corpus::{
 };
 use hallouminate_domain::ground::{
     Format, GroundMatch, GroundOpts, RenderOpts, Warning, ground, ground_union, render,
-    trim_snippets,
+    trim_snippets, validate_shape,
 };
 use hallouminate_domain::indexer::HandlerRegistry;
 use hallouminate_domain::indexer::{
@@ -419,6 +419,8 @@ fn ground_opts(cfg: &Config, req: &GroundRequest) -> GroundOpts {
         rerank_timeout: Duration::from_millis(cfg.search.rerank_timeout_ms),
         footnote_mode: req.footnote_mode,
         match_mode: req.match_mode,
+        group_by: req.group_by,
+        output: req.output,
     }
 }
 
@@ -533,6 +535,9 @@ async fn handle_ground(
                 return DaemonResponse::invalid_params(error.to_string());
             }
         }
+    }
+    if let Err(error) = validate_shape(req.match_mode, req.output) {
+        return DaemonResponse::invalid_params(error.to_string());
     }
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
@@ -2876,6 +2881,7 @@ mod tests {
                 path: None,
                 stale: false,
                 chunks: vec![],
+                coverage: None,
             },
         );
         let mut response = hallouminate_domain::ground::GroundResponse {
@@ -2929,6 +2935,7 @@ mod tests {
                 path: None,
                 stale: false,
                 chunks: vec![],
+                coverage: None,
             },
         );
         let mut response = hallouminate_domain::ground::GroundResponse {

@@ -42,6 +42,28 @@ pub enum MatchArg {
     Phrase,
 }
 
+/// CLI surface for `ground` grouping. Mirrors
+/// `domain::ground::GroundGroupBy` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum GroupByArg {
+    /// One entry per matched chunk.
+    #[default]
+    Chunk,
+    /// One entry per PDF page, with its matched chunk count.
+    Page,
+}
+
+/// CLI surface for the `ground` response shape. Mirrors
+/// `domain::ground::GroundOutput` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum OutputArg {
+    /// Ranked chunks with snippets.
+    #[default]
+    Hits,
+    /// Matched chunk and page counts per file, with no snippets.
+    Counts,
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
@@ -225,6 +247,16 @@ pub struct GroundCli {
     /// whitespace run counts as one space, so line breaks do not block a match.
     #[arg(long = "match", value_enum, default_value_t = MatchArg::Ranked)]
     pub match_mode: MatchArg,
+    /// Unit returned within each file. `page` returns one entry per PDF page
+    /// with its matched chunk count; `--chunks-per-file` then caps pages.
+    #[arg(long, value_enum, default_value_t = GroupByArg::Chunk)]
+    pub group_by: GroupByArg,
+    /// Response shape. `counts` needs `--match phrase` and returns matched
+    /// chunk and page counts for each matched file, with no snippets and no
+    /// `--top-files`, `--chunks-per-file`, or `--limit` caps. It lists at most
+    /// 2,000 files and warns when more match.
+    #[arg(long, value_enum, default_value_t = OutputArg::Hits)]
+    pub output: OutputArg,
     /// Accepted for backward compatibility; same caveat as `hallouminate
     /// index --config`. The daemon owns config resolution (XDG baseline
     /// at startup + repo-layer discovery per request), so this flag is
@@ -240,7 +272,7 @@ pub struct GroundCli {
 
 impl From<GroundCli> for GroundArgs {
     fn from(cli: GroundCli) -> Self {
-        use hallouminate_domain::ground::{Format, GroundMatch};
+        use hallouminate_domain::ground::{Format, GroundGroupBy, GroundMatch, GroundOutput};
         let format = if cli.full {
             Format::JsonPretty
         } else {
@@ -254,6 +286,14 @@ impl From<GroundCli> for GroundArgs {
             MatchArg::Ranked => GroundMatch::Ranked,
             MatchArg::Phrase => GroundMatch::Phrase,
         };
+        let group_by = match cli.group_by {
+            GroupByArg::Chunk => GroundGroupBy::Chunk,
+            GroupByArg::Page => GroundGroupBy::Page,
+        };
+        let output = match cli.output {
+            OutputArg::Hits => GroundOutput::Hits,
+            OutputArg::Counts => GroundOutput::Counts,
+        };
         Self {
             query: cli.query,
             corpus: cli.corpus,
@@ -263,6 +303,8 @@ impl From<GroundCli> for GroundArgs {
             chunks_per_file: cli.chunks_per_file,
             limit: cli.limit,
             match_mode,
+            group_by,
+            output,
             config: cli.config,
             socket: cli.socket,
         }
@@ -553,16 +595,38 @@ mod tests {
             "2",
             "--limit",
             "20",
+            "--match",
+            "phrase",
+            "--group-by",
+            "page",
+            "--output",
+            "counts",
         ])
         .expect("parse ground with flags");
         match cli.command {
             Command::Ground(args) => {
+                assert_eq!(args.match_mode, MatchArg::Phrase);
+                assert_eq!(args.group_by, GroupByArg::Page);
+                assert_eq!(args.output, OutputArg::Counts);
                 assert_eq!(args.query, "tokio");
                 assert_eq!(args.corpus.as_deref(), Some("docs"));
                 assert_eq!(args.format, FormatArg::JsonPretty);
                 assert_eq!(args.top_files, Some(5));
                 assert_eq!(args.chunks_per_file, Some(2));
                 assert_eq!(args.limit, Some(20));
+                let mapped = GroundArgs::from(args);
+                assert_eq!(
+                    mapped.match_mode,
+                    hallouminate_domain::ground::GroundMatch::Phrase
+                );
+                assert_eq!(
+                    mapped.group_by,
+                    hallouminate_domain::ground::GroundGroupBy::Page
+                );
+                assert_eq!(
+                    mapped.output,
+                    hallouminate_domain::ground::GroundOutput::Counts
+                );
             }
             _ => panic!("wrong variant"),
         }

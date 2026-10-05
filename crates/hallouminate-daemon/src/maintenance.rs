@@ -1489,6 +1489,7 @@ mod tests {
                 search_text: "body".into(),
                 claim_marks: None,
                 structure: None,
+                overlap_bytes: 0,
             }],
         }
     }

@@ -107,6 +107,8 @@ async fn ground(client: &hallouminate_daemon::DaemonClient, cwd: &Path) -> Groun
                 snippet_chars: None,
                 footnote_mode: Default::default(),
                 match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
             }),
         })
         .await

@@ -149,6 +149,7 @@ mod tests {
             mtime_ms: 0,
             claim_marks: vec![],
             structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
     }

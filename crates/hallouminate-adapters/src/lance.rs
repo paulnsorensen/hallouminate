@@ -151,10 +151,10 @@ struct Meta {
 /// The schema version this build reads and writes, bumped whenever the Arrow
 /// `chunks` schema changes shape (v2 added `frontmatter`; v3 added
 /// `claim_marks`; v4 added canonical `root` and derived `search_text`;
-/// v5 added parsed chunk structure.
+/// v5 added parsed chunk structure; v6 added `overlap_bytes`).
 /// Also the serde default, though every managed store records this field.
 fn default_schema_version() -> u32 {
-    5
+    6
 }
 
 #[doc(hidden)]
@@ -290,6 +290,7 @@ pub fn chunks_schema() -> SchemaRef {
         // Nullable: null = no claim marks anchored within this chunk.
         Field::new("claim_marks", DataType::Utf8, true),
         Field::new("structure", DataType::Utf8, true),
+        Field::new("overlap_bytes", DataType::Int64, false),
         Field::new(
             "embedding",
             DataType::FixedSizeList(
@@ -341,6 +342,7 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
     let mut search_texts: Vec<String> = Vec::new();
     let mut claim_marks: Vec<Option<String>> = Vec::new();
     let mut structures: Vec<Option<String>> = Vec::new();
+    let mut overlaps: Vec<i64> = Vec::new();
     let mut embeddings_flat: Vec<f32> = Vec::new();
     // One validity bit per chunk row: true = real vector, false = null
     // (embeddings-OFF mode). Stays all-true on the ON path so the null
@@ -392,6 +394,7 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
                         HallouminateError::Indexer(format!("encode structure: {error}"))
                     })?,
             );
+            overlaps.push(chunk.overlap_bytes as i64);
             match &fwe.embeddings {
                 Some(embeddings) => {
                     embeddings_flat.extend_from_slice(&embeddings[idx]);
@@ -442,6 +445,7 @@ fn build_record_batch(batch: &[FileWithEmbeddings], schema: SchemaRef) -> Result
         Arc::new(StringArray::from(search_texts)),
         Arc::new(StringArray::from_iter(claim_marks)),
         Arc::new(StringArray::from_iter(structures)),
+        Arc::new(Int64Array::from(overlaps)),
         Arc::new(embedding_array),
     ];
     RecordBatch::try_new(schema, columns)
@@ -915,7 +919,7 @@ fn decode_claim_marks(col: &StringArray, row: usize) -> Vec<ClaimMark> {
 /// Columns `decode_hits` reads. `fts_scan` and `vector_scan` project to
 /// exactly this set so a hit never deserializes the `embedding` vector,
 /// which no caller reads after retrieval.
-const HIT_COLUMNS: [&str; 12] = [
+const HIT_COLUMNS: [&str; 13] = [
     "chunk_id",
     "file_ref",
     "summary",
@@ -928,6 +932,7 @@ const HIT_COLUMNS: [&str; 12] = [
     "keywords",
     "claim_marks",
     "structure",
+    "overlap_bytes",
 ];
 
 fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit>) -> Result<()> {
@@ -952,6 +957,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
     let keywords = list_utf8_col(rb, "keywords")?;
     let claim_marks = string_col(rb, "claim_marks")?;
     let structures = string_col(rb, "structure")?;
+    let overlap_bytes = int64_col(rb, "overlap_bytes")?;
     for i in 0..rb.num_rows() {
         let structure = if structures.is_null(i) {
             None
@@ -991,6 +997,7 @@ fn decode_hits(rb: &RecordBatch, corpus_key: &CorpusKey, out: &mut Vec<SearchHit
             mtime_ms: mtime_ms.value(i),
             claim_marks: decode_claim_marks(claim_marks, i),
             structure,
+            overlap_bytes: overlap_bytes.value(i).max(0) as usize,
             z_score: None,
         });
     }
@@ -2484,8 +2491,8 @@ impl LanceStore {
         .await
     }
 
-    /// Retrieve up to `limit` chunks of one corpus key whose `search_text`
-    /// contains `phrase` as a case-insensitive substring, in scan order.
+    /// Retrieve up to `limit` chunks of one corpus key whose body text
+    /// can contain `phrase` as a case-insensitive substring, in scan order.
     ///
     /// The scan uses no FTS or vector index. The predicate first requires the
     /// longest space-free segment of the phrase through a cheap
@@ -2495,8 +2502,12 @@ impl LanceStore {
     /// the phrase match literally. The first test is exact because the fold
     /// changes only whitespace. The regex `\s` is Unicode `White_Space`,
     /// the same class that `collapse_whitespace` folds for the phrase.
-    /// Returns an empty list when the table has no text index yet, as
-    /// `retrieve_signals` does.
+    /// A last test requires the same fold of `text` (the body) to hold the
+    /// phrase, or `text` to hold `[^`. Footnote exclusion removes only
+    /// `[^` ranges, so a row without `[^` has a body equal to `text`. This
+    /// keeps rows that match only in the breadcrumb or file summary out of
+    /// the scan cap. Returns an empty list when the table has no text index
+    /// yet, as `retrieve_signals` does.
     ///
     /// # Errors
     ///
@@ -2525,11 +2536,13 @@ impl LanceStore {
                 escape_sql_str(anchor)
             )
         };
+        let needle = escape_sql_str(&needle);
         let filter = format!(
-            "{}{} AND strpos(regexp_replace(lower(search_text), '\\s+', ' ', 'g'), '{}') > 0",
+            "{}{} AND strpos(regexp_replace(lower(search_text), '\\s+', ' ', 'g'), '{needle}') > 0 \
+             AND (strpos(regexp_replace(lower(text), '\\s+', ' ', 'g'), '{needle}') > 0 \
+             OR strpos(text, '[^') > 0)",
             corpus_key_filter(corpus_key)?,
             prefilter,
-            escape_sql_str(&needle)
         );
         let table = self.table.clone();
         let corpus_key = corpus_key.clone();
@@ -4457,14 +4470,14 @@ mod tests {
     }
 
     #[test]
-    fn meta_check_or_init_defaults_missing_embedding_fields_on_v5() {
+    fn meta_check_or_init_defaults_missing_embedding_fields_on_v6() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
             &meta_path,
             r#"# auto-managed by hallouminate; do not edit
 embedding_model_name = "BAAI/bge-small-en-v1.5"
-schema_version = 5
+schema_version = 6
 "#,
         )
         .unwrap();
@@ -4487,13 +4500,13 @@ schema_version = 1
         )
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect_err("a v1 store must be rejected by the v5 binary");
+            .expect_err("a v1 store must be rejected by the v6 binary");
         assert!(
             matches!(
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 1,
-                    expected: 5,
+                    expected: 6,
                     ..
                 }
             ),
@@ -4516,13 +4529,13 @@ schema_version = 2
         )
         .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect_err("a v2 store must be rejected by the v5 binary");
+            .expect_err("a v2 store must be rejected by the v6 binary");
         assert!(
             matches!(
                 err,
                 HallouminateError::StoreSchemaStale {
                     found: 2,
-                    expected: 5,
+                    expected: 6,
                     ..
                 }
             ),
@@ -4537,10 +4550,10 @@ schema_version = 2
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true).unwrap();
         let text = std::fs::read_to_string(&meta_path).unwrap();
         let meta: Meta = toml::from_str(&text).unwrap();
-        assert_eq!(default_schema_version(), 5);
-        assert_eq!(meta.schema_version, 5);
+        assert_eq!(default_schema_version(), 6);
+        assert_eq!(meta.schema_version, 6);
         meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, true)
-            .expect("v5 store must re-open");
+            .expect("v6 store must re-open");
     }
 
     #[test]
@@ -4608,6 +4621,7 @@ schema_version = 1
                 "search_text",
                 "claim_marks",
                 "structure",
+                "overlap_bytes",
                 "embedding",
             ]
         );
@@ -4656,6 +4670,7 @@ schema_version = 1
                 search_text: format!("chunk-{i}"),
                 claim_marks: None,
                 structure: None,
+                overlap_bytes: 0,
             });
         }
         pf
@@ -4703,7 +4718,7 @@ schema_version = 1
         let schema = chunks_schema();
         let rb = build_record_batch(&batch, schema).expect("build batch");
         assert_eq!(rb.num_rows(), 5);
-        assert_eq!(rb.num_columns(), 19);
+        assert_eq!(rb.num_columns(), 20);
     }
 
     #[test]
@@ -5173,35 +5188,7 @@ schema_version = 1
     // ─── T7: unit guard classifies schema-version direction ──────────────────
 
     #[test]
-    fn guard_stale_when_stored_version_is_v3() {
-        let dir = tempfile::tempdir().unwrap();
-        let meta_path = dir.path().join("meta.toml");
-        std::fs::write(
-            &meta_path,
-            "# auto-managed by hallouminate; do not edit\n\
-             embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
-             quantized = false\n\
-             embeddings_enabled = false\n\
-             schema_version = 3\n",
-        )
-        .unwrap();
-        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
-            .expect_err("v3 store must be stale and rebuildable");
-        assert!(
-            matches!(
-                err,
-                HallouminateError::StoreSchemaStale {
-                    found: 3,
-                    expected: 5,
-                    ..
-                }
-            ),
-            "expected v3 StoreSchemaStale, got: {err}"
-        );
-    }
-
-    #[test]
-    fn guard_ok_when_stored_version_is_v5() {
+    fn guard_stale_when_stored_version_is_v5() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
@@ -5213,12 +5200,23 @@ schema_version = 1
              schema_version = 5\n",
         )
         .unwrap();
-        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
-            .expect("v5 store must open");
+        let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect_err("v5 store must be stale and rebuildable");
+        assert!(
+            matches!(
+                err,
+                HallouminateError::StoreSchemaStale {
+                    found: 5,
+                    expected: 6,
+                    ..
+                }
+            ),
+            "expected v5 StoreSchemaStale, got: {err}"
+        );
     }
 
     #[test]
-    fn guard_fatal_config_when_stored_version_is_v6() {
+    fn guard_ok_when_stored_version_is_v6() {
         let dir = tempfile::tempdir().unwrap();
         let meta_path = dir.path().join("meta.toml");
         std::fs::write(
@@ -5230,8 +5228,25 @@ schema_version = 1
              schema_version = 6\n",
         )
         .unwrap();
+        meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
+            .expect("v6 store must open");
+    }
+
+    #[test]
+    fn guard_fatal_config_when_stored_version_is_v7() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta_path = dir.path().join("meta.toml");
+        std::fs::write(
+            &meta_path,
+            "# auto-managed by hallouminate; do not edit\n\
+             embedding_model_name = \"BAAI/bge-small-en-v1.5\"\n\
+             quantized = false\n\
+             embeddings_enabled = false\n\
+             schema_version = 7\n",
+        )
+        .unwrap();
         let err = meta_check_or_init(&meta_path, "BAAI/bge-small-en-v1.5", false, false)
-            .expect_err("v6 store must fail fatally");
+            .expect_err("v7 store must fail fatally");
         assert!(
             matches!(err, HallouminateError::Config(_)),
             "expected Config (downgrade fatal), got: {err}"
@@ -5412,6 +5427,38 @@ schema_version = 1
             .await
             .expect("search display-only token");
         assert!(display_signals.fts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retrieve_phrase_scans_body_text_not_summary_only_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let mut file = synthetic_prepared("/tmp/phrase.md", 3);
+        let bodies = [
+            "unrelated words only",
+            "the Tax   Abatement applies",
+            "the tax[^1] abatement applies",
+        ];
+        for (chunk, body) in file.chunks.iter_mut().zip(bodies) {
+            chunk.text = body.into();
+            chunk.search_text = format!("H summary tax abatement {body}");
+        }
+        store.apply_batch(vec![file]).await.expect("apply batch");
+
+        let hits = store
+            .retrieve_phrase(&docs_key(), "tax abatement", 10)
+            .await
+            .expect("scan phrase");
+        let mut texts: Vec<&str> = hits.iter().map(|hit| hit.text.as_str()).collect();
+        texts.sort_unstable();
+        assert_eq!(
+            texts,
+            vec![bodies[1], bodies[2]],
+            "summary-only row must not match; body and footnote-split rows must"
+        );
     }
 
     #[tokio::test]

@@ -584,6 +584,8 @@ async fn ground_query(
                     snippet_chars: None,
                     footnote_mode: Default::default(),
                     match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             },
             ground_rpc_timeout(arm),
@@ -638,12 +640,13 @@ const RERANK_FALLBACK_CODES: [&str; 2] = [RERANK_TIMEOUT_CODE, CROSSENCODER_UNAV
 
 /// Informational only — they describe what the query covered, not a broken
 /// signal, so they must never fail the eval.
-const ADVISORY_WARNING_CODES: [&str; 5] = [
+const ADVISORY_WARNING_CODES: [&str; 6] = [
     "code-repos-empty",
     "cross-repo-union",
     "index-coverage",
     "index-reconciliation",
     "phrase-truncated",
+    "counts-truncated",
 ];
 
 /// Every `Warning.code` the domain and daemon crates emit. Re-derive with:
@@ -655,7 +658,7 @@ const ADVISORY_WARNING_CODES: [&str; 5] = [
 /// `producer_warning_codes_are_classified_exactly_once` pins this against the
 /// three sets above, so a new producer-side warning breaks a test at its source
 /// instead of silently reaching the eval gate unclassified.
-const PRODUCER_WARNING_CODES: [&str; 11] = [
+const PRODUCER_WARNING_CODES: [&str; 12] = [
     "ripgrep-unresolved",
     "ripgrep-unparseable",
     "ripgrep-failed",
@@ -667,6 +670,7 @@ const PRODUCER_WARNING_CODES: [&str; 11] = [
     "index-coverage",
     "index-reconciliation",
     "phrase-truncated",
+    "counts-truncated",
 ];
 
 /// Which of `run_arm`'s two sweeps a response came from. Only the measured

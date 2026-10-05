@@ -55,13 +55,15 @@ Semantic search. Embeds the query with the configured embedding model
 (default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from
 LanceDB, and rolls up per-file with breadcrumb context. Params: `query`
 (required), `corpus`, `top_files`, `chunks_per_file`, `limit`, `snippet_chars`,
-`footnotes`, `match`.
+`footnotes`, `match`, `group_by`, `output`.
 Returns a ripgrep-style outline in `content` and the full structured response
 in `structuredContent.docs`.
 
 Set `match: "phrase"` for an exact lookup, such as a canonical URL or a
 source title. Phrase mode uses bounded case-insensitive literal matching of
-the whole query against chunk search text. It does not use BM25,
+the whole query against chunk body text. The match ignores the heading
+breadcrumb and the file summary, so inline markup in a heading, such as
+`## Tax **Abatement**`, does not match as a phrase. It does not use BM25,
 vector search, or the reranker. Stopwords, punctuation, quotes, `%`, and `_`
 match literally. Each run of whitespace, such as a line break, a tab, repeated
 spaces, or a non-breaking space, counts as one space in the query and in the
@@ -71,6 +73,24 @@ The query must hold 1 to 512 characters and must not be only whitespace.
 The `limit`, `chunks_per_file`, `top_files`, and 10,000-match scan cap can
 restrict results. A `phrase-truncated` warning reports these limits. Do not
 conclude absence or uniqueness from a truncated result.
+
+Plain-text, JSON, and PDF chunks repeat about 12 percent of the chunk budget from the
+previous chunk. A short phrase across a split point is then whole in one
+chunk. Phrase mode counts each occurrence once, in the first chunk that holds
+it.
+
+Set `group_by: "page"` to return one entry for each PDF page (`page:N`
+breadcrumb). The entry is the best chunk of the page, and `chunk_count` gives
+the number of matched chunks on that page. `chunks_per_file` then caps pages.
+Chunks without a page breadcrumb stay single entries.
+
+Set `output: "counts"` with `match: "phrase"` to get coverage counts.
+Each matched file carries `coverage: {chunks, pages}` and no chunks, snippets,
+summary, or keywords. `pages` is `null` for a file without page breadcrumbs.
+Counts ignore `top_files`, `chunks_per_file`, and `limit`. The 10,000-match scan
+cap applies. A counts response lists at most 2,000 files and adds a
+`counts-truncated` warning when more files match. A response over the IPC frame
+limit returns an error. `output: "counts"` with `match: "ranked"` is rejected.
 
 ### `add_markdown`
 

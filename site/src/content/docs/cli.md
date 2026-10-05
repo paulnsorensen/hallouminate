@@ -75,10 +75,22 @@ hallouminate ground "socket protocol" --corpus repo:hallouminate:wiki --format j
 | `--limit N` | Hard cap on returned chunks. |
 | `--snippet-chars N` | Snippet length when not using `--full`. |
 | `--match ranked\|phrase` | Retrieval mode. `phrase` uses bounded, case-insensitive literal matching of the whole query. Each whitespace run counts as one space, so a phrase across a line break matches. |
+| `--group-by chunk\|page` | Unit returned within each file. `page` returns one entry for each PDF page with its matched chunk count. |
+| `--output hits\|counts` | Response shape. `counts` needs `--match phrase` and returns matched chunks and distinct pages for each file, with no snippets. |
 
 Phrase results can omit matches because of `--limit`, `--chunks-per-file`,
 `--top-files`, or the 10,000-match scan cap. A `phrase-truncated` warning
 reports these limits. Do not infer absence or uniqueness from truncated results.
+
+For a count, use `--match phrase --output counts`. Counts ignore `--limit`,
+`--chunks-per-file`, and `--top-files`. The scan cap applies, and the output
+lists at most 2,000 files with a `counts-truncated` warning when more match.
+With `--group-by page`, `--chunks-per-file` caps pages, not chunks.
+
+```sh
+hallouminate ground "abatement" --match phrase --output counts
+hallouminate ground "abatement" --match phrase --group-by page --chunks-per-file 50
+```
 
 ## `daemon`
 

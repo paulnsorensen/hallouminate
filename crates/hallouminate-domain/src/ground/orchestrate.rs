@@ -6,10 +6,18 @@ use futures_util::{StreamExt, TryStreamExt};
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
 use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
-use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused, search_phrase};
+use crate::search::{
+    ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, search_fused, search_phrase,
+};
 
-use super::bucket::{build_docs, build_phrase_docs, normalize_scores};
-use super::types::{DocFile, GroundMatch, GroundResponse, Stats, Warning};
+use super::bucket::{Rollup, normalize_scores, roll_up};
+use super::types::{
+    DocFile, GroundGroupBy, GroundMatch, GroundOutput, GroundResponse, Stats, Warning,
+};
+
+/// Maximum number of files a counts response lists. Counts output has no
+/// `top_files` cap, so this bound keeps the response inside the IPC frame.
+pub const MAX_COUNTS_FILES: usize = 2_000;
 
 /// Why one bounded crossencoder attempt kept fusion order.
 #[derive(Debug, PartialEq, Eq)]
@@ -103,6 +111,14 @@ pub struct GroundOpts {
     pub footnote_mode: FootnoteMode,
     /// Retrieval mode. [`GroundMatch::Phrase`] skips fusion and reranking.
     pub match_mode: GroundMatch,
+    /// Unit returned within each file. [`GroundGroupBy::Page`] returns one
+    /// entry per PDF page, and `chunks_per_file` then caps pages.
+    pub group_by: GroundGroupBy,
+    /// Response shape. [`GroundOutput::Counts`] ignores `top_files`,
+    /// `chunks_per_file`, and `limit`, lists at most [`MAX_COUNTS_FILES`]
+    /// files with a `counts-truncated` warning, and needs
+    /// [`GroundMatch::Phrase`].
+    pub output: GroundOutput,
 }
 
 impl Default for GroundOpts {
@@ -114,7 +130,55 @@ impl Default for GroundOpts {
             rerank_timeout: Duration::from_secs(2),
             footnote_mode: FootnoteMode::Include,
             match_mode: GroundMatch::Ranked,
+            group_by: GroundGroupBy::Chunk,
+            output: GroundOutput::Hits,
         }
+    }
+}
+
+/// Reason a `ground` request shape is rejected before retrieval.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::{GroundMatch, GroundOutput, GroundShapeError, validate_shape};
+/// let error = validate_shape(GroundMatch::Ranked, GroundOutput::Counts).unwrap_err();
+/// assert_eq!(error, GroundShapeError::CountsNeedPhrase);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GroundShapeError {
+    /// Counts need every match, and only phrase mode retrieves every match.
+    #[error(
+        "output \"counts\" requires match \"phrase\"; ranked retrieval returns a bounded candidate pool, so its counts are not complete"
+    )]
+    CountsNeedPhrase,
+}
+
+/// Checks that `output` is valid for `match_mode`.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::{GroundMatch, GroundOutput, GroundShapeError, validate_shape};
+/// assert_eq!(validate_shape(GroundMatch::Phrase, GroundOutput::Counts), Ok(()));
+/// assert_eq!(
+///     validate_shape(GroundMatch::Ranked, GroundOutput::Counts),
+///     Err(GroundShapeError::CountsNeedPhrase)
+/// );
+/// ```
+///
+/// # Errors
+///
+/// Returns [`GroundShapeError::CountsNeedPhrase`] for counts output in
+/// ranked mode.
+pub fn validate_shape(
+    match_mode: GroundMatch,
+    output: GroundOutput,
+) -> std::result::Result<(), GroundShapeError> {
+    match (match_mode, output) {
+        (GroundMatch::Ranked, GroundOutput::Counts) => Err(GroundShapeError::CountsNeedPhrase),
+        (GroundMatch::Ranked | GroundMatch::Phrase, GroundOutput::Hits)
+        | (GroundMatch::Phrase, GroundOutput::Counts) => Ok(()),
     }
 }
 
@@ -184,9 +248,15 @@ fn rollup_order(
 /// `priority_corpus`, when `Some`, names the corpus whose docs get ranking
 /// priority in the final `top_files` rollup (#425): equal-score ties favor
 /// it, and up to `RESERVED_LOCAL_SLOTS` of its docs survive the cut even when
-/// their global score falls outside it. `None` (the single-corpus `ground`
-/// wrapper, and an above-all-repos union ground) leaves ranking exactly as
-/// before — pure global score order.
+/// their global score falls outside it. Counts output applies the same
+/// reserve to its `MAX_COUNTS_FILES` cut and ranks files by matched chunks.
+/// `None` (the single-corpus `ground` wrapper, and an above-all-repos union
+/// ground) leaves ranking exactly as before.
+///
+/// # Errors
+///
+/// Returns an error when the request shape is invalid (see
+/// [`validate_shape`]) or when retrieval or rollup fails.
 pub async fn ground_union(
     query: &str,
     corpora: &[CorpusConfig],
@@ -195,7 +265,13 @@ pub async fn ground_union(
     opts: GroundOpts,
     priority_corpus: Option<&str>,
 ) -> Result<GroundResponse> {
+    validate_shape(opts.match_mode, opts.output)
+        .map_err(|error| HallouminateError::Search(error.to_string()))?;
     let started = Instant::now();
+    let limit = match opts.output {
+        GroundOutput::Hits => opts.limit,
+        GroundOutput::Counts => MAX_PHRASE_SCAN_ROWS,
+    };
     let corpus_keys: Vec<(CorpusKey, &[String])> = corpora
         .iter()
         .flat_map(|c| {
@@ -213,7 +289,7 @@ pub async fn ground_union(
     let searches: Vec<_> = corpus_keys
         .iter()
         .map(|(corpus_key, globs)| {
-            search_corpus(query, corpus_key, store, globs, opts.limit, opts.match_mode)
+            search_corpus(query, corpus_key, store, globs, limit, opts.match_mode)
         })
         .collect();
     // `buffered` (not `buffer_unordered`) preserves per-root result order,
@@ -270,18 +346,16 @@ pub async fn ground_union(
         by_key.entry(hit.corpus_key.clone()).or_default().push(hit);
     }
 
+    let rollup = Rollup {
+        chunks_per_file: opts.chunks_per_file,
+        footnote_mode: opts.footnote_mode,
+        match_mode: opts.match_mode,
+        group_by: opts.group_by,
+        output: opts.output,
+    };
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
     for (corpus_key, corpus_hits) in by_key {
-        let build = match opts.match_mode {
-            GroundMatch::Ranked => build_docs,
-            GroundMatch::Phrase => build_phrase_docs,
-        };
-        let mut built = build(
-            &corpus_hits,
-            usize::MAX,
-            opts.chunks_per_file,
-            opts.footnote_mode,
-        )?;
+        let mut built = roll_up(&corpus_hits, usize::MAX, rollup)?;
         let root = corpus_key.canonical_root.to_string_lossy().into_owned();
         for (absolute_path, doc) in built.iter_mut() {
             doc.corpus = corpus_key.name.clone();
@@ -300,66 +374,50 @@ pub async fn ground_union(
         }
     }
 
-    // Repo-local docs (matching `priority_corpus`) get a guaranteed foothold
-    // in the final `top_files` cut even when their global score falls
-    // outside it, so a few high-scoring neighbor-corpus hits can't fully
-    // crowd out the searcher's own repo (#425).
-    const RESERVED_LOCAL_SLOTS: usize = 2;
-
-    if docs.len() > opts.top_files {
-        let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
-        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
-
-        let mut swapped = false;
-        if let Some(priority) = priority_corpus {
-            let kept_locals = ranked[..opts.top_files]
-                .iter()
-                .filter(|(_, d)| d.corpus == priority)
-                .count();
-            let missing = RESERVED_LOCAL_SLOTS.saturating_sub(kept_locals);
-            if missing > 0 {
-                let promote: Vec<usize> = (opts.top_files..ranked.len())
-                    .filter(|&i| ranked[i].1.corpus == priority)
-                    .take(missing)
-                    .collect();
-                // Evict the lowest-ranked non-priority docs in the kept
-                // window; the zip truncates to however many of those exist,
-                // so promotion can never over-fill the window.
-                let evict: Vec<usize> = (0..opts.top_files)
-                    .rev()
-                    .filter(|&i| ranked[i].1.corpus != priority)
-                    .take(promote.len())
-                    .collect();
-                for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
-                    ranked.swap(evict_idx, promote_idx);
-                    swapped = true;
-                }
+    match opts.output {
+        GroundOutput::Hits => {
+            if docs.len() > opts.top_files {
+                docs = cut_with_local_reserve(docs, opts.top_files, priority_corpus, |a, b| {
+                    rollup_order(priority_corpus, a, b)
+                });
             }
         }
-
-        ranked.truncate(opts.top_files);
-        // Truncating a sorted vec leaves it sorted; only actual promotion
-        // swaps disturb the order and need the re-sort.
-        if swapped {
-            ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
+        GroundOutput::Counts => {
+            if docs.len() > MAX_COUNTS_FILES {
+                let matched_files = docs.len();
+                docs = cut_with_local_reserve(docs, MAX_COUNTS_FILES, priority_corpus, |a, b| {
+                    counts_order(priority_corpus, a, b)
+                });
+                warnings.push(Warning {
+                    code: "counts-truncated".to_string(),
+                    message: format!(
+                        "counts output lists the first {MAX_COUNTS_FILES} of {matched_files} matched files; narrow the phrase or the corpus to see the rest"
+                    ),
+                });
+            }
         }
-        docs = ranked.into_iter().collect();
     }
 
-    if opts.match_mode == GroundMatch::Phrase {
-        let mut retained = 0;
-        for doc in docs.values() {
-            retained += doc.chunks.len();
+    match (opts.match_mode, opts.output) {
+        (GroundMatch::Phrase, GroundOutput::Hits) => {
+            let mut retained = 0;
+            for doc in docs.values() {
+                for chunk in &doc.chunks {
+                    retained += chunk.chunk_count.unwrap_or(1);
+                }
+            }
+            if retained < stats.hits {
+                warnings.push(Warning {
+                    code: "phrase-truncated".to_string(),
+                    message: format!(
+                        "phrase rollup retained {retained} of {} matched chunks after chunks_per_file and top_files caps",
+                        stats.hits
+                    ),
+                });
+            }
         }
-        if retained < stats.hits {
-            warnings.push(Warning {
-                code: "phrase-truncated".to_string(),
-                message: format!(
-                    "phrase rollup retained {retained} of {} matched chunks after chunks_per_file and top_files caps",
-                    stats.hits
-                ),
-            });
-        }
+        (GroundMatch::Phrase, GroundOutput::Counts)
+        | (GroundMatch::Ranked, GroundOutput::Hits | GroundOutput::Counts) => {}
     }
 
     Ok(GroundResponse {
@@ -370,6 +428,73 @@ pub async fn ground_union(
         code: BTreeMap::new(),
         warnings,
     })
+}
+
+/// Keeps up to `RESERVED_LOCAL_SLOTS` docs of `priority_corpus` in the final
+/// cut even when `order` ranks them outside it, so a few high-ranked
+/// neighbor-corpus docs cannot fully crowd out the searcher's own repo (#425).
+fn cut_with_local_reserve(
+    docs: BTreeMap<String, DocFile>,
+    cap: usize,
+    priority_corpus: Option<&str>,
+    order: impl Fn(&(String, DocFile), &(String, DocFile)) -> std::cmp::Ordering,
+) -> BTreeMap<String, DocFile> {
+    let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
+    ranked.sort_by(&order);
+
+    let mut swapped = false;
+    if let Some(priority) = priority_corpus {
+        let kept_locals = ranked[..cap]
+            .iter()
+            .filter(|(_, d)| d.corpus == priority)
+            .count();
+        let missing = RESERVED_LOCAL_SLOTS.saturating_sub(kept_locals);
+        if missing > 0 {
+            let promote: Vec<usize> = (cap..ranked.len())
+                .filter(|&i| ranked[i].1.corpus == priority)
+                .take(missing)
+                .collect();
+            // Evict the lowest-ranked non-priority docs in the kept
+            // window; the zip truncates to however many of those exist,
+            // so promotion can never over-fill the window.
+            let evict: Vec<usize> = (0..cap)
+                .rev()
+                .filter(|&i| ranked[i].1.corpus != priority)
+                .take(promote.len())
+                .collect();
+            for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
+                ranked.swap(evict_idx, promote_idx);
+                swapped = true;
+            }
+        }
+    }
+
+    ranked.truncate(cap);
+    // Truncating a sorted vec leaves it sorted; only actual promotion
+    // swaps disturb the order and need the re-sort.
+    if swapped {
+        ranked.sort_by(&order);
+    }
+    ranked.into_iter().collect()
+}
+
+const RESERVED_LOCAL_SLOTS: usize = 2;
+
+/// Ranks counts-mode files by matched chunks, most first. Occurrence count of
+/// the best chunk does not measure coverage.
+fn counts_order(
+    priority_corpus: Option<&str>,
+    a: &(String, DocFile),
+    b: &(String, DocFile),
+) -> std::cmp::Ordering {
+    let chunks_of = |doc: &DocFile| doc.coverage.as_ref().map_or(0, |coverage| coverage.chunks);
+    chunks_of(&b.1)
+        .cmp(&chunks_of(&a.1))
+        .then_with(|| match priority_corpus {
+            Some(p) => (b.1.corpus == p).cmp(&(a.1.corpus == p)),
+            None => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.0.cmp(&b.0))
 }
 
 #[cfg(test)]
@@ -441,9 +566,14 @@ mod tests {
     /// makes these tests crawl the entire filesystem — fast only while the
     /// literal pass happens to match nothing.
     fn fixture_root() -> &'static std::path::Path {
-        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| tempfile::tempdir().expect("fixture corpus root"))
-            .path()
+        static ROOT: std::sync::OnceLock<(tempfile::TempDir, std::path::PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_dir, canonical) = ROOT.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("fixture corpus root");
+            let canonical = dir.path().canonicalize().expect("canonical fixture root");
+            (dir, canonical)
+        });
+        canonical
     }
 
     fn fixture_corpus() -> CorpusConfig {
@@ -628,6 +758,7 @@ mod tests {
             mtime_ms: 0,
             claim_marks: vec![],
             structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
     }
@@ -861,6 +992,7 @@ mod tests {
         for (i, text) in texts.iter().enumerate() {
             let file_ref = fixture_root().join(format!("phrase{i}.md"));
             let mut hit = hit_for_timeout_test(&file_ref.to_string_lossy(), 0.0);
+            hit.text = (*text).to_string();
             hit.search_text = (*text).to_string();
             hits.push(hit);
         }
@@ -909,12 +1041,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn phrase_mode_ignores_a_phrase_that_only_the_file_summary_holds() {
+        let path = fixture_root().join("phrase-summary.md");
+        let path = path.to_string_lossy();
+        let mut summary_only = hit_for_timeout_test(&path, 0.0);
+        summary_only.chunk_id = "summary-only".into();
+        summary_only.text = "plain body".into();
+        summary_only.search_text = "crumb\nexact phrase in summary\nplain body".into();
+        let mut in_body = summary_only.clone();
+        in_body.chunk_id = "in-body".into();
+        in_body.line_start = 20;
+        in_body.text = "the exact phrase".into();
+        in_body.search_text = "crumb\nexact phrase in summary\nthe exact phrase".into();
+        let store = FakeChunkStore {
+            hits: vec![summary_only, in_body],
+        };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("phrase ground");
+        assert_eq!(resp.stats.hits, 1);
+        let doc = resp.docs.values().next().expect("one file");
+        assert_eq!(doc.chunks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn counts_output_caps_the_file_count_and_warns() {
+        let mut hits = Vec::new();
+        for index in 0..=MAX_COUNTS_FILES {
+            let path = fixture_root().join(format!("counts-{index:05}.md"));
+            let mut hit = hit_for_timeout_test(&path.to_string_lossy(), 0.0);
+            hit.text = "exact phrase".into();
+            hit.search_text = "exact phrase".into();
+            hit.summary = "file summary".into();
+            hit.keywords = vec!["keyword".into()];
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("counts ground");
+        assert_eq!(resp.docs.len(), MAX_COUNTS_FILES);
+        assert_eq!(resp.stats.hits, MAX_COUNTS_FILES + 1);
+        let mut codes = Vec::new();
+        for warning in &resp.warnings {
+            codes.push(warning.code.as_str());
+        }
+        assert_eq!(codes, vec!["counts-truncated"]);
+        assert!(
+            resp.warnings[0]
+                .message
+                .contains("2000 of 2001 matched files"),
+            "{}",
+            resp.warnings[0].message
+        );
+        for doc in resp.docs.values() {
+            assert_eq!(doc.summary, None);
+            assert!(doc.keywords.is_empty());
+            assert!(doc.chunks.is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn phrase_rollup_warns_when_chunks_per_file_drops_a_match() {
         let path = fixture_root().join("phrase-chunks.md");
         let path = path.to_string_lossy();
         let mut first = hit_for_timeout_test(&path, 0.0);
         first.chunk_id = "first".into();
         first.line_start = 1;
+        first.text = "exact phrase".into();
         first.search_text = "exact phrase".into();
         let mut second = first.clone();
         second.chunk_id = "second".into();
@@ -942,6 +1145,7 @@ mod tests {
         for name in ["phrase-top-a.md", "phrase-top-b.md"] {
             let path = fixture_root().join(name);
             let mut hit = hit_for_timeout_test(&path.to_string_lossy(), 0.0);
+            hit.text = "exact phrase".into();
             hit.search_text = "exact phrase".into();
             hits.push(hit);
         }
@@ -1376,6 +1580,69 @@ mod tests {
                 .map(|d| (&d.corpus, d.score))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Counts output ranks by matched chunks and keeps the reserved local
+    /// slots, so a flood of neighbor files cannot drop every local file.
+    #[tokio::test]
+    async fn counts_cut_keeps_reserved_local_files_below_the_cap() {
+        let local_root = tempfile::tempdir().expect("local root");
+        let neighbor_root = tempfile::tempdir().expect("neighbor root");
+        let local = priority_corpus_config(local_root.path(), "repo:local:wiki");
+        let neighbor = priority_corpus_config(neighbor_root.path(), "neighbor");
+
+        let mut hits = Vec::new();
+        for index in 0..MAX_COUNTS_FILES {
+            for chunk in 0..2 {
+                let mut hit = priority_hit(
+                    neighbor_root.path(),
+                    "neighbor",
+                    &format!("n{index:05}.md"),
+                    0.0,
+                );
+                hit.chunk_id = format!("n{index:05}-{chunk}");
+                hit.text = "exact phrase".into();
+                hit.search_text = "exact phrase".into();
+                hits.push(hit);
+            }
+        }
+        for index in 0..2 {
+            let mut hit = priority_hit(
+                local_root.path(),
+                "repo:local:wiki",
+                &format!("l{index}.md"),
+                0.0,
+            );
+            hit.chunk_id = format!("l{index}-0");
+            hit.text = "exact phrase".into();
+            hit.search_text = "exact phrase".into();
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        };
+        let resp = ground_union(
+            "exact phrase",
+            &[local, neighbor],
+            &store,
+            None,
+            opts,
+            Some("repo:local:wiki"),
+        )
+        .await
+        .expect("counts ground_union");
+
+        assert_eq!(resp.docs.len(), MAX_COUNTS_FILES);
+        let mut local_kept = 0;
+        for doc in resp.docs.values() {
+            if doc.corpus == "repo:local:wiki" {
+                local_kept += 1;
+            }
+        }
+        assert_eq!(local_kept, 2, "reserved local slots must survive the cut");
     }
 
     /// AC3/no-op: `priority_corpus = None` must reproduce today's pure-score
