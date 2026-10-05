@@ -60,7 +60,7 @@ pub use ipc::{
     WatcherCounters,
 };
 pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
-pub use report::{CorpusReport, IndexReport};
+pub use report::{CorpusReport, IndexReport, SkippedFileReason, SkippedFileReport};
 pub use server::{
     DaemonArgs, IDLE_READ_TIMEOUT, run_daemon, serve, serve_with_idle_timeout,
     spawn_signal_handlers,

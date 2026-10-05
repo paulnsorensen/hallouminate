@@ -5,6 +5,10 @@
 //! case-insensitive substring, and this module ranks those chunks by how
 //! many times the phrase occurs. The occurrence count is the only rankable
 //! quantity a literal match produces without an invented scale.
+//!
+//! Both sides collapse each run of Unicode whitespace to one ASCII space
+//! before they compare, so a phrase that wraps across a hard line break
+//! still matches. All other characters match literally.
 
 use crate::common::{CorpusKey, HallouminateError, Result};
 use crate::ground::Warning;
@@ -65,7 +69,8 @@ pub fn validate_phrase(phrase: &str) -> std::result::Result<(), PhraseError> {
 /// function ranks all of them, then keeps the first `limit`. The order is
 /// occurrence count of the lowercased phrase in the lowercased
 /// `search_text`, descending, then root-relative path, `line_start`, and
-/// `chunk_id`. Each returned hit's `score` is its occurrence count.
+/// `chunk_id`. Each returned hit's `score` is its occurrence count. Both
+/// texts pass through [`collapse_whitespace`] before the comparison.
 ///
 /// A `phrase-truncated` warning is pushed when more than `limit`
 /// chunks matched or the scan reached [`MAX_PHRASE_SCAN_ROWS`]. Callers
@@ -94,11 +99,11 @@ pub async fn search_phrase(
     limit: usize,
 ) -> Result<FusedSearch> {
     validate_phrase(phrase).map_err(|error| HallouminateError::Search(error.to_string()))?;
+    let needle = collapse_whitespace(&phrase.to_lowercase());
     let hits = store
-        .retrieve_phrase(corpus_key, phrase, MAX_PHRASE_SCAN_ROWS)
+        .retrieve_phrase(corpus_key, &needle, MAX_PHRASE_SCAN_ROWS)
         .await?;
     let matched = hits.len();
-    let needle = phrase.to_lowercase();
     let mut decorated = Vec::with_capacity(matched);
     for mut hit in hits {
         let count = occurrence_count(&hit.search_text, &needle);
@@ -140,8 +145,42 @@ fn truncation_warning(corpus_key: &CorpusKey, matched: usize, limit: usize) -> O
     })
 }
 
+/// Replaces each run of Unicode whitespace in `text` with one ASCII space.
+///
+/// The match uses [`char::is_whitespace`], which is the Unicode
+/// `White_Space` property. That property includes CR, LF, tab, and
+/// U+00A0. Leading and trailing runs collapse but stay, so a phrase
+/// that ends in a space still requires a word boundary.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::search::collapse_whitespace;
+/// assert_eq!(collapse_whitespace("a\r\n\tb\u{a0} c "), "a b c ");
+/// ```
+pub fn collapse_whitespace(text: &str) -> String {
+    let mut collapsed = String::with_capacity(text.len());
+    let mut in_run = false;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !in_run {
+                collapsed.push(' ');
+            }
+            in_run = true;
+        } else {
+            collapsed.push(ch);
+            in_run = false;
+        }
+    }
+    collapsed
+}
+
 fn occurrence_count(search_text: &str, needle: &str) -> usize {
-    search_text.to_lowercase().matches(needle).count()
+    let mut count = 0;
+    for _ in collapse_whitespace(&search_text.to_lowercase()).matches(needle) {
+        count += 1;
+    }
+    count
 }
 
 #[cfg(test)]
@@ -171,6 +210,35 @@ mod tests {
         );
         assert_eq!(occurrence_count("aaaa", "aa"), 2);
         assert_eq!(occurrence_count("art and x", "the art of x"), 0);
+    }
+
+    #[test]
+    fn collapse_whitespace_folds_every_unicode_whitespace_run() {
+        assert_eq!(collapse_whitespace("a\nb"), "a b");
+        assert_eq!(collapse_whitespace("a\r\nb"), "a b");
+        assert_eq!(collapse_whitespace("a\tb"), "a b");
+        assert_eq!(collapse_whitespace("a  b"), "a b");
+        assert_eq!(collapse_whitespace("a\u{a0}b"), "a b");
+        assert_eq!(collapse_whitespace("a \n\u{3000} b"), "a b");
+        assert_eq!(collapse_whitespace("\n a \n"), " a ");
+        assert_eq!(collapse_whitespace("a-b"), "a-b");
+    }
+
+    #[test]
+    fn occurrence_count_matches_across_wrapped_whitespace_once() {
+        let text = "the company is the majority shareholder\nof both plants";
+        assert_eq!(
+            occurrence_count(text, "majority shareholder of both plants"),
+            1
+        );
+        assert_eq!(
+            occurrence_count("minority partner in a third\r\nfab", "third fab"),
+            1
+        );
+        assert_eq!(
+            occurrence_count("majority-shareholder of", "majority shareholder of"),
+            0
+        );
     }
 
     #[test]

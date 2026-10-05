@@ -214,6 +214,52 @@ fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
     result
 }
 
+/// Render an `IndexReport` as one summary line per corpus. Each skipped
+/// unreadable file follows its corpus line, so the caller does not have to
+/// find skipped files by elimination.
+fn index_summary(report: &hallouminate_daemon::IndexReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut summary = String::new();
+    for hallouminate_daemon::CorpusReport {
+        name,
+        files_upserted,
+        files_touched,
+        files_deleted,
+        files_skipped_empty: _,
+        files_skipped_unreadable,
+        skipped_unreadable,
+        chunks_inserted,
+        embeddings_inserted: _,
+    } in &report.corpora
+    {
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        let _ = write!(
+            summary,
+            "{name}: upserted={files_upserted} touched={files_touched} deleted={files_deleted} unreadable={files_skipped_unreadable} chunks+={chunks_inserted}"
+        );
+        for hallouminate_daemon::SkippedFileReport { path, reason } in skipped_unreadable {
+            let _ = write!(summary, "\n  skipped {path}: ");
+            match reason {
+                hallouminate_daemon::SkippedFileReason::UnsupportedFormat => {
+                    summary.push_str("unsupported format");
+                }
+                hallouminate_daemon::SkippedFileReason::ExtractionFailed { error } => {
+                    let error = hallouminate_domain::search::collapse_whitespace(error);
+                    let _ = write!(summary, "extraction failed: {error}");
+                }
+            }
+        }
+        let unnamed = files_skipped_unreadable.saturating_sub(skipped_unreadable.len());
+        if unnamed > 0 {
+            let _ = write!(summary, "\n  and {unnamed} more unreadable files");
+        }
+    }
+    summary
+}
+
 /// Render a `TreeNode` as an indented ASCII outline — subdirs first, then
 /// files, with one entry per line and two-space indents per depth level.
 /// Mirrors the structured tree for clients that only want the text block.
@@ -459,8 +505,9 @@ pub struct GroundParams {
     /// literal retrieval. `phrase` returns every chunk whose search text
     /// contains the whole query as a case-insensitive literal substring.
     /// In `phrase` mode, stopwords, punctuation, `%`, `_`, and quotes count
-    /// literally, and whitespace is not normalized, so a phrase across a
-    /// hard line break does not match. The query must hold 1 to 512
+    /// literally. Each run of whitespace (line breaks, tabs, repeated or
+    /// non-breaking spaces) counts as one space on both sides, so a phrase
+    /// that wraps across a hard line break matches. The query must hold 1 to 512
     /// characters and must not be only whitespace. Hits rank by occurrence
     /// count; a `phrase-truncated` warning means more chunks matched than
     /// the response holds.
@@ -782,7 +829,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Build or refresh the LanceDB index for one or all configured corpora. Returns a one-line summary in `content` and the per-corpus IndexReport in `structuredContent`.",
+        description = "Build or refresh the LanceDB index for one or all configured corpora. Returns a one-line summary per corpus in `content`, followed by one line per skipped unreadable file, and the per-corpus IndexReport in `structuredContent`. `skipped_unreadable` names at most 100 skipped files, each with a `reason` of `unsupported_format` or `extraction_failed`; `files_skipped_unreadable` is the exact count.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -805,17 +852,7 @@ impl HallouminateTools {
         };
         let report: hallouminate_daemon::IndexReport =
             client.call(req).await.map_err(map_daemon_err)?;
-        let summary = report
-            .corpora
-            .iter()
-            .map(|c| {
-                format!(
-                    "{}: upserted={} touched={} deleted={} chunks+={}",
-                    c.name, c.files_upserted, c.files_touched, c.files_deleted, c.chunks_inserted
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let summary = index_summary(&report);
         let structured = to_structured(&report)?;
         Ok(tool_ok(summary, structured))
     }
@@ -1396,5 +1433,77 @@ mod tests {
         let dir = std::env::temp_dir();
         let resolved = validate_cwd(dir.to_str().expect("utf8 path")).expect("valid dir accepted");
         assert_eq!(resolved, dir.canonicalize().expect("canonicalize temp dir"));
+    }
+
+    #[test]
+    fn index_summary_names_each_skipped_file_and_the_unnamed_rest() {
+        let report = hallouminate_daemon::IndexReport {
+            corpora: vec![hallouminate_daemon::CorpusReport {
+                name: "docs".into(),
+                files_upserted: 2,
+                files_touched: 0,
+                files_deleted: 0,
+                files_skipped_empty: 0,
+                files_skipped_unreadable: 3,
+                skipped_unreadable: vec![
+                    hallouminate_daemon::SkippedFileReport {
+                        path: "/r/brief.html".into(),
+                        reason: hallouminate_daemon::SkippedFileReason::UnsupportedFormat,
+                    },
+                    hallouminate_daemon::SkippedFileReport {
+                        path: "/r/scan.pdf".into(),
+                        reason: hallouminate_daemon::SkippedFileReason::ExtractionFailed {
+                            error: "no text layer".into(),
+                        },
+                    },
+                ],
+                chunks_inserted: 7,
+                embeddings_inserted: 7,
+            }],
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            index_summary(&report),
+            "docs: upserted=2 touched=0 deleted=0 unreadable=3 chunks+=7\n  skipped /r/brief.html: unsupported format\n  skipped /r/scan.pdf: extraction failed: no text layer\n  and 1 more unreadable files"
+        );
+    }
+
+    #[test]
+    fn index_summary_folds_a_multi_line_error_onto_one_line() {
+        let report = hallouminate_daemon::IndexReport {
+            corpora: vec![hallouminate_daemon::CorpusReport {
+                name: "docs".into(),
+                files_upserted: 0,
+                files_touched: 0,
+                files_deleted: 0,
+                files_skipped_empty: 0,
+                files_skipped_unreadable: 1,
+                skipped_unreadable: vec![hallouminate_daemon::SkippedFileReport {
+                    path: "/r/scan.pdf".into(),
+                    reason: hallouminate_daemon::SkippedFileReason::ExtractionFailed {
+                        error: "bad xref\n  at offset 12\r\n\tgave up".into(),
+                    },
+                }],
+                chunks_inserted: 0,
+                embeddings_inserted: 0,
+            }],
+            warnings: Vec::new(),
+        };
+        let summary = index_summary(&report);
+        assert_eq!(summary.lines().count(), 2, "{summary}");
+        assert!(
+            summary
+                .ends_with("skipped /r/scan.pdf: extraction failed: bad xref at offset 12 gave up"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn index_tool_description_states_the_skip_cap() {
+        let cap = hallouminate_domain::indexer::MAX_REPORTED_SKIPS.to_string();
+        let description = HallouminateTools::index_tool_attr()
+            .description
+            .expect("index tool has a description");
+        assert!(description.contains(&cap), "{description}");
     }
 }
