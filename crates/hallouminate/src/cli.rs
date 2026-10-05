@@ -243,7 +243,8 @@ pub struct GroundCli {
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
     /// Retrieval mode. `phrase` returns every chunk that contains QUERY as a
-    /// case-insensitive literal substring, ranked by occurrence count.
+    /// case-insensitive literal substring, ranked by occurrence count. Each
+    /// whitespace run counts as one space, so line breaks do not block a match.
     #[arg(long = "match", value_enum, default_value_t = MatchArg::Ranked)]
     pub match_mode: MatchArg,
     /// Unit returned within each file. `page` returns one entry per PDF page

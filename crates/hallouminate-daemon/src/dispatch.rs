@@ -757,16 +757,9 @@ async fn handle_index(state: &DaemonState, cfg: &Config, req: IndexRequest) -> D
             Err(e) => return DaemonResponse::internal(e.to_string()),
         };
         drop(guard);
-        report.corpora.push(CorpusReport {
-            name: corpus.name.clone(),
-            files_upserted: stats.files_upserted,
-            files_touched: stats.files_touched,
-            files_deleted: stats.files_deleted,
-            files_skipped_empty: stats.files_skipped_empty,
-            files_skipped_unreadable: stats.files_skipped_unreadable,
-            chunks_inserted: stats.chunks_inserted,
-            embeddings_inserted: stats.embeddings_inserted,
-        });
+        report
+            .corpora
+            .push(CorpusReport::from_stats(corpus.name.clone(), stats));
     }
     DaemonResponse::ok(&report)
 }
@@ -1151,7 +1144,7 @@ async fn handle_add_markdown(
     // it entirely.
     if is_wiki_corpus(&corpus) {
         match rebuild_wiki_indexes(state, cfg, &corpus, &root, &relative).await {
-            Ok(extra) => fold_apply_stats(&mut stats, &extra),
+            Ok(extra) => stats.merge(extra),
             Err(msg) => {
                 warnings.push(format!(
                     "wrote {} but ancestor index refresh failed: {msg}; run `index` to repair",
@@ -1163,16 +1156,7 @@ async fn handle_add_markdown(
     drop(guard);
 
     let report = IndexReport {
-        corpora: vec![CorpusReport {
-            name: corpus.name.clone(),
-            files_upserted: stats.files_upserted,
-            files_touched: stats.files_touched,
-            files_deleted: stats.files_deleted,
-            files_skipped_empty: stats.files_skipped_empty,
-            files_skipped_unreadable: stats.files_skipped_unreadable,
-            chunks_inserted: stats.chunks_inserted,
-            embeddings_inserted: stats.embeddings_inserted,
-        }],
+        corpora: vec![CorpusReport::from_stats(corpus.name.clone(), stats)],
         warnings: Vec::new(),
     };
     DaemonResponse::ok(&AddMarkdownResult {
@@ -1802,23 +1786,6 @@ async fn ensure_paths_exist(corpus: &CorpusConfig) {
     .await;
 }
 
-/// Sum `extra` into `into` so the daemon's IndexReport reflects both the
-/// initial single-file write and the cascade of index.md rewrites that
-/// followed it. Without this, the auto-built indexes would be silently
-/// re-embedded but the report would still claim `files_upserted = 1`.
-fn fold_apply_stats(
-    into: &mut hallouminate_domain::indexer::ApplyStats,
-    extra: &hallouminate_domain::indexer::ApplyStats,
-) {
-    into.files_upserted += extra.files_upserted;
-    into.files_touched += extra.files_touched;
-    into.files_deleted += extra.files_deleted;
-    into.files_skipped_empty += extra.files_skipped_empty;
-    into.files_skipped_unreadable += extra.files_skipped_unreadable;
-    into.chunks_inserted += extra.chunks_inserted;
-    into.embeddings_inserted += extra.embeddings_inserted;
-}
-
 /// Walk from `root` down to the parent of `file_relative`, rewriting each
 /// directory's `index.md` between INDEX-START / INDEX-END markers. Returns
 /// the aggregate of `index_single_file` stats for every regenerated index
@@ -1944,7 +1911,7 @@ async fn rebuild_wiki_indexes(
         let stats = index_single_file(store, &registry, corpus, &dest)
             .await
             .map_err(|e| format!("reindex {}: {e}", dest.display()))?;
-        fold_apply_stats(&mut totals, &stats);
+        totals.merge(stats);
     }
     Ok(totals)
 }

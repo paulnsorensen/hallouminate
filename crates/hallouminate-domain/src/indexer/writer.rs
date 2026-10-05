@@ -1,5 +1,6 @@
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 
 use super::chunk::PreparedFile;
 use crate::common::{CorpusKey, FileRef, HallouminateError, Mtime, Result};
@@ -15,6 +16,23 @@ pub(super) struct WriteRequest<'a> {
     pub mtime: Mtime,
 }
 
+/// Reason the indexer skips a present file without indexing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// No format handler accepts the file type.
+    UnsupportedFormat,
+    /// The format handler failed to extract content. Holds the error text.
+    ExtractionFailed(String),
+}
+
+/// Outcome of [`prepare_file`] for one file.
+pub(super) enum Prepared {
+    /// The file is ready to embed and store.
+    File(PreparedFile),
+    /// The file is skipped. Its last-good rows, if any, stay in the index.
+    Skipped(SkipReason),
+}
+
 /// Dispatch one file to its format handler.
 ///
 /// Decides the format from the extension first: a known-but-unsupported
@@ -24,15 +42,16 @@ pub(super) struct WriteRequest<'a> {
 /// do read is a hard error — the caller must not silently drop it from the
 /// index — and the full bytes are hashed so any edit re-indexes.
 ///
-/// Returns `Ok(None)` — a graceful per-file skip, logged here — when the type
-/// is unsupported or the handler fails to extract content. One bad file never
-/// aborts the run. `Ok(Some(_))` is a prepared file ready to embed and store.
+/// Returns `Ok(Prepared::Skipped(_))` — a graceful per-file skip, logged
+/// here — when the type is unsupported or the handler fails to extract
+/// content. One bad file never aborts the run. `Ok(Prepared::File(_))` is a
+/// prepared file ready to embed and store.
 pub(super) fn prepare_file(
     req: WriteRequest<'_>,
     registry: &HandlerRegistry,
     indexed_at_ms: i64,
     bytes_override: Option<&[u8]>,
-) -> Result<Option<PreparedFile>> {
+) -> Result<Prepared> {
     let path = req.file.as_path();
     // Skip a known-unsupported extension before any IO — no read, no hash.
     if let Some(None) = format_from_extension(path) {
@@ -41,7 +60,7 @@ pub(super) fn prepare_file(
             file = %path.display(),
             "skipping file: unsupported format (no handler for its type)"
         );
-        return Ok(None);
+        return Ok(Prepared::Skipped(SkipReason::UnsupportedFormat));
     }
 
     let owned_bytes;
@@ -63,7 +82,7 @@ pub(super) fn prepare_file(
             file = %path.display(),
             "skipping file: unsupported format (no handler for its type)"
         );
-        return Ok(None);
+        return Ok(Prepared::Skipped(SkipReason::UnsupportedFormat));
     };
 
     let ctx = PrepareCtx {
@@ -85,7 +104,7 @@ pub(super) fn prepare_file(
             ))
         });
     match prepared {
-        Ok(pf) => Ok(Some(pf)),
+        Ok(pf) => Ok(Prepared::File(pf)),
         Err(e) => {
             // Extraction failure (corrupt workbook, non-UTF8 text, …) is a
             // per-file skip, not a run abort: log and continue the reindex.
@@ -95,9 +114,27 @@ pub(super) fn prepare_file(
                 error = %e,
                 "skipping file: extraction failed"
             );
-            Ok(None)
+            Ok(Prepared::Skipped(SkipReason::ExtractionFailed(
+                extraction_cause(path, e),
+            )))
         }
     }
+}
+
+/// Returns the extraction error without the file path. `extract_err` adds an
+/// `extract <path>: ` prefix, and the text handlers add `<path>:` inside
+/// messages such as `non-utf8 file <path>: ...`. The skip report already
+/// names the path.
+fn extraction_cause(path: &Path, error: HallouminateError) -> String {
+    let HallouminateError::Indexer(message) = error else {
+        return error.to_string();
+    };
+    let prefix = format!("extract {}: ", path.display());
+    let cause = match message.strip_prefix(&prefix) {
+        Some(cause) => cause,
+        None => &message,
+    };
+    cause.replace(&format!(" {}:", path.display()), ":")
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -144,7 +181,7 @@ mod tests {
     /// prepared (not skipped). Returns the [`PreparedFile`].
     fn prep(path: &Path, registry: &HandlerRegistry, mtime: i64, indexed_at: i64) -> PreparedFile {
         let file = FileRef::new(PathBuf::from(path));
-        prepare_file(
+        let prepared = prepare_file(
             WriteRequest {
                 corpus_key: corpus_key(),
                 file: &file,
@@ -154,8 +191,11 @@ mod tests {
             indexed_at,
             None,
         )
-        .expect("prepare_file must not hard-error")
-        .expect("file must be prepared, not skipped")
+        .expect("prepare_file must not hard-error");
+        let Prepared::File(prepared) = prepared else {
+            panic!("file must be prepared, not skipped");
+        };
+        prepared
     }
 
     #[test]
@@ -183,7 +223,7 @@ mod tests {
     #[test]
     fn prepare_file_skips_non_utf8_markdown_with_no_hard_error() {
         // A non-UTF8 `.md` file routes to the markdown handler, which fails to
-        // decode. Under per-file-skip semantics that is a graceful `Ok(None)`
+        // decode. Under per-file-skip semantics that is a graceful skip
         // (logged), NOT a run-aborting error — one bad file must not crash the
         // reindex of the rest of the corpus.
         let dir = tempfile::tempdir().unwrap();
@@ -201,7 +241,17 @@ mod tests {
             None,
         )
         .expect("non-utf8 must be a skip, not a hard error");
-        assert!(out.is_none(), "non-utf8 file must be skipped (Ok(None))");
+        let Prepared::Skipped(SkipReason::ExtractionFailed(error)) = out else {
+            panic!("non-utf8 file must be skipped as an extraction failure");
+        };
+        assert!(
+            !error.is_empty(),
+            "the skip must carry the extraction error"
+        );
+        assert!(
+            !error.contains(&path.display().to_string()),
+            "the stored error must not repeat the path: {error}"
+        );
     }
 
     #[test]
