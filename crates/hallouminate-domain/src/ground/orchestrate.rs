@@ -566,9 +566,14 @@ mod tests {
     /// makes these tests crawl the entire filesystem — fast only while the
     /// literal pass happens to match nothing.
     fn fixture_root() -> &'static std::path::Path {
-        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| tempfile::tempdir().expect("fixture corpus root"))
-            .path()
+        static ROOT: std::sync::OnceLock<(tempfile::TempDir, std::path::PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_dir, canonical) = ROOT.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("fixture corpus root");
+            let canonical = dir.path().canonicalize().expect("canonical fixture root");
+            (dir, canonical)
+        });
+        canonical
     }
 
     fn fixture_corpus() -> CorpusConfig {
