@@ -7,11 +7,24 @@ use crate::indexer::store::ChunkStore;
 
 use super::format::HandlerRegistry;
 use super::plan::{IndexPlan, MtimeCandidate};
-use super::writer::{WriteRequest, file_ref_string, prepare_file};
+use super::writer::{Prepared, SkipReason, WriteRequest, file_ref_string, prepare_file};
+
+/// Maximum number of files that [`ApplyStats::skipped_unreadable`] names.
+/// The `files_skipped_unreadable` count stays exact past this cap.
+pub const MAX_REPORTED_SKIPS: usize = 100;
+
+/// One present file that an [`apply`] run skipped without indexing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    /// The skipped file.
+    pub file: FileRef,
+    /// Why the indexer skipped it.
+    pub reason: SkipReason,
+}
 
 /// Tallies of the work an [`apply`] run performed, returned to the caller for
 /// reporting and assertions.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ApplyStats {
     /// Files written through the upsert/fallthrough path (content (re)indexed).
     pub files_upserted: usize,
@@ -33,10 +46,49 @@ pub struct ApplyStats {
     /// parse failure (atomic-save race, partial write, momentary corruption)
     /// must not silently drop a file from search.
     pub files_skipped_unreadable: usize,
+    /// The first [`MAX_REPORTED_SKIPS`] files counted in
+    /// `files_skipped_unreadable`, in processing order, with the reason.
+    pub skipped_unreadable: Vec<SkippedFile>,
     /// Total chunks written across all upserted files (both embedding modes).
     pub chunks_inserted: usize,
     /// Total embedding vectors written; zero when the embedder is `None`.
     pub embeddings_inserted: usize,
+}
+
+impl ApplyStats {
+    /// Counts one unreadable file, and names it while fewer than
+    /// [`MAX_REPORTED_SKIPS`] files are named.
+    pub fn record_unreadable(&mut self, skipped: SkippedFile) {
+        self.files_skipped_unreadable += 1;
+        if self.skipped_unreadable.len() < MAX_REPORTED_SKIPS {
+            self.skipped_unreadable.push(skipped);
+        }
+    }
+
+    /// Adds every tally in `other` to `self`. The named skips stay capped
+    /// at [`MAX_REPORTED_SKIPS`].
+    pub fn merge(&mut self, other: ApplyStats) {
+        let ApplyStats {
+            files_upserted,
+            files_touched,
+            files_deleted,
+            files_skipped_empty,
+            files_skipped_unreadable,
+            skipped_unreadable,
+            chunks_inserted,
+            embeddings_inserted,
+        } = other;
+        self.files_upserted += files_upserted;
+        self.files_touched += files_touched;
+        self.files_deleted += files_deleted;
+        self.files_skipped_empty += files_skipped_empty;
+        self.files_skipped_unreadable += files_skipped_unreadable;
+        let room = MAX_REPORTED_SKIPS.saturating_sub(self.skipped_unreadable.len());
+        self.skipped_unreadable
+            .extend(skipped_unreadable.into_iter().take(room));
+        self.chunks_inserted += chunks_inserted;
+        self.embeddings_inserted += embeddings_inserted;
+    }
 }
 
 /// Whether `run_in_batches` should evict a truncated-to-empty file's stale
@@ -238,9 +290,15 @@ async fn run_in_batches(
                     run.indexed_at_ms,
                     bytes_override,
                 )?;
-                let Some(prepared_file) = prepared_file else {
-                    stats.files_skipped_unreadable += 1;
-                    continue;
+                let prepared_file = match prepared_file {
+                    Prepared::File(prepared_file) => prepared_file,
+                    Prepared::Skipped(reason) => {
+                        stats.record_unreadable(SkippedFile {
+                            file: req.file.clone(),
+                            reason,
+                        });
+                        continue;
+                    }
                 };
                 if prepared_file.chunks.is_empty() {
                     tracing::warn!(
@@ -518,5 +576,62 @@ mod tests {
         // indexing timestamp -- a later rewrite necessarily bumps the mtime,
         // so equality gates already see it correctly.
         assert_eq!(smudge_racy_mtime(Mtime(999), 1_000), Mtime(999));
+    }
+
+    fn skipped(name: &str) -> SkippedFile {
+        SkippedFile {
+            file: FileRef::new(PathBuf::from(format!("/docs/{name}"))),
+            reason: SkipReason::UnsupportedFormat,
+        }
+    }
+
+    #[test]
+    fn record_unreadable_counts_every_skip_and_names_up_to_the_cap() {
+        let mut stats = ApplyStats::default();
+        for i in 0..MAX_REPORTED_SKIPS + 5 {
+            stats.record_unreadable(skipped(&format!("f{i}.bin")));
+        }
+        assert_eq!(stats.files_skipped_unreadable, MAX_REPORTED_SKIPS + 5);
+        assert_eq!(stats.skipped_unreadable.len(), MAX_REPORTED_SKIPS);
+        assert_eq!(stats.skipped_unreadable[0], skipped("f0.bin"));
+    }
+
+    #[test]
+    fn merge_sums_every_tally_and_keeps_the_name_cap() {
+        let mut into = ApplyStats {
+            files_upserted: 1,
+            files_touched: 2,
+            files_deleted: 3,
+            files_skipped_empty: 4,
+            chunks_inserted: 5,
+            embeddings_inserted: 6,
+            ..Default::default()
+        };
+        for i in 0..MAX_REPORTED_SKIPS - 1 {
+            into.record_unreadable(skipped(&format!("a{i}.bin")));
+        }
+        let mut extra = ApplyStats {
+            files_upserted: 10,
+            files_touched: 20,
+            files_deleted: 30,
+            files_skipped_empty: 40,
+            chunks_inserted: 50,
+            embeddings_inserted: 60,
+            ..Default::default()
+        };
+        extra.record_unreadable(skipped("b0.bin"));
+        extra.record_unreadable(skipped("b1.bin"));
+
+        into.merge(extra);
+
+        assert_eq!(into.files_upserted, 11);
+        assert_eq!(into.files_touched, 22);
+        assert_eq!(into.files_deleted, 33);
+        assert_eq!(into.files_skipped_empty, 44);
+        assert_eq!(into.chunks_inserted, 55);
+        assert_eq!(into.embeddings_inserted, 66);
+        assert_eq!(into.files_skipped_unreadable, MAX_REPORTED_SKIPS + 1);
+        assert_eq!(into.skipped_unreadable.len(), MAX_REPORTED_SKIPS);
+        assert_eq!(into.skipped_unreadable.last(), Some(&skipped("b0.bin")));
     }
 }

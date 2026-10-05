@@ -2488,9 +2488,12 @@ impl LanceStore {
     /// contains `phrase` as a case-insensitive substring, in scan order.
     ///
     /// The scan uses no FTS or vector index. The predicate is
-    /// `strpos(lower(search_text), '<lowercased phrase>') > 0`, so `LIKE`
-    /// metacharacters in the phrase match literally. Returns an empty list
-    /// when the table has no text index yet, as `retrieve_signals` does.
+    /// `strpos(regexp_replace(lower(search_text), '\s+', ' ', 'g'),
+    /// '<lowercased phrase>') > 0`, so `LIKE` and regex metacharacters in
+    /// the phrase match literally. The regex `\s` is Unicode `White_Space`,
+    /// the same class that `collapse_whitespace` folds for the phrase.
+    /// Returns an empty list when the table has no text index yet, as
+    /// `retrieve_signals` does.
     ///
     /// # Errors
     ///
@@ -2505,7 +2508,7 @@ impl LanceStore {
             return Ok(Vec::new());
         }
         let filter = format!(
-            "{} AND strpos(lower(search_text), '{}') > 0",
+            "{} AND strpos(regexp_replace(lower(search_text), '\\s+', ' ', 'g'), '{}') > 0",
             corpus_key_filter(corpus_key)?,
             escape_sql_str(&phrase.to_lowercase())
         );

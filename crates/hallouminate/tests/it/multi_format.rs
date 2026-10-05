@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime};
 use hallouminate_domain::indexer::{
-    Format, HandlerRegistry, PrepareCtx, detect_format, index_corpus,
+    Format, HandlerRegistry, PrepareCtx, SkipReason, detect_format, index_corpus,
 };
-use hallouminate_domain::search::search_fused;
+use hallouminate_domain::search::{search_fused, search_phrase};
 use text_splitter::Characters;
 
 use crate::common::LANCE_WRITE_LOCK;
@@ -326,6 +326,14 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
         stats.files_skipped_empty, 0,
         "an unsupported type must not be miscounted as truncate-to-empty"
     );
+    let [skipped] = stats.skipped_unreadable.as_slice() else {
+        panic!(
+            "the skip must name one file: {:?}",
+            stats.skipped_unreadable
+        );
+    };
+    assert!(skipped.file.as_path().ends_with("photo.png"), "{skipped:?}");
+    assert_eq!(skipped.reason, SkipReason::UnsupportedFormat);
 
     let hits = search_fused(
         &store,
@@ -958,6 +966,79 @@ async fn pdf_indexes_text_pages_with_page_breadcrumbs_and_skips_empty_pages() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phrase_mode_matches_phrases_wrapped_across_source_lines() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("wrapped.md"),
+        "# Siting notes\n\nTSMC fully owns its Arizona factories, which currently make chips for\nseveral customers.\n\n## Ownership models\n\nThe overseas plants follow different models. Some sites are joint\nventures with customers, and the company is the majority shareholder\nof both plants in Japan and Germany.\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("wrapped.txt"),
+        "Ownership notes for the overseas plants.\r\n\r\nA later agreement made the company a minority partner in a third\r\nfab, with the partner funding the rest.\r\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("wrapped.pdf"),
+        pdf_fixture(&[
+            Some("Cover page of the plant report."),
+            // A printed line break: two text runs with a `Td` line move between them.
+            Some("The plant says it has commenced) Tj 0 -14 Td (production this year."),
+        ]),
+    )
+    .unwrap();
+
+    let corpus = corpus(
+        corpus_dir.path(),
+        "docs",
+        &["**/*.md", "**/*.txt", "**/*.pdf"],
+    );
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index wrapped fixtures");
+    assert_eq!(stats.files_upserted, 3);
+
+    let key = corpus.primary_corpus_key().expect("corpus root");
+    for (phrase, file) in [
+        ("majority shareholder of both plants", "wrapped.md"),
+        ("Some sites are joint ventures", "wrapped.md"),
+        ("minority partner in a third fab", "wrapped.txt"),
+        ("it has commenced production", "wrapped.pdf"),
+    ] {
+        let found = search_phrase(&store, &key, phrase, 50)
+            .await
+            .unwrap_or_else(|e| panic!("phrase {phrase:?} must not error: {e}"));
+        let Some(hit) = found.hits.iter().find(|hit| hit.file_ref.ends_with(file)) else {
+            panic!(
+                "phrase {phrase:?} must match {file}; hits: {:?}",
+                found.hits
+            );
+        };
+        assert!(
+            !hit.search_text
+                .to_lowercase()
+                .contains(&phrase.to_lowercase()),
+            "fixture must wrap {phrase:?} in {file}: {:?}",
+            hit.search_text
+        );
+        assert_eq!(hit.score, 1.0, "{phrase:?} occurs once in {file}");
+    }
+
+    let found = search_phrase(&store, &key, "majority shareholders of both", 50)
+        .await
+        .expect("phrase search");
+    assert!(
+        found.hits.is_empty(),
+        "a non-whitespace difference must still miss: {:?}",
+        found.hits
+    );
+}
+
 #[test]
 fn detect_format_extensionless_pdf_bytes_sniff_as_pdf() {
     let bytes = pdf_fixture(&[Some("A text-layer PDF.")]);
@@ -1151,6 +1232,19 @@ async fn corrupt_and_empty_pdfs_skip_without_blocking_valid_siblings() {
         "corrupt and wholly empty PDFs are both reported as unreadable"
     );
     assert_eq!(stats.files_skipped_empty, 0);
+    let mut named = Vec::new();
+    for skipped in &stats.skipped_unreadable {
+        let SkipReason::ExtractionFailed(error) = &skipped.reason else {
+            panic!("a bad PDF is an extraction failure: {skipped:?}");
+        };
+        assert!(!error.is_empty(), "{skipped:?}");
+        let Some(name) = skipped.file.as_path().file_name() else {
+            panic!("skipped file has a name: {skipped:?}");
+        };
+        named.push(name.to_string_lossy().into_owned());
+    }
+    named.sort();
+    assert_eq!(named, vec!["broken.pdf", "empty.pdf"]);
     let hits = search_fused(
         &store,
         &corpus.primary_corpus_key().expect("corpus root"),

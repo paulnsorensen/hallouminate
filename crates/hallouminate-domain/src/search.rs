@@ -45,7 +45,8 @@ pub use crossencoder::{
     canonical_crossencoder_model,
 };
 pub use phrase::{
-    MAX_PHRASE_CHARS, MAX_PHRASE_SCAN_ROWS, PhraseError, search_phrase, validate_phrase,
+    MAX_PHRASE_CHARS, MAX_PHRASE_SCAN_ROWS, PhraseError, collapse_whitespace, search_phrase,
+    validate_phrase,
 };
 pub use ripgrep::RipgrepHit;
 
@@ -90,7 +91,10 @@ pub trait ChunkRetrieval: Send + Sync {
     /// Retrieves up to `limit` chunks whose `search_text` contains `phrase`
     /// as a case-insensitive substring, unranked.
     ///
-    /// The match is literal: no tokenization, no stopword removal, and no
+    /// The store lowercases `search_text` and replaces each run of Unicode
+    /// whitespace with one ASCII space, as [`collapse_whitespace`] does.
+    /// The caller passes `phrase` already collapsed. All other characters
+    /// match literally: no tokenization, no stopword removal, and no
     /// pattern metacharacters. Returns an empty list when nothing matches.
     async fn retrieve_phrase(
         &self,

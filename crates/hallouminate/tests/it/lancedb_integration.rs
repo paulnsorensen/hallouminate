@@ -803,6 +803,51 @@ async fn phrase_match_treats_quotes_and_like_metacharacters_literally() {
 }
 
 #[tokio::test]
+async fn phrase_match_collapses_whitespace_runs_on_both_sides() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let (_dir, store, key) = phrase_store(&[
+        ("/tmp/lf.md", "a minority partner in a third\nfab today"),
+        ("/tmp/crlf.md", "a minority partner in a third\r\nfab today"),
+        ("/tmp/tab.md", "a minority partner in a third\tfab today"),
+        ("/tmp/double.md", "a minority partner in a third  fab today"),
+        (
+            "/tmp/nbsp.md",
+            "a minority partner in a third\u{a0}fab today",
+        ),
+        ("/tmp/hyphen.md", "a minority partner in a third-fab today"),
+        ("/tmp/joined.md", "a minority partner in a thirdfab today"),
+    ])
+    .await;
+    let wrapped = vec![
+        "/tmp/crlf.md",
+        "/tmp/double.md",
+        "/tmp/lf.md",
+        "/tmp/nbsp.md",
+        "/tmp/tab.md",
+    ];
+    assert_eq!(
+        phrase_files(&store, &key, "minority partner in a third fab").await,
+        wrapped
+    );
+    assert_eq!(
+        phrase_files(&store, &key, "third \n\t fab").await,
+        wrapped,
+        "a whitespace run in the query collapses the same way"
+    );
+
+    let found = search_phrase(&store, &key, "third fab", 50)
+        .await
+        .expect("phrase search");
+    for hit in &found.hits {
+        assert_eq!(
+            hit.score, 1.0,
+            "{} counts its one wrapped occurrence once",
+            hit.file_ref
+        );
+    }
+}
+
+#[tokio::test]
 async fn phrase_match_with_no_match_returns_empty() {
     let _guard = LANCE_WRITE_LOCK.lock().await;
     let (_dir, store, key) = phrase_store(&[("/tmp/a.md", "The spice must flow.")]).await;
