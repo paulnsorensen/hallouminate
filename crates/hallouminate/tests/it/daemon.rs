@@ -2536,6 +2536,8 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     snippet_chars: None,
                     footnote_mode: Default::default(),
                     match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             })
             .await
@@ -2556,6 +2558,8 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     snippet_chars: None,
                     footnote_mode: Default::default(),
                     match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             })
             .await
@@ -2591,6 +2595,8 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                         snippet_chars: None,
                         footnote_mode: Default::default(),
                         match_mode: Default::default(),
+                        group_by: Default::default(),
+                        output: Default::default(),
                     }),
                 })
                 .await
@@ -2874,6 +2880,8 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
                     snippet_chars: None,
                     footnote_mode: Default::default(),
                     match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             })
             .await
@@ -3002,6 +3010,8 @@ async fn ground_through_ipc(
                     snippet_chars: None,
                     footnote_mode: Default::default(),
                     match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             })
             .await
@@ -4144,6 +4154,8 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 snippet_chars: None,
                 footnote_mode: Default::default(),
                 match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
             }),
         })
         .await
@@ -4176,6 +4188,8 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 snippet_chars: None,
                 footnote_mode: Default::default(),
                 match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
             }),
         })
         .await
@@ -4204,6 +4218,8 @@ fn phrase_ground_request(query: String) -> DaemonRequestPayload {
         snippet_chars: None,
         footnote_mode: Default::default(),
         match_mode: hallouminate_domain::ground::GroundMatch::Phrase,
+        group_by: Default::default(),
+        output: Default::default(),
     })
 }
 
@@ -4280,6 +4296,57 @@ async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queri
             DaemonResponse::Ok { result } => {
                 panic!("an invalid phrase must error; got Ok({result:?})")
             }
+        }
+    }
+
+    let client = connect_at(harness.socket()).await.expect("reconnect");
+    let mut counts_request = phrase_ground_request("the art of x".into());
+    if let DaemonRequestPayload::Ground(request) = &mut counts_request {
+        request.output = hallouminate_domain::ground::GroundOutput::Counts;
+    }
+    let counted: GroundResult = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: counts_request,
+        })
+        .await
+        .expect("phrase counts ok");
+    let Some(doc) = counted
+        .response
+        .docs
+        .get(abs_full.to_string_lossy().as_ref())
+    else {
+        panic!("counts must report the matching file");
+    };
+    assert_eq!(
+        doc.coverage,
+        Some(hallouminate_domain::ground::FileCoverage {
+            chunks: 1,
+            pages: None
+        })
+    );
+    assert!(doc.chunks.is_empty(), "counts output carries no snippets");
+
+    let client = connect_at(harness.socket()).await.expect("reconnect");
+    let mut ranked_counts = phrase_ground_request("the art of x".into());
+    if let DaemonRequestPayload::Ground(request) = &mut ranked_counts {
+        request.match_mode = hallouminate_domain::ground::GroundMatch::Ranked;
+        request.output = hallouminate_domain::ground::GroundOutput::Counts;
+    }
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: ranked_counts,
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(message.contains("requires match"), "got: {message}");
+        }
+        DaemonResponse::Ok { result } => {
+            panic!("counts output in ranked mode must error; got Ok({result:?})")
         }
     }
 }

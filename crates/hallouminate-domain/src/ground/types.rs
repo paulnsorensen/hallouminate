@@ -25,6 +25,44 @@ pub enum GroundMatch {
     Phrase,
 }
 
+/// Selects the unit that `ground` returns within each matched file.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::GroundGroupBy;
+/// assert_eq!(GroundGroupBy::default(), GroundGroupBy::Chunk);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GroundGroupBy {
+    /// One entry per matched chunk.
+    #[default]
+    Chunk,
+    /// One entry per `page:N` breadcrumb: the best chunk of that page plus
+    /// its matched chunk count. Chunks without a page breadcrumb stay single.
+    Page,
+}
+
+/// Selects what `ground` returns for each matched file.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::GroundOutput;
+/// assert_eq!(GroundOutput::default(), GroundOutput::Hits);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GroundOutput {
+    /// Ranked chunks with snippets, bounded by the request caps.
+    #[default]
+    Hits,
+    /// Matched chunk and page counts for every matched file, with no chunks
+    /// and no snippets. Phrase mode only.
+    Counts,
+}
+
 /// Structured payload of the `ground` MCP tool: one semantic-search query and
 /// its per-file ranked results.
 ///
@@ -92,6 +130,19 @@ pub struct DocFile {
     pub stale: bool,
     /// Matching chunks within the file, ranked by `score` descending.
     pub chunks: Vec<DocChunk>,
+    /// Complete match counts for the file. Set only for `output: counts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<FileCoverage>,
+}
+
+/// Match counts for one file in a counts-only `ground` response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileCoverage {
+    /// Number of chunks that match, after overlap deduplication.
+    pub chunks: usize,
+    /// Number of distinct `page:N` breadcrumbs among the matched chunks, or
+    /// `None` when the file has no page breadcrumbs.
+    pub pages: Option<usize>,
 }
 
 /// One matched chunk within a [`DocFile`]: a heading-delimited span of the file
@@ -117,6 +168,10 @@ pub struct DocChunk {
     /// that omits it) still deserializes, with `corpus` defaulting to empty.
     #[serde(default)]
     pub provenance: ChunkProvenance,
+    /// Number of matched chunks that this entry stands for. Set only for
+    /// `group_by: page`, where one entry represents a whole page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_count: Option<usize>,
 }
 
 /// Provenance of a [`DocChunk`]: where it came from and (later) how trustworthy
@@ -186,7 +241,9 @@ mod tests {
                             note: None,
                         }],
                     },
+                    chunk_count: None,
                 }],
+                coverage: None,
             },
         );
         GroundResponse {
@@ -253,6 +310,7 @@ mod tests {
             path: None,
             stale: false,
             chunks: vec![],
+            coverage: None,
         };
         let actual = serde_json::to_value(&file).expect("serialize");
         assert_eq!(actual["summary"], json!(null));
@@ -342,6 +400,7 @@ mod tests {
             path: None,
             stale: false,
             chunks: vec![],
+            coverage: None,
         };
         let actual = serde_json::to_value(&file).expect("serialize");
         assert_eq!(actual["path"], json!(null));
@@ -359,8 +418,43 @@ mod tests {
             path: Some("wiki/concepts.md".into()),
             stale: false,
             chunks: vec![],
+            coverage: None,
         };
         let actual = serde_json::to_value(&file).expect("serialize");
         assert_eq!(actual["path"], json!("wiki/concepts.md"));
+    }
+
+    #[test]
+    fn coverage_and_chunk_count_serialize_only_when_set() {
+        let mut response = fixture_response();
+        let plain = serde_json::to_value(&response).expect("serialize");
+        let doc = &plain["docs"]["/abs/path/to/file.md"];
+        assert!(doc.get("coverage").is_none(), "{doc}");
+        assert!(doc["chunks"][0].get("chunk_count").is_none(), "{doc}");
+
+        let Some(file) = response.docs.get_mut("/abs/path/to/file.md") else {
+            panic!("fixture file");
+        };
+        file.coverage = Some(FileCoverage {
+            chunks: 48,
+            pages: Some(20),
+        });
+        file.chunks[0].chunk_count = Some(4);
+        let set = serde_json::to_value(&response).expect("serialize");
+        let doc = &set["docs"]["/abs/path/to/file.md"];
+        assert_eq!(doc["coverage"], json!({ "chunks": 48, "pages": 20 }));
+        assert_eq!(doc["chunks"][0]["chunk_count"], json!(4));
+
+        let round_trip: GroundResponse = serde_json::from_value(set).expect("deserialize");
+        let Some(file) = round_trip.docs.get("/abs/path/to/file.md") else {
+            panic!("round-trip file");
+        };
+        assert_eq!(
+            file.coverage,
+            Some(FileCoverage {
+                chunks: 48,
+                pages: Some(20)
+            })
+        );
     }
 }

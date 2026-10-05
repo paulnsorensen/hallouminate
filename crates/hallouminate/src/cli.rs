@@ -42,6 +42,28 @@ pub enum MatchArg {
     Phrase,
 }
 
+/// CLI surface for `ground` grouping. Mirrors
+/// `domain::ground::GroundGroupBy` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum GroupByArg {
+    /// One entry per matched chunk.
+    #[default]
+    Chunk,
+    /// One entry per PDF page, with its matched chunk count.
+    Page,
+}
+
+/// CLI surface for the `ground` response shape. Mirrors
+/// `domain::ground::GroundOutput` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum OutputArg {
+    /// Ranked chunks with snippets.
+    #[default]
+    Hits,
+    /// Matched chunk and page counts per file, with no snippets.
+    Counts,
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
@@ -224,6 +246,15 @@ pub struct GroundCli {
     /// case-insensitive literal substring, ranked by occurrence count.
     #[arg(long = "match", value_enum, default_value_t = MatchArg::Ranked)]
     pub match_mode: MatchArg,
+    /// Unit returned within each file. `page` returns one entry per PDF page
+    /// with its matched chunk count; `--chunks-per-file` then caps pages.
+    #[arg(long, value_enum, default_value_t = GroupByArg::Chunk)]
+    pub group_by: GroupByArg,
+    /// Response shape. `counts` needs `--match phrase` and returns matched
+    /// chunk and page counts for every matched file, with no snippets and
+    /// no `--top-files`, `--chunks-per-file`, or `--limit` caps.
+    #[arg(long, value_enum, default_value_t = OutputArg::Hits)]
+    pub output: OutputArg,
     /// Accepted for backward compatibility; same caveat as `hallouminate
     /// index --config`. The daemon owns config resolution (XDG baseline
     /// at startup + repo-layer discovery per request), so this flag is
@@ -239,7 +270,7 @@ pub struct GroundCli {
 
 impl From<GroundCli> for GroundArgs {
     fn from(cli: GroundCli) -> Self {
-        use hallouminate_domain::ground::{Format, GroundMatch};
+        use hallouminate_domain::ground::{Format, GroundGroupBy, GroundMatch, GroundOutput};
         let format = if cli.full {
             Format::JsonPretty
         } else {
@@ -253,6 +284,14 @@ impl From<GroundCli> for GroundArgs {
             MatchArg::Ranked => GroundMatch::Ranked,
             MatchArg::Phrase => GroundMatch::Phrase,
         };
+        let group_by = match cli.group_by {
+            GroupByArg::Chunk => GroundGroupBy::Chunk,
+            GroupByArg::Page => GroundGroupBy::Page,
+        };
+        let output = match cli.output {
+            OutputArg::Hits => GroundOutput::Hits,
+            OutputArg::Counts => GroundOutput::Counts,
+        };
         Self {
             query: cli.query,
             corpus: cli.corpus,
@@ -262,6 +301,8 @@ impl From<GroundCli> for GroundArgs {
             chunks_per_file: cli.chunks_per_file,
             limit: cli.limit,
             match_mode,
+            group_by,
+            output,
             config: cli.config,
             socket: cli.socket,
         }

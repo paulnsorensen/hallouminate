@@ -8,6 +8,7 @@
 
 use crate::common::{CorpusKey, HallouminateError, Result};
 use crate::ground::Warning;
+use crate::indexer::SearchHit;
 
 use super::{ChunkRetrieval, FusedSearch, hit_tie_break_key};
 
@@ -67,6 +68,11 @@ pub fn validate_phrase(phrase: &str) -> std::result::Result<(), PhraseError> {
 /// `search_text`, descending, then root-relative path, `line_start`, and
 /// `chunk_id`. Each returned hit's `score` is its occurrence count.
 ///
+/// An occurrence that lies whole in a chunk's overlap prefix
+/// (`overlap_bytes`) is not counted again, because an earlier chunk of the
+/// same section holds it. A chunk whose every occurrence lies there is
+/// dropped, so each occurrence belongs to the first chunk in `ord` order.
+///
 /// A `phrase-truncated` warning is pushed when more than `limit`
 /// chunks matched or the scan reached [`MAX_PHRASE_SCAN_ROWS`]. Callers
 /// must not conclude absence or uniqueness from a truncated set.
@@ -97,22 +103,27 @@ pub async fn search_phrase(
     let hits = store
         .retrieve_phrase(corpus_key, phrase, MAX_PHRASE_SCAN_ROWS)
         .await?;
-    let matched = hits.len();
+    let scanned = hits.len();
     let needle = phrase.to_lowercase();
-    let mut decorated = Vec::with_capacity(matched);
+    let mut decorated = Vec::with_capacity(scanned);
     for mut hit in hits {
-        let count = occurrence_count(&hit.search_text, &needle);
+        let count = occurrence_count(&hit.search_text, &needle)
+            .saturating_sub(overlap_occurrence_count(&hit, &needle));
+        if count == 0 {
+            continue;
+        }
         hit.score = count as f32;
         let key = hit_tie_break_key(&hit, &corpus_key.canonical_root);
         decorated.push((count, key, hit));
     }
+    let matched = decorated.len();
     decorated.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     let mut ranked = Vec::with_capacity(matched.min(limit));
     for (_, _, hit) in decorated.into_iter().take(limit) {
         ranked.push(hit);
     }
     let mut warnings = Vec::new();
-    if let Some(warning) = truncation_warning(corpus_key, matched, limit) {
+    if let Some(warning) = truncation_warning(corpus_key, scanned, matched, limit) {
         warnings.push(warning);
     }
     Ok(FusedSearch {
@@ -121,9 +132,14 @@ pub async fn search_phrase(
     })
 }
 
-fn truncation_warning(corpus_key: &CorpusKey, matched: usize, limit: usize) -> Option<Warning> {
+fn truncation_warning(
+    corpus_key: &CorpusKey,
+    scanned: usize,
+    matched: usize,
+    limit: usize,
+) -> Option<Warning> {
     let root = corpus_key.canonical_root.display();
-    let message = if matched >= MAX_PHRASE_SCAN_ROWS {
+    let message = if scanned >= MAX_PHRASE_SCAN_ROWS {
         format!(
             "phrase scan in corpus root {root} stopped at the cap of {MAX_PHRASE_SCAN_ROWS} matched chunks; more chunks can match, and at most {limit} are returned"
         )
@@ -142,6 +158,16 @@ fn truncation_warning(corpus_key: &CorpusKey, matched: usize, limit: usize) -> O
 
 fn occurrence_count(search_text: &str, needle: &str) -> usize {
     search_text.to_lowercase().matches(needle).count()
+}
+
+/// Counts the occurrences of `needle` that lie whole in the leading
+/// `overlap_bytes` of the hit's text. A prefix length that is not a char
+/// boundary of the text counts as no overlap.
+fn overlap_occurrence_count(hit: &SearchHit, needle: &str) -> usize {
+    let Some(prefix) = hit.text.get(..hit.overlap_bytes) else {
+        return 0;
+    };
+    occurrence_count(prefix, needle)
 }
 
 #[cfg(test)]
@@ -176,10 +202,14 @@ mod tests {
     #[test]
     fn truncation_warning_fires_above_limit_and_at_the_scan_cap() {
         let key = CorpusKey::from_configured_root("c", "/tmp");
-        assert!(truncation_warning(&key, 0, 50).is_none());
-        assert!(truncation_warning(&key, 50, 50).is_none());
+        assert!(truncation_warning(&key, 0, 0, 50).is_none());
+        assert!(truncation_warning(&key, 50, 50, 50).is_none());
+        assert!(
+            truncation_warning(&key, 60, 50, 50).is_none(),
+            "overlap duplicates dropped below the limit must not warn"
+        );
 
-        let Some(over_limit) = truncation_warning(&key, 51, 50) else {
+        let Some(over_limit) = truncation_warning(&key, 51, 51, 50) else {
             panic!("51 matches over a limit of 50 must warn");
         };
         assert_eq!(over_limit.code, "phrase-truncated");
@@ -189,8 +219,12 @@ mod tests {
             over_limit.message
         );
 
-        let Some(at_cap) = truncation_warning(&key, MAX_PHRASE_SCAN_ROWS, MAX_PHRASE_SCAN_ROWS)
-        else {
+        let Some(at_cap) = truncation_warning(
+            &key,
+            MAX_PHRASE_SCAN_ROWS,
+            MAX_PHRASE_SCAN_ROWS - 1,
+            MAX_PHRASE_SCAN_ROWS,
+        ) else {
             panic!("a scan that reaches the cap must warn even when it equals the limit");
         };
         assert_eq!(at_cap.code, "phrase-truncated");
@@ -198,6 +232,50 @@ mod tests {
             at_cap.message.contains("cap of 10000"),
             "{}",
             at_cap.message
+        );
+    }
+
+    fn overlapping_hit(text: &str, overlap_bytes: usize) -> SearchHit {
+        SearchHit {
+            chunk_id: "c".into(),
+            corpus_key: CorpusKey::from_configured_root("c", "/tmp"),
+            file_ref: "/tmp/f.pdf".into(),
+            heading_path: vec!["page:1".into()],
+            line_start: 1,
+            line_end: 1,
+            text: text.into(),
+            search_text: format!("page:1\nsummary\n{text}"),
+            summary: "summary".into(),
+            keywords: Vec::new(),
+            score: 0.0,
+            mtime_ms: 0,
+            claim_marks: Vec::new(),
+            structure: None,
+            overlap_bytes,
+            z_score: None,
+        }
+    }
+
+    #[test]
+    fn overlap_occurrence_count_counts_only_whole_occurrences_in_the_prefix() {
+        let hit = overlapping_hit("Tax Abatement ends. tax abatement again", 14);
+        assert_eq!(overlap_occurrence_count(&hit, "tax abatement"), 1);
+
+        let straddling = overlapping_hit("Tax Abatement ends.", 5);
+        assert_eq!(
+            overlap_occurrence_count(&straddling, "tax abatement"),
+            0,
+            "an occurrence that crosses the end of the overlap is new to this chunk"
+        );
+
+        let no_overlap = overlapping_hit("Tax Abatement ends.", 0);
+        assert_eq!(overlap_occurrence_count(&no_overlap, "tax abatement"), 0);
+
+        let off_boundary = overlapping_hit("é tax abatement", 1);
+        assert_eq!(
+            overlap_occurrence_count(&off_boundary, "tax abatement"),
+            0,
+            "a prefix length inside a multibyte char counts as no overlap"
         );
     }
 }

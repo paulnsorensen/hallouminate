@@ -127,15 +127,30 @@ fn write_doc_block(buf: &mut String, path: &str, doc: &DocFile, strip_prefix: Op
     if let Some(summary) = &doc.summary {
         writeln!(buf, "  {summary}").expect("summary");
     }
+    if let Some(coverage) = doc.coverage {
+        match coverage.pages {
+            Some(pages) => writeln!(
+                buf,
+                "  {chunks} matched chunks on {pages} pages",
+                chunks = coverage.chunks
+            ),
+            None => writeln!(buf, "  {chunks} matched chunks", chunks = coverage.chunks),
+        }
+        .expect("coverage");
+    }
     for chunk in &doc.chunks {
         let heading = chunk.heading_path.join(" > ");
         let z_suffix = match chunk.z_score {
             Some(z) => format!("  z={z:.3}"),
             None => String::new(),
         };
+        let count_suffix = match chunk.chunk_count {
+            Some(count) => format!("  chunks={count}"),
+            None => String::new(),
+        };
         writeln!(
             buf,
-            "  L{start}-{end}  {heading}  ({score:.3}){z_suffix}",
+            "  L{start}-{end}  {heading}  ({score:.3}){z_suffix}{count_suffix}",
             start = chunk.line_range[0],
             end = chunk.line_range[1],
             score = chunk.score,
@@ -178,6 +193,7 @@ mod tests {
                             corpus: "cheese".into(),
                             ..Default::default()
                         },
+                        chunk_count: None,
                     },
                     DocChunk {
                         chunk_id: "def456".into(),
@@ -190,8 +206,10 @@ mod tests {
                             corpus: "cheese".into(),
                             ..Default::default()
                         },
+                        chunk_count: None,
                     },
                 ],
+                coverage: None,
             },
         );
         GroundResponse {
@@ -499,6 +517,40 @@ mod tests {
     }
 
     #[test]
+    fn outline_renders_coverage_and_page_chunk_counts_only_when_set() {
+        let plain = render(&fixture(), Format::Outline, &RenderOpts::default());
+        assert!(!plain.contains("matched chunks"), "{plain}");
+        assert!(!plain.contains("chunks="), "{plain}");
+
+        let mut paged = fixture();
+        for doc in paged.docs.values_mut() {
+            doc.chunks[0].chunk_count = Some(4);
+        }
+        let out = render(&paged, Format::Outline, &RenderOpts::default());
+        assert!(out.contains("(0.910)  chunks=4"), "{out}");
+
+        let mut counted = fixture();
+        for doc in counted.docs.values_mut() {
+            doc.chunks.clear();
+            doc.coverage = Some(crate::ground::types::FileCoverage {
+                chunks: 48,
+                pages: Some(20),
+            });
+        }
+        let out = render(&counted, Format::Outline, &RenderOpts::default());
+        assert!(out.contains("  48 matched chunks on 20 pages"), "{out}");
+
+        for doc in counted.docs.values_mut() {
+            doc.coverage = Some(crate::ground::types::FileCoverage {
+                chunks: 2,
+                pages: None,
+            });
+        }
+        let out = render(&counted, Format::Outline, &RenderOpts::default());
+        assert!(out.contains("  2 matched chunks\n"), "{out}");
+    }
+
+    #[test]
     fn outline_orders_docs_by_score_not_path() {
         // Regression: `docs` is a `BTreeMap` keyed by absolute path, so
         // iterating it directly yields alphabetical order. A higher-scored
@@ -517,6 +569,7 @@ mod tests {
                 path: None,
                 stale: false,
                 chunks: vec![],
+                coverage: None,
             },
         );
         docs.insert(
@@ -531,6 +584,7 @@ mod tests {
                 path: None,
                 stale: false,
                 chunks: vec![],
+                coverage: None,
             },
         );
         let response = GroundResponse {

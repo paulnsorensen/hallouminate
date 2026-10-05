@@ -6,10 +6,14 @@ use futures_util::{StreamExt, TryStreamExt};
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
 use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
-use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused, search_phrase};
+use crate::search::{
+    ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, search_fused, search_phrase,
+};
 
-use super::bucket::{build_docs, build_phrase_docs, normalize_scores};
-use super::types::{DocFile, GroundMatch, GroundResponse, Stats, Warning};
+use super::bucket::{Rollup, normalize_scores, roll_up};
+use super::types::{
+    DocFile, GroundGroupBy, GroundMatch, GroundOutput, GroundResponse, Stats, Warning,
+};
 
 /// Why one bounded crossencoder attempt kept fusion order.
 #[derive(Debug, PartialEq, Eq)]
@@ -103,6 +107,12 @@ pub struct GroundOpts {
     pub footnote_mode: FootnoteMode,
     /// Retrieval mode. [`GroundMatch::Phrase`] skips fusion and reranking.
     pub match_mode: GroundMatch,
+    /// Unit returned within each file. [`GroundGroupBy::Page`] returns one
+    /// entry per PDF page, and `chunks_per_file` then caps pages.
+    pub group_by: GroundGroupBy,
+    /// Response shape. [`GroundOutput::Counts`] ignores `top_files`,
+    /// `chunks_per_file`, and `limit`, and needs [`GroundMatch::Phrase`].
+    pub output: GroundOutput,
 }
 
 impl Default for GroundOpts {
@@ -114,7 +124,47 @@ impl Default for GroundOpts {
             rerank_timeout: Duration::from_secs(2),
             footnote_mode: FootnoteMode::Include,
             match_mode: GroundMatch::Ranked,
+            group_by: GroundGroupBy::Chunk,
+            output: GroundOutput::Hits,
         }
+    }
+}
+
+/// Reason a `ground` request shape is rejected before retrieval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GroundShapeError {
+    /// Counts need every match, and only phrase mode retrieves every match.
+    #[error(
+        "output \"counts\" requires match \"phrase\"; ranked retrieval returns a bounded candidate pool, so its counts are not complete"
+    )]
+    CountsNeedPhrase,
+}
+
+/// Checks that `output` is valid for `match_mode`.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::{GroundMatch, GroundOutput, GroundShapeError, validate_shape};
+/// assert_eq!(validate_shape(GroundMatch::Phrase, GroundOutput::Counts), Ok(()));
+/// assert_eq!(
+///     validate_shape(GroundMatch::Ranked, GroundOutput::Counts),
+///     Err(GroundShapeError::CountsNeedPhrase)
+/// );
+/// ```
+///
+/// # Errors
+///
+/// Returns [`GroundShapeError::CountsNeedPhrase`] for counts output in
+/// ranked mode.
+pub fn validate_shape(
+    match_mode: GroundMatch,
+    output: GroundOutput,
+) -> std::result::Result<(), GroundShapeError> {
+    match (match_mode, output) {
+        (GroundMatch::Ranked, GroundOutput::Counts) => Err(GroundShapeError::CountsNeedPhrase),
+        (GroundMatch::Ranked | GroundMatch::Phrase, GroundOutput::Hits)
+        | (GroundMatch::Phrase, GroundOutput::Counts) => Ok(()),
     }
 }
 
@@ -195,7 +245,13 @@ pub async fn ground_union(
     opts: GroundOpts,
     priority_corpus: Option<&str>,
 ) -> Result<GroundResponse> {
+    validate_shape(opts.match_mode, opts.output)
+        .map_err(|error| HallouminateError::Search(error.to_string()))?;
     let started = Instant::now();
+    let limit = match opts.output {
+        GroundOutput::Hits => opts.limit,
+        GroundOutput::Counts => MAX_PHRASE_SCAN_ROWS,
+    };
     let corpus_keys: Vec<(CorpusKey, &[String])> = corpora
         .iter()
         .flat_map(|c| {
@@ -213,7 +269,7 @@ pub async fn ground_union(
     let searches: Vec<_> = corpus_keys
         .iter()
         .map(|(corpus_key, globs)| {
-            search_corpus(query, corpus_key, store, globs, opts.limit, opts.match_mode)
+            search_corpus(query, corpus_key, store, globs, limit, opts.match_mode)
         })
         .collect();
     // `buffered` (not `buffer_unordered`) preserves per-root result order,
@@ -270,18 +326,16 @@ pub async fn ground_union(
         by_key.entry(hit.corpus_key.clone()).or_default().push(hit);
     }
 
+    let rollup = Rollup {
+        chunks_per_file: opts.chunks_per_file,
+        footnote_mode: opts.footnote_mode,
+        match_mode: opts.match_mode,
+        group_by: opts.group_by,
+        output: opts.output,
+    };
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
     for (corpus_key, corpus_hits) in by_key {
-        let build = match opts.match_mode {
-            GroundMatch::Ranked => build_docs,
-            GroundMatch::Phrase => build_phrase_docs,
-        };
-        let mut built = build(
-            &corpus_hits,
-            usize::MAX,
-            opts.chunks_per_file,
-            opts.footnote_mode,
-        )?;
+        let mut built = roll_up(&corpus_hits, usize::MAX, rollup)?;
         let root = corpus_key.canonical_root.to_string_lossy().into_owned();
         for (absolute_path, doc) in built.iter_mut() {
             doc.corpus = corpus_key.name.clone();
@@ -306,7 +360,7 @@ pub async fn ground_union(
     // crowd out the searcher's own repo (#425).
     const RESERVED_LOCAL_SLOTS: usize = 2;
 
-    if docs.len() > opts.top_files {
+    if opts.output == GroundOutput::Hits && docs.len() > opts.top_files {
         let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
         ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
 
@@ -346,10 +400,12 @@ pub async fn ground_union(
         docs = ranked.into_iter().collect();
     }
 
-    if opts.match_mode == GroundMatch::Phrase {
+    if opts.match_mode == GroundMatch::Phrase && opts.output == GroundOutput::Hits {
         let mut retained = 0;
         for doc in docs.values() {
-            retained += doc.chunks.len();
+            for chunk in &doc.chunks {
+                retained += chunk.chunk_count.unwrap_or(1);
+            }
         }
         if retained < stats.hits {
             warnings.push(Warning {
@@ -627,6 +683,7 @@ mod tests {
             mtime_ms: 0,
             claim_marks: vec![],
             structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
     }

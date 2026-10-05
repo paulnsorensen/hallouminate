@@ -17,10 +17,11 @@ use std::path::{Path, PathBuf};
 
 use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime};
+use hallouminate_domain::ground::{GroundGroupBy, GroundMatch, GroundOpts, GroundOutput, ground};
 use hallouminate_domain::indexer::{
     Format, HandlerRegistry, PrepareCtx, detect_format, index_corpus,
 };
-use hallouminate_domain::search::search_fused;
+use hallouminate_domain::search::{search_fused, search_phrase};
 use text_splitter::Characters;
 
 use crate::common::LANCE_WRITE_LOCK;
@@ -1029,6 +1030,174 @@ async fn pdf_preserves_page_order_and_local_line_ranges_across_empty_pages() {
         (third.line_start, third.line_end),
         (3, 3),
         "the third-page marker keeps the same page-local extracted-text line"
+    );
+}
+
+/// Text of `count` numbered words, `w000 w001 ...`, so that every pair of
+/// adjacent words is a unique phrase.
+fn numbered_words(count: usize) -> String {
+    let mut words = Vec::with_capacity(count);
+    for index in 0..count {
+        words.push(format!("w{index:03}"));
+    }
+    words.join(" ")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_overlap_matches_every_cross_boundary_phrase_exactly_once() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let words = numbered_words(120);
+    // Page 1 holds the summary paragraph, so no word pair of page 2 reaches
+    // every chunk through the summary in `search_text`.
+    let bytes = pdf_fixture(&[Some("Intro page."), Some(&words)]);
+    fs::write(corpus_dir.path().join("numbered.pdf"), bytes).unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf"]);
+    let store = open_store(store_dir.path()).await;
+    // 200-character chunks repeat 25 characters, so the 600-character page
+    // splits several times and each 9-character word pair fits the overlap.
+    let registry = HandlerRegistry::new(Characters, 200);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index numbered PDF");
+    assert!(
+        stats.chunks_inserted >= 4,
+        "page 2 must split into several chunks, got {} chunks",
+        stats.chunks_inserted
+    );
+
+    let key = corpus.primary_corpus_key().expect("corpus root");
+    for index in 0..119 {
+        let phrase = format!("w{index:03} w{:03}", index + 1);
+        let found = search_phrase(&store, &key, &phrase, 50)
+            .await
+            .expect("phrase search");
+        let mut matches = Vec::new();
+        for hit in &found.hits {
+            matches.push((hit.heading_path.clone(), hit.score));
+        }
+        assert_eq!(
+            matches,
+            vec![(vec!["page:2".to_string()], 1.0)],
+            "{phrase:?} must match exactly one chunk once"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_page_grouping_and_counts_report_distinct_pages() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let mut clauses = Vec::new();
+    for index in 0..30 {
+        clauses.push(format!("clause w{index:03} abatement"));
+    }
+    let dense = clauses.join(". ");
+    let bytes = pdf_fixture(&[
+        Some("Intro page."),
+        Some(&dense),
+        Some("A single abatement clause."),
+    ]);
+    fs::write(corpus_dir.path().join("agreement.pdf"), bytes).unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 200);
+    index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index agreement PDF");
+
+    let uncapped = GroundOpts {
+        top_files: 10,
+        chunks_per_file: 1_000,
+        limit: 1_000,
+        match_mode: GroundMatch::Phrase,
+        ..GroundOpts::default()
+    };
+    let chunked = ground("abatement", &corpus, &store, None, uncapped)
+        .await
+        .expect("chunk ground");
+    let doc = chunked.docs.values().next().expect("agreement matched");
+    let chunk_total = doc.chunks.len();
+    assert!(
+        chunk_total >= 3,
+        "page 2 must contribute several chunks, got {chunk_total}"
+    );
+
+    let paged = ground(
+        "abatement",
+        &corpus,
+        &store,
+        None,
+        GroundOpts {
+            group_by: GroundGroupBy::Page,
+            ..uncapped
+        },
+    )
+    .await
+    .expect("page ground");
+    let doc = paged.docs.values().next().expect("agreement matched");
+    let mut pages = Vec::new();
+    for chunk in &doc.chunks {
+        pages.push((chunk.heading_path.join(" > "), chunk.chunk_count));
+    }
+    pages.sort();
+    assert_eq!(
+        pages,
+        vec![
+            ("page:2".to_string(), Some(chunk_total - 1)),
+            ("page:3".to_string(), Some(1)),
+        ]
+    );
+    for warning in &paged.warnings {
+        assert_ne!(warning.code, "phrase-truncated", "{}", warning.message);
+    }
+
+    let counted = ground(
+        "abatement",
+        &corpus,
+        &store,
+        None,
+        GroundOpts {
+            top_files: 1,
+            chunks_per_file: 1,
+            limit: 1,
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        },
+    )
+    .await
+    .expect("counts ground");
+    let doc = counted.docs.values().next().expect("agreement counted");
+    let Some(coverage) = doc.coverage else {
+        panic!("counts output must carry coverage");
+    };
+    assert_eq!((coverage.chunks, coverage.pages), (chunk_total, Some(2)));
+    assert!(doc.chunks.is_empty(), "counts output carries no snippets");
+    assert!(
+        counted.warnings.is_empty(),
+        "complete counts ignore the hit caps: {:?}",
+        counted.warnings
+    );
+
+    let ranked_counts = ground(
+        "abatement",
+        &corpus,
+        &store,
+        None,
+        GroundOpts {
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        },
+    )
+    .await;
+    assert!(
+        ranked_counts.is_err(),
+        "counts output in ranked mode must be rejected"
     );
 }
 

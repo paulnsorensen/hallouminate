@@ -584,6 +584,8 @@ async fn ground_query(
                     snippet_chars: None,
                     footnote_mode: Default::default(),
                     match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             },
             ground_rpc_timeout(arm),

@@ -35,6 +35,9 @@ pub struct PreparedChunk {
     pub claim_marks: Option<String>,
     /// Parsed Markdown evidence, or `None` for formats without this metadata.
     pub structure: Option<ChunkStructure>,
+    /// Length in bytes of the leading part of `text` that an earlier chunk of
+    /// the same section also holds. Zero when the splitter adds no overlap.
+    pub overlap_bytes: usize,
 }
 
 /// A single source file plus all of its chunks, ready for `apply_batch`.
@@ -85,6 +88,10 @@ pub struct SearchHit {
     pub claim_marks: Vec<ClaimMark>,
     /// Stored Markdown evidence, or `None` for neutral and legacy rows.
     pub structure: Option<ChunkStructure>,
+    /// Length in bytes of the leading part of `text` that an earlier chunk of
+    /// the same section also holds. Phrase mode does not count an occurrence
+    /// inside this prefix again.
+    pub overlap_bytes: usize,
     /// Per-query z-score of `score`, stamped by the orchestrator after rerank.
     /// TRANSIENT: not decoded from or persisted to a Lance column; defaults to
     /// `None` at decode and only the cross-encoder path populates it.

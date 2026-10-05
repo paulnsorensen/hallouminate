@@ -1163,6 +1163,8 @@ mod tests {
                 snippet_chars: None,
                 footnote_mode: Default::default(),
                 match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
             }),
             DaemonRequestPayload::Index(IndexRequest {
                 corpus: None,
@@ -1197,6 +1199,8 @@ mod tests {
             snippet_chars: None,
             footnote_mode: Default::default(),
             match_mode: Default::default(),
+            group_by: Default::default(),
+            output: Default::default(),
         });
         let response = DaemonResponse::invalid_params("invalid corpus");
         assert_eq!(

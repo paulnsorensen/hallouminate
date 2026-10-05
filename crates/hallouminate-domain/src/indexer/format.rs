@@ -352,6 +352,7 @@ impl FormatHandler for MarkdownHandler {
                 search_text,
                 claim_marks: marks_to_canonical_json(&chunk_marks),
                 structure,
+                overlap_bytes: 0,
             });
         }
         Ok(PreparedFile {
@@ -408,6 +409,7 @@ impl FormatHandler for RstHandler {
                 search_text,
                 claim_marks: None,
                 structure: None,
+                overlap_bytes: 0,
             });
         }
         Ok(PreparedFile {
@@ -439,9 +441,8 @@ pub struct TextHandler<S: ChunkSizer> {
 
 impl<S: ChunkSizer> TextHandler<S> {
     pub fn new(sizer: S, budget_tokens: usize) -> Self {
-        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
         Self {
-            splitter: TextSplitter::new(config),
+            splitter: overlapping_splitter(sizer, budget_tokens),
         }
     }
 
@@ -582,13 +583,31 @@ fn split_record_into_chunks<S: ChunkSizer>(
             text: slice.to_string(),
             claim_marks: None,
             structure: None,
+            overlap_bytes: 0,
         });
     }
+}
+
+/// Share of the chunk budget that consecutive plain-text and PDF chunks
+/// repeat, as a divisor: 8 gives 12.5 percent. A phrase that crosses a split
+/// point and is shorter than the overlap lies whole in one of the two chunks.
+const CHUNK_OVERLAP_DIVISOR: usize = 8;
+
+/// Builds a splitter whose consecutive chunks repeat
+/// `budget_tokens / CHUNK_OVERLAP_DIVISOR` tokens. A budget too small for a
+/// non-zero overlap gets a splitter with no overlap.
+fn overlapping_splitter<S: ChunkSizer>(sizer: S, budget_tokens: usize) -> TextSplitter<S> {
+    let config = ChunkConfig::new(budget_tokens)
+        .with_overlap(budget_tokens / CHUNK_OVERLAP_DIVISOR)
+        .unwrap_or_else(|_| ChunkConfig::new(budget_tokens));
+    TextSplitter::new(config.with_sizer(sizer))
 }
 
 /// Splits `text` with `splitter`, pushing one [`PreparedChunk`] per non-empty
 /// piece. Shared by [`TextHandler`] (whole document, empty `heading_path`) and
 /// [`PdfHandler`] (called once per page, so line numbers stay page-local).
+/// Each chunk records how many of its leading bytes an earlier chunk from the
+/// same call already holds.
 fn split_into_chunks<S: ChunkSizer>(
     splitter: &TextSplitter<S>,
     text: &str,
@@ -597,12 +616,16 @@ fn split_into_chunks<S: ChunkSizer>(
     chunks: &mut Vec<PreparedChunk>,
 ) {
     let line_starts = build_line_starts(text);
+    let mut covered_end: usize = 0;
     for (byte_off, slice) in splitter.chunk_indices(text) {
         if slice.is_empty() {
             continue;
         }
+        let slice_end = byte_off + slice.len();
+        let overlap_bytes = covered_end.saturating_sub(byte_off).min(slice.len());
+        covered_end = covered_end.max(slice_end);
         let line_start = byte_to_line(byte_off, &line_starts);
-        let line_end = byte_to_line(byte_off + slice.len() - 1, &line_starts);
+        let line_end = byte_to_line(slice_end - 1, &line_starts);
         chunks.push(PreparedChunk {
             ord: chunks.len(),
             search_text: build_search_text(heading_path, summary, slice),
@@ -612,6 +635,7 @@ fn split_into_chunks<S: ChunkSizer>(
             text: slice.to_string(),
             claim_marks: None,
             structure: None,
+            overlap_bytes,
         });
     }
 }
@@ -642,6 +666,9 @@ fn extract_pdf_pages(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
     Ok(pages)
 }
 
+/// Prefix of the one-element breadcrumb that marks a PDF chunk's page, as in
+/// `page:3`. `ground` groups and counts pages by this breadcrumb.
+pub const PAGE_BREADCRUMB_PREFIX: &str = "page:";
 /// Text-layer PDF handler: split each extracted page independently with the
 /// configured text splitter and retain page-local line ranges. Empty pages are
 /// skipped, while a wholly empty document is an extraction failure.
@@ -651,9 +678,8 @@ pub struct PdfHandler<S: ChunkSizer> {
 
 impl<S: ChunkSizer> PdfHandler<S> {
     pub fn new(sizer: S, budget_tokens: usize) -> Self {
-        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
         Self {
-            splitter: TextSplitter::new(config),
+            splitter: overlapping_splitter(sizer, budget_tokens),
         }
     }
 }
@@ -696,7 +722,7 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for PdfHandler<S> {
         let mut chunks = Vec::new();
         for page_idx in text_pages {
             let page = &pages[page_idx];
-            let heading_path = vec![format!("page:{}", page_idx + 1)];
+            let heading_path = vec![format!("{PAGE_BREADCRUMB_PREFIX}{}", page_idx + 1)];
             split_into_chunks(&self.splitter, page, &heading_path, &summary, &mut chunks);
         }
         Ok(PreparedFile {
@@ -864,6 +890,7 @@ fn push_row_chunk(
         search_text: String::new(),
         claim_marks: None,
         structure: None,
+        overlap_bytes: 0,
     });
 }
 
@@ -1190,5 +1217,43 @@ mod tests {
             (4, 4),
             "bob is on physical line 4, not logical-record line 3"
         );
+    }
+
+    #[test]
+    fn split_into_chunks_records_the_prefix_each_chunk_repeats() {
+        let mut words = Vec::new();
+        for index in 0..60 {
+            words.push(format!("w{index:03}"));
+        }
+        let text = words.join(" ");
+        let splitter = overlapping_splitter(text_splitter::Characters, 80);
+        let mut chunks = Vec::new();
+        split_into_chunks(&splitter, &text, &[], "", &mut chunks);
+
+        assert!(chunks.len() > 2, "fixture must split: {}", chunks.len());
+        assert_eq!(chunks[0].overlap_bytes, 0);
+        for pair in chunks.windows(2) {
+            let [previous, current] = pair else {
+                panic!("windows(2) yields pairs");
+            };
+            assert!(current.overlap_bytes > 0, "{:?}", current.text);
+            let repeated = &current.text[..current.overlap_bytes];
+            assert!(
+                previous.text.ends_with(repeated),
+                "{repeated:?} must end {:?}",
+                previous.text
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_splitter_keeps_no_overlap_for_a_tiny_budget() {
+        let splitter = overlapping_splitter(text_splitter::Characters, 7);
+        let mut chunks = Vec::new();
+        split_into_chunks(&splitter, "aaaa bbbb cccc dddd", &[], "", &mut chunks);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert_eq!(chunk.overlap_bytes, 0, "{:?}", chunk.text);
+        }
     }
 }
