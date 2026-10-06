@@ -1,10 +1,11 @@
 ---
 status: reviewed
-last_verified: 2026-08-02
+last_verified: 2026-10-06
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
   - https://github.com/paulnsorensen/hallouminate/pull/290
+  - https://github.com/paulnsorensen/hallouminate/issues/589
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055379
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055531
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055759
@@ -41,7 +42,7 @@ Consequences: worktrees own distinct rows; storage grew until retired-root GC sh
 
 ## ADR-003 — Rebuild older derived schemas automatically
 
-Status: shipped in #290; amends the prior fail-loud stale-schema convention.
+Status: shipped in #290; amends the prior fail-loud stale-schema convention. Extended to per-request `[storage].ground_dir` override stores by #589.
 
 Decision: Version < 4 logs, recreates the derived chunks table, and runs catch-up indexing; = 4 opens normally; > 4 remains fatal.[^spec]
 
@@ -50,6 +51,17 @@ Evidence: Filesystem Markdown is canonical and Lance rows are reconstructible, w
 Rejected: manual reindex creates avoidable broken-start states; fail-on-older wastes safe reconstructibility; in-place migration is more complex than authoritative rebuild; opening newer schemas is unsafe.
 
 Consequences: first open may spend minutes re-embedding large corpora; migration must be observable and preserve the existing newer-schema failure.
+
+### Amendment (#589) — boot rebuilds inline, request stores refill through catch-up
+
+Stale-schema recovery for a ground store has two paths, and only boot reindexes inline.[^589]
+
+- **Boot** (`DaemonState::open_with_owner` → `check_ground_dir`, `open_boot_store`): a store older than the build moves to `<ground>.bak-v<N>`, and every effective corpus reindexes before the daemon serves and before the watchdog arms. A failed move leaves the stale store in place and fails boot. A failed open or reindex removes the partial store, keeps the backup, and fails boot; the next start opens a fresh store, and boot `catch_up_index` refills it.
+- **Per request** (`resources_for_with_initializer`, a repo-level `[storage].ground_dir` override): validation runs first, then embedder and tokenizer init, so an init failure leaves the stale store in place. Then the stale store moves aside, a fresh empty store opens with no in-request reindex, and the request calls `watch_registry().mark_reconcile_due_all()`. The watcher's admitted catch-up (`catch_up_corpus`: debt gate, corpus lock, write lane) refills the store, so the first request can return partial results with an `index-coverage` warning.
+
+Why the request path does not reindex: a multi-minute rebuild inside a request stalls the watcher pump heartbeat past `watchdog_stall_secs` (default 300 s, then a process abort). It also holds the single write-lane permit when `add_markdown` or `delete_markdown` triggers it, and it bypasses debt backpressure.
+
+Supporting rules: a per-ground-dir lock (`ground_dir_locks`) serializes check, move, and open, because two `ResourceKey`s with different embedding settings can name one dir. Boot and each per-request store open prune `<ground>.bak-v<N>` backups older than `STALE_BACKUP_MAX_AGE` (about 30 days).
 
 ## ADR-004 — Let evaluation choose the reranker default
 
@@ -94,5 +106,6 @@ Implementation note: the diagnostic keeps rerank completion separate from z-scor
 [^filesystem]: [design-rationale](design-rationale.md), “Filesystem is the source of truth; LanceDB is derived.”
 [^eval]: eval/README.md:75-85; [ground-search-evaluation](ground-search-evaluation.md).
 [^implementation]: crates/hallouminate/tests/eval_ground_recall.rs:582-646,1124-1147; crates/hallouminate-domain/src/ground/orchestrate.rs:155-174; crates/hallouminate-daemon/src/dispatch.rs:385-417.
+[^589]: [Issue #589](https://github.com/paulnsorensen/hallouminate/issues/589); `crates/hallouminate-daemon/src/state.rs` (`check_ground_dir`, `open_boot_store`, `resources_for_with_initializer`); `plugins/hallouminate/skills/wiki-reindex/SKILL.md` § Auto-heal.
 
-_Source: issue #288 plus research comments 1–4, PR #290 (landed), and Anthropic's Introducing Contextual Retrieval · Updated: 2026-08-02 · Supersedes: the 2026-07-25 draft that marked ADR-001/002/003/005 "proposed"_
+_Source: issue #288 plus research comments 1–4, PR #290 (landed), issue #589 fix, and Anthropic's Introducing Contextual Retrieval · Updated: 2026-10-06 · Supersedes: the 2026-07-25 draft that marked ADR-001/002/003/005 "proposed"; the implicit "boot-only" scope of ADR-003_

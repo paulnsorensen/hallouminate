@@ -337,6 +337,9 @@ struct DaemonStateInner {
     /// dir concurrently (the single-open-per-ground-dir invariant), without
     /// holding the `resources` map lock across that async open.
     resource_build_locks: KeyedLockMap<ResourceKey>,
+    /// Per-ground-dir lock. Two `ResourceKey`s can name one ground dir, so
+    /// the stale-store check, move, and open serialize on the dir itself.
+    ground_dir_locks: KeyedLockMap<PathBuf>,
     store_lock_owner: StoreLockOwner,
     corpus_locks: KeyedLockMap<String>,
     write_lane: Arc<Semaphore>,
@@ -509,39 +512,7 @@ impl DaemonState {
         store_lock_owner: StoreLockOwner,
     ) -> anyhow::Result<Self> {
         let ground_dir = expand_tilde(&cfg.storage.ground_dir);
-        if let Some(parent) = ground_dir.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
-        }
-        let stale_version = match LanceStore::validate_existing_metadata(
-            &ground_dir,
-            &cfg.embeddings.model,
-            cfg.embeddings.quantized,
-            cfg.embeddings.enabled,
-        ) {
-            Ok(()) => None,
-            Err(HallouminateError::StoreSchemaStale {
-                found, expected, ..
-            }) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    %found,
-                    %expected,
-                    "ground store schema v{found} < expected v{expected}; rebuilding from source",
-                );
-                move_stale_store(&ground_dir, found).await?;
-                Some(found)
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "validate ground dir {}: {e}",
-                    ground_dir.display()
-                ));
-            }
-        };
+        let stale = check_ground_dir(&cfg, &ground_dir).await?;
 
         // Model construction and ONNX session setup are synchronous and
         // CPU-heavy. Keep them off Tokio's async worker capacity.
@@ -573,78 +544,17 @@ impl DaemonState {
 
         // Metadata validation happened before model ownership moved into the
         // store, so stale-schema recovery reuses this single ONNX session.
-        let build_result: anyhow::Result<LanceStore> = async {
-            let store = LanceStore::open_or_create_with_owner(
-                &ground_dir,
-                &cfg.embeddings.model,
-                cfg.embeddings.quantized,
-                cfg.embeddings.enabled,
-                embedder,
-                store_lock_owner.clone(),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
-
-            if stale_version.is_some() {
-                let registry = HandlerRegistry::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
-                for corpus in cfg
-                    .effective_corpora()
-                    .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
-                {
-                    let missing = missing_roots(&corpus);
-                    if !missing.is_empty() {
-                        tracing::warn!(
-                            target: "hallouminate::daemon",
-                            corpus = %corpus.name,
-                            "rebuild: corpus root missing; skipped",
-                        );
-                        continue;
-                    }
-                    let stats = index_corpus(&corpus, &store, &registry)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
-                    tracing::info!(
-                        target: "hallouminate::daemon",
-                        corpus = %corpus.name,
-                        files = stats.files_upserted,
-                        chunks = stats.chunks_inserted,
-                        "rebuild: reindexed",
-                    );
-                }
-            }
-            Ok(store)
-        }
-        .await;
-        let store = match build_result {
-            Ok(store) => store,
-            Err(e) => {
-                if let Some(found) = stale_version
-                    && ground_dir.exists()
-                {
-                    let _ = tokio::fs::remove_dir_all(&ground_dir).await;
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        "rebuild failed; removed partial ground dir so next boot retries. \
-                         Backup preserved at {}.bak-v{found}",
-                        ground_dir.display(),
-                    );
-                }
-                return Err(e);
-            }
-        };
-        // Recoverable-until-pruned backups from a prior schema rebuild
-        // (see `move_stale_store` above) accumulate on disk forever
-        // otherwise. Tolerate failure — a stuck backup dir must never
-        // block startup; the next boot's prune retries.
-        if let Err(e) =
-            prune_stale_backups(&ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE).await
-        {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "failed to prune stale ground store backups",
-            );
-        }
+        // Boot rebuilds a stale store inline, before the watchdog arms.
+        let store = open_boot_store(
+            &cfg,
+            &ground_dir,
+            stale,
+            embedder,
+            &tokenizer,
+            store_lock_owner.clone(),
+        )
+        .await?;
+        prune_stale_backups_logged(&ground_dir).await;
         // Keep model construction lazy. The rerank blocking-pool task owns
         // construction and the per-model slot for the configured deadline.
         let crossencoders = StdMutex::new(HashMap::new());
@@ -725,6 +635,7 @@ impl DaemonState {
                     baseline_resources,
                     resources: Mutex::new(resources_map),
                     resource_build_locks: KeyedLockMap::default(),
+                    ground_dir_locks: KeyedLockMap::default(),
                     corpus_locks: KeyedLockMap::default(),
                     store_lock_owner,
                     write_lane,
@@ -879,11 +790,10 @@ impl DaemonState {
     /// `[embeddings].enabled`) takes effect on the very next request — no
     /// daemon restart — while requests sharing a key share one
     /// `LanceStore`/embedder/tokenizer set so two `Arc<LanceStore>` handles
-    /// never open on the same ground dir. Deliberately no stale-schema-
-    /// rebuild handling here (that is boot-only, see `move_stale_store`); a
-    /// per-request `ground_dir` hitting `HallouminateError::StoreSchemaStale`
-    /// just surfaces as an `Err`, no worse than today's "can't point at a
-    /// different ground_dir at all".
+    /// never open on the same ground dir. A stale-schema store at a
+    /// per-request `ground_dir` moves aside on first use, and a fresh store
+    /// opens in its place. The request does not reindex. The watcher's
+    /// admitted catch-up refills the fresh store from source.
     pub async fn resources_for(&self, cfg: &Config) -> anyhow::Result<Arc<RequestResources>> {
         self.resources_for_with_initializer(cfg, |model, quantized, cache_dir| async move {
             init_embedder(&model, quantized, cache_dir).await
@@ -937,13 +847,8 @@ impl DaemonState {
         }
 
         let ground_dir = key.ground_dir.clone();
-        if let Some(parent) = ground_dir.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
-        }
+        let _ground = self.inner.ground_dir_locks.lock(ground_dir.as_path()).await;
+        let stale = check_ground_dir(cfg, &ground_dir).await?;
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
         let embedder = if cfg.embeddings.enabled {
             Some(
@@ -959,16 +864,27 @@ impl DaemonState {
         };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
-        let store = LanceStore::open_or_create_with_owner(
+        if let Some(StaleStore { found, expected }) = stale {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                ground_dir = %ground_dir.display(),
+                %found,
+                %expected,
+                "ground store schema v{found} < expected v{expected}; moving it aside for catch-up",
+            );
+            move_stale_store(&ground_dir, found).await?;
+        }
+        let store = open_ground_store(
+            cfg,
             &ground_dir,
-            &cfg.embeddings.model,
-            cfg.embeddings.quantized,
-            cfg.embeddings.enabled,
             embedder,
             self.inner.store_lock_owner.clone(),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
+        .await?;
+        if stale.is_some() {
+            self.watch_registry().mark_reconcile_due_all();
+        }
+        prune_stale_backups_logged(&ground_dir).await;
         let resources = Arc::new(RequestResources {
             store: Arc::new(store),
             tokenizer,
@@ -1314,6 +1230,183 @@ impl DaemonState {
     }
 }
 
+/// A ground store whose schema is older than this build.
+#[derive(Clone, Copy)]
+struct StaleStore {
+    found: u32,
+    expected: u32,
+}
+
+/// Create the ground dir's parent and validate any existing store metadata.
+/// Return the stale store's schema versions, or `None` for a current store.
+/// This step moves nothing, so a later model or tokenizer failure leaves
+/// the store in place.
+async fn check_ground_dir(cfg: &Config, ground_dir: &Path) -> anyhow::Result<Option<StaleStore>> {
+    if let Some(parent) = ground_dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
+    }
+    match LanceStore::validate_existing_metadata(
+        ground_dir,
+        &cfg.embeddings.model,
+        cfg.embeddings.quantized,
+        cfg.embeddings.enabled,
+    ) {
+        Ok(()) => Ok(None),
+        Err(HallouminateError::StoreSchemaStale {
+            found,
+            expected,
+            ground_dir: _,
+        }) => Ok(Some(StaleStore { found, expected })),
+        Err(e) => Err(anyhow::anyhow!(
+            "validate ground dir {}: {e}",
+            ground_dir.display()
+        )),
+    }
+}
+
+/// Open the ground store at `ground_dir`.
+async fn open_ground_store(
+    cfg: &Config,
+    ground_dir: &Path,
+    embedder: Option<Box<dyn EmbedBatch>>,
+    store_lock_owner: StoreLockOwner,
+) -> anyhow::Result<LanceStore> {
+    LanceStore::open_or_create_with_owner(
+        ground_dir,
+        &cfg.embeddings.model,
+        cfg.embeddings.quantized,
+        cfg.embeddings.enabled,
+        embedder,
+        store_lock_owner,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))
+}
+
+/// Open the boot ground store. A stale store moves aside, and every
+/// effective corpus of `cfg` reindexes into the fresh store before boot
+/// continues. A failed move leaves the stale store in place. A failed open
+/// or rebuild removes the partial store; the backup stays.
+async fn open_boot_store(
+    cfg: &Config,
+    ground_dir: &Path,
+    stale: Option<StaleStore>,
+    embedder: Option<Box<dyn EmbedBatch>>,
+    tokenizer: &Tokenizer,
+    store_lock_owner: StoreLockOwner,
+) -> anyhow::Result<LanceStore> {
+    let Some(StaleStore { found, expected }) = stale else {
+        return open_ground_store(cfg, ground_dir, embedder, store_lock_owner).await;
+    };
+    tracing::warn!(
+        target: "hallouminate::daemon",
+        ground_dir = %ground_dir.display(),
+        %found,
+        %expected,
+        "ground store schema v{found} < expected v{expected}; rebuilding from source",
+    );
+    move_stale_store(ground_dir, found).await?;
+    let result = match open_ground_store(cfg, ground_dir, embedder, store_lock_owner).await {
+        Ok(store) => reindex_effective_corpora(cfg, ground_dir, &store, tokenizer)
+            .await
+            .map(|()| store),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(store) => Ok(store),
+        Err(error) => {
+            remove_partial_store(ground_dir, found, &error).await;
+            Err(error)
+        }
+    }
+}
+
+/// Reindex every effective corpus of `cfg` into `store`.
+async fn reindex_effective_corpora(
+    cfg: &Config,
+    ground_dir: &Path,
+    store: &LanceStore,
+    tokenizer: &Tokenizer,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let registry = HandlerRegistry::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+    for corpus in cfg
+        .effective_corpora()
+        .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
+    {
+        let missing = missing_roots(&corpus);
+        if !missing.is_empty() {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                ground_dir = %ground_dir.display(),
+                corpus = %corpus.name,
+                roots = ?missing,
+                "rebuild: corpus root missing; skipped",
+            );
+            continue;
+        }
+        let stats = index_corpus(&corpus, store, &registry)
+            .await
+            .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
+        tracing::info!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            corpus = %corpus.name,
+            files = stats.files_upserted,
+            chunks = stats.chunks_inserted,
+            "rebuild: reindexed",
+        );
+    }
+    tracing::info!(
+        target: "hallouminate::daemon",
+        ground_dir = %ground_dir.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "rebuild: complete",
+    );
+    Ok(())
+}
+
+/// Remove the partial store that a failed boot rebuild left. The next open
+/// creates an empty store, and the watcher's catch-up refills it from source.
+async fn remove_partial_store(ground_dir: &Path, found: u32, error: &anyhow::Error) {
+    if !ground_dir.exists() {
+        return;
+    }
+    match tokio::fs::remove_dir_all(ground_dir).await {
+        Ok(()) => tracing::warn!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            error = %error,
+            "rebuild failed; removed partial ground dir. Backup preserved at {}.bak-v{found}",
+            ground_dir.display(),
+        ),
+        Err(remove_error) => tracing::error!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            error = %error,
+            remove_error = %remove_error,
+            "rebuild failed; could not remove partial ground dir",
+        ),
+    }
+}
+
+/// Prune old backups next to `ground_dir`. A stuck backup dir must never
+/// block an open, so this logs a failure and continues; the next open retries.
+async fn prune_stale_backups_logged(ground_dir: &Path) {
+    if let Err(e) = prune_stale_backups(ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE).await {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            error = %e,
+            "failed to prune stale ground store backups",
+        );
+    }
+}
+
 /// Move the stale ground store aside atomically so a fresh store can be
 /// created in its place. The backup is named `<ground>.bak-v{found_version}`.
 /// A pre-existing backup from a prior failed rebuild is overwritten.
@@ -1349,8 +1442,8 @@ async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Resu
 /// Prune backup ground-store directories (`<ground>.bak-v{N}`) older than
 /// `max_age`, as measured from `now`. `now` is threaded in (rather than
 /// read internally) so tests can make ages deterministic without a
-/// filetime crate. Called once at daemon boot; failures are tolerated by
-/// the caller (a stuck backup dir must never block startup).
+/// filetime crate. Boot and each per-request store open call it through
+/// `prune_stale_backups_logged`, which tolerates failure.
 async fn prune_stale_backups(
     ground_dir: &Path,
     now: SystemTime,
@@ -2712,6 +2805,429 @@ mod tests {
                  store was opened more than once for one ground dir",
             );
         }
+    }
+
+    /// #589 regression: a repo-level `[storage].ground_dir` override can hold
+    /// an older-schema store. The first request moves it aside and opens a
+    /// fresh store without a reindex. The admitted catch-up then refills it.
+    #[tokio::test]
+    async fn resources_for_moves_stale_override_store_and_catch_up_refills_it() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        let StaleSeed {
+            current,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let aged_backup = override_root.path().join("ground.bak-v0");
+        std::fs::create_dir(&aged_backup).expect("create aged backup");
+        let aged = SystemTime::now() - STALE_BACKUP_MAX_AGE - Duration::from_secs(86_400);
+        std::fs::File::open(&aged_backup)
+            .expect("open aged backup")
+            .set_modified(aged)
+            .expect("age the backup");
+
+        let resources = state
+            .resources_for(&cfg)
+            .await
+            .expect("a stale override store must open on the first request");
+
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+            "the stale store must move aside",
+        );
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read fresh meta"),
+            current,
+            "the fresh store must carry the current schema metadata",
+        );
+        assert!(
+            !aged_backup.exists(),
+            "the request must prune backups past the maximum age",
+        );
+        assert_eq!(
+            resources.store.count_rows().await.expect("count rows"),
+            0,
+            "the request must not reindex inline",
+        );
+
+        catch_up_override(&state, &resources, &cfg).await;
+        assert_ground_finds_arrakis(&resources, &cfg).await;
+    }
+
+    struct StaleSeed {
+        current: String,
+        stale: String,
+        backup_meta: PathBuf,
+    }
+
+    /// Seed an empty store at `ground_dir`, then rewrite its `meta.toml` to
+    /// the schema version before the current one.
+    async fn seed_stale_store(ground_dir: &Path, cfg: &Config) -> StaleSeed {
+        {
+            let _store = LanceStore::open_or_create(
+                ground_dir,
+                &cfg.embeddings.model,
+                cfg.embeddings.quantized,
+                cfg.embeddings.enabled,
+                None,
+            )
+            .await
+            .expect("seed override store");
+        }
+        let current_version = hallouminate_adapters::default_schema_version_pub();
+        let stale_version = current_version - 1;
+        let meta_path = ground_dir.join("meta.toml");
+        let current = std::fs::read_to_string(&meta_path).expect("read seeded meta");
+        let stale = current.replace(
+            &format!("schema_version = {current_version}"),
+            &format!("schema_version = {stale_version}"),
+        );
+        assert_ne!(
+            stale, current,
+            "seeded meta must carry the current schema version"
+        );
+        std::fs::write(&meta_path, &stale).expect("write stale meta");
+        let backup_meta = ground_dir
+            .with_file_name(format!("ground.bak-v{stale_version}"))
+            .join("meta.toml");
+        StaleSeed {
+            current,
+            stale,
+            backup_meta,
+        }
+    }
+
+    /// Lexical-only daemon plus an override config whose ground dir sits at
+    /// `<override_root>/ground` and whose one corpus holds one markdown file.
+    async fn override_fixture(
+        baseline_dir: &Path,
+        corpus_dir: &Path,
+        override_root: &Path,
+    ) -> (DaemonState, Config, PathBuf) {
+        let mut baseline = Config::default();
+        baseline.embeddings.enabled = false;
+        baseline.storage.ground_dir = baseline_dir.to_string_lossy().into_owned();
+        let state = DaemonState::open(baseline.clone(), None)
+            .await
+            .expect("open daemon state");
+        std::fs::write(
+            corpus_dir.join("arrakis.md"),
+            "# Arrakis\n\nThe spice must flow.\n",
+        )
+        .expect("write corpus file");
+        let ground_dir = override_root.join("ground");
+        let mut cfg = baseline;
+        cfg.storage.ground_dir = ground_dir.to_string_lossy().into_owned();
+        cfg.corpora = vec![CorpusConfig {
+            name: "docs".into(),
+            paths: vec![corpus_dir.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        }];
+        (state, cfg, ground_dir)
+    }
+
+    /// Run the watcher's admitted catch-up for the override corpus.
+    async fn catch_up_override(state: &DaemonState, resources: &RequestResources, cfg: &Config) {
+        super::super::dispatch::catch_up_corpus(
+            resources,
+            &state.make_registry(),
+            &cfg.corpora[0],
+            || state.acquire_write_lane(),
+        )
+        .await
+        .expect("catch up the override corpus");
+    }
+
+    async fn assert_ground_finds_arrakis(resources: &RequestResources, cfg: &Config) {
+        let response = ground(
+            "spice",
+            &cfg.corpora[0],
+            resources.store.as_ref(),
+            None,
+            rerank_opts(),
+        )
+        .await
+        .expect("ground the override store");
+        let mut paths = Vec::new();
+        for path in response.docs.keys() {
+            paths.push(path.clone());
+        }
+        assert_eq!(paths.len(), 1, "one file must match: {paths:?}");
+        assert!(
+            paths[0].ends_with("arrakis.md"),
+            "hit must be arrakis.md: {paths:?}"
+        );
+    }
+
+    /// Press attack (#589): concurrent first requests to one stale override
+    /// must move the stale store aside once. A second mover renames the
+    /// fresh store over the stale backup.
+    #[tokio::test]
+    async fn concurrent_requests_move_stale_override_store_once() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        let StaleSeed {
+            current,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let cfg = cfg.clone();
+            handles.push(tokio::spawn(async move {
+                state.resources_for(&cfg).await.expect("resources_for")
+            }));
+        }
+        let mut resolved = Vec::new();
+        for handle in handles {
+            resolved.push(handle.await.expect("join resources_for task"));
+        }
+
+        let first = &resolved[0];
+        for (i, res) in resolved.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(first, res),
+                "racer {i} resolved a different RequestResources Arc",
+            );
+        }
+        assert_one_store_and_one_backup(override_root.path(), &backup_meta);
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+            "the backup must hold the original stale store, not a fresh one",
+        );
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read fresh meta"),
+            current,
+        );
+    }
+
+    fn assert_one_store_and_one_backup(override_root: &Path, backup_meta: &Path) {
+        let backup_dir = backup_meta.parent().expect("backup dir");
+        let mut siblings = Vec::new();
+        for entry in std::fs::read_dir(override_root).expect("read override root") {
+            siblings.push(entry.expect("dir entry").file_name());
+        }
+        siblings.sort();
+        assert_eq!(
+            siblings,
+            vec![
+                std::ffi::OsString::from("ground"),
+                backup_dir.file_name().expect("backup name").to_os_string(),
+            ],
+            "exactly one store and one backup must exist",
+        );
+    }
+
+    /// Press attack (#589): two resource keys can name one stale dir. Only
+    /// the ground-dir lock stops the second key from moving the fresh store
+    /// over the stale backup.
+    #[tokio::test]
+    async fn two_keys_on_one_stale_override_dir_move_it_once() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        let StaleSeed {
+            current: _,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let mut quantized = cfg.clone();
+        quantized.embeddings.quantized = !cfg.embeddings.quantized;
+
+        let mut handles = Vec::new();
+        for request in [cfg, quantized] {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                state.resources_for(&request).await.map(|_| ())
+            }));
+        }
+        let mut errors = Vec::new();
+        for handle in handles {
+            match handle.await.expect("join resources_for task") {
+                Ok(()) => {}
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+
+        assert_eq!(errors.len(), 1, "exactly one key must lose: {errors:?}");
+        assert!(
+            errors[0].contains("embedding store mismatch"),
+            "the losing key must fail validation: {errors:?}",
+        );
+        assert_one_store_and_one_backup(override_root.path(), &backup_meta);
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+            "the backup must hold the original stale store",
+        );
+    }
+
+    /// Press attack (#589): an override store with a different embedding
+    /// model is not stale. The request must fail and leave the store in place.
+    #[tokio::test]
+    async fn override_store_with_other_model_fails_without_moving_it() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        {
+            let _store = LanceStore::open_or_create(
+                &ground_dir,
+                "intfloat/multilingual-e5-small",
+                cfg.embeddings.quantized,
+                cfg.embeddings.enabled,
+                None,
+            )
+            .await
+            .expect("seed store under another model");
+        }
+        let meta_path = ground_dir.join("meta.toml");
+        let before = std::fs::read_to_string(&meta_path).expect("read meta before");
+
+        let Err(err) = state.resources_for(&cfg).await else {
+            panic!("a model mismatch must refuse, not rebuild");
+        };
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("validate ground dir")
+                && chain.contains("intfloat/multilingual-e5-small"),
+            "error must come from metadata validation and name the stored model: {chain}",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&meta_path).expect("read meta after"),
+            before,
+            "a refused request must not touch the store",
+        );
+        let mut backups = Vec::new();
+        for entry in std::fs::read_dir(override_root.path()).expect("read override root") {
+            let name = entry.expect("dir entry").file_name();
+            if name.to_string_lossy().contains(".bak-v") {
+                backups.push(name);
+            }
+        }
+        assert!(backups.is_empty(), "no backup may exist: {backups:?}");
+    }
+
+    /// #589 enabled path: an embedder failure on the first request must leave
+    /// the stale store in place. The next request moves it, installs the
+    /// embedder, and catch-up refills the fresh store.
+    #[tokio::test]
+    async fn failed_embedder_init_leaves_stale_override_store_in_place() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, mut cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        cfg.embeddings.enabled = true;
+        let StaleSeed {
+            current: _,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let registered = super::super::watch::register_runtime_corpora(
+            &state,
+            Some(override_root.path()),
+            &cfg.corpora,
+            &cfg,
+        );
+        assert!(registered.is_ok(), "register the override corpus");
+        let Some(id) = state.watch_registry().begin_next_catch_up() else {
+            panic!("a new registration must queue its catch-up");
+        };
+        state
+            .watch_registry()
+            .finish_catch_up(&id, Err("stale store".into()));
+        assert!(
+            state.watch_registry().begin_next_catch_up().is_none(),
+            "a failed catch-up waits for the reconcile tick",
+        );
+
+        let failed = state
+            .resources_for_with_initializer(&cfg, |_, _, _| async {
+                Err(anyhow::anyhow!("model download failed"))
+            })
+            .await;
+        let Err(err) = failed else {
+            panic!("a failed embedder init must fail the request");
+        };
+        assert!(format!("{err:#}").contains("model download failed"));
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read meta"),
+            stale,
+            "a failed request must leave the stale store in place",
+        );
+        assert!(
+            !backup_meta.exists(),
+            "a failed request must not move the stale store",
+        );
+        assert!(
+            state.watch_registry().begin_next_catch_up().is_none(),
+            "a failed request must not queue a catch-up",
+        );
+
+        let resources = state
+            .resources_for_with_initializer(&cfg, |_, _, _| async {
+                Ok(Box::new(ZeroEmbedder) as Box<dyn EmbedBatch>)
+            })
+            .await
+            .expect("the next request opens the override store");
+        assert!(resources.store.embedder_available());
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+        );
+        assert!(
+            state.watch_registry().begin_next_catch_up().is_some(),
+            "a stale move must queue the catch-up again",
+        );
+        catch_up_override(&state, &resources, &cfg).await;
+        assert_ground_finds_arrakis(&resources, &cfg).await;
+    }
+
+    /// #589 boot path: when the stale store cannot move aside, boot fails and
+    /// leaves the stale store in place. A file at the backup path blocks the move.
+    #[tokio::test]
+    async fn boot_move_failure_leaves_stale_store_in_place() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ground_dir = root.path().join("ground");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = ground_dir.to_string_lossy().into_owned();
+        let StaleSeed {
+            current: _,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let backup_path = backup_meta.parent().expect("backup path");
+        std::fs::write(backup_path, "not a directory").expect("block the backup path");
+
+        let Err(err) = DaemonState::open(cfg, None).await else {
+            panic!("a failed move must fail boot");
+        };
+
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read stale meta"),
+            stale,
+            "a failed move must leave the stale store in place: {err:#}",
+        );
+        assert!(backup_path.is_file(), "the blocking file must stay");
     }
     struct ZeroEmbedder;
 
