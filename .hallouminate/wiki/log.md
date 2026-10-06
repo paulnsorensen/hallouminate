@@ -72,3 +72,6 @@
 
 - 2026-10-04 · fe76bd3da1e3c731 · merged · domain-model.md, ground-signal-fusion-adrs.md · Record landed PR #575: bounded heading and authored-content ranking, visible navigation, schema 5, and safe optional-metadata decoding. All six frozen retrieval probes pass; the daemon still reports queued reconciliation.
 
+
+- 2026-10-06 · 08d6bc9aa8b975ae · merged · ground-search-quality-adrs.md · #589: ADR-003 amendment — boot rebuilds stale stores inline; per-request override stores move aside and refill through admitted catch-up; ground_dir_locks; per-open backup prune.
+
