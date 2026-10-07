@@ -262,13 +262,14 @@ fn write_config_with_corpus(dir: &Path, corpus_name: &str, corpus_path: &str) ->
         r#"
 [[corpus]]
 name = "{corpus_name}"
-paths = ["{corpus_path}"]
+paths = [{corpus_path}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{ground}"
+ground_dir = {ground}
 "#,
-        ground = ground_dir.display(),
+        ground = toml::Value::String(ground_dir.display().to_string()),
+        corpus_path = toml::Value::String(corpus_path.to_owned()),
     );
     let cfg_path = cfg_dir.join("config.toml");
     std::fs::write(&cfg_path, &toml).expect("write config.toml");
@@ -292,13 +293,14 @@ fn write_config_with_corpus_and_ground(
         r#"
 [[corpus]]
 name = "{corpus_name}"
-paths = ["{corpus_path}"]
+paths = [{corpus_path}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{ground}"
+ground_dir = {ground}
 "#,
-        ground = ground_dir.display(),
+        ground = toml::Value::String(ground_dir.display().to_string()),
+        corpus_path = toml::Value::String(corpus_path.to_owned()),
     );
     let cfg_path = cfg_dir.join("config.toml");
     std::fs::write(&cfg_path, &toml).expect("write config.toml");
@@ -419,12 +421,12 @@ async fn mcp_corpus_stats_reports_selection_warnings() {
     let xdg = tempfile::tempdir().expect("tempdir");
     let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
     let ground_dir = tempfile::tempdir().expect("ground tempdir");
-    let corpus_root = corpus_dir.path().to_string_lossy();
+    let corpus_root = toml::Value::String(corpus_dir.path().display().to_string());
     let config_toml = format!(
         r#"
 [[corpus]]
 name = "wiki"
-paths = ["{corpus_root}"]
+paths = [{corpus_root}]
 globs = ["docs/**/*.md"]
 exclude = ["drafts/**"]
 
@@ -432,9 +434,9 @@ exclude = ["drafts/**"]
 enabled = false
 
 [storage]
-ground_dir = "{ground}"
+ground_dir = {ground}
 "#,
-        ground = ground_dir.path().display(),
+        ground = toml::Value::String(ground_dir.path().display().to_string()),
     );
     let config_dir = xdg.path().join("hallouminate");
     std::fs::create_dir_all(&config_dir).expect("mkdir config dir");
@@ -2577,7 +2579,7 @@ async fn mcp_markdown_batch_transport_failure_is_uncertain_and_never_replayed() 
     let xdg = tempfile::tempdir().expect("config");
     write_minimal_config(xdg.path());
     let socket = xdg.path().join("transport.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).expect("listener");
+    let listener = hallouminate_daemon::transport::LocalListener::bind(&socket).expect("listener");
     let server = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -2627,7 +2629,7 @@ async fn mcp_markdown_batch_preserves_outcomes_after_malformed_success() {
     let xdg = tempfile::tempdir().expect("config");
     write_minimal_config(xdg.path());
     let socket = xdg.path().join("retryable.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).expect("listener");
+    let listener = hallouminate_daemon::transport::LocalListener::bind(&socket).expect("listener");
     let first = json!({
         "corpus": "wiki", "path": "first.md", "absolute_path": "/wiki/first.md",
         "indexed": {"corpora": []}, "warnings": ["first warning"]
