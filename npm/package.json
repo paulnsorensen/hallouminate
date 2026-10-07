@@ -6,10 +6,13 @@
     "hallouminate": "run.js"
   },
   "scripts": {
-    "postinstall": "node install.js"
+    "postinstall": "node install.js",
+    "test": "node --test test/*.test.js"
   },
   "files": [
     "install.js",
+    "extract.js",
+    "platform.js",
     "run.js",
     "README.md"
   ],
