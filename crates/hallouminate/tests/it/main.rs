@@ -19,5 +19,6 @@ mod real_tokenizer;
 mod recovery;
 mod session_device;
 mod split_store_attacks;
+#[cfg(unix)]
 mod verification_gate;
 mod worktree_provisioning_vector_reuse;

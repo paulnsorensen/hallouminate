@@ -995,10 +995,12 @@ fn reject_symlink_leaf(parent: &Dir, name: &OsStr) -> Result<(), WriteError> {
 /// instead of trusting the OS default (`0o666` minus umask), mirroring the
 /// same explicit-mode restore `open_or_create_child_dir` applies to
 /// directories (`0o755`).
+#[cfg(unix)]
 const NEW_FILE_MODE: u32 = 0o644;
 
 #[derive(Clone, Copy)]
 enum ReplaceTarget {
+    #[cfg(unix)]
     Existing(u32),
     Missing,
 }
@@ -1244,6 +1246,22 @@ mod tests {
     //! immediately legible.
 
     use super::*;
+
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            let target = target.as_ref();
+            if target.is_dir() {
+                std::os::windows::fs::symlink_dir(target, link)
+            } else {
+                std::os::windows::fs::symlink_file(target, link)
+            }
+        }
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1513,7 +1531,7 @@ mod tests {
         let real_root = tmp.path().join("real-root");
         std::fs::create_dir(&real_root).unwrap();
         let root = tmp.path().join("root-link");
-        std::os::unix::fs::symlink(&real_root, &root).unwrap();
+        symlink(&real_root, &root).unwrap();
 
         let corpus = cfg("docs", vec![root.to_str().unwrap()]);
         let dest = root.join("new-page.md");
@@ -1529,7 +1547,7 @@ mod tests {
         let real_parent = tmp.path().join("real-parent");
         std::fs::create_dir(&real_parent).unwrap();
         let parent_link = tmp.path().join("parent-link");
-        std::os::unix::fs::symlink(&real_parent, &parent_link).unwrap();
+        symlink(&real_parent, &parent_link).unwrap();
 
         let root = parent_link.join("missing").join("root");
         let corpus = cfg("docs", vec![root.to_str().unwrap()]);
@@ -1576,7 +1594,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
 
         let err = atomic_write_no_follow(&root, Path::new("escape/pwned.md"), b"x", false)
             .expect_err("symlinked intermediate dir must bounce");
@@ -1597,7 +1615,7 @@ mod tests {
         let outside = tmp.path().parent().unwrap().join("outside-leaf");
         let _ = std::fs::remove_file(&outside);
         std::fs::write(&outside, b"original").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link.md")).unwrap();
+        symlink(&outside, root.join("link.md")).unwrap();
 
         let err = atomic_write_no_follow(root, Path::new("link.md"), b"new", true)
             .expect_err("final symlink must bounce");
@@ -1615,7 +1633,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         let root = tmp.path().join("root");
-        std::os::unix::fs::symlink(&outside, &root).unwrap();
+        symlink(&outside, &root).unwrap();
 
         let err = atomic_write_no_follow(&root, Path::new("pwned.md"), b"x", false)
             .expect_err("symlinked corpus root must bounce");
@@ -1626,6 +1644,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_overwrite_preserves_destination_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -1655,6 +1674,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn atomic_write_no_follow_new_file_gets_configured_safe_mode() {
         use std::os::unix::fs::PermissionsExt;
@@ -1725,13 +1745,12 @@ mod tests {
         // not `Io` — so the public `WriteErrorKind` contract matches the
         // pre-migration `cstring()`-based rejection.
         use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // A filename literally containing a NUL byte. Bypasses
         // `safe_relative_path`'s string-level check by constructing
         // straight from raw bytes.
-        let nul_name = OsString::from_vec(b"bad\0name.md".to_vec());
+        let nul_name = OsString::from("bad\0name.md");
         let rel = PathBuf::from(nul_name);
         let err = atomic_write_no_follow(root, &rel, b"x", false)
             .expect_err("NUL in component must fail");
@@ -1790,7 +1809,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let target = root.join("real.md");
         std::fs::write(&target, b"target\n").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("link.md")).unwrap();
+        symlink(&target, root.join("link.md")).unwrap();
         let err =
             read_no_follow(&root, Path::new("link.md")).expect_err("symlinked leaf must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -1809,7 +1828,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("secret.md"), b"shh\n").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
         let err = read_no_follow(&root, Path::new("escape/secret.md"))
             .expect_err("intermediate symlink must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -1971,7 +1990,7 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         let outside = tmp.path().join("outside.md");
         std::fs::write(&outside, b"secret\n").unwrap();
-        std::os::unix::fs::symlink(&outside, first.join("link.md")).unwrap();
+        symlink(&outside, first.join("link.md")).unwrap();
         std::fs::write(second.join("link.md"), b"real\n").unwrap();
         let corpus = cfg(
             "docs",
@@ -2035,7 +2054,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let target = tmp.path().join("target.md");
         std::fs::write(&target, b"keep me\n").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("link.md")).unwrap();
+        symlink(&target, root.join("link.md")).unwrap();
         let err =
             delete_no_follow(&root, Path::new("link.md")).expect_err("symlinked leaf must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -2056,7 +2075,7 @@ mod tests {
         let outside = tmp.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("victim.md"), b"keep\n").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
         let err = delete_no_follow(&root, Path::new("escape/victim.md"))
             .expect_err("intermediate symlink must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
