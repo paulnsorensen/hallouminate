@@ -2872,7 +2872,6 @@ dependencies = [
  "lancedb",
  "openssl",
  "ort",
- "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -2956,6 +2955,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-segmentation",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
