@@ -31,8 +31,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
-      - name: Install protobuf compiler
-        run: choco install protoc --yes --no-progress
+      - name: Install protobuf compiler and ripgrep
+        run: choco install protoc ripgrep --yes --no-progress
       - name: Install Rust components
         run: rustup component add rustfmt clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -117,8 +117,7 @@ jobs:
 
   build-test-matrix:
     name: build & test (${{ matrix.os }})
-    # Unix only: the crate is unix-only (libc path handling won't compile on
-    # Windows — tracked in #48).
+    # Windows runs the native verification gate in the separate windows job.
     needs: setup
     strategy:
       fail-fast: false
@@ -241,10 +240,10 @@ jobs:
   # matrix gains or loses an OS.
   build-test:
     name: build & test
-    needs: build-test-matrix
+    needs: [build-test-matrix, windows, verification-lease, npm-installer]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Require all matrix legs to pass
-        if: needs.build-test-matrix.result != 'success'
+        if: needs.build-test-matrix.result != 'success' || needs.windows.result != 'success' || needs.verification-lease.result != 'success' || needs.npm-installer.result != 'success'
         run: exit 1
