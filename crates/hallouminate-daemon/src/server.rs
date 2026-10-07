@@ -11,9 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::transport::{LocalListener, LocalStream};
 use futures_util::StreamExt;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::codec::LinesCodecError;
@@ -195,6 +195,7 @@ async fn serve_with_config(
 /// already overridden — a `kill -TERM` after this returns reaches the token,
 /// not the default killer. This synchronous postcondition is what the SIGTERM
 /// integration test relies on to raise the signal without a spawn race.
+#[cfg(unix)]
 pub fn spawn_signal_handlers(state: &DaemonState) {
     let token = state.shutdown_token().clone();
     let sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -222,6 +223,21 @@ pub fn spawn_signal_handlers(state: &DaemonState) {
                 }
             }
             token.cancel();
+        }
+    });
+}
+
+/// Registers Windows console shutdown handling for the daemon.
+#[cfg(windows)]
+pub fn spawn_signal_handlers(state: &DaemonState) {
+    let token = state.shutdown_token().clone();
+    state.supervisor().spawn(TaskName::Signal, move || {
+        let token = token.clone();
+        async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => token.cancel(),
+                Err(error) => tracing::warn!(%error, "failed to wait for console shutdown"),
+            }
         }
     });
 }
@@ -426,16 +442,21 @@ async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
         // another local user on a shared machine traverse it, connect to the
         // socket, and issue mutating requests — refuse to start rather than
         // silently degrade.
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o700);
-        tokio::fs::set_permissions(parent, perms)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to set owner-only permissions (0o700) on socket parent dir {}: {e}",
-                    parent.display(),
-                )
-            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            tokio::fs::set_permissions(parent, perms)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "failed to set owner-only permissions (0o700) on socket parent dir {}: {e}",
+                        parent.display(),
+                    )
+                })?;
+        }
+        #[cfg(windows)]
+        crate::windows_security::restrict_path(parent)?;
     }
     Ok(())
 }
@@ -522,7 +543,7 @@ async fn serve_on_listener(
     socket_path: &Path,
     idle_timeout: Duration,
 ) -> anyhow::Result<Instant> {
-    let listener = UnixListener::bind(socket_path).map_err(|e| {
+    let listener = LocalListener::bind(socket_path).map_err(|e| {
         tracing::error!(
             target: "hallouminate::daemon",
             socket = %socket_path.display(),
@@ -535,16 +556,19 @@ async fn serve_on_listener(
     // dir's 0o700 suspenders. The daemon has no peer-credential auth on the
     // wire, so refuse to start rather than serve on a socket another local
     // user could connect to.
-    use std::os::unix::fs::PermissionsExt;
-    let perms = std::fs::Permissions::from_mode(0o600);
-    tokio::fs::set_permissions(socket_path, perms)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "failed to set owner-only permissions (0o600) on socket {}: {e}",
-                socket_path.display(),
-            )
-        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        tokio::fs::set_permissions(socket_path, perms)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to set owner-only permissions (0o600) on socket {}: {e}",
+                    socket_path.display(),
+                )
+            })?;
+    }
     tracing::info!(
         target: "hallouminate::daemon",
         socket = %socket_path.display(),
@@ -575,7 +599,7 @@ async fn serve_on_listener(
         };
         // Gate concurrently active handlers so unlimited clients can't spend
         // unbounded memory/CPU at once. The permit is acquired here, before
-        // spawning, so an accepted-but-unhandled `UnixStream` and its task
+        // spawning, so an accepted-but-unhandled `LocalStream` and its task
         // never accumulate unbounded while waiting for a permit; it is
         // acquired against `shutdown.cancelled()` so waiting for a permit
         // never blocks drain/shutdown.
@@ -643,14 +667,20 @@ async fn drain_handlers(handlers: &mut JoinSet<()>, deadline: Instant) {
 
 async fn handle_connection(
     state: DaemonState,
-    stream: UnixStream,
+    stream: LocalStream,
     idle_timeout: Duration,
 ) -> anyhow::Result<()> {
     // Best-effort peer uid, checked below against the mutating-request
     // allowlist (B6 defense-in-depth). Captured before `into_split` since the
-    // whole `UnixStream` (not either half) implements `AsRawFd`.
+    // whole `LocalStream` (not either half) implements `AsRawFd`.
+    #[cfg(unix)]
     let peer_uid = peer_credential_uid(&stream);
+    #[cfg(unix)]
     let effective_uid = rustix::process::geteuid().as_raw();
+    #[cfg(windows)]
+    let peer_uid = stream.peer_user().ok();
+    #[cfg(windows)]
+    let effective_uid = crate::windows_security::current_user_sid()?;
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = ipc_lines(read_half);
     let frame = match tokio::time::timeout(idle_timeout, lines.next()).await {
@@ -779,26 +809,22 @@ fn lock_path_for(socket_path: &Path) -> PathBuf {
 /// (POSIX). A second daemon on the same socket bounces with `EWOULDBLOCK`
 /// and surfaces a clear "daemon already running" error.
 fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    use rustix::fs::{FlockOperation, flock};
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(lock_path)
-        .map_err(|e| anyhow::anyhow!("open lockfile {}: {e}", lock_path.display()))?;
-    if let Err(errno) = flock(&file, FlockOperation::NonBlockingLockExclusive) {
-        return Err(anyhow::anyhow!(
-            "another hallouminate daemon already holds {} ({})",
-            lock_path.display(),
-            std::io::Error::from(errno)
-        ));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let file = options
+        .open(lock_path)
+        .map_err(|error| anyhow::anyhow!("open lockfile {}: {error}", lock_path.display()))?;
+    file.try_lock().map_err(|error| {
+        anyhow::anyhow!(
+            "another hallouminate daemon already holds {} ({error})",
+            lock_path.display(),
+        )
+    })?;
     Ok(file)
 }
 
@@ -811,9 +837,9 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
 /// CorpusStats) are unrestricted. `peer_uid: None` (credential lookup
 /// unsupported or failed) fails closed for mutating requests rather than
 /// silently allowing them.
-fn authorize_peer(
-    peer_uid: Option<u32>,
-    effective_uid: u32,
+fn authorize_peer<T: std::fmt::Display + PartialEq>(
+    peer_uid: Option<T>,
+    effective_uid: T,
     payload: &super::ipc::DaemonRequestPayload,
 ) -> Option<DaemonResponse> {
     if !is_mutating_payload(payload) {
@@ -855,7 +881,8 @@ fn is_mutating_payload(payload: &super::ipc::DaemonRequestPayload) -> bool {
 /// is Linux-only, so it can't cover both). `None` on any error or
 /// unsupported platform; [`authorize_peer`] fails closed for mutating
 /// requests in that case.
-fn peer_credential_uid(stream: &UnixStream) -> Option<u32> {
+#[cfg(unix)]
+fn peer_credential_uid(stream: &LocalStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     raw_peer_uid(stream.as_raw_fd())
 }
@@ -900,6 +927,7 @@ fn raw_peer_uid(fd: std::os::fd::RawFd) -> Option<u32> {
     target_os = "openbsd",
     target_os = "dragonfly"
 )))]
+#[cfg(unix)]
 fn raw_peer_uid(_fd: std::os::fd::RawFd) -> Option<u32> {
     None
 }
@@ -932,9 +960,11 @@ mod tests {
         cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open state");
         let socket = tmp.path().join("request.sock");
-        let listener = UnixListener::bind(&socket).expect("bind request socket");
+        let listener = LocalListener::bind(&socket).expect("bind request socket");
         let client = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(&socket).await.expect("connect request");
+            let mut stream = LocalStream::connect(&socket)
+                .await
+                .expect("connect request");
             let _ = stream.write_all(&bytes).await;
             let _ = stream.shutdown().await;
             let mut lines = ipc_lines(stream);
@@ -1052,8 +1082,8 @@ mod tests {
         cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
         let state = DaemonState::open(cfg, None).await.expect("open state");
         let socket = tmp.path().join("idle.sock");
-        let listener = UnixListener::bind(&socket).expect("bind idle socket");
-        let client = UnixStream::connect(&socket)
+        let listener = LocalListener::bind(&socket).expect("bind idle socket");
+        let client = LocalStream::connect(&socket)
             .await
             .expect("connect idle client");
         let (stream, _) = listener.accept().await.expect("accept idle request");
