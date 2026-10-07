@@ -9,11 +9,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use super::transport::LocalStream;
 use anyhow::Context;
 use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
@@ -98,7 +98,7 @@ pub fn daemon_client_unavailable(reason: impl std::fmt::Display) -> anyhow::Erro
 pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {
     // Probe the socket with a quick connect to confirm a daemon is alive,
     // surfacing the failure here instead of inside the first `call`.
-    UnixStream::connect(socket).await.with_context(|| {
+    LocalStream::connect(socket).await.with_context(|| {
         format!(
             "daemon unavailable: cannot connect to {} \
              (start it with `hallouminate daemon`)",
@@ -128,7 +128,7 @@ impl DaemonClient {
             )
             .into());
         }
-        let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
+        let mut stream = LocalStream::connect(&self.socket).await.map_err(|e| {
             daemon_client_unavailable(format!("connect to {} failed: {e}", self.socket.display()))
         })?;
         // Wrap mid-call I/O errors with the same `daemon unavailable` hint
@@ -316,7 +316,7 @@ mod tests {
     async fn connect_or_spawn_prefers_live_socket_over_spawning() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind socket");
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -366,7 +366,7 @@ mod tests {
         // the whole round trip and return promptly instead of hanging.
         let tmp = tempfile::tempdir().expect("tempdir");
         let sock_path = tmp.path().join("silent.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&sock_path).expect("bind");
         tokio::spawn(async move {
             // Accept and hold the connection open without ever reading or
             // writing — simulates a wedged daemon.
@@ -487,7 +487,7 @@ mod tests {
         // so "start it with `hallouminate daemon`" would be the wrong hint.
         let tmp = tempfile::tempdir().expect("tempdir");
         let sock_path = tmp.path().join("silent.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&sock_path).expect("bind");
         tokio::spawn(async move {
             let (_stream, _addr) = listener.accept().await.expect("accept");
             std::future::pending::<()>().await;
@@ -525,7 +525,7 @@ mod tests {
         // against a dead daemon cannot succeed.
         let tmp = tempfile::tempdir().expect("tempdir");
         let sock_path = tmp.path().join("eof.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&sock_path).expect("bind");
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -593,7 +593,7 @@ mod tests {
     async fn call_with_response(bytes: Vec<u8>) -> anyhow::Result<DaemonResponse> {
         let tmp = tempfile::tempdir().expect("tempdir");
         let socket = tmp.path().join("response.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind");
         let server = tokio::spawn(async move {
             let (probe, _) = listener.accept().await.expect("accept probe");
             drop(probe);
@@ -701,7 +701,7 @@ mod tests {
         );
         let tmp = tempfile::tempdir().expect("temp");
         let socket = tmp.path().join("frame.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let (read, mut write) = stream.into_split();
@@ -740,7 +740,7 @@ mod tests {
     async fn markdown_batch_timeout_reports_uncertainty_without_replay() {
         let tmp = tempfile::tempdir().expect("temp");
         let socket = tmp.path().join("timeout.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind");
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
             let mut lines = ipc_lines(stream);

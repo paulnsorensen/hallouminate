@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::net::UnixStream;
+use super::transport::LocalStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_at;
@@ -93,7 +93,7 @@ pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
         .await;
 
     loop {
-        if !socket.exists() || UnixStream::connect(socket).await.is_err() {
+        if !socket.exists() || LocalStream::connect(socket).await.is_err() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -143,7 +143,7 @@ mod tests {
     async fn status_reports_running_for_live_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind socket");
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -185,7 +185,7 @@ mod tests {
     async fn stop_shuts_down_live_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind socket");
         let socket_for_server = socket.clone();
         let server = tokio::spawn(async move {
             loop {
