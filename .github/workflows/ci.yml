@@ -10,6 +10,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  npm-installer:
+    name: npm installer (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: npm test --prefix npm
+
+  windows:
+    name: Windows MSVC verification
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Install protobuf compiler
+        run: choco install protoc --yes --no-progress
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Verify native Windows build and tests
+        run: just verify
+
   verification-lease:
     name: verification lease (${{ matrix.os }})
     strategy:
