@@ -20,6 +20,7 @@ jobs:
     outputs:
       tag: ${{ steps.rel.outputs.tag }}
       version: ${{ steps.rel.outputs.version }}
+      windows: ${{ steps.rel.outputs.windows }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -33,6 +34,12 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "Latest release: $tag"
+          config="$(gh api "repos/${{ github.repository }}/contents/dist-workspace.toml?ref=$tag" --jq .content | base64 --decode)"
+          if grep -q '"x86_64-pc-windows-msvc"' <<<"$config"; then
+            echo "windows=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "windows=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # A real user's install path: fresh npx of the published package on each
   # target the shim advertises, then run it and assert the version equals the
@@ -47,12 +54,15 @@ jobs:
           - runner: ubuntu-latest # linux-x64
           - runner: ubuntu-24.04-arm # linux-arm64
           - runner: macos-latest # darwin-arm64
+          - runner: windows-2022 # win32-x64
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - name: npx install and run
+        if: runner.os != 'Windows' || needs.resolve.outputs.windows == 'true'
+        shell: bash
         run: |
           set -euo pipefail
           want="${{ needs.resolve.outputs.version }}"
@@ -73,7 +83,7 @@ jobs:
         with:
           ref: ${{ needs.resolve.outputs.tag }}
           persist-credentials: false
-      - name: Release has a tarball + checksum for every dist target
+      - name: Release has an archive and checksum for every dist target
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -85,7 +95,9 @@ jobs:
           assets="$(gh release view "$tag" --json assets --jq '.assets[].name')"
           rc=0
           for t in $targets; do
-            for name in "hallouminate-$t.tar.xz" "hallouminate-$t.tar.xz.sha256"; do
+            extension=tar.xz
+            case "$t" in *-pc-windows-*) extension=zip ;; esac
+            for name in "hallouminate-$t.$extension" "hallouminate-$t.$extension.sha256"; do
               if grep -Fqx "$name" <<<"$assets"; then
                 echo "ok   $name"
               else
