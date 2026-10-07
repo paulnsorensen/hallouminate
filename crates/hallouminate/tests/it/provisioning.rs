@@ -44,9 +44,9 @@ fn cfg_baseline(ground_dir: &Path) -> Config {
 enabled = false
 
 [storage]
-ground_dir = "{ground}"
+ground_dir = {ground}
 "#,
-        ground = ground_dir.display(),
+        ground = toml::Value::String(ground_dir.display().to_string()),
     );
     toml::from_str(&toml).expect("baseline toml parses")
 }
