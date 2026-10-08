@@ -10,7 +10,7 @@ use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 fn resolve_model(canonical: &'static str) -> RerankerModel {
     match canonical {
         "jina-reranker-v1-turbo-en" => RerankerModel::JINARerankerV1TurboEn,
-        "jina-reranker-v2-base-multiligual" => RerankerModel::JINARerankerV2BaseMultiligual,
+        "jina-reranker-v2-base-multiligual" => RerankerModel::JINARerankerV2BaseMultilingual,
         "bge-reranker-base" => RerankerModel::BGERerankerBase,
         "bge-reranker-v2-m3" => RerankerModel::BGERerankerV2M3,
         _ => unreachable!("resolve_model takes a canonical name from canonical_crossencoder_model"),
