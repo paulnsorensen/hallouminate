@@ -17,3 +17,6 @@ ralphs/
 milknado.toml
 npm/bin/
 npm/node_modules/
+# Python tooling for wedge-packaged skill CLIs under plugins/.
+__pycache__/
+.venv/
