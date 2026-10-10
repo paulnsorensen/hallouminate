@@ -20,10 +20,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hallouminate_config::Config;
 use hallouminate_domain::common::{CorpusConfig, CorpusKey};
+
+use crate::state::corpus_lock_keys;
 
 use super::WatchRoot;
 
@@ -204,6 +207,9 @@ struct Registration {
     /// Set by `finish_catch_up` on a failed pass, cleared on the next
     /// success (`finish_catch_up(Ok)` is the sole clear site).
     last_error: Option<String>,
+    /// Set when the first catch-up pass finishes, whether it succeeds or
+    /// fails. A cold-start `ground` waits only while this is unset.
+    reconciled_once: bool,
     /// Set by `finish_catch_up` on a failed pass; gates `begin_next_catch_up`
     /// from re-admitting this registration until `mark_reconcile_due_all`
     /// clears it on the next reconcile tick, preventing a failing pass from
@@ -229,16 +235,25 @@ pub(crate) struct RetiredRegistration {
     pub(crate) cfg: Arc<Config>,
 }
 
+/// One admitted catch-up: a leader plus every compatible registration that
+/// shares its pass. `valid` turns false when the leader registration is
+/// released before its pass finishes.
+struct ActiveGroup {
+    leader: RegistrationId,
+    lock_keys: Vec<CorpusKey>,
+    members: Vec<RegistrationId>,
+    valid: bool,
+}
+
 /// Fair-scheduling and admission state shared by every registration.
-/// `queue` holds ids that are `Queued`, in FIFO order; at most one
-/// registration may be `InFlight` at a time, enforcing at most one running
-/// catch-up pass across the whole daemon.
+/// `queue` holds ids that are `Queued`, in FIFO order; `active` holds one
+/// group per running catch-up pass, bounded by `catch_up_limit`. Two groups
+/// never share a `CorpusKey`, which matches the per-key corpus lock; the same
+/// corpus name under different roots (worktrees) runs concurrently.
 struct Inner {
     regs: HashMap<RegistrationId, Registration>,
     queue: VecDeque<RegistrationId>,
-    active_group: Vec<RegistrationId>,
-    active_leader: Option<RegistrationId>,
-    active_leader_valid: bool,
+    active: Vec<ActiveGroup>,
     /// Bumped on every mutation that already notifies `changed`, plus every
     /// `refresh_roots` re-key. Lets the pump's per-iteration reconcile skip
     /// work when nothing in the registry moved since its last pass.
@@ -251,21 +266,29 @@ struct Inner {
 /// periodic reconcile pass.
 pub(crate) struct WatchRegistry {
     inner: Mutex<Inner>,
+    catch_up_limit: AtomicUsize,
     changed: tokio::sync::Notify,
+    /// Woken after every catch-up pass settles, so a request can await its
+    /// registrations' first reconciliation without polling.
+    settled: tokio::sync::Notify,
+    /// Set when the watcher pump could not be created; nothing admits
+    /// catch-up passes then, so cold-start waits are skipped.
+    pump_unavailable: std::sync::atomic::AtomicBool,
 }
 
 impl WatchRegistry {
     pub(crate) fn new() -> Self {
         Self {
+            catch_up_limit: AtomicUsize::new(1),
             inner: Mutex::new(Inner {
                 regs: HashMap::new(),
                 queue: VecDeque::new(),
-                active_group: Vec::new(),
-                active_leader: None,
-                active_leader_valid: false,
+                active: Vec::new(),
                 generation: 0,
             }),
             changed: tokio::sync::Notify::new(),
+            settled: tokio::sync::Notify::new(),
+            pump_unavailable: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -305,6 +328,7 @@ impl WatchRegistry {
                 pending: PendingWork::Idle,
                 catch_up: CatchUpState::Done,
                 last_error: None,
+                reconciled_once: true,
                 retry_on_tick: false,
             },
         );
@@ -407,6 +431,7 @@ impl WatchRegistry {
                 pending: PendingWork::Idle,
                 catch_up: CatchUpState::Queued,
                 last_error: None,
+                reconciled_once: false,
                 retry_on_tick: false,
             },
         );
@@ -630,6 +655,7 @@ impl WatchRegistry {
                     pending: PendingWork::Idle,
                     catch_up: CatchUpState::Queued,
                     last_error: None,
+                    reconciled_once: false,
                     retry_on_tick: false,
                 },
             );
@@ -638,6 +664,7 @@ impl WatchRegistry {
         guard.generation += 1;
         drop(guard);
         self.signal_changed();
+        self.settled.notify_waiters();
         Ok(retired)
     }
 
@@ -843,16 +870,19 @@ impl WatchRegistry {
     /// retries a failing registration; this is what keeps a persistently
     /// failing pass from busy-looping.
     pub(crate) fn begin_next_catch_up(&self) -> Option<RegistrationId> {
+        let limit = self.catch_up_limit.load(Ordering::Relaxed).max(1);
         let mut guard = self.lock();
-        if guard.active_leader.is_some() {
+        let inner = &mut *guard;
+        if inner.active.len() >= limit {
             return None;
         }
         let mut gated: Vec<RegistrationId> = Vec::new();
+        let mut deferred: Vec<RegistrationId> = Vec::new();
         let admitted = loop {
-            let Some(id) = guard.queue.pop_front() else {
+            let Some(id) = inner.queue.pop_front() else {
                 break None;
             };
-            let Some(reg) = guard.regs.get_mut(&id) else {
+            let Some(reg) = inner.regs.get(&id) else {
                 continue;
             };
             if reg.catch_up != CatchUpState::Queued {
@@ -862,25 +892,24 @@ impl WatchRegistry {
                 gated.push(id);
                 continue;
             }
-            let Some(leader) = guard.regs.get(&id) else {
+            let lock_keys = corpus_lock_keys(&reg.corpus);
+            if active_locks_overlap(&inner.active, &lock_keys) {
+                deferred.push(id);
+                continue;
+            }
+            let leader_corpus = reg.corpus.clone();
+            let leader_roots = reg.roots.clone();
+            let leader_cfg = reg.cfg.clone();
+            let Some(leader) = inner.regs.get_mut(&id) else {
                 continue;
             };
-            let leader_corpus = leader.corpus.clone();
-            let leader_roots = leader.roots.clone();
-            let leader_cfg = leader.cfg.clone();
-            guard
-                .regs
-                .get_mut(&id)
-                .expect("queued registration must exist")
-                .catch_up = CatchUpState::InFlight;
-            guard.active_leader = Some(id.clone());
-            guard.active_leader_valid = true;
-            guard.active_group.push(id.clone());
-            let group_members: Vec<RegistrationId> = guard
+            leader.catch_up = CatchUpState::InFlight;
+            let mut members = vec![id.clone()];
+            let group_members: Vec<RegistrationId> = inner
                 .queue
                 .iter()
                 .filter(|candidate| {
-                    guard.regs.get(*candidate).is_some_and(|member| {
+                    inner.regs.get(*candidate).is_some_and(|member| {
                         member.catch_up == CatchUpState::Queued
                             && member.corpus == leader_corpus
                             && member.roots == leader_roots
@@ -890,16 +919,31 @@ impl WatchRegistry {
                 .cloned()
                 .collect();
             for member_id in group_members {
-                if let Some(member) = guard.regs.get_mut(&member_id) {
+                if let Some(member) = inner.regs.get_mut(&member_id) {
                     member.catch_up = CatchUpState::InFlight;
                 }
-                guard.queue.retain(|candidate| candidate != &member_id);
-                guard.active_group.push(member_id);
+                inner.queue.retain(|candidate| candidate != &member_id);
+                members.push(member_id);
             }
+            inner.active.push(ActiveGroup {
+                leader: id.clone(),
+                lock_keys,
+                members,
+                valid: true,
+            });
             break Some(id);
         };
-        guard.queue.extend(gated);
+        for id in deferred.into_iter().rev() {
+            inner.queue.push_front(id);
+        }
+        inner.queue.extend(gated);
         admitted
+    }
+
+    /// Sets how many catch-up leaders may run at once. A value of zero
+    /// counts as one.
+    pub(crate) fn set_catch_up_limit(&self, limit: usize) {
+        self.catch_up_limit.store(limit.max(1), Ordering::Relaxed);
     }
 
     /// Marks catch-up finished for `id`, releasing the daemon-wide slot and
@@ -926,18 +970,20 @@ impl WatchRegistry {
         outcome: Result<(), String>,
     ) -> PendingWork {
         let mut guard = self.lock();
-        let members: Vec<RegistrationId> = if guard.active_leader.as_ref() == Some(id) {
-            let leader_valid = guard.active_leader_valid;
-            guard.active_leader = None;
-            guard.active_leader_valid = false;
-            if guard.active_group.is_empty() {
-                if leader_valid && guard.regs.contains_key(id) {
+        let led_group = guard
+            .active
+            .iter()
+            .position(|group| group.leader == *id)
+            .map(|position| guard.active.remove(position));
+        let members: Vec<RegistrationId> = if let Some(group) = led_group {
+            if group.members.is_empty() {
+                if group.valid && guard.regs.contains_key(id) {
                     vec![id.clone()]
                 } else {
                     Vec::new()
                 }
             } else {
-                std::mem::take(&mut guard.active_group)
+                group.members
             }
         } else if guard.regs.contains_key(id) {
             vec![id.clone()]
@@ -950,10 +996,11 @@ impl WatchRegistry {
                 continue;
             };
             if member_id != *id {
-                // A group member other than the one `finish_catch_up` was
-                // called for didn't itself just run a catch-up pass; only
-                // its admission slot is released here, not its logical
-                // state (pending/last_error stay per registration).
+                // Another group member shares the leader's pass. Its admission
+                // slot is released here; pending and `last_error` stay its own.
+                if let Ok(()) = outcome {
+                    reg.reconciled_once = true;
+                }
                 if reg.pending.is_idle() {
                     reg.catch_up = CatchUpState::Done;
                 } else {
@@ -962,6 +1009,7 @@ impl WatchRegistry {
                 }
                 continue;
             }
+            reg.reconciled_once = true;
             let pending = match &outcome {
                 Ok(()) => {
                     reg.last_error = None;
@@ -988,7 +1036,73 @@ impl WatchRegistry {
         guard.generation += 1;
         drop(guard);
         self.signal_changed();
+        self.settled.notify_waiters();
         returned
+    }
+
+    /// Reports whether any registration under `source` for a corpus in
+    /// `names` has not yet finished its first pass and still has one queued
+    /// or in flight. Routine passes on a registration that already
+    /// reconciled once do not count, and neither does a failed first pass.
+    fn first_reconcile_pending(&self, source: &ConfigSource, names: &HashSet<&str>) -> bool {
+        let guard = self.lock();
+        for (id, reg) in &guard.regs {
+            if id.source != *source
+                || !names.contains(reg.corpus.name.as_str())
+                || reg.reconciled_once
+                || reg.last_error.is_some()
+            {
+                continue;
+            }
+            match reg.catch_up {
+                CatchUpState::Queued | CatchUpState::InFlight => return true,
+                CatchUpState::NotStarted | CatchUpState::Done => {}
+            }
+        }
+        false
+    }
+
+    /// Records that the watcher pump failed to start. With no pump, no
+    /// catch-up pass is ever admitted, so a cold-start wait cannot succeed.
+    pub(crate) fn mark_pump_unavailable(&self) {
+        self.pump_unavailable.store(true, Ordering::SeqCst);
+    }
+
+    /// Records that the watcher pump started.
+    pub(crate) fn mark_pump_available(&self) {
+        self.pump_unavailable.store(false, Ordering::SeqCst);
+    }
+
+    pub(crate) fn pump_unavailable(&self) -> bool {
+        self.pump_unavailable.load(Ordering::SeqCst)
+    }
+
+    /// Waits until no registration of `queried` under `source` has an
+    /// unfinished first pass, or until `timeout` elapses. Returns `true`
+    /// when the registrations settled and `false` on timeout or when the
+    /// watcher pump is not running. Holds no registry lock while it waits.
+    pub(crate) async fn wait_first_reconcile(
+        &self,
+        source: &ConfigSource,
+        queried: &[CorpusConfig],
+        timeout: std::time::Duration,
+    ) -> bool {
+        let names: HashSet<&str> = queried.iter().map(|corpus| corpus.name.as_str()).collect();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.first_reconcile_pending(source, &names) {
+                return true;
+            }
+            if self.pump_unavailable() {
+                return false;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return !self.first_reconcile_pending(source, &names);
+            }
+        }
     }
 
     pub(crate) fn config_for(&self, id: &RegistrationId) -> Option<(CorpusConfig, Arc<Config>)> {
@@ -999,14 +1113,28 @@ impl WatchRegistry {
     }
 }
 
+/// Reports whether any in-flight group already holds one of `lock_keys`.
+fn active_locks_overlap(active: &[ActiveGroup], lock_keys: &[CorpusKey]) -> bool {
+    for group in active {
+        for key in &group.lock_keys {
+            if lock_keys.contains(key) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Drops `id` from the in-flight admission group, invalidating the leader slot
 /// when `id` was leading it so the next `begin_next_catch_up` can re-admit.
 fn release_admission(guard: &mut Inner, id: &RegistrationId) {
-    if let Some(position) = guard.active_group.iter().position(|active| active == id) {
-        guard.active_group.remove(position);
-    }
-    if guard.active_leader.as_ref() == Some(id) {
-        guard.active_leader_valid = false;
+    for group in &mut guard.active {
+        if let Some(position) = group.members.iter().position(|active| active == id) {
+            group.members.remove(position);
+        }
+        if group.leader == *id {
+            group.valid = false;
+        }
     }
 }
 
@@ -1315,6 +1443,129 @@ mod tests {
                 "/repo/mid.md"
             )])))
         );
+    }
+
+    fn register_baseline(registry: &WatchRegistry, name: &str) -> RegistrationId {
+        registry.register(
+            ConfigSource::Baseline,
+            corpus(name),
+            Arc::new(Config::default()),
+            vec![root(&format!("/{name}"), corpus(name))],
+        );
+        registry
+            .snapshot_roots()
+            .into_iter()
+            .map(|(id, _)| id)
+            .find(|id| id.corpus_key.name == name)
+            .expect("registered id")
+    }
+
+    #[test]
+    fn catch_up_concurrency_admits_up_to_the_limit_at_once() {
+        let registry = WatchRegistry::new();
+        registry.set_catch_up_limit(2);
+        let a = register_baseline(&registry, "a");
+        let b = register_baseline(&registry, "b");
+        let c = register_baseline(&registry, "c");
+
+        let first = registry.begin_next_catch_up().expect("first admitted");
+        let second = registry.begin_next_catch_up().expect("second admitted");
+        assert_eq!(registry.begin_next_catch_up(), None, "limit reached");
+        assert_eq!(
+            [first.clone(), second.clone()]
+                .into_iter()
+                .filter(|id| *id == c)
+                .count(),
+            0,
+            "FIFO order admits the first two roots",
+        );
+        assert_ne!(first, second);
+        let waiting = [&a, &b, &c]
+            .into_iter()
+            .find(|id| **id != first && **id != second)
+            .expect("one waits");
+        assert_eq!(registry.catch_up_state(waiting), Some(CatchUpState::Queued));
+
+        registry.finish_catch_up(&first, Ok(()));
+        assert_eq!(registry.begin_next_catch_up().as_ref(), Some(waiting));
+        assert_eq!(registry.begin_next_catch_up(), None);
+    }
+
+    #[test]
+    fn catch_up_concurrency_of_one_matches_serial_admission() {
+        let registry = WatchRegistry::new();
+        registry.set_catch_up_limit(1);
+        let a = register_baseline(&registry, "a");
+        register_baseline(&registry, "b");
+
+        let first = registry.begin_next_catch_up().expect("first admitted");
+        assert_eq!(registry.begin_next_catch_up(), None);
+        registry.finish_catch_up(&first, Ok(()));
+        let second = registry.begin_next_catch_up().expect("second admitted");
+        assert_ne!(first, second);
+        assert!(first == a || second == a);
+    }
+
+    fn corpus_at(name: &str, paths: &[&str]) -> CorpusConfig {
+        CorpusConfig {
+            paths: paths.iter().map(|path| (*path).to_string()).collect(),
+            ..corpus(name)
+        }
+    }
+
+    #[test]
+    fn catch_up_runs_worktrees_of_one_corpus_name_concurrently() {
+        let registry = WatchRegistry::new();
+        registry.set_catch_up_limit(2);
+        let cfg = Arc::new(Config::default());
+        let main = corpus_at("wiki", &["/no-such-main"]);
+        let worktree = corpus_at("wiki", &["/no-such-worktree"]);
+        registry.register(
+            ConfigSource::Baseline,
+            main.clone(),
+            cfg.clone(),
+            vec![root("/no-such-main", main)],
+        );
+        registry.register(
+            ConfigSource::RepoLayer(PathBuf::from("/no-such-worktree/.hallouminate")),
+            worktree.clone(),
+            cfg,
+            vec![root("/no-such-worktree", worktree)],
+        );
+
+        let first = registry.begin_next_catch_up().expect("first admitted");
+        let second = registry.begin_next_catch_up().expect("second admitted");
+        assert_ne!(first, second, "distinct roots run in flight together");
+        assert_eq!(registry.begin_next_catch_up(), None);
+    }
+
+    #[test]
+    fn catch_up_never_admits_registrations_sharing_a_corpus_key() {
+        let registry = WatchRegistry::new();
+        registry.set_catch_up_limit(3);
+        let cfg = Arc::new(Config::default());
+        let one = corpus_at("wiki", &["/no-such-a"]);
+        let overlapping = corpus_at("wiki", &["/no-such-b", "/no-such-a"]);
+        registry.register(
+            ConfigSource::Baseline,
+            one.clone(),
+            cfg.clone(),
+            vec![root("/no-such-a", one)],
+        );
+        registry.register(
+            ConfigSource::RepoLayer(PathBuf::from("/no-such-b/.hallouminate")),
+            overlapping.clone(),
+            cfg,
+            vec![root("/no-such-b", overlapping)],
+        );
+        let other = register_baseline(&registry, "other");
+
+        let first = registry.begin_next_catch_up().expect("first admitted");
+        let second = registry.begin_next_catch_up().expect("second admitted");
+        assert_eq!(second, other, "key-sharing registration is deferred");
+        assert_eq!(registry.begin_next_catch_up(), None);
+        registry.finish_catch_up(&first, Ok(()));
+        assert!(registry.begin_next_catch_up().is_some());
     }
 
     #[test]
@@ -2207,5 +2458,178 @@ mod tests {
 
         registry.mark_watched(&id);
         assert_eq!(registry.degraded_count(), 0);
+    }
+
+    fn wait_targets() -> HashSet<&'static str> {
+        HashSet::from(["wiki"])
+    }
+
+    #[test]
+    fn first_pass_counts_as_pending_until_it_finishes_ok_or_err() {
+        for outcome in [Ok(()), Err("scan failed".to_string())] {
+            let registry = WatchRegistry::new();
+            registry.register(
+                ConfigSource::Baseline,
+                corpus("wiki"),
+                Arc::new(Config::default()),
+                vec![],
+            );
+            let id = baseline_id("wiki");
+            assert!(registry.first_reconcile_pending(&ConfigSource::Baseline, &wait_targets()));
+            assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+            assert!(registry.first_reconcile_pending(&ConfigSource::Baseline, &wait_targets()));
+            registry.finish_catch_up(&id, outcome);
+            assert!(!registry.first_reconcile_pending(&ConfigSource::Baseline, &wait_targets()));
+        }
+    }
+
+    /// WHY: a routine pass on a root that already reconciled once must not
+    /// make `ground` wait; only the first reconciliation is a cold start.
+    #[tokio::test]
+    async fn routine_pass_on_warm_root_does_not_block_waiters() {
+        let registry = WatchRegistry::new();
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            Arc::new(Config::default()),
+            vec![],
+        );
+        let id = baseline_id("wiki");
+        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        registry.finish_catch_up(&id, Ok(()));
+        registry.mark_reconcile_due_all();
+        assert_eq!(
+            registry.catch_up_state(&id),
+            Some(CatchUpState::Queued),
+            "the routine pass is queued"
+        );
+
+        let started = std::time::Instant::now();
+        let settled = registry
+            .wait_first_reconcile(
+                &ConfigSource::Baseline,
+                &[corpus("wiki")],
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        assert!(settled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// WHY: a group member shares the leader's pass; without its own
+    /// `reconciled_once`, later routine passes would park every waiter.
+    #[tokio::test]
+    async fn group_member_counts_as_reconciled_after_leader_finishes_ok() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let member_source = ConfigSource::RepoLayer(PathBuf::from("/repo-member"));
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg.clone(), vec![]);
+        registry.register(member_source.clone(), corpus("wiki"), cfg, vec![]);
+        let leader = baseline_id("wiki");
+        let member = RegistrationId {
+            source: member_source.clone(),
+            corpus_key: leader.corpus_key.clone(),
+        };
+        assert_eq!(registry.begin_next_catch_up(), Some(leader.clone()));
+        assert_eq!(
+            registry.catch_up_state(&member),
+            Some(CatchUpState::InFlight),
+            "the member shares the leader's pass"
+        );
+        registry.finish_catch_up(&leader, Ok(()));
+        registry.mark_reconcile_due_all();
+        assert_eq!(
+            registry.catch_up_state(&member),
+            Some(CatchUpState::Queued),
+            "the routine pass is queued"
+        );
+
+        let started = std::time::Instant::now();
+        let settled = registry
+            .wait_first_reconcile(
+                &member_source,
+                &[corpus("wiki")],
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        assert!(settled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn waiter_for_cold_root_times_out_when_pump_is_live() {
+        let registry = WatchRegistry::new();
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            Arc::new(Config::default()),
+            vec![],
+        );
+        let settled = registry
+            .wait_first_reconcile(
+                &ConfigSource::Baseline,
+                &[corpus("wiki")],
+                std::time::Duration::from_millis(100),
+            )
+            .await;
+        assert!(!settled, "a never-reconciled root keeps the waiter parked");
+    }
+
+    /// WHY: with no pump nothing admits catch-ups, so waiting the full bound
+    /// only delays the answer.
+    #[tokio::test]
+    async fn waiter_returns_at_once_when_pump_is_unavailable() {
+        let registry = WatchRegistry::new();
+        registry.register(
+            ConfigSource::Baseline,
+            corpus("wiki"),
+            Arc::new(Config::default()),
+            vec![],
+        );
+        registry.mark_pump_unavailable();
+        let started = std::time::Instant::now();
+        let settled = registry
+            .wait_first_reconcile(
+                &ConfigSource::Baseline,
+                &[corpus("wiki")],
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+        assert!(!settled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn replacing_a_source_wakes_waiters_on_removed_registrations() {
+        let registry = Arc::new(WatchRegistry::new());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        registry.register(
+            source.clone(),
+            corpus("wiki"),
+            Arc::new(Config::default()),
+            vec![],
+        );
+        let waiter = {
+            let registry = registry.clone();
+            let source = source.clone();
+            tokio::spawn(async move {
+                registry
+                    .wait_first_reconcile(
+                        &source,
+                        &[corpus("wiki")],
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        registry
+            .replace_source(source, vec![], Arc::new(Config::default()), |_| vec![])
+            .unwrap();
+        let settled = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("waiter wakes without waiting the full bound")
+            .expect("waiter task");
+        assert!(settled);
     }
 }

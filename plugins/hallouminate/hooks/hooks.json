@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v hallouminate >/dev/null 2>&1 && (hallouminate index --background >/dev/null 2>&1 &) ; exit 0",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

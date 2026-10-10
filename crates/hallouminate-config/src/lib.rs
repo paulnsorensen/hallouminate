@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use hallouminate_domain::common::{CorpusConfig, HallouminateError, Result};
+use hallouminate_domain::common::{CorpusConfig, HallouminateError, Result, expand_tilde};
 use hallouminate_domain::discovery::{DEFAULT_MAX_DEPTH, IgnoreRules, discover_wiki_roots};
 use hallouminate_domain::embeddings::{DEFAULT_EMBED_MODEL, canonical_model_name};
 use hallouminate_domain::repository::{
@@ -28,6 +28,13 @@ const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 // 2s covers the measured ~1.25s median rerank for the default N=50 candidate
 // pool — see `domain::search::crossencoder` for the latency rationale.
 const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
+// Longest a cold-start `ground` waits for a registration catch-up before it
+// answers from the lexical fallback. Capped so a typo cannot park a request.
+const DEFAULT_COLD_WAIT_MS: u64 = 10_000;
+const MAX_COLD_WAIT_MS: u64 = 60_000;
+// Registration catch-up passes the daemon runs at once.
+const DEFAULT_CATCH_UP_CONCURRENCY: usize = 4;
+const MAX_CATCH_UP_CONCURRENCY: usize = 16;
 
 /// Search and ranking defaults applied when a query does not override them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +60,15 @@ pub struct SearchConfig {
     /// `domain::ground::orchestrate::rerank_with_timeout`.
     #[serde(default = "default_rerank_timeout_ms")]
     pub rerank_timeout_ms: u64,
+    /// Milliseconds a `ground` call waits for a cold registration's catch-up
+    /// before it answers from the lexical fallback (default `10000`).
+    /// Values above `60000` are rejected. `0` means never wait.
+    ///
+    /// Layers like the other `search.*` keys: a repository layer may
+    /// set it over a default baseline; two different non-default values
+    /// conflict.
+    #[serde(default = "default_cold_wait_ms")]
+    pub cold_wait_ms: u64,
 }
 
 impl Default for SearchConfig {
@@ -63,6 +79,7 @@ impl Default for SearchConfig {
             limit_default: DEFAULT_LIMIT,
             crossencoder: None,
             rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
+            cold_wait_ms: DEFAULT_COLD_WAIT_MS,
         }
     }
 }
@@ -153,6 +170,14 @@ pub struct WatchConfig {
     /// error naming both source paths.
     #[serde(default)]
     pub reconcile_interval_secs: Option<u64>,
+    /// Registration catch-up passes the daemon runs at once (default `4`).
+    /// Must be at least `1`; `0` is rejected.
+    ///
+    /// Belongs to daemon startup configuration (the XDG baseline layer)
+    /// only, with the same inherit, no-op, and conflict rules as
+    /// `reconcile_interval_secs`, because the limit is daemon-wide.
+    #[serde(default)]
+    pub catch_up_concurrency: Option<usize>,
 }
 
 impl Default for WatchConfig {
@@ -161,6 +186,7 @@ impl Default for WatchConfig {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             failure_reminder_secs: DEFAULT_FAILURE_REMINDER_SECS,
             reconcile_interval_secs: None,
+            catch_up_concurrency: None,
         }
     }
 }
@@ -171,6 +197,13 @@ impl WatchConfig {
     pub fn effective_reconcile_interval_secs(&self) -> u64 {
         self.reconcile_interval_secs
             .unwrap_or(DEFAULT_RECONCILE_INTERVAL_SECS)
+    }
+
+    /// Resolved value after baseline-only merge; `None` on the raw layer
+    /// means "inherit", falling back to the default of `4` when unset.
+    pub fn effective_catch_up_concurrency(&self) -> usize {
+        self.catch_up_concurrency
+            .unwrap_or(DEFAULT_CATCH_UP_CONCURRENCY)
     }
 }
 
@@ -315,6 +348,17 @@ impl Default for StorageConfig {
     }
 }
 
+/// Trust-boundary settings. Baseline-only: a repository layer cannot set them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityConfig {
+    /// Absolute directories that repo-layer `[[corpus]]` and `[[repository]]`
+    /// paths may reach even when they lie outside the repo root. Without an
+    /// entry here, a repo-layer path whose canonical form is outside the repo
+    /// root is skipped with a `config-path-outside-repo` warning.
+    #[serde(default)]
+    pub allow_repo_paths_outside_root: Vec<String>,
+}
+
 /// The fully-resolved hallouminate configuration.
 ///
 /// Assembled by merging the XDG baseline layer with the discovered per-repo
@@ -354,6 +398,9 @@ pub struct Config {
     /// Daemon-wide runtime settings.
     #[serde(default)]
     pub daemon: DaemonConfig,
+    /// Trust-boundary settings, read from the baseline layer only.
+    #[serde(default)]
+    pub security: SecurityConfig,
 }
 
 impl Default for Config {
@@ -368,6 +415,7 @@ impl Default for Config {
             watch: WatchConfig::default(),
             storage: StorageConfig::default(),
             daemon: DaemonConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -404,6 +452,10 @@ pub struct ResolvedLayers {
     /// the same derived corpus name. `handle_ground` surfaces these on the
     /// `GroundResponse.warnings` list. Empty in the common case.
     pub warnings: Vec<String>,
+    /// Repo-layer corpus or repository entries skipped because a path lies
+    /// outside the repo root and the baseline does not allowlist it.
+    /// `handle_ground` surfaces these as `config-path-outside-repo` warnings.
+    pub path_warnings: Vec<String>,
 }
 
 /// Load the XDG baseline (or `--config PATH`).
@@ -647,7 +699,14 @@ fn discover_repo_config_from(cwd: &Path, start: &Path) -> Result<Option<PathBuf>
 ///     tilde expansion happens at consumption time via `expand_tilde`,
 ///     identical to the XDG layer's behavior today.
 ///   - The same `validate()` rules apply (post-resolution).
-pub fn load_repo_layer(config_path: &Path) -> Result<Config> {
+///   - Corpus and repository entries with a path outside the repo root are
+///     dropped, unless the canonical path lies under an `allowed_outside`
+///     entry (the baseline's `security.allow_repo_paths_outside_root`). The
+///     second return value lists one warning per dropped entry.
+pub fn load_repo_layer(
+    config_path: &Path,
+    allowed_outside: &[String],
+) -> Result<(Config, Vec<String>)> {
     let text = std::fs::read_to_string(config_path).map_err(HallouminateError::from)?;
     let mut cfg: Config = toml::from_str(&text).map_err(|e| {
         HallouminateError::Config(format!("parsing config at {}: {e}", config_path.display()))
@@ -666,9 +725,10 @@ pub fn load_repo_layer(config_path: &Path) -> Result<Config> {
     })?;
     let repo_root = hallouminate_dir.parent().unwrap_or(hallouminate_dir);
     resolve_repo_layer_paths(&mut cfg, repo_root);
+    let path_warnings = confine_repo_layer(&mut cfg, repo_root, allowed_outside);
     normalize(&mut cfg)?;
     validate(&cfg)?;
-    Ok(cfg)
+    Ok((cfg, path_warnings))
 }
 
 /// Merge a baseline `Config` with a repo-layer `Config`.
@@ -753,6 +813,14 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        cold_wait_ms: merge_scalar(
+            "search.cold_wait_ms",
+            baseline.search.cold_wait_ms,
+            repo.search.cold_wait_ms,
+            defaults.search.cold_wait_ms,
+            baseline_path,
+            repo_path,
+        )?,
     };
     let embeddings = EmbeddingsConfig {
         enabled: merge_scalar(
@@ -821,6 +889,15 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
+        catch_up_concurrency: merge_baseline_only(
+            "watch.catch_up_concurrency",
+            baseline.watch.catch_up_concurrency.map(widen_usize),
+            repo.watch.catch_up_concurrency.map(widen_usize),
+            widen_usize(DEFAULT_CATCH_UP_CONCURRENCY),
+            baseline_path,
+            repo_path,
+        )?
+        .map(narrow_u64),
     };
     let storage = StorageConfig {
         ground_dir: merge_scalar(
@@ -1004,6 +1081,17 @@ fn merge_layers_with_sources(
         )));
     }
 
+    if repo.security != SecurityConfig::default() {
+        let repo_src = repo_path
+            .map(|p| format!(" (repo at {})", p.display()))
+            .unwrap_or_else(|| " (repo layer)".into());
+        return Err(HallouminateError::Config(format!(
+            "repo-layer conflict on security: [security] is baseline-only, \
+             repo = {:?}{repo_src}",
+            repo.security
+        )));
+    }
+
     let merged = Config {
         corpora,
         repositories,
@@ -1014,6 +1102,7 @@ fn merge_layers_with_sources(
         storage,
         daemon,
         inherit_global_corpora: repo.inherit_global_corpora,
+        security: baseline.security.clone(),
     };
     // Re-run cross-layer validation on the combined lists; the inner
     // `effective_corpora` call covers duplicate-name detection across
@@ -1057,10 +1146,12 @@ pub fn resolve_for_cwd(
                 xdg_path: xdg_path.map(Path::to_path_buf),
                 repo_path: None,
                 warnings,
+                path_warnings: Vec::new(),
             },
         ));
     };
-    let repo = load_repo_layer(&repo_path)?;
+    let (repo, path_warnings) =
+        load_repo_layer(&repo_path, &baseline.security.allow_repo_paths_outside_root)?;
     let effective = merge_layers_with_sources(baseline, &repo, xdg_path, Some(&repo_path))?;
     Ok((
         effective,
@@ -1068,6 +1159,7 @@ pub fn resolve_for_cwd(
             xdg_path: xdg_path.map(Path::to_path_buf),
             repo_path: Some(repo_path),
             warnings: Vec::new(),
+            path_warnings,
         },
     ))
 }
@@ -1188,6 +1280,87 @@ fn resolve_repo_path(raw: &str, base: &Path) -> String {
     base.join(candidate).to_string_lossy().into_owned()
 }
 
+/// Canonicalize `path` even when its tail does not exist yet: resolve the
+/// deepest existing ancestor (following symlinks) and re-append the rest.
+/// Returns an empty path when no ancestor resolves or the tail ends in `..`,
+/// which never lies inside any root.
+fn canonical_lossy(path: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut head = path.to_path_buf();
+    loop {
+        if let Ok(mut real) = head.canonicalize() {
+            for part in tail.iter().rev() {
+                real.push(part);
+            }
+            return real;
+        }
+        let (Some(name), Some(parent)) = (head.file_name(), head.parent()) else {
+            return PathBuf::new();
+        };
+        tail.push(name.to_owned());
+        head = parent.to_path_buf();
+    }
+}
+
+/// Drop repo-layer corpora and repositories with a path outside `repo_root`
+/// (after symlink resolution) unless `allowed_outside` covers it. Runs after
+/// `resolve_repo_layer_paths`, so relative paths are already absolute.
+fn confine_repo_layer(
+    cfg: &mut Config,
+    repo_root: &Path,
+    allowed_outside: &[String],
+) -> Vec<String> {
+    let root = canonical_lossy(repo_root);
+    let mut allowed: Vec<PathBuf> = Vec::new();
+    for entry in allowed_outside {
+        allowed.push(canonical_lossy(&expand_tilde(entry)));
+    }
+    let inside = |raw: &str| -> bool {
+        if raw.is_empty() {
+            return true;
+        }
+        let real = canonical_lossy(&expand_tilde(raw));
+        if real.starts_with(&root) {
+            return true;
+        }
+        for entry in &allowed {
+            if real.starts_with(entry) {
+                return true;
+            }
+        }
+        false
+    };
+    let mut warnings = Vec::new();
+    let corpora = std::mem::take(&mut cfg.corpora);
+    for corpus in corpora {
+        if let Some(path) = corpus.paths.iter().find(|p| !inside(p)) {
+            warnings.push(outside_root_warning("corpus", &corpus.name, path, &root));
+            continue;
+        }
+        cfg.corpora.push(corpus);
+    }
+    let repositories = std::mem::take(&mut cfg.repositories);
+    for repo in repositories {
+        let offending = std::iter::once(&repo.path)
+            .chain(repo.corpus_paths.iter())
+            .find(|p| !inside(p));
+        if let Some(path) = offending {
+            warnings.push(outside_root_warning("repository", &repo.name, path, &root));
+            continue;
+        }
+        cfg.repositories.push(repo);
+    }
+    warnings
+}
+
+fn outside_root_warning(kind: &str, name: &str, path: &str, root: &Path) -> String {
+    format!(
+        "repo-layer {kind} `{name}` skipped: path `{path}` is outside the repo root {}; \
+         allow it with security.allow_repo_paths_outside_root in the baseline config",
+        root.display()
+    )
+}
+
 pub fn xdg_config_path() -> PathBuf {
     crate::xdg::xdg_path(
         "XDG_CONFIG_HOME",
@@ -1246,6 +1419,25 @@ fn validate(cfg: &Config) -> Result<()> {
         return Err(HallouminateError::Config(
             "watch.reconcile_interval_secs must be greater than zero".to_string(),
         ));
+    }
+    if cfg.watch.catch_up_concurrency == Some(0) {
+        return Err(HallouminateError::Config(
+            "watch.catch_up_concurrency must be greater than zero".to_string(),
+        ));
+    }
+    if cfg
+        .watch
+        .catch_up_concurrency
+        .is_some_and(|value| value > MAX_CATCH_UP_CONCURRENCY)
+    {
+        return Err(HallouminateError::Config(format!(
+            "watch.catch_up_concurrency must be at most {MAX_CATCH_UP_CONCURRENCY}"
+        )));
+    }
+    if cfg.search.cold_wait_ms > MAX_COLD_WAIT_MS {
+        return Err(HallouminateError::Config(format!(
+            "search.cold_wait_ms must be at most {MAX_COLD_WAIT_MS}"
+        )));
     }
     for (idx, c) in cfg.corpora.iter().enumerate() {
         if c.name.trim().is_empty() {
@@ -1322,6 +1514,18 @@ fn default_chunks_per_file() -> usize {
 fn default_limit() -> usize {
     DEFAULT_LIMIT
 }
+fn default_cold_wait_ms() -> u64 {
+    DEFAULT_COLD_WAIT_MS
+}
+
+fn widen_usize(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn narrow_u64(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
 fn default_rerank_timeout_ms() -> u64 {
     DEFAULT_RERANK_TIMEOUT_MS
 }
@@ -2130,6 +2334,7 @@ rrf_k                   = 60
                 limit_default: DEFAULT_LIMIT,
                 crossencoder: None,
                 rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
+                cold_wait_ms: DEFAULT_COLD_WAIT_MS,
             },
             "SearchConfig must hold only the surviving fields"
         );
@@ -2580,7 +2785,7 @@ cache_dir = "var/fastembed"
 "#;
         let cfg_path = write_repo_config(&repo_root, cfg);
 
-        let parsed = load_repo_layer(&cfg_path).expect("load_repo_layer");
+        let parsed = load_repo_layer(&cfg_path, &[]).expect("load_repo_layer").0;
         // Repo-layer relative paths are resolved against the repo root
         // (the parent of `.hallouminate/`), not against `.hallouminate/`
         // itself. This matches user intuition: `paths = ["docs"]` written
@@ -2636,7 +2841,10 @@ ground_dir = "/abs/ground"
 cache_dir = "/abs/cache"
 "#;
         let cfg_path = write_repo_config(&repo_root, cfg);
-        let parsed = load_repo_layer(&cfg_path).expect("load_repo_layer");
+        let allowed = vec!["/abs".to_string()];
+        let parsed = load_repo_layer(&cfg_path, &allowed)
+            .expect("load_repo_layer")
+            .0;
 
         assert_eq!(parsed.corpora[0].paths, vec!["/abs/docs".to_string()]);
         assert_eq!(parsed.repositories[0].path, "/abs/repo");
@@ -2669,7 +2877,10 @@ ground_dir = "~/ground"
 cache_dir = "~/cache"
 "#;
         let cfg_path = write_repo_config(&repo_root, cfg);
-        let parsed = load_repo_layer(&cfg_path).expect("load_repo_layer");
+        let allowed = vec!["~".to_string()];
+        let parsed = load_repo_layer(&cfg_path, &allowed)
+            .expect("load_repo_layer")
+            .0;
 
         // Tilde expansion happens at consumption time via `expand_tilde`;
         // the loader must NOT rewrite tilde-prefixed strings.
@@ -2949,6 +3160,98 @@ path = "/b"
         let cfg = parse("", None).expect("empty config parses");
         assert_eq!(cfg.watch.reconcile_interval_secs, None);
         assert_eq!(cfg.watch.effective_reconcile_interval_secs(), 60);
+    }
+
+    #[test]
+    fn cold_wait_ms_defaults_to_ten_thousand_when_omitted() {
+        let cfg = parse("", None).expect("empty config parses");
+        assert_eq!(cfg.search.cold_wait_ms, 10_000);
+    }
+
+    #[test]
+    fn cold_wait_ms_set_value_is_honored_and_repo_sets_over_default_baseline() {
+        let baseline = parse("[search]\ncold_wait_ms = 2500\n", None).expect("baseline");
+        assert_eq!(baseline.search.cold_wait_ms, 2500);
+        let default_baseline = parse("", None).expect("default baseline");
+        let repo = parse("[search]\ncold_wait_ms = 100\n", None).expect("repo");
+        let merged = merge_layers(&default_baseline, &repo).expect("merge");
+        assert_eq!(merged.search.cold_wait_ms, 100);
+        let conflict = merge_layers(&baseline, &repo).expect_err("two non-default values conflict");
+        match conflict {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("search.cold_wait_ms"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cold_wait_ms_above_cap_is_rejected() {
+        let err = parse("[search]\ncold_wait_ms = 60001\n", None)
+            .expect_err("cold_wait_ms above the cap must be rejected");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("search.cold_wait_ms"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        parse("[search]\ncold_wait_ms = 60000\n", None).expect("cap itself is valid");
+    }
+
+    #[test]
+    fn catch_up_concurrency_defaults_to_four_when_omitted() {
+        let cfg = parse("", None).expect("empty config parses");
+        assert_eq!(cfg.watch.catch_up_concurrency, None);
+        assert_eq!(cfg.watch.effective_catch_up_concurrency(), 4);
+    }
+
+    #[test]
+    fn catch_up_concurrency_set_value_is_honored_and_repo_omission_inherits() {
+        let baseline = parse("[watch]\ncatch_up_concurrency = 8\n", None).expect("baseline");
+        let repo = parse("", None).expect("repo");
+        let merged = merge_layers(&baseline, &repo).expect("merge");
+        assert_eq!(merged.watch.effective_catch_up_concurrency(), 8);
+    }
+
+    #[test]
+    fn catch_up_concurrency_repo_override_is_a_conflict() {
+        let baseline = parse("[watch]\ncatch_up_concurrency = 8\n", None).expect("baseline");
+        let repo = parse("[watch]\ncatch_up_concurrency = 2\n", None).expect("repo");
+        let err = merge_layers(&baseline, &repo).expect_err("repo override must conflict");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("watch.catch_up_concurrency"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catch_up_concurrency_zero_is_rejected() {
+        let err = parse("[watch]\ncatch_up_concurrency = 0\n", None)
+            .expect_err("zero catch_up_concurrency must be rejected");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("watch.catch_up_concurrency"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catch_up_concurrency_above_cap_is_rejected() {
+        let over = MAX_CATCH_UP_CONCURRENCY + 1;
+        let err = parse(&format!("[watch]\ncatch_up_concurrency = {over}\n"), None)
+            .expect_err("oversized catch_up_concurrency must be rejected");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("watch.catch_up_concurrency"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let at_cap = MAX_CATCH_UP_CONCURRENCY;
+        parse(&format!("[watch]\ncatch_up_concurrency = {at_cap}\n"), None)
+            .expect("the cap itself is accepted");
     }
 
     #[test]
@@ -3309,5 +3612,180 @@ paths = ["/srv/cheese-global"]
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    fn corpus_names(cfg: &Config) -> Vec<&str> {
+        let mut names = Vec::new();
+        for corpus in &cfg.corpora {
+            names.push(corpus.name.as_str());
+        }
+        names
+    }
+
+    const OUTSIDE_CONFIG: &str = r#"
+[[corpus]]
+name = "home"
+paths = ["~"]
+
+[[corpus]]
+name = "etc"
+paths = ["/etc"]
+
+[[corpus]]
+name = "sibling"
+paths = ["../sibling"]
+
+[[corpus]]
+name = "docs"
+paths = ["docs"]
+
+[[repository]]
+name = "evil"
+path = "/etc"
+"#;
+
+    #[test]
+    fn repo_layer_paths_outside_root_are_skipped_with_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        std::fs::create_dir_all(outer.join("sibling")).expect("mkdir sibling");
+        let cfg_path = write_repo_config(&repo_root, OUTSIDE_CONFIG);
+
+        let (cfg, warnings) = load_repo_layer(&cfg_path, &[]).expect("load");
+
+        assert_eq!(corpus_names(&cfg), vec!["docs"]);
+        assert!(cfg.repositories.is_empty(), "got: {:?}", cfg.repositories);
+        assert_eq!(warnings.len(), 4, "got: {warnings:?}");
+        for name in ["`home`", "`etc`", "`sibling`", "`evil`"] {
+            assert!(
+                warnings.iter().any(|w| w.contains(name)),
+                "missing {name}: {warnings:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_for_cwd_reports_outside_root_paths_and_keeps_in_repo_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        write_repo_config(&repo_root, OUTSIDE_CONFIG);
+
+        let (effective, layers) =
+            resolve_for_cwd(&Config::default(), &repo_root, None).expect("resolve");
+
+        assert_eq!(corpus_names(&effective), vec!["docs"]);
+        assert_eq!(
+            layers.path_warnings.len(),
+            4,
+            "got: {:?}",
+            layers.path_warnings
+        );
+    }
+
+    #[test]
+    fn in_repo_relative_paths_resolve_for_main_checkout_and_worktree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let main_repo = outer.join("main-repo");
+        let worktrees_dir = main_repo.join(".git").join("worktrees").join("wt1");
+        std::fs::create_dir_all(&worktrees_dir).expect("mkdir worktrees/wt1");
+        write_repo_config(
+            &main_repo,
+            r#"
+[[corpus]]
+name = "docs"
+paths = ["docs"]
+
+[[repository]]
+name = "self"
+path = "."
+"#,
+        );
+        let wt = outer.join("wt1");
+        std::fs::create_dir_all(&wt).expect("mkdir wt1");
+        let ptr = format!("gitdir: {}\n", worktrees_dir.display());
+        std::fs::write(wt.join(".git"), ptr).expect("write worktree .git");
+
+        for cwd in [&main_repo, &wt] {
+            let (effective, layers) =
+                resolve_for_cwd(&Config::default(), cwd, None).expect("resolve");
+            assert!(
+                layers.path_warnings.is_empty(),
+                "{:?}",
+                layers.path_warnings
+            );
+            assert_eq!(corpus_names(&effective), vec!["docs"]);
+            assert_eq!(effective.repositories.len(), 1);
+        }
+    }
+
+    #[test]
+    fn baseline_allowlist_permits_outside_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        let sibling = outer.join("sibling");
+        std::fs::create_dir_all(&sibling).expect("mkdir sibling");
+        write_repo_config(
+            &repo_root,
+            "[[corpus]]\nname = \"sibling\"\npaths = [\"../sibling/notes\"]\n",
+        );
+        let mut baseline = Config::default();
+        baseline.security.allow_repo_paths_outside_root = vec![sibling.display().to_string()];
+
+        let (effective, layers) = resolve_for_cwd(&baseline, &repo_root, None).expect("resolve");
+
+        assert_eq!(corpus_names(&effective), vec!["sibling"]);
+        assert!(layers.path_warnings.is_empty());
+        assert_eq!(
+            effective.security.allow_repo_paths_outside_root,
+            baseline.security.allow_repo_paths_outside_root
+        );
+    }
+
+    #[test]
+    fn repo_layer_cannot_set_security_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        write_repo_config(
+            &repo_root,
+            "[security]\nallow_repo_paths_outside_root = [\"/etc\"]\n\n\
+             [[corpus]]\nname = \"etc\"\npaths = [\"/etc\"]\n",
+        );
+
+        let err = resolve_for_cwd(&Config::default(), &repo_root, None)
+            .expect_err("repo-layer [security] must be rejected");
+
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("security"), "got: {msg}");
+                assert!(msg.contains("baseline-only"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_layer_symlink_pointing_outside_root_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        let outside = outer.join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+        std::os::unix::fs::symlink(&outside, repo_root.join("link")).expect("symlink");
+        let cfg_path = write_repo_config(
+            &repo_root,
+            "[[corpus]]\nname = \"linked\"\npaths = [\"link\", \"link/deeper\"]\n",
+        );
+
+        let (cfg, warnings) = load_repo_layer(&cfg_path, &[]).expect("load");
+
+        assert!(cfg.corpora.is_empty());
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
     }
 }

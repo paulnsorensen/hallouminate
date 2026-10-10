@@ -44,7 +44,10 @@ Spawn one haiku sub-agent per sub-question in a single message so they run concu
 Give each the exact Ground call, fixed checkout and corpus, and this contract:
 
 > Run `ground { query: "<sub-question>", corpus: "<corpus>", top_files: 5, chunks_per_file: 3, cwd }`.
-> Inspect `index-coverage` and `index-reconciliation` warnings for the selected corpus before interpreting results, including zero hits.
+> A cold corpus makes the first Ground wait for the first reconciliation, up to `search.cold_wait_ms` (default 10 s, maximum 60 s).
+> After that wait, Ground can return lexical line-window hits instead of indexed chunks.
+> A fallback hit has a `chunk_id` that starts with `lexical-fallback:` and an empty `heading_path`; its `stale` flag does not show index freshness.
+> Inspect `index-coverage`, `index-reconciliation`, every `lexical-fallback*` warning (`lexical-fallback`, `-truncated`, `-timeout`, `-failed`, `-scan-timeout`), and `config-path-outside-repo` for the selected corpus before interpreting results, including zero hits.
 > Foreign-corpus hits do not establish coverage or successful grounding of the selected repository.
 > For each relevant selected-corpus chunk, return:
 > `{ claim, path, line_range, heading_path, score, snippet (≤200 chars) }`.
@@ -55,6 +58,7 @@ Give each the exact Ground call, fixed checkout and corpus, and this contract:
 > Return `{ found, incomplete_retrieval, warnings, remaining_warnings, evidence }`.
 > Carry selected-corpus readiness warnings verbatim, including their checkout or root information.
 > Set `incomplete_retrieval: true` while coverage is incomplete or reconciliation remains unresolved.
+> Also set it when any `lexical-fallback*` warning is present: those results are not evidence of absence.
 > `found: false` means no supporting evidence was retrieved; it does not by itself establish a wiki gap.
 
 Ground provides per-file `summary, keywords, score, mtime, corpus, chunks[]`.

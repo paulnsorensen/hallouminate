@@ -511,6 +511,7 @@ mod tests {
                 corpus: None,
                 paths_from: None,
                 strict: false,
+                background: false,
             })),
             mutation_class,
         );

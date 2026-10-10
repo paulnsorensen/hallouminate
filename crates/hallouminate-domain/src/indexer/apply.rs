@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::common::{CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::blake3_file;
@@ -113,6 +115,7 @@ struct RunCtx<'a> {
     registry: &'a HandlerRegistry,
     indexed_at_ms: i64,
     batch_size: usize,
+    lane: Option<&'a LaneFn>,
 }
 
 /// Default number of files prepared and embedded per batch when the caller
@@ -169,6 +172,54 @@ pub async fn apply(
     batch_size: usize,
     precomputed: Option<(&FileRef, &[u8])>,
 ) -> Result<ApplyStats> {
+    apply_with_lane(plan, store, registry, corpus, batch_size, precomputed, None).await
+}
+
+/// Opaque guard that a [`LaneFn`] returns. `apply_with_lane` holds it for the
+/// duration of one store write and then drops it.
+pub type LaneGuard = Box<dyn Send>;
+
+/// Why a caller could not hand out the write lane, such as a closed lane
+/// or a daemon that is shutting down. The pass that asked for the lane
+/// aborts with this reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct LaneError(pub &'static str);
+
+impl From<LaneError> for HallouminateError {
+    fn from(error: LaneError) -> Self {
+        HallouminateError::Indexer(error.0.to_string())
+    }
+}
+
+/// Future that resolves once the caller owns the write lane, or fails with
+/// the reason the lane is unavailable.
+pub type LaneFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<LaneGuard, LaneError>> + Send>>;
+
+/// Caller-supplied closure that acquires the write lane.
+pub type LaneFn = dyn Fn() -> LaneFuture + Send + Sync;
+
+async fn acquire_lane(lane: Option<&LaneFn>) -> Result<Option<LaneGuard>> {
+    match lane {
+        Some(acquire) => Ok(Some(acquire().await?)),
+        None => Ok(None),
+    }
+}
+
+/// Like [`apply`], but acquires the write lane through `lane` around each
+/// store write batch, not around the whole plan. File reads, hashing, and
+/// chunking run without the lane. With `lane` set to `None`, this function
+/// behaves as [`apply`].
+pub async fn apply_with_lane(
+    plan: IndexPlan,
+    store: &dyn ChunkStore,
+    registry: &HandlerRegistry,
+    corpus: &CorpusConfig,
+    batch_size: usize,
+    precomputed: Option<(&FileRef, &[u8])>,
+    lane: Option<&LaneFn>,
+) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
     let batch_size = batch_size.max(1);
     let indexed_at_ms = chrono::Utc::now().timestamp_millis();
@@ -177,6 +228,7 @@ pub async fn apply(
         registry,
         indexed_at_ms,
         batch_size,
+        lane,
     };
 
     let mut upsert_reqs: Vec<WriteRequest<'_>> = Vec::with_capacity(plan.upserts.len());
@@ -207,6 +259,7 @@ pub async fn apply(
             None => blake3_file(candidate.file.as_path())?,
         };
         if new_hash == candidate.snap.content_hash {
+            let _lane = acquire_lane(lane).await?;
             store
                 .touch_mtime(
                     &candidate.snap.corpus_key,
@@ -239,6 +292,7 @@ pub async fn apply(
     let configured_keys = corpus.corpus_keys();
     for snapshot in plan.deletes {
         if configured_keys.contains(&snapshot.corpus_key) {
+            let _lane = acquire_lane(lane).await?;
             store
                 .delete_file(&snapshot.corpus_key, &snapshot.file_ref)
                 .await?;
@@ -319,6 +373,7 @@ async fn run_in_batches(
                             file = %file_ref,
                             "evicting indexed file from search: re-index produced an empty file",
                         );
+                        let _lane = acquire_lane(run.lane).await?;
                         run.store.delete_file(&req.corpus_key, &file_ref).await?;
                         stats.files_deleted += 1;
                     }
@@ -330,6 +385,7 @@ async fn run_in_batches(
                 continue;
             }
             let file_count = prepared.len();
+            let _lane = acquire_lane(run.lane).await?;
             let write_stats = run.store.apply_batch(prepared).await?;
             stats.chunks_inserted += write_stats.chunks_written;
             stats.embeddings_inserted += write_stats.embeddings_written;
@@ -342,7 +398,8 @@ async fn run_in_batches(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use text_splitter::Characters;
@@ -357,6 +414,16 @@ mod tests {
     struct RecordingStore {
         deleted: Mutex<Vec<(CorpusKey, String)>>,
         batches: Mutex<Vec<CorpusKey>>,
+        guards_live: Arc<AtomicUsize>,
+        guards_live_at_write: Mutex<Vec<usize>>,
+    }
+
+    struct CountedGuard(Arc<AtomicUsize>);
+
+    impl Drop for CountedGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -403,6 +470,10 @@ mod tests {
                 .lock()
                 .map_err(|_| HallouminateError::Indexer("batches mutex poisoned".into()))?
                 .push(first.corpus_key.clone());
+            self.guards_live_at_write
+                .lock()
+                .map_err(|_| HallouminateError::Indexer("guards mutex poisoned".into()))?
+                .push(self.guards_live.load(Ordering::SeqCst));
             Ok(BatchWriteStats {
                 chunks_written: files.iter().map(|file| file.chunks.len()).sum(),
                 embeddings_written: 0,
@@ -559,6 +630,75 @@ mod tests {
             *store.batches.lock().expect("batches mutex"),
             expected,
             "one deterministic write batch per corpus root"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_with_lane_acquires_the_lane_once_per_write_batch() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let key = CorpusKey::from_configured_root("docs", &root.path().to_string_lossy());
+        let mut upserts = Vec::new();
+        for name in ["a.md", "b.md", "c.md"] {
+            let file = root.path().join(name);
+            std::fs::write(&file, format!("# {name}\n\nbody of {name}\n")).expect("write file");
+            upserts.push(Upsert {
+                file: FileRef::new(file),
+                mtime: Mtime(1),
+                corpus_key: Some(key.clone()),
+            });
+        }
+        let plan = IndexPlan {
+            upserts,
+            mtime_touches: Vec::new(),
+            deletes: Vec::new(),
+        };
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![root.path().to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+        let guards_live = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&acquisitions);
+        let live = Arc::clone(&guards_live);
+        let lane: Box<LaneFn> = Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            live.fetch_add(1, Ordering::SeqCst);
+            let guard = CountedGuard(Arc::clone(&live));
+            Box::pin(async move { Ok(Box::new(guard) as LaneGuard) })
+        });
+        let store = RecordingStore {
+            guards_live: Arc::clone(&guards_live),
+            ..RecordingStore::default()
+        };
+        let registry = HandlerRegistry::new(Characters, 384);
+
+        let stats = apply_with_lane(plan, &store, &registry, &corpus, 1, None, Some(&*lane))
+            .await
+            .expect("apply_with_lane");
+
+        let batch_count = store.batches.lock().expect("batches mutex").len();
+        assert_eq!(stats.files_upserted, 3);
+        assert_eq!(
+            batch_count, 3,
+            "batch size 1 must split three files into three batches"
+        );
+        assert_eq!(
+            acquisitions.load(Ordering::SeqCst),
+            batch_count,
+            "the lane is acquired once per write batch"
+        );
+        assert_eq!(
+            *store.guards_live_at_write.lock().expect("guards mutex"),
+            vec![1, 1, 1],
+            "exactly one lane guard is held while each batch writes"
+        );
+        assert_eq!(
+            guards_live.load(Ordering::SeqCst),
+            0,
+            "every lane guard is released after its batch"
         );
     }
 

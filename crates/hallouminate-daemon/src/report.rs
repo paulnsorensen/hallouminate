@@ -11,6 +11,27 @@ pub struct IndexReport {
     pub warnings: Vec<String>,
 }
 
+/// Reply to a background `IndexRequest`: the corpora the daemon newly
+/// registered and queued for catch-up. Corpora that were already registered
+/// unchanged are not listed. The catch-up itself has not finished.
+///
+/// Wire compatibility: a daemon that predates background indexing replies
+/// with an [`IndexReport`] and no `queued` field. That reply decodes here with
+/// an empty `queued` list and `acknowledged` false. Only a daemon that queued
+/// the pass sets `acknowledged`, so a client must fail on its absence instead
+/// of treating an empty list as proof of a queued pass.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct QueuedIndexReport {
+    /// True when the daemon honoured `background` and queued the catch-up.
+    #[serde(default)]
+    pub acknowledged: bool,
+    #[serde(default)]
+    pub queued: Vec<String>,
+    /// True when the watcher registration limit left a corpus unwatched.
+    #[serde(default)]
+    pub registration_limit_reached: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorpusReport {
     pub name: String,
@@ -150,5 +171,15 @@ mod tests {
         let report = CorpusReport::from_stats("docs".into(), ApplyStats::default());
         let wire = serde_json::to_value(&report).expect("serialize report");
         assert!(wire.get("skipped_unreadable").is_none(), "{wire}");
+    }
+
+    #[test]
+    fn queued_report_decodes_an_older_daemons_index_reply_as_nothing_queued() {
+        let old_reply = serde_json::json!({ "corpora": [], "warnings": ["x"] });
+        let decoded: QueuedIndexReport =
+            serde_json::from_value(old_reply).expect("older reply decodes");
+        assert!(decoded.queued.is_empty());
+        assert!(!decoded.acknowledged);
+        assert!(!decoded.registration_limit_reached);
     }
 }

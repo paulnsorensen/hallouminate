@@ -1,16 +1,20 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, TryStreamExt};
 
-use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
+use crate::common::{CorpusConfig, CorpusKey, FileRef, HallouminateError, Result};
+use crate::corpus::scan;
 use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
 use crate::search::{
-    ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, search_fused, search_phrase,
+    ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, lexical_fallback_search,
+    rank_after, search_fused_indexed, search_phrase,
 };
 
 use super::bucket::{Rollup, normalize_scores, roll_up};
+use super::inventory::{IndexedFiles, Inventory, RootInventory};
 use super::types::{
     DocFile, GroundGroupBy, GroundMatch, GroundOutput, GroundResponse, Stats, Warning,
 };
@@ -200,20 +204,140 @@ pub async fn ground(
     .await
 }
 
-/// Searches one root-aware corpus identity, returning its un-reranked hits
-/// plus any warnings raised while assembling them.
-async fn search_corpus(
+/// One corpus root's search result: the fused hits plus the lexical
+/// fallback hits, which stay out of the rerank pool and rank after every
+/// fused hit.
+struct CorpusSearch {
+    fused: FusedSearch,
+    fallback: Vec<SearchHit>,
+}
+
+/// Lists each root's indexed files once, then scans each corpus once.
+///
+/// The scan applies the include, exclude, gitignore, and nested-root rules,
+/// so the fallback admits only files the indexer would index. A corpus that
+/// cannot be scanned adds no eligible files. A corpus whose store cannot
+/// list its indexed files is not scanned, because it gets no fallback.
+async fn scan_inventory(corpora: &[CorpusConfig], store: &dyn ChunkRetrieval) -> Inventory {
+    let mut listed: Vec<(&CorpusConfig, Vec<(CorpusKey, IndexedFiles)>)> =
+        Vec::with_capacity(corpora.len());
+    for corpus in corpora {
+        let mut roots = Vec::new();
+        for corpus_key in corpus.corpus_keys() {
+            let indexed = match store.indexed_file_refs(&corpus_key).await {
+                Ok(Some(indexed)) => IndexedFiles::Known(Arc::new(indexed)),
+                Ok(None) => IndexedFiles::Unknown,
+                Err(error) => IndexedFiles::ListingFailed(error.to_string()),
+            };
+            roots.push((corpus_key, indexed));
+        }
+        listed.push((corpus, roots));
+    }
+    let mut scannable = Vec::new();
+    for (corpus, roots) in &listed {
+        let mut has_known_root = false;
+        for (_, indexed) in roots {
+            match indexed {
+                IndexedFiles::Known(_) => has_known_root = true,
+                IndexedFiles::Unknown | IndexedFiles::ListingFailed(_) => {}
+            }
+        }
+        if has_known_root {
+            scannable.push((*corpus).clone());
+        }
+    }
+    let scans = futures_util::future::join_all(scannable.into_iter().map(|corpus| async move {
+        let scanned = tokio::task::spawn_blocking(move || scan(&corpus)).await;
+        match scanned {
+            Ok(Ok(files)) => files,
+            Ok(Err(error)) => {
+                tracing::debug!(err = %error, "lexical fallback skipped: corpus scan failed");
+                Vec::new()
+            }
+            Err(error) => {
+                tracing::warn!(err = %error, "lexical fallback skipped: corpus scan task failed");
+                Vec::new()
+            }
+        }
+    }))
+    .await;
+    let mut eligible: BTreeMap<CorpusKey, HashSet<FileRef>> = BTreeMap::new();
+    for file in scans.into_iter().flatten() {
+        eligible
+            .entry(file.corpus_key)
+            .or_default()
+            .insert(file.file);
+    }
+    let mut inventory = Inventory::new();
+    for (_, roots) in listed {
+        for (corpus_key, indexed) in roots {
+            let files = eligible.get(&corpus_key).cloned().unwrap_or_default();
+            inventory.insert(
+                corpus_key,
+                RootInventory {
+                    eligible: Arc::new(files),
+                    indexed,
+                },
+            );
+        }
+    }
+    inventory
+}
+
+/// Searches one root: the fused signals, then the lexical fallback over the
+/// root's unindexed files. A failed indexed-file listing degrades to no
+/// fallback plus a `lexical-fallback-failed` warning.
+async fn search_root_ranked(
     query: &str,
+    corpus: &CorpusConfig,
     corpus_key: &CorpusKey,
     store: &dyn ChunkRetrieval,
-    globs: &[String],
     limit: usize,
-    match_mode: GroundMatch,
-) -> Result<FusedSearch> {
-    match match_mode {
-        GroundMatch::Ranked => search_fused(store, corpus_key, query, globs, limit).await,
-        GroundMatch::Phrase => search_phrase(store, corpus_key, query, limit).await,
+    root: RootInventory,
+) -> Result<CorpusSearch> {
+    let RootInventory { eligible, indexed } = root;
+    let mut listing_warning = None;
+    let indexed = match &indexed {
+        IndexedFiles::Known(files) => Some(files.as_ref()),
+        IndexedFiles::Unknown => None,
+        IndexedFiles::ListingFailed(reason) => {
+            tracing::warn!(err = %reason, "lexical fallback skipped: indexed file listing failed");
+            listing_warning = Some(Warning {
+                code: "lexical-fallback-failed".to_string(),
+                message: format!(
+                    "could not list indexed files in corpus root {} ({reason}); skipping the lexical fallback",
+                    corpus_key.canonical_root.display()
+                ),
+            });
+            None
+        }
+    };
+    let mut fused =
+        search_fused_indexed(store, corpus_key, query, &corpus.globs, limit, indexed).await?;
+    fused.warnings.extend(listing_warning);
+    let lexical = lexical_fallback_search(corpus_key, query, &eligible, indexed, limit).await;
+    if let Some(unpooled) = &fused.unpooled_files {
+        let mut covered = HashSet::new();
+        for hit in &lexical.hits {
+            covered.insert(hit.file_ref.as_str());
+        }
+        let mut resolved = true;
+        for file in unpooled {
+            if !covered.contains(file.as_str()) {
+                resolved = false;
+            }
+        }
+        if resolved {
+            fused
+                .warnings
+                .retain(|warning| warning.code != "ripgrep-unresolved");
+        }
     }
+    fused.warnings.extend(lexical.warnings);
+    Ok(CorpusSearch {
+        fused,
+        fallback: lexical.hits,
+    })
 }
 
 /// Cap on concurrent per-root searches fanned out by `ground_union`. Each
@@ -265,6 +389,40 @@ pub async fn ground_union(
     opts: GroundOpts,
     priority_corpus: Option<&str>,
 ) -> Result<GroundResponse> {
+    let inventory = match opts.match_mode {
+        GroundMatch::Ranked => scan_inventory(corpora, store).await,
+        GroundMatch::Phrase => Inventory::new(),
+    };
+    ground_union_inventoried(
+        query,
+        corpora,
+        store,
+        crossencoder,
+        opts,
+        priority_corpus,
+        &inventory,
+    )
+    .await
+}
+
+/// [`ground_union`] with each root's eligible and indexed file sets supplied
+/// by the caller, so the caller walks and lists each root once per request.
+///
+/// A root missing from `inventory` gets no lexical fallback.
+///
+/// # Errors
+///
+/// Returns an error when the request shape is invalid (see
+/// [`validate_shape`]) or when retrieval or rollup fails.
+pub async fn ground_union_inventoried(
+    query: &str,
+    corpora: &[CorpusConfig],
+    store: &dyn ChunkRetrieval,
+    crossencoder: Option<Box<dyn Crossencoder>>,
+    opts: GroundOpts,
+    priority_corpus: Option<&str>,
+    inventory: &Inventory,
+) -> Result<GroundResponse> {
     validate_shape(opts.match_mode, opts.output)
         .map_err(|error| HallouminateError::Search(error.to_string()))?;
     let started = Instant::now();
@@ -272,40 +430,63 @@ pub async fn ground_union(
         GroundOutput::Hits => opts.limit,
         GroundOutput::Counts => MAX_PHRASE_SCAN_ROWS,
     };
-    let corpus_keys: Vec<(CorpusKey, &[String])> = corpora
-        .iter()
-        .flat_map(|c| {
-            c.corpus_keys()
-                .into_iter()
-                .map(move |k| (k, c.globs.as_slice()))
-        })
-        .collect();
-    // Collected eagerly: a lazy `Map` iterator would bake the closure into
-    // the stream's type, and that closure is not general enough over the
-    // borrow's lifetime once this future is spawned (the daemon spawns it),
-    // so inference fails at the far-away spawn site. Futures are inert until
-    // polled, so building them up front costs nothing and `buffered` still
-    // polls at most MAX_CONCURRENT_CORPUS_SEARCHES of them at a time.
-    let searches: Vec<_> = corpus_keys
-        .iter()
-        .map(|(corpus_key, globs)| {
-            search_corpus(query, corpus_key, store, globs, limit, opts.match_mode)
-        })
-        .collect();
-    // `buffered` (not `buffer_unordered`) preserves per-root result order,
-    // which callers rely on for warning ordering; it still propagates the
-    // first `Err` like `try_join_all` did.
-    let search_results: Vec<FusedSearch> = futures_util::stream::iter(searches)
-        .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
-        .try_collect()
-        .await?;
-    let mut hits: Vec<SearchHit> = Vec::new();
-    let mut warnings = Vec::new();
-    for result in search_results {
-        hits.extend(result.hits);
-        warnings.extend(result.warnings);
+    let mut corpus_keys: Vec<(CorpusKey, &CorpusConfig)> = Vec::new();
+    for corpus in corpora {
+        for corpus_key in corpus.corpus_keys() {
+            corpus_keys.push((corpus_key, corpus));
+        }
     }
-    let stats = Stats { hits: hits.len() };
+    let mut warnings = Vec::new();
+    // The futures are collected eagerly because a lazy `Map` stream infers a
+    // closure type that is not general enough once the daemon spawns this
+    // future. `buffered` keeps per-root order, which warning order relies on.
+    let search_results: Vec<CorpusSearch> = match opts.match_mode {
+        GroundMatch::Ranked => {
+            let mut searches = Vec::with_capacity(corpus_keys.len());
+            for (corpus_key, corpus) in &corpus_keys {
+                let root = inventory.get(corpus_key).cloned().unwrap_or_default();
+                searches.push(search_root_ranked(
+                    query, corpus, corpus_key, store, limit, root,
+                ));
+            }
+            futures_util::stream::iter(searches)
+                .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+                .try_collect()
+                .await?
+        }
+        GroundMatch::Phrase => {
+            let mut searches = Vec::with_capacity(corpus_keys.len());
+            for (corpus_key, _) in &corpus_keys {
+                searches.push(search_phrase(store, corpus_key, query, limit));
+            }
+            let phrased = futures_util::stream::iter(searches)
+                .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+                .try_collect::<Vec<FusedSearch>>()
+                .await?;
+            let mut results = Vec::with_capacity(phrased.len());
+            for fused in phrased {
+                results.push(CorpusSearch {
+                    fused,
+                    fallback: Vec::new(),
+                });
+            }
+            results
+        }
+    };
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut fallback_hits: Vec<SearchHit> = Vec::new();
+    let mut fallback_files: BTreeSet<(CorpusKey, String)> = BTreeSet::new();
+    for result in search_results {
+        hits.extend(result.fused.hits);
+        warnings.extend(result.fused.warnings);
+        for hit in &result.fallback {
+            fallback_files.insert((hit.corpus_key.clone(), hit.file_ref.clone()));
+        }
+        fallback_hits.extend(result.fallback);
+    }
+    let stats = Stats {
+        hits: hits.len() + fallback_hits.len(),
+    };
 
     let crossencoder = match opts.match_mode {
         GroundMatch::Ranked => crossencoder,
@@ -341,6 +522,9 @@ pub async fn ground_union(
         }
     }
 
+    rank_after(&mut fallback_hits, &hits);
+    hits.extend(fallback_hits);
+
     let mut by_key: BTreeMap<CorpusKey, Vec<SearchHit>> = BTreeMap::new();
     for hit in hits {
         by_key.entry(hit.corpus_key.clone()).or_default().push(hit);
@@ -354,6 +538,7 @@ pub async fn ground_union(
         output: opts.output,
     };
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
+    let mut fallback_docs: HashSet<String> = HashSet::new();
     for (corpus_key, corpus_hits) in by_key {
         let mut built = roll_up(&corpus_hits, usize::MAX, rollup)?;
         let root = corpus_key.canonical_root.to_string_lossy().into_owned();
@@ -365,11 +550,15 @@ pub async fn ground_union(
             }
         }
         for (path, doc) in built {
+            let is_fallback = fallback_files.contains(&(corpus_key.clone(), path.clone()));
             let doc_key = if docs.contains_key(&path) {
                 format!("{path} [{}]", corpus_key.name)
             } else {
                 path
             };
+            if is_fallback {
+                fallback_docs.insert(doc_key.clone());
+            }
             docs.insert(doc_key, doc);
         }
     }
@@ -377,17 +566,25 @@ pub async fn ground_union(
     match opts.output {
         GroundOutput::Hits => {
             if docs.len() > opts.top_files {
-                docs = cut_with_local_reserve(docs, opts.top_files, priority_corpus, |a, b| {
-                    rollup_order(priority_corpus, a, b)
-                });
+                docs = cut_with_local_reserve(
+                    docs,
+                    opts.top_files,
+                    priority_corpus,
+                    &fallback_docs,
+                    |a, b| rollup_order(priority_corpus, a, b),
+                );
             }
         }
         GroundOutput::Counts => {
             if docs.len() > MAX_COUNTS_FILES {
                 let matched_files = docs.len();
-                docs = cut_with_local_reserve(docs, MAX_COUNTS_FILES, priority_corpus, |a, b| {
-                    counts_order(priority_corpus, a, b)
-                });
+                docs = cut_with_local_reserve(
+                    docs,
+                    MAX_COUNTS_FILES,
+                    priority_corpus,
+                    &fallback_docs,
+                    |a, b| counts_order(priority_corpus, a, b),
+                );
                 warnings.push(Warning {
                     code: "counts-truncated".to_string(),
                     message: format!(
@@ -433,14 +630,33 @@ pub async fn ground_union(
 /// Keeps up to `RESERVED_LOCAL_SLOTS` docs of `priority_corpus` in the final
 /// cut even when `order` ranks them outside it, so a few high-ranked
 /// neighbor-corpus docs cannot fully crowd out the searcher's own repo (#425).
+///
+/// Docs named in `fallback_docs` never take part in the reserve and never
+/// displace a fused doc. They fill only the slots the fused docs leave.
 fn cut_with_local_reserve(
     docs: BTreeMap<String, DocFile>,
     cap: usize,
     priority_corpus: Option<&str>,
+    fallback_docs: &HashSet<String>,
     order: impl Fn(&(String, DocFile), &(String, DocFile)) -> std::cmp::Ordering,
 ) -> BTreeMap<String, DocFile> {
-    let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
+    let mut ranked: Vec<(String, DocFile)> = Vec::new();
+    let mut fallback: Vec<(String, DocFile)> = Vec::new();
+    for entry in docs {
+        if fallback_docs.contains(&entry.0) {
+            fallback.push(entry);
+        } else {
+            ranked.push(entry);
+        }
+    }
     ranked.sort_by(&order);
+
+    if ranked.len() <= cap {
+        fallback.sort_by(&order);
+        fallback.truncate(cap - ranked.len());
+        ranked.extend(fallback);
+        return ranked.into_iter().collect();
+    }
 
     let mut swapped = false;
     if let Some(priority) = priority_corpus {
@@ -1678,5 +1894,285 @@ mod tests {
             "with no priority_corpus, the tie must fall back to the unchanged path-key \
              tie-break (\"a_tied_neighbor.md\" < \"z_tied_local.md\"), not favor either corpus"
         );
+    }
+
+    /// Store double with no indexed rows. `indexed` is what the membership
+    /// read returns; `fail_listing` makes that read fail.
+    struct ColdStore {
+        indexed: Option<HashSet<FileRef>>,
+        fail_listing: bool,
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for ColdStore {
+        async fn retrieve_signals(
+            &self,
+            _corpus_key: &CorpusKey,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<SignalLists> {
+            Ok(SignalLists::default())
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn indexed_file_refs(
+            &self,
+            _corpus_key: &CorpusKey,
+        ) -> Result<Option<HashSet<FileRef>>> {
+            if self.fail_listing {
+                return Err(HallouminateError::Search("membership read failed".into()));
+            }
+            Ok(self.indexed.clone())
+        }
+    }
+
+    fn md_corpus(name: &str, dir: &std::path::Path) -> CorpusConfig {
+        CorpusConfig {
+            name: name.into(),
+            paths: vec![dir.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        }
+    }
+
+    fn warning_codes(resp: &GroundResponse) -> Vec<&str> {
+        resp.warnings.iter().map(|w| w.code.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_membership_read_degrades_to_no_fallback_with_a_warning() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("cold.md"), "the quokkaherd is cold\n").expect("cold");
+        let store = ColdStore {
+            indexed: Some(HashSet::new()),
+            fail_listing: true,
+        };
+
+        let resp = ground_union(
+            "quokkaherd",
+            &[md_corpus("docs", dir.path())],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+        )
+        .await
+        .expect("a membership failure must not fail ground");
+
+        assert!(resp.docs.is_empty());
+        assert_eq!(warning_codes(&resp), vec!["lexical-fallback-failed"]);
+    }
+
+    fn doc_in(corpus: &str, score: f64) -> DocFile {
+        DocFile {
+            summary: None,
+            keywords: Vec::new(),
+            score,
+            z_score: None,
+            mtime: String::new(),
+            corpus: corpus.into(),
+            path: None,
+            stale: false,
+            chunks: Vec::new(),
+            coverage: None,
+        }
+    }
+
+    fn kept_keys(docs: &BTreeMap<String, DocFile>) -> Vec<&str> {
+        docs.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn local_reserve_never_promotes_a_fallback_doc_over_fused_docs() {
+        let docs: BTreeMap<String, DocFile> = BTreeMap::from([
+            ("a-fused".to_string(), doc_in("other", 0.9)),
+            ("b-fused".to_string(), doc_in("other", 0.8)),
+            ("c-fallback".to_string(), doc_in("local", 0.001)),
+        ]);
+        let fallback = HashSet::from(["c-fallback".to_string()]);
+
+        let kept = cut_with_local_reserve(docs, 2, Some("local"), &fallback, |a, b| {
+            rollup_order(Some("local"), a, b)
+        });
+
+        assert_eq!(kept_keys(&kept), vec!["a-fused", "b-fused"]);
+    }
+
+    #[test]
+    fn fallback_docs_fill_only_the_slots_fused_docs_leave() {
+        let docs: BTreeMap<String, DocFile> = BTreeMap::from([
+            ("a-fused".to_string(), doc_in("other", 0.9)),
+            ("b-fallback".to_string(), doc_in("local", 0.002)),
+            ("c-fallback".to_string(), doc_in("local", 0.001)),
+        ]);
+        let fallback = HashSet::from(["b-fallback".to_string(), "c-fallback".to_string()]);
+
+        let kept = cut_with_local_reserve(docs, 2, Some("local"), &fallback, |a, b| {
+            rollup_order(Some("local"), a, b)
+        });
+
+        assert_eq!(kept_keys(&kept), vec!["a-fused", "b-fallback"]);
+    }
+
+    /// Fused hits for the warm corpus; every root reports its own indexed
+    /// files, so only the warm corpus counts the shared file as indexed.
+    struct WarmColdStore {
+        warm_hits: FakeChunkStore,
+        warm_file: String,
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for WarmColdStore {
+        async fn retrieve_signals(
+            &self,
+            corpus_key: &CorpusKey,
+            query: &str,
+            limit: usize,
+        ) -> Result<SignalLists> {
+            self.warm_hits
+                .retrieve_signals(corpus_key, query, limit)
+                .await
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            self.warm_hits
+                .retrieve_phrase(corpus_key, phrase, limit)
+                .await
+        }
+
+        async fn indexed_file_refs(
+            &self,
+            corpus_key: &CorpusKey,
+        ) -> Result<Option<HashSet<FileRef>>> {
+            let mut indexed = HashSet::new();
+            if corpus_key.name == "a-warm" {
+                indexed.insert(FileRef::new(std::path::PathBuf::from(&self.warm_file)));
+            }
+            Ok(Some(indexed))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_warm_fused_doc_keeps_its_slot_when_a_cold_corpus_falls_back_on_the_same_file() {
+        let dir = tempfile::tempdir().expect("shared root");
+        std::fs::write(dir.path().join("shared.md"), "the quokkaherd is shared\n").expect("file");
+        let warm_hit = priority_hit(dir.path(), "a-warm", "shared.md", 0.5);
+        let store = WarmColdStore {
+            warm_file: warm_hit.file_ref.clone(),
+            warm_hits: FakeChunkStore {
+                hits: vec![warm_hit],
+            },
+        };
+        let corpora = [
+            priority_corpus_config(dir.path(), "a-warm"),
+            priority_corpus_config(dir.path(), "z-cold"),
+        ];
+        let opts = GroundOpts {
+            top_files: 1,
+            ..GroundOpts::default()
+        };
+
+        let resp = ground_union("quokkaherd", &corpora, &store, None, opts, Some("z-cold"))
+            .await
+            .expect("ground_union");
+
+        let kept: Vec<&str> = resp.docs.values().map(|doc| doc.corpus.as_str()).collect();
+        assert_eq!(kept, vec!["a-warm"]);
+    }
+
+    fn file_ref_in(dir: &std::path::Path, name: &str) -> FileRef {
+        FileRef::new(dir.canonicalize().expect("canonical dir").join(name))
+    }
+
+    fn key_of(corpus: &CorpusConfig) -> CorpusKey {
+        corpus.corpus_keys().remove(0)
+    }
+
+    /// A supplied inventory replaces the walk and the membership read: the
+    /// store would fail the listing and the disk holds an extra matching
+    /// file, yet only the inventory's eligible file is searched.
+    #[tokio::test]
+    async fn a_supplied_inventory_replaces_the_walk_and_the_membership_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("cold.md"), "the quokkaherd is cold\n").expect("cold");
+        std::fs::write(dir.path().join("other.md"), "the quokkaherd is other\n").expect("other");
+        let corpus = md_corpus("docs", dir.path());
+        let store = ColdStore {
+            indexed: None,
+            fail_listing: true,
+        };
+        let inventory = Inventory::from([(
+            key_of(&corpus),
+            RootInventory {
+                eligible: Arc::new(HashSet::from([file_ref_in(dir.path(), "cold.md")])),
+                indexed: IndexedFiles::Known(Arc::new(HashSet::new())),
+            },
+        )]);
+
+        let resp = ground_union_inventoried(
+            "quokkaherd",
+            &[corpus],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+            &inventory,
+        )
+        .await
+        .expect("ground_union_inventoried");
+
+        let paths: Vec<Option<&str>> = resp.docs.values().map(|doc| doc.path.as_deref()).collect();
+        assert_eq!(paths, vec![Some("cold.md")]);
+        assert_eq!(warning_codes(&resp), vec!["lexical-fallback"]);
+    }
+
+    /// A root whose eligible files all have indexed rows searches no
+    /// unindexed file.
+    #[tokio::test]
+    async fn a_fully_indexed_root_adds_no_fallback_hits() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("cold.md"), "the quokkaherd is cold\n").expect("cold");
+        let corpus = md_corpus("docs", dir.path());
+        let store = ColdStore {
+            indexed: None,
+            fail_listing: false,
+        };
+        let covered = Arc::new(HashSet::from([file_ref_in(dir.path(), "cold.md")]));
+        let inventory = Inventory::from([(
+            key_of(&corpus),
+            RootInventory {
+                eligible: Arc::clone(&covered),
+                indexed: IndexedFiles::Known(covered),
+            },
+        )]);
+
+        let resp = ground_union_inventoried(
+            "quokkaherd",
+            &[corpus],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+            &inventory,
+        )
+        .await
+        .expect("ground_union_inventoried");
+
+        assert!(resp.docs.is_empty());
+        assert!(resp.warnings.is_empty(), "{:?}", warning_codes(&resp));
     }
 }

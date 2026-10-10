@@ -135,6 +135,7 @@ pub async fn search_phrase(
     Ok(FusedSearch {
         hits: ranked,
         warnings,
+        unpooled_files: None,
     })
 }
 

@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
 
 use crate::common::{
-    CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result, expand_tilde,
+    CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result, epoch_millis, expand_tilde,
 };
 
 /// One scanned file paired with the canonical corpus root that owns it.
@@ -425,10 +424,12 @@ fn entry_mtime_ms(entry: &ignore::DirEntry) -> Result<i64> {
         .metadata()
         .map_err(|e| HallouminateError::Indexer(format!("metadata: {e}")))?;
     let mtime = meta.modified()?;
-    let dur = mtime.duration_since(UNIX_EPOCH).map_err(|_| {
-        HallouminateError::Indexer(format!("pre-epoch mtime on {}", entry.path().display()))
-    })?;
-    Ok(dur.as_millis() as i64)
+    epoch_millis(mtime).ok_or_else(|| {
+        HallouminateError::Indexer(format!(
+            "unrepresentable mtime on {}",
+            entry.path().display()
+        ))
+    })
 }
 
 #[cfg(test)]
