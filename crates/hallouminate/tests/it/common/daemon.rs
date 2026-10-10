@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 pub struct DaemonHarness {
     socket: PathBuf,
     cwd: PathBuf,
+    state: DaemonState,
     _tmp: tempfile::TempDir,
     handle: Option<JoinHandle<anyhow::Result<()>>>,
     shutdown: Option<oneshot::Sender<()>>,
@@ -52,9 +53,11 @@ impl DaemonHarness {
         std::fs::write(hallou_dir.join("config.toml"), "").expect("write empty repo config");
 
         let state = DaemonState::open(cfg, None).await.expect("open state");
+        let served_state = state.clone();
         let (tx, rx) = oneshot::channel();
         let socket_clone = socket.clone();
         let handle = tokio::spawn(async move {
+            let state = served_state;
             let server = serve_with_idle_timeout(&state, &socket_clone, idle_timeout);
             tokio::pin!(server);
             tokio::select! {
@@ -91,6 +94,7 @@ impl DaemonHarness {
         DaemonHarness {
             socket,
             cwd,
+            state,
             _tmp: tmp,
             handle: Some(handle),
             shutdown: Some(tx),
@@ -123,6 +127,12 @@ impl DaemonHarness {
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Handle to the served daemon state, for tests that hold its write lane
+    /// to stall background work.
+    pub fn state(&self) -> &DaemonState {
+        &self.state
     }
 
     /// Path of the harness tempdir, which contains an empty

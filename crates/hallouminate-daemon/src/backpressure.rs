@@ -16,6 +16,7 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use hallouminate_domain::common::CorpusKey;
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::debt::{self, DebtLevel, MaintenanceDebt};
@@ -32,10 +33,10 @@ pub(crate) const RETRYABLE_HARD_DEBT: &str =
 /// write-lane permit, in that documented order).
 pub(super) async fn acquire(
     state: &DaemonState,
-    corpus: &str,
+    keys: &[CorpusKey],
 ) -> Result<MutationGuard, &'static str> {
     await_debt_gate(state).await?;
-    let corpus_guard = state.lock_corpus(corpus).await;
+    let corpus_guard = state.lock_corpus(keys).await;
     let permit = state
         .write_lane()
         .acquire_owned()
@@ -434,6 +435,13 @@ mod tests {
             .expect("open daemon state")
     }
 
+    fn wiki_key() -> CorpusKey {
+        CorpusKey {
+            name: "wiki".to_string(),
+            canonical_root: std::path::PathBuf::from("/wiki"),
+        }
+    }
+
     #[tokio::test]
     async fn acquire_on_a_fresh_store_classifies_ok_and_grants_the_guard_promptly() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -447,7 +455,7 @@ mod tests {
         let state = open_state(&tmp, daemon).await;
         let started = StdInstant::now();
         let _guard = state
-            .acquire_mutation_guard("wiki")
+            .acquire_mutation_guard(&[wiki_key()])
             .await
             .expect("fresh store must not be backpressured");
         assert!(
@@ -470,7 +478,7 @@ mod tests {
         let state = open_state(&tmp, daemon).await;
         let started = StdInstant::now();
         let _guard = state
-            .acquire_mutation_guard("wiki")
+            .acquire_mutation_guard(&[wiki_key()])
             .await
             .expect("Soft debt admits after the delay");
         assert!(
@@ -503,7 +511,7 @@ mod tests {
         let state = open_state(&tmp, daemon).await;
         let started = StdInstant::now();
         let _guard = state
-            .acquire_mutation_guard("wiki")
+            .acquire_mutation_guard(&[wiki_key()])
             .await
             .expect("Hard debt with maintenance disabled must not soft-lock the mutation");
         // acquire's refresh recorded Hard into the process-wide

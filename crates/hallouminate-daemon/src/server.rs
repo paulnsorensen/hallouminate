@@ -142,11 +142,17 @@ async fn serve_with_config(
             let state = factory_state.clone();
             async move {
                 match super::watch::spawn_corpus_watcher(&state) {
-                    Some(handle) => handle.join().await,
+                    Some(handle) => {
+                        state.watch_registry().mark_pump_available();
+                        handle.join().await
+                    }
                     // Creation failed on this (re)start: park instead of
                     // hot-looping the factory; a restart only helps after
                     // conditions change, which needs a daemon restart anyway.
-                    None => std::future::pending::<()>().await,
+                    None => {
+                        state.watch_registry().mark_pump_unavailable();
+                        std::future::pending::<()>().await
+                    }
                 }
             }
         });
@@ -1215,6 +1221,7 @@ mod tests {
                 corpus: None,
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
             DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default()),
         ];

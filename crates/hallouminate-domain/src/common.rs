@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +43,21 @@ impl From<PathBuf> for FileRef {
     }
 }
 
+/// The last path component of `file_ref`, or an empty string when it has none.
+pub(crate) fn file_name(file_ref: &str) -> String {
+    Path::new(file_ref)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Milliseconds since the Unix epoch, or `None` for a pre-epoch or
+/// out-of-range time. Callers choose whether `None` is an error.
+pub(crate) fn epoch_millis(time: SystemTime) -> Option<i64> {
+    let elapsed = time.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(elapsed.as_millis()).ok()
+}
+
 /// Identifies one configured corpus root after filesystem canonicalization.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct CorpusKey {
@@ -78,7 +94,7 @@ impl CorpusKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Mtime(pub i64);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CorpusConfig {
     pub name: String,
     #[serde(default)]

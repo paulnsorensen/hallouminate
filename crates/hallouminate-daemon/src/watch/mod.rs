@@ -21,7 +21,7 @@
 //! `handle_add_markdown` take, so a watch-triggered reindex never races the
 //! daemon's own writes.
 
-mod registry;
+pub(crate) mod registry;
 
 pub(crate) use registry::{ConfigSource, WatchRegistry};
 
@@ -43,7 +43,7 @@ use hallouminate_domain::corpus::ensure_corpus_allows_relative;
 use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
-use super::state::{DaemonState, IdleClock, WorkClass};
+use super::state::{DaemonState, IdleClock, WorkClass, corpus_lock_keys, path_lock_keys};
 use registry::RegistrationId;
 use tokio_util::task::TaskTracker;
 
@@ -265,8 +265,14 @@ fn reload_repo_layer(
             }
         }};
     }
-    let repo = match hallouminate_config::load_repo_layer(path) {
-        Ok(config) => config,
+    let allowed_outside = &state.baseline().security.allow_repo_paths_outside_root;
+    let repo = match hallouminate_config::load_repo_layer(path, allowed_outside) {
+        Ok((config, path_warnings)) => {
+            for warning in path_warnings {
+                tracing::warn!(target: "hallouminate::daemon", path = %path.display(), code = "config-path-outside-repo", "{warning}");
+            }
+            config
+        }
         Err(error) => {
             report_failure!(
                 error,
@@ -875,7 +881,8 @@ impl PumpState {
         state: &DaemonState,
         tracker: &TaskTracker,
     ) {
-        if let Some(id) = registry.begin_next_catch_up() {
+        registry.set_catch_up_limit(state.baseline().watch.effective_catch_up_concurrency());
+        while let Some(id) = registry.begin_next_catch_up() {
             spawn_registration_catch_up(state.clone(), id, tracker);
         }
     }
@@ -910,7 +917,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     return;
                 }
             }
-            let _guard = state.lock_corpus(&corpus.name).await;
+            let _guard = state.lock_corpus(&corpus_lock_keys(&corpus)).await;
             match state.resources_for(&cfg).await {
                 Ok(res) => {
                     let reg = state.make_registry();
@@ -920,7 +927,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     // parked behind another writer's permit bails out as
                     // soon as shutdown is requested, instead of holding the
                     // corpus lock (and thus this task) open indefinitely.
-                    match super::dispatch::catch_up_corpus(&res, &reg, &corpus, || {
+                    match super::dispatch::catch_up_corpus(&res, &reg, &corpus, move || {
                         let lane_state = lane_state.clone();
                         let shutdown = shutdown.clone();
                         async move {
@@ -987,6 +994,16 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
     });
 }
 
+/// What one `register_runtime_corpora` call did.
+pub(crate) struct RuntimeRegistration {
+    pub(crate) source: registry::ConfigSource,
+    /// True when the watcher registration limit left a corpus unwatched.
+    pub(crate) limit_reached: bool,
+    /// Corpora whose registration this call newly queued for a catch-up.
+    /// Corpora that were already registered unchanged are not listed.
+    pub(crate) queued: Vec<String>,
+}
+
 /// Derives this call's `ConfigSource` from `repo_path` (`None` means the
 /// boot baseline) and registers request-resolved corpora with the live
 /// watcher under that source.
@@ -995,12 +1012,13 @@ pub(crate) fn register_runtime_corpora(
     repo_path: Option<&std::path::Path>,
     corpora: &[CorpusConfig],
     cfg: &hallouminate_config::Config,
-) -> Result<(registry::ConfigSource, bool), String> {
+) -> Result<RuntimeRegistration, String> {
     let source = repo_path
         .map(|path| registry::ConfigSource::RepoLayer(path.to_path_buf()))
         .unwrap_or(registry::ConfigSource::Baseline);
     let cfg = std::sync::Arc::new(cfg.clone());
     let mut limit_reached = false;
+    let mut queued = Vec::new();
     for corpus in corpora {
         let roots = watch_roots_for(corpus);
         if state
@@ -1015,7 +1033,8 @@ pub(crate) fn register_runtime_corpora(
         {
             registry::RegisterOutcome::Conflict(message) => return Err(message),
             registry::RegisterOutcome::LimitReached => limit_reached = true,
-            registry::RegisterOutcome::New | registry::RegisterOutcome::AlreadyRegistered => {}
+            registry::RegisterOutcome::New => queued.push(corpus.name.clone()),
+            registry::RegisterOutcome::AlreadyRegistered => {}
         }
     }
     if limit_reached {
@@ -1025,7 +1044,11 @@ pub(crate) fn register_runtime_corpora(
             "watcher: registration limit reached; one or more corpora are not watched",
         );
     }
-    Ok((source, limit_reached))
+    Ok(RuntimeRegistration {
+        source,
+        limit_reached,
+        queued,
+    })
 }
 
 /// Builds the notify debouncer that reindexes changed markdown files: each
@@ -1533,7 +1556,8 @@ async fn handle_changed_path(
         );
         return false;
     }
-    let guard = match state.acquire_mutation_guard(&corpus.name).await {
+    let lock_keys = path_lock_keys(&corpus, path);
+    let guard = match state.acquire_mutation_guard(&lock_keys).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(target: "hallouminate::daemon", error = %e, "watcher: lock failed");
@@ -5270,7 +5294,7 @@ body
         let lane_state = state.clone();
         let shutdown = state.shutdown_token().clone();
         let task = tokio::spawn(async move {
-            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus_cfg, || {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus_cfg, move || {
                 let lane_state = lane_state.clone();
                 let shutdown = shutdown.clone();
                 async move {

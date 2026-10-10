@@ -6,7 +6,7 @@ use anyhow::Context;
 use crate::input_error::InputError;
 use hallouminate_config::Config;
 use hallouminate_daemon::{
-    DaemonRequest, DaemonRequestPayload, IndexReport, IndexRequest, client_for,
+    DaemonRequest, DaemonRequestPayload, IndexReport, IndexRequest, QueuedIndexReport, client_for,
 };
 use hallouminate_domain::common::CorpusConfig;
 
@@ -20,15 +20,49 @@ pub struct IndexArgs {
     /// Optional daemon socket override. Mirrors `HALLOUMINATE_SOCKET` so
     /// test fixtures can pin the socket per-test without env mutation.
     pub socket: Option<PathBuf>,
-    /// Abort the run if any selected corpus root is missing, instead of the
-    /// default skip-with-warning.
+    /// Abort the run if any selected corpus root is missing, instead of
+    /// skipping it with a warning.
     pub strict: bool,
+    /// Queue the catch-up on the daemon and return once it acknowledges.
+    pub background: bool,
 }
 
 pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
+    if args.background {
+        let report = run_index_background(args).await?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
     let report = run_index(args).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+/// Ask the daemon to queue the catch-up for the working directory and return
+/// as soon as it acknowledges, without waiting for indexing to finish.
+pub async fn run_index_background(args: IndexArgs) -> anyhow::Result<QueuedIndexReport> {
+    if let Some(paths_from) = args.paths_from.as_deref() {
+        return Err(ad_hoc_corpus_unsupported(paths_from));
+    }
+    if args.strict {
+        return Err(InputError::new(
+            "--strict cannot combine with --background: a queued catch-up reports no missing roots",
+        )
+        .into());
+    }
+    let report: QueuedIndexReport = send_index(args).await?;
+    require_background_ack(report)
+}
+
+/// A daemon that predates `--background` ignores the flag, runs a synchronous
+/// index, and replies with an `IndexReport` that decodes here with no ack.
+fn require_background_ack(report: QueuedIndexReport) -> anyhow::Result<QueuedIndexReport> {
+    if !report.acknowledged {
+        return Err(anyhow::anyhow!(
+            "daemon does not support --background; upgrade/restart the daemon"
+        ));
+    }
+    Ok(report)
 }
 
 /// Build the `IndexReport` by routing through the daemon. The CLI no longer
@@ -53,6 +87,14 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
         return Err(ad_hoc_corpus_unsupported(paths_from));
     }
 
+    send_index(IndexArgs {
+        background: false,
+        ..args
+    })
+    .await
+}
+
+async fn send_index<T: serde::de::DeserializeOwned>(args: IndexArgs) -> anyhow::Result<T> {
     let client = client_for(args.socket.as_deref()).await?;
     // Capture CWD at the CLI entry so the daemon can run repo-config
     // discovery against the user's working directory rather than its own
@@ -66,9 +108,10 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
             corpus: args.corpus.clone(),
             paths_from: None,
             strict: args.strict,
+            background: args.background,
         }),
     };
-    let report: IndexReport = client.call(req).await?;
+    let report: T = client.call(req).await?;
     Ok(report)
 }
 
@@ -291,5 +334,26 @@ mod tests {
             crate::input_error::is_input_error(&err),
             "must be an InputError so MCP routes it to -32602: {err}",
         );
+    }
+
+    #[test]
+    fn background_reply_without_ack_from_an_old_daemon_fails_clearly() {
+        let old_reply = serde_json::json!({ "corpora": [], "warnings": ["x"] });
+        let decoded: QueuedIndexReport =
+            serde_json::from_value(old_reply).expect("older reply decodes");
+        let err = require_background_ack(decoded).expect_err("missing ack must fail");
+        assert!(
+            err.to_string()
+                .contains("daemon does not support --background; upgrade/restart the daemon"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn background_reply_with_ack_passes_through() {
+        let reply = serde_json::json!({ "acknowledged": true, "queued": ["docs"] });
+        let decoded: QueuedIndexReport = serde_json::from_value(reply).expect("reply decodes");
+        let report = require_background_ack(decoded).expect("ack must pass");
+        assert_eq!(report.queued, vec!["docs".to_string()]);
     }
 }

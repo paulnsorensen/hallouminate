@@ -52,6 +52,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "watch",
     "storage",
     "daemon",
+    "security",
 ];
 
 /// Keys recognized inside a `[[repository]]` entry. Used by
@@ -85,6 +86,7 @@ const KNOWN_SEARCH_KEYS: &[&str] = &[
     "limit_default",
     "crossencoder",
     "rerank_timeout_ms",
+    "cold_wait_ms",
 ];
 const KNOWN_LOGGING_KEYS: &[&str] = &["max_file_bytes", "max_total_bytes"];
 const KNOWN_STORAGE_KEYS: &[&str] = &["ground_dir"];
@@ -109,10 +111,12 @@ const KNOWN_DAEMON_KEYS: &[&str] = &[
     "boot_backoff_floor_secs",
     "boot_backoff_cap_secs",
 ];
+const KNOWN_SECURITY_KEYS: &[&str] = &["allow_repo_paths_outside_root"];
 const KNOWN_WATCH_KEYS: &[&str] = &[
     "debounce_ms",
     "failure_reminder_secs",
     "reconcile_interval_secs",
+    "catch_up_concurrency",
 ];
 
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
@@ -226,6 +230,7 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
         .and_then(|p| unregistered_wiki_advisory(p, &effective));
     let root_advisories = missing_root_advisories(&effective);
     let selection_advisories = selection_advisories(&effective)?;
+    let path_advisories = layers.path_warnings.clone();
 
     // Check unknown keys against every resolved layer's raw text, not just
     // the baseline — a repo-layer scalar key (e.g. `[embeddings] enable =
@@ -243,8 +248,10 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     }
     let warnings = collect_layered_warnings(&layer_sources, &effective);
 
-    let any_advisory =
-        advisory.is_some() || !root_advisories.is_empty() || !selection_advisories.is_empty();
+    let any_advisory = advisory.is_some()
+        || !root_advisories.is_empty()
+        || !selection_advisories.is_empty()
+        || !path_advisories.is_empty();
     if any_advisory || !warnings.is_empty() {
         println!();
     }
@@ -256,6 +263,9 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     }
     for a in &selection_advisories {
         println!("warning: {a}");
+    }
+    for a in &path_advisories {
+        println!("warning: config-path-outside-repo: {a}");
     }
     for w in &warnings {
         println!("warning: {w}");
@@ -420,6 +430,7 @@ fn key_warnings(raw: &str) -> Vec<String> {
             collect_scalar_table_warnings(&table, "storage", KNOWN_STORAGE_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "daemon", KNOWN_DAEMON_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "watch", KNOWN_WATCH_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "security", KNOWN_SECURITY_KEYS, &mut out);
         }
         Ok(_) => out.push("config is not a TOML table".to_string()),
         Err(e) => out.push(format!("re-parse for key check failed: {e}")),
@@ -645,6 +656,7 @@ mod tests {
     fn known_scalar_section_keys_match_config_fields() {
         let mut cfg = Config::default();
         cfg.watch.reconcile_interval_secs = Some(60);
+        cfg.watch.catch_up_concurrency = Some(2);
         cfg.search.crossencoder = Some("jina-reranker-v1-turbo-en".to_string());
         let value = toml::Value::try_from(cfg).expect("serialize config");
         let table = value.as_table().expect("config serializes to a table");
@@ -970,7 +982,7 @@ mod tests {
         let cwd = canon(dir.path());
         let xdg_path = cwd.join("xdg.toml");
         fs::write(&xdg_path, "").expect("write empty XDG");
-        write_repo_config(&cwd, "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n");
+        write_repo_config(&cwd, "[[corpus]]\nname = \"docs\"\npaths = [\"x\"]\n");
         // Just exercise the path — the printlns go to stdout. We assert on
         // the Ok result + that the implementation accesses both layers.
         cmd_config_validate(ConfigValidateArgs {
@@ -1035,7 +1047,7 @@ mod tests {
             "[[corpus]]\nname = \"global\"\npaths = [\"/global\"]\n",
         )
         .expect("write XDG with global corpus");
-        write_repo_config(&cwd, "[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n");
+        write_repo_config(&cwd, "[[corpus]]\nname = \"local\"\npaths = [\"local\"]\n");
 
         // Re-load the same way `show` does and assert the merged corpora.
         let baseline = hallouminate_config::load_xdg(Some(&xdg_path)).expect("load baseline");
@@ -1064,7 +1076,7 @@ mod tests {
         .expect("write XDG with global corpus");
         write_repo_config(
             &cwd,
-            "inherit_global_corpora = false\n[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n",
+            "inherit_global_corpora = false\n[[corpus]]\nname = \"local\"\npaths = [\"local\"]\n",
         );
 
         let baseline = hallouminate_config::load_xdg(Some(&xdg_path)).expect("load baseline");

@@ -554,6 +554,7 @@ async fn index_fixture(
                 corpus: Some(CORPUS_NAME.into()),
                 paths_from: None,
                 strict: true,
+                background: false,
             }),
         })
         .await
@@ -640,9 +641,15 @@ const RERANK_FALLBACK_CODES: [&str; 2] = [RERANK_TIMEOUT_CODE, CROSSENCODER_UNAV
 
 /// Informational only — they describe what the query covered, not a broken
 /// signal, so they must never fail the eval.
-const ADVISORY_WARNING_CODES: [&str; 6] = [
+const ADVISORY_WARNING_CODES: [&str; 12] = [
+    "lexical-fallback",
+    "lexical-fallback-truncated",
+    "lexical-fallback-failed",
+    "lexical-fallback-timeout",
+    "lexical-fallback-scan-timeout",
     "code-repos-empty",
     "cross-repo-union",
+    "config-path-outside-repo",
     "index-coverage",
     "index-reconciliation",
     "phrase-truncated",
@@ -658,7 +665,12 @@ const ADVISORY_WARNING_CODES: [&str; 6] = [
 /// `producer_warning_codes_are_classified_exactly_once` pins this against the
 /// three sets above, so a new producer-side warning breaks a test at its source
 /// instead of silently reaching the eval gate unclassified.
-const PRODUCER_WARNING_CODES: [&str; 12] = [
+const PRODUCER_WARNING_CODES: [&str; 18] = [
+    "lexical-fallback",
+    "lexical-fallback-truncated",
+    "lexical-fallback-failed",
+    "lexical-fallback-timeout",
+    "lexical-fallback-scan-timeout",
     "ripgrep-unresolved",
     "ripgrep-unparseable",
     "ripgrep-failed",
@@ -667,6 +679,7 @@ const PRODUCER_WARNING_CODES: [&str; 12] = [
     CROSSENCODER_UNAVAILABLE_CODE,
     "code-repos-empty",
     "cross-repo-union",
+    "config-path-outside-repo",
     "index-coverage",
     "index-reconciliation",
     "phrase-truncated",

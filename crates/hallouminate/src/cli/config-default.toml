@@ -32,6 +32,9 @@ limit_default           = 50
 # Supported: jina-reranker-v1-turbo-en, jina-reranker-v2-base-multiligual,
 # bge-reranker-base, bge-reranker-v2-m3.
 # crossencoder = "jina-reranker-v1-turbo-en"
+# Longest a cold-start ground waits for indexing before it answers from the
+# lexical fallback, in milliseconds. 0 never waits; the maximum is 60000.
+cold_wait_ms            = 10000
 
 # Dense embeddings are on by default: hallouminate downloads the embedding
 # model on first use and fuses the dense (vector) signal with lexical search
@@ -56,6 +59,16 @@ max_total_bytes = 104857600
 [watch]
 debounce_ms = 500
 failure_reminder_secs = 60
+# Registration catch-up passes the daemon runs at once. Minimum 1.
+# Baseline config only; a repository config cannot change it.
+catch_up_concurrency = 4
 
 [storage]
 ground_dir = "~/.local/share/hallouminate/ground"
+
+# Repo-layer `[[corpus]]` and `[[repository]]` paths must stay inside the repo
+# root. A path outside it (after symlink resolution) is skipped with a
+# `config-path-outside-repo` warning. List trusted directories here to allow
+# them. Baseline config only; a repository config cannot set this key.
+# [security]
+# allow_repo_paths_outside_root = ["~/Dev/shared-docs"]

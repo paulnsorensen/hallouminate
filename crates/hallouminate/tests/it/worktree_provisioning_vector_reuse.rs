@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole, LanceStore};
 use hallouminate_domain::common::{CorpusConfig, Result};
 use hallouminate_domain::ground::{GroundOpts, ground};
-use hallouminate_domain::indexer::{HandlerRegistry, index_corpus};
+use hallouminate_domain::indexer::{ChunkStore, HandlerRegistry, index_corpus};
 use text_splitter::Characters;
 
 use crate::common::{LANCE_WRITE_LOCK, StubEmbedder};
@@ -90,9 +90,19 @@ async fn provisioning_a_byte_identical_root_reuses_vectors_with_zero_embedder_ca
     assert!(calls_after_a > 0, "root a must embed on its first index");
 
     let corpus_b = corpus_for_root(&root_b);
-    index_corpus(&corpus_b, &store, &registry)
+    let stats_b = index_corpus(&corpus_b, &store, &registry)
         .await
         .expect("provision byte-identical root b");
+    assert_eq!(
+        stats_b.embeddings_inserted, 0,
+        "a byte-identical root must reuse stored vectors and insert no embeddings"
+    );
+    let key_b = corpus_b.primary_corpus_key().expect("root b corpus key");
+    let files_b = store.list_files(&key_b).await.expect("list root b files");
+    assert!(
+        files_b.iter().any(|snap| snap.file_ref.ends_with("a.md")),
+        "root b's file map must list a.md, got {files_b:?}"
+    );
 
     assert_eq!(
         calls.load(Ordering::SeqCst),

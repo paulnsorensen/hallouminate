@@ -33,6 +33,13 @@ pub trait ChunkStore: Send + Sync {
 
     async fn delete_root(&self, root: &RetiredRoot) -> Result<u64>;
 
+    /// Removes shared content rows that no root file map row references.
+    /// Returns the number of content rows removed. Stores without shared
+    /// content rows keep this default.
+    async fn delete_orphan_content(&self) -> Result<u64> {
+        Ok(0)
+    }
+
     async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats>;
 }
 

@@ -147,6 +147,7 @@ impl MaintenanceLifecycle {
             gc_ran,
             roots_collected = gc_stats.roots_collected as u64,
             rows_removed = gc_stats.rows_removed,
+            content_rows_removed = gc_stats.content_rows_removed,
             fragments_removed = stats.fragments_removed,
             fragments_added = stats.fragments_added,
             old_versions_pruned = stats.old_versions_pruned,
@@ -168,6 +169,7 @@ impl MaintenanceLifecycle {
             gc_ran,
             roots_collected = gc_stats.roots_collected as u64,
             rows_removed = gc_stats.rows_removed,
+            content_rows_removed = gc_stats.content_rows_removed,
             error = %error,
             "periodic LanceDB maintenance failed",
         );
@@ -187,6 +189,7 @@ impl MaintenanceLifecycle {
             gc_ran,
             roots_collected = gc_stats.roots_collected as u64,
             rows_removed = gc_stats.rows_removed,
+            content_rows_removed = gc_stats.content_rows_removed,
             "periodic LanceDB maintenance stopped during shutdown",
         );
         self.finished = true;
@@ -511,15 +514,7 @@ impl DaemonState {
         };
         let scan_ms = scan_started.elapsed();
 
-        let permit = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => {
-                lifecycle.shutdown(run_gc, GcStats::default());
-                return MaintenanceTick::Stop;
-            }
-            permit = self.write_lane().acquire_owned() => permit,
-        };
-        let Ok(_permit) = permit else {
+        let Some(mut permit) = self.acquire_maintenance_lane(&shutdown).await else {
             lifecycle.shutdown(run_gc, GcStats::default());
             return MaintenanceTick::Stop;
         };
@@ -531,7 +526,7 @@ impl DaemonState {
         // compaction, or fragment debt accumulates unbounded every tick.
         // Partial progress is always kept, never zeroed, on error.
         let delete_started = Instant::now();
-        let (gc_stats, gc_result) = self
+        let (mut gc_stats, gc_result) = self
             .gc_delete(
                 store.as_ref(),
                 gc_candidates,
@@ -539,6 +534,28 @@ impl DaemonState {
                 &shutdown,
             )
             .await;
+        // Orphan GC takes its own write gate, so it runs without the lane.
+        let gc_result = if run_gc && gc_result.is_ok() {
+            drop(permit);
+            let orphan_result = self
+                .gc_orphans_after_delete(
+                    store.as_ref(),
+                    &mut gc_stats,
+                    lifecycle.maintenance_id,
+                    &shutdown,
+                    gc_result,
+                )
+                .await;
+            let Some(reacquired) = self.acquire_maintenance_lane(&shutdown).await else {
+                lifecycle.shutdown(run_gc, gc_stats);
+                return MaintenanceTick::Stop;
+            };
+            permit = reacquired;
+            orphan_result
+        } else {
+            gc_result
+        };
+        let _permit = permit;
         let gc_ms = duration_ms(scan_ms + delete_started.elapsed());
         if let Err(error) = &gc_result {
             tracing::warn!(
@@ -548,6 +565,7 @@ impl DaemonState {
                 gc_ms,
                 roots_collected = gc_stats.roots_collected as u64,
                 rows_removed = gc_stats.rows_removed,
+                content_rows_removed = gc_stats.content_rows_removed,
                 error = %error,
                 "orphaned-root GC delete failed partway; continuing compaction with partial results",
             );
@@ -560,6 +578,7 @@ impl DaemonState {
                 gc_ms,
                 roots_collected = gc_stats.roots_collected as u64,
                 rows_removed = gc_stats.rows_removed,
+                content_rows_removed = gc_stats.content_rows_removed,
                 "orphaned-root GC finished",
             );
         }
@@ -588,6 +607,19 @@ impl DaemonState {
             Err(error) => lifecycle.failure(run_gc, gc_stats, &error),
         }
         MaintenanceTick::Continue
+    }
+
+    /// Waits for the write lane. Returns `None` on shutdown or when the lane
+    /// is closed.
+    async fn acquire_maintenance_lane(
+        &self,
+        shutdown: &CancellationToken,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            permit = self.write_lane().acquire_owned() => permit.ok(),
+        }
     }
 
     /// Phase 1 of orphaned-root GC: scan for retired roots. Read-only --
@@ -698,6 +730,46 @@ impl DaemonState {
         (stats, Ok(()))
     }
 
+    /// Removes content rows that no map row references after `gc_delete`.
+    async fn gc_orphan_content(
+        &self,
+        store: &dyn ChunkStore,
+        stats: &mut GcStats,
+        maintenance_id: u64,
+        shutdown: &CancellationToken,
+    ) -> std::result::Result<(), HallouminateError> {
+        if shutdown.is_cancelled() {
+            return Ok(());
+        }
+        let removed = self.bump_while(store.delete_orphan_content()).await?;
+        stats.content_rows_removed += removed;
+        self.heartbeat()
+            .bump(super::heartbeat::TaskName::Maintenance);
+        tracing::info!(
+            target: "hallouminate::lance",
+            gc_event = "orphan_content_collected",
+            maintenance_id,
+            content_rows_removed = removed,
+            "orphaned-root GC removed unreferenced content rows",
+        );
+        Ok(())
+    }
+
+    /// Runs orphan-content GC when the retired-root delete succeeded and
+    /// otherwise passes the delete error through.
+    async fn gc_orphans_after_delete(
+        &self,
+        store: &dyn ChunkStore,
+        stats: &mut GcStats,
+        maintenance_id: u64,
+        shutdown: &CancellationToken,
+        delete_result: std::result::Result<(), HallouminateError>,
+    ) -> std::result::Result<(), HallouminateError> {
+        delete_result?;
+        self.gc_orphan_content(store, stats, maintenance_id, shutdown)
+            .await
+    }
+
     /// Convenience wrapper combining `gc_scan` + `gc_delete` for direct
     /// callers (tests) that don't need write-lane-hoisting. Production code
     /// (`run_maintenance_tick_with`) calls `gc_scan`/`gc_delete` separately
@@ -713,13 +785,24 @@ impl DaemonState {
             .await
         {
             Ok(candidates) => {
-                self.gc_delete(
-                    store.as_ref(),
-                    candidates,
-                    maintenance_id,
-                    self.shutdown_token(),
-                )
-                .await
+                let (mut stats, result) = self
+                    .gc_delete(
+                        store.as_ref(),
+                        candidates,
+                        maintenance_id,
+                        self.shutdown_token(),
+                    )
+                    .await;
+                let result = self
+                    .gc_orphans_after_delete(
+                        store.as_ref(),
+                        &mut stats,
+                        maintenance_id,
+                        self.shutdown_token(),
+                        result,
+                    )
+                    .await;
+                (stats, result)
             }
             Err(error) => (GcStats::default(), Err(error)),
         }
@@ -732,7 +815,10 @@ impl DaemonState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct GcStats {
     pub(super) roots_collected: usize,
+    /// Map rows deleted with retired roots. Shared content rows count in
+    /// `content_rows_removed`.
     pub(super) rows_removed: u64,
+    pub(super) content_rows_removed: u64,
 }
 
 #[cfg(test)]
@@ -1710,5 +1796,80 @@ mod tests {
             after >= before + 3,
             "heartbeat must bump at least once per retired root: before={before}, after={after}"
         );
+    }
+
+    /// AC-5: content rows shared by two roots survive until the last
+    /// referencing root is retired, then GC removes them.
+    #[tokio::test]
+    async fn gc_removes_orphan_content() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let root_a = tempfile::tempdir().expect("root a");
+        let root_b = tempfile::tempdir().expect("root b");
+        let key_a = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:a:corpus",
+            root_a.path().to_str().expect("utf8"),
+        );
+        let key_b = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:b:corpus",
+            root_b.path().to_str().expect("utf8"),
+        );
+        for key in [&key_a, &key_b] {
+            state
+                .store()
+                .apply_batch(vec![prepared_file(key, "/tmp/shared.md")])
+                .await
+                .expect("seed shared content");
+        }
+        assert_eq!(state.store().count_rows().await.expect("count"), 1);
+
+        drop(root_b);
+        let (stats_b, result_b) = state.run_gc(1).await;
+        result_b.expect("gc after retiring b");
+        assert_eq!(stats_b.rows_removed, 1);
+        assert_eq!(stats_b.content_rows_removed, 0);
+        assert_eq!(state.store().count_rows().await.expect("count"), 1);
+
+        drop(root_a);
+        let (stats_a, result_a) = state.run_gc(2).await;
+        result_a.expect("gc after retiring a");
+        assert_eq!(stats_a.content_rows_removed, 1);
+        assert_eq!(state.store().count_rows().await.expect("count"), 0);
+    }
+
+    /// AC-5 through the production tick: the tick removes orphan content and
+    /// reports `content_rows_removed` beside the map `rows_removed`.
+    #[tokio::test]
+    async fn maintenance_tick_removes_and_reports_orphan_content() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let gone = tempfile::tempdir().expect("gone root");
+        let key_gone = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:gone:corpus",
+            gone.path().to_str().expect("utf8"),
+        );
+        state
+            .store()
+            .apply_batch(vec![prepared_file(&key_gone, "/tmp/gone.md")])
+            .await
+            .expect("seed retired root");
+        drop(gone);
+        assert_eq!(state.store().count_rows().await.expect("count"), 1);
+
+        let capture = EventCapture::default();
+        let subscriber = Registry::default().with(capture.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tick = state
+            .run_maintenance_tick_with(true, |_id| async { Ok(stats(Some(0))) })
+            .await;
+        assert_eq!(tick, MaintenanceTick::Continue);
+
+        assert_eq!(state.store().count_rows().await.expect("count"), 0);
+        let events = capture.0.lock().expect("capture lock");
+        let success = events
+            .iter()
+            .find(|e| e.strings.get("outcome").map(String::as_str) == Some("success"))
+            .expect("success event");
+        assert_eq!(success.numbers.get("rows_removed"), Some(&1));
+        assert_eq!(success.numbers.get("content_rows_removed"), Some(&1));
     }
 }

@@ -5,7 +5,10 @@ use crate::common::{CorpusConfig, CorpusKey, FileRef, Result};
 use crate::corpus::{ScannedFile, scan};
 use crate::indexer::store::ChunkStore;
 
-pub use super::apply::{ApplyStats, DEFAULT_BATCH_SIZE, MAX_REPORTED_SKIPS, SkippedFile, apply};
+pub use super::apply::{
+    ApplyStats, DEFAULT_BATCH_SIZE, LaneError, LaneFn, LaneFuture, LaneGuard, MAX_REPORTED_SKIPS,
+    SkippedFile, apply, apply_with_lane,
+};
 pub use super::format::HandlerRegistry;
 pub use super::plan::{FileSnapshot, IndexPlan, IntoPlanInput, MtimeCandidate, Upsert, plan};
 pub use super::writer::SkipReason;

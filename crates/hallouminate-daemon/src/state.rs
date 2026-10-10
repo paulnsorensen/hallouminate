@@ -61,7 +61,7 @@ use hallouminate_adapters::{
     EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, StoreLockOwner,
 };
 use hallouminate_config::Config;
-use hallouminate_domain::common::{HallouminateError, expand_tilde};
+use hallouminate_domain::common::{CorpusConfig, CorpusKey, HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
@@ -214,7 +214,7 @@ fn is_idle(last_use_secs: u64, now_secs: u64, idle_secs: u64) -> bool {
 
 /// Map of key → per-key async mutex, created on first use. Two callers
 /// holding the same key serialize on its mutex; distinct keys never collide.
-/// Backs both the per-corpus write lock (keyed by corpus name) and the
+/// Backs both the per-corpus write lock (keyed by `CorpusKey`) and the
 /// per-`ResourceKey` build lock in `resources_for`. For corpus writes, every
 /// mutating handler also takes the single-permit global `write_lane` (see
 /// `DaemonStateInner.write_lane`), so cross-corpus writes still serialize at
@@ -244,6 +244,29 @@ impl<K: Eq + Hash> KeyedLockMap<K> {
         };
         mutex.lock_owned().await
     }
+}
+
+/// Every lock key a whole-corpus operation must hold. A corpus with no
+/// configured root still gets one key (empty root) so it keeps mutual
+/// exclusion by name.
+pub(crate) fn corpus_lock_keys(corpus: &CorpusConfig) -> Vec<CorpusKey> {
+    let keys = corpus.corpus_keys();
+    if keys.is_empty() {
+        return vec![CorpusKey {
+            name: corpus.name.clone(),
+            canonical_root: PathBuf::new(),
+        }];
+    }
+    keys
+}
+
+/// The lock key a single-file operation at `path` must hold: the root that
+/// owns `path`, or every key of the corpus when no root owns it.
+pub(crate) fn path_lock_keys(corpus: &CorpusConfig, path: &Path) -> Vec<CorpusKey> {
+    let Some(key) = corpus.corpus_key_for_path(path) else {
+        return corpus_lock_keys(corpus);
+    };
+    vec![key]
 }
 
 /// Key identifying one distinct resource set: a `[storage].ground_dir` +
@@ -341,10 +364,12 @@ struct DaemonStateInner {
     /// the stale-store check, move, and open serialize on the dir itself.
     ground_dir_locks: KeyedLockMap<PathBuf>,
     store_lock_owner: StoreLockOwner,
-    corpus_locks: KeyedLockMap<String>,
+    corpus_locks: KeyedLockMap<CorpusKey>,
     write_lane: Arc<Semaphore>,
     /// Daemon-wide gate for filesystem and indexed-path coverage work.
     coverage_gate: Arc<Semaphore>,
+    /// In-flight corpus walks shared by concurrent `ground` requests.
+    scan_cache: crate::scan_cache::ScanCache,
     #[cfg(test)]
     coverage_probe: Arc<CoverageProbe>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
@@ -409,23 +434,24 @@ struct DaemonStateInner {
     shutdown: CancellationToken,
 }
 
-/// Both guards a mutating handler takes in the documented `corpus → write_lane`
-/// order. Dropping it releases the write-lane permit first (LIFO drop order),
-/// then the corpus lock; that matches the acquisition order's inverse and
-/// keeps the per-corpus serial chain visible to the next waiter.
+/// Both guards a mutating handler takes in the documented
+/// `corpus keys → write_lane` order. Dropping it releases the write-lane
+/// permit first, then the corpus-key locks; that matches the acquisition
+/// order's inverse and keeps the per-key serial chain visible to the next
+/// waiter.
 pub struct MutationGuard {
     // Drop order: `_permit` first, then `_corpus`. The fields are private to
     // make the order an invariant rather than a convention.
     _permit: OwnedSemaphorePermit,
-    _corpus: OwnedMutexGuard<()>,
+    _corpus: Vec<OwnedMutexGuard<()>>,
 }
 
 impl MutationGuard {
-    /// Constructs a guard from its two held locks. `pub(super)` so only
+    /// Constructs a guard from its held locks. `pub(super)` so only
     /// `backpressure::acquire` (the sole place that assembles a
     /// `MutationGuard`) can build one -- the private fields above stay an
     /// invariant, not a convention, for every other caller in the crate.
-    pub(super) fn new(permit: OwnedSemaphorePermit, corpus: OwnedMutexGuard<()>) -> Self {
+    pub(super) fn new(permit: OwnedSemaphorePermit, corpus: Vec<OwnedMutexGuard<()>>) -> Self {
         Self {
             _permit: permit,
             _corpus: corpus,
@@ -640,6 +666,7 @@ impl DaemonState {
                     store_lock_owner,
                     write_lane,
                     coverage_gate,
+                    scan_cache: crate::scan_cache::ScanCache::new(crate::scan_cache::SCAN_BUDGET),
                     #[cfg(test)]
                     coverage_probe: Arc::new(CoverageProbe::default()),
                     crossencoders,
@@ -777,6 +804,10 @@ impl DaemonState {
     /// Return the daemon-wide Ground coverage admission gate.
     pub(crate) fn coverage_gate(&self) -> Arc<Semaphore> {
         Arc::clone(&self.inner.coverage_gate)
+    }
+
+    pub(crate) fn scan_cache(&self) -> &crate::scan_cache::ScanCache {
+        &self.inner.scan_cache
     }
 
     #[cfg(test)]
@@ -1194,20 +1225,32 @@ impl DaemonState {
         )
     }
 
-    /// Acquire the per-corpus async mutex. Call before any operation that
-    /// reads-modifies-writes that corpus's filesystem or LanceDB rows.
-    pub async fn lock_corpus(&self, corpus: &str) -> OwnedMutexGuard<()> {
-        self.inner.corpus_locks.lock(corpus).await
+    /// Acquire the per-`CorpusKey` async mutexes (name + canonical root).
+    /// Call before any operation that reads-modifies-writes the filesystem
+    /// or LanceDB rows under those roots. Worktrees of one repo share a
+    /// corpus name but not a root, so they lock distinct keys and run in
+    /// parallel. Keys are sorted and deduplicated before acquisition, so
+    /// every multi-key caller takes them in the same total order and cannot
+    /// deadlock against another. Never call while holding the write lane.
+    pub async fn lock_corpus(&self, keys: &[CorpusKey]) -> Vec<OwnedMutexGuard<()>> {
+        let mut sorted: Vec<&CorpusKey> = keys.iter().collect();
+        sorted.sort();
+        sorted.dedup();
+        let mut guards = Vec::with_capacity(sorted.len());
+        for key in sorted {
+            guards.push(self.inner.corpus_locks.lock(key).await);
+        }
+        guards
     }
 
     /// Acquire the global write-lane permit. ALWAYS call after
     /// `lock_corpus` for the same operation to maintain the documented
-    /// `corpus → write_lane` order and prevent deadlock.
+    /// `corpus keys → write_lane` order and prevent deadlock.
     pub fn write_lane(&self) -> Arc<Semaphore> {
         self.inner.write_lane.clone()
     }
 
-    /// Acquire the per-corpus mutex AND the global write-lane permit in the
+    /// Acquire the per-key corpus mutexes AND the global write-lane permit in the
     /// documented order. The returned `MutationGuard` releases both in the
     /// inverse order on drop. Replaces the open-coded
     /// `lock_corpus().await; write_lane().acquire_owned().await?` pattern
@@ -1215,9 +1258,9 @@ impl DaemonState {
     /// flipping the order by accident.
     pub async fn acquire_mutation_guard(
         &self,
-        corpus: &str,
+        keys: &[CorpusKey],
     ) -> Result<MutationGuard, &'static str> {
-        super::backpressure::acquire(self, corpus).await
+        super::backpressure::acquire(self, keys).await
     }
 
     /// Acquire only the global write-lane permit, without a corpus lock or
@@ -2113,6 +2156,88 @@ mod tests {
         DaemonState::open(cfg, None).await.expect("open")
     }
 
+    fn key(name: &str, root: &str) -> CorpusKey {
+        CorpusKey {
+            name: name.to_string(),
+            canonical_root: PathBuf::from(root),
+        }
+    }
+
+    async fn lock_completes_promptly(state: &DaemonState, keys: Vec<CorpusKey>) -> bool {
+        let state = state.clone();
+        let task = tokio::spawn(async move {
+            let _guard = state.lock_corpus(&keys).await;
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let finished = task.is_finished();
+        if !finished {
+            task.abort();
+        }
+        finished
+    }
+
+    #[tokio::test]
+    async fn same_name_different_roots_lock_independently() {
+        let state = test_state().await;
+        let _main = state.lock_corpus(&[key("wiki", "/main")]).await;
+
+        assert!(
+            lock_completes_promptly(&state, vec![key("wiki", "/worktree")]).await,
+            "a worktree root must not wait on the main checkout's key",
+        );
+        assert!(
+            !lock_completes_promptly(&state, vec![key("wiki", "/main")]).await,
+            "the same key must still serialize",
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_root_lock_serializes_with_single_root_on_a_shared_key() {
+        let state = test_state().await;
+        let multi = state
+            .lock_corpus(&[key("wiki", "/b"), key("wiki", "/a")])
+            .await;
+
+        assert!(
+            !lock_completes_promptly(&state, vec![key("wiki", "/b")]).await,
+            "single-root op on a held key must wait",
+        );
+        assert!(
+            lock_completes_promptly(&state, vec![key("wiki", "/c")]).await,
+            "a key outside the multi-root set stays free",
+        );
+        drop(multi);
+        assert!(lock_completes_promptly(&state, vec![key("wiki", "/b")]).await);
+    }
+
+    #[tokio::test]
+    async fn multi_key_locks_in_opposite_order_do_not_deadlock() {
+        let state = test_state().await;
+        let mut tasks = Vec::new();
+        for index in 0..32 {
+            let state = state.clone();
+            let keys = if index % 2 == 0 {
+                vec![key("wiki", "/a"), key("wiki", "/b")]
+            } else {
+                vec![key("wiki", "/b"), key("wiki", "/a")]
+            };
+            tasks.push(tokio::spawn(async move {
+                let _guard = state.lock_corpus(&keys).await;
+                tokio::task::yield_now().await;
+            }));
+        }
+        let all = async {
+            for task in tasks {
+                task.await.expect("lock task");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), all)
+            .await
+            .expect("opposite-order multi-key locks must not deadlock");
+    }
+
     #[tokio::test]
     async fn catch_up_slow_scan_does_not_hold_write_lane() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2128,7 +2253,7 @@ mod tests {
             global: false,
         };
 
-        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let _corpus_guard = state.lock_corpus(&super::corpus_lock_keys(&corpus)).await;
         let res = state
             .resources_for(state.baseline())
             .await
@@ -2136,12 +2261,20 @@ mod tests {
         let registry = state.make_registry();
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(std::sync::Mutex::new(Some((reached_tx, release_rx))));
         let lane_state = state.clone();
         let task = tokio::spawn(async move {
-            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
-                reached_tx.send(()).unwrap();
-                release_rx.await.unwrap();
-                lane_state.acquire_write_lane().await
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+                let hook = hook.clone();
+                let lane_state = lane_state.clone();
+                async move {
+                    let first = hook.lock().unwrap().take();
+                    if let Some((reached_tx, release_rx)) = first {
+                        reached_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    }
+                    lane_state.acquire_write_lane().await
+                }
             })
             .await
         });
@@ -2173,9 +2306,9 @@ mod tests {
             exclude: Vec::new(),
             global: false,
         };
-        let corpus_name = corpus.name.clone();
+        let lock_keys = super::corpus_lock_keys(&corpus);
 
-        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let _corpus_guard = state.lock_corpus(&super::corpus_lock_keys(&corpus)).await;
         let res = state
             .resources_for(state.baseline())
             .await
@@ -2183,12 +2316,20 @@ mod tests {
         let registry = state.make_registry();
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(std::sync::Mutex::new(Some((reached_tx, release_rx))));
         let lane_state = state.clone();
         let task = tokio::spawn(async move {
-            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
-                reached_tx.send(()).unwrap();
-                release_rx.await.unwrap();
-                lane_state.acquire_write_lane().await
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+                let hook = hook.clone();
+                let lane_state = lane_state.clone();
+                async move {
+                    let first = hook.lock().unwrap().take();
+                    if let Some((reached_tx, release_rx)) = first {
+                        reached_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    }
+                    lane_state.acquire_write_lane().await
+                }
             })
             .await
         });
@@ -2197,7 +2338,7 @@ mod tests {
         let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
         let second_state = state.clone();
         let second = tokio::spawn(async move {
-            let _guard = second_state.lock_corpus(&corpus_name).await;
+            let _guard = second_state.lock_corpus(&lock_keys).await;
             second_tx.send(()).unwrap();
         });
         for _ in 0..100 {
@@ -2229,7 +2370,7 @@ mod tests {
             global: false,
         };
 
-        let _corpus_guard = state.lock_corpus(&corpus.name).await;
+        let _corpus_guard = state.lock_corpus(&super::corpus_lock_keys(&corpus)).await;
         let res = state
             .resources_for(state.baseline())
             .await
@@ -2237,13 +2378,21 @@ mod tests {
         let registry = state.make_registry();
         let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(std::sync::Mutex::new(Some((reached_tx, release_rx))));
         let lane_state = state.clone();
         let task = tokio::spawn(async move {
-            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
-                let permit = lane_state.acquire_write_lane().await?;
-                reached_tx.send(()).unwrap();
-                release_rx.await.unwrap();
-                Ok(permit)
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+                let hook = hook.clone();
+                let lane_state = lane_state.clone();
+                async move {
+                    let permit = lane_state.acquire_write_lane().await?;
+                    let first = hook.lock().unwrap().take();
+                    if let Some((reached_tx, release_rx)) = first {
+                        reached_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    }
+                    Ok(permit)
+                }
             })
             .await
         });
@@ -2283,18 +2432,115 @@ mod tests {
         let registry = state.make_registry();
         let lane_touched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let touched = lane_touched.clone();
-        let result =
-            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, || async move {
+        let result = super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+            let touched = touched.clone();
+            async move {
                 touched.store(true, Ordering::Relaxed);
                 panic!("no-work plan must never acquire the write lane");
-            })
-            .await;
+                #[allow(unreachable_code)]
+                Err("unreachable")
+            }
+        })
+        .await;
 
         assert!(matches!(result, Ok(None)));
         assert!(!lane_touched.load(Ordering::Relaxed));
         assert!(
             state.write_lane().try_acquire().is_ok(),
             "lane must be untouched when the plan has no work",
+        );
+    }
+
+    #[tokio::test]
+    async fn write_lane_per_batch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let big_root = tmp.path().join("big");
+        let small_root = tmp.path().join("small");
+        std::fs::create_dir_all(&big_root).expect("mkdir big");
+        std::fs::create_dir_all(&small_root).expect("mkdir small");
+        for n in 0..20 {
+            std::fs::write(
+                big_root.join(format!("f{n}.md")),
+                format!("# F{n}\n\nbody\n"),
+            )
+            .expect("write big file");
+        }
+        std::fs::write(small_root.join("s.md"), "# S\n\nbody\n").expect("write small file");
+        let corpus = |name: &str, root: &std::path::Path| CorpusConfig {
+            name: name.to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let big = corpus("big", &big_root);
+        let small = corpus("small", &small_root);
+        let state = test_state().await;
+        let res = Arc::new(
+            state
+                .resources_for(state.baseline())
+                .await
+                .expect("resources"),
+        );
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let big_task = tokio::spawn({
+            let (state, res) = (state.clone(), res.clone());
+            let (calls, parked, resume) = (calls.clone(), parked.clone(), resume.clone());
+            async move {
+                super::super::dispatch::catch_up_corpus(
+                    &res,
+                    &state.make_registry(),
+                    &big,
+                    move || {
+                        let (state, calls) = (state.clone(), calls.clone());
+                        let (parked, resume) = (parked.clone(), resume.clone());
+                        async move {
+                            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                                parked.notify_one();
+                                resume.notified().await;
+                            }
+                            state.acquire_write_lane().await
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), parked.notified())
+            .await
+            .expect("large catch-up reaches its second batch");
+        let small_stats = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::super::dispatch::catch_up_corpus(
+                &res,
+                &state.make_registry(),
+                &small,
+                super::super::dispatch::state_write_lane(&state),
+            ),
+        )
+        .await
+        .expect("small catch-up must write while the large one waits between batches")
+        .expect("small catch-up");
+        assert!(small_stats.is_some());
+        assert!(
+            !big_task.is_finished(),
+            "large catch-up is still between batches when the small one finishes",
+        );
+
+        resume.notify_one();
+        let big_stats = big_task
+            .await
+            .expect("join")
+            .expect("large catch-up")
+            .expect("large catch-up had work");
+        assert_eq!(big_stats.files_upserted, 20);
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be free after both catch-ups",
         );
     }
 
@@ -2939,7 +3185,7 @@ mod tests {
             resources,
             &state.make_registry(),
             &cfg.corpora[0],
-            || state.acquire_write_lane(),
+            super::super::dispatch::state_write_lane(state),
         )
         .await
         .expect("catch up the override corpus");
