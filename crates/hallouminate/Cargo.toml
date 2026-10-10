@@ -44,7 +44,7 @@ tracing.workspace = true
 # no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
 # is covered by a detection/routing unit test, not a generated binary fixture.
 rust_xlsxwriter = "0.99"
-zip = "8"
+zip = "9"
 hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
 blake3.workspace = true
