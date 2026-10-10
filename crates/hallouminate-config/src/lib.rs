@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use hallouminate_domain::common::{CorpusConfig, HallouminateError, Result, expand_tilde};
+use hallouminate_domain::common::{
+    CorpusConfig, HallouminateError, Result, canonical_following_leaf, expand_tilde,
+};
 use hallouminate_domain::discovery::{DEFAULT_MAX_DEPTH, IgnoreRules, discover_wiki_roots};
 use hallouminate_domain::embeddings::{DEFAULT_EMBED_MODEL, canonical_model_name};
 use hallouminate_domain::repository::{
     RepositoryConfig, effective_corpora, repository_for_discovered_wiki,
-    union_discovered_repositories,
+    union_discovered_repositories, wiki_directory,
 };
 
 const DEFAULT_TOP_FILES: usize = 10;
@@ -28,11 +30,11 @@ const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 // 2s covers the measured ~1.25s median rerank for the default N=50 candidate
 // pool — see `domain::search::crossencoder` for the latency rationale.
 const DEFAULT_RERANK_TIMEOUT_MS: u64 = 2_000;
-// Longest a cold-start `ground` waits for a registration catch-up before it
-// answers from the lexical fallback. Capped so a typo cannot park a request.
+/// Longest a cold-start `ground` waits for a registration catch-up before it
+/// answers from the lexical fallback. Capped so a typo cannot park a request.
 const DEFAULT_COLD_WAIT_MS: u64 = 10_000;
 const MAX_COLD_WAIT_MS: u64 = 60_000;
-// Registration catch-up passes the daemon runs at once.
+/// Registration catch-up passes the daemon runs at once.
 const DEFAULT_CATCH_UP_CONCURRENCY: usize = 4;
 const MAX_CATCH_UP_CONCURRENCY: usize = 16;
 
@@ -847,14 +849,16 @@ fn merge_layers_with_sources(
             baseline_path,
             repo_path,
         )?,
-        cache_dir: merge_scalar(
+        cache_dir: merge_baseline_only(
             "embeddings.cache_dir",
-            baseline.embeddings.cache_dir.clone(),
-            repo.embeddings.cache_dir.clone(),
+            Some(baseline.embeddings.cache_dir.clone()),
+            (repo.embeddings.cache_dir != defaults.embeddings.cache_dir)
+                .then(|| repo.embeddings.cache_dir.clone()),
             defaults.embeddings.cache_dir.clone(),
             baseline_path,
             repo_path,
-        )?,
+        )?
+        .unwrap_or_else(|| defaults.embeddings.cache_dir.clone()),
         idle_evict_secs: merge_scalar(
             "embeddings.idle_evict_secs",
             baseline.embeddings.idle_evict_secs,
@@ -891,23 +895,24 @@ fn merge_layers_with_sources(
         )?,
         catch_up_concurrency: merge_baseline_only(
             "watch.catch_up_concurrency",
-            baseline.watch.catch_up_concurrency.map(widen_usize),
-            repo.watch.catch_up_concurrency.map(widen_usize),
-            widen_usize(DEFAULT_CATCH_UP_CONCURRENCY),
-            baseline_path,
-            repo_path,
-        )?
-        .map(narrow_u64),
-    };
-    let storage = StorageConfig {
-        ground_dir: merge_scalar(
-            "storage.ground_dir",
-            baseline.storage.ground_dir.clone(),
-            repo.storage.ground_dir.clone(),
-            defaults.storage.ground_dir.clone(),
+            baseline.watch.catch_up_concurrency,
+            repo.watch.catch_up_concurrency,
+            DEFAULT_CATCH_UP_CONCURRENCY,
             baseline_path,
             repo_path,
         )?,
+    };
+    let storage = StorageConfig {
+        ground_dir: merge_baseline_only(
+            "storage.ground_dir",
+            Some(baseline.storage.ground_dir.clone()),
+            (repo.storage.ground_dir != defaults.storage.ground_dir)
+                .then(|| repo.storage.ground_dir.clone()),
+            defaults.storage.ground_dir.clone(),
+            baseline_path,
+            repo_path,
+        )?
+        .unwrap_or_else(|| defaults.storage.ground_dir.clone()),
     };
     let daemon = DaemonConfig {
         idle_exit_secs: merge_scalar(
@@ -1221,14 +1226,17 @@ fn scalar_conflict<T: std::fmt::Debug>(
 /// Merge a daemon-startup-only field: the active value is the baseline's
 /// (falling back to `default` when unset), and a repo layer may only
 /// restate that value, never override it.
-fn merge_baseline_only(
+fn merge_baseline_only<T>(
     field: &str,
-    baseline: Option<u64>,
-    repo: Option<u64>,
-    default: u64,
+    baseline: Option<T>,
+    repo: Option<T>,
+    default: T,
     baseline_path: Option<&Path>,
     repo_path: Option<&Path>,
-) -> Result<Option<u64>> {
+) -> Result<Option<T>>
+where
+    T: PartialEq + std::fmt::Debug,
+{
     let active = baseline.unwrap_or(default);
     let Some(repo_value) = repo else {
         return Ok(Some(active));
@@ -1262,8 +1270,6 @@ fn resolve_repo_layer_paths(cfg: &mut Config, base: &Path) {
             *p = resolve_repo_path(p, base);
         }
     }
-    cfg.storage.ground_dir = resolve_repo_path(&cfg.storage.ground_dir, base);
-    cfg.embeddings.cache_dir = resolve_repo_path(&cfg.embeddings.cache_dir, base);
 }
 
 fn resolve_repo_path(raw: &str, base: &Path) -> String {
@@ -1280,28 +1286,6 @@ fn resolve_repo_path(raw: &str, base: &Path) -> String {
     base.join(candidate).to_string_lossy().into_owned()
 }
 
-/// Canonicalize `path` even when its tail does not exist yet: resolve the
-/// deepest existing ancestor (following symlinks) and re-append the rest.
-/// Returns an empty path when no ancestor resolves or the tail ends in `..`,
-/// which never lies inside any root.
-fn canonical_lossy(path: &Path) -> PathBuf {
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    let mut head = path.to_path_buf();
-    loop {
-        if let Ok(mut real) = head.canonicalize() {
-            for part in tail.iter().rev() {
-                real.push(part);
-            }
-            return real;
-        }
-        let (Some(name), Some(parent)) = (head.file_name(), head.parent()) else {
-            return PathBuf::new();
-        };
-        tail.push(name.to_owned());
-        head = parent.to_path_buf();
-    }
-}
-
 /// Drop repo-layer corpora and repositories with a path outside `repo_root`
 /// (after symlink resolution) unless `allowed_outside` covers it. Runs after
 /// `resolve_repo_layer_paths`, so relative paths are already absolute.
@@ -1310,17 +1294,21 @@ fn confine_repo_layer(
     repo_root: &Path,
     allowed_outside: &[String],
 ) -> Vec<String> {
-    let root = canonical_lossy(repo_root);
+    let root = canonical_following_leaf(repo_root);
     let mut allowed: Vec<PathBuf> = Vec::new();
     for entry in allowed_outside {
-        allowed.push(canonical_lossy(&expand_tilde(entry)));
+        let real = canonical_following_leaf(&expand_tilde(entry));
+        if real.as_os_str().is_empty() {
+            continue;
+        }
+        allowed.push(real);
     }
     let inside = |raw: &str| -> bool {
-        if raw.is_empty() {
-            return true;
+        let real = canonical_following_leaf(&expand_tilde(raw));
+        if real.as_os_str().is_empty() {
+            return false;
         }
-        let real = canonical_lossy(&expand_tilde(raw));
-        if real.starts_with(&root) {
+        if !root.as_os_str().is_empty() && real.starts_with(&root) {
             return true;
         }
         for entry in &allowed {
@@ -1333,7 +1321,13 @@ fn confine_repo_layer(
     let mut warnings = Vec::new();
     let corpora = std::mem::take(&mut cfg.corpora);
     for corpus in corpora {
-        if let Some(path) = corpus.paths.iter().find(|p| !inside(p)) {
+        let mut offending: Option<&String> = None;
+        for path in &corpus.paths {
+            if offending.is_none() && !inside(path) {
+                offending = Some(path);
+            }
+        }
+        if let Some(path) = offending {
             warnings.push(outside_root_warning("corpus", &corpus.name, path, &root));
             continue;
         }
@@ -1341,9 +1335,16 @@ fn confine_repo_layer(
     }
     let repositories = std::mem::take(&mut cfg.repositories);
     for repo in repositories {
-        let offending = std::iter::once(&repo.path)
-            .chain(repo.corpus_paths.iter())
-            .find(|p| !inside(p));
+        let wiki = wiki_directory(&repo).to_string_lossy().into_owned();
+        let mut offending: Option<&String> = None;
+        if !inside(&wiki) {
+            offending = Some(&wiki);
+        }
+        for path in std::iter::once(&repo.path).chain(repo.corpus_paths.iter()) {
+            if offending.is_none() && !inside(path) {
+                offending = Some(path);
+            }
+        }
         if let Some(path) = offending {
             warnings.push(outside_root_warning("repository", &repo.name, path, &root));
             continue;
@@ -1439,11 +1440,27 @@ fn validate(cfg: &Config) -> Result<()> {
             "search.cold_wait_ms must be at most {MAX_COLD_WAIT_MS}"
         )));
     }
+    for entry in &cfg.security.allow_repo_paths_outside_root {
+        if !expand_tilde(entry).is_absolute() {
+            return Err(HallouminateError::Config(format!(
+                "security.allow_repo_paths_outside_root entry {entry:?} must be an absolute \
+                 path or start with `~/`"
+            )));
+        }
+    }
     for (idx, c) in cfg.corpora.iter().enumerate() {
         if c.name.trim().is_empty() {
             return Err(HallouminateError::Config(format!(
                 "corpus #{idx} has empty name"
             )));
+        }
+        for path in &c.paths {
+            if path.trim().is_empty() {
+                return Err(HallouminateError::Config(format!(
+                    "corpus '{}' has an empty path entry",
+                    c.name
+                )));
+            }
         }
         if c.paths.is_empty() {
             return Err(HallouminateError::Config(format!(
@@ -1516,14 +1533,6 @@ fn default_limit() -> usize {
 }
 fn default_cold_wait_ms() -> u64 {
     DEFAULT_COLD_WAIT_MS
-}
-
-fn widen_usize(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn narrow_u64(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 fn default_rerank_timeout_ms() -> u64 {
@@ -2776,12 +2785,6 @@ paths = ["docs", "specs/cur"]
 name = "self"
 path = "."
 corpus_paths = ["sub/docs"]
-
-[storage]
-ground_dir = "var/ground"
-
-[embeddings]
-cache_dir = "var/fastembed"
 "#;
         let cfg_path = write_repo_config(&repo_root, cfg);
 
@@ -2810,14 +2813,6 @@ cache_dir = "var/fastembed"
             parsed.repositories[0].corpus_paths,
             vec![base.join("sub/docs").to_string_lossy().into_owned()],
         );
-        assert_eq!(
-            parsed.storage.ground_dir,
-            base.join("var/ground").to_string_lossy().into_owned(),
-        );
-        assert_eq!(
-            parsed.embeddings.cache_dir,
-            base.join("var/fastembed").to_string_lossy().into_owned(),
-        );
     }
 
     #[test]
@@ -2833,12 +2828,6 @@ paths = ["/abs/docs"]
 name = "absrepo"
 path = "/abs/repo"
 corpus_paths = ["/abs/repo/docs"]
-
-[storage]
-ground_dir = "/abs/ground"
-
-[embeddings]
-cache_dir = "/abs/cache"
 "#;
         let cfg_path = write_repo_config(&repo_root, cfg);
         let allowed = vec!["/abs".to_string()];
@@ -2852,8 +2841,6 @@ cache_dir = "/abs/cache"
             parsed.repositories[0].corpus_paths,
             vec!["/abs/repo/docs".to_string()],
         );
-        assert_eq!(parsed.storage.ground_dir, "/abs/ground");
-        assert_eq!(parsed.embeddings.cache_dir, "/abs/cache");
     }
 
     #[test]
@@ -2869,12 +2856,6 @@ paths = ["~/docs"]
 name = "homerepo"
 path = "~/repo"
 corpus_paths = ["~/repo/docs"]
-
-[storage]
-ground_dir = "~/ground"
-
-[embeddings]
-cache_dir = "~/cache"
 "#;
         let cfg_path = write_repo_config(&repo_root, cfg);
         let allowed = vec!["~".to_string()];
@@ -2890,8 +2871,6 @@ cache_dir = "~/cache"
             parsed.repositories[0].corpus_paths,
             vec!["~/repo/docs".to_string()],
         );
-        assert_eq!(parsed.storage.ground_dir, "~/ground");
-        assert_eq!(parsed.embeddings.cache_dir, "~/cache");
     }
 
     // ── merge_layers ────────────────────────────────────────────────────
@@ -3787,5 +3766,136 @@ path = "."
 
         assert!(cfg.corpora.is_empty());
         assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    }
+
+    #[test]
+    fn repo_layer_wiki_override_outside_root_skips_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        std::fs::create_dir_all(outer.join("sibling")).expect("mkdir sibling");
+        for wiki in ["/etc", "../sibling"] {
+            let cfg_path = write_repo_config(
+                &repo_root,
+                &format!("[[repository]]\nname = \"r\"\npath = \".\"\nwiki = \"{wiki}\"\n"),
+            );
+
+            let (cfg, warnings) = load_repo_layer(&cfg_path, &[]).expect("load");
+
+            assert!(
+                cfg.repositories.is_empty(),
+                "{wiki}: {:?}",
+                cfg.repositories
+            );
+            assert_eq!(warnings.len(), 1, "{wiki}: {warnings:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_layer_symlinked_wiki_outside_root_skips_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        let outside = outer.join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        let cfg_path = write_repo_config(
+            &repo_root,
+            "[[repository]]\nname = \"r\"\npath = \".\"\nwiki = \"link\"\n",
+        );
+        std::os::unix::fs::symlink(&outside, repo_root.join("link")).expect("symlink");
+
+        let (cfg, warnings) = load_repo_layer(&cfg_path, &[]).expect("load");
+
+        assert!(cfg.repositories.is_empty());
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    }
+
+    #[test]
+    fn repo_layer_in_repo_wiki_override_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path()).join("repo");
+        let cfg_path = write_repo_config(
+            &repo_root,
+            "[[repository]]\nname = \"r\"\npath = \".\"\nwiki = \"docs/wiki\"\n",
+        );
+
+        let (cfg, warnings) = load_repo_layer(&cfg_path, &[]).expect("load");
+
+        assert_eq!(cfg.repositories.len(), 1);
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_and_relative_allowlist_entries() {
+        for entry in ["", "relative/dir", "~someone/dir"] {
+            let text = format!("[security]\nallow_repo_paths_outside_root = [{entry:?}]\n");
+            let err = parse(&text, None).expect_err(entry);
+            match err {
+                HallouminateError::Config(msg) => {
+                    assert!(msg.contains("allow_repo_paths_outside_root"), "got: {msg}");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+        parse(
+            "[security]\nallow_repo_paths_outside_root = [\"/abs\", \"~/docs\"]\n",
+            None,
+        )
+        .expect("absolute and ~/ entries stay valid");
+    }
+
+    #[test]
+    fn validate_rejects_empty_corpus_path_entry() {
+        let err = parse("[[corpus]]\nname = \"c\"\npaths = [\"\"]\n", None)
+            .expect_err("empty path entry must fail");
+        match err {
+            HallouminateError::Config(msg) => assert!(msg.contains("empty path"), "got: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confine_ignores_empty_allowlist_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outer = canon(dir.path());
+        let repo_root = outer.join("repo");
+        let cfg_path = write_repo_config(&repo_root, OUTSIDE_CONFIG);
+
+        let (cfg, warnings) =
+            load_repo_layer(&cfg_path, &[String::new(), "relative".to_string()]).expect("load");
+
+        assert_eq!(corpus_names(&cfg), vec!["docs"]);
+        assert_eq!(warnings.len(), 4, "got: {warnings:?}");
+    }
+
+    #[test]
+    fn repo_layer_ground_dir_and_cache_dir_are_baseline_only() {
+        let baseline = parse("", None).expect("baseline");
+        for repo_text in [
+            "[storage]\nground_dir = \"/hostile\"\n",
+            "[embeddings]\ncache_dir = \"/hostile\"\n",
+        ] {
+            let repo = parse(repo_text, None).expect("repo");
+            let err = merge_layers(&baseline, &repo).expect_err("repo override must fail");
+            match err {
+                HallouminateError::Config(msg) => {
+                    assert!(msg.contains("scalar conflict"), "got: {msg}");
+                    assert!(msg.contains("/hostile"), "got: {msg}");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+        }
+
+        let baseline = parse(
+            "[storage]\nground_dir = \"/g\"\n[embeddings]\ncache_dir = \"/c\"\n",
+            None,
+        )
+        .expect("baseline");
+        let merged = merge_layers(&baseline, &parse("", None).expect("repo")).expect("merge");
+        assert_eq!(merged.storage.ground_dir, "/g");
+        assert_eq!(merged.embeddings.cache_dir, "/c");
+        let restated = merge_layers(&baseline, &baseline).expect("restating is allowed");
+        assert_eq!(restated.storage.ground_dir, "/g");
     }
 }

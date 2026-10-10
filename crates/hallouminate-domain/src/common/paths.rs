@@ -58,6 +58,30 @@ pub fn best_effort_canonical(path: &Path) -> PathBuf {
     }
 }
 
+/// Canonicalize `path` even when its tail does not exist yet, like
+/// [`best_effort_canonical`], but dereference the final component when it
+/// exists. Use this to decide containment, where a leaf symlink that points
+/// outside a root must be seen for what it targets. Returns an empty path
+/// when no ancestor resolves or the tail ends in `..`, so the result never
+/// lies inside any root; [`best_effort_canonical`] returns `path` instead.
+pub fn canonical_following_leaf(path: &Path) -> PathBuf {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut head = path.to_path_buf();
+    loop {
+        if let Ok(mut real) = head.canonicalize() {
+            for part in tail.iter().rev() {
+                real.push(part);
+            }
+            return real;
+        }
+        let (Some(name), Some(parent)) = (head.file_name(), head.parent()) else {
+            return PathBuf::new();
+        };
+        tail.push(name.to_owned());
+        head = parent.to_path_buf();
+    }
+}
+
 /// A root confirmed absent from the filesystem via `io::ErrorKind::NotFound`
 /// -- the entire safety proof `LanceStore::delete_root` accepts. Constructible
 /// only through `retired_roots`, so a caller cannot pass an unverified path.

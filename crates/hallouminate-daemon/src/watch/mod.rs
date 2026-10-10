@@ -183,29 +183,52 @@ impl FailureCoalescer {
 /// Coalesces `reload_repo_layer` failures per repo-layer config path: an
 /// identical error logs once at `warn` and stays at `debug` on repeat, a
 /// changed error logs `warn` again, and a success after a recorded failure
-/// clears the entry so the caller can log a recovery transition.
-struct ReloadFailureMemo(HashMap<PathBuf, String>);
+/// clears the entry so the caller can log a recovery transition. Path
+/// warnings follow the same rule: an unchanged set stays at `debug`.
+struct ReloadFailureMemo {
+    failures: HashMap<PathBuf, String>,
+    path_warnings: HashMap<PathBuf, Vec<String>>,
+}
 
 impl ReloadFailureMemo {
     fn new() -> Self {
-        Self(HashMap::new())
+        Self {
+            failures: HashMap::new(),
+            path_warnings: HashMap::new(),
+        }
+    }
+
+    /// Records the `config-path-outside-repo` warnings last seen for `path`.
+    /// Returns `true` when the set differs from the previous reload, meaning
+    /// it should log at `warn`.
+    fn record_path_warnings(&mut self, path: &Path, warnings: &[String]) -> bool {
+        if warnings.is_empty() {
+            self.path_warnings.remove(path);
+            return false;
+        }
+        if self.path_warnings.get(path).map(Vec::as_slice) == Some(warnings) {
+            return false;
+        }
+        self.path_warnings
+            .insert(path.to_path_buf(), warnings.to_vec());
+        true
     }
 
     /// Records `path` failing with `error`. Returns `true` when this is a
     /// new failure (first occurrence or changed message) that should log at
     /// `warn`, `false` for a repeat that should stay at `debug`.
     fn record_failure(&mut self, path: &Path, error: &str) -> bool {
-        if self.0.get(path).map(String::as_str) == Some(error) {
+        if self.failures.get(path).map(String::as_str) == Some(error) {
             return false;
         }
-        self.0.insert(path.to_path_buf(), error.to_string());
+        self.failures.insert(path.to_path_buf(), error.to_string());
         true
     }
 
     /// Clears `path`'s failure record. Returns `true` when it had one,
     /// meaning this success is a recovery worth logging.
     fn record_success(&mut self, path: &Path) -> bool {
-        self.0.remove(path).is_some()
+        self.failures.remove(path).is_some()
     }
 }
 
@@ -268,8 +291,13 @@ fn reload_repo_layer(
     let allowed_outside = &state.baseline().security.allow_repo_paths_outside_root;
     let repo = match hallouminate_config::load_repo_layer(path, allowed_outside) {
         Ok((config, path_warnings)) => {
+            let changed = failures.record_path_warnings(path, &path_warnings);
             for warning in path_warnings {
-                tracing::warn!(target: "hallouminate::daemon", path = %path.display(), code = "config-path-outside-repo", "{warning}");
+                if changed {
+                    tracing::warn!(target: "hallouminate::daemon", path = %path.display(), code = "config-path-outside-repo", "{warning}");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", path = %path.display(), code = "config-path-outside-repo", "{warning}");
+                }
             }
             config
         }
@@ -1823,6 +1851,20 @@ fn delete_file_ref(owner: &WatchRoot, path: &Path) -> hallouminate_domain::commo
 mod tests {
     use super::*;
     use hallouminate_domain::indexer::ChunkStore;
+
+    #[test]
+    fn path_warning_memo_warns_on_change_only() {
+        let mut memo = ReloadFailureMemo::new();
+        let path = Path::new("/repo/.hallouminate/config.toml");
+        let first = vec!["outside a".to_string()];
+        let second = vec!["outside a".to_string(), "outside b".to_string()];
+
+        assert!(memo.record_path_warnings(path, &first));
+        assert!(!memo.record_path_warnings(path, &first));
+        assert!(memo.record_path_warnings(path, &second));
+        assert!(!memo.record_path_warnings(path, &[]));
+        assert!(memo.record_path_warnings(path, &second));
+    }
 
     fn corpus(name: &str, root: &str, globs: &[&str]) -> CorpusConfig {
         CorpusConfig {

@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 mod paths;
 
 pub use paths::{
-    RetiredRoot, best_effort_canonical, canonicalize_or_passthrough, expand_tilde, retired_roots,
+    RetiredRoot, best_effort_canonical, canonical_following_leaf, canonicalize_or_passthrough,
+    expand_tilde, retired_roots,
 };
 
 /// A reference to a file on disk, identified by its path.
