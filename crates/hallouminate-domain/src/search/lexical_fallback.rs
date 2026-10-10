@@ -5,11 +5,11 @@
 //! so that ground returns something useful before the first catch-up ends.
 
 use std::collections::BTreeMap;
-
-use rustix::fs::OFlags;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use std::io::{BufRead, BufReader, Read};
+use std::path::Path;
 
 use crate::common::{CorpusKey, epoch_millis, file_name};
+use crate::corpus::sandbox::open_existing_file_no_follow;
 use crate::indexer::SearchHit;
 
 use super::ripgrep::RipgrepHit;
@@ -53,7 +53,10 @@ pub(super) async fn line_window_hits(
             }
         }
     }
-    let mut ordered: Vec<(&str, FileMatch)> = by_file.into_iter().collect();
+    let mut ordered: Vec<(&str, FileMatch)> = Vec::with_capacity(by_file.len());
+    for (file_ref, found) in by_file {
+        ordered.push((file_ref, found));
+    }
     ordered.sort_by_key(|(_, found)| std::cmp::Reverse(found.terms.len()));
 
     let mut hits = Vec::new();
@@ -76,24 +79,29 @@ fn truncate_line(text: &str) -> &str {
     }
 }
 
-/// Opens `file_ref` for reading and refuses a symlink at the final path
-/// component, so a link swapped in after the scan cannot lead outside the root.
-async fn open_no_follow(file_ref: &str) -> std::io::Result<tokio::fs::File> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    options.custom_flags(OFlags::NOFOLLOW.bits().cast_signed());
-    options.open(file_ref).await
+/// Splits `file_ref` into the directory to open and the path below it. A
+/// corpus root that names one file opens through its parent directory.
+fn split_under_root<'a>(root: &'a Path, file_ref: &'a Path) -> Option<(&'a Path, &'a Path)> {
+    if file_ref == root {
+        let name = file_ref.file_name()?;
+        return Some((root.parent()?, Path::new(name)));
+    }
+    let relative = file_ref.strip_prefix(root).ok()?;
+    Some((root, relative))
 }
 
-async fn window_hit(corpus_key: &CorpusKey, file_ref: &str, line: u64) -> Option<SearchHit> {
-    let line = usize::try_from(line).ok()?;
-    if line == 0 {
-        return None;
-    }
-    let start = line.saturating_sub(WINDOW_RADIUS).max(1);
-    let wanted_end = line + WINDOW_RADIUS;
-    let file = open_no_follow(file_ref).await.ok()?;
-    let mtime_ms = match file.metadata().await {
+struct LineWindow {
+    lines: Vec<String>,
+    last_line: usize,
+    mtime_ms: i64,
+}
+
+/// Reads lines `start..=wanted_end` through the no-follow opener. Returns
+/// `None` when the file is not a plain readable UTF-8 text file under `root`.
+fn read_window(root: &Path, file_ref: &str, start: usize, wanted_end: usize) -> Option<LineWindow> {
+    let (base, relative) = split_under_root(root, Path::new(file_ref))?;
+    let file = open_existing_file_no_follow(base, relative).ok()?;
+    let mtime_ms = match file.metadata() {
         Ok(metadata) => metadata.modified().ok().and_then(epoch_millis).unwrap_or(0),
         Err(error) => {
             tracing::debug!(
@@ -109,28 +117,53 @@ async fn window_hit(corpus_key: &CorpusKey, file_ref: &str, line: u64) -> Option
     let mut window: Vec<String> = Vec::new();
     let mut number = 0;
     while number < wanted_end {
-        let Ok(next) = lines.next_line().await else {
-            return None;
-        };
-        let Some(text) = next else {
+        let Some(next) = lines.next() else {
             break;
+        };
+        let Ok(text) = next else {
+            return None;
         };
         number += 1;
         if number >= start {
             window.push(truncate_line(&text).to_string());
         }
     }
-    if number < line {
+    Some(LineWindow {
+        lines: window,
+        last_line: number,
+        mtime_ms,
+    })
+}
+
+async fn window_hit(corpus_key: &CorpusKey, file_ref: &str, line: u64) -> Option<SearchHit> {
+    let line = usize::try_from(line).ok()?;
+    if line == 0 {
         return None;
     }
-    let text = window.join("\n");
+    let start = line.saturating_sub(WINDOW_RADIUS).max(1);
+    let wanted_end = line + WINDOW_RADIUS;
+    let root = corpus_key.canonical_root.clone();
+    let owned_ref = file_ref.to_string();
+    let read =
+        tokio::task::spawn_blocking(move || read_window(&root, &owned_ref, start, wanted_end))
+            .await
+            .ok()??;
+    let LineWindow {
+        lines,
+        last_line,
+        mtime_ms,
+    } = read;
+    if last_line < line {
+        return None;
+    }
+    let text = lines.join("\n");
     Some(SearchHit {
         chunk_id: format!("lexical-fallback:{file_ref}:{start}"),
         corpus_key: corpus_key.clone(),
         file_ref: file_ref.to_string(),
         heading_path: Vec::new(),
         line_start: start,
-        line_end: number,
+        line_end: last_line,
         search_text: text.clone(),
         text,
         summary: file_name(file_ref),

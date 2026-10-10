@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, TryStreamExt};
 
-use crate::common::{CorpusConfig, CorpusKey, FileRef, HallouminateError, Result};
-use crate::corpus::scan;
+use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
+use crate::corpus::{ScannedFile, scan};
 use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
 use crate::search::{
@@ -14,7 +13,9 @@ use crate::search::{
 };
 
 use super::bucket::{Rollup, normalize_scores, roll_up};
-use super::inventory::{IndexedFiles, Inventory, RootInventory};
+use super::inventory::{
+    IndexedFiles, Inventory, RootInventory, assemble_inventory, list_root_indexes,
+};
 use super::types::{
     DocFile, GroundGroupBy, GroundMatch, GroundOutput, GroundResponse, Stats, Warning,
 };
@@ -222,18 +223,9 @@ async fn scan_inventory(corpora: &[CorpusConfig], store: &dyn ChunkRetrieval) ->
     let mut listed: Vec<(&CorpusConfig, Vec<(CorpusKey, IndexedFiles)>)> =
         Vec::with_capacity(corpora.len());
     for corpus in corpora {
-        let mut roots = Vec::new();
-        for corpus_key in corpus.corpus_keys() {
-            let indexed = match store.indexed_file_refs(&corpus_key).await {
-                Ok(Some(indexed)) => IndexedFiles::Known(Arc::new(indexed)),
-                Ok(None) => IndexedFiles::Unknown,
-                Err(error) => IndexedFiles::ListingFailed(error.to_string()),
-            };
-            roots.push((corpus_key, indexed));
-        }
-        listed.push((corpus, roots));
+        listed.push((corpus, list_root_indexes(corpus, store).await));
     }
-    let mut scannable = Vec::new();
+    let mut scans = Vec::new();
     for (corpus, roots) in &listed {
         let mut has_known_root = false;
         for (_, indexed) in roots {
@@ -242,45 +234,39 @@ async fn scan_inventory(corpora: &[CorpusConfig], store: &dyn ChunkRetrieval) ->
                 IndexedFiles::Unknown | IndexedFiles::ListingFailed(_) => {}
             }
         }
-        if has_known_root {
-            scannable.push((*corpus).clone());
+        if !has_known_root {
+            continue;
         }
+        let corpus = (*corpus).clone();
+        scans.push(async move {
+            let scanned = tokio::task::spawn_blocking(move || scan(&corpus)).await;
+            match scanned {
+                Ok(Ok(files)) => files,
+                Ok(Err(error)) => {
+                    tracing::debug!(err = %error, "lexical fallback skipped: corpus scan failed");
+                    Vec::new()
+                }
+                Err(error) => {
+                    tracing::warn!(err = %error, "lexical fallback skipped: corpus scan task failed");
+                    Vec::new()
+                }
+            }
+        });
     }
-    let scans = futures_util::future::join_all(scannable.into_iter().map(|corpus| async move {
-        let scanned = tokio::task::spawn_blocking(move || scan(&corpus)).await;
-        match scanned {
-            Ok(Ok(files)) => files,
-            Ok(Err(error)) => {
-                tracing::debug!(err = %error, "lexical fallback skipped: corpus scan failed");
-                Vec::new()
-            }
-            Err(error) => {
-                tracing::warn!(err = %error, "lexical fallback skipped: corpus scan task failed");
-                Vec::new()
-            }
-        }
-    }))
-    .await;
-    let mut eligible: BTreeMap<CorpusKey, HashSet<FileRef>> = BTreeMap::new();
-    for file in scans.into_iter().flatten() {
-        eligible
-            .entry(file.corpus_key)
-            .or_default()
-            .insert(file.file);
+    let scanned: Vec<Vec<ScannedFile>> = futures_util::stream::iter(scans)
+        .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+        .collect()
+        .await;
+    let mut files = Vec::new();
+    for corpus_files in scanned {
+        files.extend(corpus_files);
+    }
+    let mut roots = Vec::new();
+    for (_, corpus_roots) in listed {
+        roots.extend(corpus_roots);
     }
     let mut inventory = Inventory::new();
-    for (_, roots) in listed {
-        for (corpus_key, indexed) in roots {
-            let files = eligible.get(&corpus_key).cloned().unwrap_or_default();
-            inventory.insert(
-                corpus_key,
-                RootInventory {
-                    eligible: Arc::new(files),
-                    indexed,
-                },
-            );
-        }
-    }
+    inventory.extend(assemble_inventory(roots, &files));
     inventory
 }
 
@@ -715,9 +701,12 @@ fn counts_order(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use async_trait::async_trait;
 
     use super::*;
+    use crate::common::FileRef;
     use crate::indexer::SignalLists;
 
     /// `retrieve_signals` returns a canned, pre-seeded hit list; writes are

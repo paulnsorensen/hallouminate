@@ -17,7 +17,7 @@
 //! or the index time. Those belong to the per-root file map.
 
 use crate::common::file_name;
-use crate::indexer::chunk::PreparedFile;
+use crate::indexer::chunk::{ChunkStructure, PreparedFile};
 
 /// Whether the embedding model runs quantized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,11 +93,7 @@ impl ContentKey {
             put(&mut hasher, chunk.text.as_bytes());
             put(&mut hasher, chunk.search_text.as_bytes());
             put_optional(&mut hasher, chunk.claim_marks.as_deref());
-            let structure = chunk
-                .structure
-                .as_ref()
-                .and_then(|structure| serde_json::to_string(structure).ok());
-            put_optional(&mut hasher, structure.as_deref());
+            put_structure(&mut hasher, chunk.structure.as_ref());
             put_count(&mut hasher, chunk.overlap_bytes);
         }
         Self(hasher.finalize().to_hex().to_string())
@@ -127,6 +123,21 @@ fn put(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 
 fn put_count(hasher: &mut blake3::Hasher, count: usize) {
     hasher.update(&(count as u64).to_le_bytes());
+}
+
+fn put_structure(hasher: &mut blake3::Hasher, structure: Option<&ChunkStructure>) {
+    let Some(structure) = structure else {
+        hasher.update(&[0]);
+        return;
+    };
+    hasher.update(&[1]);
+    put_optional(hasher, structure.title.as_deref());
+    put_count(hasher, structure.headings.len());
+    for (level, text) in &structure.headings {
+        hasher.update(&[*level]);
+        put(hasher, text.as_bytes());
+    }
+    hasher.update(&[u8::from(structure.generated_navigation)]);
 }
 
 fn put_optional(hasher: &mut blake3::Hasher, value: Option<&str>) {
@@ -234,6 +245,29 @@ mod tests {
             ContentKey::derive(&first, &fingerprint()),
             ContentKey::derive(&second, &fingerprint()),
         );
+    }
+
+    #[test]
+    fn content_key_differs_when_the_chunk_structure_differs() {
+        let structure = |title: Option<&str>, generated_navigation: bool| ChunkStructure {
+            title: title.map(str::to_string),
+            headings: vec![(1, "A".to_string())],
+            generated_navigation,
+        };
+        let key_for = |structure: Option<ChunkStructure>| {
+            let mut file = prepared("/root/a.md", "a.md", "body");
+            file.chunks[0].structure = structure;
+            ContentKey::derive(&file, &fingerprint())
+        };
+        let absent = key_for(None);
+        let titled = key_for(Some(structure(Some("A"), false)));
+        let untitled = key_for(Some(structure(None, false)));
+        let navigation = key_for(Some(structure(Some("A"), true)));
+        assert_ne!(absent, titled);
+        assert_ne!(absent, untitled);
+        assert_ne!(titled, untitled);
+        assert_ne!(titled, navigation);
+        assert_eq!(titled, key_for(Some(structure(Some("A"), false))));
     }
 
     #[test]

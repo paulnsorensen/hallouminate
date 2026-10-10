@@ -17,14 +17,15 @@
 //! forks (and the security asymmetry where the daemon was using
 //! `tokio::fs::write` while MCP used `atomic_write_no_follow`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, UNIX_EPOCH};
 
+use futures_util::StreamExt;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::report::{CorpusReport, IndexReport, QueuedIndexReport};
-use crate::scan_cache::{SCAN_BUDGET, Scanner, Walk};
+use crate::scan_cache::{SCAN_BUDGET, Walk};
 use hallouminate_adapters::LanceStore;
 use hallouminate_config::{Config, ResolvedLayers, resolve_for_cwd};
 use hallouminate_domain::common::{
@@ -43,7 +44,8 @@ use hallouminate_domain::corpus::{
 };
 use hallouminate_domain::ground::{
     Format, GroundMatch, GroundOpts, IndexedFiles, Inventory, RenderOpts, RootInventory, Warning,
-    ground_union_inventoried, render, trim_snippets, validate_shape,
+    assemble_inventory, ground_union_inventoried, list_root_indexes, render, trim_snippets,
+    validate_shape,
 };
 use hallouminate_domain::indexer::HandlerRegistry;
 use hallouminate_domain::indexer::{
@@ -53,7 +55,7 @@ use hallouminate_domain::indexer::{
 #[cfg(test)]
 use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
 use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
-use hallouminate_domain::search::{ChunkRetrieval, validate_phrase};
+use hallouminate_domain::search::validate_phrase;
 
 use super::ipc::{
     AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
@@ -62,7 +64,6 @@ use super::ipc::{
     GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
     ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
-#[cfg(test)]
 use super::state::MAX_CONCURRENT_COVERAGE_CHECKS;
 use super::state::{
     DaemonState, IdleClock, RequestResources, WorkClass, corpus_lock_keys, path_lock_keys,
@@ -289,9 +290,10 @@ async fn handle_list_tree(
             Ok(c) => c,
             Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
         };
-    let warnings: Vec<String> = register_for_read(state, layers, &corpora, cfg)
-        .into_iter()
-        .collect();
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(warning) = register_for_read(state, layers, &corpora, cfg) {
+        warnings.push(warning);
+    }
     ensure_paths_exist(&corpus).await;
     let root = match hallouminate_domain::corpus::build_corpus_tree(&corpus) {
         Ok(node) => node,
@@ -376,10 +378,19 @@ enum WalkBudget {
     Unbounded,
 }
 
+/// Whether an inventory builds the per-root eligible file sets that the
+/// lexical fallback reads.
+#[derive(Clone, Copy)]
+enum EligibleSets {
+    Build,
+    Skip,
+}
+
 /// One corpus's file sets for one request.
 struct CorpusInventory {
-    /// One entry per root. A root whose walk gave no files has an empty
-    /// `eligible` set, so it gets no lexical fallback.
+    /// One entry per root. A root whose walk gave no files, or whose files
+    /// the index already covers, has an empty `eligible` set, so it gets no
+    /// lexical fallback.
     roots: Vec<(CorpusKey, RootInventory)>,
     /// `(covered, total)`, or the reason the walk or listing gave no count.
     coverage: anyhow::Result<(u64, u64)>,
@@ -395,15 +406,14 @@ async fn corpus_inventory(
     store: &LanceStore,
     corpus_cfg: &CorpusConfig,
     budget: WalkBudget,
+    eligible: EligibleSets,
 ) -> CorpusInventory {
     ensure_paths_exist(corpus_cfg).await;
     let walking = async {
-        let gate = state.coverage_gate();
-        let scanner = coverage_scanner(state);
         let cache = state.scan_cache();
         match budget {
-            WalkBudget::Bounded => cache.walk(corpus_cfg, gate, scanner).await.ok(),
-            WalkBudget::Unbounded => Some(cache.walk_to_end(corpus_cfg, gate, scanner).await),
+            WalkBudget::Bounded => cache.walk(corpus_cfg).await.ok(),
+            WalkBudget::Unbounded => Some(cache.walk_to_end(corpus_cfg).await),
         }
     };
     let listing = async {
@@ -411,59 +421,38 @@ async fn corpus_inventory(
         let coverage_probe = state.coverage_probe();
         #[cfg(test)]
         let _store_phase = coverage_probe.enter_store();
-        let mut listed = Vec::new();
-        for corpus_key in corpus_cfg.corpus_keys() {
-            let indexed = match store.indexed_file_refs(&corpus_key).await {
-                Ok(Some(files)) => IndexedFiles::Known(std::sync::Arc::new(files)),
-                Ok(None) => IndexedFiles::Unknown,
-                Err(error) => IndexedFiles::ListingFailed(error.to_string()),
-            };
-            listed.push((corpus_key, indexed));
-        }
-        listed
+        list_root_indexes(corpus_cfg, store).await
     };
     let (walked, listed) = tokio::join!(walking, listing);
 
-    let (files, scan_timed_out, no_files_reason) = match walked {
-        Some(Walk::Files(files)) => (Some(files), ScanTimedOut::No, String::new()),
-        Some(Walk::ScanFailed(reason)) => (None, ScanTimedOut::No, reason.to_string()),
+    let (files, coverage, scan_timed_out) = match walked {
+        Some(Walk::Files(files)) => {
+            let coverage = count_covered(&files, &listed);
+            (Some(files), coverage, ScanTimedOut::No)
+        }
+        Some(Walk::ScanFailed(reason)) => (
+            None,
+            Err(anyhow::anyhow!(reason.to_string())),
+            ScanTimedOut::No,
+        ),
         Some(Walk::TaskFailed) => (
             None,
+            Err(anyhow::anyhow!("the corpus walk task failed")),
             ScanTimedOut::No,
-            "the corpus walk task failed".to_string(),
         ),
         None => (
             None,
+            Err(anyhow::anyhow!("the corpus walk timed out")),
             ScanTimedOut::Yes,
-            "the corpus walk timed out".to_string(),
         ),
     };
-    let coverage = match &files {
-        Some(files) => count_covered(files, &listed),
-        None => Err(anyhow::anyhow!(no_files_reason)),
+    let fallback_files: &[ScannedFile] = match (eligible, &files, &coverage) {
+        (EligibleSets::Skip, _, _) | (EligibleSets::Build, None, _) => &[],
+        (EligibleSets::Build, Some(_), Ok((covered, total))) if covered == total => &[],
+        (EligibleSets::Build, Some(files), _) => files.as_slice(),
     };
-    let mut eligible: BTreeMap<CorpusKey, HashSet<FileRef>> = BTreeMap::new();
-    if let Some(files) = &files {
-        for scanned in files.iter() {
-            eligible
-                .entry(scanned.corpus_key.clone())
-                .or_default()
-                .insert(scanned.file.clone());
-        }
-    }
-    let mut roots = Vec::with_capacity(listed.len());
-    for (corpus_key, indexed) in listed {
-        let files = eligible.remove(&corpus_key).unwrap_or_default();
-        roots.push((
-            corpus_key,
-            RootInventory {
-                eligible: std::sync::Arc::new(files),
-                indexed,
-            },
-        ));
-    }
     CorpusInventory {
-        roots,
+        roots: assemble_inventory(listed, fallback_files),
         coverage,
         scan_timed_out,
     }
@@ -498,21 +487,6 @@ fn count_covered(
     Ok((covered, files.len() as u64))
 }
 
-/// The walk that the coverage check and the lexical fallback share.
-fn coverage_scanner(state: &DaemonState) -> Scanner {
-    #[cfg(test)]
-    let coverage_probe = state.coverage_probe();
-    #[cfg(not(test))]
-    let _ = state;
-    std::sync::Arc::new(move |corpus| {
-        #[cfg(test)]
-        let _walk_phase = coverage_probe.enter_walk();
-        #[cfg(test)]
-        coverage_probe.wait_for_walk_release();
-        scan(corpus).map_err(anyhow::Error::from)
-    })
-}
-
 /// On-disk vs. indexed coverage for one corpus, aggregated across its roots.
 /// Returns `(covered, total)`: `total` in-scope files present on disk, and
 /// `covered` how many of them are embedded in the index.
@@ -521,9 +495,15 @@ async fn corpus_coverage(
     store: &LanceStore,
     corpus_cfg: &CorpusConfig,
 ) -> anyhow::Result<(u64, u64)> {
-    corpus_inventory(state, store, corpus_cfg, WalkBudget::Unbounded)
-        .await
-        .coverage
+    corpus_inventory(
+        state,
+        store,
+        corpus_cfg,
+        WalkBudget::Unbounded,
+        EligibleSets::Skip,
+    )
+    .await
+    .coverage
 }
 
 /// Ceiling on the candidate pool a single request may ask for.
@@ -605,13 +585,22 @@ async fn request_inventory(
     state: &DaemonState,
     store: &LanceStore,
     targets: &[CorpusConfig],
+    eligible: EligibleSets,
 ) -> RequestInventory {
     let mut pending = Vec::with_capacity(targets.len());
     for corpus in targets {
-        pending.push(corpus_inventory(state, store, corpus, WalkBudget::Bounded));
+        pending.push(corpus_inventory(
+            state,
+            store,
+            corpus,
+            WalkBudget::Bounded,
+            eligible,
+        ));
     }
-    let corpus_inventories = futures_util::future::join_all(pending).await;
-
+    let corpus_inventories: Vec<CorpusInventory> = futures_util::stream::iter(pending)
+        .buffered(MAX_CONCURRENT_COVERAGE_CHECKS)
+        .collect()
+        .await;
     let mut request = RequestInventory {
         inventory: Inventory::new(),
         scan_warnings: Vec::new(),
@@ -710,26 +699,35 @@ async fn handle_ground(
         Ok(result) => result,
         Err(error) => return DaemonResponse::invalid_params(error),
     };
+    // Union ground (#106, #425): every corpus-less request fans the query
+    // across EVERY effective corpus and merges into one re-ranked set, whether
+    // cwd sits above all repos or inside one (the repo's own wiki is just one
+    // more corpus in that set, ranked first via `priority_corpus` below). Only
+    // an explicit `corpus` takes the single-corpus path below.
+    let union = req.corpus.is_none();
+    let single_corpus = if union {
+        None
+    } else {
+        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
+            Ok(c) => Some(c),
+            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
+        }
+    };
+    let grounded: &[CorpusConfig] = match &single_corpus {
+        Some(corpus) => std::slice::from_ref(corpus),
+        None => &corpora,
+    };
     let res = match state.resources_for(cfg).await {
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
     let store = &res.store;
-    let coverage_targets: Vec<CorpusConfig> = match req.corpus.as_deref() {
-        Some(name) => match corpora.iter().find(|corpus| corpus.name == name) {
-            Some(corpus) => vec![corpus.clone()],
-            None => Vec::new(),
-        },
-        None => corpora.clone(),
-    };
-    // Wait for the first reconciliation of a cold root, bounded by
-    // `cold_wait_ms`. No lock is held.
     if cfg.search.cold_wait_ms > 0 {
         let wait = Duration::from_millis(cfg.search.cold_wait_ms);
         let waited_from = std::time::Instant::now();
         let completed = state
             .watch_registry()
-            .wait_first_reconcile(&source, &coverage_targets, wait)
+            .wait_first_reconcile(&source, grounded, wait)
             .await;
         tracing::debug!(
             target: "hallouminate::daemon",
@@ -739,34 +737,15 @@ async fn handle_ground(
         );
     }
     let opts = ground_opts(cfg, &req);
-
-    // Union ground (#106, #425): every corpus-less request fans the query
-    // across EVERY effective corpus and merges into one re-ranked set, whether
-    // cwd sits above all repos or inside one (the repo's own wiki is just one
-    // more corpus in that set, ranked first via `priority_corpus` below). Only
-    // an explicit `corpus` takes the single-corpus path below.
-    let union = req.corpus.is_none();
-
-    // Resolve the single corpus up front for the non-union path; on the union
-    // path the corpus list is the whole `corpora` set.
-    let single_corpus = if union {
-        None
-    } else {
-        match pick_corpus_or_default(&corpora, &cfg.repositories, cwd, req.corpus.as_deref()) {
-            Ok(c) => Some(c),
-            Err(e) => return DaemonResponse::invalid_params(e.into_inner()),
-        }
-    };
-
-    let grounded: &[CorpusConfig] = match &single_corpus {
-        Some(corpus) => std::slice::from_ref(corpus),
-        None => &corpora,
+    let eligible = match req.match_mode {
+        GroundMatch::Ranked => EligibleSets::Build,
+        GroundMatch::Phrase => EligibleSets::Skip,
     };
     let RequestInventory {
         inventory,
         scan_warnings,
         coverage_warnings,
-    } = request_inventory(state, store, grounded).await;
+    } = request_inventory(state, store, grounded, eligible).await;
 
     // Crossencoder admission is best-effort. Construction and rerank run
     // inside the ground timeout, and busy or failed slots use fusion fallback.
@@ -852,7 +831,7 @@ async fn handle_ground(
 
     response
         .warnings
-        .extend(collect_recovery_warnings(state, &source, &coverage_targets));
+        .extend(collect_recovery_warnings(state, &source, grounded));
 
     let response = if let Some(limit) = req.snippet_chars {
         trim_snippets(&response, limit)
@@ -893,6 +872,11 @@ async fn handle_index(
     // selected would let MCP clients believe the path list landed.
     if req.paths_from.is_some() {
         return DaemonResponse::invalid_params("paths_from is not supported via the daemon yet");
+    }
+    if req.background && req.strict {
+        return DaemonResponse::invalid_params(
+            "strict is not supported with background; the queued index cannot fail on a missing root",
+        );
     }
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
@@ -1941,8 +1925,8 @@ pub(super) fn state_write_lane(
     }
 }
 
-/// Plan + apply one corpus's down-window diff. Callers hold `lock_corpus`
-/// for `corpus.name` across this whole call (scan through apply) so no other
+/// Plan + apply one corpus's down-window diff. Callers hold the locks of
+/// `corpus_lock_keys(corpus)` across this whole call (scan through apply) so no other
 /// writer to the corpus interleaves. `acquire_lane` is invoked only once a
 /// non-empty plan confirms there is real work, and then once per write
 /// batch: the lane is released between batches so another catch-up can
@@ -3584,7 +3568,7 @@ mod tests {
             "[embeddings]\nenabled = false\n",
         )
         .await;
-        let gate = state.coverage_gate();
+        let gate = state.scan_cache().gate();
         let probe = state.coverage_probe();
         probe.block_walk();
         struct WalkReleaseGuard {
@@ -4646,6 +4630,123 @@ mod tests {
         state.shutdown_token().cancel();
     }
 
+    /// WHY: the eligible file sets exist only for the lexical fallback. A
+    /// request that skips them still gets the coverage counts from the same walk.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn corpus_inventory_builds_eligible_sets_only_when_asked() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let corpus_dir = cold_root(tmp.path());
+        std::fs::write(corpus_dir.join("a.md"), "# A\n\nAlpha content.\n").expect("write a");
+        let state = state_with_cold_wait(&tmp.path().join("ground"), COLD_BASELINE, 0).await;
+        let corpus_cfg = CorpusConfig {
+            name: "test".to_string(),
+            paths: vec![corpus_dir.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let store = state.store();
+
+        let built = corpus_inventory(
+            &state,
+            &store,
+            &corpus_cfg,
+            WalkBudget::Unbounded,
+            EligibleSets::Build,
+        )
+        .await;
+        let skipped = corpus_inventory(
+            &state,
+            &store,
+            &corpus_cfg,
+            WalkBudget::Unbounded,
+            EligibleSets::Skip,
+        )
+        .await;
+
+        let [(_, built_root)] = &built.roots[..] else {
+            panic!("one root expected");
+        };
+        let [(_, skipped_root)] = &skipped.roots[..] else {
+            panic!("one root expected");
+        };
+        assert_eq!(
+            built_root.eligible.len(),
+            1,
+            "the unindexed file is eligible"
+        );
+        assert!(skipped_root.eligible.is_empty(), "Skip builds no sets");
+        let built_coverage = built.coverage.expect("built coverage");
+        let skipped_coverage = skipped.coverage.expect("skipped coverage");
+        assert_eq!(built_coverage, (0, 1));
+        assert_eq!(skipped_coverage, (0, 1));
+        state.shutdown_token().cancel();
+    }
+
+    /// WHY: a background index replies before the catch-up runs, and `strict`
+    /// needs a synchronous run to report a missing root.
+    #[tokio::test]
+    async fn index_rejects_strict_with_background() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        cold_root(tmp.path());
+        let state = state_with_cold_wait(&tmp.path().join("ground"), COLD_BASELINE, 0).await;
+
+        let response = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: None,
+                    paths_from: None,
+                    strict: true,
+                    background: true,
+                }),
+            },
+        )
+        .await;
+
+        assert_invalid_params(response, "strict");
+        assert!(
+            state.watch_registry().snapshot_roots().is_empty(),
+            "the rejected request must queue nothing"
+        );
+        state.shutdown_token().cancel();
+    }
+
+    /// WHY: an unknown corpus is a caller error. It must fail before the cold
+    /// wait, not after the full bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ground_unknown_corpus_fails_without_the_cold_wait() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        cold_root(tmp.path());
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = state_with_cold_wait(&tmp.path().join("ground"), COLD_BASELINE, 10_000).await;
+
+        let started = std::time::Instant::now();
+        let response = dispatch(
+            &state,
+            DaemonRequest {
+                cwd: tmp.path().to_path_buf(),
+                payload: DaemonRequestPayload::Ground(
+                    serde_json::from_value(serde_json::json!({
+                        "query": "content",
+                        "corpus": "no-such-corpus",
+                    }))
+                    .expect("ground request"),
+                ),
+            },
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "validation must precede the cold wait: {:?}",
+            started.elapsed()
+        );
+        assert_invalid_params(response, "no-such-corpus");
+        state.shutdown_token().cancel();
+    }
+
     /// WHY (AC-8): a background index request registers the cwd's corpora
     /// and replies before the catch-up runs; the pump finishes it later.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4654,8 +4755,9 @@ mod tests {
         let corpus_dir = cold_root(tmp.path());
         std::fs::write(corpus_dir.join("a.md"), "# A\n\nAlpha content.\n").expect("write a");
         let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
-        let state = state_with_cold_wait(&tmp.path().join("ground"), COLD_BASELINE, 0).await;
+        let state = state_with_cold_wait(&tmp.path().join("ground"), COLD_BASELINE, 10_000).await;
 
+        let started = std::time::Instant::now();
         let response = dispatch(
             &state,
             DaemonRequest {
@@ -4669,6 +4771,11 @@ mod tests {
             },
         )
         .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a background index must not run the cold wait: {:?}",
+            started.elapsed()
+        );
         let DaemonResponse::Ok { result } = response else {
             panic!("background index must succeed: {response:?}");
         };

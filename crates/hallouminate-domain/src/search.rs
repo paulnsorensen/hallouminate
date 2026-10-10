@@ -1968,6 +1968,42 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_drops_a_candidate_whose_parent_dir_became_a_symlink() {
+        let (_dir, corpus_key) = fixture_root();
+        let outside = tempfile::tempdir().expect("outside dir");
+        write_lines(&outside.path().join("secret.md"), &["zebrafish secret"]);
+        let swapped_dir = corpus_key.canonical_root.join("docs");
+        std::os::unix::fs::symlink(outside.path(), &swapped_dir).expect("swap parent for symlink");
+        let eligible = HashSet::from([FileRef::new(swapped_dir.join("secret.md"))]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(
+            result.hits.is_empty(),
+            "a parent symlink must not leak outside text: {:?}",
+            result.hits
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_does_not_create_a_missing_parent_directory() {
+        let (_dir, corpus_key) = fixture_root();
+        let ghost = corpus_key.canonical_root.join("ghost");
+        let eligible = HashSet::from([FileRef::new(ghost.join("cold.md"))]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(result.hits.is_empty());
+        assert!(!ghost.exists(), "the fallback must not create directories");
+    }
+
     #[test]
     fn rank_after_scores_every_fallback_hit_below_every_fused_hit() {
         let fused = |score: f32| SearchHit {

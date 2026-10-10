@@ -59,7 +59,7 @@ pub async fn run_index_background(args: IndexArgs) -> anyhow::Result<QueuedIndex
 fn require_background_ack(report: QueuedIndexReport) -> anyhow::Result<QueuedIndexReport> {
     if !report.acknowledged {
         return Err(anyhow::anyhow!(
-            "daemon does not support --background; upgrade/restart the daemon"
+            "daemon does not support --background and ran a synchronous index instead; upgrade/restart the daemon"
         ));
     }
     Ok(report)
@@ -344,7 +344,7 @@ mod tests {
         let err = require_background_ack(decoded).expect_err("missing ack must fail");
         assert!(
             err.to_string()
-                .contains("daemon does not support --background; upgrade/restart the daemon"),
+                .contains("ran a synchronous index instead; upgrade/restart the daemon"),
             "got: {err}",
         );
     }

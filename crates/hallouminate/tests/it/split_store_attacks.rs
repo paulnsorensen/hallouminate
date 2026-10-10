@@ -273,8 +273,12 @@ async fn split_store_identical_bytes_with_other_file_name_report_the_new_path() 
     let corpus_a = corpus_for_root(&roots.root_a);
     let corpus_b = corpus_for_root(&roots.root_b);
     let embedded_a = index_with(&corpus_a, &store, 1500).await;
-    index_with(&corpus_b, &store, 1500).await;
+    let embedded_b = index_with(&corpus_b, &store, 1500).await;
     assert!(embedded_a > 0, "the first root must embed its own chunks");
+    assert!(
+        embedded_b > 0,
+        "another file name must derive its own content row and embed it"
+    );
 
     let paths_b = ground_paths(&corpus_b, &store).await;
 

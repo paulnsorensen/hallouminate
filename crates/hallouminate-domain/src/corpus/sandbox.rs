@@ -667,6 +667,71 @@ fn not_found_error() -> WriteError {
     )
 }
 
+/// Open the existing regular file `<root>/<relative>` for reading. The walk
+/// never creates anything: every parent component and the leaf pass a
+/// `symlink_metadata` check through a `cap-std` `Dir` capability, so a
+/// component swapped for a symlink bounces with `WriteErrorKind::Symlink`.
+/// The leaf must be a regular file, so a FIFO or device cannot block the
+/// caller. The caller bounds the read size.
+///
+/// The `symlink_metadata` + open split is not atomic at the syscall level; a
+/// race can only redirect within the capability, never outside `root`.
+///
+/// # Errors
+///
+/// Returns [`WriteError`] with:
+/// - [`WriteErrorKind::Symlink`] when any path component or the leaf is a symlink.
+/// - [`WriteErrorKind::InvalidPath`] when `relative` is not a non-empty path of
+///   normal file components, a parent component is not a directory, or the
+///   leaf is not a regular file.
+/// - [`WriteErrorKind::Io`] when a component is absent or any other open fails.
+pub fn open_existing_file_no_follow(
+    root: &Path,
+    relative: &Path,
+) -> Result<std::fs::File, WriteError> {
+    let names = normal_components(relative)?;
+    let Some((file_name, dirs)) = names.split_last() else {
+        return Err(invalid_path_error("path must name a file"));
+    };
+    let mut current = Dir::open_ambient_dir(root, ambient_authority())
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    for dir in dirs {
+        let meta = current
+            .symlink_metadata(dir.as_os_str())
+            .map_err(classify_path_io_error)?;
+        if meta.file_type().is_symlink() {
+            return Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()));
+        }
+        if !meta.is_dir() {
+            return Err(invalid_path_error("path component is not a directory"));
+        }
+        current = current
+            .open_dir(dir.as_os_str())
+            .map_err(classify_path_io_error)?;
+    }
+    let meta = current
+        .symlink_metadata(file_name.as_os_str())
+        .map_err(classify_path_io_error)?;
+    let file_type = meta.file_type();
+    if file_type.is_symlink() {
+        return Err(WriteError::new(WriteErrorKind::Symlink, symlink_io_error()));
+    }
+    if !file_type.is_file() {
+        return Err(invalid_path_error("target is not a regular file"));
+    }
+    let file = current
+        .open(file_name.as_os_str())
+        .map_err(classify_path_io_error)?
+        .into_std();
+    let opened = file
+        .metadata()
+        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+    if !opened.is_file() {
+        return Err(invalid_path_error("target is not a regular file"));
+    }
+    Ok(file)
+}
+
 /// Unlink `<root>/<relative>` after walking every parent component through a
 /// `cap-std` `Dir` capability. Refuses to delete when the leaf is a symlink
 /// (the pre-fix daemon path silently followed parent symlinks via
@@ -1665,6 +1730,58 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "source kind: {err:?}"
         );
+    }
+
+    #[test]
+    fn open_existing_file_no_follow_reads_a_plain_nested_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("a/b")).unwrap();
+        std::fs::write(tmp.path().join("a/b/leaf.md"), b"plain\n").unwrap();
+        let mut file = open_existing_file_no_follow(tmp.path(), Path::new("a/b/leaf.md"))
+            .expect("plain file opens");
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "plain\n");
+    }
+
+    #[test]
+    fn open_existing_file_no_follow_rejects_symlinked_parent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.md"), b"shh\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("docs")).unwrap();
+        let err = open_existing_file_no_follow(&root, Path::new("docs/secret.md"))
+            .expect_err("swapped parent must bounce");
+        assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
+    }
+
+    #[test]
+    fn open_existing_file_no_follow_does_not_create_a_missing_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = open_existing_file_no_follow(tmp.path(), Path::new("missing/leaf.md"))
+            .expect_err("missing parent must fail");
+        assert!(matches!(err.kind, WriteErrorKind::Io), "{err:?}");
+        assert!(!tmp.path().join("missing").exists(), "parent was created");
+    }
+
+    #[test]
+    fn open_existing_file_no_follow_rejects_a_fifo_leaf_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe.md");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            0,
+        )
+        .expect("mkfifo");
+        let err = open_existing_file_no_follow(tmp.path(), Path::new("pipe.md"))
+            .expect_err("fifo must be refused");
+        assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
     }
 
     // ── resolve_read_root: multi-root read resolution (Curd B) ───────────

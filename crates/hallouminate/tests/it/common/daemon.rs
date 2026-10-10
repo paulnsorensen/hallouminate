@@ -53,19 +53,20 @@ impl DaemonHarness {
         std::fs::write(hallou_dir.join("config.toml"), "").expect("write empty repo config");
 
         let state = DaemonState::open(cfg, None).await.expect("open state");
-        let served_state = state.clone();
         let (tx, rx) = oneshot::channel();
         let socket_clone = socket.clone();
-        let handle = tokio::spawn(async move {
-            let state = served_state;
-            let server = serve_with_idle_timeout(&state, &socket_clone, idle_timeout);
-            tokio::pin!(server);
-            tokio::select! {
-                res = &mut server => res,
-                _ = rx => {
-                    state.shutdown_token().cancel();
-                    server.await
-                },
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let server = serve_with_idle_timeout(&state, &socket_clone, idle_timeout);
+                tokio::pin!(server);
+                tokio::select! {
+                    res = &mut server => res,
+                    _ = rx => {
+                        state.shutdown_token().cancel();
+                        server.await
+                    },
+                }
             }
         });
         // Wait for a successful Ping round-trip, not just socket-path

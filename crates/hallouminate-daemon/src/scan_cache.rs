@@ -6,13 +6,13 @@
 //! coverage checks and the lexical fallback share one concurrency limit.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
 use hallouminate_domain::common::CorpusConfig;
-use hallouminate_domain::corpus::ScannedFile;
+use hallouminate_domain::corpus::{ScannedFile, scan};
 use tokio::sync::Semaphore;
 use tokio::time::error::Elapsed;
 
@@ -45,57 +45,48 @@ struct EntryGuard {
 
 impl Drop for EntryGuard {
     fn drop(&mut self) {
-        let Ok(mut inflight) = self.registry.lock() else {
-            return;
-        };
+        let mut inflight = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
         inflight.remove(&self.corpus);
     }
 }
 
 pub(crate) struct ScanCache {
     budget: Duration,
+    gate: Arc<Semaphore>,
+    scanner: Scanner,
     inflight: Registry,
 }
 
 impl ScanCache {
-    pub(crate) fn new(budget: Duration) -> Self {
+    pub(crate) fn new(budget: Duration, gate: Arc<Semaphore>, scanner: Scanner) -> Self {
         Self {
             budget,
+            gate,
+            scanner,
             inflight: Arc::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.gate)
     }
 
     /// Joins or starts the walk of `corpus` and waits at most the budget.
     ///
     /// The walk keeps running after a timeout and holds its permit until it
     /// ends.
-    pub(crate) async fn walk(
-        &self,
-        corpus: &CorpusConfig,
-        gate: Arc<Semaphore>,
-        scanner: Scanner,
-    ) -> Result<Walk, Elapsed> {
-        let flight = self.join_or_start(corpus, gate, scanner);
-        tokio::time::timeout(self.budget, flight).await
+    pub(crate) async fn walk(&self, corpus: &CorpusConfig) -> Result<Walk, Elapsed> {
+        tokio::time::timeout(self.budget, self.join_or_start(corpus)).await
     }
 
     /// Joins or starts the walk of `corpus` and waits for it to end.
-    pub(crate) async fn walk_to_end(
-        &self,
-        corpus: &CorpusConfig,
-        gate: Arc<Semaphore>,
-        scanner: Scanner,
-    ) -> Walk {
-        self.join_or_start(corpus, gate, scanner).await
+    pub(crate) async fn walk_to_end(&self, corpus: &CorpusConfig) -> Walk {
+        self.join_or_start(corpus).await
     }
 
-    fn join_or_start(
-        &self,
-        corpus: &CorpusConfig,
-        gate: Arc<Semaphore>,
-        scanner: Scanner,
-    ) -> InFlight {
-        let mut inflight = self.inflight.lock().expect("scan cache lock");
+    fn join_or_start(&self, corpus: &CorpusConfig) -> InFlight {
+        let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(flight) = inflight.get(corpus) {
             return flight.clone();
         }
@@ -104,6 +95,8 @@ impl ScanCache {
             corpus: corpus.clone(),
         };
         let owned = corpus.clone();
+        let gate = Arc::clone(&self.gate);
+        let scanner = Arc::clone(&self.scanner);
         let task = tokio::spawn(async move {
             let walk = run_walk(owned, gate, scanner).await;
             drop(guard);
@@ -124,6 +117,19 @@ impl ScanCache {
         inflight.insert(corpus.clone(), flight.clone());
         flight
     }
+}
+
+/// The walk that the coverage check and the lexical fallback share.
+pub(crate) fn corpus_scanner(
+    #[cfg(test)] coverage_probe: Arc<crate::state::CoverageProbe>,
+) -> Scanner {
+    Arc::new(move |corpus| {
+        #[cfg(test)]
+        let _walk_phase = coverage_probe.enter_walk();
+        #[cfg(test)]
+        coverage_probe.wait_for_walk_release();
+        scan(corpus).map_err(anyhow::Error::from)
+    })
 }
 
 async fn run_walk(corpus: CorpusConfig, gate: Arc<Semaphore>, scanner: Scanner) -> Walk {
@@ -187,8 +193,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_requests_for_one_corpus_walk_once() {
-        let cache = Arc::new(ScanCache::new(Duration::from_secs(5)));
-        let gate = Arc::new(Semaphore::new(6));
         let walks = Arc::new(AtomicUsize::new(0));
         let (release, released) = mpsc::channel::<()>();
         let released = Arc::new(StdMutex::new(released));
@@ -200,16 +204,17 @@ mod tests {
                 Ok(one_file(corpus))
             })
         };
+        let cache = Arc::new(ScanCache::new(
+            Duration::from_secs(5),
+            Arc::new(Semaphore::new(6)),
+            scanner,
+        ));
         let target = corpus("shared");
         let mut requests = Vec::new();
         for _ in 0..3 {
             let cache = Arc::clone(&cache);
-            let gate = Arc::clone(&gate);
-            let scanner = Arc::clone(&scanner);
             let target = target.clone();
-            requests.push(tokio::spawn(async move {
-                cache.walk(&target, gate, scanner).await
-            }));
+            requests.push(tokio::spawn(async move { cache.walk(&target).await }));
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
         release.send(()).expect("release the walk");
@@ -220,7 +225,7 @@ mod tests {
         assert_eq!(walks.load(Ordering::SeqCst), 1);
 
         release.send(()).expect("release the second walk");
-        let again = cache.walk_to_end(&target, gate, scanner).await;
+        let again = cache.walk_to_end(&target).await;
         assert_eq!(file_count(&again), Some(1));
         assert_eq!(
             walks.load(Ordering::SeqCst),
@@ -231,8 +236,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slow_corpus_times_out_without_delaying_another_corpus() {
-        let cache = Arc::new(ScanCache::new(Duration::from_millis(200)));
-        let gate = Arc::new(Semaphore::new(6));
         let (release, released) = mpsc::channel::<()>();
         let released = Arc::new(StdMutex::new(released));
         let scanner: Scanner = Arc::new(move |corpus| {
@@ -241,17 +244,49 @@ mod tests {
             }
             Ok(one_file(corpus))
         });
+        let cache = Arc::new(ScanCache::new(
+            Duration::from_millis(200),
+            Arc::new(Semaphore::new(6)),
+            scanner,
+        ));
         let slow = corpus("slow");
         let fast = corpus("fast");
 
-        let (slow_walk, fast_walk) = tokio::join!(
-            cache.walk(&slow, Arc::clone(&gate), Arc::clone(&scanner)),
-            cache.walk(&fast, Arc::clone(&gate), Arc::clone(&scanner)),
-        );
+        let (slow_walk, fast_walk) = tokio::join!(cache.walk(&slow), cache.walk(&fast));
 
         assert!(slow_walk.is_err(), "the slow walk must hit the budget");
         let fast_walk = fast_walk.expect("the fast corpus stays within budget");
         assert_eq!(file_count(&fast_walk), Some(1));
         release.send(()).expect("release the slow walk");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poisoned_registry_still_drops_finished_entries() {
+        let walks = Arc::new(AtomicUsize::new(0));
+        let scanner: Scanner = {
+            let walks = Arc::clone(&walks);
+            Arc::new(move |corpus| {
+                walks.fetch_add(1, Ordering::SeqCst);
+                Ok(one_file(corpus))
+            })
+        };
+        let cache = ScanCache::new(Duration::from_secs(5), Arc::new(Semaphore::new(6)), scanner);
+        let registry = Arc::clone(&cache.inflight);
+        let poisoned = std::thread::spawn(move || {
+            let _held = registry.lock().expect("registry lock");
+            panic!("poison the registry");
+        })
+        .join();
+        assert!(poisoned.is_err());
+        assert!(cache.inflight.is_poisoned());
+
+        let target = corpus("poisoned");
+        assert_eq!(file_count(&cache.walk_to_end(&target).await), Some(1));
+        assert_eq!(file_count(&cache.walk_to_end(&target).await), Some(1));
+        assert_eq!(
+            walks.load(Ordering::SeqCst),
+            2,
+            "a finished walk must leave the poisoned registry"
+        );
     }
 }

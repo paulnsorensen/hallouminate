@@ -2697,12 +2697,25 @@ impl ChunkRetrieval for LanceStore {
         &self,
         corpus_key: &CorpusKey,
     ) -> Result<Option<HashSet<hallouminate_domain::common::FileRef>>> {
-        let files = ChunkStore::list_files(self, corpus_key).await?;
-        let mut refs = HashSet::with_capacity(files.len());
-        for file in files {
-            refs.insert(hallouminate_domain::common::FileRef::new(
-                std::path::PathBuf::from(file.file_ref),
-            ));
+        let batches = scan_columns(
+            &self.files,
+            "indexed_file_refs",
+            Some(corpus_key_filter(corpus_key)?),
+            &["file_ref"],
+            None,
+        )
+        .await?;
+        let mut refs = HashSet::new();
+        for rb in &batches {
+            if rb.num_rows() == 0 {
+                continue;
+            }
+            let file_ref = string_col(rb, "file_ref")?;
+            for i in 0..rb.num_rows() {
+                refs.insert(hallouminate_domain::common::FileRef::new(
+                    std::path::PathBuf::from(file_ref.value(i)),
+                ));
+            }
         }
         Ok(Some(refs))
     }
@@ -3189,6 +3202,49 @@ mod tests {
         assert_eq!(store.count_rows().await.expect("count content rows"), 2);
         let files = store.list_files(&root).await.expect("list files");
         assert_eq!(files.len(), 2, "the map holds one row per file");
+    }
+
+    /// WHY: the ground inventory reads only the indexed file refs of a root.
+    #[tokio::test]
+    async fn indexed_file_refs_lists_each_mapped_file_of_one_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let root = corpus_key("docs", "/root-a");
+        let other_root = corpus_key("docs", "/root-b");
+        store
+            .apply_batch(vec![
+                synthetic_prepared_for(&root, "one/a.md", 1, "text a", 1, 1),
+                synthetic_prepared_for(&root, "two/b.md", 1, "text b", 1, 1),
+            ])
+            .await
+            .expect("apply root batch");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &other_root,
+                "c.md",
+                1,
+                "text c",
+                1,
+                1,
+            )])
+            .await
+            .expect("apply other root batch");
+
+        let refs = store
+            .indexed_file_refs(&root)
+            .await
+            .expect("list refs")
+            .expect("the lance store lists its files");
+
+        let mut paths: Vec<String> = Vec::new();
+        for file_ref in &refs {
+            paths.push(file_ref.as_path().display().to_string());
+        }
+        paths.sort();
+        assert_eq!(paths, vec!["one/a.md".to_string(), "two/b.md".to_string()]);
     }
 
     #[tokio::test]

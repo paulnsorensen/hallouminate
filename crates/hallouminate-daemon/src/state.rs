@@ -366,9 +366,8 @@ struct DaemonStateInner {
     store_lock_owner: StoreLockOwner,
     corpus_locks: KeyedLockMap<CorpusKey>,
     write_lane: Arc<Semaphore>,
-    /// Daemon-wide gate for filesystem and indexed-path coverage work.
-    coverage_gate: Arc<Semaphore>,
-    /// In-flight corpus walks shared by concurrent `ground` requests.
+    /// In-flight corpus walks shared by concurrent `ground` requests. Every
+    /// walk takes a permit from the daemon-wide coverage gate.
     scan_cache: crate::scan_cache::ScanCache,
     #[cfg(test)]
     coverage_probe: Arc<CoverageProbe>,
@@ -588,7 +587,16 @@ impl DaemonState {
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
         let write_lane = Arc::new(Semaphore::new(1));
-        let coverage_gate = Arc::new(Semaphore::new(MAX_CONCURRENT_COVERAGE_CHECKS));
+        #[cfg(test)]
+        let coverage_probe = Arc::new(CoverageProbe::default());
+        let scan_cache = crate::scan_cache::ScanCache::new(
+            crate::scan_cache::SCAN_BUDGET,
+            Arc::new(Semaphore::new(MAX_CONCURRENT_COVERAGE_CHECKS)),
+            crate::scan_cache::corpus_scanner(
+                #[cfg(test)]
+                Arc::clone(&coverage_probe),
+            ),
+        );
 
         // #161's idle eviction is deleted (ADR-001): dropping the ONNX session
         // released nothing (the CPU BFCArena retains its extents), so each
@@ -665,10 +673,9 @@ impl DaemonState {
                     corpus_locks: KeyedLockMap::default(),
                     store_lock_owner,
                     write_lane,
-                    coverage_gate,
-                    scan_cache: crate::scan_cache::ScanCache::new(crate::scan_cache::SCAN_BUDGET),
+                    scan_cache,
                     #[cfg(test)]
-                    coverage_probe: Arc::new(CoverageProbe::default()),
+                    coverage_probe,
                     crossencoders,
                     last_activity_secs: last_activity,
                     active_connections: Arc::new(AtomicUsize::new(0)),
@@ -799,11 +806,6 @@ impl DaemonState {
     /// and `index_corpus`. False means the embedder is permanently `None`.
     pub fn embeddings_enabled(&self) -> bool {
         self.inner.baseline_resources.embeddings_enabled
-    }
-
-    /// Return the daemon-wide Ground coverage admission gate.
-    pub(crate) fn coverage_gate(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.inner.coverage_gate)
     }
 
     pub(crate) fn scan_cache(&self) -> &crate::scan_cache::ScanCache {

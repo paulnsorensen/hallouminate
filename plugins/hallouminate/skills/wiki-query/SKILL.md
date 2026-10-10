@@ -45,7 +45,7 @@ Give each the exact Ground call, fixed checkout and corpus, and this contract:
 
 > Run `ground { query: "<sub-question>", corpus: "<corpus>", top_files: 5, chunks_per_file: 3, cwd }`.
 > A cold corpus makes the first Ground wait for the first reconciliation, up to `search.cold_wait_ms` (default 10 s, maximum 60 s).
-> After that wait, Ground can return lexical line-window hits instead of indexed chunks.
+> Ground also returns lexical line-window hits for selected files that have no indexed rows, with or without a cold wait.
 > A fallback hit has a `chunk_id` that starts with `lexical-fallback:` and an empty `heading_path`; its `stale` flag does not show index freshness.
 > Inspect `index-coverage`, `index-reconciliation`, every `lexical-fallback*` warning (`lexical-fallback`, `-truncated`, `-timeout`, `-failed`, `-scan-timeout`), and `config-path-outside-repo` for the selected corpus before interpreting results, including zero hits.
 > Foreign-corpus hits do not establish coverage or successful grounding of the selected repository.
