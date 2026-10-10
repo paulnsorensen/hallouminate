@@ -3396,14 +3396,14 @@ mod tests {
             &cfg,
         );
         assert!(registered.is_ok(), "register the override corpus");
-        let Some(id) = state.watch_registry().begin_next_catch_up() else {
+        let Some(id) = state.watch_registry().begin_next_catch_up(1) else {
             panic!("a new registration must queue its catch-up");
         };
         state
             .watch_registry()
             .finish_catch_up(&id, Err("stale store".into()));
         assert!(
-            state.watch_registry().begin_next_catch_up().is_none(),
+            state.watch_registry().begin_next_catch_up(1).is_none(),
             "a failed catch-up waits for the reconcile tick",
         );
 
@@ -3426,7 +3426,7 @@ mod tests {
             "a failed request must not move the stale store",
         );
         assert!(
-            state.watch_registry().begin_next_catch_up().is_none(),
+            state.watch_registry().begin_next_catch_up(1).is_none(),
             "a failed request must not queue a catch-up",
         );
 
@@ -3442,7 +3442,7 @@ mod tests {
             stale,
         );
         assert!(
-            state.watch_registry().begin_next_catch_up().is_some(),
+            state.watch_registry().begin_next_catch_up(1).is_some(),
             "a stale move must queue the catch-up again",
         );
         catch_up_override(&state, &resources, &cfg).await;

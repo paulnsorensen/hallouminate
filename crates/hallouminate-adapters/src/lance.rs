@@ -102,6 +102,11 @@ pub struct MaintenanceStats {
 pub struct LanceDebt {
     pub fragments: u64,
     pub stale_versions: u64,
+    /// Fragments in the file-map table, which map-only writes grow without
+    /// touching the content table.
+    pub files_fragments: u64,
+    /// Superseded versions of the file-map table.
+    pub files_stale_versions: u64,
 }
 
 /// Rounds a prune-retention `Duration` to whole seconds for LanceDB's
@@ -1657,9 +1662,13 @@ impl LanceStore {
     pub async fn debt(&self) -> Result<LanceDebt> {
         let stats = self.table.stats().await.map_err(map_lance_err)?;
         let versions = self.table.list_versions().await.map_err(map_lance_err)?;
+        let files_stats = self.files.stats().await.map_err(map_lance_err)?;
+        let files_versions = self.files.list_versions().await.map_err(map_lance_err)?;
         Ok(LanceDebt {
             fragments: stats.fragment_stats.num_fragments as u64,
             stale_versions: versions.len().saturating_sub(1) as u64,
+            files_fragments: files_stats.fragment_stats.num_fragments as u64,
+            files_stale_versions: files_versions.len().saturating_sub(1) as u64,
         })
     }
 
@@ -3697,6 +3706,84 @@ mod tests {
             "maintain must reduce debt's stale_versions count: before {}, after {}",
             debt_before.stale_versions,
             debt_after.stale_versions
+        );
+    }
+
+    #[tokio::test]
+    async fn debt_counts_file_map_table_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        let seed = corpus_key("docs", "/tmp/map-only-root-0");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &seed,
+                "/tmp/same.md",
+                1,
+                "maponlytoken",
+                10,
+                100,
+            )])
+            .await
+            .expect("apply");
+        let before = store.debt().await.expect("debt before");
+        for i in 1..6 {
+            let key = corpus_key("docs", &format!("/tmp/map-only-root-{i}"));
+            store
+                .apply_batch(vec![synthetic_prepared_for(
+                    &key,
+                    "/tmp/same.md",
+                    1,
+                    "maponlytoken",
+                    10,
+                    100,
+                )])
+                .await
+                .expect("apply map-only");
+        }
+        let after = store.debt().await.expect("debt after");
+        assert_eq!(
+            after.stale_versions, before.stale_versions,
+            "same-content writes must leave the content table untouched"
+        );
+        assert!(
+            after.files_fragments > before.files_fragments,
+            "map-only writes must raise file-map fragment debt: {before:?} -> {after:?}"
+        );
+        assert!(
+            after.files_stale_versions > before.files_stale_versions,
+            "map-only writes must raise file-map stale versions: {before:?} -> {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn maintain_compacts_file_map_fragments() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        for i in 0..30 {
+            store
+                .apply_batch(vec![synthetic_prepared(&format!("/tmp/f{i}.md"), 1)])
+                .await
+                .expect("apply");
+        }
+        let before = store.debt().await.expect("debt before");
+        store
+            .maintain(MaintenanceOptions {
+                maintenance_id: 1,
+                prune_older_than: Duration::ZERO,
+                max_fragments_per_slice: None,
+            })
+            .await
+            .expect("maintain");
+        let after = store.debt().await.expect("debt after");
+        assert!(
+            after.files_fragments < before.files_fragments,
+            "maintain must compact file-map fragments: {before:?} -> {after:?}"
         );
     }
 

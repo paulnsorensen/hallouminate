@@ -909,8 +909,8 @@ impl PumpState {
         state: &DaemonState,
         tracker: &TaskTracker,
     ) {
-        registry.set_catch_up_limit(state.baseline().watch.effective_catch_up_concurrency());
-        while let Some(id) = registry.begin_next_catch_up() {
+        let limit = state.baseline().watch.effective_catch_up_concurrency();
+        while let Some(id) = registry.begin_next_catch_up(limit) {
             spawn_registration_catch_up(state.clone(), id, tracker);
         }
     }
@@ -3418,6 +3418,51 @@ mod tests {
             u64::MAX,
             "delete-only watcher work must not reset the idle-exit window",
         );
+    }
+
+    /// `watch.catch_up_concurrency` from config must reach admission: with a
+    /// limit of two, one admission pass starts two queued roots together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_pass_honors_configured_catch_up_concurrency() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.watch.catch_up_concurrency = Some(2);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let mut corpora = Vec::new();
+        for name in ["alpha", "beta", "gamma"] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).expect("mkdir root");
+            let root = root.canonicalize().expect("canonicalize root");
+            corpora.push(corpus(name, root.to_str().unwrap(), &["**/*.md"]));
+        }
+        register_runtime_corpora(&state, None, &corpora, &cfg).expect("register corpora");
+
+        let tracker = TaskTracker::new();
+        let _write_lane = state
+            .acquire_write_lane()
+            .await
+            .expect("hold the write lane so admitted passes stay in flight");
+        PumpState::admit_next_catch_up(state.watch_registry(), &state, &tracker);
+
+        let mut in_flight = 0;
+        let mut queued = 0;
+        for (id, _) in state.watch_registry().snapshot_roots() {
+            match state.watch_registry().catch_up_state(&id) {
+                Some(registry::CatchUpState::InFlight) => in_flight += 1,
+                Some(registry::CatchUpState::Queued) => queued += 1,
+                Some(registry::CatchUpState::NotStarted)
+                | Some(registry::CatchUpState::Done)
+                | None => {}
+            }
+        }
+        assert_eq!(in_flight, 2, "a limit of two admits two roots at once");
+        assert_eq!(queued, 1, "the third root waits for a slot");
     }
 
     /// Drives `pump` twice against `state`, asserting one catch-up pass is

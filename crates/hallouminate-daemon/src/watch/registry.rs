@@ -20,7 +20,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use hallouminate_config::Config;
@@ -199,6 +199,9 @@ pub(crate) enum CatchUpState {
 
 struct Registration {
     corpus: CorpusConfig,
+    /// `corpus_lock_keys(&corpus)`, computed when the registration is
+    /// created so admission scans do not canonicalize under the registry lock.
+    lock_keys: Vec<CorpusKey>,
     cfg: Arc<Config>,
     roots: Vec<WatchRoot>,
     observation: Observation,
@@ -247,7 +250,7 @@ struct ActiveGroup {
 
 /// Fair-scheduling and admission state shared by every registration.
 /// `queue` holds ids that are `Queued`, in FIFO order; `active` holds one
-/// group per running catch-up pass, bounded by `catch_up_limit`. Two groups
+/// group per running catch-up pass, bounded by the limit passed to `begin_next_catch_up`. Two groups
 /// never share a `CorpusKey`, which matches the per-key corpus lock; the same
 /// corpus name under different roots (worktrees) runs concurrently.
 struct Inner {
@@ -266,7 +269,6 @@ struct Inner {
 /// periodic reconcile pass.
 pub(crate) struct WatchRegistry {
     inner: Mutex<Inner>,
-    catch_up_limit: AtomicUsize,
     changed: tokio::sync::Notify,
     /// Woken after every catch-up pass settles, so a request can await its
     /// registrations' first reconciliation without polling.
@@ -279,7 +281,6 @@ pub(crate) struct WatchRegistry {
 impl WatchRegistry {
     pub(crate) fn new() -> Self {
         Self {
-            catch_up_limit: AtomicUsize::new(1),
             inner: Mutex::new(Inner {
                 regs: HashMap::new(),
                 queue: VecDeque::new(),
@@ -321,6 +322,7 @@ impl WatchRegistry {
         guard.regs.insert(
             id,
             Registration {
+                lock_keys: corpus_lock_keys(&corpus),
                 corpus,
                 cfg,
                 roots,
@@ -369,6 +371,7 @@ impl WatchRegistry {
             .is_some_and(|existing| registration_equivalent(existing, &corpus, &cfg, &roots));
         if unchanged {
             let existing = guard.regs.get_mut(&id).expect("checked above");
+            existing.lock_keys = corpus_lock_keys(&corpus);
             existing.corpus = corpus;
             existing.cfg = cfg;
             return RegisterOutcome::AlreadyRegistered;
@@ -424,6 +427,7 @@ impl WatchRegistry {
         guard.regs.insert(
             id.clone(),
             Registration {
+                lock_keys: corpus_lock_keys(&corpus),
                 corpus,
                 cfg,
                 roots,
@@ -633,6 +637,7 @@ impl WatchRegistry {
             if let Some(existing) = guard.regs.get_mut(&id)
                 && registration_equivalent(existing, &corpus, &cfg, &roots)
             {
+                existing.lock_keys = corpus_lock_keys(&corpus);
                 existing.corpus = corpus;
                 existing.cfg = cfg.clone();
                 continue;
@@ -648,6 +653,7 @@ impl WatchRegistry {
             guard.regs.insert(
                 id.clone(),
                 Registration {
+                    lock_keys: corpus_lock_keys(&corpus),
                     corpus,
                     cfg: cfg.clone(),
                     roots,
@@ -869,8 +875,7 @@ impl WatchRegistry {
     /// `mark_reconcile_due_all` -- not immediate re-admission -- is what
     /// retries a failing registration; this is what keeps a persistently
     /// failing pass from busy-looping.
-    pub(crate) fn begin_next_catch_up(&self) -> Option<RegistrationId> {
-        let limit = self.catch_up_limit.load(Ordering::Relaxed).max(1);
+    pub(crate) fn begin_next_catch_up(&self, limit: usize) -> Option<RegistrationId> {
         let mut guard = self.lock();
         let inner = &mut *guard;
         if inner.active.len() >= limit {
@@ -892,7 +897,7 @@ impl WatchRegistry {
                 gated.push(id);
                 continue;
             }
-            let lock_keys = corpus_lock_keys(&reg.corpus);
+            let lock_keys = reg.lock_keys.clone();
             if active_locks_overlap(&inner.active, &lock_keys) {
                 deferred.push(id);
                 continue;
@@ -938,12 +943,6 @@ impl WatchRegistry {
         }
         inner.queue.extend(gated);
         admitted
-    }
-
-    /// Sets how many catch-up leaders may run at once. A value of zero
-    /// counts as one.
-    pub(crate) fn set_catch_up_limit(&self, limit: usize) {
-        self.catch_up_limit.store(limit.max(1), Ordering::Relaxed);
     }
 
     /// Marks catch-up finished for `id`, releasing the daemon-wide slot and
@@ -1087,7 +1086,10 @@ impl WatchRegistry {
         queried: &[CorpusConfig],
         timeout: std::time::Duration,
     ) -> bool {
-        let names: HashSet<&str> = queried.iter().map(|corpus| corpus.name.as_str()).collect();
+        let mut names: HashSet<&str> = HashSet::with_capacity(queried.len());
+        for corpus in queried {
+            names.insert(corpus.name.as_str());
+        }
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let notified = self.settled.notified();
@@ -1424,8 +1426,8 @@ mod tests {
             corpus_key: baseline_id.corpus_key.clone(),
         };
 
-        assert_eq!(registry.begin_next_catch_up(), Some(baseline_id.clone()));
-        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.begin_next_catch_up(1), Some(baseline_id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), None);
         registry.record_pending(&source_id, [PathBuf::from("/repo/mid.md")]);
         registry.finish_catch_up(&baseline_id, Ok(()));
 
@@ -1463,14 +1465,13 @@ mod tests {
     #[test]
     fn catch_up_concurrency_admits_up_to_the_limit_at_once() {
         let registry = WatchRegistry::new();
-        registry.set_catch_up_limit(2);
         let a = register_baseline(&registry, "a");
         let b = register_baseline(&registry, "b");
         let c = register_baseline(&registry, "c");
 
-        let first = registry.begin_next_catch_up().expect("first admitted");
-        let second = registry.begin_next_catch_up().expect("second admitted");
-        assert_eq!(registry.begin_next_catch_up(), None, "limit reached");
+        let first = registry.begin_next_catch_up(2).expect("first admitted");
+        let second = registry.begin_next_catch_up(2).expect("second admitted");
+        assert_eq!(registry.begin_next_catch_up(2), None, "limit reached");
         assert_eq!(
             [first.clone(), second.clone()]
                 .into_iter()
@@ -1487,21 +1488,20 @@ mod tests {
         assert_eq!(registry.catch_up_state(waiting), Some(CatchUpState::Queued));
 
         registry.finish_catch_up(&first, Ok(()));
-        assert_eq!(registry.begin_next_catch_up().as_ref(), Some(waiting));
-        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.begin_next_catch_up(2).as_ref(), Some(waiting));
+        assert_eq!(registry.begin_next_catch_up(2), None);
     }
 
     #[test]
     fn catch_up_concurrency_of_one_matches_serial_admission() {
         let registry = WatchRegistry::new();
-        registry.set_catch_up_limit(1);
         let a = register_baseline(&registry, "a");
         register_baseline(&registry, "b");
 
-        let first = registry.begin_next_catch_up().expect("first admitted");
-        assert_eq!(registry.begin_next_catch_up(), None);
+        let first = registry.begin_next_catch_up(1).expect("first admitted");
+        assert_eq!(registry.begin_next_catch_up(1), None);
         registry.finish_catch_up(&first, Ok(()));
-        let second = registry.begin_next_catch_up().expect("second admitted");
+        let second = registry.begin_next_catch_up(1).expect("second admitted");
         assert_ne!(first, second);
         assert!(first == a || second == a);
     }
@@ -1516,7 +1516,6 @@ mod tests {
     #[test]
     fn catch_up_runs_worktrees_of_one_corpus_name_concurrently() {
         let registry = WatchRegistry::new();
-        registry.set_catch_up_limit(2);
         let cfg = Arc::new(Config::default());
         let main = corpus_at("wiki", &["/no-such-main"]);
         let worktree = corpus_at("wiki", &["/no-such-worktree"]);
@@ -1533,16 +1532,15 @@ mod tests {
             vec![root("/no-such-worktree", worktree)],
         );
 
-        let first = registry.begin_next_catch_up().expect("first admitted");
-        let second = registry.begin_next_catch_up().expect("second admitted");
+        let first = registry.begin_next_catch_up(2).expect("first admitted");
+        let second = registry.begin_next_catch_up(2).expect("second admitted");
         assert_ne!(first, second, "distinct roots run in flight together");
-        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.begin_next_catch_up(2), None);
     }
 
     #[test]
     fn catch_up_never_admits_registrations_sharing_a_corpus_key() {
         let registry = WatchRegistry::new();
-        registry.set_catch_up_limit(3);
         let cfg = Arc::new(Config::default());
         let one = corpus_at("wiki", &["/no-such-a"]);
         let overlapping = corpus_at("wiki", &["/no-such-b", "/no-such-a"]);
@@ -1560,12 +1558,12 @@ mod tests {
         );
         let other = register_baseline(&registry, "other");
 
-        let first = registry.begin_next_catch_up().expect("first admitted");
-        let second = registry.begin_next_catch_up().expect("second admitted");
+        let first = registry.begin_next_catch_up(3).expect("first admitted");
+        let second = registry.begin_next_catch_up(3).expect("second admitted");
         assert_eq!(second, other, "key-sharing registration is deferred");
-        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.begin_next_catch_up(3), None);
         registry.finish_catch_up(&first, Ok(()));
-        assert!(registry.begin_next_catch_up().is_some());
+        assert!(registry.begin_next_catch_up(3).is_some());
     }
 
     #[test]
@@ -1593,7 +1591,7 @@ mod tests {
             corpus_key: baseline_id.corpus_key.clone(),
         };
 
-        assert_eq!(registry.begin_next_catch_up(), Some(baseline_id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(baseline_id.clone()));
         registry.record_pending(&baseline_id, [PathBuf::from("/repo/leader.md")]);
         registry.record_pending(&source_id, [PathBuf::from("/repo/member.md")]);
 
@@ -1637,14 +1635,14 @@ mod tests {
         };
         let other = baseline_id("other");
 
-        assert_eq!(registry.begin_next_catch_up(), Some(leader.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(leader.clone()));
         registry
             .replace_source(source, vec![], Arc::new(Config::default()), |_| vec![])
             .unwrap();
-        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.begin_next_catch_up(1), None);
         assert_eq!(registry.finish_catch_up(&leader, Ok(())), PendingWork::Idle);
         assert_eq!(registry.catch_up_state(&member), None);
-        assert_eq!(registry.begin_next_catch_up(), Some(other));
+        assert_eq!(registry.begin_next_catch_up(1), Some(other));
     }
 
     #[test]
@@ -1671,7 +1669,7 @@ mod tests {
             source: source.clone(),
             corpus_key: leader.corpus_key.clone(),
         };
-        assert_eq!(registry.begin_next_catch_up(), Some(leader.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(leader.clone()));
 
         registry
             .replace_source(source.clone(), vec![], cfg.clone(), |_| vec![])
@@ -1682,7 +1680,7 @@ mod tests {
             registry.register(source, replacement, cfg, replacement_roots),
             RegisterOutcome::New
         );
-        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.begin_next_catch_up(1), None);
         registry.finish_catch_up(&leader, Err("old failure".into()));
         assert_eq!(registry.catch_up_state(&member), Some(CatchUpState::Queued));
         assert_eq!(registry.pending(&member), Some(PendingWork::Idle));
@@ -1746,7 +1744,7 @@ mod tests {
             )
         );
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             Some(RegistrationId {
                 source: ConfigSource::Baseline,
                 corpus_key: CorpusKey {
@@ -1755,7 +1753,7 @@ mod tests {
                 },
             })
         );
-        assert_eq!(registry.begin_next_catch_up(), None);
+        assert_eq!(registry.begin_next_catch_up(1), None);
     }
 
     #[test]
@@ -1863,9 +1861,9 @@ mod tests {
         registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
         let id = baseline_id("wiki");
 
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             None,
             "catch-up must not start twice"
         );
@@ -1936,16 +1934,16 @@ mod tests {
         registry.register(ConfigSource::Baseline, corpus("b"), cfg, vec![]);
         let a = baseline_id("a");
 
-        assert_eq!(registry.begin_next_catch_up(), Some(a.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(a.clone()));
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             None,
             "a second pass must not be admitted while one is active"
         );
 
         registry.finish_catch_up(&a, Ok(()));
         assert!(
-            registry.begin_next_catch_up().is_some(),
+            registry.begin_next_catch_up(1).is_some(),
             "the slot frees up once the active pass finishes"
         );
     }
@@ -1960,7 +1958,7 @@ mod tests {
         let b = baseline_id("b");
 
         // Queue is [a, b] from registration. Start a's pass.
-        assert_eq!(registry.begin_next_catch_up(), Some(a.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(a.clone()));
         // A follow-up arrives for `a` mid-flight; `a` cannot re-queue itself
         // (it's InFlight, not Queued) until its pass finishes.
         registry.record_pending(&a, [PathBuf::from("/a/mid.md")]);
@@ -1968,7 +1966,7 @@ mod tests {
         registry.finish_catch_up(&a, Ok(()));
 
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             Some(b),
             "b must start before a's follow-up, since a was requeued behind it"
         );
@@ -1981,7 +1979,7 @@ mod tests {
         registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
         let id = baseline_id("wiki");
 
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         let pending = registry.finish_catch_up(&id, Err("boom".into()));
         assert_eq!(
             pending,
@@ -1989,7 +1987,7 @@ mod tests {
             "a failed pass must widen to a full retry, not vanish"
         );
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             None,
             "a failed pass must not immediately re-admit itself (no busy loop)"
         );
@@ -1997,7 +1995,7 @@ mod tests {
         // The next reconcile tick's admission cycle is what retries it.
         registry.mark_reconcile_due_all();
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             Some(id.clone()),
             "the reconcile tick's admission must retry the failed registration"
         );
@@ -2025,7 +2023,7 @@ mod tests {
             )]
         );
 
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         registry.finish_catch_up(&id, Err("boom".into()));
         assert_eq!(
             registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
@@ -2036,7 +2034,7 @@ mod tests {
         );
 
         registry.mark_reconcile_due_all();
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         registry.finish_catch_up(&id, Ok(()));
         // The failed pass left FullRoot pending, so the successful pass
         // conservatively re-queues one more pass; the warning stays until
@@ -2048,7 +2046,7 @@ mod tests {
                 "root <no root>; recovery state queued; reconciliation not complete".into()
             )]
         );
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         registry.finish_catch_up(&id, Ok(()));
         assert!(
             registry
@@ -2119,7 +2117,7 @@ mod tests {
             )],
             "a freshly registered corpus has not been reconciled yet"
         );
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         assert_eq!(
             registry.recovery_warnings_for(&ConfigSource::Baseline, &queried),
             vec![(
@@ -2142,7 +2140,7 @@ mod tests {
         let cfg = Arc::new(Config::default());
         registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
         let id = baseline_id("wiki");
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         registry.finish_catch_up(&id, Err("boom".into()));
         registry.mark_degraded(&id, "watch failed".into());
         let queried = [corpus("wiki")];
@@ -2163,7 +2161,7 @@ mod tests {
         registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
         let id = baseline_id("wiki");
 
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         registry.finish_catch_up(
             &id,
             Err("registration vanished before catch-up could start".into()),
@@ -2171,7 +2169,7 @@ mod tests {
 
         registry.mark_reconcile_due_all();
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             Some(id),
             "the active slot must be released even when the admitted registration vanished"
         );
@@ -2214,7 +2212,7 @@ mod tests {
         let cfg = Arc::new(Config::default());
         registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
         let old_id = baseline_id("wiki");
-        assert_eq!(registry.begin_next_catch_up(), Some(old_id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(old_id.clone()));
 
         registry.refresh_roots(|c| vec![root("/newly/resolved", c.clone())]);
 
@@ -2226,12 +2224,12 @@ mod tests {
             },
         };
         assert_eq!(
-            registry.begin_next_catch_up(),
+            registry.begin_next_catch_up(1),
             None,
             "the re-keyed registration must wait for the old in-flight pass"
         );
         assert_eq!(registry.finish_catch_up(&old_id, Ok(())), PendingWork::Idle);
-        assert_eq!(registry.begin_next_catch_up(), Some(new_id));
+        assert_eq!(registry.begin_next_catch_up(1), Some(new_id));
     }
 
     #[test]
@@ -2476,7 +2474,7 @@ mod tests {
             );
             let id = baseline_id("wiki");
             assert!(registry.first_reconcile_pending(&ConfigSource::Baseline, &wait_targets()));
-            assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+            assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
             assert!(registry.first_reconcile_pending(&ConfigSource::Baseline, &wait_targets()));
             registry.finish_catch_up(&id, outcome);
             assert!(!registry.first_reconcile_pending(&ConfigSource::Baseline, &wait_targets()));
@@ -2495,7 +2493,7 @@ mod tests {
             vec![],
         );
         let id = baseline_id("wiki");
-        assert_eq!(registry.begin_next_catch_up(), Some(id.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
         registry.finish_catch_up(&id, Ok(()));
         registry.mark_reconcile_due_all();
         assert_eq!(
@@ -2530,7 +2528,7 @@ mod tests {
             source: member_source.clone(),
             corpus_key: leader.corpus_key.clone(),
         };
-        assert_eq!(registry.begin_next_catch_up(), Some(leader.clone()));
+        assert_eq!(registry.begin_next_catch_up(1), Some(leader.clone()));
         assert_eq!(
             registry.catch_up_state(&member),
             Some(CatchUpState::InFlight),

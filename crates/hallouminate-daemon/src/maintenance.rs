@@ -535,7 +535,7 @@ impl DaemonState {
             )
             .await;
         // Orphan GC takes its own write gate, so it runs without the lane.
-        let gc_result = if run_gc && gc_result.is_ok() {
+        let gc_result = if run_gc {
             drop(permit);
             let orphan_result = self
                 .gc_orphans_after_delete(
@@ -723,7 +723,7 @@ impl DaemonState {
                 gc_event = "root_collected",
                 maintenance_id,
                 root = %reconfirmed.as_path().display(),
-                root_rows_removed = removed,
+                root_map_rows_removed = removed,
                 "orphaned-root GC collected a retired root",
             );
         }
@@ -755,8 +755,9 @@ impl DaemonState {
         Ok(())
     }
 
-    /// Runs orphan-content GC when the retired-root delete succeeded and
-    /// otherwise passes the delete error through.
+    /// Runs orphan-content GC even when the retired-root delete failed:
+    /// unreferenced content rows stay unreferenced regardless. Reports the
+    /// first error, the delete error before any orphan-GC error.
     async fn gc_orphans_after_delete(
         &self,
         store: &dyn ChunkStore,
@@ -765,9 +766,10 @@ impl DaemonState {
         shutdown: &CancellationToken,
         delete_result: std::result::Result<(), HallouminateError>,
     ) -> std::result::Result<(), HallouminateError> {
-        delete_result?;
-        self.gc_orphan_content(store, stats, maintenance_id, shutdown)
-            .await
+        let orphan_result = self
+            .gc_orphan_content(store, stats, maintenance_id, shutdown)
+            .await;
+        delete_result.and(orphan_result)
     }
 
     /// Convenience wrapper combining `gc_scan` + `gc_delete` for direct
@@ -1796,6 +1798,49 @@ mod tests {
             after >= before + 3,
             "heartbeat must bump at least once per retired root: before={before}, after={after}"
         );
+    }
+
+    /// A failed retired-root delete must not skip orphan-content GC, and the
+    /// delete error is the one reported.
+    #[tokio::test]
+    async fn gc_orphans_run_after_failed_root_delete() {
+        let (state, _ground) = test_state(|_| {}).await;
+        let gone = tempfile::tempdir().expect("gone root");
+        let key = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "repo:gone:corpus",
+            gone.path().to_str().expect("utf8"),
+        );
+        state
+            .store()
+            .apply_batch(vec![prepared_file(&key, "/tmp/gone.md")])
+            .await
+            .expect("seed retired root");
+        drop(gone);
+        let store = state.store();
+        let candidates = state
+            .gc_scan(store.as_ref(), 1, state.shutdown_token())
+            .await
+            .expect("scan");
+        let (mut stats, result) = state
+            .gc_delete(store.as_ref(), candidates, 1, state.shutdown_token())
+            .await;
+        result.expect("delete");
+        assert_eq!(stats.content_rows_removed, 0);
+
+        let injected = Err(HallouminateError::Indexer("injected delete failure".into()));
+        let result = state
+            .gc_orphans_after_delete(
+                store.as_ref(),
+                &mut stats,
+                1,
+                state.shutdown_token(),
+                injected,
+            )
+            .await;
+        let error = result.expect_err("delete error must be reported");
+        assert!(error.to_string().contains("injected delete failure"));
+        assert_eq!(stats.content_rows_removed, 1);
+        assert_eq!(store.count_rows().await.expect("count"), 0);
     }
 
     /// AC-5: content rows shared by two roots survive until the last

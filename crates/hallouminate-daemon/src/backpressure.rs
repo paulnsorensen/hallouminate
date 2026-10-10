@@ -158,8 +158,8 @@ pub(super) async fn refresh_observed(state: &DaemonState) -> DebtLevel {
         Ok(lance_debt) => {
             let level = debt::classify(
                 &MaintenanceDebt {
-                    fragments: lance_debt.fragments,
-                    stale_versions: lance_debt.stale_versions,
+                    fragments: lance_debt.fragments + lance_debt.files_fragments,
+                    stale_versions: lance_debt.stale_versions + lance_debt.files_stale_versions,
                 },
                 daemon_cfg,
             );
