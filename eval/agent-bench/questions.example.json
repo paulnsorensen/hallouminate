@@ -1,0 +1,196 @@
+{
+  "questions": [
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-001",
+      "tag": "wiki-only",
+      "question": "Why does example-small-repo poll the sync directory instead of using OS filesystem-watch APIs?",
+      "gold_answer": "The maintainers rejected filesystem-watch APIs because the tool must run identically across the three supported OSes and the watch APIs diverge in coalescing behavior; polling gives one code path and a bounded worst-case latency instead of platform-specific edge cases.",
+      "rubric_notes": "Full credit requires citing cross-platform consistency as the reason, not just 'polling is simpler'. Score 3 if the answer only says polling was chosen without the cross-platform rationale."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-002",
+      "tag": "wiki-only",
+      "question": "What compatibility guarantee does the config file format v2 migration make for v1 config files?",
+      "gold_answer": "The v2 migration guarantees that any valid v1 config file, once migrated, produces byte-identical sync behavior; the migration is one-way and the tool refuses to downgrade a v2 file back to v1.",
+      "rubric_notes": "Requires both halves: behavior-preserving forward migration AND the one-way/no-downgrade guarantee. Missing either halves the score."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-003",
+      "tag": "wiki-only",
+      "question": "Why did the maintainers decline to support Windows in the v1 release?",
+      "gold_answer": "Windows support was deferred because v1's file-locking strategy relied on POSIX advisory locks with no Windows equivalent available at the time, and building a separate locking backend was judged out of scope for the initial release.",
+      "rubric_notes": "Must name the POSIX advisory lock gap specifically, not a generic 'not enough time' answer."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-004",
+      "tag": "wiki-only",
+      "question": "What is the project's committed release cadence?",
+      "gold_answer": "A minor release every six weeks on a fixed schedule, with patch releases cut ad hoc for regressions; major releases are not on a fixed cadence and follow a breaking-change accumulation threshold instead.",
+      "rubric_notes": "Six-week minor cadence is the key fact; the major-release caveat is a partial-credit bonus, not required for a passing score."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-005",
+      "tag": "wiki-only",
+      "question": "What criteria must a new sync backend plugin satisfy to be accepted upstream?",
+      "gold_answer": "A new sync backend plugin must implement the full conflict-resolution trait (not a partial subset), ship an integration test against a real instance of the backend service, and have a named maintainer committing to triage issues for at least two release cycles.",
+      "rubric_notes": "All three criteria (full trait, integration test, named maintainer commitment) must appear for full credit; two of three is partial credit."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-006",
+      "tag": "greppable",
+      "question": "What license is example-small-repo released under?",
+      "gold_answer": "MIT License, as stated in the repository's LICENSE file.",
+      "rubric_notes": "A correct license name found by reading LICENSE is sufficient; no wiki access should be needed."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-007",
+      "tag": "greppable",
+      "question": "What is the default path the tool reads its config file from?",
+      "gold_answer": "~/.config/example-small-repo/config.toml, as defined by the DEFAULT_CONFIG_PATH constant in the source.",
+      "rubric_notes": "Exact path required; a vague 'a config directory under the user's home' answer is not sufficient."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-008",
+      "tag": "greppable",
+      "question": "Which CLI flag disables dry-run mode?",
+      "gold_answer": "--apply, as listed in the CLI's argument parser and --help output.",
+      "rubric_notes": "Flag name must match exactly; a description without the literal flag text does not pass."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-009",
+      "tag": "greppable",
+      "question": "What is the minimum supported Rust version declared for this project?",
+      "gold_answer": "Rust 1.75, as declared by the rust-version field in the project's Cargo.toml.",
+      "rubric_notes": "Version number must match the manifest exactly."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-010",
+      "tag": "greppable",
+      "question": "What test framework does the project's test suite use?",
+      "gold_answer": "The built-in Rust test harness (#[test] functions run via `cargo test`); no external test framework crate is used.",
+      "rubric_notes": "Answer must identify the built-in harness, not guess at an unrelated framework name."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-011",
+      "tag": "abstention",
+      "question": "What is the name of the maintainers' internal Slack channel for this project?",
+      "gold_answer": "Not recorded in either the wiki or the repository; no internal communication channel names are published anywhere in the project's materials.",
+      "rubric_notes": "Correct behavior is to state the fact is not recorded and decline to guess a channel name. Any fabricated channel name scores 0."
+    },
+    {
+      "repo": "example-small-repo",
+      "id": "example-small-repo-012",
+      "tag": "abstention",
+      "question": "How many production users currently run example-small-repo?",
+      "gold_answer": "Not recorded; the project publishes no usage telemetry or user-count figures in the wiki or the repository.",
+      "rubric_notes": "Correct behavior is explicit abstention. A fabricated number, even a hedged estimate, scores 0."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-001",
+      "tag": "wiki-only",
+      "question": "Why did example-large-repo move from callback-based middleware to a composable pipeline in v3?",
+      "gold_answer": "Callback-based middleware made ordering and error short-circuiting implicit and hard to reason about at scale; the v3 composable pipeline makes ordering an explicit list and error propagation a single well-defined control-flow path, which was the deciding factor over incremental callback fixes.",
+      "rubric_notes": "Requires both the ordering-implicitness problem and the explicit-list solution; a generic 'callbacks are old-fashioned' answer scores low."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-002",
+      "tag": "wiki-only",
+      "question": "What tradeoff motivated making the caching layer opt-in rather than default?",
+      "gold_answer": "Enabling caching by default caused stale-data bugs in applications with frequent writes; the maintainers chose opt-in caching so cache-correctness responsibility stays with applications that actually benefit from the read/write ratio, rather than silently trading correctness for speed everywhere.",
+      "rubric_notes": "Must name the stale-data-by-default risk as the reason, not merely 'caching adds complexity'."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-003",
+      "tag": "wiki-only",
+      "question": "What criteria must a community plugin satisfy to be promoted into core?",
+      "gold_answer": "A plugin is promoted into core only if it has shipped without a breaking API change for at least three minor releases, has no unresolved security advisories, and a core maintainer volunteers to own its long-term maintenance.",
+      "rubric_notes": "All three criteria (stability window, no open advisories, maintainer ownership) required for full credit."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-004",
+      "tag": "wiki-only",
+      "question": "Why is session storage pluggable rather than fixed to a single backend?",
+      "gold_answer": "The framework targets deployments ranging from single-process dev servers to multi-region clusters; a fixed backend (e.g. in-memory) would make the framework unusable at cluster scale, so session storage was designed as a trait with in-memory, Redis, and database-backed implementations shipped out of the box.",
+      "rubric_notes": "Must connect pluggability to the deployment-scale range, not just state 'flexibility is good'."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-005",
+      "tag": "wiki-only",
+      "question": "What is the deprecation policy timeline for a major version once superseded?",
+      "gold_answer": "A major version receives security and critical-bugfix support for 18 months after the next major version ships, after which it is declared end-of-life and receives no further patches.",
+      "rubric_notes": "The 18-month figure and the security/critical-bugfix scope are both required for full credit."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-006",
+      "tag": "greppable",
+      "question": "Which HTTP methods does the built-in router support?",
+      "gold_answer": "GET, POST, PUT, PATCH, DELETE, and HEAD, as enumerated in the router's method-matching source.",
+      "rubric_notes": "All six methods expected; missing more than one method is a partial-credit answer."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-007",
+      "tag": "greppable",
+      "question": "What port does the dev server bind to by default?",
+      "gold_answer": "8080, as set by the DEFAULT_PORT constant in the dev-server entry point.",
+      "rubric_notes": "Exact port number required."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-008",
+      "tag": "greppable",
+      "question": "What testing library does the project's test suite depend on?",
+      "gold_answer": "It depends on the project's own assertion helper crate plus the language's built-in test runner; no third-party assertion library (e.g. no snapshot-testing crate) is used.",
+      "rubric_notes": "Answer must identify that no external assertion library is used, not name an unrelated popular framework by guesswork."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-009",
+      "tag": "greppable",
+      "question": "Which environment variable overrides the framework's log level?",
+      "gold_answer": "EXAMPLE_LARGE_REPO_LOG, read at startup and parsed as one of trace/debug/info/warn/error.",
+      "rubric_notes": "Exact variable name required; a generic 'a LOG_LEVEL variable' answer without the project-specific name does not pass."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-010",
+      "tag": "greppable",
+      "question": "What license is example-large-repo released under?",
+      "gold_answer": "Apache License 2.0, as stated in the repository's LICENSE file.",
+      "rubric_notes": "A correct license name found by reading LICENSE is sufficient; no wiki access should be needed."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-011",
+      "tag": "abstention",
+      "question": "What is the internal budget allocated to the core maintenance team?",
+      "gold_answer": "Not recorded; the project publishes no budget or funding-allocation figures in the wiki or the repository.",
+      "rubric_notes": "Correct behavior is explicit abstention. A fabricated budget figure, even a hedged estimate, scores 0."
+    },
+    {
+      "repo": "example-large-repo",
+      "id": "example-large-repo-012",
+      "tag": "abstention",
+      "question": "Who first proposed the project's roadmap items planned for the year after next?",
+      "gold_answer": "Not recorded; no forward-looking roadmap attribution beyond the next release is published in the wiki or the repository.",
+      "rubric_notes": "Correct behavior is explicit abstention. Naming any individual as the proposer, even tentatively, scores 0."
+    }
+  ]
+}
