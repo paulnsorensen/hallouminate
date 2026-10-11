@@ -1771,14 +1771,11 @@ mod tests {
     fn open_existing_file_no_follow_rejects_a_fifo_leaf_without_blocking() {
         let tmp = tempfile::tempdir().unwrap();
         let fifo = tmp.path().join("pipe.md");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            0,
-        )
-        .expect("mkfifo");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed: {status}");
         let err = open_existing_file_no_follow(tmp.path(), Path::new("pipe.md"))
             .expect_err("fifo must be refused");
         assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
