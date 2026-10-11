@@ -1048,6 +1048,7 @@ impl WatchRegistry {
                 match &outcome {
                     Ok(()) => {
                         reg.reconciled_once = true;
+                        reg.last_error = None;
                         if reg.pending.is_idle() {
                             reg.catch_up = CatchUpState::Done;
                         } else {
@@ -2636,6 +2637,37 @@ mod tests {
         assert_eq!(reg.last_error.as_deref(), Some("scan failed"));
         assert!(reg.retry_on_tick);
         assert!(guard.queue.contains(&member), "member is requeued");
+    }
+
+    #[test]
+    fn successful_group_pass_clears_member_last_error() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let member_source = ConfigSource::RepoLayer(PathBuf::from("/repo-member"));
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg.clone(), vec![]);
+        registry.register(member_source.clone(), corpus("wiki"), cfg, vec![]);
+        let leader = baseline_id("wiki");
+        let member = RegistrationId {
+            source: member_source,
+            corpus_key: leader.corpus_key.clone(),
+        };
+        assert_eq!(registry.begin_next_catch_up(1), Some(leader.clone()));
+        registry.finish_catch_up(&leader, Err("scan failed".into()));
+        registry.mark_reconcile_due_all();
+        let next = registry
+            .begin_next_catch_up(1)
+            .expect("the tick readmits the failed group");
+
+        registry.finish_catch_up(&next, Ok(()));
+
+        let guard = registry.lock();
+        for id in [&leader, &member] {
+            let reg = guard.regs.get(id).expect("registered");
+            assert_eq!(
+                reg.last_error, None,
+                "a successful shared pass clears {id:?}"
+            );
+        }
     }
 
     /// WHY: seeded baseline registrations start `Done`, so only the boot
