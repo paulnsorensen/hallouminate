@@ -276,6 +276,26 @@ pub(crate) struct WatchRegistry {
     /// Set when the watcher pump could not be created; nothing admits
     /// catch-up passes then, so cold-start waits are skipped.
     pump_unavailable: std::sync::atomic::AtomicBool,
+    /// Set while the boot `catch_up_index` task runs. Baseline registrations
+    /// start `Done`, so this is the only signal that their index may lag.
+    boot_catch_up_running: std::sync::atomic::AtomicBool,
+}
+
+/// Whether the boot catch-up sweep is still reconciling baseline corpora.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootCatchUp {
+    Idle,
+    Running,
+}
+
+/// Clears the boot catch-up flag on drop, so no exit path of the sweep can
+/// leave baseline results flagged as stale.
+pub(crate) struct BootCatchUpGuard(Arc<WatchRegistry>);
+
+impl Drop for BootCatchUpGuard {
+    fn drop(&mut self) {
+        self.0.boot_catch_up_running.store(false, Ordering::SeqCst);
+    }
 }
 
 impl WatchRegistry {
@@ -290,6 +310,25 @@ impl WatchRegistry {
             changed: tokio::sync::Notify::new(),
             settled: tokio::sync::Notify::new(),
             pump_unavailable: std::sync::atomic::AtomicBool::new(false),
+            boot_catch_up_running: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Marks the boot catch-up sweep as running. Call before spawning it.
+    pub(crate) fn mark_boot_catch_up_running(&self) {
+        self.boot_catch_up_running.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns a guard that marks the boot catch-up sweep finished on drop.
+    pub(crate) fn boot_catch_up_guard(self: &Arc<Self>) -> BootCatchUpGuard {
+        BootCatchUpGuard(Arc::clone(self))
+    }
+
+    pub(crate) fn boot_catch_up(&self) -> BootCatchUp {
+        if self.boot_catch_up_running.load(Ordering::SeqCst) {
+            BootCatchUp::Running
+        } else {
+            BootCatchUp::Idle
         }
     }
 
@@ -776,12 +815,13 @@ impl WatchRegistry {
         queried: &[CorpusConfig],
     ) -> Vec<(String, String)> {
         let names: HashSet<&str> = queried.iter().map(|corpus| corpus.name.as_str()).collect();
+        let boot_catch_up = self.boot_catch_up();
         let guard = self.lock();
         guard
             .regs
             .iter()
             .filter(|(id, reg)| id.source == *source && names.contains(reg.corpus.name.as_str()))
-            .filter_map(|(_, reg)| {
+            .filter_map(|(id, reg)| {
                 let root = reg
                     .roots
                     .first()
@@ -811,6 +851,13 @@ impl WatchRegistry {
                 }
                 if !reg.pending.is_idle() {
                     clauses.push("reconciliation pending".to_string());
+                }
+                match (&id.source, boot_catch_up) {
+                    (ConfigSource::Baseline, BootCatchUp::Running) => clauses
+                        .push("boot reconciliation in progress; results may be stale".to_string()),
+                    (ConfigSource::Baseline, BootCatchUp::Idle)
+                    | (ConfigSource::RepoLayer(_), BootCatchUp::Running)
+                    | (ConfigSource::RepoLayer(_), BootCatchUp::Idle) => {}
                 }
                 // A queued or in-flight pass with no dirty paths and no
                 // error is still incomplete work: the caller cannot rely on
@@ -996,15 +1043,25 @@ impl WatchRegistry {
             };
             if member_id != *id {
                 // Another group member shares the leader's pass. Its admission
-                // slot is released here; pending and `last_error` stay its own.
-                if let Ok(()) = outcome {
-                    reg.reconciled_once = true;
-                }
-                if reg.pending.is_idle() {
-                    reg.catch_up = CatchUpState::Done;
-                } else {
-                    reg.catch_up = CatchUpState::Queued;
-                    guard.queue.push_back(member_id.clone());
+                // slot is released here. On success its own pending work stays;
+                // on failure it records the error and requeues a full pass.
+                match &outcome {
+                    Ok(()) => {
+                        reg.reconciled_once = true;
+                        if reg.pending.is_idle() {
+                            reg.catch_up = CatchUpState::Done;
+                        } else {
+                            reg.catch_up = CatchUpState::Queued;
+                            guard.queue.push_back(member_id.clone());
+                        }
+                    }
+                    Err(error) => {
+                        reg.last_error = Some(error.clone());
+                        reg.retry_on_tick = true;
+                        reg.pending = PendingWork::FullRoot;
+                        reg.catch_up = CatchUpState::Queued;
+                        guard.queue.push_back(member_id.clone());
+                    }
                 }
                 continue;
             }
@@ -2552,6 +2609,121 @@ mod tests {
             .await;
         assert!(settled);
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// WHY: a member whose shared pass failed must not look settled and
+    /// clean; it keeps the failure and retries like the leader.
+    #[test]
+    fn failed_group_leader_marks_members_failed_and_requeues() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let member_source = ConfigSource::RepoLayer(PathBuf::from("/repo-member"));
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg.clone(), vec![]);
+        registry.register(member_source.clone(), corpus("wiki"), cfg, vec![]);
+        let leader = baseline_id("wiki");
+        let member = RegistrationId {
+            source: member_source,
+            corpus_key: leader.corpus_key.clone(),
+        };
+        assert_eq!(registry.begin_next_catch_up(1), Some(leader.clone()));
+
+        registry.finish_catch_up(&leader, Err("scan failed".into()));
+
+        assert_eq!(registry.catch_up_state(&member), Some(CatchUpState::Queued));
+        assert_eq!(registry.pending(&member), Some(PendingWork::FullRoot));
+        let guard = registry.lock();
+        let reg = guard.regs.get(&member).expect("member registered");
+        assert_eq!(reg.last_error.as_deref(), Some("scan failed"));
+        assert!(reg.retry_on_tick);
+        assert!(guard.queue.contains(&member), "member is requeued");
+    }
+
+    /// WHY: seeded baseline registrations start `Done`, so only the boot
+    /// flag tells a baseline ground that the sweep still runs.
+    #[test]
+    fn baseline_ground_warns_during_boot_catch_up() {
+        let registry = Arc::new(WatchRegistry::new());
+        registry.seed_baseline(corpus("wiki"), Arc::new(Config::default()), vec![]);
+        let repo_source = ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate"));
+        registry.register(
+            repo_source.clone(),
+            corpus("wiki"),
+            Arc::new(Config::default()),
+            vec![],
+        );
+        let queried = [corpus("wiki")];
+        assert!(
+            registry
+                .recovery_warnings_for(&ConfigSource::Baseline, &queried)
+                .is_empty()
+        );
+
+        registry.mark_boot_catch_up_running();
+        let guard = registry.boot_catch_up_guard();
+
+        assert_eq!(registry.boot_catch_up(), BootCatchUp::Running);
+        let warnings = registry.recovery_warnings_for(&ConfigSource::Baseline, &queried);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].1.contains("boot reconciliation in progress"),
+            "{warnings:?}"
+        );
+        let repo_warnings = registry.recovery_warnings_for(&repo_source, &queried);
+        assert!(
+            repo_warnings
+                .iter()
+                .all(|(_, message)| !message.contains("boot reconciliation")),
+            "{repo_warnings:?}"
+        );
+
+        drop(guard);
+    }
+
+    #[test]
+    fn baseline_warning_clears_when_boot_catch_up_guard_drops() {
+        let registry = Arc::new(WatchRegistry::new());
+        registry.seed_baseline(corpus("wiki"), Arc::new(Config::default()), vec![]);
+        registry.mark_boot_catch_up_running();
+        drop(registry.boot_catch_up_guard());
+
+        assert_eq!(registry.boot_catch_up(), BootCatchUp::Idle);
+        assert!(
+            registry
+                .recovery_warnings_for(&ConfigSource::Baseline, &[corpus("wiki")])
+                .is_empty()
+        );
+    }
+
+    /// WHY: a cold wait on a group member ends when the shared pass fails,
+    /// and the member's source reports the failed reconciliation.
+    #[tokio::test]
+    async fn cold_wait_returns_with_warning_after_shared_pass_failure() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let member_source = ConfigSource::RepoLayer(PathBuf::from("/repo-member"));
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg.clone(), vec![]);
+        registry.register(member_source.clone(), corpus("wiki"), cfg, vec![]);
+        let leader = baseline_id("wiki");
+        assert_eq!(registry.begin_next_catch_up(1), Some(leader.clone()));
+        registry.finish_catch_up(&leader, Err("scan failed".into()));
+
+        let started = std::time::Instant::now();
+        let settled = registry
+            .wait_first_reconcile(
+                &member_source,
+                &[corpus("wiki")],
+                std::time::Duration::from_secs(30),
+            )
+            .await;
+
+        assert!(settled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let warnings = registry.recovery_warnings_for(&member_source, &[corpus("wiki")]);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].1.contains("failed reconciliation: scan failed"),
+            "{warnings:?}"
+        );
     }
 
     #[tokio::test]

@@ -62,8 +62,9 @@ pub fn best_effort_canonical(path: &Path) -> PathBuf {
 /// [`best_effort_canonical`], but dereference the final component when it
 /// exists. Use this to decide containment, where a leaf symlink that points
 /// outside a root must be seen for what it targets. Returns an empty path
-/// when no ancestor resolves or the tail ends in `..`, so the result never
-/// lies inside any root; [`best_effort_canonical`] returns `path` instead.
+/// when no ancestor resolves, the tail ends in `..`, or a component is a
+/// dangling symlink, so the result never lies inside any root;
+/// [`best_effort_canonical`] returns `path` instead.
 pub fn canonical_following_leaf(path: &Path) -> PathBuf {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut head = path.to_path_buf();
@@ -73,6 +74,11 @@ pub fn canonical_following_leaf(path: &Path) -> PathBuf {
                 real.push(part);
             }
             return real;
+        }
+        if let Ok(metadata) = std::fs::symlink_metadata(&head)
+            && metadata.file_type().is_symlink()
+        {
+            return PathBuf::new();
         }
         let (Some(name), Some(parent)) = (head.file_name(), head.parent()) else {
             return PathBuf::new();
@@ -269,6 +275,62 @@ mod tests {
             retired_roots(std::slice::from_ref(&link)).len(),
             1,
             "once the link itself is gone, its own path (not a canonical root anyone stores) is a plain absent path"
+        );
+    }
+
+    #[test]
+    fn canonical_following_leaf_resolves_existing_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let file = tmp.path().join("a.md");
+        std::fs::write(&file, "x").expect("write");
+        let expected = std::fs::canonicalize(&file).expect("canonicalize");
+        assert_eq!(canonical_following_leaf(&file), expected);
+    }
+
+    #[test]
+    fn canonical_following_leaf_keeps_missing_leaf_under_existing_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let expected = std::fs::canonicalize(tmp.path())
+            .expect("canonicalize")
+            .join("new.md");
+        assert_eq!(
+            canonical_following_leaf(&tmp.path().join("new.md")),
+            expected
+        );
+    }
+
+    #[test]
+    fn canonical_following_leaf_keeps_missing_nested_tail() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let expected = std::fs::canonicalize(tmp.path())
+            .expect("canonicalize")
+            .join("a")
+            .join("b")
+            .join("new.md");
+        assert_eq!(
+            canonical_following_leaf(&tmp.path().join("a/b/new.md")),
+            expected
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_following_leaf_rejects_dangling_leaf_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &link).expect("symlink");
+        assert_eq!(canonical_following_leaf(&link), PathBuf::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_following_leaf_rejects_dangling_mid_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(tmp.path().join("missing"), &link).expect("symlink");
+        assert_eq!(
+            canonical_following_leaf(&link.join("sub").join("new.md")),
+            PathBuf::new()
         );
     }
 }

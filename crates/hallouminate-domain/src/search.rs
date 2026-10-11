@@ -30,11 +30,13 @@ pub mod phrase;
 pub mod ripgrep;
 pub mod terms;
 
+use std::any::Any;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::common::{CorpusKey, FileRef, Result};
-use crate::ground::Warning;
+use crate::ground::{Warning, warning_codes};
 use crate::indexer::{SearchHit, SignalLists};
 use async_trait::async_trait;
 use fuse::{RankedList, fuse};
@@ -74,6 +76,37 @@ pub const RIPGREP_WEIGHT: f32 = 0.5;
 /// FM-Index `contains()` signal weight. See [`RIPGREP_WEIGHT`] — the two
 /// literal signals are weighted together and for the same reason.
 pub const CONTAINS_WEIGHT: f32 = 0.5;
+
+/// An opaque, store-owned view of one root's file map, loaded once per
+/// request. The store that made it downcasts it back; no other code reads it.
+#[derive(Clone)]
+pub struct RootHandle(Arc<dyn Any + Send + Sync>);
+
+impl RootHandle {
+    /// Wraps a store-owned value.
+    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+
+    /// Returns the wrapped value when it has type `T`.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for RootHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RootHandle(..)")
+    }
+}
+
+/// One root's indexed files plus the store's optional handle on the same
+/// read.
+#[derive(Debug, Clone)]
+pub struct RootIndex {
+    pub files: Arc<HashSet<FileRef>>,
+    pub handle: Option<RootHandle>,
+}
 
 /// Storage-agnostic port for chunk retrieval (ranking-time reads).
 ///
@@ -115,6 +148,48 @@ pub trait ChunkRetrieval: Send + Sync {
     async fn indexed_file_refs(&self, _corpus_key: &CorpusKey) -> Result<Option<HashSet<FileRef>>> {
         Ok(None)
     }
+
+    /// Reads the root's file map once: the indexed files plus an optional
+    /// handle that [`retrieve_signals_in`] and [`retrieve_phrase_in`] reuse
+    /// instead of reading the map again. `None` means the store cannot tell.
+    ///
+    /// [`retrieve_signals_in`]: ChunkRetrieval::retrieve_signals_in
+    /// [`retrieve_phrase_in`]: ChunkRetrieval::retrieve_phrase_in
+    async fn load_root_index(&self, corpus_key: &CorpusKey) -> Result<Option<RootIndex>> {
+        let Some(files) = self.indexed_file_refs(corpus_key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(RootIndex {
+            files: Arc::new(files),
+            handle: None,
+        }))
+    }
+
+    /// [`retrieve_signals`](ChunkRetrieval::retrieve_signals) with the handle
+    /// from [`load_root_index`](ChunkRetrieval::load_root_index), when the
+    /// caller has one.
+    async fn retrieve_signals_in(
+        &self,
+        corpus_key: &CorpusKey,
+        query: &str,
+        limit: usize,
+        _handle: Option<&RootHandle>,
+    ) -> Result<SignalLists> {
+        self.retrieve_signals(corpus_key, query, limit).await
+    }
+
+    /// [`retrieve_phrase`](ChunkRetrieval::retrieve_phrase) with the handle
+    /// from [`load_root_index`](ChunkRetrieval::load_root_index), when the
+    /// caller has one.
+    async fn retrieve_phrase_in(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+        _handle: Option<&RootHandle>,
+    ) -> Result<Vec<SearchHit>> {
+        self.retrieve_phrase(corpus_key, phrase, limit).await
+    }
 }
 
 /// Outcome of [`search_fused`]: the fused hits plus any warnings raised
@@ -148,13 +223,17 @@ pub async fn search_fused(
     globs: &[String],
     limit: usize,
 ) -> Result<FusedSearch> {
-    let indexed = store.indexed_file_refs(corpus_key).await.ok().flatten();
-    search_fused_indexed(store, corpus_key, query, globs, limit, indexed.as_ref()).await
+    let root = store.load_root_index(corpus_key).await.ok().flatten();
+    let (indexed, handle) = match &root {
+        Some(RootIndex { files, handle }) => (Some(files.as_ref()), handle.as_ref()),
+        None => (None, None),
+    };
+    search_fused_indexed(store, corpus_key, query, globs, limit, indexed, handle).await
 }
 
 /// [`search_fused`] with the root's indexed-file membership supplied by the
 /// caller, so one `indexed_file_refs` read serves both the cold-root skip
-/// and the lexical fallback.
+/// and the lexical fallback. `handle` is the same read's store handle.
 pub(crate) async fn search_fused_indexed(
     store: &dyn ChunkRetrieval,
     corpus_key: &CorpusKey,
@@ -162,6 +241,7 @@ pub(crate) async fn search_fused_indexed(
     globs: &[String],
     limit: usize,
     indexed: Option<&HashSet<FileRef>>,
+    handle: Option<&RootHandle>,
 ) -> Result<FusedSearch> {
     let terms = cap_terms(split_terms(query));
     let mut warnings = Vec::new();
@@ -178,7 +258,7 @@ pub(crate) async fn search_fused_indexed(
     // a term first appearing past that cap is missed regardless of this total.
     let rg_budget = limit;
 
-    let signals_fut = store.retrieve_signals(corpus_key, query, limit);
+    let signals_fut = store.retrieve_signals_in(corpus_key, query, limit, handle);
     let rg_fut = tokio::time::timeout(
         RIPGREP_TIMEOUT,
         ripgrep::run(&roots, &terms, globs, rg_budget),
@@ -247,7 +327,7 @@ pub(crate) async fn search_fused_indexed(
             "ripgrep signal produced hits but resolved to zero chunks"
         );
         warnings.push(Warning {
-            code: "ripgrep-unresolved".to_string(),
+            code: warning_codes::RIPGREP_UNRESOLVED.to_string(),
             message: format!(
                 "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}; dropped_file_not_in_pool={}, dropped_line_out_of_range={}, truncated={}",
                 rg_hits.len(),
@@ -266,7 +346,7 @@ pub(crate) async fn search_fused_indexed(
             "ripgrep produced unparseable match events; the rg output schema may have changed"
         );
         warnings.push(Warning {
-            code: "ripgrep-unparseable".to_string(),
+            code: warning_codes::RIPGREP_UNPARSEABLE.to_string(),
             message: format!(
                 "ripgrep produced {} unparseable match events in corpus root {}",
                 rg_unparseable,
@@ -372,7 +452,7 @@ pub async fn lexical_fallback_search(
     let root = corpus_key.canonical_root.display();
     if dropped > 0 {
         warnings.push(Warning {
-            code: "lexical-fallback-truncated".to_string(),
+            code: warning_codes::LEXICAL_FALLBACK_TRUNCATED.to_string(),
             message: format!(
                 "{dropped} unindexed file(s) in corpus root {root} were not searched; the lexical fallback covers {FALLBACK_MAX_FILES} files per query"
             ),
@@ -393,7 +473,7 @@ pub async fn lexical_fallback_search(
         Ok(Err(error)) => {
             tracing::warn!(target: "hallouminate::search", err = %error, "lexical fallback ripgrep pass failed");
             warnings.push(Warning {
-                code: "lexical-fallback-failed".to_string(),
+                code: warning_codes::LEXICAL_FALLBACK_FAILED.to_string(),
                 message: format!(
                     "lexical fallback ripgrep pass failed in corpus root {root} ({error}); unindexed files were not searched"
                 ),
@@ -403,7 +483,7 @@ pub async fn lexical_fallback_search(
         Err(_elapsed) => {
             tracing::warn!(target: "hallouminate::search", "lexical fallback ripgrep pass timed out");
             warnings.push(Warning {
-                code: "lexical-fallback-timeout".to_string(),
+                code: warning_codes::LEXICAL_FALLBACK_TIMEOUT.to_string(),
                 message: format!(
                     "lexical fallback ripgrep pass timed out after {} ms in corpus root {root}; unindexed files were not searched",
                     RIPGREP_TIMEOUT.as_millis()
@@ -425,7 +505,7 @@ pub async fn lexical_fallback_search(
     let hits = lexical_fallback::line_window_hits(corpus_key, &scoped_hits, limit).await;
     if !hits.is_empty() {
         warnings.push(Warning {
-            code: "lexical-fallback".to_string(),
+            code: warning_codes::LEXICAL_FALLBACK.to_string(),
             message: format!(
                 "{} file(s) in corpus root {root} have no indexed rows; returning ripgrep line-window hits ranked after indexed hits",
                 hits.len()
@@ -716,7 +796,7 @@ fn resolve_rg_run(
         Ok(Err(error)) => {
             tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
             warnings.push(Warning {
-                code: "ripgrep-failed".to_string(),
+                code: warning_codes::RIPGREP_FAILED.to_string(),
                 message: format!(
                     "ripgrep pass failed ({error}); ranking without the ripgrep signal"
                 ),
@@ -730,7 +810,7 @@ fn resolve_rg_run(
                 "ripgrep pass timed out; ranking without the ripgrep signal"
             );
             warnings.push(Warning {
-                code: "ripgrep-timeout".to_string(),
+                code: warning_codes::RIPGREP_TIMEOUT.to_string(),
                 message: format!(
                     "ripgrep pass timed out after {} ms; ranking without the ripgrep signal",
                     timeout.as_millis()

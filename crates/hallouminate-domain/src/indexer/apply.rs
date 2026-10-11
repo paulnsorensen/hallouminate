@@ -385,8 +385,9 @@ async fn run_in_batches(
                 continue;
             }
             let file_count = prepared.len();
+            let prepared_batch = run.store.prepare_batch(&prepared).await?;
             let _lane = acquire_lane(run.lane).await?;
-            let write_stats = run.store.apply_batch(prepared).await?;
+            let write_stats = run.store.commit_batch(prepared, prepared_batch).await?;
             stats.chunks_inserted += write_stats.chunks_written;
             stats.embeddings_inserted += write_stats.embeddings_written;
             stats.files_upserted += file_count;

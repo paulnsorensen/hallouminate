@@ -80,6 +80,8 @@ pub(crate) const MAX_CONCURRENT_COVERAGE_CHECKS: usize = 6;
 pub(crate) struct CoverageProbe {
     active_store: Arc<AtomicUsize>,
     max_store: Arc<AtomicUsize>,
+    requested_store: Arc<AtomicUsize>,
+    store_release: Arc<tokio::sync::watch::Sender<bool>>,
     active_walk: Arc<AtomicUsize>,
     max_walk: Arc<AtomicUsize>,
     walk_release: Arc<(StdMutex<bool>, Condvar)>,
@@ -91,6 +93,8 @@ impl Default for CoverageProbe {
         Self {
             active_store: Arc::new(AtomicUsize::new(0)),
             max_store: Arc::new(AtomicUsize::new(0)),
+            requested_store: Arc::new(AtomicUsize::new(0)),
+            store_release: Arc::new(tokio::sync::watch::channel(true).0),
             active_walk: Arc::new(AtomicUsize::new(0)),
             max_walk: Arc::new(AtomicUsize::new(0)),
             walk_release: Arc::new((StdMutex::new(true), Condvar::new())),
@@ -178,6 +182,27 @@ impl CoverageProbe {
 
     pub(crate) fn max_store(&self) -> usize {
         self.max_store.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn note_store_request(&self) {
+        self.requested_store.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn requested_store(&self) -> usize {
+        self.requested_store.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn block_store(&self) {
+        self.store_release.send_replace(false);
+    }
+
+    pub(crate) fn release_store(&self) {
+        self.store_release.send_replace(true);
+    }
+
+    pub(crate) async fn wait_for_store_release(&self) {
+        let mut receiver = self.store_release.subscribe();
+        let _released = receiver.wait_for(|released| *released).await;
     }
 }
 /// Backup ground-store directories (`<ground>.bak-v{N}`, left behind by
@@ -369,6 +394,8 @@ struct DaemonStateInner {
     /// In-flight corpus walks shared by concurrent `ground` requests. Every
     /// walk takes a permit from the daemon-wide coverage gate.
     scan_cache: crate::scan_cache::ScanCache,
+    /// Daemon-wide cap on concurrent store listings for coverage checks.
+    coverage_listing_gate: Semaphore,
     #[cfg(test)]
     coverage_probe: Arc<CoverageProbe>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
@@ -589,6 +616,7 @@ impl DaemonState {
         let write_lane = Arc::new(Semaphore::new(1));
         #[cfg(test)]
         let coverage_probe = Arc::new(CoverageProbe::default());
+        let coverage_listing_gate = Semaphore::new(MAX_CONCURRENT_COVERAGE_CHECKS);
         let scan_cache = crate::scan_cache::ScanCache::new(
             crate::scan_cache::SCAN_BUDGET,
             Arc::new(Semaphore::new(MAX_CONCURRENT_COVERAGE_CHECKS)),
@@ -674,6 +702,7 @@ impl DaemonState {
                     store_lock_owner,
                     write_lane,
                     scan_cache,
+                    coverage_listing_gate,
                     #[cfg(test)]
                     coverage_probe,
                     crossencoders,
@@ -810,6 +839,10 @@ impl DaemonState {
 
     pub(crate) fn scan_cache(&self) -> &crate::scan_cache::ScanCache {
         &self.inner.scan_cache
+    }
+
+    pub(crate) fn coverage_listing_gate(&self) -> &Semaphore {
+        &self.inner.coverage_listing_gate
     }
 
     #[cfg(test)]

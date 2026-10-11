@@ -16,4 +16,4 @@ pub use format::{
 };
 pub use index::*;
 pub use plan::FileSnapshot;
-pub use store::{BatchWriteStats, ChunkStore, SignalLists};
+pub use store::{BatchWriteStats, ChunkStore, PreparedBatch, SignalLists};

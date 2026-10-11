@@ -726,6 +726,7 @@ pub fn load_repo_layer(
         ))
     })?;
     let repo_root = hallouminate_dir.parent().unwrap_or(hallouminate_dir);
+    reject_empty_paths(&cfg)?;
     resolve_repo_layer_paths(&mut cfg, repo_root);
     let path_warnings = confine_repo_layer(&mut cfg, repo_root, allowed_outside);
     normalize(&mut cfg)?;
@@ -1399,6 +1400,39 @@ fn normalize(cfg: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// Rejects blank `path` and path-list entries. `load_repo_layer` runs this
+/// before path resolution, which would otherwise turn a blank entry into the
+/// repo root.
+fn reject_empty_paths(cfg: &Config) -> Result<()> {
+    for c in &cfg.corpora {
+        for path in &c.paths {
+            if path.trim().is_empty() {
+                return Err(HallouminateError::Config(format!(
+                    "corpus '{}' has an empty path entry",
+                    c.name
+                )));
+            }
+        }
+    }
+    for r in &cfg.repositories {
+        if r.path.trim().is_empty() {
+            return Err(HallouminateError::Config(format!(
+                "repository '{}' has empty path",
+                r.name
+            )));
+        }
+        for path in &r.corpus_paths {
+            if path.trim().is_empty() {
+                return Err(HallouminateError::Config(format!(
+                    "repository '{}' has an empty corpus_paths entry",
+                    r.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate(cfg: &Config) -> Result<()> {
     if cfg.logging.max_file_bytes == 0 {
         return Err(HallouminateError::Config(
@@ -1448,19 +1482,12 @@ fn validate(cfg: &Config) -> Result<()> {
             )));
         }
     }
+    reject_empty_paths(cfg)?;
     for (idx, c) in cfg.corpora.iter().enumerate() {
         if c.name.trim().is_empty() {
             return Err(HallouminateError::Config(format!(
                 "corpus #{idx} has empty name"
             )));
-        }
-        for path in &c.paths {
-            if path.trim().is_empty() {
-                return Err(HallouminateError::Config(format!(
-                    "corpus '{}' has an empty path entry",
-                    c.name
-                )));
-            }
         }
         if c.paths.is_empty() {
             return Err(HallouminateError::Config(format!(
@@ -1473,12 +1500,6 @@ fn validate(cfg: &Config) -> Result<()> {
         if r.name.trim().is_empty() {
             return Err(HallouminateError::Config(format!(
                 "repository #{idx} has empty name"
-            )));
-        }
-        if r.path.trim().is_empty() {
-            return Err(HallouminateError::Config(format!(
-                "repository '{}' has empty path",
-                r.name
             )));
         }
     }
@@ -3768,6 +3789,25 @@ path = "."
         assert_eq!(warnings.len(), 1, "got: {warnings:?}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn repo_layer_dangling_symlink_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path()).join("repo");
+        std::fs::create_dir_all(&repo_root).expect("mkdir repo");
+        std::os::unix::fs::symlink(repo_root.join("gone"), repo_root.join("link"))
+            .expect("symlink");
+        let cfg_path = write_repo_config(
+            &repo_root,
+            "[[corpus]]\nname = \"linked\"\npaths = [\"link\", \"link/deeper\"]\n",
+        );
+
+        let (cfg, warnings) = load_repo_layer(&cfg_path, &[]).expect("load");
+
+        assert!(cfg.corpora.is_empty());
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    }
+
     #[test]
     fn repo_layer_wiki_override_outside_root_skips_repository() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3852,6 +3892,61 @@ path = "."
         match err {
             HallouminateError::Config(msg) => assert!(msg.contains("empty path"), "got: {msg}"),
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_empty_repository_corpus_paths_entry() {
+        let err = parse(
+            "[[repository]]\nname = \"tern\"\npath = \"/abs/tern\"\ncorpus_paths = [\"docs\", \"\"]\n",
+            None,
+        )
+        .expect_err("empty corpus_paths entry must fail");
+        match err {
+            HallouminateError::Config(msg) => {
+                assert!(msg.contains("empty corpus_paths"), "got: {msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_repo_layer_rejects_empty_repository_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        let cfg_path =
+            write_repo_config(&repo_root, "[[repository]]\nname = \"tern\"\npath = \"\"\n");
+
+        let err = load_repo_layer(&cfg_path, &[]).expect_err("empty repository path");
+
+        match err {
+            HallouminateError::Config(msg) => assert!(msg.contains("empty path"), "got: {msg}"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_repo_layer_rejects_empty_corpus_path_entry() {
+        let cases = [
+            (
+                "[[corpus]]\nname = \"c\"\npaths = [\"\"]\n",
+                "empty path entry",
+            ),
+            (
+                "[[repository]]\nname = \"tern\"\npath = \"tern\"\ncorpus_paths = [\"\"]\n",
+                "empty corpus_paths entry",
+            ),
+        ];
+        for (body, expected) in cases {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cfg_path = write_repo_config(&canon(dir.path()), body);
+
+            let err = load_repo_layer(&cfg_path, &[]).expect_err("empty corpus path entry");
+
+            match err {
+                HallouminateError::Config(msg) => assert!(msg.contains(expected), "got: {msg}"),
+                other => panic!("unexpected error: {other:?}"),
+            }
         }
     }
 

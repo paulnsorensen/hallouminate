@@ -27,9 +27,9 @@ use hallouminate_domain::corpus::ClaimMark;
 use hallouminate_domain::embeddings::canonical_model_name;
 use hallouminate_domain::indexer::{
     BatchWriteStats, ChunkStore, ChunkStructure, ContentKey, DerivationFingerprint, EmbeddingsMode,
-    FileSnapshot, PreparedFile, Quantization, SearchHit, SignalLists,
+    FileSnapshot, PreparedBatch, PreparedFile, Quantization, SearchHit, SignalLists,
 };
-use hallouminate_domain::search::ChunkRetrieval;
+use hallouminate_domain::search::{ChunkRetrieval, RootHandle, RootIndex};
 
 const TABLE_NAME: &str = "chunks";
 const FILES_TABLE_NAME: &str = "root_files";
@@ -505,6 +505,13 @@ const KEY_LOOKUP_CHUNK: usize = 512;
 const SCOPE_KEY_GROUP: usize = 1024;
 /// Key-group content scans that run at once for one signal.
 const SCOPE_SCAN_CONCURRENCY: usize = 4;
+/// A large-map ranked read first scans this many rows per wanted hit with no
+/// prefilter. At 10k mapped files one unscoped scan costs about 30 ms against
+/// about 870 ms for the grouped scans, so a miss costs little.
+const OVERFETCH_FACTOR: usize = 8;
+/// Lower bound on the over-fetch row count, so a small `limit` still reaches
+/// past a few foreign rows.
+const OVERFETCH_FLOOR: usize = 64;
 
 const MAP_COLUMNS: [&str; 3] = ["content_key", "file_ref", "mtime_ms"];
 const SNAPSHOT_COLUMNS: [&str; 3] = ["file_ref", "mtime_ms", "content_hash"];
@@ -928,6 +935,29 @@ fn content_key_in_filter<'a>(keys: impl IntoIterator<Item = &'a ContentKey>) -> 
     format!("content_key IN ({})", quoted.join(", "))
 }
 
+/// Passage vectors of new content, keyed by content key.
+type EmbeddedContent = HashMap<ContentKey, Vec<[f32; EMBEDDING_DIM]>>;
+
+/// Picks one `(file, key)` per distinct content key of `batch` that has
+/// chunks and is not in `stored`.
+fn select_new_content<'a>(
+    batch: &'a [PreparedFile],
+    keys: &'a [ContentKey],
+    stored: &HashSet<ContentKey>,
+) -> Vec<(&'a PreparedFile, &'a ContentKey)> {
+    let mut new_content: Vec<(&PreparedFile, &ContentKey)> = Vec::new();
+    let mut queued: HashSet<&ContentKey> = HashSet::new();
+    for (file, key) in batch.iter().zip(keys) {
+        if stored.contains(key) || file.chunks.is_empty() {
+            continue;
+        }
+        if queued.insert(key) {
+            new_content.push((file, key));
+        }
+    }
+    new_content
+}
+
 fn corpus_key_filter(corpus_key: &CorpusKey) -> Result<String> {
     let Some(root) = corpus_key.canonical_root.to_str() else {
         return Err(HallouminateError::Indexer(format!(
@@ -1017,6 +1047,9 @@ pub struct LanceStore {
     /// Content keys per prefiltered content scan.
     #[cfg(test)]
     scope_key_group: usize,
+    /// Root-map scans run, for tests that bound the reads per request.
+    #[cfg(test)]
+    map_scans: std::sync::atomic::AtomicUsize,
     /// Serializes batch writes and orphan-content collection, so collection
     /// never removes content a batch is about to reference.
     write_gate: tokio::sync::Mutex<()>,
@@ -1325,6 +1358,8 @@ impl LanceStore {
             files,
             #[cfg(test)]
             scope_key_group: SCOPE_KEY_GROUP,
+            #[cfg(test)]
+            map_scans: std::sync::atomic::AtomicUsize::new(0),
             write_gate: tokio::sync::Mutex::new(()),
             fingerprint,
             embeddings_enabled,
@@ -1719,6 +1754,30 @@ impl LanceStore {
     /// returns a mismatched vector count, when building the Arrow record
     /// batch fails, or when LanceDB write or index maintenance fails.
     async fn apply_batch(&self, batch: Vec<PreparedFile>) -> Result<BatchWriteStats> {
+        let embedded = self.prepare_batch(&batch).await?;
+        self.commit_batch(batch, embedded).await
+    }
+
+    /// Embeds the new content of `batch` without taking the write gate, so a
+    /// slow embedder blocks neither other writers nor orphan collection.
+    async fn prepare_batch(&self, batch: &[PreparedFile]) -> Result<EmbeddedContent> {
+        let mut keys: Vec<ContentKey> = Vec::with_capacity(batch.len());
+        for file in batch {
+            keys.push(ContentKey::derive(file, &self.fingerprint));
+        }
+        let precheck = self.stored_content_keys(&keys).await?;
+        let candidates = select_new_content(batch, &keys, &precheck);
+        self.embed_content(&candidates).await
+    }
+
+    /// Writes `batch` under the write gate. Rechecks stored keys under the
+    /// gate: vectors in `embedded` for content stored meanwhile are dropped,
+    /// and content collected meanwhile is embedded here.
+    async fn commit_batch(
+        &self,
+        batch: Vec<PreparedFile>,
+        embedded: EmbeddedContent,
+    ) -> Result<BatchWriteStats> {
         if batch.is_empty() {
             return Ok(BatchWriteStats::default());
         }
@@ -1728,29 +1787,22 @@ impl LanceStore {
                 "apply_batch: all PreparedFiles in a batch must share the same corpus key".into(),
             ));
         }
-        let _gate = self.write_gate.lock().await;
         let mut keys: Vec<ContentKey> = Vec::with_capacity(batch.len());
         for file in &batch {
             keys.push(ContentKey::derive(file, &self.fingerprint));
         }
+
+        let _gate = self.write_gate.lock().await;
         let stored = self.stored_content_keys(&keys).await?;
-        let mut new_content: Vec<(&PreparedFile, &ContentKey)> = Vec::new();
-        let mut queued: HashSet<&ContentKey> = HashSet::new();
-        for (file, key) in batch.iter().zip(&keys) {
-            if stored.contains(key) || file.chunks.is_empty() {
-                continue;
-            }
-            if queued.insert(key) {
-                new_content.push((file, key));
-            }
-        }
+        let new_content = select_new_content(&batch, &keys, &stored);
 
         let mut stats = BatchWriteStats::default();
         for file in &batch {
             stats.chunks_written += file.chunks.len();
         }
         if !new_content.is_empty() {
-            self.write_content(&new_content, &mut stats).await?;
+            self.write_content(&new_content, embedded, &mut stats)
+                .await?;
         }
         self.write_file_map(&batch, &keys).await?;
         self.refresh_file_indexes(&corpus_key).await?;
@@ -1794,48 +1846,74 @@ impl LanceStore {
         Ok(stored)
     }
 
-    /// Embeds (when enabled) and inserts the content rows of `new_content`.
+    /// Embeds the chunks of `files` (when embeddings are enabled), keyed by
+    /// content key. Runs without the write gate so a slow embedder never
+    /// blocks other writers or orphan collection.
+    async fn embed_content(
+        &self,
+        files: &[(&PreparedFile, &ContentKey)],
+    ) -> Result<HashMap<ContentKey, Vec<[f32; EMBEDDING_DIM]>>> {
+        let mut embedded: HashMap<ContentKey, Vec<[f32; EMBEDDING_DIM]>> = HashMap::new();
+        if !self.embeddings_enabled || files.is_empty() {
+            return Ok(embedded);
+        }
+        let mut all_texts: Vec<String> = Vec::new();
+        for (file, _) in files {
+            for chunk in &file.chunks {
+                all_texts.push(chunk.search_text.clone());
+            }
+        }
+        let expected = all_texts.len();
+        let vectors =
+            run_embedding_blocking(Arc::clone(&self.embedder), all_texts, EmbedRole::Passage)
+                .await?;
+        if vectors.len() != expected {
+            return Err(HallouminateError::Indexer(format!(
+                "embedder returned {} vectors for {} chunks",
+                vectors.len(),
+                expected
+            )));
+        }
+        let mut iter = vectors.into_iter();
+        for (file, key) in files {
+            let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(file.chunks.len());
+            for _ in 0..file.chunks.len() {
+                let v = iter.next().ok_or_else(|| {
+                    HallouminateError::Indexer("embedding count drained early".into())
+                })?;
+                buf.push(v);
+            }
+            embedded.insert((*key).clone(), buf);
+        }
+        Ok(embedded)
+    }
+
+    /// Inserts the content rows of `new_content`. Vectors come from
+    /// `prepared`; a key missing from it (collected after the pre-gate
+    /// embedding pass) is embedded here, under the caller's write gate.
     async fn write_content(
         &self,
         new_content: &[(&PreparedFile, &ContentKey)],
+        mut prepared: HashMap<ContentKey, Vec<[f32; EMBEDDING_DIM]>>,
         stats: &mut BatchWriteStats,
     ) -> Result<()> {
+        let mut missing: Vec<(&PreparedFile, &ContentKey)> = Vec::new();
+        for (file, key) in new_content {
+            if !prepared.contains_key(*key) {
+                missing.push((file, key));
+            }
+        }
+        for (key, vectors) in self.embed_content(&missing).await? {
+            prepared.insert(key, vectors);
+        }
         let mut file_embeddings: Vec<Option<Vec<[f32; EMBEDDING_DIM]>>> =
             Vec::with_capacity(new_content.len());
-        if self.embeddings_enabled {
-            let mut all_texts: Vec<String> = Vec::new();
-            for (file, _) in new_content {
-                for chunk in &file.chunks {
-                    all_texts.push(chunk.search_text.clone());
-                }
+        for (_, key) in new_content {
+            let vectors = prepared.remove(*key);
+            if let Some(vectors) = &vectors {
+                stats.embeddings_written += vectors.len();
             }
-            let expected = all_texts.len();
-            let vectors =
-                run_embedding_blocking(Arc::clone(&self.embedder), all_texts, EmbedRole::Passage)
-                    .await?;
-            if vectors.len() != expected {
-                return Err(HallouminateError::Indexer(format!(
-                    "embedder returned {} vectors for {} chunks",
-                    vectors.len(),
-                    expected
-                )));
-            }
-            let mut iter = vectors.into_iter();
-            for (file, _) in new_content {
-                let mut buf: Vec<[f32; EMBEDDING_DIM]> = Vec::with_capacity(file.chunks.len());
-                for _ in 0..file.chunks.len() {
-                    let v = iter.next().ok_or_else(|| {
-                        HallouminateError::Indexer("embedding count drained early".into())
-                    })?;
-                    buf.push(v);
-                }
-                file_embeddings.push(Some(buf));
-            }
-            stats.embeddings_written += expected;
-        } else {
-            for _ in new_content {
-                file_embeddings.push(None);
-            }
+            file_embeddings.push(vectors);
         }
         let mut paired: Vec<FileWithEmbeddings> = Vec::with_capacity(new_content.len());
         for ((file, key), embeddings) in new_content.iter().zip(file_embeddings.iter()) {
@@ -2344,6 +2422,9 @@ impl LanceStore {
     /// keys, so a scan never sees another root's rows. The key-group
     /// prefilters are built once here and shared by every signal.
     async fn load_scope(&self, corpus_key: &CorpusKey) -> Result<RootScope> {
+        #[cfg(test)]
+        self.map_scans
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let batches = scan_columns(
             &self.files,
             "root_scope_load",
@@ -2367,7 +2448,11 @@ impl LanceStore {
 
     /// Runs `scan` over content rows and returns the hits of the selected
     /// root's map. `scan` receives a content-key prefilter and the row limit
-    /// to fetch. A map within one key group needs one scan. A larger map scans
+    /// to fetch. A map within one key group needs one scan. For a ranked
+    /// signal, a larger map first tries one unscoped scan of
+    /// `limit * OVERFETCH_FACTOR` rows and keeps the root's rows. That is
+    /// exact when it yields `limit` hits, because the root's best rows inside
+    /// the global top rows are its global best rows. Otherwise the map scans
     /// each key group exactly, a bounded number at a time, and merges the best
     /// `limit` rows by `signal` score, so rows of other roots never crowd the
     /// root out.
@@ -2394,6 +2479,27 @@ impl LanceStore {
             }
             hits.truncate(limit);
             return Ok(hits);
+        }
+        let overfetchable = match signal {
+            ScoreSignal::Fts => true,
+            ScoreSignal::Vector => true,
+            ScoreSignal::Scan => false,
+        };
+        if overfetchable {
+            let fetch = limit.saturating_mul(OVERFETCH_FACTOR).max(OVERFETCH_FLOOR);
+            let batches = scan(None, fetch).await?;
+            let mut scored: Vec<(f32, SearchHit)> = Vec::new();
+            for rb in &batches {
+                decode_scored_hits(rb, signal, mapped, corpus_key, &mut scored)?;
+            }
+            if scored.len() >= limit {
+                scored.sort_by(|left, right| signal.best_first(left.0, right.0));
+                let mut hits = Vec::with_capacity(limit);
+                for (_, hit) in scored.into_iter().take(limit) {
+                    hits.push(hit);
+                }
+                return Ok(hits);
+            }
         }
         let mut scans = Vec::with_capacity(prefilters.len());
         for prefilter in prefilters {
@@ -2433,14 +2539,34 @@ impl LanceStore {
         query: &str,
         limit: usize,
     ) -> Result<SignalLists> {
+        self.retrieve_signals_with(corpus_key, query, limit, None)
+            .await
+    }
+
+    /// [`retrieve_signals`](Self::retrieve_signals) over an already loaded
+    /// `scope`, or one it loads itself when `scope` is `None`.
+    async fn retrieve_signals_with(
+        &self,
+        corpus_key: &CorpusKey,
+        query: &str,
+        limit: usize,
+        scope: Option<&RootScope>,
+    ) -> Result<SignalLists> {
         if !self.has_text_index().await? {
             return Ok(SignalLists::default());
         }
-        let scope = self.load_scope(corpus_key).await?;
+        let loaded;
+        let scope = match scope {
+            Some(scope) => scope,
+            None => {
+                loaded = self.load_scope(corpus_key).await?;
+                &loaded
+            }
+        };
 
         let fts = self.scoped_hits(
             corpus_key,
-            &scope,
+            scope,
             limit,
             ScoreSignal::Fts,
             |filter, fetch| self.fts_scan(filter, query.to_string(), fetch),
@@ -2457,7 +2583,7 @@ impl LanceStore {
             })?;
             self.scoped_hits(
                 corpus_key,
-                &scope,
+                scope,
                 limit,
                 ScoreSignal::Vector,
                 |filter, fetch| self.vector_scan(filter, query_vec, fetch),
@@ -2556,6 +2682,19 @@ impl LanceStore {
         phrase: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
+        self.retrieve_phrase_with(corpus_key, phrase, limit, None)
+            .await
+    }
+
+    /// [`retrieve_phrase`](Self::retrieve_phrase) over an already loaded
+    /// `scope`, or one it loads itself when `scope` is `None`.
+    async fn retrieve_phrase_with(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+        scope: Option<&RootScope>,
+    ) -> Result<Vec<SearchHit>> {
         if !self.has_text_index().await? {
             return Ok(Vec::new());
         }
@@ -2580,10 +2719,17 @@ impl LanceStore {
              OR strpos(text, '[^') > 0)"
         ));
         let phrase_filter = conditions.join(" AND ");
-        let scope = self.load_scope(corpus_key).await?;
+        let loaded;
+        let scope = match scope {
+            Some(scope) => scope,
+            None => {
+                loaded = self.load_scope(corpus_key).await?;
+                &loaded
+            }
+        };
         self.scoped_hits(
             corpus_key,
-            &scope,
+            scope,
             limit,
             ScoreSignal::Scan,
             |prefilter, fetch| {
@@ -2680,6 +2826,22 @@ impl ChunkStore for LanceStore {
     async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats> {
         LanceStore::apply_batch(self, files).await
     }
+
+    async fn prepare_batch(&self, files: &[PreparedFile]) -> Result<Option<PreparedBatch>> {
+        let embedded = LanceStore::prepare_batch(self, files).await?;
+        Ok(Some(PreparedBatch::new(embedded)))
+    }
+
+    async fn commit_batch(
+        &self,
+        files: Vec<PreparedFile>,
+        prepared: Option<PreparedBatch>,
+    ) -> Result<BatchWriteStats> {
+        let embedded = prepared
+            .and_then(PreparedBatch::into_inner::<EmbeddedContent>)
+            .unwrap_or_default();
+        LanceStore::commit_batch(self, files, embedded).await
+    }
 }
 
 #[async_trait]
@@ -2706,28 +2868,55 @@ impl ChunkRetrieval for LanceStore {
         &self,
         corpus_key: &CorpusKey,
     ) -> Result<Option<HashSet<hallouminate_domain::common::FileRef>>> {
-        let batches = scan_columns(
-            &self.files,
-            "indexed_file_refs",
-            Some(corpus_key_filter(corpus_key)?),
-            &["file_ref"],
-            None,
-        )
-        .await?;
-        let mut refs = HashSet::new();
-        for rb in &batches {
-            if rb.num_rows() == 0 {
-                continue;
-            }
-            let file_ref = string_col(rb, "file_ref")?;
-            for i in 0..rb.num_rows() {
-                refs.insert(hallouminate_domain::common::FileRef::new(
-                    std::path::PathBuf::from(file_ref.value(i)),
-                ));
-            }
-        }
-        Ok(Some(refs))
+        let scope = self.load_scope(corpus_key).await?;
+        Ok(Some(scope_file_refs(&scope)))
     }
+
+    async fn load_root_index(&self, corpus_key: &CorpusKey) -> Result<Option<RootIndex>> {
+        let scope = self.load_scope(corpus_key).await?;
+        let files = scope_file_refs(&scope);
+        Ok(Some(RootIndex {
+            files: Arc::new(files),
+            handle: Some(RootHandle::new(scope)),
+        }))
+    }
+
+    async fn retrieve_signals_in(
+        &self,
+        corpus_key: &CorpusKey,
+        query: &str,
+        limit: usize,
+        handle: Option<&RootHandle>,
+    ) -> Result<SignalLists> {
+        let scope = handle.and_then(RootHandle::downcast_ref::<RootScope>);
+        LanceStore::retrieve_signals_with(self, corpus_key, query, limit, scope).await
+    }
+
+    async fn retrieve_phrase_in(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+        handle: Option<&RootHandle>,
+    ) -> Result<Vec<SearchHit>> {
+        let scope = handle.and_then(RootHandle::downcast_ref::<RootScope>);
+        LanceStore::retrieve_phrase_with(self, corpus_key, phrase, limit, scope).await
+    }
+}
+
+fn scope_file_refs(scope: &RootScope) -> HashSet<hallouminate_domain::common::FileRef> {
+    let mut refs = HashSet::new();
+    let RootScope::Mapped(ScopedFiles { mapped, .. }) = scope else {
+        return refs;
+    };
+    for files in mapped.values() {
+        for MappedFile { file_ref, .. } in files {
+            refs.insert(hallouminate_domain::common::FileRef::new(
+                std::path::PathBuf::from(file_ref),
+            ));
+        }
+    }
+    refs
 }
 
 #[cfg(test)]
@@ -3510,6 +3699,114 @@ mod tests {
             calls.load(Ordering::SeqCst),
             2,
             "each batch must trigger its own fresh embed call, not reuse a held lock"
+        );
+    }
+
+    async fn gated_embedder_store(
+        dir: &std::path::Path,
+    ) -> (
+        Arc<LanceStore>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let store = LanceStore::open_or_create(
+            dir,
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(GatedFirstCallEmbedder {
+                first_call: AtomicBool::new(true),
+                entered_tx,
+                release_rx,
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        (Arc::new(store), entered_rx, release_tx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_batch_embeds_outside_write_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, entered_rx, release_tx) = gated_embedder_store(dir.path()).await;
+
+        let writer = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            writer
+                .apply_batch(vec![synthetic_prepared("/tmp/outside-gate.md", 1)])
+                .await
+                .expect("apply blocked batch")
+        });
+        entered_rx.recv().expect("embed_batch entered");
+
+        let gate_free =
+            tokio::time::timeout(std::time::Duration::from_secs(2), store.write_gate.lock())
+                .await
+                .is_ok();
+        let gc = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.delete_orphan_content(),
+        )
+        .await
+        .is_ok();
+
+        release_tx.send(()).expect("release embed call");
+        handle.await.expect("blocked batch task");
+        assert!(gate_free, "write_gate must be free while a batch embeds");
+        assert!(gc, "orphan GC must finish while a batch embeds");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn apply_batch_rechecks_stored_keys_after_embedding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, entered_rx, release_tx) = gated_embedder_store(dir.path()).await;
+        let file = synthetic_prepared("/tmp/recheck-a.md", 2);
+        let key = ContentKey::derive(&file, &store.fingerprint);
+
+        let writer = Arc::clone(&store);
+        let batch = vec![file.clone()];
+        let handle = tokio::spawn(async move {
+            writer
+                .apply_batch(batch)
+                .await
+                .expect("apply blocked batch")
+        });
+        entered_rx.recv().expect("embed_batch entered");
+
+        let mut concurrent_stats = BatchWriteStats::default();
+        let mut vectors = HashMap::new();
+        vectors.insert(key.clone(), vec![[0.0; EMBEDDING_DIM]; 2]);
+        store
+            .write_content(&[(&file, &key)], vectors, &mut concurrent_stats)
+            .await
+            .expect("concurrent writer stores the content");
+
+        release_tx.send(()).expect("release embed call");
+        let stats = handle.await.expect("blocked batch task");
+
+        let batches = scan_columns(
+            &store.table,
+            "recheck_rows",
+            Some(content_key_in_filter([&key])),
+            &["content_key"],
+            None,
+        )
+        .await
+        .expect("scan content rows");
+        let mut rows = 0;
+        for rb in &batches {
+            rows += rb.num_rows();
+        }
+        assert_eq!(
+            rows, 2,
+            "content stored meanwhile must not be written twice"
+        );
+        assert_eq!(
+            stats.embeddings_written, 0,
+            "vectors for content stored meanwhile are dropped"
         );
     }
 
@@ -5816,6 +6113,130 @@ schema_version = 1
     }
 
     #[tokio::test]
+    async fn prepare_batch_embeds_before_commit_and_commit_does_not_re_embed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(InputRecordingEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        let files = vec![synthetic_prepared("/tmp/prepare-commit.md", 2)];
+
+        let prepared = ChunkStore::prepare_batch(&store, &files)
+            .await
+            .expect("prepare batch");
+        assert_eq!(calls.lock().expect("calls lock").len(), 1);
+
+        let stats = ChunkStore::commit_batch(&store, files, prepared)
+            .await
+            .expect("commit batch");
+        assert_eq!(calls.lock().expect("calls lock").len(), 1, "no re-embed");
+        assert_eq!(stats.embeddings_written, 2);
+    }
+
+    fn report_latency(label: &str, samples: &mut [f64]) {
+        samples.sort_by(|a, b| a.total_cmp(b));
+        let median = samples[samples.len() / 2];
+        let p95_index = (samples.len() * 95).div_ceil(100) - 1;
+        eprintln!(
+            "{label}: median {median:.2} ms, p95 {:.2} ms",
+            samples[p95_index]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "timing measurement; run with --ignored --nocapture"]
+    async fn scoped_ground_latency_on_ten_thousand_file_root() {
+        const OWN_FILES: usize = 10_000;
+        const FOREIGN_FILES: usize = 2_000;
+        const SEED_BATCH: usize = 1_000;
+        const ITERATIONS: usize = 20;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(InputRecordingEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        let own = corpus_key("repo:own:wiki", "/tmp/latency-own");
+        let foreign = corpus_key("repo:foreign:wiki", "/tmp/latency-foreign");
+
+        let seeding = std::time::Instant::now();
+        for (key, root, count) in [
+            (&own, "latency-own", OWN_FILES),
+            (&foreign, "latency-foreign", FOREIGN_FILES),
+        ] {
+            let mut start = 0;
+            while start < count {
+                let end = (start + SEED_BATCH).min(count);
+                let mut files = Vec::new();
+                for i in start..end {
+                    let mut file = synthetic_prepared_for(
+                        key,
+                        &format!("/tmp/{root}/{i}.md"),
+                        1,
+                        &format!("latencytoken {root} doc{i}"),
+                        10,
+                        100,
+                    );
+                    file.content_hash = format!("{root}-hash-{i}");
+                    files.push(file);
+                }
+                store.apply_batch(files).await.expect("seed batch");
+                start = end;
+            }
+        }
+        eprintln!("seeded in {:.1} s", seeding.elapsed().as_secs_f64());
+        assert!(store.has_text_index().await.expect("text index check"));
+
+        let query = "latencytoken";
+        let mut scoped = Vec::new();
+        let mut unscoped = Vec::new();
+        let mut scope_load = Vec::new();
+        for _ in 0..ITERATIONS {
+            let started = std::time::Instant::now();
+            let signals = store
+                .retrieve_signals(&own, query, 10)
+                .await
+                .expect("scoped retrieve");
+            scoped.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(signals.fts.len(), 10);
+
+            let started = std::time::Instant::now();
+            store
+                .fts_scan(None, query.to_string(), 10)
+                .await
+                .expect("unscoped fts");
+            store
+                .vector_scan(None, [0.0; EMBEDDING_DIM], 10)
+                .await
+                .expect("unscoped vector");
+            unscoped.push(started.elapsed().as_secs_f64() * 1000.0);
+
+            let started = std::time::Instant::now();
+            store.load_scope(&own).await.expect("load scope");
+            scope_load.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        report_latency("scoped retrieve_signals (10 key groups)", &mut scoped);
+        report_latency("unscoped fts_scan + vector_scan", &mut unscoped);
+        report_latency("load_scope", &mut scope_load);
+    }
+
+    #[tokio::test]
     async fn large_root_reads_stay_exact_despite_foreign_matching_content() {
         let dir = tempfile::tempdir().expect("tempdir");
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -5848,7 +6269,7 @@ schema_version = 1
         }
         store.apply_batch(own_files).await.expect("seed own root");
         let mut foreign_files = Vec::new();
-        for i in 0..30 {
+        for i in 0..100 {
             let mut file = synthetic_prepared_for(
                 &foreign,
                 &format!("/tmp/crowd-foreign/{i}.md"),
@@ -5901,6 +6322,192 @@ schema_version = 1
         for hit in limited.hits.values() {
             assert_eq!(hit.corpus_key, own);
         }
+
+        let scope = store.load_scope(&own).await.expect("load scope");
+        let RootScope::Mapped(ScopedFiles { prefilters, .. }) = &scope else {
+            panic!("own root has a mapped scope");
+        };
+        assert_eq!(prefilters.len(), 3, "5 files in groups of 2");
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+        let hits = store
+            .scoped_hits(&own, &scope, 10, ScoreSignal::Fts, |filter, fetch| {
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                store.fts_scan(filter, "crowdtoken".to_string(), fetch)
+            })
+            .await
+            .expect("crowded scoped read");
+        assert_eq!(hits.len(), 5, "the fallback finds every own file");
+        assert_eq!(
+            scans.load(std::sync::atomic::Ordering::SeqCst),
+            1 + prefilters.len(),
+            "foreign rows fill the over-fetch, so the grouped scans run"
+        );
+    }
+
+    #[tokio::test]
+    async fn ranked_ground_scans_root_map_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(InputRecordingEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        let key = corpus_key("repo:once:wiki", "/tmp/once-root");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/once-root/a.md",
+                1,
+                "oncetoken alpha",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed root");
+        store
+            .map_scans
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let fused = hallouminate_domain::search::search_fused(&store, &key, "oncetoken", &[], 10)
+            .await
+            .expect("ranked search");
+        assert!(!fused.hits.is_empty(), "the seeded file is found");
+        assert_eq!(
+            store.map_scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one root-map read serves membership and retrieval"
+        );
+    }
+
+    #[tokio::test]
+    async fn phrase_ground_scans_root_map_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(InputRecordingEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        let key = corpus_key("repo:phrase-once:wiki", "/tmp/phrase-once-root");
+        store
+            .apply_batch(vec![synthetic_prepared_for(
+                &key,
+                "/tmp/phrase-once-root/a.md",
+                1,
+                "phraseonce alpha beta",
+                10,
+                100,
+            )])
+            .await
+            .expect("seed root");
+        store
+            .map_scans
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let root = store
+            .load_root_index(&key)
+            .await
+            .expect("root index")
+            .expect("lance lists its files");
+        let hits = store
+            .retrieve_phrase_in(&key, "phraseonce alpha", 10, root.handle.as_ref())
+            .await
+            .expect("phrase read");
+        assert_eq!(hits.len(), 1, "the seeded chunk matches the phrase");
+        assert_eq!(
+            store.map_scans.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the phrase read reuses the loaded root map"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_hits_overfetch_returns_exact_top_hits_without_group_scans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut store = LanceStore::open_or_create(
+            dir.path(),
+            "BAAI/bge-small-en-v1.5",
+            false,
+            true,
+            Some(Box::new(InputRecordingEmbedder {
+                calls: Arc::clone(&calls),
+            })),
+        )
+        .await
+        .expect("open enabled store");
+        let own = corpus_key("repo:own:wiki", "/tmp/overfetch-own");
+        let foreign = corpus_key("repo:foreign:wiki", "/tmp/overfetch-foreign");
+        let mut own_files = Vec::new();
+        for i in 0..6 {
+            let mut file = synthetic_prepared_for(
+                &own,
+                &format!("/tmp/overfetch-own/{i}.md"),
+                1,
+                &"overfetchtoken ".repeat(i + 3),
+                10,
+                100,
+            );
+            file.content_hash = format!("own-hash-{i}");
+            own_files.push(file);
+        }
+        store.apply_batch(own_files).await.expect("seed own root");
+        let foreign_file = synthetic_prepared_for(
+            &foreign,
+            "/tmp/overfetch-foreign/0.md",
+            1,
+            "overfetchtoken foreign",
+            20,
+            200,
+        );
+        store
+            .apply_batch(vec![foreign_file])
+            .await
+            .expect("seed foreign root");
+
+        let single = store
+            .retrieve_signals(&own, "overfetchtoken", 3)
+            .await
+            .expect("single-group read");
+        assert_eq!(single.fts.len(), 3);
+
+        store.scope_key_group = 2;
+        let scope = store.load_scope(&own).await.expect("load scope");
+        let RootScope::Mapped(ScopedFiles { prefilters, .. }) = &scope else {
+            panic!("own root has a mapped scope");
+        };
+        assert_eq!(prefilters.len(), 3, "6 files in groups of 2");
+        let scans = std::sync::atomic::AtomicUsize::new(0);
+        let hits = store
+            .scoped_hits(&own, &scope, 3, ScoreSignal::Fts, |filter, fetch| {
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                store.fts_scan(filter, "overfetchtoken".to_string(), fetch)
+            })
+            .await
+            .expect("over-fetch read");
+        assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let mut chunk_ids = Vec::new();
+        for hit in &hits {
+            assert_eq!(hit.corpus_key, own, "a foreign row must never appear");
+            chunk_ids.push(hit.chunk_id.clone());
+        }
+        assert_eq!(
+            chunk_ids, single.fts,
+            "same ranked top hits as the exact read"
+        );
     }
 
     #[tokio::test]

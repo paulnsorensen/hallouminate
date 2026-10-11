@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -41,6 +42,41 @@ pub trait ChunkStore: Send + Sync {
     }
 
     async fn apply_batch(&self, files: Vec<PreparedFile>) -> Result<BatchWriteStats>;
+
+    /// Runs the slow, lock-free part of `apply_batch` (embedding) so a caller
+    /// can do it before taking its write lane. Stores with no such work keep
+    /// this default.
+    async fn prepare_batch(&self, _files: &[PreparedFile]) -> Result<Option<PreparedBatch>> {
+        Ok(None)
+    }
+
+    /// Writes `files` using the output of `prepare_batch` for the same files.
+    /// Stores that prepare nothing keep this default, which is `apply_batch`.
+    async fn commit_batch(
+        &self,
+        files: Vec<PreparedFile>,
+        _prepared: Option<PreparedBatch>,
+    ) -> Result<BatchWriteStats> {
+        self.apply_batch(files).await
+    }
+}
+
+/// Opaque work a store did in `ChunkStore::prepare_batch`, handed back to
+/// `commit_batch`. Only the store that made it can read it.
+pub struct PreparedBatch(Box<dyn Any + Send>);
+
+impl PreparedBatch {
+    pub fn new<T: Any + Send>(value: T) -> Self {
+        Self(Box::new(value))
+    }
+
+    /// Returns the wrapped value, or `None` when it holds a different type.
+    pub fn into_inner<T: Any + Send>(self) -> Option<T> {
+        let Ok(value) = self.0.downcast::<T>() else {
+            return None;
+        };
+        Some(*value)
+    }
 }
 
 /// Per-signal ranked lists from the retrieval backend, unfused.

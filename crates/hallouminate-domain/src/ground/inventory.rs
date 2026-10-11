@@ -3,13 +3,14 @@ use std::sync::Arc;
 
 use crate::common::{CorpusConfig, CorpusKey, FileRef};
 use crate::corpus::ScannedFile;
-use crate::search::ChunkRetrieval;
+use crate::search::{ChunkRetrieval, RootHandle, RootIndex};
 
 /// What the store reports about one root's indexed files.
 #[derive(Debug, Clone, Default)]
 pub enum IndexedFiles {
-    /// Files that have indexed rows under the root.
-    Known(Arc<HashSet<FileRef>>),
+    /// Files that have indexed rows under the root, with the store's handle
+    /// on the same read.
+    Known(RootIndex),
     /// The store cannot list its indexed files.
     #[default]
     Unknown,
@@ -31,6 +32,17 @@ pub struct RootInventory {
 /// The per-root file sets of one request, keyed by corpus identity.
 pub type Inventory = BTreeMap<CorpusKey, RootInventory>;
 
+impl RootInventory {
+    /// The store handle from the root's single file-map read, if any.
+    pub fn handle(&self) -> Option<&RootHandle> {
+        match &self.indexed {
+            IndexedFiles::Known(RootIndex { handle, .. }) => handle.as_ref(),
+            IndexedFiles::Unknown => None,
+            IndexedFiles::ListingFailed(_) => None,
+        }
+    }
+}
+
 /// Lists the indexed files of each root of `corpus`, one store read per root.
 pub async fn list_root_indexes(
     corpus: &CorpusConfig,
@@ -38,8 +50,8 @@ pub async fn list_root_indexes(
 ) -> Vec<(CorpusKey, IndexedFiles)> {
     let mut listed = Vec::new();
     for corpus_key in corpus.corpus_keys() {
-        let indexed = match store.indexed_file_refs(&corpus_key).await {
-            Ok(Some(files)) => IndexedFiles::Known(Arc::new(files)),
+        let indexed = match store.load_root_index(&corpus_key).await {
+            Ok(Some(index)) => IndexedFiles::Known(index),
             Ok(None) => IndexedFiles::Unknown,
             Err(error) => IndexedFiles::ListingFailed(error.to_string()),
         };

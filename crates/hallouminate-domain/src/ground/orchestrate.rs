@@ -7,9 +7,11 @@ use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
 use crate::corpus::{ScannedFile, scan};
 use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
+use crate::search::RootIndex;
+use crate::search::phrase::search_phrase_in;
 use crate::search::{
     ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, lexical_fallback_search,
-    rank_after, search_fused_indexed, search_phrase,
+    rank_after, search_fused_indexed,
 };
 
 use super::bucket::{Rollup, normalize_scores, roll_up};
@@ -19,6 +21,7 @@ use super::inventory::{
 use super::types::{
     DocFile, GroundGroupBy, GroundMatch, GroundOutput, GroundResponse, Stats, Warning,
 };
+use super::warning_codes;
 
 /// Maximum number of files a counts response lists. Counts output has no
 /// `top_files` cap, so this bound keeps the response inside the IPC frame.
@@ -283,23 +286,31 @@ async fn search_root_ranked(
 ) -> Result<CorpusSearch> {
     let RootInventory { eligible, indexed } = root;
     let mut listing_warning = None;
-    let indexed = match &indexed {
-        IndexedFiles::Known(files) => Some(files.as_ref()),
-        IndexedFiles::Unknown => None,
+    let (indexed, handle) = match &indexed {
+        IndexedFiles::Known(RootIndex { files, handle }) => (Some(files.as_ref()), handle.as_ref()),
+        IndexedFiles::Unknown => (None, None),
         IndexedFiles::ListingFailed(reason) => {
             tracing::warn!(err = %reason, "lexical fallback skipped: indexed file listing failed");
             listing_warning = Some(Warning {
-                code: "lexical-fallback-failed".to_string(),
+                code: warning_codes::LEXICAL_FALLBACK_FAILED.to_string(),
                 message: format!(
                     "could not list indexed files in corpus root {} ({reason}); skipping the lexical fallback",
                     corpus_key.canonical_root.display()
                 ),
             });
-            None
+            (None, None)
         }
     };
-    let mut fused =
-        search_fused_indexed(store, corpus_key, query, &corpus.globs, limit, indexed).await?;
+    let mut fused = search_fused_indexed(
+        store,
+        corpus_key,
+        query,
+        &corpus.globs,
+        limit,
+        indexed,
+        handle,
+    )
+    .await?;
     fused.warnings.extend(listing_warning);
     let lexical = lexical_fallback_search(corpus_key, query, &eligible, indexed, limit).await;
     if let Some(unpooled) = &fused.unpooled_files {
@@ -443,7 +454,8 @@ pub async fn ground_union_inventoried(
         GroundMatch::Phrase => {
             let mut searches = Vec::with_capacity(corpus_keys.len());
             for (corpus_key, _) in &corpus_keys {
-                searches.push(search_phrase(store, corpus_key, query, limit));
+                let handle = inventory.get(corpus_key).and_then(RootInventory::handle);
+                searches.push(search_phrase_in(store, corpus_key, query, limit, handle));
             }
             let phrased = futures_util::stream::iter(searches)
                 .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
@@ -491,17 +503,15 @@ pub async fn ground_union_inventoried(
                     hit.z_score = z_score;
                 }
             }
-            // Keep each code as a string literal on the `code` field: the eval
-            // gate scans sources for that shape to classify producer warnings.
             Some(RerankFallback::Timeout) => warnings.push(Warning {
-                code: "rerank-timeout".to_string(),
+                code: warning_codes::RERANK_TIMEOUT.to_string(),
                 message: format!(
                     "crossencoder rerank timed out after {} ms; falling back to fusion order",
                     opts.rerank_timeout.as_millis()
                 ),
             }),
             Some(RerankFallback::Unavailable) => warnings.push(Warning {
-                code: "crossencoder-unavailable".to_string(),
+                code: warning_codes::CROSSENCODER_UNAVAILABLE.to_string(),
                 message: "crossencoder rerank unavailable; falling back to fusion order"
                     .to_string(),
             }),
@@ -572,7 +582,7 @@ pub async fn ground_union_inventoried(
                     |a, b| counts_order(priority_corpus, a, b),
                 );
                 warnings.push(Warning {
-                    code: "counts-truncated".to_string(),
+                    code: warning_codes::COUNTS_TRUNCATED.to_string(),
                     message: format!(
                         "counts output lists the first {MAX_COUNTS_FILES} of {matched_files} matched files; narrow the phrase or the corpus to see the rest"
                     ),
@@ -591,7 +601,7 @@ pub async fn ground_union_inventoried(
             }
             if retained < stats.hits {
                 warnings.push(Warning {
-                    code: "phrase-truncated".to_string(),
+                    code: warning_codes::PHRASE_TRUNCATED.to_string(),
                     message: format!(
                         "phrase rollup retained {retained} of {} matched chunks after chunks_per_file and top_files caps",
                         stats.hits
@@ -1394,7 +1404,7 @@ mod tests {
         let root = fixture_root().to_string_lossy();
         let key = CorpusKey::from_configured_root("fixtures", &root);
         for phrase in [" ", &"x".repeat(513)] {
-            let result = search_phrase(&PanicStore, &key, phrase, 1).await;
+            let result = search_phrase_in(&PanicStore, &key, phrase, 1, None).await;
             assert!(result.is_err(), "{phrase:?} must fail before store access");
         }
     }
@@ -2108,7 +2118,10 @@ mod tests {
             key_of(&corpus),
             RootInventory {
                 eligible: Arc::new(HashSet::from([file_ref_in(dir.path(), "cold.md")])),
-                indexed: IndexedFiles::Known(Arc::new(HashSet::new())),
+                indexed: IndexedFiles::Known(RootIndex {
+                    files: Arc::new(HashSet::new()),
+                    handle: None,
+                }),
             },
         )]);
 
@@ -2145,7 +2158,10 @@ mod tests {
             key_of(&corpus),
             RootInventory {
                 eligible: Arc::clone(&covered),
-                indexed: IndexedFiles::Known(covered),
+                indexed: IndexedFiles::Known(RootIndex {
+                    files: covered,
+                    handle: None,
+                }),
             },
         )]);
 
@@ -2163,5 +2179,108 @@ mod tests {
 
         assert!(resp.docs.is_empty());
         assert!(resp.warnings.is_empty(), "{:?}", warning_codes(&resp));
+    }
+
+    /// Counts retrievals that receive the handle from the one root read.
+    #[derive(Default)]
+    struct HandleStore {
+        inner: FakeChunkStore,
+        with_handle: std::sync::atomic::AtomicUsize,
+        without_handle: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HandleStore {
+        fn note(&self, handle: Option<&crate::search::RootHandle>) {
+            let counter = match handle {
+                Some(_) => &self.with_handle,
+                None => &self.without_handle,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for HandleStore {
+        async fn retrieve_signals(
+            &self,
+            corpus_key: &CorpusKey,
+            query: &str,
+            limit: usize,
+        ) -> Result<SignalLists> {
+            self.inner.retrieve_signals(corpus_key, query, limit).await
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            self.inner.retrieve_phrase(corpus_key, phrase, limit).await
+        }
+
+        async fn load_root_index(&self, _corpus_key: &CorpusKey) -> Result<Option<RootIndex>> {
+            Ok(Some(RootIndex {
+                files: Arc::new(HashSet::new()),
+                handle: Some(crate::search::RootHandle::new(7_u8)),
+            }))
+        }
+
+        async fn retrieve_signals_in(
+            &self,
+            corpus_key: &CorpusKey,
+            query: &str,
+            limit: usize,
+            handle: Option<&crate::search::RootHandle>,
+        ) -> Result<SignalLists> {
+            self.note(handle);
+            self.inner.retrieve_signals(corpus_key, query, limit).await
+        }
+
+        async fn retrieve_phrase_in(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+            handle: Option<&crate::search::RootHandle>,
+        ) -> Result<Vec<SearchHit>> {
+            self.note(handle);
+            self.inner.retrieve_phrase(corpus_key, phrase, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ground_hands_the_one_root_read_to_ranked_and_phrase_retrieval() {
+        let dir = tempfile::tempdir().expect("dir");
+        let corpus = md_corpus("docs", dir.path());
+        for match_mode in [GroundMatch::Ranked, GroundMatch::Phrase] {
+            let store = HandleStore::default();
+            let opts = GroundOpts {
+                match_mode,
+                ..GroundOpts::default()
+            };
+
+            let listed = list_root_indexes(&corpus, &store).await;
+            let mut inventory = Inventory::new();
+            inventory.extend(assemble_inventory(listed, &[]));
+
+            ground_union_inventoried(
+                "quokkaherd",
+                std::slice::from_ref(&corpus),
+                &store,
+                None,
+                opts,
+                None,
+                &inventory,
+            )
+            .await
+            .expect("ground_union_inventoried");
+
+            let with = store.with_handle.load(std::sync::atomic::Ordering::SeqCst);
+            let without = store
+                .without_handle
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!((with, without), (1, 0), "{match_mode:?} reuses the handle");
+        }
     }
 }

@@ -18,7 +18,7 @@ use hallouminate_daemon::{
 };
 use hallouminate_domain::common::{CorpusConfig, expand_tilde};
 use hallouminate_domain::corpus::{blake3_bytes, load_tokenizer, scan};
-use hallouminate_domain::ground::{DocFile, GroundResponse, Warning};
+use hallouminate_domain::ground::{DocFile, GroundResponse, Warning, warning_codes};
 use hallouminate_domain::indexer::{Format, HandlerRegistry, PrepareCtx};
 use serde::{Deserialize, Serialize};
 use text_splitter::{Characters, ChunkSizer};
@@ -620,8 +620,8 @@ fn top_rerank_signal(ranked: &[(&String, &DocFile)]) -> Option<f64> {
     None
 }
 
-const RERANK_TIMEOUT_CODE: &str = "rerank-timeout";
-const CROSSENCODER_UNAVAILABLE_CODE: &str = "crossencoder-unavailable";
+const RERANK_TIMEOUT_CODE: &str = warning_codes::RERANK_TIMEOUT;
+const CROSSENCODER_UNAVAILABLE_CODE: &str = warning_codes::CROSSENCODER_UNAVAILABLE;
 
 /// A fused retrieval signal broke mid-run — a ripgrep pass that failed, timed
 /// out, resolved to nothing, or emitted unparseable events silently changes
@@ -629,10 +629,10 @@ const CROSSENCODER_UNAVAILABLE_CODE: &str = "crossencoder-unavailable";
 /// bake it into the committed baseline. These codes, and only these, fail the
 /// eval.
 const DEGRADED_SIGNAL_CODES: [&str; 4] = [
-    "ripgrep-unresolved",
-    "ripgrep-unparseable",
-    "ripgrep-failed",
-    "ripgrep-timeout",
+    warning_codes::RIPGREP_UNRESOLVED,
+    warning_codes::RIPGREP_UNPARSEABLE,
+    warning_codes::RIPGREP_FAILED,
+    warning_codes::RIPGREP_TIMEOUT,
 ];
 
 /// Rerank fell back to plain fusion. `rerank_completion` owns and judges these
@@ -641,49 +641,18 @@ const RERANK_FALLBACK_CODES: [&str; 2] = [RERANK_TIMEOUT_CODE, CROSSENCODER_UNAV
 
 /// Informational only — they describe what the query covered, not a broken
 /// signal, so they must never fail the eval.
-const ADVISORY_WARNING_CODES: [&str; 12] = [
-    "lexical-fallback",
-    "lexical-fallback-truncated",
-    "lexical-fallback-failed",
-    "lexical-fallback-timeout",
-    "lexical-fallback-scan-timeout",
-    "code-repos-empty",
-    "cross-repo-union",
-    "config-path-outside-repo",
-    "index-coverage",
-    "index-reconciliation",
-    "phrase-truncated",
-    "counts-truncated",
-];
-
-/// Every `Warning.code` the domain and daemon crates emit. Re-derive with:
-///
-/// ```text
-/// rg -n 'code:\s*"' --glob '*.rs' crates/
-/// ```
-///
-/// `producer_warning_codes_are_classified_exactly_once` pins this against the
-/// three sets above, so a new producer-side warning breaks a test at its source
-/// instead of silently reaching the eval gate unclassified.
-const PRODUCER_WARNING_CODES: [&str; 18] = [
-    "lexical-fallback",
-    "lexical-fallback-truncated",
-    "lexical-fallback-failed",
-    "lexical-fallback-timeout",
-    "lexical-fallback-scan-timeout",
-    "ripgrep-unresolved",
-    "ripgrep-unparseable",
-    "ripgrep-failed",
-    "ripgrep-timeout",
-    RERANK_TIMEOUT_CODE,
-    CROSSENCODER_UNAVAILABLE_CODE,
-    "code-repos-empty",
-    "cross-repo-union",
-    "config-path-outside-repo",
-    "index-coverage",
-    "index-reconciliation",
-    "phrase-truncated",
-    "counts-truncated",
+const ADVISORY_WARNING_CODES: [&str; 11] = [
+    warning_codes::LEXICAL_FALLBACK,
+    warning_codes::LEXICAL_FALLBACK_TRUNCATED,
+    warning_codes::LEXICAL_FALLBACK_FAILED,
+    warning_codes::LEXICAL_FALLBACK_TIMEOUT,
+    warning_codes::LEXICAL_FALLBACK_SCAN_TIMEOUT,
+    warning_codes::CROSS_REPO_UNION,
+    warning_codes::CONFIG_PATH_OUTSIDE_REPO,
+    warning_codes::INDEX_COVERAGE,
+    warning_codes::INDEX_RECONCILIATION,
+    warning_codes::PHRASE_TRUNCATED,
+    warning_codes::COUNTS_TRUNCATED,
 ];
 
 /// Which of `run_arm`'s two sweeps a response came from. Only the measured
@@ -2371,77 +2340,11 @@ fn advisory_warnings_do_not_fail_the_eval() {
     }
 }
 
-/// Collects every `code: "<literal>"` a Rust source constructs.
-fn collect_warning_code_literals(text: &str, found: &mut BTreeSet<String>) {
-    const MARKER: &str = "code: \"";
-    let mut rest = text;
-    while let Some(start) = rest.find(MARKER) {
-        let after = &rest[start + MARKER.len()..];
-        let Some(end) = after.find('"') else { break };
-        found.insert(after[..end].to_string());
-        rest = &after[end..];
-    }
-}
-
-/// Every `Warning.code` the workspace's own sources construct, read from disk.
-///
-/// This is what makes `PRODUCER_WARNING_CODES` a pin rather than a wish: the
-/// list is checked against the producers instead of against itself, so adding a
-/// warning code anywhere under `crates/*/src` fails a test here until it is
-/// classified.
-fn scan_producer_warning_codes() -> BTreeSet<String> {
-    fn visit(dir: &Path, found: &mut BTreeSet<String>) {
-        let entries =
-            fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
-        for entry in entries {
-            let path = entry.expect("read dir entry").path();
-            if path.is_dir() {
-                visit(&path, found);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                let text = fs::read_to_string(&path)
-                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-                collect_warning_code_literals(&text, found);
-            }
-        }
-    }
-
-    let crates = repo_root().join("crates");
-    let mut found = BTreeSet::new();
-    let entries =
-        fs::read_dir(&crates).unwrap_or_else(|error| panic!("read {}: {error}", crates.display()));
-    for entry in entries {
-        let src = entry.expect("read crate dir entry").path().join("src");
-        if src.is_dir() {
-            visit(&src, &mut found);
-        }
-    }
-    assert!(
-        !found.is_empty(),
-        "scanned {} and found no warning codes at all — the scan is broken, not the sources",
-        crates.display()
-    );
-    found
-}
-
-#[test]
-fn producer_warning_codes_match_the_workspace_sources() {
-    let declared: BTreeSet<String> = PRODUCER_WARNING_CODES
-        .iter()
-        .map(|code| (*code).to_string())
-        .collect();
-    assert_eq!(
-        scan_producer_warning_codes(),
-        declared,
-        "PRODUCER_WARNING_CODES is out of date with crates/*/src. Every warning \
-         code a producer emits must be classified into DEGRADED_SIGNAL_CODES, \
-         RERANK_FALLBACK_CODES, or ADVISORY_WARNING_CODES — an unclassified code \
-         reaches the eval gate and is silently tolerated as a valid measurement."
-    );
-}
-
+/// `warning_codes::ALL` is the one list of producer codes, so a new code fails
+/// here until it is classified into exactly one eval class.
 #[test]
 fn producer_warning_codes_are_classified_exactly_once() {
-    for code in PRODUCER_WARNING_CODES {
+    for &code in warning_codes::ALL {
         let mut classes = Vec::new();
         if DEGRADED_SIGNAL_CODES.contains(&code) {
             classes.push("degraded");

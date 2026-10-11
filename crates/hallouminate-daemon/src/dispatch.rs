@@ -42,6 +42,7 @@ use hallouminate_domain::corpus::{
     ensure_corpus_allows_file, first_corpus_root, list_corpus_files, pick_corpus, read_no_follow,
     resolve_read_root, safe_relative_path,
 };
+use hallouminate_domain::ground::warning_codes;
 use hallouminate_domain::ground::{
     Format, GroundMatch, GroundOpts, IndexedFiles, Inventory, RenderOpts, RootInventory, Warning,
     assemble_inventory, ground_union_inventoried, list_root_indexes, render, trim_snippets,
@@ -420,7 +421,12 @@ async fn corpus_inventory(
         #[cfg(test)]
         let coverage_probe = state.coverage_probe();
         #[cfg(test)]
+        coverage_probe.note_store_request();
+        let _permit = state.coverage_listing_gate().acquire().await;
+        #[cfg(test)]
         let _store_phase = coverage_probe.enter_store();
+        #[cfg(test)]
+        coverage_probe.wait_for_store_release().await;
         list_root_indexes(corpus_cfg, store).await
     };
     let (walked, listed) = tokio::join!(walking, listing);
@@ -466,7 +472,7 @@ fn count_covered(
     let mut indexed_sets = Vec::with_capacity(listed.len());
     for (_, indexed) in listed {
         match indexed {
-            IndexedFiles::Known(set) => indexed_sets.push(set),
+            IndexedFiles::Known(index) => indexed_sets.push(&index.files),
             IndexedFiles::Unknown => {
                 return Err(anyhow::anyhow!("the store cannot list its indexed files"));
             }
@@ -615,7 +621,7 @@ async fn request_inventory(
         request.inventory.extend(roots);
         match scan_timed_out {
             ScanTimedOut::Yes => request.scan_warnings.push(Warning {
-                code: "lexical-fallback-scan-timeout".to_string(),
+                code: warning_codes::LEXICAL_FALLBACK_SCAN_TIMEOUT.to_string(),
                 message: format!(
                     "indexable-file scan of corpus {} timed out after {} ms; skipping its lexical fallback",
                     corpus.name,
@@ -630,7 +636,7 @@ async fn request_inventory(
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| corpus.name.clone());
                 request.coverage_warnings.push(Warning {
-                    code: "index-coverage".to_string(),
+                    code: warning_codes::INDEX_COVERAGE.to_string(),
                     message: format!(
                         "index coverage {covered}/{total} files for {} at {root} — run `index` to build",
                         corpus.name
@@ -663,7 +669,7 @@ fn collect_recovery_warnings(
         .recovery_warnings_for(source, coverage_targets)
         .into_iter()
         .map(|(corpus, message)| Warning {
-            code: "index-reconciliation".to_string(),
+            code: warning_codes::INDEX_RECONCILIATION.to_string(),
             message: format!("{corpus}: {message}"),
         })
         .collect()
@@ -792,7 +798,7 @@ async fn handle_ground(
     };
     if crossencoder_unavailable {
         response.warnings.push(Warning {
-            code: "crossencoder-unavailable".to_string(),
+            code: warning_codes::CROSSENCODER_UNAVAILABLE.to_string(),
             message: "crossencoder unavailable; falling back to fusion-only ranking".to_string(),
         });
     }
@@ -805,7 +811,7 @@ async fn handle_ground(
     if union {
         for w in &layers.warnings {
             response.warnings.push(Warning {
-                code: "cross-repo-union".to_string(),
+                code: warning_codes::CROSS_REPO_UNION.to_string(),
                 message: w.clone(),
             });
         }
@@ -813,7 +819,7 @@ async fn handle_ground(
 
     for w in &layers.path_warnings {
         response.warnings.push(Warning {
-            code: "config-path-outside-repo".to_string(),
+            code: warning_codes::CONFIG_PATH_OUTSIDE_REPO.to_string(),
             message: w.clone(),
         });
     }
@@ -822,7 +828,7 @@ async fn handle_ground(
     response.warnings.extend(coverage_warnings);
     if registration_limit_reached {
         response.warnings.push(Warning {
-            code: "index-reconciliation".to_string(),
+            code: warning_codes::INDEX_RECONCILIATION.to_string(),
             message: format!(
                 "watcher registration limit reached for source {source}; one or more corpora are not watched"
             ),
@@ -1854,6 +1860,7 @@ pub(super) async fn catch_up_index(state: DaemonState) {
     // whole sweep so idle-exit defers until it finishes instead of tearing a
     // reindex mid-scan under a small `idle_exit_secs` (ADR-003).
     let _conn = state.enter_connection(WorkClass::Internal);
+    let _boot_flag = state.watch_registry().boot_catch_up_guard();
     let corpora = match state.baseline().effective_corpora() {
         Ok(c) => c,
         Err(e) => {
@@ -3570,6 +3577,7 @@ mod tests {
         .await;
         let gate = state.scan_cache().gate();
         let probe = state.coverage_probe();
+        probe.block_store();
         probe.block_walk();
         struct WalkReleaseGuard {
             probe: std::sync::Arc<crate::state::CoverageProbe>,
@@ -3579,6 +3587,7 @@ mod tests {
             fn release(&mut self) {
                 if !self.released {
                     self.probe.release_walk();
+                    self.probe.release_store();
                     self.released = true;
                 }
             }
@@ -3634,11 +3643,18 @@ mod tests {
         .await;
         assert_eq!(probe.active_walk(), MAX_CONCURRENT_COVERAGE_CHECKS);
         assert_eq!(probe.max_walk(), MAX_CONCURRENT_COVERAGE_CHECKS);
-        assert!(probe.max_store() > 0);
         for request in &requests {
             assert!(!request.is_finished());
         }
         assert_eq!(gate.available_permits(), 0);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while probe.requested_store() <= MAX_CONCURRENT_COVERAGE_CHECKS {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("every request must reach the store listing");
+        probe.release_store();
 
         requests[0].abort();
         let cancelled = requests
@@ -3657,6 +3673,8 @@ mod tests {
             assert_eq!(result.response.query, "content");
         }
         assert_eq!(gate.available_permits(), MAX_CONCURRENT_COVERAGE_CHECKS);
+        assert!(probe.max_store() > 0);
+        assert!(probe.max_store() <= MAX_CONCURRENT_COVERAGE_CHECKS);
     }
 
     /// WHY (#427 part 2): when a queried corpus's index trails its on-disk

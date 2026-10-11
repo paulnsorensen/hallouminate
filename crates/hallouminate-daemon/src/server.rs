@@ -162,6 +162,7 @@ async fn serve_with_config(
     {
         let sup = state.supervisor().clone();
         let factory_state = state.clone();
+        state.watch_registry().mark_boot_catch_up_running();
         sup.spawn(TaskName::CatchUp, move || {
             super::dispatch::catch_up_index(factory_state.clone())
         });
