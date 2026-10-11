@@ -16,7 +16,9 @@ pub use config::{
 pub use ground::{GroundArgs, cmd_ground, run_ground};
 pub use hallouminate_daemon::{CorpusReport, IndexReport};
 pub use hook::{HookArgs, cmd_hook_install, cmd_hook_uninstall};
-pub use index::{AD_HOC_CORPUS_NAME, IndexArgs, cmd_index, run_index, select_corpora};
+pub use index::{
+    AD_HOC_CORPUS_NAME, IndexArgs, cmd_index, run_index, run_index_background, select_corpora,
+};
 pub use init_repo::{InitRepoArgs, cmd_init_repo};
 pub use wiki::{WikiStatusArgs, cmd_wiki_status};
 
@@ -205,6 +207,10 @@ pub struct IndexCli {
     /// still index).
     #[arg(long)]
     pub strict: bool,
+    /// Queue the catch-up on the daemon and exit once it acknowledges,
+    /// without waiting for indexing to finish. Cannot combine with `--strict`.
+    #[arg(long)]
+    pub background: bool,
 }
 
 impl From<IndexCli> for IndexArgs {
@@ -215,6 +221,7 @@ impl From<IndexCli> for IndexArgs {
             config: cli.config,
             socket: cli.socket,
             strict: cli.strict,
+            background: cli.background,
         }
     }
 }

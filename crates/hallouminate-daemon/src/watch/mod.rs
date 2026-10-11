@@ -21,7 +21,7 @@
 //! `handle_add_markdown` take, so a watch-triggered reindex never races the
 //! daemon's own writes.
 
-mod registry;
+pub(crate) mod registry;
 
 pub(crate) use registry::{ConfigSource, WatchRegistry};
 
@@ -43,7 +43,7 @@ use hallouminate_domain::corpus::ensure_corpus_allows_relative;
 use super::churn::{ChurnTracker, ReindexEffect};
 use super::dispatch::index_single_file_with_content;
 use super::ladder::LadderOutcome;
-use super::state::{DaemonState, IdleClock, WorkClass};
+use super::state::{DaemonState, IdleClock, WorkClass, corpus_lock_keys, path_lock_keys};
 use registry::RegistrationId;
 use tokio_util::task::TaskTracker;
 
@@ -183,29 +183,52 @@ impl FailureCoalescer {
 /// Coalesces `reload_repo_layer` failures per repo-layer config path: an
 /// identical error logs once at `warn` and stays at `debug` on repeat, a
 /// changed error logs `warn` again, and a success after a recorded failure
-/// clears the entry so the caller can log a recovery transition.
-struct ReloadFailureMemo(HashMap<PathBuf, String>);
+/// clears the entry so the caller can log a recovery transition. Path
+/// warnings follow the same rule: an unchanged set stays at `debug`.
+struct ReloadFailureMemo {
+    failures: HashMap<PathBuf, String>,
+    path_warnings: HashMap<PathBuf, Vec<String>>,
+}
 
 impl ReloadFailureMemo {
     fn new() -> Self {
-        Self(HashMap::new())
+        Self {
+            failures: HashMap::new(),
+            path_warnings: HashMap::new(),
+        }
+    }
+
+    /// Records the `config-path-outside-repo` warnings last seen for `path`.
+    /// Returns `true` when the set differs from the previous reload, meaning
+    /// it should log at `warn`.
+    fn record_path_warnings(&mut self, path: &Path, warnings: &[String]) -> bool {
+        if warnings.is_empty() {
+            self.path_warnings.remove(path);
+            return false;
+        }
+        if self.path_warnings.get(path).map(Vec::as_slice) == Some(warnings) {
+            return false;
+        }
+        self.path_warnings
+            .insert(path.to_path_buf(), warnings.to_vec());
+        true
     }
 
     /// Records `path` failing with `error`. Returns `true` when this is a
     /// new failure (first occurrence or changed message) that should log at
     /// `warn`, `false` for a repeat that should stay at `debug`.
     fn record_failure(&mut self, path: &Path, error: &str) -> bool {
-        if self.0.get(path).map(String::as_str) == Some(error) {
+        if self.failures.get(path).map(String::as_str) == Some(error) {
             return false;
         }
-        self.0.insert(path.to_path_buf(), error.to_string());
+        self.failures.insert(path.to_path_buf(), error.to_string());
         true
     }
 
     /// Clears `path`'s failure record. Returns `true` when it had one,
     /// meaning this success is a recovery worth logging.
     fn record_success(&mut self, path: &Path) -> bool {
-        self.0.remove(path).is_some()
+        self.failures.remove(path).is_some()
     }
 }
 
@@ -265,8 +288,19 @@ fn reload_repo_layer(
             }
         }};
     }
-    let repo = match hallouminate_config::load_repo_layer(path) {
-        Ok(config) => config,
+    let allowed_outside = &state.baseline().security.allow_repo_paths_outside_root;
+    let repo = match hallouminate_config::load_repo_layer(path, allowed_outside) {
+        Ok((config, path_warnings)) => {
+            let changed = failures.record_path_warnings(path, &path_warnings);
+            for warning in path_warnings {
+                if changed {
+                    tracing::warn!(target: "hallouminate::daemon", path = %path.display(), code = "config-path-outside-repo", "{warning}");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", path = %path.display(), code = "config-path-outside-repo", "{warning}");
+                }
+            }
+            config
+        }
         Err(error) => {
             report_failure!(
                 error,
@@ -875,7 +909,8 @@ impl PumpState {
         state: &DaemonState,
         tracker: &TaskTracker,
     ) {
-        if let Some(id) = registry.begin_next_catch_up() {
+        let limit = state.baseline().watch.effective_catch_up_concurrency();
+        while let Some(id) = registry.begin_next_catch_up(limit) {
             spawn_registration_catch_up(state.clone(), id, tracker);
         }
     }
@@ -910,7 +945,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     return;
                 }
             }
-            let _guard = state.lock_corpus(&corpus.name).await;
+            let _guard = state.lock_corpus(&corpus_lock_keys(&corpus)).await;
             match state.resources_for(&cfg).await {
                 Ok(res) => {
                     let reg = state.make_registry();
@@ -920,7 +955,7 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                     // parked behind another writer's permit bails out as
                     // soon as shutdown is requested, instead of holding the
                     // corpus lock (and thus this task) open indefinitely.
-                    match super::dispatch::catch_up_corpus(&res, &reg, &corpus, || {
+                    match super::dispatch::catch_up_corpus(&res, &reg, &corpus, move || {
                         let lane_state = lane_state.clone();
                         let shutdown = shutdown.clone();
                         async move {
@@ -987,6 +1022,16 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
     });
 }
 
+/// What one `register_runtime_corpora` call did.
+pub(crate) struct RuntimeRegistration {
+    pub(crate) source: registry::ConfigSource,
+    /// True when the watcher registration limit left a corpus unwatched.
+    pub(crate) limit_reached: bool,
+    /// Corpora whose registration this call newly queued for a catch-up.
+    /// Corpora that were already registered unchanged are not listed.
+    pub(crate) queued: Vec<String>,
+}
+
 /// Derives this call's `ConfigSource` from `repo_path` (`None` means the
 /// boot baseline) and registers request-resolved corpora with the live
 /// watcher under that source.
@@ -995,12 +1040,13 @@ pub(crate) fn register_runtime_corpora(
     repo_path: Option<&std::path::Path>,
     corpora: &[CorpusConfig],
     cfg: &hallouminate_config::Config,
-) -> Result<(registry::ConfigSource, bool), String> {
+) -> Result<RuntimeRegistration, String> {
     let source = repo_path
         .map(|path| registry::ConfigSource::RepoLayer(path.to_path_buf()))
         .unwrap_or(registry::ConfigSource::Baseline);
     let cfg = std::sync::Arc::new(cfg.clone());
     let mut limit_reached = false;
+    let mut queued = Vec::new();
     for corpus in corpora {
         let roots = watch_roots_for(corpus);
         if state
@@ -1015,7 +1061,8 @@ pub(crate) fn register_runtime_corpora(
         {
             registry::RegisterOutcome::Conflict(message) => return Err(message),
             registry::RegisterOutcome::LimitReached => limit_reached = true,
-            registry::RegisterOutcome::New | registry::RegisterOutcome::AlreadyRegistered => {}
+            registry::RegisterOutcome::New => queued.push(corpus.name.clone()),
+            registry::RegisterOutcome::AlreadyRegistered => {}
         }
     }
     if limit_reached {
@@ -1025,7 +1072,11 @@ pub(crate) fn register_runtime_corpora(
             "watcher: registration limit reached; one or more corpora are not watched",
         );
     }
-    Ok((source, limit_reached))
+    Ok(RuntimeRegistration {
+        source,
+        limit_reached,
+        queued,
+    })
 }
 
 /// Builds the notify debouncer that reindexes changed markdown files: each
@@ -1533,7 +1584,8 @@ async fn handle_changed_path(
         );
         return false;
     }
-    let guard = match state.acquire_mutation_guard(&corpus.name).await {
+    let lock_keys = path_lock_keys(&corpus, path);
+    let guard = match state.acquire_mutation_guard(&lock_keys).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(target: "hallouminate::daemon", error = %e, "watcher: lock failed");
@@ -1799,6 +1851,20 @@ fn delete_file_ref(owner: &WatchRoot, path: &Path) -> hallouminate_domain::commo
 mod tests {
     use super::*;
     use hallouminate_domain::indexer::ChunkStore;
+
+    #[test]
+    fn path_warning_memo_warns_on_change_only() {
+        let mut memo = ReloadFailureMemo::new();
+        let path = Path::new("/repo/.hallouminate/config.toml");
+        let first = vec!["outside a".to_string()];
+        let second = vec!["outside a".to_string(), "outside b".to_string()];
+
+        assert!(memo.record_path_warnings(path, &first));
+        assert!(!memo.record_path_warnings(path, &first));
+        assert!(memo.record_path_warnings(path, &second));
+        assert!(!memo.record_path_warnings(path, &[]));
+        assert!(memo.record_path_warnings(path, &second));
+    }
 
     fn corpus(name: &str, root: &str, globs: &[&str]) -> CorpusConfig {
         CorpusConfig {
@@ -3352,6 +3418,51 @@ mod tests {
             u64::MAX,
             "delete-only watcher work must not reset the idle-exit window",
         );
+    }
+
+    /// `watch.catch_up_concurrency` from config must reach admission: with a
+    /// limit of two, one admission pass starts two queued roots together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admission_pass_honors_configured_catch_up_concurrency() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 0;
+        cfg.watch.catch_up_concurrency = Some(2);
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+
+        let mut corpora = Vec::new();
+        for name in ["alpha", "beta", "gamma"] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).expect("mkdir root");
+            let root = root.canonicalize().expect("canonicalize root");
+            corpora.push(corpus(name, root.to_str().unwrap(), &["**/*.md"]));
+        }
+        register_runtime_corpora(&state, None, &corpora, &cfg).expect("register corpora");
+
+        let tracker = TaskTracker::new();
+        let _write_lane = state
+            .acquire_write_lane()
+            .await
+            .expect("hold the write lane so admitted passes stay in flight");
+        PumpState::admit_next_catch_up(state.watch_registry(), &state, &tracker);
+
+        let mut in_flight = 0;
+        let mut queued = 0;
+        for (id, _) in state.watch_registry().snapshot_roots() {
+            match state.watch_registry().catch_up_state(&id) {
+                Some(registry::CatchUpState::InFlight) => in_flight += 1,
+                Some(registry::CatchUpState::Queued) => queued += 1,
+                Some(registry::CatchUpState::NotStarted)
+                | Some(registry::CatchUpState::Done)
+                | None => {}
+            }
+        }
+        assert_eq!(in_flight, 2, "a limit of two admits two roots at once");
+        assert_eq!(queued, 1, "the third root waits for a slot");
     }
 
     /// Drives `pump` twice against `state`, asserting one catch-up pass is
@@ -5270,7 +5381,7 @@ body
         let lane_state = state.clone();
         let shutdown = state.shutdown_token().clone();
         let task = tokio::spawn(async move {
-            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus_cfg, || {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus_cfg, move || {
                 let lane_state = lane_state.clone();
                 let shutdown = shutdown.clone();
                 async move {

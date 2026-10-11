@@ -12,10 +12,10 @@
 
 use crate::common::{CorpusKey, HallouminateError, Result};
 use crate::footnotes::{FootnoteMode, apply_footnote_mode};
-use crate::ground::Warning;
+use crate::ground::{Warning, warning_codes};
 use crate::indexer::SearchHit;
 
-use super::{ChunkRetrieval, FusedSearch, hit_tie_break_key};
+use super::{ChunkRetrieval, FusedSearch, RootHandle, hit_tie_break_key};
 
 /// Maximum length of a phrase-mode query, in Unicode scalar values.
 pub const MAX_PHRASE_CHARS: usize = 512;
@@ -105,10 +105,21 @@ pub async fn search_phrase(
     phrase: &str,
     limit: usize,
 ) -> Result<FusedSearch> {
+    search_phrase_in(store, corpus_key, phrase, limit, None).await
+}
+
+/// [`search_phrase`] with the handle of the root's already loaded file map.
+pub(crate) async fn search_phrase_in(
+    store: &dyn ChunkRetrieval,
+    corpus_key: &CorpusKey,
+    phrase: &str,
+    limit: usize,
+    handle: Option<&RootHandle>,
+) -> Result<FusedSearch> {
     validate_phrase(phrase).map_err(|error| HallouminateError::Search(error.to_string()))?;
     let needle = collapse_whitespace(&phrase.to_lowercase());
     let hits = store
-        .retrieve_phrase(corpus_key, &needle, MAX_PHRASE_SCAN_ROWS)
+        .retrieve_phrase_in(corpus_key, &needle, MAX_PHRASE_SCAN_ROWS, handle)
         .await?;
     let scanned = hits.len();
     let mut decorated = Vec::with_capacity(scanned);
@@ -135,6 +146,7 @@ pub async fn search_phrase(
     Ok(FusedSearch {
         hits: ranked,
         warnings,
+        unpooled_files: None,
     })
 }
 
@@ -157,7 +169,7 @@ fn truncation_warning(
         return None;
     };
     Some(Warning {
-        code: "phrase-truncated".to_string(),
+        code: warning_codes::PHRASE_TRUNCATED.to_string(),
         message,
     })
 }

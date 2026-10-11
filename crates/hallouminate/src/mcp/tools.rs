@@ -811,8 +811,11 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), repo-local pages ranked first; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. Inspect `index-coverage` and `index-reconciliation` warnings for the selected corpus before treating zero hits as absence. Incomplete retrieval does not establish missing knowledge; foreign-corpus hits do not establish selected-corpus coverage. Complete file coverage does not prove freshness or reconciliation completion. Keep the original `cwd` and selected `corpus` fixed during recovery. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set. Set `match: \"phrase\"` to return every chunk whose body text contains the whole query as a case-insensitive literal substring, ranked by occurrence count; a `phrase-truncated` warning means that more chunks matched than the response holds. Set `group_by: \"page\"` to return one entry per PDF page with its `chunk_count`. Set `output: \"counts\"` with `match: \"phrase\"` to get each matched file's `coverage: {chunks, pages}` without snippets, summaries, or the file cap of `top_files`; at most 2000 files are listed, and a `counts-truncated` warning means more files matched.",
+        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), repo-local pages ranked first; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. A cold or never-indexed corpus makes the first `ground` wait for the first reconciliation, up to `search.cold_wait_ms` (default 10000 ms, maximum 60000 ms; first reconciliation only). Every ranked `ground` (not `match: \"phrase\"`) also runs a lexical line-window scan of the files that the indexer selects but that have no indexed rows, whether the wait ended before the index was ready or the index lacks those files. A fallback hit has a `chunk_id` that starts with `lexical-fallback:`, an empty `heading_path`, and `score` 0; its `stale` flag does not report index freshness because the hit reads the live file. Fallback warning codes: `lexical-fallback` (fallback results returned), `lexical-fallback-truncated` (more than 1000 unindexed files; some were not searched), `lexical-fallback-timeout` and `lexical-fallback-scan-timeout` (scan ran out of time), `lexical-fallback-failed` (scan failed). Other warning codes: `config-path-outside-repo` (a configured path outside the repository root was skipped), `index-coverage` (fewer files are indexed than the corpus selects), `index-reconciliation` (reconciliation is pending, failed, degraded, or not watched), `cross-repo-union` (a union search resolved a name collision between repositories), `crossencoder-unavailable` and `rerank-timeout` (the reranker was unavailable or timed out; ranking fell back to fusion order), `ripgrep-failed` and `ripgrep-timeout` (the ripgrep pass failed or timed out; ranking continued without its signal), `ripgrep-unresolved` (ripgrep hits resolved to no indexed chunk), and `ripgrep-unparseable` (ripgrep output could not be parsed). Inspect `index-coverage`, `index-reconciliation`, and every `lexical-fallback*` warning for the selected corpus before treating zero or fallback hits as absence. Incomplete retrieval does not establish missing knowledge; foreign-corpus hits do not establish selected-corpus coverage. Complete file coverage does not prove freshness or reconciliation completion. Keep the original `cwd` and selected `corpus` fixed during recovery. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set. Set `match: \"phrase\"` to return every chunk whose body text contains the whole query as a case-insensitive literal substring, ranked by occurrence count; a `phrase-truncated` warning means that more chunks matched than the response holds. Set `group_by: \"page\"` to return one entry per PDF page with its `chunk_count`. Set `output: \"counts\"` with `match: \"phrase\"` to get each matched file's `coverage: {chunks, pages}` without snippets, summaries, or the file cap of `top_files`; at most 2000 files are listed, and a `counts-truncated` warning means more files matched.",
         annotations(
+            // A queued catch-up refreshes only the server's own index, so the
+            // tool stays read-only for hosts (Codex skips its approval prompt
+            // only for read-only tools).
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -867,6 +870,7 @@ impl HallouminateTools {
                 corpus: params.corpus,
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         };
         let report: hallouminate_daemon::IndexReport =
@@ -877,8 +881,11 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing `cwd` when `corpus` is omitted.",
+        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing `cwd` when `corpus` is omitted. `structuredContent.warnings` (omitted when empty) lists non-fatal notes such as `index-registration-conflict`; `content` repeats each one as a trailing `warning:` line. The call never changes user data. It can queue background indexing for an unregistered checkout, which refreshes only the server's own index, so `read_only_hint` is true and `idempotent_hint` is true.",
         annotations(
+            // A queued catch-up refreshes only the server's own index, so the
+            // tool stays read-only for hosts (Codex skips its approval prompt
+            // only for read-only tools).
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -899,6 +906,9 @@ impl HallouminateTools {
         let result: ListTreeResult = client.call(req).await.map_err(map_daemon_err)?;
         let mut outline = String::new();
         render_tree_outline(&result.root, 0, &mut outline);
+        for warning in &result.warnings {
+            outline.push_str(&format!("warning: {warning}\n"));
+        }
         let structured = to_structured(&result)?;
         Ok(tool_ok(outline, structured))
     }
@@ -1040,10 +1050,17 @@ impl HallouminateTools {
                       total chunk row count, the newest index timestamp (ms since epoch, null when \
                       the corpus has never been indexed), and how many on-disk files matching the \
                       corpus globs have not yet been indexed. It also reports advisory warnings for \
-                      zero-match include and exclude patterns. Corpus selection follows the same \
-                      default resolution as `list_files`. `structuredContent` is \
+                      zero-match include and exclude patterns and for registration conflicts \
+                      such as `index-registration-conflict`. Corpus selection follows the same \
+                      default resolution as `list_files`. It never waits for the cold-start \
+                      reconciliation. The call never changes user data. It can queue background \
+                      indexing for an unregistered checkout, which refreshes only the server's own index, so `read_only_hint` is true and \
+                      `idempotent_hint` is true. `structuredContent` is \
                       { corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files, warnings }.",
         annotations(
+            // A queued catch-up refreshes only the server's own index, so the
+            // tool stays read-only for hosts (Codex skips its approval prompt
+            // only for read-only tools).
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -1295,6 +1312,10 @@ mod tests {
     //! code each error variant maps to so a future refactor of the
     //! daemon's `ErrorKind` would have to deliberately update the test.
 
+    use std::collections::BTreeSet;
+
+    use hallouminate_domain::ground::warning_codes;
+
     use super::*;
 
     #[test]
@@ -1524,5 +1545,55 @@ mod tests {
             .description
             .expect("index tool has a description");
         assert!(description.contains(&cap), "{description}");
+    }
+
+    /// Backticked kebab-case tokens (`two-or-more-words`) in `text`.
+    fn backticked_kebab_tokens(text: &str) -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        for (index, span) in text.split('`').enumerate() {
+            let is_code_span = index % 2 == 1;
+            let is_kebab = span.contains('-')
+                && span
+                    .split('-')
+                    .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_lowercase()));
+            if is_code_span && is_kebab {
+                found.insert(span.to_string());
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn ground_description_documents_every_warning_code() {
+        let description = HallouminateTools::ground_tool_attr()
+            .description
+            .expect("ground tool has a description");
+        let documented = backticked_kebab_tokens(&description);
+        let known: BTreeSet<String> = warning_codes::ALL
+            .iter()
+            .map(|code| (*code).to_string())
+            .collect();
+        assert_eq!(
+            documented, known,
+            "ground description drifted from warning_codes::ALL"
+        );
+    }
+
+    #[test]
+    fn wiki_query_skill_lists_only_known_warning_codes() {
+        let skill = include_str!("../../../../plugins/hallouminate/skills/wiki-query/SKILL.md");
+        let warning_lines = skill
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("warning"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let named = backticked_kebab_tokens(&warning_lines);
+        assert!(!named.is_empty(), "SKILL.md names no warning codes");
+        for code in &named {
+            assert!(
+                warning_codes::ALL.contains(&code.as_str()),
+                "SKILL.md names unknown warning code `{code}`"
+            );
+        }
     }
 }

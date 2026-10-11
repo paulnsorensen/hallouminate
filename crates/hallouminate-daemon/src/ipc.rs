@@ -123,6 +123,11 @@ pub struct IndexRequest {
     /// that omit the field keep the lenient behavior.
     #[serde(default)]
     pub strict: bool,
+    /// Register the cwd's corpora and queue their catch-up, then return
+    /// before the catch-up finishes. Defaults to `false` so older clients
+    /// keep the synchronous run.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -384,6 +389,10 @@ pub type ListFilesResult = Vec<FileEntry>;
 pub struct ListTreeResult {
     pub corpus: String,
     pub root: TreeNode,
+    /// Non-fatal notes such as `index-registration-conflict`. Omitted when
+    /// empty, so replies from older daemons still decode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `ListCorpora` payload alias — daemon emits an array of [`CorpusEntry`].

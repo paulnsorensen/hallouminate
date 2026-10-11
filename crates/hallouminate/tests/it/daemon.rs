@@ -1315,6 +1315,7 @@ ground_dir = "{g}"
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
                 strict: false,
+                background: false,
             }),
         })
         .await
@@ -2981,6 +2982,7 @@ async fn index_corpus_through_ipc(
                     corpus: Some(corpus.into()),
                     paths_from: None,
                     strict: false,
+                    background: false,
                 }),
             })
             .await
@@ -3274,6 +3276,74 @@ async fn daemon_ground_isolates_same_name_corpus_by_request_cwd_root() {
 
     assert_ground_result_wire_shape(&result_a_wire);
     assert_ground_result_wire_shape(&result_b_wire);
+}
+
+#[tokio::test]
+async fn daemon_ground_skips_repo_layer_corpus_outside_repo_root_with_warning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo = tmp.path().join("repo");
+    let local_docs = repo.join("docs");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&local_docs).expect("mkdir repo docs");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::fs::write(
+        local_docs.join("local.md"),
+        "# Local\n\nrepoconfinementquery local page.\n",
+    )
+    .expect("write local doc");
+    std::fs::write(
+        outside.join("secret.md"),
+        "# Secret\n\nrepoconfinementquery secretoutsidemarker.\n",
+    )
+    .expect("write outside doc");
+    let cwd = repo_override_cwd(
+        &repo,
+        &format!(
+            "[[corpus]]\nname = \"local\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n\n\
+             [[corpus]]\nname = \"hostile\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            outside.display()
+        ),
+    );
+
+    let harness = DaemonHarness::spawn(cfg_request_scoped_corpora(&ground)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let wire = daemon_ok_payload(
+        client
+            .call_raw(DaemonRequest {
+                cwd: cwd.clone(),
+                payload: DaemonRequestPayload::Ground(GroundRequest {
+                    query: "repoconfinementquery".into(),
+                    corpus: None,
+                    top_files: Some(10),
+                    chunks_per_file: Some(3),
+                    limit: Some(50),
+                    snippet_chars: None,
+                    footnote_mode: Default::default(),
+                    match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
+                }),
+            })
+            .await
+            .expect("ground through daemon IPC"),
+        "ground",
+    );
+    let result: GroundResult = serde_json::from_value(wire).expect("decode ground result");
+
+    let mut codes = Vec::new();
+    for warning in &result.response.warnings {
+        codes.push(warning.code.as_str());
+    }
+    assert!(
+        codes.contains(&"config-path-outside-repo"),
+        "missing outside-repo warning: {:?}",
+        result.response.warnings
+    );
+    for (path, doc) in &result.response.docs {
+        assert!(!path.contains("secret.md"), "outside file leaked: {path}");
+        assert_ne!(doc.corpus, "hostile");
+    }
 }
 
 /// Build a daemon config with one explicit corpus that has TWO roots, plus a
@@ -4019,6 +4089,7 @@ async fn index_skips_missing_corpus_root_and_indexes_the_rest() {
                 corpus: None,
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         })
         .await
@@ -4081,6 +4152,7 @@ async fn index_strict_aborts_on_missing_corpus_root() {
                 corpus: None,
                 paths_from: None,
                 strict: true,
+                background: false,
             }),
         })
         .await
@@ -4106,7 +4178,7 @@ async fn index_strict_aborts_on_missing_corpus_root() {
 /// Build a single-corpus daemon config with embeddings disabled.
 fn cfg_stale_corpus(ground: &Path, corpus_root: &Path) -> Config {
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n",
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n\n[search]\ncold_wait_ms = 0\n",
         c = corpus_root.display(),
         g = ground.display(),
     );
@@ -4147,6 +4219,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 corpus: Some("docs".into()),
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         })
         .await
@@ -4272,6 +4345,7 @@ async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queri
                 corpus: Some("docs".into()),
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         })
         .await

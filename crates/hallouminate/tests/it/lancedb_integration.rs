@@ -44,6 +44,10 @@ async fn re_index_with_fewer_chunks_drops_orphaned_ords() {
         .apply_batch(vec![three])
         .await
         .expect("apply 3 chunks");
+    store
+        .delete_orphan_content()
+        .await
+        .expect("collect orphans");
     assert_eq!(
         store.count_rows().await.unwrap(),
         3,
@@ -68,6 +72,10 @@ async fn delete_file_removes_all_chunks_for_that_file_only() {
         .delete_file(&corpus_key, "/tmp/a.md")
         .await
         .expect("delete /tmp/a.md");
+    store
+        .delete_orphan_content()
+        .await
+        .expect("collect orphans");
     assert_eq!(
         store.count_rows().await.unwrap(),
         2,
@@ -296,6 +304,10 @@ async fn file_ref_with_apostrophes_round_trips_through_apply_and_delete() {
         .delete_file(&corpus_key, weird)
         .await
         .expect("delete weird");
+    store
+        .delete_orphan_content()
+        .await
+        .expect("collect orphans");
     assert_eq!(store.count_rows().await.unwrap(), 0);
 }
 
@@ -367,6 +379,10 @@ async fn same_file_ref_in_two_corpora_keeps_independent_rows() {
         .delete_file(&alpha, shared)
         .await
         .expect("delete alpha row");
+    store
+        .delete_orphan_content()
+        .await
+        .expect("collect orphans");
     assert_eq!(store.count_rows().await.unwrap(), 1);
     let beta = store.list_files(&beta).await.unwrap();
     assert!(beta.iter().any(|s| s.file_ref == shared));

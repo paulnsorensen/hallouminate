@@ -176,6 +176,77 @@ fn codex_plugin_manifest_declares_bundled_components() {
 }
 
 #[test]
+fn session_start_hook_runs_background_index_and_always_exits_zero() {
+    let hooks = read_json("plugins/hallouminate/hooks/hooks.json");
+    let events = hooks
+        .pointer("/hooks")
+        .and_then(|v| v.as_object())
+        .expect("hooks.json must wrap events in a top-level `hooks` object");
+    assert_eq!(
+        events.keys().collect::<Vec<_>>(),
+        ["SessionStart"],
+        "the pack declares only the SessionStart event"
+    );
+    let groups = events["SessionStart"].as_array().expect("group array");
+    assert_eq!(groups.len(), 1, "exactly one SessionStart group");
+    let handlers = groups[0]["hooks"].as_array().expect("handler array");
+    assert_eq!(
+        groups[0]["matcher"], "startup|resume",
+        "hook must skip clear and compact sources"
+    );
+    assert_eq!(handlers.len(), 1, "exactly one SessionStart handler");
+    assert_eq!(handlers[0]["type"], "command");
+    let timeout = handlers[0]["timeout"].as_u64().expect("numeric timeout");
+    assert!(
+        (1..=30).contains(&timeout),
+        "hook must stay short: {timeout}"
+    );
+    let command = handlers[0]["command"].as_str().expect("command string");
+    assert!(
+        command.contains("hallouminate index --background"),
+        "{command}"
+    );
+
+    let codex = read_json("plugins/hallouminate/.codex-plugin/plugin.json");
+    assert_eq!(
+        str_at(&codex, "/hooks", "codex plugin.json"),
+        "./hooks/hooks.json",
+        "codex plugin must reference the shared hook file"
+    );
+
+    let empty = tempfile::tempdir().expect("tempdir");
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", command])
+        .env("PATH", empty.path())
+        .status()
+        .expect("run hook command");
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "hook must exit 0 when hallouminate is missing"
+    );
+
+    let bin = tempfile::tempdir().expect("tempdir");
+    let fake = bin.path().join("hallouminate");
+    std::fs::write(&fake, "#!/bin/sh\nsleep 5\n").expect("write fake binary");
+    std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod fake binary");
+    let path = format!("{}:/usr/bin:/bin", bin.path().display());
+    let started = std::time::Instant::now();
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", command])
+        .env("PATH", path)
+        .status()
+        .expect("run hook command");
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "hook must detach the index command: {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
 fn copilot_plugin_manifest_declares_bundled_components() {
     let copilot = read_json("plugins/hallouminate/plugin.json");
     assert_eq!(

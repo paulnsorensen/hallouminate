@@ -229,10 +229,10 @@ async fn a_failed_catch_up_pass_indexes_once_the_root_is_readable_and_reconciled
     harness.shutdown().await.expect("daemon shutdown");
 }
 
-// ── AC-7: non-ground reads never enqueue catch-up ─────────────────────────
+// ── AC-7/AC-12: only ground, corpus_stats and list_tree enqueue catch-up ──
 
 #[tokio::test]
-async fn non_ground_reads_do_not_enqueue_catch_up() {
+async fn corpus_stats_enqueues_catch_up_after_read_only_calls() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground_dir = tmp.path().join("ground");
     let repo_root = tmp.path().join("worktree");
@@ -250,7 +250,6 @@ async fn non_ground_reads_do_not_enqueue_catch_up() {
         })
         .await
         .expect("list_files call");
-    let _stats = corpus_stats(&client, &repo_root).await;
     let _read: serde_json::Value = client
         .call(DaemonRequest {
             cwd: repo_root.to_path_buf(),
@@ -262,13 +261,22 @@ async fn non_ground_reads_do_not_enqueue_catch_up() {
         .await
         .expect("read_markdown call");
 
-    // A short grace period for a wrongly-enqueued pass to have run.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let stats = corpus_stats(&client, &repo_root).await;
-    assert_eq!(
-        stats.indexed_files, 0,
-        "list_files/corpus_stats/read_markdown must never enqueue catch-up"
-    );
+    // The registry-level proof that list_files and read_markdown create no
+    // registration lives in the daemon's dispatch tests, which can read the
+    // registry. Over the wire the only observable is that a trigger call
+    // (`corpus_stats`) eventually indexes the file.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let stats = corpus_stats(&client, &repo_root).await;
+        if stats.indexed_files == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "corpus_stats must enqueue catch-up that indexes the seeded file"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     harness.shutdown().await.expect("daemon shutdown");
 }

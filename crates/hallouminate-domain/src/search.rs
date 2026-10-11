@@ -25,15 +25,18 @@
 
 pub mod crossencoder;
 pub mod fuse;
+mod lexical_fallback;
 pub mod phrase;
 pub mod ripgrep;
 pub mod terms;
 
-use std::collections::HashMap;
+use std::any::Any;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::common::{CorpusKey, Result};
-use crate::ground::Warning;
+use crate::common::{CorpusKey, FileRef, Result};
+use crate::ground::{Warning, warning_codes};
 use crate::indexer::{SearchHit, SignalLists};
 use async_trait::async_trait;
 use fuse::{RankedList, fuse};
@@ -74,6 +77,37 @@ pub const RIPGREP_WEIGHT: f32 = 0.5;
 /// literal signals are weighted together and for the same reason.
 pub const CONTAINS_WEIGHT: f32 = 0.5;
 
+/// An opaque, store-owned view of one root's file map, loaded once per
+/// request. The store that made it downcasts it back; no other code reads it.
+#[derive(Clone)]
+pub struct RootHandle(Arc<dyn Any + Send + Sync>);
+
+impl RootHandle {
+    /// Wraps a store-owned value.
+    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+
+    /// Returns the wrapped value when it has type `T`.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for RootHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RootHandle(..)")
+    }
+}
+
+/// One root's indexed files plus the store's optional handle on the same
+/// read.
+#[derive(Debug, Clone)]
+pub struct RootIndex {
+    pub files: Arc<HashSet<FileRef>>,
+    pub handle: Option<RootHandle>,
+}
+
 /// Storage-agnostic port for chunk retrieval (ranking-time reads).
 ///
 /// Split from `ChunkStore` so the ranking path can depend on retrieval
@@ -104,6 +138,58 @@ pub trait ChunkRetrieval: Send + Sync {
         phrase: &str,
         limit: usize,
     ) -> Result<Vec<SearchHit>>;
+
+    /// Lists the `file_ref` of every file that has indexed rows under
+    /// `corpus_key`'s root.
+    ///
+    /// `None` means the store cannot tell. [`lexical_fallback_search`] then
+    /// returns no hits, because it cannot know which files the index
+    /// already covers.
+    async fn indexed_file_refs(&self, _corpus_key: &CorpusKey) -> Result<Option<HashSet<FileRef>>> {
+        Ok(None)
+    }
+
+    /// Reads the root's file map once: the indexed files plus an optional
+    /// handle that [`retrieve_signals_in`] and [`retrieve_phrase_in`] reuse
+    /// instead of reading the map again. `None` means the store cannot tell.
+    ///
+    /// [`retrieve_signals_in`]: ChunkRetrieval::retrieve_signals_in
+    /// [`retrieve_phrase_in`]: ChunkRetrieval::retrieve_phrase_in
+    async fn load_root_index(&self, corpus_key: &CorpusKey) -> Result<Option<RootIndex>> {
+        let Some(files) = self.indexed_file_refs(corpus_key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(RootIndex {
+            files: Arc::new(files),
+            handle: None,
+        }))
+    }
+
+    /// [`retrieve_signals`](ChunkRetrieval::retrieve_signals) with the handle
+    /// from [`load_root_index`](ChunkRetrieval::load_root_index), when the
+    /// caller has one.
+    async fn retrieve_signals_in(
+        &self,
+        corpus_key: &CorpusKey,
+        query: &str,
+        limit: usize,
+        _handle: Option<&RootHandle>,
+    ) -> Result<SignalLists> {
+        self.retrieve_signals(corpus_key, query, limit).await
+    }
+
+    /// [`retrieve_phrase`](ChunkRetrieval::retrieve_phrase) with the handle
+    /// from [`load_root_index`](ChunkRetrieval::load_root_index), when the
+    /// caller has one.
+    async fn retrieve_phrase_in(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+        _handle: Option<&RootHandle>,
+    ) -> Result<Vec<SearchHit>> {
+        self.retrieve_phrase(corpus_key, phrase, limit).await
+    }
 }
 
 /// Outcome of [`search_fused`]: the fused hits plus any warnings raised
@@ -112,9 +198,14 @@ pub trait ChunkRetrieval: Send + Sync {
 /// The `ripgrep-unresolved` warning retains the hit count and corpus root.
 /// It also reports `dropped_file_not_in_pool`, `dropped_line_out_of_range`,
 /// and `truncated` from the same ripgrep resolver pass.
+#[derive(Default)]
 pub struct FusedSearch {
     pub hits: Vec<SearchHit>,
     pub warnings: Vec<Warning>,
+    /// Files whose ripgrep hits missed the retrieval pool, set only when the
+    /// `ripgrep-unresolved` warning has no other cause. A lexical fallback
+    /// that covers every file here makes that warning stale.
+    pub(crate) unpooled_files: Option<BTreeSet<String>>,
 }
 
 /// Retrieve, rank and return chunk hits for `query`.
@@ -132,14 +223,28 @@ pub async fn search_fused(
     globs: &[String],
     limit: usize,
 ) -> Result<FusedSearch> {
+    let root = store.load_root_index(corpus_key).await.ok().flatten();
+    let (indexed, handle) = match &root {
+        Some(RootIndex { files, handle }) => (Some(files.as_ref()), handle.as_ref()),
+        None => (None, None),
+    };
+    search_fused_indexed(store, corpus_key, query, globs, limit, indexed, handle).await
+}
+
+/// [`search_fused`] with the root's indexed-file membership supplied by the
+/// caller, so one `indexed_file_refs` read serves both the cold-root skip
+/// and the lexical fallback. `handle` is the same read's store handle.
+pub(crate) async fn search_fused_indexed(
+    store: &dyn ChunkRetrieval,
+    corpus_key: &CorpusKey,
+    query: &str,
+    globs: &[String],
+    limit: usize,
+    indexed: Option<&HashSet<FileRef>>,
+    handle: Option<&RootHandle>,
+) -> Result<FusedSearch> {
     let terms = cap_terms(split_terms(query));
     let mut warnings = Vec::new();
-    // Bound on the rg subprocess. The `max_hits` truncation only fires when
-    // matches are plentiful; a sparse-or-empty match still forces rg to walk
-    // the whole corpus root under `--sort path`'s single traversal thread.
-    // This deadline caps that worst case instead of letting a rare query
-    // stall Ground on however long the corpus takes to walk exhaustively.
-    const RIPGREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
     let root = corpus_key.canonical_root.to_string_lossy().into_owned();
     let roots = [root];
     // Bound on total rg hits collected. Hits are pool-gated downstream by
@@ -153,19 +258,38 @@ pub async fn search_fused(
     // a term first appearing past that cap is missed regardless of this total.
     let rg_budget = limit;
 
-    let signals_fut = store.retrieve_signals(corpus_key, query, limit);
+    let signals_fut = store.retrieve_signals_in(corpus_key, query, limit, handle);
     let rg_fut = tokio::time::timeout(
         RIPGREP_TIMEOUT,
         ripgrep::run(&roots, &terms, globs, rg_budget),
     );
-    let (signals_res, rg_res) = tokio::join!(signals_fut, rg_fut);
-
-    let signals = signals_res?;
+    tokio::pin!(signals_fut);
+    tokio::pin!(rg_fut);
+    let mut rg_done = None;
+    let signals = loop {
+        tokio::select! {
+            signals_res = &mut signals_fut => break signals_res?,
+            rg_res = &mut rg_fut, if rg_done.is_none() => rg_done = Some(rg_res),
+        }
+    };
+    let rg_res = match rg_done {
+        Some(rg_res) => rg_res,
+        None => {
+            // A cold root (empty pool, no indexed files) leaves ripgrep
+            // nothing to rank, so its pass is dropped. The lexical
+            // fallback owns that root.
+            if signals.hits.is_empty() && indexed.is_some_and(HashSet::is_empty) {
+                return Ok(FusedSearch::default());
+            }
+            rg_fut.await
+        }
+    };
     if signals.hits.is_empty() {
         let _ = resolve_rg_run(rg_res, RIPGREP_TIMEOUT, &mut warnings);
         return Ok(FusedSearch {
             hits: Vec::new(),
             warnings,
+            unpooled_files: None,
         });
     }
     let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) =
@@ -186,7 +310,15 @@ pub async fn search_fused(
         elapsed_ms = rg_elapsed_ms,
         "ripgrep signal resolved"
     );
+    let mut unpooled_files = None;
     if !rg_hits.is_empty() && resolved_chunks == 0 {
+        if rg_stats.dropped_line_out_of_range == 0 {
+            let mut files = BTreeSet::new();
+            for rg_hit in &rg_hits {
+                files.insert(rg_hit.file_ref.clone());
+            }
+            unpooled_files = Some(files);
+        }
         tracing::warn!(
             target: "hallouminate::search",
             rg_hits = rg_hits.len(),
@@ -195,7 +327,7 @@ pub async fn search_fused(
             "ripgrep signal produced hits but resolved to zero chunks"
         );
         warnings.push(Warning {
-            code: "ripgrep-unresolved".to_string(),
+            code: warning_codes::RIPGREP_UNRESOLVED.to_string(),
             message: format!(
                 "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}; dropped_file_not_in_pool={}, dropped_line_out_of_range={}, truncated={}",
                 rg_hits.len(),
@@ -214,7 +346,7 @@ pub async fn search_fused(
             "ripgrep produced unparseable match events; the rg output schema may have changed"
         );
         warnings.push(Warning {
-            code: "ripgrep-unparseable".to_string(),
+            code: warning_codes::RIPGREP_UNPARSEABLE.to_string(),
             message: format!(
                 "ripgrep produced {} unparseable match events in corpus root {}",
                 rg_unparseable,
@@ -271,7 +403,160 @@ pub async fn search_fused(
     Ok(FusedSearch {
         hits: ranked,
         warnings,
+        unpooled_files,
     })
+}
+
+/// Bound on the rg subprocess. The `max_hits` truncation only fires when
+/// matches are plentiful; a sparse-or-empty match still forces rg to walk
+/// every path under `--sort path`'s single traversal thread. This deadline
+/// caps that worst case instead of letting a rare query stall Ground on
+/// however long the corpus takes to walk exhaustively.
+const RIPGREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Most files one lexical fallback pass hands to ripgrep as explicit paths.
+const FALLBACK_MAX_FILES: usize = 1_000;
+
+/// Searches the files that the indexer would index for `corpus_key` but
+/// that have no indexed rows, and returns ripgrep line-window hits.
+///
+/// `eligible` lists the files the indexer scan selects for this corpus key.
+/// It carries the include, exclude, and nested-root rules, so this pass
+/// never admits a file the indexer would skip. `indexed` lists the files
+/// that have indexed rows; the caller reads it once per root. Ripgrep
+/// searches only the unindexed files, so indexed files cannot starve them
+/// of the hit budget. The hits carry `score` `0.0`; rank them with
+/// [`rank_after`].
+///
+/// `None` for `indexed` means the store cannot list its indexed files, and
+/// the pass yields no hits.
+pub async fn lexical_fallback_search(
+    corpus_key: &CorpusKey,
+    query: &str,
+    eligible: &HashSet<FileRef>,
+    indexed: Option<&HashSet<FileRef>>,
+    limit: usize,
+) -> FusedSearch {
+    let mut warnings = Vec::new();
+    let terms = cap_terms(split_terms(query));
+    let Some(indexed) = indexed else {
+        return FusedSearch::default();
+    };
+    if eligible.is_empty() || terms.is_empty() {
+        return FusedSearch::default();
+    }
+    let (candidates, dropped) = unindexed_candidates(eligible, indexed);
+    if candidates.is_empty() {
+        return FusedSearch::default();
+    }
+    let root = corpus_key.canonical_root.display();
+    if dropped > 0 {
+        warnings.push(Warning {
+            code: warning_codes::LEXICAL_FALLBACK_TRUNCATED.to_string(),
+            message: format!(
+                "{dropped} unindexed file(s) in corpus root {root} were not searched; the lexical fallback covers {FALLBACK_MAX_FILES} files per query"
+            ),
+        });
+    }
+    let budget = limit.saturating_mul(terms.len());
+    let mut rg_paths = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        rg_paths.push(candidate.as_path().to_string_lossy().into_owned());
+    }
+    let rg_res = tokio::time::timeout(
+        RIPGREP_TIMEOUT,
+        ripgrep::run(&rg_paths, &terms, &[], budget),
+    )
+    .await;
+    let rg_hits = match rg_res {
+        Ok(Ok(run)) => run.hits,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "hallouminate::search", err = %error, "lexical fallback ripgrep pass failed");
+            warnings.push(Warning {
+                code: warning_codes::LEXICAL_FALLBACK_FAILED.to_string(),
+                message: format!(
+                    "lexical fallback ripgrep pass failed in corpus root {root} ({error}); unindexed files were not searched"
+                ),
+            });
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(target: "hallouminate::search", "lexical fallback ripgrep pass timed out");
+            warnings.push(Warning {
+                code: warning_codes::LEXICAL_FALLBACK_TIMEOUT.to_string(),
+                message: format!(
+                    "lexical fallback ripgrep pass timed out after {} ms in corpus root {root}; unindexed files were not searched",
+                    RIPGREP_TIMEOUT.as_millis()
+                ),
+            });
+            Vec::new()
+        }
+    };
+    let mut candidate_paths: HashSet<&Path> = HashSet::with_capacity(candidates.len());
+    for candidate in &candidates {
+        candidate_paths.insert(candidate.as_path());
+    }
+    let mut scoped_hits = Vec::with_capacity(rg_hits.len());
+    for rg_hit in rg_hits {
+        if candidate_paths.contains(Path::new(&rg_hit.file_ref)) {
+            scoped_hits.push(rg_hit);
+        }
+    }
+    let hits = lexical_fallback::line_window_hits(corpus_key, &scoped_hits, limit).await;
+    if !hits.is_empty() {
+        warnings.push(Warning {
+            code: warning_codes::LEXICAL_FALLBACK.to_string(),
+            message: format!(
+                "{} file(s) in corpus root {root} have no indexed rows; returning ripgrep line-window hits ranked after indexed hits",
+                hits.len()
+            ),
+        });
+    }
+    FusedSearch {
+        hits,
+        warnings,
+        unpooled_files: None,
+    }
+}
+
+/// Eligible files with no indexed rows, sorted and capped at
+/// [`FALLBACK_MAX_FILES`], plus the count the cap dropped.
+///
+/// An empty result means the index covers every eligible file, so the
+/// caller skips ripgrep and reads no file.
+fn unindexed_candidates(
+    eligible: &HashSet<FileRef>,
+    indexed: &HashSet<FileRef>,
+) -> (Vec<FileRef>, usize) {
+    let mut candidates: Vec<FileRef> = Vec::new();
+    for file_ref in eligible {
+        if !indexed.contains(file_ref) {
+            candidates.push(file_ref.clone());
+        }
+    }
+    candidates.sort_by(|a, b| a.as_path().as_os_str().cmp(b.as_path().as_os_str()));
+    let dropped = candidates.len().saturating_sub(FALLBACK_MAX_FILES);
+    candidates.truncate(FALLBACK_MAX_FILES);
+    (candidates, dropped)
+}
+
+/// Scores `fallback` hits strictly below every hit in `fused`, in list order.
+///
+/// Call it after reranking and after the cross-corpus merge, so no
+/// fallback hit can outrank a fused hit from any corpus.
+pub fn rank_after(fallback: &mut [SearchHit], fused: &[SearchHit]) {
+    let mut floor = RIPGREP_WEIGHT / RRF_K;
+    for hit in fused {
+        floor = floor.min(hit.score);
+    }
+    for (rank, hit) in fallback.iter_mut().enumerate() {
+        let step = (rank + 1) as f32;
+        hit.score = if floor > 0.0 {
+            floor * 0.5 / step
+        } else {
+            floor - step
+        };
+    }
 }
 
 fn heading_overlap(terms: &[String], heading: &str) -> usize {
@@ -511,7 +796,7 @@ fn resolve_rg_run(
         Ok(Err(error)) => {
             tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
             warnings.push(Warning {
-                code: "ripgrep-failed".to_string(),
+                code: warning_codes::RIPGREP_FAILED.to_string(),
                 message: format!(
                     "ripgrep pass failed ({error}); ranking without the ripgrep signal"
                 ),
@@ -525,7 +810,7 @@ fn resolve_rg_run(
                 "ripgrep pass timed out; ranking without the ripgrep signal"
             );
             warnings.push(Warning {
-                code: "ripgrep-timeout".to_string(),
+                code: warning_codes::RIPGREP_TIMEOUT.to_string(),
                 message: format!(
                     "ripgrep pass timed out after {} ms; ranking without the ripgrep signal",
                     timeout.as_millis()
@@ -1483,5 +1768,337 @@ mod tests {
             "a failed ripgrep pass must be reported even when the FTS/vector pool was empty"
         );
         assert!(result.hits.is_empty());
+    }
+
+    struct FakeMembershipStore {
+        indexed: Option<HashSet<FileRef>>,
+    }
+
+    fn file_ref(path: &str) -> FileRef {
+        FileRef::new(PathBuf::from(path))
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for FakeMembershipStore {
+        async fn retrieve_signals(
+            &self,
+            _corpus_key: &CorpusKey,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<SignalLists> {
+            Ok(SignalLists {
+                fts: Vec::new(),
+                vector: Vec::new(),
+                hits: HashMap::new(),
+            })
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn indexed_file_refs(
+            &self,
+            _corpus_key: &CorpusKey,
+        ) -> Result<Option<HashSet<FileRef>>> {
+            Ok(self.indexed.clone())
+        }
+    }
+
+    fn fixture_root() -> (tempfile::TempDir, CorpusKey) {
+        let dir = tempfile::tempdir().expect("root");
+        let canonical_root = crate::common::canonicalize_or_passthrough(dir.path()).into_path_buf();
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root,
+        };
+        (dir, corpus_key)
+    }
+
+    fn write_lines(path: &Path, lines: &[&str]) -> String {
+        std::fs::write(path, lines.join("\n")).expect("write fixture file");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn search_fused_leaves_unindexed_files_to_the_fallback_pass() {
+        let (_dir, corpus_key) = fixture_root();
+        write_lines(&corpus_key.canonical_root.join("cold.md"), &["zebrafish"]);
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::new()),
+        };
+
+        let result = search_fused(&store, &corpus_key, "zebrafish", &[], 10)
+            .await
+            .expect("search");
+
+        assert!(result.hits.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_returns_line_window_for_unindexed_file() {
+        let (_dir, corpus_key) = fixture_root();
+        let file = write_lines(
+            &corpus_key.canonical_root.join("cold.md"),
+            &[
+                "l1",
+                "l2",
+                "l3",
+                "l4",
+                "l5",
+                "zebrafish here",
+                "l7",
+                "l8",
+                "l9",
+                "l10",
+                "l11",
+            ],
+        );
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::new()),
+        };
+        let eligible = HashSet::from([file_ref(&file)]);
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.file_ref, file);
+        assert_eq!((hit.line_start, hit.line_end), (3, 9));
+        assert!(hit.text.contains("zebrafish here"));
+        assert!(!hit.text.contains("l2") && !hit.text.contains("l10"));
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, vec!["lexical-fallback"]);
+    }
+
+    #[test]
+    fn unindexed_candidates_is_empty_when_the_index_covers_every_file() {
+        let eligible = HashSet::from([file_ref("a.md"), file_ref("b.md")]);
+        let indexed = eligible.clone();
+
+        let (candidates, dropped) = unindexed_candidates(&eligible, &indexed);
+
+        assert!(candidates.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn unindexed_candidates_reports_files_past_the_cap() {
+        let mut eligible = HashSet::new();
+        for index in 0..FALLBACK_MAX_FILES + 5 {
+            eligible.insert(file_ref(&format!("f{index:05}.md")));
+        }
+
+        let (candidates, dropped) = unindexed_candidates(&eligible, &HashSet::new());
+
+        assert_eq!(candidates.len(), FALLBACK_MAX_FILES);
+        assert_eq!(dropped, 5);
+        assert_eq!(candidates[0], file_ref("f00000.md"));
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_warns_when_the_file_cap_drops_files() {
+        let (_dir, corpus_key) = fixture_root();
+        let root = &corpus_key.canonical_root;
+        let hit_file = write_lines(&root.join("f00000.md"), &["zebrafish here"]);
+        let mut eligible = HashSet::from([file_ref(&hit_file)]);
+        for index in 1..FALLBACK_MAX_FILES + 3 {
+            eligible.insert(FileRef::new(root.join(format!("f{index:05}.md"))));
+        }
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::new()),
+        };
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(
+            codes.contains(&"lexical-fallback-truncated"),
+            "codes: {codes:?}"
+        );
+        let truncated = result
+            .warnings
+            .iter()
+            .find(|w| w.code == "lexical-fallback-truncated")
+            .expect("truncated warning");
+        assert!(truncated.message.starts_with("3 unindexed file(s)"));
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_skips_indexed_and_ineligible_files() {
+        let (_dir, corpus_key) = fixture_root();
+        let root = &corpus_key.canonical_root;
+        let indexed = write_lines(&root.join("indexed.md"), &["zebrafish indexed"]);
+        let cold = write_lines(&root.join("cold.md"), &["zebrafish cold"]);
+        // On disk and matching, but the indexer scan does not select it
+        // (excluded by pattern or owned by a nested root).
+        write_lines(&root.join("excluded.md"), &["zebrafish excluded"]);
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::from([file_ref(&indexed)])),
+        };
+        let eligible = HashSet::from([file_ref(&indexed), file_ref(&cold)]);
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        let files: Vec<&str> = result.hits.iter().map(|h| h.file_ref.as_str()).collect();
+        assert_eq!(files, vec![cold.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_reaches_unindexed_file_behind_many_indexed_matches() {
+        let (_dir, corpus_key) = fixture_root();
+        let root = &corpus_key.canonical_root;
+        let mut eligible = HashSet::new();
+        let mut indexed = HashSet::new();
+        for number in 0..30 {
+            let file = write_lines(
+                &root.join(format!("a{number:02}.md")),
+                &["zebrafish indexed"],
+            );
+            indexed.insert(file_ref(&file));
+            eligible.insert(file_ref(&file));
+        }
+        let cold = write_lines(&root.join("zz-cold.md"), &["zebrafish cold"]);
+        eligible.insert(file_ref(&cold));
+        let store = FakeMembershipStore {
+            indexed: Some(indexed),
+        };
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            3,
+        )
+        .await;
+
+        let files: Vec<&str> = result.hits.iter().map(|h| h.file_ref.as_str()).collect();
+        assert_eq!(files, vec![cold.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_is_off_when_membership_is_unknown() {
+        let (_dir, corpus_key) = fixture_root();
+        let cold = write_lines(
+            &corpus_key.canonical_root.join("cold.md"),
+            &["zebrafish cold"],
+        );
+        let store = FakeMembershipStore { indexed: None };
+        let eligible = HashSet::from([file_ref(&cold)]);
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        assert!(result.hits.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_drops_a_candidate_swapped_for_an_outside_symlink() {
+        let (_dir, corpus_key) = fixture_root();
+        let outside = tempfile::tempdir().expect("outside dir");
+        let secret = write_lines(&outside.path().join("secret.md"), &["zebrafish secret"]);
+        let swapped = corpus_key.canonical_root.join("cold.md");
+        std::os::unix::fs::symlink(&secret, &swapped).expect("swap candidate for symlink");
+        let eligible = HashSet::from([FileRef::new(swapped)]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(
+            result.hits.is_empty(),
+            "a symlink swapped in after the scan must not leak outside text: {:?}",
+            result.hits
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_drops_a_candidate_whose_parent_dir_became_a_symlink() {
+        let (_dir, corpus_key) = fixture_root();
+        let outside = tempfile::tempdir().expect("outside dir");
+        write_lines(&outside.path().join("secret.md"), &["zebrafish secret"]);
+        let swapped_dir = corpus_key.canonical_root.join("docs");
+        std::os::unix::fs::symlink(outside.path(), &swapped_dir).expect("swap parent for symlink");
+        let eligible = HashSet::from([FileRef::new(swapped_dir.join("secret.md"))]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(
+            result.hits.is_empty(),
+            "a parent symlink must not leak outside text: {:?}",
+            result.hits
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_does_not_create_a_missing_parent_directory() {
+        let (_dir, corpus_key) = fixture_root();
+        let ghost = corpus_key.canonical_root.join("ghost");
+        let eligible = HashSet::from([FileRef::new(ghost.join("cold.md"))]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(result.hits.is_empty());
+        assert!(!ghost.exists(), "the fallback must not create directories");
+    }
+
+    #[test]
+    fn rank_after_scores_every_fallback_hit_below_every_fused_hit() {
+        let fused = |score: f32| SearchHit {
+            score,
+            ..hit("f", "/repo/wiki/f.md", 1, 2)
+        };
+        for fused_scores in [vec![0.04, 0.02], vec![3.5, -1.0], vec![-4.0]] {
+            let fused_hits: Vec<SearchHit> = fused_scores.iter().map(|s| fused(*s)).collect();
+            let mut fallback = vec![hit("a", "/repo/a.md", 1, 2), hit("b", "/repo/b.md", 1, 2)];
+
+            rank_after(&mut fallback, &fused_hits);
+
+            let lowest = fused_scores.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(fallback[0].score < lowest, "{fused_scores:?}");
+            assert!(fallback[1].score < fallback[0].score, "{fused_scores:?}");
+        }
     }
 }
