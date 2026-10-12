@@ -205,11 +205,11 @@ fn validate_windows_relative_path(raw: &str) -> Result<(), SandboxError> {
             return Err(SandboxError::new("path contains a Windows device name"));
         }
         for prefix in ["COM", "LPT"] {
-            if let Some(suffix) = stem.strip_prefix(prefix) {
-                if ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&suffix)
-                {
-                    return Err(SandboxError::new("path contains a Windows device name"));
-                }
+            let Some(suffix) = stem.strip_prefix(prefix) else {
+                continue;
+            };
+            if ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&suffix) {
+                return Err(SandboxError::new("path contains a Windows device name"));
             }
         }
     }
