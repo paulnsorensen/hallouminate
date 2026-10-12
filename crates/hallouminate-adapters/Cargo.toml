@@ -20,6 +20,8 @@ serde_json.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 # Force vendored (compile-from-source) OpenSSL so `openssl-sys` cross-compiles for
 # aarch64-unknown-linux-gnu in the dist release build. openssl-sys is pulled in
 # transitively via native-tls (ort-sys/ureq, fastembed/hf-hub, lancedb/reqwest);
