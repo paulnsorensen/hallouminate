@@ -1,0 +1,60 @@
+# Wedge-packaged skill CLIs (see plugins/hallouminate/skills/*/wedge.toml).
+# Pull requests run the CLI tests and `wedge check` (lock and launcher fresh).
+# A push to main publishes missing .pyz assets to the rolling `wedge` release
+# that each committed launcher downloads on first use. Keep the action SHA equal
+# to the skillz-that-grillz revision used for `wedge lock`; a different builder
+# can change the archive digest, and publish then rejects the lock.
+name: wedge
+
+on:
+  pull_request:
+    paths:
+      - "plugins/hallouminate/skills/**"
+      - ".github/workflows/wedge.yml"
+  push:
+    branches: [main]
+    paths:
+      - "plugins/hallouminate/skills/**"
+      - ".github/workflows/wedge.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: wedge check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      - name: ingest-ledger CLI tests
+        working-directory: plugins/hallouminate/skills/wiki-ingest
+        run: uv run --locked --project . python -m unittest discover -s tests -v
+      - uses: paulnsorensen/skillz-that-grillz/actions/wedge@bdeeaed45cb5ae18ffee5c648aca1c7c1dc2a031 # main
+        with:
+          command: check
+          roots: plugins/hallouminate/skills
+
+  publish:
+    name: wedge publish
+    needs: check
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `branch: main` refuses a commit that main does not contain, so a
+      # workflow_dispatch from another ref cannot publish.
+      - uses: paulnsorensen/skillz-that-grillz/actions/wedge@bdeeaed45cb5ae18ffee5c648aca1c7c1dc2a031 # main
+        with:
+          command: publish
+          roots: plugins/hallouminate/skills
+          branch: main
