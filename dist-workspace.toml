@@ -5,6 +5,7 @@ members = ["cargo:crates/hallouminate"]
 [dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
+msvc-crt-static = false
 # CI backends to support
 ci = "github"
 # release.yml is dist-generated, but its actions are hand-pinned to commit SHAs

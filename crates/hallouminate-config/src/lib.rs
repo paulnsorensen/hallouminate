@@ -2297,7 +2297,15 @@ corpus_paths = ["docs"]
         let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["repo:tern:wiki", "repo:tern:corpus"]);
         let source = &all[1];
-        assert_eq!(source.paths, vec!["/repos/tern/docs".to_string()]);
+        assert_eq!(
+            source.paths,
+            vec![
+                PathBuf::from("/repos/tern")
+                    .join("docs")
+                    .display()
+                    .to_string()
+            ]
+        );
     }
 
     #[test]
@@ -2894,17 +2902,19 @@ name = "absrepo"
 path = "/abs/repo"
 corpus_paths = ["/abs/repo/docs"]
 "#;
-        let cfg_path = write_repo_config(&repo_root, cfg);
-        let allowed = vec!["/abs".to_string()];
+        let prefix = if cfg!(windows) { "C:" } else { "" };
+        let cfg = cfg.replace("/abs", &format!("{prefix}/abs"));
+        let cfg_path = write_repo_config(&repo_root, &cfg);
+        let allowed = vec![format!("{prefix}/abs")];
         let parsed = load_repo_layer(&cfg_path, &allowed)
             .expect("load_repo_layer")
             .0;
 
-        assert_eq!(parsed.corpora[0].paths, vec!["/abs/docs".to_string()]);
-        assert_eq!(parsed.repositories[0].path, "/abs/repo");
+        assert_eq!(parsed.corpora[0].paths, vec![format!("{prefix}/abs/docs")]);
+        assert_eq!(parsed.repositories[0].path, format!("{prefix}/abs/repo"));
         assert_eq!(
             parsed.repositories[0].corpus_paths,
-            vec!["/abs/repo/docs".to_string()],
+            vec![format!("{prefix}/abs/repo/docs")],
         );
     }
 
@@ -3652,7 +3662,7 @@ paths = ["/srv/cheese-global"]
                 assert!(msg.contains("/etc/hallouminate/config.toml"), "got: {msg}");
                 assert!(msg.contains(&cfg_path.display().to_string()), "got: {msg}");
                 assert!(msg.contains("/xdg-cache"), "got: {msg}");
-                assert!(msg.contains("/repo-cache"), "got: {msg}");
+                assert!(msg.contains("repo-cache"), "got: {msg}");
             }
             other => panic!("unexpected error: {other:?}"),
         }
