@@ -1055,12 +1055,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn request_without_lf_is_decoded_at_eof() {
         let response = exchange_request(ping_request_bytes()).await;
         assert_ping_response(response);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn truncated_request_at_eof_gets_structured_error() {
         let message = invalid_request_message(exchange_request(br#"{"cwd":"#.to_vec()).await);

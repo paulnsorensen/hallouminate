@@ -320,7 +320,9 @@ pub fn list_corpus_files(corpus: &CorpusConfig) -> anyhow::Result<Vec<FileEntry>
                 .find_map(|r| absolute.strip_prefix(r).ok())
                 .unwrap_or(absolute.as_path());
             FileEntry {
-                path: relative.to_string_lossy().into_owned(),
+                path: relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
                 absolute_path: absolute.to_string_lossy().into_owned(),
             }
         })

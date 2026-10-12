@@ -3547,6 +3547,9 @@ async fn daemon_read_markdown_citation_miss_suggests_bare_path() {
     let root = tmp.path().join("wiki");
     std::fs::create_dir_all(&root).expect("mkdir wiki");
     std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    #[cfg(windows)]
+    std::fs::write(root.join("notes.md:12"), "private-content-sentinel")
+        .expect("seed alternate data stream");
     std::fs::write(root.join("other.md"), "other").expect("seed other");
     let harness =
         DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
@@ -3625,7 +3628,12 @@ async fn daemon_read_markdown_citation_miss_rejects_invalid_suffixes() {
     ] {
         let message = read_miss_message(&client, harness.cwd(), path).await;
         assert!(
-            message.starts_with(&format!("{path} does not exist")),
+            message.starts_with(&format!("{path} does not exist"))
+                || (cfg!(windows)
+                    && message
+                        == hallouminate_domain::corpus::safe_relative_path(path)
+                            .expect_err("Windows must reject colon paths")
+                            .to_string()),
             "{message}"
         );
         assert!(!message.contains("Use path="), "{message}");
@@ -3633,6 +3641,7 @@ async fn daemon_read_markdown_citation_miss_rejects_invalid_suffixes() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn daemon_read_markdown_citation_exact_colon_filename_wins() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -3693,7 +3702,8 @@ async fn daemon_read_markdown_citation_miss_preserves_path_protections() {
     }
     let message = read_miss_message(&client, harness.cwd(), "excluded.md:12").await;
     assert!(
-        message.starts_with("excluded.md:12 does not exist"),
+        message.starts_with("excluded.md:12 does not exist")
+            || (cfg!(windows) && message == "path contains a Windows reserved character"),
         "{message}"
     );
     assert!(!message.contains("Use path="), "{message}");

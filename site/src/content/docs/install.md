@@ -53,6 +53,8 @@ PowerShell installer is also available:
 irm https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.ps1 | iex
 ```
 
+Windows binaries require the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
 ## From crates.io
 
 Builds from source, so it works on any platform with a Rust toolchain — at the

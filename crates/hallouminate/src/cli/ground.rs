@@ -315,7 +315,12 @@ mod tests {
         };
         assert_eq!(
             resolve_path_prefix_strip(&cfg, None),
-            Some("/repos/tern/.hallouminate/wiki/".to_string())
+            Some(format!(
+                "{}/",
+                std::path::Path::new("/repos/tern")
+                    .join(".hallouminate/wiki")
+                    .display()
+            ))
         );
     }
 }

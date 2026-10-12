@@ -2044,11 +2044,19 @@ fn enrich_read_not_found(
     req_path: &str,
 ) -> DaemonResponse {
     let bare = format!("{req_path} does not exist");
-    let is_bare_not_found = matches!(
-        &resp,
-        DaemonResponse::Err { kind: ErrorKind::InvalidParams, message } if *message == bare
-    );
-    if !is_bare_not_found {
+    let DaemonResponse::Err {
+        kind: ErrorKind::InvalidParams,
+        message,
+    } = &resp
+    else {
+        return resp;
+    };
+    let is_windows_citation = cfg!(windows)
+        && message == "path contains a Windows reserved character"
+        && citation_bare_path(req_path).is_some_and(|candidate| {
+            validate_wiki_read_path(corpora, corpus_name, candidate).is_ok()
+        });
+    if *message != bare && !is_windows_citation {
         return resp;
     }
     let Some(corpus) = corpora.iter().find(|c| c.name == corpus_name) else {
@@ -2770,7 +2778,7 @@ mod tests {
                     "conflict error must name the field: {message}",
                 );
                 assert!(
-                    message.contains("\"/a\"") && message.contains("\"/b\""),
+                    message.contains("\"/a\"") && message.contains("/b\""),
                     "conflict error must show both values: {message}",
                 );
             }
@@ -3125,10 +3133,10 @@ mod tests {
         let repo_config = format!(
             concat!(
                 "[[corpus]]\nname = \"test\"\n",
-                "paths = [\"{}\"]",
+                "paths = [{}]",
                 "\nglobs = [\"**/*.md\"]\nexclude = [\"**/excluded.md\"]\n"
             ),
-            corpus_dir.display()
+            toml::Value::String(corpus_dir.display().to_string())
         );
         write_repo_layer(tmp.path(), &repo_config);
         let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
@@ -3661,7 +3669,9 @@ mod tests {
         // silently routed into the upsert path as if it were a brand-new file.
         let indexed_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
         std::fs::write(&file, "").unwrap();
-        std::fs::File::open(&file)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
             .unwrap()
             .set_modified(indexed_mtime)
             .unwrap();

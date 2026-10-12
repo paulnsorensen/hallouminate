@@ -1427,16 +1427,30 @@ async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Resu
     // same boot that created it. Stamp it to "now" so age is measured from
     // when it was set aside, not from the original store's last write.
     let stamp_target = bak.clone();
-    tokio::task::spawn_blocking(move || {
-        std::fs::File::open(&stamp_target)?.set_modified(SystemTime::now())
-    })
-    .await??;
+    tokio::task::spawn_blocking(move || set_directory_modified(&stamp_target, SystemTime::now()))
+        .await??;
     tracing::info!(
         target: "hallouminate::daemon",
         backup = %bak.display(),
         "moved stale ground store aside; recoverable until pruned",
     );
     Ok(())
+}
+
+fn set_directory_modified(path: &Path, modified: SystemTime) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        };
+        options
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
+    options.open(path)?.set_modified(modified)
 }
 
 /// Prune backup ground-store directories (`<ground>.bak-v{N}`) older than
@@ -2676,7 +2690,7 @@ mod tests {
 
         let old_mtime = SystemTime::now() - Duration::from_secs(60 * 24 * 60 * 60);
         let dir = ground_dir.clone();
-        tokio::task::spawn_blocking(move || std::fs::File::open(&dir)?.set_modified(old_mtime))
+        tokio::task::spawn_blocking(move || set_directory_modified(&dir, old_mtime))
             .await
             .expect("join")
             .expect("backdate ground dir mtime");
@@ -2825,10 +2839,7 @@ mod tests {
         let aged_backup = override_root.path().join("ground.bak-v0");
         std::fs::create_dir(&aged_backup).expect("create aged backup");
         let aged = SystemTime::now() - STALE_BACKUP_MAX_AGE - Duration::from_secs(86_400);
-        std::fs::File::open(&aged_backup)
-            .expect("open aged backup")
-            .set_modified(aged)
-            .expect("age the backup");
+        set_directory_modified(&aged_backup, aged).expect("age the backup");
 
         let resources = state
             .resources_for(&cfg)

@@ -423,7 +423,9 @@ async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
     // Bump mtime forward so the plan re-visits the file, then corrupt it.
     let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
     fs::write(&file, b"\xff\xfe\x00 not,a valid\x00 csv").unwrap();
-    std::fs::File::open(&file)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
         .unwrap()
         .set_modified(bumped)
         .unwrap();
