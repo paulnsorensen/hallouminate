@@ -31,9 +31,30 @@ Workers never compile or download application assets.
 | Publish readable, searchable documents | Publish for another client | MCP add/read/stats/ground | Exact content, indexed counts, document identity, ancestor links | Skip indexing or link refresh |
 | Reject accidental document replacement | Reject document replacement | MCP add/read/ground | Invalid-parameters error, original content, unchanged index | Allow unrequested overwrite |
 | Remove deleted documents | Delete from wiki and search | MCP delete/read/ground | Specific missing-file error, empty search, removed link | Keep document or indexed rows |
+| Survive process changes | Graceful restart and manual restart after crash | daemon CLI, new MCP process | Exact persisted page and search hit after restart or stale-socket cleanup | Lose durable knowledge or refuse a stale socket |
+| Start on first use | New client with no daemon | MCP serve, daemon status, add/read/ground | A later client reads and finds the page after automatic daemon startup | Require manual startup on the default socket |
+| Keep one daemon owner | Reject second daemon | daemon CLI, live MCP process | Nonzero second exit; first client still reads and searches | Displace the active listener |
+| Reconcile external files | Create, update, delete, repeat index | filesystem edit, MCP index/read/ground/list/stats | New facts appear, old facts disappear, unchanged index counts remain stable | Retain stale rows or miss new files |
+| Observe outside edits | Watcher reconciliation | filesystem edit, MCP ground/stats | New phrase appears without explicit index; old phrase disappears; index has full file coverage | Leave external edits stale |
+| Make safe targeted changes | Overwrite, section edit, ambiguous match | MCP add/read/ground | Exact replacement, preserved unrelated section, error and unchanged page | Clobber content or guess an edit target |
+| Keep successful concurrent work | Distinct pages and shared-section appends | two MCP processes, add/read/ground | Both successful authors' facts remain once and are searchable | Lost update or serialized result omission |
+| Isolate repository context | Two repositories on one daemon | MCP calls with distinct cwd | Default reads/searches use each wiki; pinned searches exclude the other wiki | Resolve every cwd to one repository |
+| Navigate and cite | Corpus, file, tree, backlink, line and footnote reads | MCP list/read/backlinks/ground | Exact page path, linking page, source line, footnote and heading range | Hide source provenance or stale navigation |
+| Reject unsafe or partial writes | Path escape and mixed-result batch | MCP add/read/ground | Outside bytes unchanged; ordered item errors do not roll back successes | Escape the root or treat a batch as atomic |
 
 Each feature binds to a collected `test_*.py` module.
-The suite collects six scenarios.
+The suite collects 26 scenarios: six baseline cases and 20 knowledge workflows.
+
+## Coverage boundaries
+
+| Area | Status | Reason |
+|---|---|---|
+| Lexical search, live files, MCP writes, lifecycle, and navigation | Covered here | Tests use the built Rust binary, a real daemon, isolated storage, and separate MCP clients. |
+| Dense retrieval and model downloads | Not run here | Offline fixtures disable embeddings. Ranking quality needs a pinned model and separate evidence. |
+| Schema migration and version skew | Not run here | Schema migration needs dedicated legacy-store fixtures. Version skew needs two built binaries. |
+| Interrupted indexing and partial database failure | Not run here | This suite does not inject internal faults or corrupt LanceDB state. |
+| High-contention multi-process stress | Not run here | Two-author scenarios verify representative outcomes, not a stress or linearizability proof. |
+| Mutation-based regression proof | Not run here | Production Rust edits are outside this test-only scope. |
 
 ## Isolation and lifetime
 
