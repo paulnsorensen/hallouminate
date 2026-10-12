@@ -44,7 +44,9 @@ text-splitter = { version = "0.33", features = ["markdown", "tokenizers"] }
 # major, so this direct dep MUST match text-splitter or the `ChunkSizer` impl no
 # longer applies to our `Tokenizer`. fastembed pins its own tokenizers 0.22
 # internally, so the lock carries both — benign, since those types never cross.
-tokenizers = { version = "0.23", features = ["http"] }
+# esaxx_fast is only used to train tokenizers and forces a static MSVC runtime,
+# conflicting with the dynamic runtime used by the bundled ONNX library.
+tokenizers = { version = "0.23", default-features = false, features = ["http", "onig", "progressbar"] }
 # Multi-format ingestion (Phase 1): plain-text uses the existing text-splitter
 # `TextSplitter`; spreadsheets use calamine (xlsx/xls/ods) + csv; file-format is
 # the magic-byte fallback when an extension is missing or ambiguous. The
