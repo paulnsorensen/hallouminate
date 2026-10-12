@@ -2519,7 +2519,10 @@ async fn mcp_markdown_batch_preserves_path_safety_and_continues() {
     let outside = tempfile::tempdir().expect("outside");
     let secret = "outside secret";
     std::fs::write(outside.path().join("secret.md"), secret).expect("secret");
+    #[cfg(unix)]
     std::os::unix::fs::symlink(outside.path(), corpus.path().join("link")).expect("symlink");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(outside.path(), corpus.path().join("link")).expect("symlink");
     std::fs::write(corpus.path().join("safe.md"), "").expect("safe");
     let cfg = write_config_with_corpus(xdg.path(), "wiki", &corpus.path().to_string_lossy());
     let harness = DaemonHarness::spawn(cfg).await;
