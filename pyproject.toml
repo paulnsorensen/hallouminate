@@ -3,7 +3,7 @@ name = "hallouminate-behavior-tests"
 version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
-    "pytest==8.4.2",
+    "pytest==9.1.1",
     "pytest-bdd==8.1.0",
     "pytest-xdist==3.8.0",
 ]
