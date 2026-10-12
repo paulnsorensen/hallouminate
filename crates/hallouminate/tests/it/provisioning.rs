@@ -44,9 +44,9 @@ fn cfg_baseline(ground_dir: &Path) -> Config {
 enabled = false
 
 [storage]
-ground_dir = "{ground}"
+ground_dir = {ground}
 "#,
-        ground = ground_dir.display(),
+        ground = toml::Value::String(ground_dir.display().to_string()),
     );
     toml::from_str(&toml).expect("baseline toml parses")
 }
@@ -164,6 +164,7 @@ fn nix_getuid_is_zero() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failed_catch_up_pass_indexes_once_the_root_is_readable_and_reconciled() {
     use std::os::unix::fs::PermissionsExt;

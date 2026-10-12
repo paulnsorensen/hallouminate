@@ -386,7 +386,9 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
     // Truncate to empty and bump mtime forward so the plan sees it as changed.
     fs::write(&file, "").unwrap();
     let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
-    std::fs::File::open(&file)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&file)
         .unwrap()
         .set_modified(bumped)
         .unwrap();
@@ -477,11 +479,10 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     let err = apply(p, &store, &registry, &corpus, DEFAULT_BATCH_SIZE, None)
         .await
         .expect_err("missing file must surface as Err, not silent skip");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("vanishes.md") || msg.contains("No such file") || msg.contains("not found"),
-        "error should reference the missing file: {msg}"
-    );
+    let hallouminate_domain::common::HallouminateError::Io(error) = err else {
+        panic!("expected a filesystem error: {err}");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
 
 /// Spec testing #1 + #2: embeddings-OFF index + ground round-trip. With no

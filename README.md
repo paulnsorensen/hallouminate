@@ -67,6 +67,8 @@ On Windows, use `npx hallouminate --help` or install from PowerShell:
 irm https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.ps1 | iex
 ```
 
+Windows binaries require the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
 Source builds need `protoc` (the `lancedb` build dependency:
 `brew install protobuf` / `apt install protobuf-compiler`); from a git
 checkout, `cargo build --release` lands the binary at
@@ -77,6 +79,10 @@ no Intel-mac build — pykeio/ort#556); use the source build there. Windows sour
 builds require the MSVC Rust toolchain, Visual Studio C++ Build Tools with the
 Windows SDK, and `protoc`. From a checkout, run `just verify`; the executable
 is `target/debug/hallouminate.exe`.
+
+The Windows verification gate also needs Python, `just`, ripgrep, and the Rust
+`rustfmt` and `clippy` components. Enable Windows Developer Mode before running
+the sandbox tests: they create symbolic links to verify filesystem containment.
 
 Verify with `hallouminate --version`.
 

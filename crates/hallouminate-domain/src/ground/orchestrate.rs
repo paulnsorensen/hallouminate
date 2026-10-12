@@ -80,19 +80,15 @@ async fn rerank_with_timeout(
 /// Returns `None` when no root is a prefix (e.g. symlinked or global corpora).
 fn relative_path_for(abs_path: &str, corpus_roots: &[String]) -> Option<String> {
     for root in corpus_roots {
-        let root = root.trim_end_matches('/');
-        if let Some(rel) = abs_path.strip_prefix(root) {
-            // Only accept if the remainder starts with '/' — i.e. the prefix
-            // ended at a real path-component boundary.  Without this check,
-            // root "/corpus/root" would match "/corpus/rootext/f.md" and
-            // return the nonsense path "ext/f.md".
-            if !rel.starts_with('/') {
-                continue;
-            }
-            let rel = rel.trim_start_matches('/');
-            if !rel.is_empty() {
-                return Some(rel.to_string());
-            }
+        let Ok(relative) = std::path::Path::new(abs_path).strip_prefix(root) else {
+            continue;
+        };
+        if !relative.as_os_str().is_empty() {
+            return Some(
+                relative
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/"),
+            );
         }
     }
     None

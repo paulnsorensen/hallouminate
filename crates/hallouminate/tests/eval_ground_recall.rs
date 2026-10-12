@@ -2014,12 +2014,17 @@ fn exec_guard() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn stub_binary(dir: &Path, name: &str, script: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join(name);
+    #[cfg(windows)]
+    let path = path.with_extension("cmd");
     fs::write(&path, script).expect("write stub script");
-    let mut perms = fs::metadata(&path).expect("stat stub script").permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms).expect("chmod stub script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path).expect("stat stub script").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).expect("chmod stub script");
+    }
     path
 }
 
@@ -2058,7 +2063,11 @@ fn ripgrep_version_fails_loud_on_nonzero_exit() {
     let script = stub_binary(
         dir.path(),
         "broken-rg",
-        "#!/bin/sh\necho 'error while loading shared libraries' >&2\nexit 127\n",
+        if cfg!(windows) {
+            "@echo off\r\necho error while loading shared libraries 1>&2\r\nexit /b 127\r\n"
+        } else {
+            "#!/bin/sh\necho 'error while loading shared libraries' >&2\nexit 127\n"
+        },
     );
     let error = ripgrep_version_from_binary(script.to_str().expect("utf8 path"))
         .expect_err("a non-zero exit must fail loud, not silently degrade");
@@ -2078,7 +2087,15 @@ fn ripgrep_version_fails_loud_on_empty_output() {
     // stand in for a silent binary here; a throwaway script that ignores
     // its arguments and exits clean can.
     let dir = tempfile::tempdir().expect("tempdir");
-    let script = stub_binary(dir.path(), "silent-ok", "#!/bin/sh\nexit 0\n");
+    let script = stub_binary(
+        dir.path(),
+        "silent-ok",
+        if cfg!(windows) {
+            "@echo off\r\nexit /b 0\r\n"
+        } else {
+            "#!/bin/sh\nexit 0\n"
+        },
+    );
     let error = ripgrep_version_from_binary(script.to_str().expect("utf8 path"))
         .expect_err("empty output must fail loud, not record a placeholder");
     let message = format!("{error:#}");

@@ -239,7 +239,12 @@ mod tests {
         assert_eq!(out[0].name, "repo:tern:wiki");
         assert_eq!(
             out[0].paths,
-            vec!["/repos/tern/.hallouminate/wiki".to_string()]
+            vec![
+                std::path::Path::new("/repos/tern")
+                    .join(".hallouminate/wiki")
+                    .display()
+                    .to_string()
+            ]
         );
     }
 

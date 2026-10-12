@@ -445,7 +445,12 @@ mod tests {
         assert_eq!(cfg.name, "repo:tern:wiki");
         assert_eq!(
             cfg.paths,
-            vec!["/repos/tern/.hallouminate/wiki".to_string()],
+            vec![
+                PathBuf::from("/repos/tern")
+                    .join(".hallouminate/wiki")
+                    .display()
+                    .to_string()
+            ],
         );
         assert_eq!(cfg.globs, vec!["**/*.md".to_string()]);
         assert!(cfg.exclude.is_empty());
@@ -467,7 +472,13 @@ mod tests {
         assert_eq!(cfg.name, "repo:tern:corpus");
         assert_eq!(
             cfg.paths,
-            vec!["/repos/tern/docs".to_string(), "/abs/elsewhere".to_string(),],
+            vec![
+                PathBuf::from("/repos/tern")
+                    .join("docs")
+                    .display()
+                    .to_string(),
+                "/abs/elsewhere".to_string()
+            ],
         );
         assert_eq!(cfg.globs, vec!["**/*.md".to_string()]);
         assert_eq!(cfg.exclude, vec!["**/drafts/**".to_string()]);
@@ -534,7 +545,12 @@ mod tests {
         );
         assert_eq!(
             repository_wiki_corpus(&r).unwrap().paths,
-            vec!["/repos/tern/.hallouminate/artifacts".to_string()],
+            vec![
+                PathBuf::from("/repos/tern")
+                    .join(".hallouminate/artifacts")
+                    .display()
+                    .to_string()
+            ],
             "repo:{{name}}:wiki corpus must resolve through the override too"
         );
     }

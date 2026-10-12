@@ -805,8 +805,8 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"[\"]\n",
-                root.display()
+                "[[corpus]]\nname = \"wiki\"\npaths = [{}]\nglobs = [\"[\"]\n",
+                toml::Value::String(root.display().to_string()),
             ),
         )
         .expect("write config");
@@ -830,8 +830,8 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"/absolute/**/*.md\"]\n",
-                root.display()
+                "[[corpus]]\nname = \"wiki\"\npaths = [{}]\nglobs = [\"/absolute/**/*.md\"]\n",
+                toml::Value::String(root.display().to_string()),
             ),
         )
         .expect("write config");
@@ -852,9 +852,9 @@ mod tests {
         let root = dir.path().join("wiki");
         fs::create_dir(&root).expect("mkdir root");
         let cfg: Config = toml::from_str(&format!(
-            "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\nexclude = [\"tmp/**\"]\n",
-            root.display()
-        ))
+"[[corpus]]\nname = \"wiki\"\npaths = [{}]\nglobs = [\"**/*.md\"]\nexclude = [\"tmp/**\"]\n",
+toml::Value::String(root.display().to_string()),
+))
         .expect("parse config");
 
         assert_eq!(

@@ -16,5 +16,6 @@ mod plugin_manifests;
 mod provisioning;
 mod real_tokenizer;
 mod recovery;
+#[cfg(unix)]
 mod verification_gate;
 mod worktree_provisioning_vector_reuse;

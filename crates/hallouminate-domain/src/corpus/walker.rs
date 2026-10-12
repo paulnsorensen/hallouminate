@@ -384,7 +384,7 @@ struct IndexedGlobs {
 }
 
 fn validate_relative_pattern(pattern: &str) -> Result<()> {
-    if Path::new(pattern).is_absolute() {
+    if Path::new(pattern).has_root() {
         return Err(HallouminateError::Config(format!(
             "glob {pattern:?} must be root-relative (matched against the corpus root), \
              e.g. \"docs/**/*.md\" not \"/docs/**/*.md\""

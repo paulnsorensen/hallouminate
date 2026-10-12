@@ -18,7 +18,13 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPip
 use crate::windows_security::{OwnerSecurity, UserSid, current_user_sid, process_user_sid};
 
 fn pipe_name(path: &Path) -> io::Result<String> {
-    let path = hallouminate_domain::common::best_effort_canonical(path);
+    let path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            hallouminate_domain::common::best_effort_canonical(path)
+        }
+        Err(error) => return Err(error),
+    };
     let mut hash = blake3::Hasher::new();
     for unit in path.as_os_str().encode_wide() {
         hash.update(&unit.to_le_bytes());
@@ -60,25 +66,32 @@ fn create_server(name: &str, instance: Instance) -> io::Result<NamedPipeServer> 
     }
 }
 
-pub(crate) struct LocalListener {
+/// Accepts connections to an account-restricted local endpoint.
+pub struct LocalListener {
     name: String,
     pending: Mutex<NamedPipeServer>,
 }
 
 impl LocalListener {
-    pub(crate) fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
+    /// Binds the local endpoint identified by a filesystem path.
+    pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        crate::windows_security::restrict_path(path)?;
         let name = pipe_name(path)?;
         let pending = create_server(&name, Instance::First)?;
-        std::fs::File::create(path)?;
-        crate::windows_security::restrict_path(path)?;
         Ok(Self {
             name,
             pending: Mutex::new(pending),
         })
     }
 
-    pub(crate) async fn accept(&self) -> io::Result<(LocalStream, ())> {
+    /// Accepts the next connection while keeping another pipe instance available.
+    pub async fn accept(&self) -> io::Result<(LocalStream, ())> {
         let mut pending = self.pending.lock().await;
         pending.connect().await?;
         let next = create_server(&self.name, Instance::Additional)?;
@@ -87,13 +100,17 @@ impl LocalListener {
     }
 }
 
-pub(crate) enum LocalStream {
+/// Carries bytes between local daemon clients and servers.
+pub enum LocalStream {
+    /// A connection opened by a client.
     Client(NamedPipeClient),
+    /// A connection accepted by a server.
     Server(NamedPipeServer),
 }
 
 impl LocalStream {
-    pub(crate) async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
+    /// Connects to a local endpoint and verifies the server's Windows account.
+    pub async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
         let name = pipe_name(path.as_ref())?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -135,7 +152,8 @@ impl LocalStream {
         process_user_sid(pid)
     }
 
-    pub(crate) fn into_split(self) -> (ReadHalf<Self>, WriteHalf<Self>) {
+    /// Splits a connection into independently owned read and write halves.
+    pub fn into_split(self) -> (ReadHalf<Self>, WriteHalf<Self>) {
         tokio::io::split(self)
     }
 }
@@ -228,6 +246,38 @@ mod tests {
         assert_eq!(
             server.peer_user().expect("peer SID"),
             client.peer_user().expect("server SID")
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_endpoint_aliases_resolve_to_the_same_pipe() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let endpoint = directory.path().join("daemon.sock");
+        let listener = LocalListener::bind(&endpoint).expect("bind pipe");
+        let canonical = std::fs::canonicalize(&endpoint).expect("canonical endpoint");
+        let dotted = directory.path().join(".").join("daemon.sock");
+        let uppercase = directory.path().join("DAEMON.SOCK");
+        if uppercase.exists() {
+            assert_eq!(
+                pipe_name(&endpoint).expect("name"),
+                pipe_name(&uppercase).expect("case alias")
+            );
+        }
+        assert_eq!(
+            pipe_name(&endpoint).expect("name"),
+            pipe_name(&canonical).expect("canonical name")
+        );
+        assert_eq!(
+            pipe_name(&endpoint).expect("name"),
+            pipe_name(&dotted).expect("dotted name")
+        );
+        let client = LocalStream::connect(&canonical)
+            .await
+            .expect("connect alias");
+        let (server, ()) = listener.accept().await.expect("accept alias");
+        assert_eq!(
+            server.peer_user().expect("peer"),
+            client.peer_user().expect("server")
         );
     }
 }
