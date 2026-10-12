@@ -164,6 +164,7 @@ fn nix_getuid_is_zero() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn a_failed_catch_up_pass_indexes_once_the_root_is_readable_and_reconciled() {
     use std::os::unix::fs::PermissionsExt;
