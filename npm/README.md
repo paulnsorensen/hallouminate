@@ -11,6 +11,7 @@ npx hallouminate --help
 
 Supported platforms: macOS (arm64), Linux (x64 / arm64, glibc ≥ 2.39),
 and Windows (x64).
+Windows requires the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 For Intel macOS or musl Linux, install from source with
 `cargo install hallouminate`.
 
