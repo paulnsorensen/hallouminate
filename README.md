@@ -78,6 +78,10 @@ builds require the MSVC Rust toolchain, Visual Studio C++ Build Tools with the
 Windows SDK, and `protoc`. From a checkout, run `just verify`; the executable
 is `target/debug/hallouminate.exe`.
 
+The Windows verification gate also needs Python, `just`, ripgrep, and the Rust
+`rustfmt` and `clippy` components. Enable Windows Developer Mode before running
+the sandbox tests: they create symbolic links to verify filesystem containment.
+
 Verify with `hallouminate --version`.
 
 ### Plugin setup (recommended)
