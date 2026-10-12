@@ -64,6 +64,28 @@ admission and resource isolation belong to the execution environment. See
 [Development verification](./site/src/content/docs/development-verification.md) for the
 lease, evidence log, compatibility routes, and fix mode.
 
+### Python behavior tests
+
+Install Python 3.12 or newer and uv 0.13.0 for the BDD suite.
+
+```sh
+just bdd
+```
+
+This command builds the CLI once under the verification lease.
+It downloads the tokenizer before workers start.
+It then collects scenarios and runs them serially and with two workers.
+
+Use `just bdd -k publish` to select scenarios.
+Use `just bdd-check` when the binary and tokenizer are already available.
+CI runs `just bdd-check` after its existing build and tokenizer warm-up.
+
+Each scenario uses isolated configuration, storage, files, and a Unix socket.
+Workers use the shared tokenizer cache offline.
+Fixtures never build the application or use the developer's daemon.
+
+See [BDD coverage and fixture rules](./tests/bdd/README.md).
+
 ## Submitting a pull request
 
 1. Fork the repo and create a topic branch from `main`.

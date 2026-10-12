@@ -22,6 +22,19 @@ ci:
 llm:
     just verify --fix
 
+# Build once before workers start. Keep compiler work inside the existing lease.
+bdd *args:
+    uv sync --locked
+    just verify cargo build --locked -p hallouminate --bin hallouminate
+    just verify cargo run --locked -p hallouminate -- config download --config tests/bdd/tokenizer.toml
+    just bdd-check {{quote(args)}}
+
+# CI reuses its built binary and warmed tokenizer cache.
+bdd-check *args:
+    uv run --locked pytest tests/bdd --collect-only -q
+    uv run --locked pytest tests/bdd -n 0 {{quote(args)}}
+    uv run --locked pytest tests/bdd -n 2 {{quote(args)}}
+
 # Measure the production fusion baseline against the Jina-v1 diagnostic arm.
 eval-measure:
     HALLOUMINATE_EVAL_OUTPUT=.context/issue-288-eval-results.json just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_measure -- --ignored --nocapture --exact
