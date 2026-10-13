@@ -91,6 +91,14 @@ pub struct SignalLists {
     /// chunk_ids in vector rank order, best first. Empty when embeddings
     /// are disabled.
     pub vector: Vec<String>,
+    /// Raw full-text relevance per chunk_id in `fts`, higher is better.
+    /// Every root shares one full-text index, so these compare across roots.
+    /// Empty when the backend reports no raw scores.
+    pub fts_scores: HashMap<String, f32>,
+    /// Raw vector distance per chunk_id in `vector`, lower is better.
+    /// Every root shares one embedding model, so these compare across roots.
+    /// Empty when the backend reports no raw scores.
+    pub vector_distances: HashMap<String, f32>,
     /// Every retrieved chunk keyed by chunk_id: the union of `fts` and
     /// `vector`. Scores here are per-signal and NOT comparable across
     /// signals; the caller overwrites them with the fused score.

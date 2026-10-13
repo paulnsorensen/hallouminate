@@ -10,8 +10,8 @@ use crate::indexer::SearchHit;
 use crate::search::RootIndex;
 use crate::search::phrase::search_phrase_in;
 use crate::search::{
-    ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, lexical_fallback_search,
-    rank_after, search_fused_indexed,
+    ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, RootSignals, fuse_roots,
+    gather_signals, lexical_fallback_search, rank_after,
 };
 
 use super::bucket::{Rollup, normalize_scores, roll_up};
@@ -208,11 +208,11 @@ pub async fn ground(
     .await
 }
 
-/// One corpus root's search result: the fused hits plus the lexical
-/// fallback hits, which stay out of the rerank pool and rank after every
-/// fused hit.
+/// One corpus root's search result: the unfused signal lists plus the
+/// lexical fallback hits, which stay out of the rerank pool and rank after
+/// every fused hit.
 struct CorpusSearch {
-    fused: FusedSearch,
+    signals: RootSignals,
     fallback: Vec<SearchHit>,
 }
 
@@ -273,7 +273,7 @@ async fn scan_inventory(corpora: &[CorpusConfig], store: &dyn ChunkRetrieval) ->
     inventory
 }
 
-/// Searches one root: the fused signals, then the lexical fallback over the
+/// Searches one root: the signal lists, then the lexical fallback over the
 /// root's unindexed files. A failed indexed-file listing degrades to no
 /// fallback plus a `lexical-fallback-failed` warning.
 async fn search_root_ranked(
@@ -301,7 +301,7 @@ async fn search_root_ranked(
             (None, None)
         }
     };
-    let mut fused = search_fused_indexed(
+    let mut signals = gather_signals(
         store,
         corpus_key,
         query,
@@ -311,9 +311,9 @@ async fn search_root_ranked(
         handle,
     )
     .await?;
-    fused.warnings.extend(listing_warning);
+    signals.warnings.extend(listing_warning);
     let lexical = lexical_fallback_search(corpus_key, query, &eligible, indexed, limit).await;
-    if let Some(unpooled) = &fused.unpooled_files {
+    if let Some(unpooled) = &signals.unpooled_files {
         let mut covered = HashSet::new();
         for hit in &lexical.hits {
             covered.insert(hit.file_ref.as_str());
@@ -325,14 +325,14 @@ async fn search_root_ranked(
             }
         }
         if resolved {
-            fused
+            signals
                 .warnings
                 .retain(|warning| warning.code != "ripgrep-unresolved");
         }
     }
-    fused.warnings.extend(lexical.warnings);
+    signals.warnings.extend(lexical.warnings);
     Ok(CorpusSearch {
-        fused,
+        signals,
         fallback: lexical.hits,
     })
 }
@@ -364,7 +364,9 @@ fn rollup_order(
         .then_with(|| a.0.cmp(&b.0))
 }
 
-/// Fans one query across every effective corpus root and globally reranks it.
+/// Fans one query across every effective corpus root and ranks the roots'
+/// signals as one fusion, so a root's best chunk outranks another root's
+/// chunks only on the evidence.
 ///
 /// `priority_corpus`, when `Some`, names the corpus whose docs get ranking
 /// priority in the final `top_files` rollup (#425): equal-score ties favor
@@ -434,10 +436,13 @@ pub async fn ground_union_inventoried(
         }
     }
     let mut warnings = Vec::new();
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut fallback_hits: Vec<SearchHit> = Vec::new();
+    let mut fallback_files: BTreeSet<(CorpusKey, String)> = BTreeSet::new();
     // The futures are collected eagerly because a lazy `Map` stream infers a
     // closure type that is not general enough once the daemon spawns this
     // future. `buffered` keeps per-root order, which warning order relies on.
-    let search_results: Vec<CorpusSearch> = match opts.match_mode {
+    match opts.match_mode {
         GroundMatch::Ranked => {
             let mut searches = Vec::with_capacity(corpus_keys.len());
             for (corpus_key, corpus) in &corpus_keys {
@@ -446,10 +451,24 @@ pub async fn ground_union_inventoried(
                     query, corpus, corpus_key, store, limit, root,
                 ));
             }
-            futures_util::stream::iter(searches)
+            let searched: Vec<CorpusSearch> = futures_util::stream::iter(searches)
                 .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
                 .try_collect()
-                .await?
+                .await?;
+            let mut roots = Vec::with_capacity(searched.len());
+            for CorpusSearch {
+                mut signals,
+                fallback,
+            } in searched
+            {
+                warnings.append(&mut signals.warnings);
+                for hit in &fallback {
+                    fallback_files.insert((hit.corpus_key.clone(), hit.file_ref.clone()));
+                }
+                fallback_hits.extend(fallback);
+                roots.push(signals);
+            }
+            hits = fuse_roots(roots, query, priority_corpus);
         }
         GroundMatch::Phrase => {
             let mut searches = Vec::with_capacity(corpus_keys.len());
@@ -457,30 +476,15 @@ pub async fn ground_union_inventoried(
                 let handle = inventory.get(corpus_key).and_then(RootInventory::handle);
                 searches.push(search_phrase_in(store, corpus_key, query, limit, handle));
             }
-            let phrased = futures_util::stream::iter(searches)
+            let phrased: Vec<FusedSearch> = futures_util::stream::iter(searches)
                 .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
-                .try_collect::<Vec<FusedSearch>>()
+                .try_collect()
                 .await?;
-            let mut results = Vec::with_capacity(phrased.len());
             for fused in phrased {
-                results.push(CorpusSearch {
-                    fused,
-                    fallback: Vec::new(),
-                });
+                hits.extend(fused.hits);
+                warnings.extend(fused.warnings);
             }
-            results
         }
-    };
-    let mut hits: Vec<SearchHit> = Vec::new();
-    let mut fallback_hits: Vec<SearchHit> = Vec::new();
-    let mut fallback_files: BTreeSet<(CorpusKey, String)> = BTreeSet::new();
-    for result in search_results {
-        hits.extend(result.fused.hits);
-        warnings.extend(result.fused.warnings);
-        for hit in &result.fallback {
-            fallback_files.insert((hit.corpus_key.clone(), hit.file_ref.clone()));
-        }
-        fallback_hits.extend(result.fallback);
     }
     let stats = Stats {
         hits: hits.len() + fallback_hits.len(),
@@ -745,6 +749,8 @@ mod tests {
             Ok(SignalLists {
                 fts: hits.iter().map(|h| h.chunk_id.clone()).collect(),
                 vector: Vec::new(),
+                fts_scores: std::collections::HashMap::new(),
+                vector_distances: std::collections::HashMap::new(),
                 hits: hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect(),
             })
         }
@@ -1589,13 +1595,17 @@ mod tests {
 
     #[tokio::test]
     async fn ground_union_collects_ripgrep_warnings_from_every_root() {
-        // Two nonexistent roots: `search_fused`'s ripgrep pass errors on
-        // each (no such directory), so both must surface a distinct
+        // Two roots whose ripgrep pass errors (an unclosed glob class makes
+        // rg exit 2), so both must surface a distinct
         // "ripgrep-failed" warning in GroundResponse.warnings. If the
         // fan-out's warnings.extend ever regresses to overwrite-with-last
         // or keep-only-first, this collapses to one warning and fails.
-        let root_a = "/nonexistent/hallouminate-orchestrate-test-root-a";
-        let root_b = "/nonexistent/hallouminate-orchestrate-test-root-b";
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let root_a = dir_a.path().canonicalize().expect("canonical root a");
+        let root_b = dir_b.path().canonicalize().expect("canonical root b");
+        let root_a = root_a.to_str().expect("utf-8 root a");
+        let root_b = root_b.to_str().expect("utf-8 root b");
         let key_a = CorpusKey::from_configured_root("warnings", root_a);
         let key_b = CorpusKey::from_configured_root("warnings", root_b);
 
@@ -1610,7 +1620,7 @@ mod tests {
         let corpus = CorpusConfig {
             name: "warnings".into(),
             paths: vec![root_a.into(), root_b.into()],
-            globs: vec!["**/*.md".into()],
+            globs: vec!["[".into()],
             exclude: Vec::new(),
             global: false,
         };

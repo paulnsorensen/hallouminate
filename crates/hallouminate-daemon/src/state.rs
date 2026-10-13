@@ -4044,6 +4044,8 @@ mod tests {
             Ok(SignalLists {
                 fts,
                 vector: Vec::new(),
+                fts_scores: HashMap::new(),
+                vector_distances: HashMap::new(),
                 hits: hit_map,
             })
         }

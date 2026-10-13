@@ -41,9 +41,12 @@ Workers never compile or download application assets.
 | Isolate repository context | Two repositories on one daemon | MCP calls with distinct cwd | Default reads/searches use each wiki; pinned searches exclude the other wiki | Resolve every cwd to one repository |
 | Navigate and cite | Corpus, file, tree, backlink, line and footnote reads | MCP list/read/backlinks/ground | Exact page path, linking page, source line, footnote and heading range | Hide source provenance or stale navigation |
 | Reject unsafe or partial writes | Path escape and mixed-result batch | MCP add/read/ground | Outside bytes unchanged; ordered item errors do not roll back successes | Escape the root or treat a batch as atomic |
+| Tolerate absent optional corpora | Missing scratch corpus | repo config, MCP add/ground | Page found; no ripgrep failure; reconciliation finishes | Fail search or reconciliation on a gitignored root |
+| Rank corpora on shared evidence | Weak leader of another corpus | user config, MCP index/add/ground | Both stronger local pages score above the other corpus's only page | Rank each corpus alone so every corpus leader ties |
+| Search a fresh checkout | Git worktree of an indexed repository | git worktree, MCP add/ground | First search finds the page; index coverage converges | Return no results until a manual index |
 
 Each feature binds to a collected `test_*.py` module.
-The suite collects 26 scenarios: six baseline cases and 20 knowledge workflows.
+The suite collects 29 scenarios: six baseline cases, 20 knowledge workflows, and three search workflows.
 
 ## Coverage boundaries
 
