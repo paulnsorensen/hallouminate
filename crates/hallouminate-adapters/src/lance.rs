@@ -2463,7 +2463,7 @@ impl LanceStore {
         limit: usize,
         signal: ScoreSignal,
         scan: S,
-    ) -> Result<Vec<SearchHit>>
+    ) -> Result<Vec<(f32, SearchHit)>>
     where
         S: Fn(Option<String>, usize) -> F,
         F: Future<Output = Result<Vec<RecordBatch>>>,
@@ -2473,12 +2473,12 @@ impl LanceStore {
         };
         if let [prefilter] = prefilters.as_slice() {
             let batches = scan(Some(prefilter.clone()), limit).await?;
-            let mut hits = Vec::new();
+            let mut scored = Vec::new();
             for rb in &batches {
-                decode_hits(rb, mapped, corpus_key, &mut hits)?;
+                decode_scored_hits(rb, signal, mapped, corpus_key, &mut scored)?;
             }
-            hits.truncate(limit);
-            return Ok(hits);
+            scored.truncate(limit);
+            return Ok(scored);
         }
         let overfetchable = match signal {
             ScoreSignal::Fts => true,
@@ -2494,11 +2494,8 @@ impl LanceStore {
             }
             if scored.len() >= limit {
                 scored.sort_by(|left, right| signal.best_first(left.0, right.0));
-                let mut hits = Vec::with_capacity(limit);
-                for (_, hit) in scored.into_iter().take(limit) {
-                    hits.push(hit);
-                }
-                return Ok(hits);
+                scored.truncate(limit);
+                return Ok(scored);
             }
         }
         let mut scans = Vec::with_capacity(prefilters.len());
@@ -2516,11 +2513,8 @@ impl LanceStore {
             }
         }
         scored.sort_by(|left, right| signal.best_first(left.0, right.0));
-        let mut hits = Vec::with_capacity(limit.min(scored.len()));
-        for (_, hit) in scored.into_iter().take(limit) {
-            hits.push(hit);
-        }
-        Ok(hits)
+        scored.truncate(limit);
+        Ok(scored)
     }
 
     /// Retrieve the FTS and vector ranked lists separately, unfused. Runs
@@ -2593,10 +2587,18 @@ impl LanceStore {
         let (fts_hits, vector_hits) = tokio::try_join!(fts, vector)?;
 
         let mut hits: HashMap<String, SearchHit> = HashMap::new();
-        let fts = index_signal(fts_hits, &mut hits);
-        let vector = index_signal(vector_hits, &mut hits);
+        let mut fts_scores = HashMap::new();
+        let mut vector_distances = HashMap::new();
+        let fts = index_signal(fts_hits, &mut hits, &mut fts_scores);
+        let vector = index_signal(vector_hits, &mut hits, &mut vector_distances);
 
-        Ok(SignalLists { fts, vector, hits })
+        Ok(SignalLists {
+            fts,
+            vector,
+            fts_scores,
+            vector_distances,
+            hits,
+        })
     }
 
     /// Full-text scan of `search_text` under the optional `filter`, best
@@ -2727,39 +2729,51 @@ impl LanceStore {
                 &loaded
             }
         };
-        self.scoped_hits(
-            corpus_key,
-            scope,
-            limit,
-            ScoreSignal::Scan,
-            |prefilter, fetch| {
-                let filter = match prefilter {
-                    Some(prefilter) => format!("{prefilter} AND {phrase_filter}"),
-                    None => phrase_filter.clone(),
-                };
-                scan_columns(
-                    &self.table,
-                    "phrase_scan",
-                    Some(filter),
-                    &HIT_COLUMNS,
-                    Some(fetch),
-                )
-            },
-        )
-        .await
+        let scored = self
+            .scoped_hits(
+                corpus_key,
+                scope,
+                limit,
+                ScoreSignal::Scan,
+                |prefilter, fetch| {
+                    let filter = match prefilter {
+                        Some(prefilter) => format!("{prefilter} AND {phrase_filter}"),
+                        None => phrase_filter.clone(),
+                    };
+                    scan_columns(
+                        &self.table,
+                        "phrase_scan",
+                        Some(filter),
+                        &HIT_COLUMNS,
+                        Some(fetch),
+                    )
+                },
+            )
+            .await?;
+        let mut hits = Vec::with_capacity(scored.len());
+        for (_, hit) in scored {
+            hits.push(hit);
+        }
+        Ok(hits)
     }
 }
 
-/// Index one signal's hits into the shared pool, keyed by `chunk_id`,
-/// keeping the first (best-ranked) occurrence on a duplicate. Returns the
-/// chunk_ids in rank order, deduplicated.
-fn index_signal(hits: Vec<SearchHit>, pool: &mut HashMap<String, SearchHit>) -> Vec<String> {
+/// Index one signal's scored hits into the shared pool, keyed by `chunk_id`,
+/// keeping the first (best-ranked) occurrence on a duplicate. Records each
+/// kept chunk's raw score in `scores`. Returns the chunk_ids in rank order,
+/// deduplicated.
+fn index_signal(
+    hits: Vec<(f32, SearchHit)>,
+    pool: &mut HashMap<String, SearchHit>,
+    scores: &mut HashMap<String, f32>,
+) -> Vec<String> {
     let mut order: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    for hit in hits {
-        if seen.insert(hit.chunk_id.clone()) {
-            order.push(hit.chunk_id.clone());
+    for (score, hit) in hits {
+        if scores.contains_key(&hit.chunk_id) {
+            continue;
         }
+        scores.insert(hit.chunk_id.clone(), score);
+        order.push(hit.chunk_id.clone());
         pool.entry(hit.chunk_id.clone()).or_insert(hit);
     }
     order
@@ -6500,7 +6514,7 @@ schema_version = 1
             .expect("over-fetch read");
         assert_eq!(scans.load(std::sync::atomic::Ordering::SeqCst), 1);
         let mut chunk_ids = Vec::new();
-        for hit in &hits {
+        for (_, hit) in &hits {
             assert_eq!(hit.corpus_key, own, "a foreign row must never appear");
             chunk_ids.push(hit.chunk_id.clone());
         }
@@ -6668,6 +6682,44 @@ schema_version = 1
             assert_eq!(
                 hit.score, 0.0,
                 "decode_hits must not leak a raw per-signal score pre-fusion"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieve_signals_reports_a_raw_score_for_every_ranked_chunk() {
+        // Union search compares roots by these scores; a missing score makes
+        // it fall back to ranking each root alone.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            LanceStore::open_or_create(dir.path(), "BAAI/bge-small-en-v1.5", false, false, None)
+                .await
+                .expect("open store");
+        store
+            .apply_batch(vec![synthetic_prepared("/tmp/a.md", 3)])
+            .await
+            .expect("seed docs corpus");
+
+        let signals = store
+            .retrieve_signals(&docs_key(), "chunk-0", 10)
+            .await
+            .expect("fts search");
+        assert!(!signals.fts.is_empty(), "expected full-text hits");
+        let mut previous = f32::INFINITY;
+        for chunk_id in &signals.fts {
+            let Some(score) = signals.fts_scores.get(chunk_id) else {
+                panic!("{chunk_id} has no raw full-text score");
+            };
+            assert!(
+                *score <= previous,
+                "full-text scores must follow rank order"
+            );
+            previous = *score;
+        }
+        for chunk_id in &signals.vector {
+            assert!(
+                signals.vector_distances.contains_key(chunk_id),
+                "{chunk_id} has no raw vector distance"
             );
         }
     }

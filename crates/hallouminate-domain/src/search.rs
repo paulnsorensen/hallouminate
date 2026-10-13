@@ -202,10 +202,6 @@ pub trait ChunkRetrieval: Send + Sync {
 pub struct FusedSearch {
     pub hits: Vec<SearchHit>,
     pub warnings: Vec<Warning>,
-    /// Files whose ripgrep hits missed the retrieval pool, set only when the
-    /// `ripgrep-unresolved` warning has no other cause. A lexical fallback
-    /// that covers every file here makes that warning stale.
-    pub(crate) unpooled_files: Option<BTreeSet<String>>,
 }
 
 /// Retrieve, rank and return chunk hits for `query`.
@@ -243,10 +239,62 @@ pub(crate) async fn search_fused_indexed(
     indexed: Option<&HashSet<FileRef>>,
     handle: Option<&RootHandle>,
 ) -> Result<FusedSearch> {
+    let mut signals =
+        gather_signals(store, corpus_key, query, globs, limit, indexed, handle).await?;
+    let warnings = std::mem::take(&mut signals.warnings);
+    Ok(FusedSearch {
+        hits: fuse_roots(vec![signals], query, None),
+        warnings,
+    })
+}
+
+/// One chunk of a signal list, with the raw strength the list is ordered by.
+struct SignalEntry {
+    chunk_id: String,
+    /// Higher is better. `None` when the store reported no raw score.
+    strength: Option<f32>,
+}
+
+/// One root's signal lists before fusion. [`fuse_roots`] fuses the lists of
+/// one or more roots as one ranking.
+#[derive(Default)]
+pub(crate) struct RootSignals {
+    /// The corpus name of the root. Empty for a root with no signals.
+    corpus: String,
+    fts: Vec<SignalEntry>,
+    vector: Vec<SignalEntry>,
+    rg: Vec<SignalEntry>,
+    contains: Vec<SignalEntry>,
+    hits: HashMap<String, SearchHit>,
+    pub(crate) warnings: Vec<Warning>,
+    /// Files whose ripgrep hits missed the retrieval pool, set only when the
+    /// `ripgrep-unresolved` warning has no other cause. A lexical fallback
+    /// that covers every file here makes that warning stale.
+    pub(crate) unpooled_files: Option<BTreeSet<String>>,
+}
+
+/// Retrieves one root's four signal lists, unfused.
+///
+/// The ripgrep and FM-Index `contains()` passes below only filter and
+/// rank `signals.hits` — the pool `store.retrieve_signals` returned —
+/// so a chunk outside that FTS/vector pool is invisible to both.
+pub(crate) async fn gather_signals(
+    store: &dyn ChunkRetrieval,
+    corpus_key: &CorpusKey,
+    query: &str,
+    globs: &[String],
+    limit: usize,
+    indexed: Option<&HashSet<FileRef>>,
+    handle: Option<&RootHandle>,
+) -> Result<RootSignals> {
     let terms = cap_terms(split_terms(query));
     let mut warnings = Vec::new();
-    let root = corpus_key.canonical_root.to_string_lossy().into_owned();
-    let roots = [root];
+    let mut roots = Vec::new();
+    // A gitignored root such as `.cheese` is absent from a fresh worktree.
+    // It holds nothing to grep, and rg would fail the pass for it.
+    if let Ok(true) | Err(_) = corpus_key.canonical_root.try_exists() {
+        roots.push(corpus_key.canonical_root.to_string_lossy().into_owned());
+    }
     // Bound on total rg hits collected. Hits are pool-gated downstream by
     // `resolve_rg_hits_to_chunks`, which attributes them to at most the
     // pool's `limit` chunks -- and that mapping is lossy in both directions:
@@ -279,25 +327,33 @@ pub(crate) async fn search_fused_indexed(
             // nothing to rank, so its pass is dropped. The lexical
             // fallback owns that root.
             if signals.hits.is_empty() && indexed.is_some_and(HashSet::is_empty) {
-                return Ok(FusedSearch::default());
+                return Ok(RootSignals::default());
             }
             rg_fut.await
         }
     };
     if signals.hits.is_empty() {
-        let _ = resolve_rg_run(rg_res, RIPGREP_TIMEOUT, &mut warnings);
-        return Ok(FusedSearch {
-            hits: Vec::new(),
+        let _ = resolve_rg_run(
+            rg_res,
+            RIPGREP_TIMEOUT,
+            &corpus_key.canonical_root,
+            &mut warnings,
+        );
+        return Ok(RootSignals {
             warnings,
-            unpooled_files: None,
+            ..RootSignals::default()
         });
     }
-    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) =
-        resolve_rg_run(rg_res, RIPGREP_TIMEOUT, &mut warnings);
+    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) = resolve_rg_run(
+        rg_res,
+        RIPGREP_TIMEOUT,
+        &corpus_key.canonical_root,
+        &mut warnings,
+    );
 
     let (rg_chunk_counts, rg_stats) = resolve_rg_hits_to_chunks(&signals.hits, &rg_hits);
     let resolved_chunks = rg_chunk_counts.len();
-    let rg_list = ranked_by_term_count(rg_chunk_counts, &signals.hits, &corpus_key.canonical_root);
+    let rg = ranked_by_term_count(rg_chunk_counts, &signals.hits, &corpus_key.canonical_root);
 
     tracing::debug!(
         target: "hallouminate::search",
@@ -355,56 +411,200 @@ pub(crate) async fn search_fused_indexed(
         });
     }
 
-    let fm_list = ranked_by_term_count(
+    let contains = ranked_by_term_count(
         contains_term_counts(&signals.hits, &terms),
         &signals.hits,
         &corpus_key.canonical_root,
     );
+    let SignalLists {
+        fts,
+        vector,
+        fts_scores,
+        vector_distances,
+        hits,
+    } = signals;
+    let fts = raw_entries(fts, &fts_scores, |score| score);
+    let vector = raw_entries(vector, &vector_distances, |distance| -distance);
 
     tracing::debug!(
         target: "hallouminate::search",
-        fts = %signal_order_log(&signals.fts, &signals.hits),
-        vector = %signal_order_log(&signals.vector, &signals.hits),
-        rg = %signal_order_log(&rg_list, &signals.hits),
-        fm = %signal_order_log(&fm_list, &signals.hits),
+        fts = %signal_order_log(&fts, &hits),
+        vector = %signal_order_log(&vector, &hits),
+        rg = %signal_order_log(&rg, &hits),
+        fm = %signal_order_log(&contains, &hits),
         "pre-fusion signal order"
     );
+    Ok(RootSignals {
+        corpus: corpus_key.name.clone(),
+        fts,
+        vector,
+        rg,
+        contains,
+        hits,
+        warnings,
+        unpooled_files,
+    })
+}
+
+/// Pairs each chunk_id with its raw store score, mapped so higher is better.
+fn raw_entries(
+    chunk_ids: Vec<String>,
+    raw: &HashMap<String, f32>,
+    strength: fn(f32) -> f32,
+) -> Vec<SignalEntry> {
+    let mut entries = Vec::with_capacity(chunk_ids.len());
+    for chunk_id in chunk_ids {
+        let strength = raw.get(&chunk_id).copied().map(strength);
+        entries.push(SignalEntry { chunk_id, strength });
+    }
+    entries
+}
+
+/// One root's signal entry, keyed for a ranking that spans roots.
+struct MergedEntry {
+    key: String,
+    strength: Option<f32>,
+    priority: bool,
+    rank: usize,
+    root: usize,
+}
+
+/// Orders one signal's entries from every root as one list, best first:
+/// by raw strength, then the priority corpus on equal strength, then by
+/// rank within the root.
+fn merge_signal(mut entries: Vec<MergedEntry>) -> Vec<String> {
+    entries.sort_by(|left, right| {
+        let by_strength = match (left.strength, right.strength) {
+            (Some(left), Some(right)) => right.total_cmp(&left),
+            (Some(_), None) | (None, Some(_)) | (None, None) => std::cmp::Ordering::Equal,
+        };
+        by_strength
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| left.rank.cmp(&right.rank))
+            .then_with(|| left.root.cmp(&right.root))
+    });
+    let mut keys = Vec::with_capacity(entries.len());
+    for entry in entries {
+        keys.push(entry.key);
+    }
+    keys
+}
+
+/// Whether every full-text and vector entry of every root carries a raw
+/// store score, so ranks can compare across roots.
+fn report_raw_scores(roots: &[RootSignals]) -> bool {
+    for root in roots {
+        for entry in root.fts.iter().chain(&root.vector) {
+            if entry.strength.is_none() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Fuses the signal lists of one or more roots as one weighted RRF ranking.
+///
+/// Every signal merges its lists across roots before fusion, so each rank is
+/// global. A root's best chunk then outranks another root's chunks only on
+/// the evidence, not because it led its own root. On equal evidence, chunks
+/// of `priority_corpus` rank first. A store that reports no raw scores gives
+/// no basis to compare roots, so each root then fuses alone.
+///
+/// Every returned hit's `score` is the fused RRF score, not the
+/// per-signal score the storage layer supplied.
+pub(crate) fn fuse_roots(
+    roots: Vec<RootSignals>,
+    query: &str,
+    priority_corpus: Option<&str>,
+) -> Vec<SearchHit> {
+    let terms = cap_terms(split_terms(query));
+    if report_raw_scores(&roots) {
+        return fuse_together(roots, &terms, priority_corpus);
+    }
+    let mut hits = Vec::new();
+    for root in roots {
+        hits.extend(fuse_together(vec![root], &terms, priority_corpus));
+    }
+    hits
+}
+
+fn fuse_together(
+    roots: Vec<RootSignals>,
+    terms: &[String],
+    priority_corpus: Option<&str>,
+) -> Vec<SearchHit> {
+    let mut fts = Vec::new();
+    let mut vector = Vec::new();
+    let mut rg = Vec::new();
+    let mut contains = Vec::new();
+    let mut hits = HashMap::new();
+    for (root, signals) in roots.into_iter().enumerate() {
+        let RootSignals {
+            corpus,
+            fts: root_fts,
+            vector: root_vector,
+            rg: root_rg,
+            contains: root_contains,
+            hits: root_hits,
+            warnings: _,
+            unpooled_files: _,
+        } = signals;
+        let priority = priority_corpus == Some(corpus.as_str());
+        // Two roots can return the same chunk_id for a file that both
+        // corpora select, so keys carry the root.
+        let key = |chunk_id: &str| format!("{root}/{chunk_id}");
+        for (merged, list) in [
+            (&mut fts, root_fts),
+            (&mut vector, root_vector),
+            (&mut rg, root_rg),
+            (&mut contains, root_contains),
+        ] {
+            for (rank, entry) in list.into_iter().enumerate() {
+                merged.push(MergedEntry {
+                    key: key(&entry.chunk_id),
+                    strength: entry.strength,
+                    priority,
+                    rank,
+                    root,
+                });
+            }
+        }
+        for (chunk_id, hit) in root_hits {
+            hits.insert(key(&chunk_id), hit);
+        }
+    }
     let mut lists = vec![
         RankedList {
             weight: FTS_WEIGHT,
-            chunk_ids: signals.fts,
+            chunk_ids: merge_signal(fts),
         },
         RankedList {
             weight: VECTOR_WEIGHT,
-            chunk_ids: signals.vector,
+            chunk_ids: merge_signal(vector),
         },
         RankedList {
             weight: RIPGREP_WEIGHT,
-            chunk_ids: rg_list,
+            chunk_ids: merge_signal(rg),
         },
         RankedList {
             weight: CONTAINS_WEIGHT,
-            chunk_ids: fm_list,
+            chunk_ids: merge_signal(contains),
         },
     ];
     let baseline = fuse(&lists, RRF_K);
-    lists.extend(structural_lists(&signals.hits, &terms, &baseline));
+    lists.extend(structural_lists(&hits, terms, &baseline));
     let fused = fuse(&lists, RRF_K);
 
-    let mut hits = signals.hits;
     let mut ranked = Vec::with_capacity(fused.len());
-    for (chunk_id, score) in fused {
-        let Some(mut hit) = hits.remove(&chunk_id) else {
+    for (key, score) in fused {
+        let Some(mut hit) = hits.remove(&key) else {
             continue;
         };
         hit.score = score;
         ranked.push(hit);
     }
-    Ok(FusedSearch {
-        hits: ranked,
-        warnings,
-        unpooled_files,
-    })
+    ranked
 }
 
 /// Bound on the rg subprocess. The `max_hits` truncation only fires when
@@ -512,11 +712,7 @@ pub async fn lexical_fallback_search(
             ),
         });
     }
-    FusedSearch {
-        hits,
-        warnings,
-        unpooled_files: None,
-    }
+    FusedSearch { hits, warnings }
 }
 
 /// Eligible files with no indexed rows, sorted and capped at
@@ -648,12 +844,12 @@ fn structural_lists(
 /// pairs, root-relativized, for the `hallouminate::search` debug log above.
 /// Not read by production ranking — a seam for `#[ignore]`d eval
 /// diagnostics to recover per-signal rank without a schema change.
-fn signal_order_log(list: &[String], hits: &HashMap<String, SearchHit>) -> String {
+fn signal_order_log(list: &[SignalEntry], hits: &HashMap<String, SearchHit>) -> String {
     list.iter()
         .take(20)
-        .map(|chunk_id| match hits.get(chunk_id) {
+        .map(|entry| match hits.get(&entry.chunk_id) {
             Some(hit) => format!("{}:{}", hit.file_ref, hit.line_start),
-            None => format!("{chunk_id}:?"),
+            None => format!("{}:?", entry.chunk_id),
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -789,6 +985,7 @@ fn contains_term_counts(
 fn resolve_rg_run(
     rg_res: std::result::Result<Result<ripgrep::RipgrepRun>, tokio::time::error::Elapsed>,
     timeout: std::time::Duration,
+    root: &Path,
     warnings: &mut Vec<Warning>,
 ) -> (Vec<RipgrepHit>, bool, u64, usize) {
     match rg_res {
@@ -798,7 +995,8 @@ fn resolve_rg_run(
             warnings.push(Warning {
                 code: warning_codes::RIPGREP_FAILED.to_string(),
                 message: format!(
-                    "ripgrep pass failed ({error}); ranking without the ripgrep signal"
+                    "ripgrep pass failed in corpus root {} ({error}); ranking without the ripgrep signal",
+                    root.display()
                 ),
             });
             (Vec::new(), false, 0, 0)
@@ -835,7 +1033,7 @@ fn ranked_by_term_count(
     counts: HashMap<String, usize>,
     hits: &HashMap<String, SearchHit>,
     canonical_root: &Path,
-) -> Vec<String> {
+) -> Vec<SignalEntry> {
     let mut decorated: Vec<((String, usize, String), usize, String)> = counts
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -845,10 +1043,14 @@ fn ranked_by_term_count(
         })
         .collect();
     decorated.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    decorated
-        .into_iter()
-        .map(|(_, _, chunk_id)| chunk_id)
-        .collect()
+    let mut entries = Vec::with_capacity(decorated.len());
+    for (_, count, chunk_id) in decorated {
+        entries.push(SignalEntry {
+            chunk_id,
+            strength: Some(count as f32),
+        });
+    }
+    entries
 }
 
 /// Deterministic, root-relative sort key for a chunk_id tie: the file's
@@ -1349,6 +1551,13 @@ mod tests {
         assert_eq!(stats.dropped_line_out_of_range, 1);
     }
 
+    fn ids(entries: Vec<SignalEntry>) -> Vec<String> {
+        let mut ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            ids.push(entry.chunk_id);
+        }
+        ids
+    }
     #[test]
     fn chunk_matching_more_distinct_terms_ranks_first() {
         let mut counts = HashMap::new();
@@ -1361,7 +1570,11 @@ mod tests {
             hit("some", "/repo/wiki/some.md", 1, 10),
         ]);
         assert_eq!(
-            ranked_by_term_count(counts, &hits, &corpus_key().canonical_root),
+            ids(ranked_by_term_count(
+                counts,
+                &hits,
+                &corpus_key().canonical_root
+            )),
             vec!["many", "some", "few"]
         );
     }
@@ -1380,7 +1593,11 @@ mod tests {
             hit("none", "/repo/wiki/x.md", 1, 10),
         ]);
         assert_eq!(
-            ranked_by_term_count(counts, &hits, &corpus_key().canonical_root),
+            ids(ranked_by_term_count(
+                counts,
+                &hits,
+                &corpus_key().canonical_root
+            )),
             vec!["aaa", "zzz"]
         );
     }
@@ -1443,8 +1660,16 @@ mod tests {
         let (walker_b, sandbox_b) = ("zzz999", "aaa000");
         let hits_b = hits_for("/zz/other/wiki", walker_b, sandbox_b);
 
-        let order_a = ranked_by_term_count(counts_for(walker_a, sandbox_a), &hits_a, &root_a);
-        let order_b = ranked_by_term_count(counts_for(walker_b, sandbox_b), &hits_b, &root_b);
+        let order_a = ids(ranked_by_term_count(
+            counts_for(walker_a, sandbox_a),
+            &hits_a,
+            &root_a,
+        ));
+        let order_b = ids(ranked_by_term_count(
+            counts_for(walker_b, sandbox_b),
+            &hits_b,
+            &root_b,
+        ));
 
         assert_eq!(
             order_a,
@@ -1556,6 +1781,8 @@ mod tests {
             Ok(SignalLists {
                 fts: self.fts.clone(),
                 vector: self.vector.clone(),
+                fts_scores: HashMap::new(),
+                vector_distances: HashMap::new(),
                 hits: self.hits.clone(),
             })
         }
@@ -1706,11 +1933,11 @@ mod tests {
         // A Ground response that claims four-signal fusion while actually
         // ranked on fewer is the failure this warning exists to prevent: the
         // degradation is already logged, but logs do not reach the caller.
+        // An unclosed glob class makes rg exit 2 on an existing root.
+        let root = tempfile::tempdir().expect("tempdir");
         let corpus_key = CorpusKey {
             name: "fixtures".into(),
-            canonical_root: std::path::PathBuf::from(
-                "/nonexistent/hallouminate-rg-failure-fixture",
-            ),
+            canonical_root: root.path().to_path_buf(),
         };
         let store = FakeFusionStore {
             fts: vec!["a".into()],
@@ -1718,9 +1945,15 @@ mod tests {
             hits: pool(vec![hit_with_search_text("a", "unrelated")]),
         };
 
-        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
-            .await
-            .expect("a failed ripgrep pass must degrade the ranking, not fail the query");
+        let result = search_fused(
+            &store,
+            &corpus_key,
+            "distinctiveterm",
+            &["[".to_string()],
+            10,
+        )
+        .await
+        .expect("a failed ripgrep pass must degrade the ranking, not fail the query");
 
         assert_eq!(
             result
@@ -1742,11 +1975,10 @@ mod tests {
     async fn empty_pool_early_return_still_surfaces_a_failed_ripgrep_warning() {
         // Finding 6: the empty-pool early return used to discard rg_res
         // outright, so a failed/timed-out rg on this path warned nobody.
+        let root = tempfile::tempdir().expect("tempdir");
         let corpus_key = CorpusKey {
             name: "fixtures".into(),
-            canonical_root: std::path::PathBuf::from(
-                "/nonexistent/hallouminate-rg-failure-fixture-empty-pool",
-            ),
+            canonical_root: root.path().to_path_buf(),
         };
         let store = FakeFusionStore {
             fts: Vec::new(),
@@ -1754,9 +1986,15 @@ mod tests {
             hits: HashMap::new(),
         };
 
-        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
-            .await
-            .expect("an empty pool must not fail the query");
+        let result = search_fused(
+            &store,
+            &corpus_key,
+            "distinctiveterm",
+            &["[".to_string()],
+            10,
+        )
+        .await
+        .expect("an empty pool must not fail the query");
 
         assert_eq!(
             result
@@ -1768,6 +2006,171 @@ mod tests {
             "a failed ripgrep pass must be reported even when the FTS/vector pool was empty"
         );
         assert!(result.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_skips_ripgrep_without_a_warning() {
+        // A gitignored corpus root such as `.cheese` is absent from a fresh
+        // worktree. It has nothing to grep, so it must not report a failure.
+        let parent = tempfile::tempdir().expect("tempdir");
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root: parent.path().join(".cheese"),
+        };
+        let store = FakeFusionStore {
+            fts: vec!["a".into()],
+            vector: Vec::new(),
+            hits: pool(vec![hit_with_search_text("a", "unrelated")]),
+        };
+
+        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
+            .await
+            .expect("a missing root must not fail the query");
+
+        assert!(
+            result.warnings.is_empty(),
+            "a missing root has nothing to grep: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.hits.len(), 1);
+    }
+
+    fn root_signals(
+        corpus: &str,
+        fts: &[(&str, f32)],
+        vector: &[(&str, f32)],
+        hits: Vec<SearchHit>,
+    ) -> RootSignals {
+        let mut fts_entries = Vec::new();
+        for (chunk_id, score) in fts {
+            fts_entries.push(SignalEntry {
+                chunk_id: (*chunk_id).to_string(),
+                strength: Some(*score),
+            });
+        }
+        let mut vector_entries = Vec::new();
+        for (chunk_id, distance) in vector {
+            vector_entries.push(SignalEntry {
+                chunk_id: (*chunk_id).to_string(),
+                strength: Some(-distance),
+            });
+        }
+        RootSignals {
+            corpus: corpus.to_string(),
+            fts: fts_entries,
+            vector: vector_entries,
+            hits: pool(hits),
+            ..RootSignals::default()
+        }
+    }
+
+    fn fused_ids(hits: &[SearchHit]) -> Vec<&str> {
+        let mut ids = Vec::with_capacity(hits.len());
+        for hit in hits {
+            ids.push(hit.chunk_id.as_str());
+        }
+        ids
+    }
+
+    #[test]
+    fn a_weak_root_leader_does_not_outrank_stronger_chunks_of_another_root() {
+        // Per-root fusion gave every root's first chunk the top score, so
+        // an irrelevant page that led a small foreign corpus outranked the
+        // relevant pages of the local corpus.
+        let local = root_signals(
+            "local",
+            &[("local-a", 9.0), ("local-b", 7.0)],
+            &[("local-a", 0.20), ("local-b", 0.25)],
+            vec![
+                hit("local-a", "/repo/wiki/a.md", 1, 5),
+                hit("local-b", "/repo/wiki/b.md", 1, 5),
+            ],
+        );
+        let foreign = root_signals(
+            "foreign",
+            &[("foreign", 0.4)],
+            &[("foreign", 0.90)],
+            vec![hit("foreign", "/other/wiki/loudness.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![foreign, local], "watcher reconciliation", None);
+
+        assert_eq!(fused_ids(&fused), vec!["local-a", "local-b", "foreign"]);
+        assert!(fused[1].score > fused[2].score);
+    }
+
+    #[test]
+    fn equal_evidence_ranks_the_priority_corpus_first() {
+        let first = root_signals(
+            "neighbor",
+            &[("neighbor", 3.0)],
+            &[("neighbor", 0.5)],
+            vec![hit("neighbor", "/other/wiki/a.md", 1, 5)],
+        );
+        let second = root_signals(
+            "local",
+            &[("local", 3.0)],
+            &[("local", 0.5)],
+            vec![hit("local", "/repo/wiki/a.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![first, second], "term", Some("local"));
+
+        assert_eq!(fused_ids(&fused), vec!["local", "neighbor"]);
+    }
+
+    #[test]
+    fn roots_without_raw_scores_fuse_alone_with_equal_leaders() {
+        let mut first = root_signals(
+            "first",
+            &[],
+            &[],
+            vec![
+                hit("first-a", "/repo/wiki/a.md", 1, 5),
+                hit("first-b", "/repo/wiki/b.md", 1, 5),
+            ],
+        );
+        first.fts = vec![
+            SignalEntry {
+                chunk_id: "first-a".into(),
+                strength: None,
+            },
+            SignalEntry {
+                chunk_id: "first-b".into(),
+                strength: None,
+            },
+        ];
+        let second = root_signals(
+            "second",
+            &[("second-a", 100.0)],
+            &[],
+            vec![hit("second-a", "/other/wiki/a.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![first, second], "term", None);
+
+        assert_eq!(fused_ids(&fused), vec!["first-a", "first-b", "second-a"]);
+        assert!((fused[0].score - fused[2].score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_same_chunk_id_in_two_roots_stays_two_hits() {
+        let first = root_signals(
+            "first",
+            &[("shared", 2.0)],
+            &[],
+            vec![hit("shared", "/repo/wiki/a.md", 1, 5)],
+        );
+        let second = root_signals(
+            "second",
+            &[("shared", 1.0)],
+            &[],
+            vec![hit("shared", "/repo/wiki/a.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![first, second], "term", None);
+
+        assert_eq!(fused.len(), 2);
     }
 
     struct FakeMembershipStore {
@@ -1789,6 +2192,8 @@ mod tests {
             Ok(SignalLists {
                 fts: Vec::new(),
                 vector: Vec::new(),
+                fts_scores: HashMap::new(),
+                vector_distances: HashMap::new(),
                 hits: HashMap::new(),
             })
         }

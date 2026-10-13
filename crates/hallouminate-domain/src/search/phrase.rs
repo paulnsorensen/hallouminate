@@ -146,7 +146,6 @@ pub(crate) async fn search_phrase_in(
     Ok(FusedSearch {
         hits: ranked,
         warnings,
-        unpooled_files: None,
     })
 }
 

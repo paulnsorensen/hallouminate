@@ -13,11 +13,13 @@ working directory as a fallback.
 
 ## Corpus scoping
 
-`ground` with no `corpus` searches **every** effective corpus and merges the
-results into a single ranked set. The wiki for the repository containing the
-request's `cwd` is the priority corpus: its pages win score ties and are ranked
-first. Every hit carries its own source corpus, and passing `corpus` explicitly
-pins the search to that one corpus.
+`ground` with no `corpus` searches **every** effective corpus and fuses the
+results into a single ranked set. Every signal ranks the chunks of all corpora
+together, so a page that leads its own corpus does not outrank stronger pages
+of another corpus. The wiki for the repository containing the request's `cwd`
+is the priority corpus: its pages win score ties and keep reserved slots in the
+`top_files` cut. Every hit carries its own source corpus, and passing `corpus`
+explicitly pins the search to that one corpus.
 
 The other read-side tools (`read_markdown`, `list_files`, `list_tree`,
 `backlinks`, `corpus_stats`) that omit `corpus` default to the wiki for the
