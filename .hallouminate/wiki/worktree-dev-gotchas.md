@@ -127,17 +127,20 @@ reconciles an abandoned worktree branch against `main`.
 - Periodically sweep `git branch --list 'worktree-agent-*'` for branches holding
   commits that are not ancestors of `main`.
 
-## Wiki index rows stomp across worktrees
+## Wiki index rows no longer stomp across worktrees (resolved)
 
-Added 2026-07-13. Indexing or `add_markdown`-ing the repo wiki from one
-worktree **deletes the sibling worktrees' rows** for that corpus from the
-shared LanceDB table — on-disk files are untouched, but `ground` stops
-finding pages written from the other checkout. If wiki pages you wrote
-"disappear" from search after working in another worktree, this is why.
-Mechanism, symptoms, and the agreed fix direction (#215):
-[worktree-corpus-identity](worktree-corpus-identity.md). Recover the view
-you want with `hallouminate index` from the checkout you care about.
+Added 2026-07-13; resolved. Before #215, indexing or `add_markdown` of the
+repo wiki from one worktree deleted the rows of the sibling worktrees for
+that corpus. Each corpus is now keyed by `CorpusKey { name, canonical_root }`,
+so a write in one worktree does not touch the rows of another. The schema 7
+split store (#612) also shares content across roots: a sibling worktree with
+byte-identical files writes only `root_files` map rows and embeds nothing.
+See [worktree-corpus-identity](worktree-corpus-identity.md) and the content
+key entry in [domain-model](domain-model.md).
 
+The remaining trap is the target corpus, not lost rows. From a worktree,
+pass an explicit `corpus`, or author from the main checkout. See
+[wiki-conventions](wiki-conventions.md).
 
 ## Mise shims can override the verification toolchain
 
