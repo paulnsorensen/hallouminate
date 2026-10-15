@@ -5920,11 +5920,14 @@ enabled = false
     harness.shutdown().await.expect("shutdown");
 }
 
-// Issue #642: add_markdown batches the ancestor index reindex into one commit.
+// Issue #642: add_markdown batches the ancestor index reindex into a fixed
+// number of commits per mutation, independent of depth.
 
-/// Count LanceDB manifest files under `dir`. Every table commit (merge insert,
-/// delete, index optimize) writes one, so the count measures commit cycles.
-fn lance_manifest_count(dir: &Path) -> usize {
+/// Count manifest files of the LanceDB file-map table (`root_files`) under
+/// `dir`. The store merge-inserts into that table exactly once per
+/// `commit_batch`, so the count measures commit cycles without depending on
+/// the search-index refresh heuristic.
+fn lance_file_map_manifest_count(dir: &Path) -> usize {
     let mut total = 0;
     let mut pending = vec![dir.to_path_buf()];
     while let Some(current) = pending.pop() {
@@ -5936,8 +5939,13 @@ fn lance_manifest_count(dir: &Path) -> usize {
             if !path.is_dir() {
                 continue;
             }
-            if path.file_name().is_some_and(|name| name == "_versions") {
-                total += std::fs::read_dir(&path).expect("read _versions").count();
+            if path
+                .file_name()
+                .is_some_and(|name| name == "root_files.lance")
+            {
+                total += std::fs::read_dir(path.join("_versions"))
+                    .expect("read root_files _versions")
+                    .count();
             } else {
                 pending.push(path);
             }
@@ -5992,14 +6000,22 @@ model = "BAAI/bge-small-en-v1.5"
     // Warm up: creates the table, its search indexes, and the root index.md.
     add("warm.md").await;
 
-    let before_shallow = lance_manifest_count(&ground);
+    let before_shallow = lance_file_map_manifest_count(&ground);
     let shallow = add("shallow.md").await;
-    let shallow_commits = lance_manifest_count(&ground) - before_shallow;
+    let shallow_commits = lance_file_map_manifest_count(&ground)
+        .checked_sub(before_shallow)
+        .expect("file-map manifest count must not shrink after a shallow add");
+    assert!(
+        shallow_commits > 0,
+        "a shallow add must commit to the file-map table"
+    );
     assert_eq!(shallow["indexed"]["corpora"][0]["files_upserted"], 2);
 
-    let before_deep = lance_manifest_count(&ground);
+    let before_deep = lance_file_map_manifest_count(&ground);
     let deep = add("a/b/c/deep.md").await;
-    let deep_commits = lance_manifest_count(&ground) - before_deep;
+    let deep_commits = lance_file_map_manifest_count(&ground)
+        .checked_sub(before_deep)
+        .expect("file-map manifest count must not shrink after a deep add");
     // Page plus root, a, a/b, a/b/c index.md files.
     assert_eq!(deep["indexed"]["corpora"][0]["files_upserted"], 5);
     assert!(
@@ -6012,7 +6028,7 @@ model = "BAAI/bge-small-en-v1.5"
     assert_eq!(
         deep_commits, shallow_commits,
         "a page three directories deep must reindex its ancestors in the same \
-         single commit cycle as a root-level page"
+         number of commits as a root-level page, independent of depth"
     );
 
     let stats_wire = client

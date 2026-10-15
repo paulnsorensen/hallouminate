@@ -1253,23 +1253,20 @@ async fn handle_add_markdown(
     let write_root = root.clone();
     let write_relative = relative.clone();
     let error_relative = relative.clone();
-    // Read scalars and the empty-content flag before consuming `req.content`,
-    // so the move into `into_bytes()` avoids cloning a potentially large body.
+    // Read scalars and the empty-content flag before consuming `req.content`.
+    // The write task hands the bytes back, so the page body is never copied.
     let overwrite = force_overwrite;
     let content_is_empty = req.content.trim().is_empty();
-    let page_bytes = if content_is_empty {
-        Vec::new()
-    } else {
-        req.content.clone().into_bytes()
-    };
     let content_bytes = req.content.into_bytes();
     let written = tokio::task::spawn_blocking(move || {
-        atomic_write_no_follow(&write_root, &write_relative, &content_bytes, overwrite)
+        let result =
+            atomic_write_no_follow(&write_root, &write_relative, &content_bytes, overwrite);
+        (result, content_bytes)
     })
     .await;
-    let dest = match written {
-        Ok(Ok(p)) => p,
-        Ok(Err(WriteError { kind, source })) => {
+    let (dest, page_bytes) = match written {
+        Ok((Ok(p), bytes)) => (p, bytes),
+        Ok((Err(WriteError { kind, source }), _)) => {
             let resp = match kind {
                 WriteErrorKind::Exists => DaemonResponse::invalid_params(format!(
                     "{} already exists; pass overwrite=true to replace it",
@@ -1303,8 +1300,8 @@ async fn handle_add_markdown(
     // don't need the embedding model active. When the request is overwriting
     // a previously-indexed file with empty content, also prune the existing
     // LanceDB rows so searches stop returning the deleted body — the shared
-    // `apply`/`EmptyFilePolicy::Evict` path (see `apply.rs`) does this for the
-    // full `index_single_file` path, but the short-circuit below bypasses it.
+    // `apply`/`EmptyFilePolicy::Evict` path (see `apply.rs`) does this for
+    // non-empty content, but the short-circuit below bypasses it.
     let mut stats = hallouminate_domain::indexer::ApplyStats::default();
     if content_is_empty {
         stats.files_skipped_empty = 1;
@@ -1335,6 +1332,7 @@ async fn handle_add_markdown(
     // durable write and retry `index` rather than losing visibility into
     // it entirely.
     let mut ancestors = AncestorIndexWrites::default();
+    let mut ancestors_skipped: Vec<String> = Vec::new();
     if is_wiki_corpus(&corpus) {
         ancestors = timed_step(
             "ancestor_compose_write",
@@ -1344,8 +1342,8 @@ async fn handle_add_markdown(
     }
 
     // Reindex the page and every rewritten ancestor index.md through ONE
-    // `apply` call, so the store commits and refreshes its search indexes
-    // once instead of once per file.
+    // `apply` call, so the store performs a fixed number of commits per
+    // mutation, independent of directory depth.
     let mut index_targets: Vec<PathBuf> = Vec::new();
     if !content_is_empty {
         index_targets.push(dest.clone());
@@ -1364,7 +1362,10 @@ async fn handle_add_markdown(
         )
         .await;
         match indexed {
-            Ok(batch_stats) => stats.merge(batch_stats),
+            Ok(batch) => {
+                stats.merge(batch.stats);
+                ancestors_skipped = batch.skipped;
+            }
             Err(e) => {
                 // The write above already durably completed; a model/store
                 // failure here must not hide that from the caller behind a
@@ -1386,10 +1387,13 @@ async fn handle_add_markdown(
             }
         }
     }
-    if let Some(msg) = ancestors.failure {
+    let mut ancestor_problems: Vec<String> = ancestors.failure.into_iter().collect();
+    ancestor_problems.extend(ancestors_skipped);
+    if !ancestor_problems.is_empty() {
         warnings.push(format!(
-            "wrote {} but ancestor index refresh failed: {msg}; run `index` to repair",
-            relative.display()
+            "wrote {} but ancestor index refresh failed: {}; run `index` to repair",
+            relative.display(),
+            ancestor_problems.join("; ")
         ));
     }
     drop(guard);
@@ -1680,7 +1684,8 @@ async fn handle_delete_markdown(
     // longer links to the deleted file. Same internal-error semantics as
     // the add_markdown path — partial regen would desync the wiki tree. The
     // rewritten ancestors are reindexed in one batch, even after a partial
-    // write failure, so the index never lags files already on disk.
+    // write failure, so the index lags files already on disk only when the
+    // reindex itself fails.
     if is_wiki_corpus(&corpus) {
         let ancestors = timed_step(
             "ancestor_compose_write",
@@ -1694,9 +1699,21 @@ async fn handle_delete_markdown(
         )
         .await;
         let failure = match (ancestors.failure, reindexed) {
-            (Some(msg), Ok(_) | Err(_)) => Some(msg),
+            (Some(msg), Ok(_)) => Some(msg),
+            (Some(msg), Err(e)) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %e,
+                    "delete_markdown: ancestor reindex also failed",
+                );
+                Some(msg)
+            }
             (None, Err(e)) => Some(format!("reindex ancestor indexes: {e}")),
-            (None, Ok(_)) => None,
+            (None, Ok(batch)) if batch.skipped.is_empty() => None,
+            (None, Ok(batch)) => Some(format!(
+                "reindex ancestor indexes: {}",
+                batch.skipped.join("; ")
+            )),
         };
         if let Some(msg) = failure {
             drop(guard);
@@ -1794,15 +1811,14 @@ async fn mark_stale(response: &mut hallouminate_domain::ground::GroundResponse) 
     }
 }
 
+/// Reindex a single file in tests, reading its content and mtime from the
+/// ambient path.
+///
 /// Uses `block_in_place` internally, which panics on a current-thread
-/// runtime — callers (and their tests) must run under the `multi_thread`
-/// flavor.
-/// Reindex a single file the daemon controls, reading its content and mtime
-/// from the ambient path. Used by the write/add-markdown handlers, which
-/// reindex a file they just wrote through the sandbox no-follow write path.
-/// The untrusted watcher path must NOT use this — it reads no-follow bytes and
-/// calls `index_single_file_with_content` directly to avoid a symlink-swap
-/// TOCTOU between validation and content read.
+/// runtime — callers must run under the `multi_thread` flavor. Production
+/// paths read no-follow bytes and call `index_single_file_with_content`
+/// directly to avoid a symlink-swap TOCTOU between validation and content
+/// read.
 #[cfg(test)]
 pub(super) async fn index_single_file(
     store: &LanceStore,
@@ -1844,32 +1860,63 @@ pub(super) async fn index_single_file_with_content(
 ///
 /// `preloaded` carries already-read bytes for one of `files` (the page the
 /// caller just wrote); that file is never re-read from disk. The other files
-/// are read from the ambient path, like [`index_single_file`].
+/// are read from the ambient path. A non-preloaded file that fails to stat,
+/// read, or plan is skipped and named in [`BatchedReindex::skipped`]; the rest
+/// of the batch still indexes. A failure on a preloaded file, or in `apply`,
+/// fails the whole call. When `apply` commits part of the batch before it
+/// fails, the call reports the error and zero `indexed`.
 pub(super) async fn index_files_batched(
     store: &LanceStore,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     files: &[PathBuf],
     preloaded: Option<(&Path, &[u8])>,
-) -> anyhow::Result<hallouminate_domain::indexer::ApplyStats> {
+) -> anyhow::Result<BatchedReindex> {
+    use anyhow::Context as _;
+
     let started = std::time::Instant::now();
     let mut batch_plan = IndexPlan::default();
     let mut preloaded_ref: Option<FileRef> = None;
+    let mut skipped: Vec<String> = Vec::new();
     for file in files {
-        let mtime = tokio::fs::metadata(file).await?.modified()?;
         if let Some((preloaded_path, bytes)) = preloaded
             && preloaded_path == file.as_path()
         {
+            let mtime = tokio::fs::metadata(file)
+                .await
+                .and_then(|meta| meta.modified())
+                .with_context(|| format!("reindex {}", file.display()))?;
             let file_ref =
                 plan_file_with_content(store, corpus, file, bytes, mtime, &mut batch_plan).await?;
             preloaded_ref = Some(file_ref);
             continue;
         }
-        let bytes = tokio::fs::read(file).await?;
-        plan_file_with_content(store, corpus, file, &bytes, mtime, &mut batch_plan).await?;
+        let planned = async {
+            let mtime = tokio::fs::metadata(file)
+                .await
+                .and_then(|meta| meta.modified())
+                .with_context(|| format!("reindex {}", file.display()))?;
+            let bytes = tokio::fs::read(file)
+                .await
+                .with_context(|| format!("reindex {}", file.display()))?;
+            plan_file_with_content(store, corpus, file, &bytes, mtime, &mut batch_plan).await
+        }
+        .await;
+        if let Err(e) = planned {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %e,
+                path = %file.display(),
+                "batched reindex: skipping file that failed to plan",
+            );
+            skipped.push(format!("skipped {}: {e:#}", file.display()));
+        }
     }
     if batch_plan.upserts.is_empty() && batch_plan.mtime_touches.is_empty() {
-        return Ok(ApplyStats::default());
+        return Ok(BatchedReindex {
+            stats: ApplyStats::default(),
+            skipped,
+        });
     }
     let mut precomputed: Option<(&FileRef, &[u8])> = None;
     if let Some(file_ref) = &preloaded_ref
@@ -1886,7 +1933,14 @@ pub(super) async fn index_files_batched(
         elapsed_ms = elapsed_ms(started),
         "batched reindex finished",
     );
-    Ok(stats)
+    Ok(BatchedReindex { stats, skipped })
+}
+
+/// Outcome of [`index_files_batched`]: the `apply` stats plus one message per
+/// file the batch skipped.
+pub(super) struct BatchedReindex {
+    pub(super) stats: hallouminate_domain::indexer::ApplyStats,
+    pub(super) skipped: Vec<String>,
 }
 
 /// Milliseconds since `started`, saturating at `u64::MAX`.
@@ -2250,16 +2304,13 @@ async fn write_ancestor_index(root: &Path, dir: &Path) -> Result<Option<PathBuf>
             // Treat a symlinked index.md as invalid (as if absent) so a
             // child directory's index.md symlink can't smuggle content
             // from outside the corpus into the composed ancestor index.
-            Ok(Err(e)) if matches!(e.kind, WriteErrorKind::Symlink) => None,
-            Ok(Err(e))
-                if matches!(e.kind, WriteErrorKind::Io)
-                    && e.source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                None
-            }
-            Ok(Err(e)) => {
-                return Err(format!("read {}: {}", index_path.display(), e.source));
-            }
+            Ok(Err(WriteError { kind, source })) => match kind {
+                WriteErrorKind::Symlink => None,
+                WriteErrorKind::Io if source.kind() == std::io::ErrorKind::NotFound => None,
+                WriteErrorKind::Io | WriteErrorKind::Exists | WriteErrorKind::InvalidPath => {
+                    return Err(format!("read {}: {}", index_path.display(), source));
+                }
+            },
             Ok(Ok(bytes)) => Some(String::from_utf8_lossy(&bytes).into_owned()),
             Err(e) => {
                 return Err(format!("read {} join failed: {e}", index_path.display()));
