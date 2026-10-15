@@ -8,7 +8,9 @@
 //! handle — that fallback is exactly the multi-process race the daemon is
 //! built to remove.
 
+use rmcp::handler::server::common::FromContextPart;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ContentBlock, ErrorCode, ErrorData, ServerCapabilities, ServerConfig,
@@ -445,9 +447,33 @@ fn map_daemon_err(err: anyhow::Error) -> ErrorData {
     internal_error(format!("{err:#}"))
 }
 
+const MISSING_CWD_MESSAGE: &str = "cwd is required: pass the absolute path of your active checkout (the worktree or workspace directory you are working in), for example {\"cwd\": \"/abs/path/to/repo\", ...}";
+
+/// Tool-call extractor that rejects a missing `cwd` before parameter
+/// deserialization, so the caller sees [`MISSING_CWD_MESSAGE`] instead of
+/// serde's first missing-field error. It only peeks at the arguments; each
+/// tool still deserializes its own `Parameters`, whose schema keeps `cwd`
+/// required.
+struct RequireCwd;
+
+impl<S> FromContextPart<ToolCallContext<'_, S>> for RequireCwd {
+    fn from_context_part(context: &mut ToolCallContext<S>) -> Result<Self, ErrorData> {
+        let has_cwd = context
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("cwd"))
+            .is_some_and(|cwd| !cwd.is_null());
+        if has_cwd {
+            Ok(Self)
+        } else {
+            Err(invalid_params(MISSING_CWD_MESSAGE))
+        }
+    }
+}
+
 /// Validate and canonicalize a tool call's required `cwd` argument.
 ///
-/// Rejects missing (enforced by the schema's `required`), empty, relative,
+/// Rejects missing (see [`RequireCwd`]), empty, relative,
 /// nonexistent, non-directory, and inaccessible values with an
 /// invalid-parameter error. Runs before any config lookup or daemon
 /// dispatch — there is no fallback (no MCP roots, no server-startup cwd, no
@@ -825,6 +851,7 @@ impl HallouminateTools {
     )]
     pub async fn ground(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<GroundParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -862,6 +889,7 @@ impl HallouminateTools {
     )]
     pub async fn index(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -895,6 +923,7 @@ impl HallouminateTools {
     )]
     pub async fn list_tree(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ListTreeParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -925,6 +954,7 @@ impl HallouminateTools {
     )]
     pub async fn list_files(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -957,6 +987,7 @@ impl HallouminateTools {
     )]
     pub async fn add_markdown(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<AddMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let params = match params {
@@ -994,6 +1025,7 @@ impl HallouminateTools {
     )]
     pub async fn read_markdown(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ReadMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let params = match params {
@@ -1030,6 +1062,7 @@ impl HallouminateTools {
     )]
     pub async fn delete_markdown(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<DeleteMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -1070,6 +1103,7 @@ impl HallouminateTools {
     )]
     pub async fn corpus_stats(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<CorpusStatsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -1098,6 +1132,7 @@ impl HallouminateTools {
     )]
     pub async fn list_corpora(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ListCorporaParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -1128,6 +1163,7 @@ impl HallouminateTools {
     )]
     pub async fn backlinks(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;

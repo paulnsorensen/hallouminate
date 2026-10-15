@@ -526,6 +526,27 @@ async fn mcp_tools_list_requires_cwd_on_every_tool() {
         .as_array()
         .expect("tools array present");
     assert!(!tools.is_empty(), "no tools advertised: {list}");
+    let advertised: Vec<&str> = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    for expected in [
+        "ground",
+        "index",
+        "list_tree",
+        "list_files",
+        "add_markdown",
+        "read_markdown",
+        "delete_markdown",
+        "corpus_stats",
+        "list_corpora",
+        "backlinks",
+    ] {
+        assert!(
+            advertised.contains(&expected),
+            "{expected} missing from {advertised:?}"
+        );
+    }
     for tool in tools {
         let name = tool["name"].as_str().unwrap_or("?");
         let required = tool["inputSchema"]["required"]
@@ -545,9 +566,9 @@ async fn mcp_tools_list_requires_cwd_on_every_tool() {
 async fn mcp_tool_call_without_cwd_fails_before_corpus_operation() {
     // AC-1: calls without a valid `cwd` fail before any corpus operation.
     // Uses `rpc_raw` so `rpc()`'s auto-injection can't supply the missing
-    // argument under test. An ABSENT field fails in the schema layer, which
-    // reports `isError` on the tool result; a PRESENT but invalid value
-    // reaches `validate_cwd` and returns `-32602`
+    // argument under test. An ABSENT field returns `-32602` with the
+    // actionable missing-`cwd` message; a PRESENT but invalid value reaches
+    // `validate_cwd` and also returns `-32602`
     // (`mcp_tool_invalid_cwd_never_falls_back` covers that path). Either way
     // no corpus data comes back.
     let xdg = tempfile::tempdir().expect("tempdir");
@@ -574,17 +595,19 @@ async fn mcp_tool_call_without_cwd_fails_before_corpus_operation() {
             json!({"name": "list_corpora", "arguments": {}}),
         )
         .await;
+    assert_eq!(
+        call["error"]["code"], -32602,
+        "missing cwd must be reported as invalid params: {call}"
+    );
     assert!(
-        call.to_string().contains("cwd"),
+        call["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("cwd is required"),
         "the failure must name the missing `cwd` field: {call}"
     );
-    assert_eq!(
-        call["result"]["isError"].as_bool(),
-        Some(true),
-        "missing cwd must be reported as an error: {call}"
-    );
     assert!(
-        call["result"].get("structuredContent").is_none(),
+        call.get("result").is_none(),
         "missing cwd must not return corpus data: {call}"
     );
 
@@ -2817,4 +2840,69 @@ async fn mcp_markdown_batch_accepts_twenty_items_and_retains_write_warnings() {
     );
     mcp.shutdown().await;
     harness.shutdown().await.expect("shutdown");
+}
+
+const MISSING_CWD_EXTRA_CALLS: [(&str, &str); 1] =
+    [("ground", r#"{"query":"proposer attempt history"}"#)];
+
+#[tokio::test]
+async fn mcp_missing_cwd_returns_actionable_invalid_params() {
+    let xdg = tempfile::tempdir().expect("tempdir");
+    write_minimal_config(xdg.path());
+    let mut mcp = Mcp::spawn(xdg.path(), None).await;
+    mcp.rpc(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {"name": "hallouminate-test", "version": "0.0.0"}
+        }),
+    )
+    .await;
+    mcp.notify("notifications/initialized", json!({})).await;
+
+    let list = mcp.rpc(2, "tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().expect("tools array");
+    let mut calls: Vec<(String, String)> = Vec::new();
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool name");
+        calls.push((name.to_owned(), "{}".to_owned()));
+    }
+    for (tool, arguments) in MISSING_CWD_EXTRA_CALLS {
+        calls.push((tool.to_owned(), arguments.to_owned()));
+    }
+
+    for (index, (tool, arguments)) in calls.into_iter().enumerate() {
+        let arguments: Value = serde_json::from_str(&arguments).expect("arguments json");
+        let call = mcp
+            .rpc_raw(
+                index as u64 + 3,
+                "tools/call",
+                json!({"name": tool, "arguments": arguments}),
+            )
+            .await;
+        assert_eq!(call["error"]["code"], -32602, "{tool} {arguments}: {call}");
+        let message = call["error"]["message"].as_str().expect("error message");
+        assert!(
+            message.contains("cwd is required: pass the absolute path of your active checkout"),
+            "{tool} {arguments}: {message}"
+        );
+        assert!(!message.contains("missing field"), "{message}");
+    }
+
+    let relative = mcp
+        .rpc_raw(
+            20,
+            "tools/call",
+            json!({"name": "list_corpora", "arguments": {"cwd": "relative/dir"}}),
+        )
+        .await;
+    assert_eq!(relative["error"]["code"], -32602, "{relative}");
+    assert_eq!(
+        relative["error"]["message"],
+        "cwd must be an absolute path, got \"relative/dir\""
+    );
+
+    mcp.shutdown().await;
 }
