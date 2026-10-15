@@ -5919,3 +5919,114 @@ enabled = false
     );
     harness.shutdown().await.expect("shutdown");
 }
+
+// Issue #642: add_markdown batches the ancestor index reindex into one commit.
+
+/// Count LanceDB manifest files under `dir`. Every table commit (merge insert,
+/// delete, index optimize) writes one, so the count measures commit cycles.
+fn lance_manifest_count(dir: &Path) -> usize {
+    let mut total = 0;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().is_some_and(|name| name == "_versions") {
+                total += std::fs::read_dir(&path).expect("read _versions").count();
+            } else {
+                pending.push(path);
+            }
+        }
+    }
+    total
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_add_markdown_deep_page_reindexes_ancestors_in_one_commit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo = tmp.path().join("my-repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    let toml = format!(
+        r#"
+[[repository]]
+name = "myrepo"
+path = "{r}"
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+model = "BAAI/bge-small-en-v1.5"
+"#,
+        r = repo.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("cfg parses");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let corpus = repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap();
+
+    let add = async |path: &str| -> serde_json::Value {
+        client
+            .call::<serde_json::Value>(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                    corpus: corpus.clone(),
+                    path: path.into(),
+                    content: format!("# Page\n\nBody of {path}.\n"),
+                    overwrite: false,
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("add_markdown {path} ok: {e}"))
+    };
+
+    // Warm up: creates the table, its search indexes, and the root index.md.
+    add("warm.md").await;
+
+    let before_shallow = lance_manifest_count(&ground);
+    let shallow = add("shallow.md").await;
+    let shallow_commits = lance_manifest_count(&ground) - before_shallow;
+    assert_eq!(shallow["indexed"]["corpora"][0]["files_upserted"], 2);
+
+    let before_deep = lance_manifest_count(&ground);
+    let deep = add("a/b/c/deep.md").await;
+    let deep_commits = lance_manifest_count(&ground) - before_deep;
+    // Page plus root, a, a/b, a/b/c index.md files.
+    assert_eq!(deep["indexed"]["corpora"][0]["files_upserted"], 5);
+    assert!(
+        deep["warnings"]
+            .as_array()
+            .is_none_or(|warnings| warnings.is_empty()),
+        "no warnings expected: {deep}"
+    );
+
+    assert_eq!(
+        deep_commits, shallow_commits,
+        "a page three directories deep must reindex its ancestors in the same \
+         single commit cycle as a root-level page"
+    );
+
+    let stats_wire = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some(corpus.clone()),
+            },
+        })
+        .await
+        .expect("corpus stats");
+    let stats: CorpusStatsResult = serde_json::from_value(daemon_ok_payload(stats_wire, "stats"))
+        .expect("decode corpus stats");
+    // warm, shallow, deep, and the four index.md files (root, a, a/b, a/b/c).
+    assert_eq!(stats.indexed_files, 7);
+    assert_eq!(stats.unindexed_files, 0);
+}
