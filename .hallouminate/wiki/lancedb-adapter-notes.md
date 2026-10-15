@@ -58,12 +58,13 @@ order.
 ## Verified available and unused (ranked backlog)
 
 Each item was checked against the 0.38 Rust API and our call sites. None
-is benchmarked; treat the value column as a hypothesis.
+is benchmarked; treat the value column as a hypothesis. Items 1 and 2
+shipped; the rows stay as a record.
 
 | # | Opportunity | Why | Value | Effort |
 |---|---|---|---|---|
-| 1 | Bitmap scalar index on `corpus` + `root`, BTree on `content_hash` | No scalar index exists. Every read filters `corpus = .. AND root = ..`, and donor reuse filters `content_hash IN (...)`. All are full scans. | high | low — two calls in `ensure_search_indexes` |
-| 2 | `.select()` projection on `fts_scan` and `vector_scan` | Neither projects, so every hit deserializes the full `embedding` FixedSizeList it never reads. `Select::columns` is already used on three other paths. | high | low |
+| 1 | **Shipped (#546).** Scalar indexes on the hot filter columns | #546 added them. The schema 7 split store (#612) moved the filters: BTree on `content_key` in `chunks`, and BTree on `corpus`, `root`, and `content_key` in `root_files` (`SCALAR_INDEXES` and `FILE_SCALAR_INDEXES`, `crates/hallouminate-adapters/src/lance.rs:884-891`). | high | low |
+| 2 | **Shipped (#542).** `.select()` projection on `fts_scan` and `vector_scan` | #542 projects the hit columns, so a hit no longer decodes the `embedding` column. | high | low |
 | 3 | Explicit `distance_type` on `nearest_to` | None is set, so lancedb uses L2. fastembed vectors are normalized and cosine is the intended metric. L2 and cosine agree on rank for unit vectors, so this is hygiene unless normalization ever changes. | medium | low |
 | 4 | BTree on `indexed_at_ms` and `ord` | Hot staleness paths use `only_if("ord = 0")` and filter on `indexed_at_ms`. | medium | low |
 | 5 | Explicit `IvfHnswSq` / `IvfHnswFlat` instead of `Index::Auto` | Memory-for-recall trade; needs a recall benchmark first. | low–medium | medium |
@@ -75,4 +76,4 @@ experimental and may break); computed columns, materialized views, the
 UDF catalog, LSM/MemWAL, the data loader, and `cherry_pick` are remote,
 server, or Python/Node only.
 
-_Source: PR #434 review, `.cheese/research/lancedb-038-migration/` · Updated: 2026-09-10 · Supersedes: —_
+_Source: PR #434 review, `.cheese/research/lancedb-038-migration/` · Updated: 2026-10-15 · Supersedes: —_
