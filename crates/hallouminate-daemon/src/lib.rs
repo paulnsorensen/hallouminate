@@ -41,8 +41,11 @@ mod status;
 mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod transport;
 mod watch;
 mod watchdog;
+#[cfg(windows)]
+mod windows_security;
 pub use bootstrap::ensure_daemon_running;
 pub use client::{
     DaemonClient, DaemonRpcError, client_for, client_for_with, connect_at, daemon_client,
