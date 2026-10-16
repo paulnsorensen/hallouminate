@@ -1,0 +1,7 @@
+[env]
+# Lance builds one DataFusion session per process and shares its 150 MiB
+# memory pool across every store. Each write reserves 40 MiB for sort
+# spilling, so parallel tests that each own a store exhaust the pool and
+# fail with "Not enough memory to continue external sort". The value is a
+# ceiling, not an allocation.
+LANCE_MEM_POOL_SIZE = "4294967296"

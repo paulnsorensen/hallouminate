@@ -152,15 +152,15 @@ _Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-7
 
 ## Worktree-index-provisioning terms
 
-<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). The code is **implemented in PR #430**. PR #430 is open. A person did not merge it yet. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
+<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). PR #430 (`4c41f6c`) implemented them. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
 
 **WatchRegistry** — A registry in the daemon. The registry owns runtime corpus discovery and reconciliation. The registry continues while the daemon operates. `handle_ground` registers each resolved corpus through `register_runtime_corpora`. A catch-up pass for a new registration runs in `spawn_registration_catch_up`. The pump stays active in degraded mode when the native debouncer cannot start (`mark_degraded`).
 _Avoid_: Provisioner, index scheduler, background indexer
 _Code_: `WatchRegistry`, `crates/hallouminate-daemon/src/watch/registry.rs`; `register_runtime_corpora`, `spawn_registration_catch_up`, `crates/hallouminate-daemon/src/watch/mod.rs`
 
-**Donor** — A group of stored rows with the same file-level `content_hash` as an upserted file. The group can be in any root or corpus in the store. If the donor has the same number of chunks as the new file, the store copies the donor vectors in `ord` sequence. If the counts are different, the store makes new embeddings.
-_Avoid_: cache entry
-_Code_: `decode_donor_rows` and `pick_donor_vectors`, `crates/hallouminate-adapters/src/lance.rs:442-540`; `LanceStore::apply_batch`, same file lines 1295-1350; `donor_vectors_batch`, same file line 1443; hash at `crates/hallouminate-domain/src/indexer/chunk.rs:35`
+**Content key** — The identity of one group of shared content rows in the `chunks` table. Schema 7 (#612) replaced per-root chunk rows with a split store. The `chunks` table holds content rows keyed by `content_key` and has no corpus or root column. The `root_files` table maps each `(corpus, root, file_ref)` to a content key. The key is a blake3 hash of the file `content_hash`, the file name, the derivation fingerprint (model, quantization, embeddings mode, schema version), and the prepared chunks. A worktree with byte-identical files writes map rows only and embeds nothing. The store embeds only content keys that have no stored rows. Orphan collection deletes content rows that no map row references.
+_Avoid_: donor, cache entry. The donor term described the schema 6 vector copy, which #612 removed.
+_Code_: `ContentKey::derive`, `crates/hallouminate-domain/src/indexer/content_key.rs:73`; `chunks_schema` and `root_files_schema`, `crates/hallouminate-adapters/src/lance.rs:280-324`; `LanceStore::prepare_batch` and `commit_batch`, same file lines 1763-1813; `delete_orphan_content`, same file line 2303
 
 ## Excluded concepts
 
