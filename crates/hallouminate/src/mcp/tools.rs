@@ -503,7 +503,8 @@ fn validate_cwd(cwd: &str) -> Result<PathBuf, ErrorData> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GroundParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Free-text query to embed and search against the index.
     pub query: String,
@@ -561,7 +562,8 @@ pub struct GroundParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IndexParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Optional corpus name; omit to index every configured corpus.
     #[serde(default)]
@@ -570,7 +572,8 @@ pub struct IndexParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CorpusStatsParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus name; defaults to the wiki for the repo containing `cwd`.
     /// Required only when no default applies and multiple corpora are
@@ -581,13 +584,15 @@ pub struct CorpusStatsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListCorporaParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus name; defaults to the wiki for the repo containing `cwd`.
     /// Required only when no default applies and multiple corpora are
@@ -598,7 +603,8 @@ pub struct ListFilesParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListTreeParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus name; defaults to the wiki for the repo containing `cwd`.
     /// Required only when no default applies and multiple corpora are
@@ -637,6 +643,8 @@ impl<'de> Deserialize<'de> for AddMarkdownParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AddMarkdownBatchParams {
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     cwd: String,
     corpus: String,
     /// One to twenty writes, in order. Earlier successful writes remain after item errors.
@@ -691,6 +699,8 @@ impl<'de> Deserialize<'de> for ReadMarkdownParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadMarkdownBatchParams {
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     cwd: String,
     #[serde(default)]
     corpus: Option<String>,
@@ -711,7 +721,8 @@ struct ReadMarkdownItemParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct AddMarkdownSingleParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the markdown file.
     pub corpus: String,
@@ -757,7 +768,8 @@ pub struct AddMarkdownSingleParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ReadMarkdownSingleParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the markdown file. Defaults to the wiki for the repo
     /// containing `cwd` when omitted.
@@ -784,7 +796,8 @@ pub struct ReadMarkdownSingleParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteMarkdownParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the markdown file.
     pub corpus: String,
@@ -796,7 +809,8 @@ pub struct DeleteMarkdownParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BacklinksParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the page. Defaults to the wiki for the repo
     /// containing `cwd`, same as `ground`.

@@ -557,9 +557,47 @@ async fn mcp_tools_list_requires_cwd_on_every_tool() {
             required.contains(&"cwd"),
             "tool `{name}` does not require `cwd`: {required:?}"
         );
+        let mut cwd_schemas = Vec::new();
+        collect_cwd_schemas(&tool["inputSchema"], &mut cwd_schemas);
+        assert!(
+            !cwd_schemas.is_empty(),
+            "tool `{name}` has no `cwd` property: {tool}"
+        );
+        for cwd in cwd_schemas {
+            let description = cwd["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("tool `{name}` cwd description missing: {cwd}"));
+            assert!(
+                description.contains("active checkout"),
+                "tool `{name}` cwd description must name the active checkout: {description}"
+            );
+        }
     }
 
     mcp.shutdown().await;
+}
+
+/// Collects every `cwd` property schema, including batch variants under `$defs`.
+fn collect_cwd_schemas<'a>(schema: &'a Value, found: &mut Vec<&'a Value>) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(cwd) = map
+                .get("properties")
+                .and_then(|properties| properties.get("cwd"))
+            {
+                found.push(cwd);
+            }
+            for child in map.values() {
+                collect_cwd_schemas(child, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_cwd_schemas(item, found);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
 }
 
 #[tokio::test]
