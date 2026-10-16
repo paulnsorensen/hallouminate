@@ -1096,87 +1096,82 @@ struct StoreLocks {
     _store_lock: std::fs::File,
 }
 
-/// One non-blocking `flock` attempt on `store.lock`. `Ok(None)` means the lock
-/// is currently held (`WOULDBLOCK`); any other errno is a distinct failure.
-fn try_acquire_store_lock(ground_dir: &Path, owner: &StoreLockOwner) -> Result<Option<StoreLocks>> {
-    use std::io::{Seek, Write};
-    use std::os::unix::fs::OpenOptionsExt;
-
-    use rustix::fs::{FlockOperation, flock};
-
-    let lock_path = ground_dir.join(STORE_LOCK_FILENAME);
-    let mut store_lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&lock_path)?;
-    match flock(&store_lock, FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => {
-            let diagnostics_lock = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME))?;
-            match flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => {}
-                Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => return Ok(None),
-                Err(errno) => {
-                    return Err(HallouminateError::Config(format!(
-                        "failed to guard lock diagnostics for {}: {}",
-                        ground_dir.display(),
-                        std::io::Error::from(errno),
-                    )));
-                }
-            }
-            let metadata = serde_json::to_vec(owner).map_err(|error| {
-                HallouminateError::Config(format!("serialize store lock owner: {error}"))
-            })?;
-            store_lock.set_len(0)?;
-            store_lock.rewind()?;
-            store_lock.write_all(&metadata)?;
-            store_lock.sync_data()?;
-            Ok(Some(StoreLocks {
-                _diagnostics_lock: diagnostics_lock,
-                _store_lock: store_lock,
-            }))
-        }
-        Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => Ok(None),
-        Err(errno) => Err(HallouminateError::Config(format!(
-            "failed to lock {}: {}",
-            ground_dir.display(),
-            std::io::Error::from(errno),
-        ))),
+fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    options.open(path)
 }
 
-/// Return metadata only while the current store holder also holds its
-/// diagnostics guard. A raw holder or a release/acquisition transition leaves
-/// the guard available, so stale bytes never become a false owner report.
-fn contended_store_lock_owner(ground_dir: &Path) -> Option<StoreLockOwner> {
-    use std::os::unix::fs::OpenOptionsExt;
+fn store_owner_path(ground_dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    let filename = STORE_LOCK_FILENAME;
+    #[cfg(windows)]
+    let filename = "store.lock.owner.json";
+    ground_dir.join(filename)
+}
 
-    use rustix::fs::{FlockOperation, flock};
+/// Attempts exclusive ownership without blocking.
+fn try_acquire_store_lock(ground_dir: &Path, owner: &StoreLockOwner) -> Result<Option<StoreLocks>> {
+    use std::fs::TryLockError;
+    use std::io::{Seek, Write};
 
-    let diagnostics_lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME))
-        .ok()?;
-    match flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive) {
-        Err(errno) if errno == rustix::io::Errno::WOULDBLOCK => {
-            let lock_path = ground_dir.join(STORE_LOCK_FILENAME);
-            std::fs::read(lock_path)
-                .ok()
-                .and_then(|contents| serde_json::from_slice(&contents).ok())
+    let store_lock = open_lock_file(&ground_dir.join(STORE_LOCK_FILENAME))?;
+    match store_lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(error)) => {
+            return Err(HallouminateError::Config(format!(
+                "failed to lock {}: {error}",
+                ground_dir.display(),
+            )));
         }
-        Ok(()) | Err(_) => None,
+    }
+    let diagnostics_lock = open_lock_file(&ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME))?;
+    match diagnostics_lock.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Ok(None),
+        Err(TryLockError::Error(error)) => {
+            return Err(HallouminateError::Config(format!(
+                "failed to guard lock diagnostics for {}: {error}",
+                ground_dir.display(),
+            )));
+        }
+    }
+    let metadata = serde_json::to_vec(owner).map_err(|error| {
+        HallouminateError::Config(format!("serialize store lock owner: {error}"))
+    })?;
+    #[cfg(unix)]
+    let metadata_file = &mut &store_lock;
+    #[cfg(windows)]
+    let metadata_file = &mut open_lock_file(&store_owner_path(ground_dir))?;
+    metadata_file.set_len(0)?;
+    metadata_file.rewind()?;
+    metadata_file.write_all(&metadata)?;
+    metadata_file.sync_data()?;
+    Ok(Some(StoreLocks {
+        _diagnostics_lock: diagnostics_lock,
+        _store_lock: store_lock,
+    }))
+}
+
+/// Returns owner metadata only while an instrumented store holds its diagnostics guard.
+fn contended_store_lock_owner(ground_dir: &Path) -> Option<StoreLockOwner> {
+    use std::fs::TryLockError;
+
+    let diagnostics_lock =
+        open_lock_file(&ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME)).ok()?;
+    match diagnostics_lock.try_lock() {
+        Err(TryLockError::WouldBlock) => {
+            let contents = std::fs::read(store_owner_path(ground_dir)).ok()?;
+            serde_json::from_slice(&contents).ok()
+        }
+        Ok(()) => None,
+        Err(TryLockError::Error(_error)) => None,
     }
 }
 
@@ -3006,20 +3001,10 @@ mod tests {
 
     #[test]
     fn diagnostics_reader_during_store_lock_transition_retries() {
-        use rustix::fs::{FlockOperation, flock};
-        use std::os::unix::fs::OpenOptionsExt;
-
         let temp = tempfile::tempdir().expect("tempdir");
-        let diagnostics_lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(temp.path().join(STORE_LOCK_DIAGNOSTICS_FILENAME))
+        let diagnostics_lock = open_lock_file(&temp.path().join(STORE_LOCK_DIAGNOSTICS_FILENAME))
             .expect("open diagnostics lock");
-        flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive)
-            .expect("hold diagnostics lock");
+        diagnostics_lock.try_lock().expect("hold diagnostics lock");
 
         assert!(
             try_acquire_store_lock(temp.path(), &StoreLockOwner::for_process())
@@ -3046,7 +3031,7 @@ mod tests {
             .expect("uncontended lock");
         let mut metadata = std::fs::OpenOptions::new()
             .write(true)
-            .open(temp.path().join(STORE_LOCK_FILENAME))
+            .open(store_owner_path(temp.path()))
             .expect("open metadata");
         metadata.set_len(0).expect("clear metadata");
         metadata.rewind().expect("rewind metadata");
@@ -3059,24 +3044,16 @@ mod tests {
 
     #[test]
     fn stale_owner_metadata_is_not_reported_for_an_uninstrumented_holder() {
-        use rustix::fs::{FlockOperation, flock};
-        use std::os::unix::fs::OpenOptionsExt;
-
         let temp = tempfile::tempdir().expect("tempdir");
         let lock_path = temp.path().join(STORE_LOCK_FILENAME);
         let stale = StoreLockOwner::for_daemon(temp.path().join("stale.sock"));
         std::fs::write(
-            &lock_path,
+            store_owner_path(temp.path()),
             serde_json::to_vec(&stale).expect("serialize stale"),
         )
         .expect("write stale metadata");
-        let lock = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(&lock_path)
-            .expect("open lock");
-        flock(&lock, FlockOperation::NonBlockingLockExclusive).expect("hold raw store lock");
+        let lock = open_lock_file(&lock_path).expect("open lock");
+        lock.try_lock().expect("hold raw store lock");
 
         assert_eq!(contended_store_lock_owner(temp.path()), None);
         drop(lock);
