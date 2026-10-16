@@ -4,7 +4,7 @@ version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
     "pytest==9.0.3",
-    "pytest-bdd==8.1.0",
+    "pytest-bdd==9.0.0",
     "pytest-xdist==3.8.0",
 ]
 
