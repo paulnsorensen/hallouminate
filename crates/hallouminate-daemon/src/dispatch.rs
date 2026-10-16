@@ -1920,13 +1920,22 @@ pub(super) async fn index_files_batched(
     Ok(BatchedReindex { stats, skipped })
 }
 
-/// Modification time of `file`, for the reindex plan.
+/// Modification time of a file the daemon just wrote, without following a
+/// leaf symlink. A leaf that became a symlink after the write is an error, so
+/// the daemon's bytes are never indexed under the symlink target's path.
 async fn file_mtime(file: &Path) -> anyhow::Result<std::time::SystemTime> {
     use anyhow::Context as _;
 
-    tokio::fs::metadata(file)
+    let meta = tokio::fs::symlink_metadata(file)
         .await
-        .and_then(|meta| meta.modified())
+        .with_context(|| format!("reindex {}", file.display()))?;
+    if meta.file_type().is_symlink() {
+        anyhow::bail!(
+            "reindex {}: became a symlink after the write",
+            file.display()
+        );
+    }
+    meta.modified()
         .with_context(|| format!("reindex {}", file.display()))
 }
 
@@ -3975,33 +3984,33 @@ mod tests {
             .expect("open store")
     }
 
-    #[cfg(unix)]
+    async fn batched_test_store(root: &Path) -> (tempfile::TempDir, LanceStore, CorpusConfig) {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = open_off_store(store_dir.path()).await;
+        (store_dir, store, wiki_corpus_at(root))
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn index_files_batched_indexes_written_index_bytes_not_a_swapped_symlink() {
+    async fn index_files_batched_indexes_written_index_bytes_not_disk_bytes() {
         use hallouminate_domain::corpus::blake3_bytes;
         use hallouminate_domain::indexer::ChunkStore as _;
         use text_splitter::Characters;
 
-        let store_dir = tempfile::tempdir().unwrap();
         let corpus_dir = tempfile::tempdir().unwrap();
         let root = canonicalize_or_passthrough(corpus_dir.path())
             .as_path()
             .to_path_buf();
-        let corpus = wiki_corpus_at(&root);
+        let (_store_dir, store, corpus) = batched_test_store(&root).await;
         let corpus_key = corpus.primary_corpus_key().expect("wiki corpus key");
-        let store = open_off_store(store_dir.path()).await;
         let registry = HandlerRegistry::new(Characters, 1500);
 
-        // The daemon wrote `written`, then a local writer swapped index.md
-        // for a symlink before the reindex ran.
+        // The daemon wrote `written`; the disk now holds other bytes.
         let written = b"# Index\n\nThe daemon composed this ancestor index.\n".to_vec();
-        let target = root.join("target.md");
-        std::fs::write(&target, "# Target\n\nSymlink target content.\n").unwrap();
         let index = root.join("index.md");
-        std::os::unix::fs::symlink(&target, &index).unwrap();
+        std::fs::write(&index, "# Index\n\nA later writer changed this file.\n").unwrap();
 
         let ancestors = [WrittenIndex {
-            path: index,
+            path: index.clone(),
             bytes: written.clone(),
         }];
         let batch = index_files_batched(&store, &registry, &corpus, None, &ancestors)
@@ -4011,10 +4020,53 @@ mod tests {
 
         let snapshots = store.list_files(&corpus_key).await.unwrap();
         assert_eq!(snapshots.len(), 1, "one file indexed: {snapshots:?}");
+        assert_eq!(snapshots[0].file_ref, index.to_str().unwrap());
         assert_eq!(
             snapshots[0].content_hash,
             blake3_bytes(&written),
-            "the reindex must index the bytes the daemon wrote, not the symlink target",
+            "the reindex must index the bytes the daemon wrote, not a fresh disk read",
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_files_batched_skips_an_index_swapped_for_a_symlink() {
+        use hallouminate_domain::indexer::ChunkStore as _;
+        use text_splitter::Characters;
+
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_or_passthrough(corpus_dir.path())
+            .as_path()
+            .to_path_buf();
+        let (_store_dir, store, corpus) = batched_test_store(&root).await;
+        let corpus_key = corpus.primary_corpus_key().expect("wiki corpus key");
+        let registry = HandlerRegistry::new(Characters, 1500);
+
+        // The daemon wrote index.md, then a local writer swapped it for a
+        // symlink to another corpus file before the reindex ran.
+        let target = root.join("target.md");
+        std::fs::write(&target, "# Target\n\nSymlink target content.\n").unwrap();
+        let index = root.join("index.md");
+        std::os::unix::fs::symlink(&target, &index).unwrap();
+
+        let ancestors = [WrittenIndex {
+            path: index,
+            bytes: b"# Index\n\nThe daemon composed this ancestor index.\n".to_vec(),
+        }];
+        let batch = index_files_batched(&store, &registry, &corpus, None, &ancestors)
+            .await
+            .expect("batched reindex");
+        assert_eq!(batch.skipped.len(), 1, "skipped: {:?}", batch.skipped);
+        assert!(
+            batch.skipped[0].contains("became a symlink"),
+            "skipped: {:?}",
+            batch.skipped
+        );
+
+        let snapshots = store.list_files(&corpus_key).await.unwrap();
+        assert!(
+            snapshots.is_empty(),
+            "no row may be written under the symlink target: {snapshots:?}"
         );
     }
 
