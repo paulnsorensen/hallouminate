@@ -13,7 +13,7 @@ lancedb = "0.37"
 async-trait.workspace = true
 futures = "0.3"
 fastembed = "7.0"
-ort = { version = "=2.0.0-rc.13", default-features = false }
+ort = { version = "=2.0.0-rc.14", default-features = false }
 blake3.workspace = true
 rustix.workspace = true
 serde.workspace = true
