@@ -170,7 +170,7 @@ pub async fn apply(
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     batch_size: usize,
-    precomputed: Option<(&FileRef, &[u8])>,
+    precomputed: &[(&FileRef, &[u8])],
 ) -> Result<ApplyStats> {
     apply_with_lane(plan, store, registry, corpus, batch_size, precomputed, None).await
 }
@@ -217,7 +217,7 @@ pub async fn apply_with_lane(
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     batch_size: usize,
-    precomputed: Option<(&FileRef, &[u8])>,
+    precomputed: &[(&FileRef, &[u8])],
     lane: Option<&LaneFn>,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
@@ -321,7 +321,7 @@ async fn run_in_batches(
     run: &RunCtx<'_>,
     stats: &mut ApplyStats,
     empty_file_policy: EmptyFilePolicy,
-    precomputed: Option<(&FileRef, &[u8])>,
+    precomputed: &[(&FileRef, &[u8])],
 ) -> Result<()> {
     let mut by_key: BTreeMap<CorpusKey, Vec<WriteRequest<'_>>> = BTreeMap::new();
     for req in reqs {
@@ -331,12 +331,13 @@ async fn run_in_batches(
         for chunk_of_reqs in key_reqs.chunks(run.batch_size) {
             let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
             for req in chunk_of_reqs {
-                let bytes_override =
-                    precomputed.and_then(
-                        |(file, bytes)| {
-                            if req.file == file { Some(bytes) } else { None }
-                        },
-                    );
+                let mut bytes_override: Option<&[u8]> = None;
+                for &(file, bytes) in precomputed {
+                    if req.file == file {
+                        bytes_override = Some(bytes);
+                        break;
+                    }
+                }
                 let prepared_file = prepare_file(
                     WriteRequest {
                         corpus_key: req.corpus_key.clone(),
@@ -524,7 +525,7 @@ mod tests {
         let store = RecordingStore::default();
         let registry = HandlerRegistry::new(Characters, 384);
 
-        let stats = apply(plan, &store, &registry, &corpus, 16, None)
+        let stats = apply(plan, &store, &registry, &corpus, 16, &[])
             .await
             .expect("apply");
 
@@ -565,7 +566,7 @@ mod tests {
         let store = RecordingStore::default();
         let registry = HandlerRegistry::new(Characters, 384);
 
-        let stats = apply(plan, &store, &registry, &corpus, 16, None)
+        let stats = apply(plan, &store, &registry, &corpus, 16, &[])
             .await
             .expect("apply");
 
@@ -621,7 +622,7 @@ mod tests {
         let store = RecordingStore::default();
         let registry = HandlerRegistry::new(Characters, 384);
 
-        apply(plan, &store, &registry, &corpus, 16, None)
+        apply(plan, &store, &registry, &corpus, 16, &[])
             .await
             .expect("apply");
 
@@ -676,7 +677,7 @@ mod tests {
         };
         let registry = HandlerRegistry::new(Characters, 384);
 
-        let stats = apply_with_lane(plan, &store, &registry, &corpus, 1, None, Some(&*lane))
+        let stats = apply_with_lane(plan, &store, &registry, &corpus, 1, &[], Some(&*lane))
             .await
             .expect("apply_with_lane");
 

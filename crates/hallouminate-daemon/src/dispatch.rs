@@ -1344,21 +1344,16 @@ async fn handle_add_markdown(
     // Reindex the page and every rewritten ancestor index.md through ONE
     // `apply` call, so the store performs a fixed number of commits per
     // mutation, independent of directory depth.
-    let mut index_targets: Vec<PathBuf> = Vec::new();
+    let mut page: Option<(&Path, &[u8])> = None;
     if !content_is_empty {
-        index_targets.push(dest.clone());
+        page = Some((dest.as_path(), page_bytes.as_slice()));
     }
-    index_targets.extend(ancestors.rewritten);
-    if !index_targets.is_empty() {
+    if page.is_some() || !ancestors.rewritten.is_empty() {
         let store = &res.store;
         let registry = state.make_registry();
-        let mut preloaded: Option<(&Path, &[u8])> = None;
-        if !content_is_empty {
-            preloaded = Some((dest.as_path(), page_bytes.as_slice()));
-        }
         let indexed = timed_step(
             "batched_reindex",
-            index_files_batched(store, &registry, &corpus, &index_targets, preloaded),
+            index_files_batched(store, &registry, &corpus, page, &ancestors.rewritten),
         )
         .await;
         match indexed {
@@ -1695,7 +1690,7 @@ async fn handle_delete_markdown(
         let registry = state.make_registry();
         let reindexed = timed_step(
             "batched_reindex",
-            index_files_batched(&res.store, &registry, &corpus, &ancestors.rewritten, None),
+            index_files_batched(&res.store, &registry, &corpus, None, &ancestors.rewritten),
         )
         .await;
         let failure = match (ancestors.failure, reindexed) {
@@ -1850,7 +1845,7 @@ pub(super) async fn index_single_file_with_content(
     if file_plan.upserts.is_empty() && file_plan.mtime_touches.is_empty() {
         return Ok(ApplyStats::default());
     }
-    apply_file_plan(file_plan, store, registry, corpus, Some((&file_ref, bytes))).await
+    apply_file_plan(file_plan, store, registry, corpus, &[(&file_ref, bytes)]).await
 }
 
 /// Reindex several files the daemon controls through ONE `apply` call, so the
@@ -1858,58 +1853,49 @@ pub(super) async fn index_single_file_with_content(
 /// once per file. Each file keeps the per-file content-hash gate and mtime
 /// touch of [`index_single_file_with_content`].
 ///
-/// `preloaded` carries already-read bytes for one of `files` (the page the
-/// caller just wrote); that file is never re-read from disk. The other files
-/// are read from the ambient path. A non-preloaded file that fails to stat,
-/// read, or plan is skipped and named in [`BatchedReindex::skipped`]; the rest
-/// of the batch still indexes. A failure on a preloaded file, or in `apply`,
-/// fails the whole call. When `apply` commits part of the batch before it
-/// fails, the call reports the error and zero `indexed`.
+/// `page` carries the bytes of the page the caller just wrote, and each
+/// [`WrittenIndex`] carries the bytes of an ancestor `index.md` the caller
+/// just wrote. No file content is re-read from disk, so a symlink swapped in
+/// after the write cannot change what gets indexed. An ancestor that fails to
+/// stat or plan is skipped and named in [`BatchedReindex::skipped`]; the rest
+/// of the batch still indexes. A failure on the page, or in `apply`, fails
+/// the whole call. When `apply` commits part of the batch before it fails,
+/// the call reports the error and zero `indexed`.
 pub(super) async fn index_files_batched(
     store: &LanceStore,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
-    files: &[PathBuf],
-    preloaded: Option<(&Path, &[u8])>,
+    page: Option<(&Path, &[u8])>,
+    ancestors: &[WrittenIndex],
 ) -> anyhow::Result<BatchedReindex> {
-    use anyhow::Context as _;
-
     let started = std::time::Instant::now();
     let mut batch_plan = IndexPlan::default();
-    let mut preloaded_ref: Option<FileRef> = None;
+    let mut planned_files: Vec<(FileRef, &[u8])> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
-    for file in files {
-        if let Some((preloaded_path, bytes)) = preloaded
-            && preloaded_path == file.as_path()
-        {
-            let mtime = tokio::fs::metadata(file)
-                .await
-                .and_then(|meta| meta.modified())
-                .with_context(|| format!("reindex {}", file.display()))?;
-            let file_ref =
-                plan_file_with_content(store, corpus, file, bytes, mtime, &mut batch_plan).await?;
-            preloaded_ref = Some(file_ref);
-            continue;
-        }
+    if let Some((path, bytes)) = page {
+        let mtime = file_mtime(path).await?;
+        let file_ref =
+            plan_file_with_content(store, corpus, path, bytes, mtime, &mut batch_plan).await?;
+        planned_files.push((file_ref, bytes));
+    }
+    for ancestor in ancestors {
+        let WrittenIndex { path, bytes } = ancestor;
         let planned = async {
-            let mtime = tokio::fs::metadata(file)
-                .await
-                .and_then(|meta| meta.modified())
-                .with_context(|| format!("reindex {}", file.display()))?;
-            let bytes = tokio::fs::read(file)
-                .await
-                .with_context(|| format!("reindex {}", file.display()))?;
-            plan_file_with_content(store, corpus, file, &bytes, mtime, &mut batch_plan).await
+            let mtime = file_mtime(path).await?;
+            plan_file_with_content(store, corpus, path, bytes, mtime, &mut batch_plan).await
         }
         .await;
-        if let Err(e) = planned {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                error = %e,
-                path = %file.display(),
-                "batched reindex: skipping file that failed to plan",
-            );
-            skipped.push(format!("skipped {}: {e:#}", file.display()));
+        match planned {
+            Ok(file_ref) => planned_files.push((file_ref, bytes.as_slice())),
+            Err(e) => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %e,
+                    path = %path.display(),
+                    "batched reindex: skipping file that failed to plan",
+                );
+                skipped.push(format!("skipped {}: {e:#}", path.display()));
+            }
         }
     }
     if batch_plan.upserts.is_empty() && batch_plan.mtime_touches.is_empty() {
@@ -1918,22 +1904,30 @@ pub(super) async fn index_files_batched(
             skipped,
         });
     }
-    let mut precomputed: Option<(&FileRef, &[u8])> = None;
-    if let Some(file_ref) = &preloaded_ref
-        && let Some((_, bytes)) = preloaded
-    {
-        precomputed = Some((file_ref, bytes));
+    let mut precomputed: Vec<(&FileRef, &[u8])> = Vec::with_capacity(planned_files.len());
+    for (file_ref, bytes) in &planned_files {
+        precomputed.push((file_ref, bytes));
     }
     let planned = batch_plan.upserts.len() + batch_plan.mtime_touches.len();
-    let stats = apply_file_plan(batch_plan, store, registry, corpus, precomputed).await?;
+    let stats = apply_file_plan(batch_plan, store, registry, corpus, &precomputed).await?;
     tracing::debug!(
         target: "hallouminate::daemon",
-        files = files.len(),
+        files = usize::from(page.is_some()) + ancestors.len(),
         planned,
         elapsed_ms = elapsed_ms(started),
         "batched reindex finished",
     );
     Ok(BatchedReindex { stats, skipped })
+}
+
+/// Modification time of `file`, for the reindex plan.
+async fn file_mtime(file: &Path) -> anyhow::Result<std::time::SystemTime> {
+    use anyhow::Context as _;
+
+    tokio::fs::metadata(file)
+        .await
+        .and_then(|meta| meta.modified())
+        .with_context(|| format!("reindex {}", file.display()))
 }
 
 /// Outcome of [`index_files_batched`]: the `apply` stats plus one message per
@@ -1973,7 +1967,7 @@ async fn apply_file_plan(
     store: &LanceStore,
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
-    precomputed: Option<(&FileRef, &[u8])>,
+    precomputed: &[(&FileRef, &[u8])],
 ) -> anyhow::Result<hallouminate_domain::indexer::ApplyStats> {
     let stats = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(apply(
@@ -2208,7 +2202,7 @@ where
         registry,
         corpus,
         DEFAULT_BATCH_SIZE,
-        None,
+        &[],
         Some(&lane),
     )
     .await?;
@@ -2243,8 +2237,16 @@ async fn ensure_paths_exist(corpus: &CorpusConfig) {
 /// stay on disk, so the caller still reindexes them.
 #[derive(Debug, Default)]
 struct AncestorIndexWrites {
-    rewritten: Vec<PathBuf>,
+    rewritten: Vec<WrittenIndex>,
     failure: Option<String>,
+}
+
+/// An ancestor `index.md` the daemon wrote, with the exact bytes it wrote.
+/// The reindex uses these bytes, not a fresh read of `path`.
+#[derive(Debug)]
+pub(super) struct WrittenIndex {
+    path: PathBuf,
+    bytes: Vec<u8>,
 }
 
 /// Walk from `root` down to the parent of `file_relative`, rewriting each
@@ -2270,7 +2272,7 @@ async fn write_ancestor_indexes(root: &Path, file_relative: &Path) -> AncestorIn
             continue;
         }
         match write_ancestor_index(root, &dir).await {
-            Ok(Some(dest)) => writes.rewritten.push(dest),
+            Ok(Some(written)) => writes.rewritten.push(written),
             Ok(None) => {}
             Err(msg) => {
                 writes.failure = Some(msg);
@@ -2283,7 +2285,7 @@ async fn write_ancestor_indexes(root: &Path, file_relative: &Path) -> AncestorIn
 
 /// Compose `dir`'s `index.md` and write it atomically when the composed text
 /// differs. Returns the written path, or `None` when nothing changed.
-async fn write_ancestor_index(root: &Path, dir: &Path) -> Result<Option<PathBuf>, String> {
+async fn write_ancestor_index(root: &Path, dir: &Path) -> Result<Option<WrittenIndex>, String> {
     use hallouminate_domain::corpus::{INDEX_FILENAME, compose_index_md};
 
     let index_path = dir.join(INDEX_FILENAME);
@@ -2334,6 +2336,7 @@ async fn write_ancestor_index(root: &Path, dir: &Path) -> Result<Option<PathBuf>
     let bytes = new_content.into_bytes();
     let written = tokio::task::spawn_blocking(move || {
         atomic_write_no_follow(&write_root, &rel, &bytes, true)
+            .map(|path| WrittenIndex { path, bytes })
     })
     .await
     .map_err(|e| {
@@ -2345,7 +2348,7 @@ async fn write_ancestor_index(root: &Path, dir: &Path) -> Result<Option<PathBuf>
         format!("index write task panicked: {e}")
     })?;
     match written {
-        Ok(dest) => Ok(Some(dest)),
+        Ok(written) => Ok(Some(written)),
         Err(WriteError { kind, source }) => Err(format!(
             "writing index {} failed ({:?}): {source}",
             index_path.display(),
@@ -3970,6 +3973,49 @@ mod tests {
         LanceStore::open_or_create(dir, "BAAI/bge-small-en-v1.5", false, false, None)
             .await
             .expect("open store")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_files_batched_indexes_written_index_bytes_not_a_swapped_symlink() {
+        use hallouminate_domain::corpus::blake3_bytes;
+        use hallouminate_domain::indexer::ChunkStore as _;
+        use text_splitter::Characters;
+
+        let store_dir = tempfile::tempdir().unwrap();
+        let corpus_dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_or_passthrough(corpus_dir.path())
+            .as_path()
+            .to_path_buf();
+        let corpus = wiki_corpus_at(&root);
+        let corpus_key = corpus.primary_corpus_key().expect("wiki corpus key");
+        let store = open_off_store(store_dir.path()).await;
+        let registry = HandlerRegistry::new(Characters, 1500);
+
+        // The daemon wrote `written`, then a local writer swapped index.md
+        // for a symlink before the reindex ran.
+        let written = b"# Index\n\nThe daemon composed this ancestor index.\n".to_vec();
+        let target = root.join("target.md");
+        std::fs::write(&target, "# Target\n\nSymlink target content.\n").unwrap();
+        let index = root.join("index.md");
+        std::os::unix::fs::symlink(&target, &index).unwrap();
+
+        let ancestors = [WrittenIndex {
+            path: index,
+            bytes: written.clone(),
+        }];
+        let batch = index_files_batched(&store, &registry, &corpus, None, &ancestors)
+            .await
+            .expect("batched reindex");
+        assert!(batch.skipped.is_empty(), "skipped: {:?}", batch.skipped);
+
+        let snapshots = store.list_files(&corpus_key).await.unwrap();
+        assert_eq!(snapshots.len(), 1, "one file indexed: {snapshots:?}");
+        assert_eq!(
+            snapshots[0].content_hash,
+            blake3_bytes(&written),
+            "the reindex must index the bytes the daemon wrote, not the symlink target",
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
