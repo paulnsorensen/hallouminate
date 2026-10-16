@@ -482,7 +482,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     let p = plan(disk, db);
     fs::remove_file(&real).unwrap();
 
-    let err = apply(p, &store, &registry, &corpus, DEFAULT_BATCH_SIZE, None)
+    let err = apply(p, &store, &registry, &corpus, DEFAULT_BATCH_SIZE, &[])
         .await
         .expect_err("missing file must surface as Err, not silent skip");
     let msg = err.to_string();

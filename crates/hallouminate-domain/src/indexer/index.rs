@@ -46,5 +46,5 @@ pub async fn index_corpus(
         combined.mtime_touches.append(&mut root_plan.mtime_touches);
         combined.deletes.append(&mut root_plan.deletes);
     }
-    apply(combined, store, registry, corpus, DEFAULT_BATCH_SIZE, None).await
+    apply(combined, store, registry, corpus, DEFAULT_BATCH_SIZE, &[]).await
 }
