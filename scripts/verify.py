@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 import datetime
-import fcntl
+import errno
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -10,6 +11,36 @@ import shutil
 import subprocess
 import sys
 import time
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+
+@contextmanager
+def exclusive_lock(path: Path):
+    with path.open("a+b") as lock:
+        if os.name == "nt":
+            while True:
+                lock.seek(0)
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 JOBS = 1
 LOCK_NAME = "hallouminate-verify.lock"
@@ -149,15 +180,17 @@ def append_record(log: Path, event: str, command: object, **fields: object) -> N
         **fields,
     }
     line = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode()
-    descriptor = os.open(log, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    try:
-        os.fchmod(descriptor, 0o600)
-        view = memoryview(line)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
-    finally:
-        os.close(descriptor)
+    with exclusive_lock(log.with_suffix(log.suffix + ".lock")):
+        descriptor = os.open(log, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            view = memoryview(line)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+        finally:
+            os.close(descriptor)
 
 
 def reject_concurrency_overrides(command: list[str]) -> None:
@@ -190,8 +223,7 @@ def run_leased(commands: list[list[str]], command_record: object) -> int:
     wait_started = time.monotonic()
     append_record(log_path, "wait", command_record)
 
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with exclusive_lock(lock_path):
         wait_seconds = time.monotonic() - wait_started
         started = time.monotonic()
         append_record(
@@ -224,7 +256,6 @@ def run_leased(commands: list[list[str]], command_record: object) -> int:
                 exit_status=status,
                 duration_seconds=round(time.monotonic() - started, 6),
             )
-            fcntl.flock(lock, fcntl.LOCK_UN)
         return status
 
 

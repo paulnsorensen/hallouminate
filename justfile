@@ -12,15 +12,24 @@ default:
 
 # Canonical local gate. No args runs fmt, clippy, build, and tests; targeted
 # Cargo commands use the same cross-worktree verification lease.
+[unix]
+[script("python3")]
+[positional-arguments]
 verify *args:
-    python3 scripts/verify.py {{quote(args)}}
+    import runpy
+    runpy.run_path("scripts/verify.py", run_name="__main__")
+
+[windows]
+[script("python")]
+[positional-arguments]
+verify *args:
+    import runpy
+    runpy.run_path("scripts/verify.py", run_name="__main__")
 
 # Compatibility routes retained for contributors and release automation.
-ci:
-    just verify
+ci: verify
 
-llm:
-    just verify --fix
+llm: (verify "--fix")
 
 # Build once before workers start. Keep compiler work inside the existing lease.
 bdd *args:
