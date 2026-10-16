@@ -96,6 +96,34 @@ retrieval already runs on footnote-stripped `search_text`, so `exclude` does
 not change which chunks come back, only what you are shown; `only` is the
 cheap way to pull a page's citation targets without reading the page.
 
+#### Phrase mode matches the chunk body only
+
+`ground` phrase mode (`match: "phrase"`) counts a literal phrase only in the
+chunk body. The body is the chunk's own text without footnote definitions.
+The breadcrumb and the file summary are not part of the body.[^phrase-body]
+
+- **Ranking.** `search_phrase` scores each chunk by the occurrences of the
+  lowercased, whitespace-collapsed phrase in its body. A chunk with zero body
+  occurrences is dropped. A phrase that only the file summary holds therefore
+  does not match every chunk of that file.[^phrase-body]
+- **Scan filter.** `retrieve_phrase` in
+  `crates/hallouminate-adapters/src/lance.rs` first filters on `search_text`.
+  It then also requires the phrase in the body column `text`, or a `[^`
+  footnote marker in `text`. The marker case keeps rows whose body match
+  needs footnote removal (`tax[^1] abatement`).[^phrase-body]
+- **Scan cap.** Summary-only and breadcrumb-only rows no longer use up
+  `MAX_PHRASE_SCAN_ROWS` (10,000). The `phrase-truncated` cap warning reports
+  *scanned chunks*, not matches.[^phrase-body]
+- **Headings with inline markup.** The breadcrumb holds the heading as plain
+  text, but the body holds the raw heading line. A heading such as
+  `## Tax **Abatement**` no longer matches the phrase `tax abatement` through
+  the breadcrumb.[^phrase-body]
+
+Why: before #586, a phrase in the file summary or breadcrumb matched every
+chunk of the file. Those rows filled the scan cap and pushed real body
+matches out of the result. Use ranked `ground` when the words can occur only
+in a heading path or summary.
+
 ### `add_markdown`
 
 Atomic-write a markdown file to the corpus's single configured root, then
@@ -308,5 +336,6 @@ that's exactly the multi-process race the daemon exists to prevent.
 
 [^batches]: crates/hallouminate/src/mcp/tools.rs::add_markdown_batch and ::read_markdown_batch; crates/hallouminate-daemon/src/dispatch.rs::handle_add_markdown_batch; crates/hallouminate-daemon/src/client.rs::DaemonClient::call_raw and ::call_raw_with_timeout
 [^retrieval]: crates/hallouminate-domain/src/ground/format.rs::render_outline; crates/hallouminate-domain/src/search.rs::search_fused; plugins/hallouminate/skills/wiki-query/SKILL.md
+[^phrase-body]: crates/hallouminate-domain/src/search/phrase.rs::search_phrase_in and ::body_occurrence_count; crates/hallouminate-adapters/src/lance.rs::retrieve_phrase_with and test retrieve_phrase_scans_body_text_not_summary_only_rows; PR #586
 
-_Source: PR #561 and issue #453 · Updated: 2026-10-01 · Supersedes: singular-only markdown call documentation and first-root write wording_
+_Source: PR #561, issue #453, and PR #586 · Updated: 2026-10-16 · Supersedes: singular-only markdown call documentation, first-root write wording, and phrase matching on breadcrumb or summary text_

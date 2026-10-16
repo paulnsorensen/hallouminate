@@ -84,6 +84,34 @@ walks it on every request to discover the active repo-layer config
 (`.hallouminate/config.toml`) and merges it with the boot baseline.
 That's how a single daemon can serve many repos with different configs.
 
+## Reply-size guard
+
+Every daemon reply passes one reply-size guard before it goes on the socket.
+`response_frame` in `crates/hallouminate-daemon/src/server.rs` serializes the
+reply and its newline. It then compares the length to `MAX_IPC_LINE_BYTES`
+(4 MiB, `framing.rs`).[^reply-size]
+
+- A reply that fits goes out unchanged.
+- A reply that does not fit becomes an `invalid_params` error. The message
+  names the reply size and the limit, for example `response is N bytes; the
+  IPC limit is 4194304 bytes`. It tells the caller to narrow the request with
+  a smaller `limit` or `corpus`.[^reply-size]
+
+The guard covers every operation: `ground`, `read_markdown`, `list_files`,
+`list_tree`, and the others. It replaced a `ground`-only `ground_reply`
+check and that check's headroom constant.[^reply-size]
+
+Why: the client reads replies through the same 4 MiB line codec. Before the
+guard, an oversized `read_markdown` or `list_files` reply failed on the client
+as `max line length exceeded`, with no size and no reason. Now the daemon
+sends a small error that the client can read. The request side has a
+matching check: `DaemonClient::call_raw` refuses a markdown write batch over
+the frame limit before it connects.[^reply-size]
+
+[^reply-size]: `crates/hallouminate-daemon/src/server.rs::response_frame` and its tests; `crates/hallouminate-daemon/src/framing.rs::MAX_IPC_LINE_BYTES`; `crates/hallouminate-daemon/src/client.rs::DaemonClient::call_raw`; PR #586.
+
+_Source: PR #586 · Updated: 2026-10-16 · Supersedes: the `ground`-only `ground_reply` size check_
+
 ## Wire compatibility
 
 v1 ships from a single binary — CLI, MCP, and daemon are all the same
