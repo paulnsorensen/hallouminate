@@ -11,14 +11,14 @@
 const { spawn } = require("child_process");
 const path = require("path");
 
-const bin = path.join(__dirname, "bin", "hallouminate");
+const bin = path.join(__dirname, "bin", process.platform === "win32" ? "hallouminate.exe" : "hallouminate");
 
-const child = spawn(bin, process.argv.slice(2), { stdio: "inherit" });
+const child = spawn(bin, process.argv.slice(2), { stdio: "inherit", windowsHide: true });
 
 // Registering a listener overrides Node's default (which would kill the
 // wrapper and orphan the child); forward to the child and let its exit drive
 // ours. SIGKILL/SIGSTOP can't be trapped, so they're intentionally absent.
-const SIGNALS = [
+const SIGNALS = process.platform === "win32" ? ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] : [
   "SIGINT",
   "SIGTERM",
   "SIGHUP",
@@ -40,6 +40,7 @@ for (const sig of SIGNALS) {
 
 child.on("exit", (code, signal) => {
   if (signal) {
+    for (const sig of SIGNALS) process.removeAllListeners(sig);
     // Re-raise so our parent observes signal-death, not a synthetic exit code.
     process.kill(process.pid, signal);
   } else {

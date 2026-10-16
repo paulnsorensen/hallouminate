@@ -41,9 +41,17 @@ Prebuilt binaries are published for each release:
 | macOS, Apple Silicon | `aarch64-apple-darwin` |
 | Linux, arm64 | `aarch64-unknown-linux-gnu` (glibc ≥ 2.39) |
 | Linux, x86-64 | `x86_64-unknown-linux-gnu` (glibc ≥ 2.39) |
+| Windows, x86-64 | `x86_64-pc-windows-msvc` |
 
 Re-run the one-liner any time to upgrade to the latest release. On Intel Mac,
-Windows, or an older glibc, build from source with cargo below.
+or an older glibc, build from source with cargo below.
+
+On Windows, `npx hallouminate --help` uses the matching ZIP release. A native
+PowerShell installer is also available:
+
+```powershell
+irm https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.ps1 | iex
+```
 
 ## From crates.io
 
@@ -56,6 +64,10 @@ cost of compiling native dependencies (a few minutes).
 - `protoc` (the Protocol Buffers compiler) — the `lancedb` build needs it.
   - macOS: `brew install protobuf`
   - Debian/Ubuntu: `apt install protobuf-compiler`
+  - Windows: `choco install protoc` (when using Chocolatey).
+- For Windows source builds, the MSVC Rust toolchain and Visual Studio C++
+  Build Tools with the Windows SDK. From a checkout, `just verify` runs the
+  native verification gate using Python and produces `target/debug/hallouminate.exe`.
 
 ```sh
 cargo install hallouminate --locked

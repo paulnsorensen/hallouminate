@@ -1127,27 +1127,23 @@ fn write_and_sync_cap(file: &mut cap_std::fs::File, content: &[u8]) -> Result<()
 }
 
 fn fsync_dir(dir: &Dir) -> Result<(), WriteError> {
-    // `cap_std::fs::Dir` has no `sync_all` method, and its underlying
-    // `std::fs::File` is opened with `O_PATH` on Linux (cap-std's dir-open
-    // optimisation for `*at`-only handles). `O_PATH` fds cannot be fsync'd
-    // — `sync_all` on one returns `EBADF`. Re-open `.` through the
-    // capability with `read(true)` to get a regular RDONLY fd; cap-std's
-    // path-resolver special-cases the trailing `.` and re-opens with the
-    // user-supplied options, so the resulting handle supports `sync_all`.
-    // (Confirmed against cap-primitives' `internal_open::follow_with_dot`
-    // branch.) Stays cross-platform — Windows accepts `sync_all` on the
-    // dir handle either way.
-    //
-    // Cost vs pre-migration: two extra syscalls per write (`open(".")` +
-    // drop) on top of the `sync_all`. `atomic_write_no_follow` is the
-    // markdown-write hot path; the overhead has been measured as invisible
-    // here. Revisit only if a future profile flags it.
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+        options
+            .access_mode(GENERIC_READ | GENERIC_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+    }
     let dot = dir
-        .open(".")
-        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))?;
+        .open_with(".", &options)
+        .map_err(|error| WriteError::new(WriteErrorKind::Io, error))?;
     dot.into_std()
         .sync_all()
-        .map_err(|e| WriteError::new(WriteErrorKind::Io, e))
+        .map_err(|error| WriteError::new(WriteErrorKind::Io, error))
 }
 
 #[cfg(unix)]
