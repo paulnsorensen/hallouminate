@@ -1,0 +1,41 @@
+# Illustrative provenance manifest for the wiki-grounding benchmark pilot.
+#
+# subject_repos below are PLACEHOLDERS pending the open human decision on
+# which real small/large repos to benchmark against. Do not treat
+# `example-small-repo` / `example-large-repo` as chosen subjects — they only
+# exist to keep this manifest and eval/agent-bench/questions.example.json
+# internally consistent.
+
+claude_code_version = "0.0.0-placeholder"
+question_set_hash = "024ac056c55ddb82682732e4b652002fc8f77232cacc975b92fa2f9fb36dc4c4"
+container_image_refs = [
+    "ghcr.io/anthropics/agent-bench-runner@sha256:1111111111111111111111111111111111111111111111111111111111111111",
+]
+results_dir = "eval/agent-bench/results"
+checkout_root = "eval/agent-bench/checkouts"
+
+[model_ids]
+subject = "claude-sonnet-5"
+judge = "claude-opus-5"
+
+[[subject_repos]]
+# PLACEHOLDER: awaiting human selection of the real small subject repo.
+name = "example-small-repo"
+url = "https://example.com/example-small-repo"
+commit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+size_class = "small"
+
+[[subject_repos]]
+# PLACEHOLDER: awaiting human selection of the real large subject repo.
+name = "example-large-repo"
+url = "https://example.com/example-large-repo"
+commit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+size_class = "large"
+
+[[prompt_hashes]]
+path = "eval/agent-bench/prompts/wiki-authoring.md"
+blake3 = "62ec5fc03b944d2df27387059e078c14028e55bc2970224ada193d5fe6bb024e"
+
+[[prompt_hashes]]
+path = "eval/agent-bench/prompts/judge-rubric.md"
+blake3 = "7e32f7a0b16770daa93c293218376bf2b1cee70aa2bf741ad094d5ea8980930e"

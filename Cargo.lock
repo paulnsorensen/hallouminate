@@ -40,6 +40,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-bench"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "chrono",
+ "clap",
+ "rand 0.9.5",
+ "rand_chacha",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
