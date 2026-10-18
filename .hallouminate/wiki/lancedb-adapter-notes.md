@@ -1,6 +1,6 @@
 ---
 status: reviewed
-last_verified: 2026-09-10
+last_verified: 2026-10-18
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/pull/434
@@ -10,14 +10,21 @@ sources:
 
 How `crates/hallouminate-adapters/src/lance.rs` uses the `lancedb` crate
 today, what it does not use, and the version traps found while reviewing
-Renovate PR #434 (lancedb 0.37 → 0.38). Research slug:
+Renovate bump PRs #434 and #495 (lancedb 0.37 → 0.38 and later). The
+workspace still pins `lancedb = "0.37"` (lock: 0.37.1). Research slug:
 `.cheese/research/lancedb-038-migration/lancedb-038-migration.md`.
 Ranking effects of lance major bumps live in
 [eval-harness-gotchas](eval-harness-gotchas.md); compaction and index-delta
 merging live in
 [maintenance-compaction-index-deltas](maintenance-compaction-index-deltas.md).
 
-## lancedb 0.38.0 does not compile with default features
+## lancedb 0.38 and later do not compile with default features
+
+The defect is not fixed in any release checked so far. Issue #635 reports it
+for 0.39.0, and issue #648 reports it for 0.40.0, the newest release at that
+time. Issue #648 states that no fixing patch release existed then.
+Treat the 0.38.0 detail below as the root-cause record for all later
+versions.
 
 PR #434 fails clippy and build on every OS with:
 
@@ -34,10 +41,23 @@ the crate itself fails to build. No hallouminate call site is involved, and
 none of the 0.38 breaking changes (manifest-authoritative table existence,
 pydantic v2, branch merge, listing pagination) touch APIs we use.
 
-Decision: hold #434 until 0.38.1 ships upstream fix lancedb #4100. The
+Decision: hold the bump PRs (#434, #495) until upstream gates the `Http`
+use in `job.rs` behind `remote`. The
 workaround `lancedb = { version = "0.38", features = ["remote"] }` compiles
 but enables an HTTP remote-table surface an embedded local store never
-uses; use it only if a 0.38 feature becomes urgent, and revert on 0.38.1.
+uses. It adds arrow-flight, tonic, and prost to `Cargo.lock`. Use it only if
+a newer lancedb feature becomes urgent, and revert when upstream fixes the
+gate.
+
+## lancedb 0.40 breaks the exhaustive `IndexType` match
+
+`refreshed_per_batch` in `lance.rs` matches `lancedb::index::IndexType` with
+no wildcard arm. This is deliberate: a new index kind then fails to compile
+and gets a review. lancedb 0.40 adds `ZoneMap`, `NGram`, `BloomFilter`, and
+`RTree`, and `IndexType` is not `#[non_exhaustive]`. The bump therefore fails
+with E0004 until those four variants join the `=> true` arm. The store builds
+only BTree, FTS, Fm, and auto vector indexes, so runtime behavior does not
+change (issues #629 and #648). Do not add a `_ =>` arm to fix it.
 
 PR #473 (donor vector reuse) depends on `query().select(Select::columns(..))`,
 `execute()` as an incremental `TryStream`, and `RecordBatch` decoding. All
@@ -76,4 +96,4 @@ experimental and may break); computed columns, materialized views, the
 UDF catalog, LSM/MemWAL, the data loader, and `cherry_pick` are remote,
 server, or Python/Node only.
 
-_Source: PR #434 review, `.cheese/research/lancedb-038-migration/` · Updated: 2026-10-15 · Supersedes: —_
+_Source: PR #434 review, `.cheese/research/lancedb-038-migration/`, issues #629, #635, #648 · Updated: 2026-10-18 · Supersedes: —_
