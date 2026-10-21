@@ -75,3 +75,15 @@
 
 - 2026-10-06 · 08d6bc9aa8b975ae · merged · ground-search-quality-adrs.md · #589: ADR-003 amendment — boot rebuilds stale stores inline; per-request override stores move aside and refill through admitted catch-up; ground_dir_locks; per-open backup prune.
 
+
+
+
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · sources/llm-wiki-facts-layer-landscape-research.md · source page for the 2026-10-05 facts-layer landscape `/briesearch` report (no end-to-end LLM-wiki facts standard).
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · facts-layer-landscape.md · four layers, schema-first vs schema-emergent extraction, existing hallouminate constructs, 2026-10-05 tooling snapshot, and gaps; evidence only.
+- 2026-10-21 · 2d0458886448d862 · new-page · sources/rdf-store-vs-inline-facts-research.md · source page for the 2026-10-18 deep `/briesearch` report on RDF or graph stores vs inline fact demarcation.
+- 2026-10-21 · 2d0458886448d862 · new-page · facts-layer-store-evidence.md · query-language, graph-RAG, agent-memory, prompt-format, and long-context evidence; labelled inference only, no decision.
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · facts-layer-open-forks.md · forks Q1-Q4 recorded as open with options and evidence pointers; proposed order Q2, Q3, Q1, Q4 is unconfirmed.
+- 2026-10-21 · 29c3ea50f7289f79 · merged · index.md · three facts-layer topic entries added to the curated topic list.
+- 2026-10-21 · 29c3ea50f7289f79 · skipped-near-duplicate · claim-provenance-marks.md · Q4 relates to supersession marks, but no decision exists, so the page stays unchanged and the forks page links to it.
+All 16 frozen retrieval probes pass on the first write: 7 exact probes at rank 1, 9 natural or central-claim probes within the top 3.
+
