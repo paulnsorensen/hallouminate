@@ -12,5 +12,5 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let budget = usize::from(*first % 64) + 1;
-    hallouminate_fuzz::check_chunks(text, budget);
+    hallouminate_fuzz::check_chunks(text, budget, hallouminate_fuzz::ChunkerKind::Markdown);
 });

@@ -47,3 +47,38 @@ path = "fuzz_targets/chunker.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rst_chunker"
+path = "fuzz_targets/rst_chunker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "section_edit"
+path = "fuzz_targets/section_edit.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relative_path"
+path = "fuzz_targets/relative_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wikilinks"
+path = "fuzz_targets/wikilinks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_helpers"
+path = "fuzz_targets/text_helpers.rs"
+test = false
+doc = false
+bench = false

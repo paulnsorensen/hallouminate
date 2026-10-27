@@ -1,14 +1,23 @@
 # Fuzz targets
 
-cargo-fuzz (libFuzzer) targets for the hallouminate-domain markdown parsers.
+cargo-fuzz (libFuzzer) targets for the hallouminate-domain parsers and the
+text helpers that handle wiki content, MCP edit arguments, and paths.
 Each target checks the documented contract in `src/lib.rs`, not only "no panic".
 
-| Target | Parser | Invariant |
+| Target | Domain code | Invariant |
 | --- | --- | --- |
 | `claim_marks` | `strip_claim_marks`, `extract_claim_marks` | Line count kept; marks on real lines, in order |
 | `frontmatter` | `split_frontmatter` | `rest` is a suffix; line count matches the removed block |
 | `footnotes` | `apply_footnote_mode` | `Include` is identity; `Exclude` and `Only` never grow text |
 | `chunker` | `MarkdownChunker` | Verbatim, ordered chunks; line ranges inside the document |
+| `rst_chunker` | `RstChunker` | Same chunk invariants as `chunker` |
+| `section_edit` | `splice_under_heading`, `replace_line_range`, `replace_unique_match` | Bytes outside the edit kept; errors only for documented reasons |
+| `relative_path` | `safe_relative_path` | Accepted paths have only normal components |
+| `wikilinks` | `find_wikilinks`, `lint_wikilinks`, `resolve_slug` | Targets trimmed and closed; lint agrees with `resolve_slug` |
+| `text_helpers` | `make_snippet`, `extract_summary`, `split_terms`, `collapse_whitespace`, `validate_phrase`, `inject_block` | Caps kept; whitespace collapse idempotent; index prose kept |
+
+`section_edit` reads its first three bytes as the edit and its arguments.
+A NUL in the rest separates the document from the inserted body.
 
 ## Run locally
 

@@ -89,6 +89,16 @@ jobs:
           # Small budgets make many chunks; shorter inputs keep exec/s useful.
           - target: chunker
             max_len: 8192
+          - target: rst_chunker
+            max_len: 8192
+          - target: section_edit
+            max_len: 32768
+          - target: relative_path
+            max_len: 4096
+          - target: wikilinks
+            max_len: 32768
+          - target: text_helpers
+            max_len: 32768
     defaults:
       run:
         working-directory: fuzz
