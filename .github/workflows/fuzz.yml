@@ -125,6 +125,8 @@ jobs:
             max_len: 32768
           - target: text_helpers
             max_len: 32768
+          - target: format_handlers
+            max_len: 65536
     defaults:
       run:
         working-directory: fuzz

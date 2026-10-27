@@ -430,3 +430,7 @@ pub fn check_text_helpers(text: &str) {
         (None, Some(_)) => panic!("index inject skipped present markers"),
     }
 }
+
+mod format_handlers;
+
+pub use format_handlers::check_format_handlers;

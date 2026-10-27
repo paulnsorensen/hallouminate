@@ -1,0 +1,15 @@
+@---
+status: active
+tags:
+- fuzz
+---
+# Claims
+
+The daemon owns the index. <!--claim:confirmed-->
+
+## Older
+
+The CLI wrote rows directly. <!--claim:superseded ref=daemon.md note="moved"-->
+A long line that the small budget splits across chunks before its mark. <!--claim:qualified-->
+
+<!-- an ordinary comment -->
