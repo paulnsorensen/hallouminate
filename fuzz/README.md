@@ -6,7 +6,7 @@ Each target checks the documented contract in `src/lib.rs`, not only "no panic".
 
 | Target | Domain code | Invariant |
 | --- | --- | --- |
-| `claim_marks` | `strip_claim_marks`, `extract_claim_marks` | Line count kept; marks on real lines, in order; strict mode below |
+| `claim_marks` | `strip_claim_marks`, `extract_claim_marks` | Line count kept; no claim mark left after strip; strip idempotent; marks on real lines, in order |
 | `frontmatter` | `split_frontmatter` | `rest` is a suffix; line count matches the removed block |
 | `footnotes` | `apply_footnote_mode` | `Include` is identity; `Exclude` and `Only` never grow text |
 | `chunker` | `MarkdownChunker` | Chunks found in order with only whitespace between them; exact line ranges |
@@ -22,10 +22,6 @@ A NUL in the rest separates the document from the inserted body.
 
 `wikilinks` uses the same NUL convention. The part after the NUL holds
 extra corpus paths, one per line, so inputs can make slugs collide.
-
-`claim_marks` has a strict mode. Set `HALLOUMINATE_FUZZ_STRICT_CLAIMS=1`
-to also assert that stripped text has no claim mark and that stripping is
-idempotent. Current code fails both checks, so they are off by default.
 
 `format_handlers` reads its first byte as the file type (low three bits)
 and the chunk budget (high bits). The rest is the file. Its seeds are in

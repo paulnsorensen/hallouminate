@@ -225,7 +225,8 @@ pub fn extract_claim_marks(content: &str) -> Vec<ClaimMark> {
 /// Remove `<!--claim:...-->` comments from `text`, preserving newlines so the
 /// line count is unchanged and citations stay valid. Ordinary HTML comments are
 /// left intact. Only single-line claim comments are stripped (claim marks are
-/// single-line by grammar).
+/// single-line by grammar). Text that joins into a new claim comment after a
+/// removal is removed too, so the output contains no claim comment.
 pub fn strip_claim_marks(text: &str) -> String {
     // `lines()` drops a trailing newline; reattach the original terminator shape
     // by splitting on '\n' inclusively so line count and EOL bytes are preserved.
@@ -241,9 +242,23 @@ pub fn strip_claim_marks(text: &str) -> String {
     out
 }
 
-/// Strip every `<!--claim:...-->` comment from a single line, leaving non-claim
-/// comments and surrounding text untouched.
+/// Strip claim comments from a single line until none remain. A removal can
+/// join the text around it into a new claim comment, so one pass is not enough.
+/// Each pass that changes the line makes it shorter, so the loop ends.
 fn strip_claim_comments_in_line(line: &str) -> String {
+    let mut line = strip_claim_comments_once(line);
+    loop {
+        let next = strip_claim_comments_once(&line);
+        if next.len() == line.len() {
+            return next;
+        }
+        line = next;
+    }
+}
+
+/// Strip every `<!--claim:...-->` comment found in one left-to-right scan of a
+/// line, leaving non-claim comments and surrounding text untouched.
+fn strip_claim_comments_once(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(open) = rest.find("<!--") {
@@ -253,12 +268,9 @@ fn strip_claim_comments_in_line(line: &str) -> String {
         };
         let inner = &after_open[..close];
         let full_end = open + 4 + close + 3;
-        if matches!(classify(inner), Comment::NotClaim) {
-            // Keep the whole non-claim comment and the text before it.
-            out.push_str(&rest[..full_end]);
-        } else {
-            // Drop the claim/malformed-claim comment; keep the text before it.
-            out.push_str(&rest[..open]);
+        match classify(inner) {
+            Comment::NotClaim => out.push_str(&rest[..full_end]),
+            Comment::Malformed | Comment::Mark { .. } => out.push_str(&rest[..open]),
         }
         rest = &rest[full_end..];
     }
@@ -746,5 +758,57 @@ mod tests {
         assert_eq!(marks[0].note.as_deref(), Some("why"));
         lint_claim_marks(body);
         assert_eq!(strip_claim_marks(body), "x\n");
+    }
+
+    #[test]
+    fn strip_removes_claim_comments_that_reform_after_a_removal() {
+        let cases = [
+            ("<!-<!--claim:confirmed-->-claim:confirmed-->\n", "\n"),
+            (
+                "<!-<!-<!--claim:confirmed-->-claim:qualified-->-claim:superseded-->tail\n",
+                "tail\n",
+            ),
+            ("<!-<!--claim:-->-claim:-->\n", "\n"),
+            (
+                "<!-<!--claim:confirmed-->- ordinary -->\n",
+                "<!-- ordinary -->\n",
+            ),
+            (
+                "a<!-<!--claim:confirmed-->-claim:qualified-->\r\nb<!-<!--claim:confirmed-->-claim:qualified-->",
+                "a\r\nb",
+            ),
+            (
+                "\u{e9}<!-<!--claim:confirmed-->-claim:qualified-->\u{fc}\n",
+                "\u{e9}\u{fc}\n",
+            ),
+            (
+                "<!-<!--claim:confirmed-->-claim:confirmed\n",
+                "<!--claim:confirmed\n",
+            ),
+            (
+                "<!-<!--claim:confirmed-->-claim:confirmed <!-- ordinary -->\n",
+                "\n",
+            ),
+        ];
+        for (text, expected) in cases {
+            let stripped = strip_claim_marks(text);
+            assert_eq!(stripped, expected, "strip of {text:?}");
+            assert!(
+                extract_claim_marks(&stripped).is_empty(),
+                "stripped {text:?} still has a claim mark: {stripped:?}"
+            );
+            assert_eq!(
+                strip_claim_marks(&stripped),
+                stripped,
+                "strip is not idempotent on {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_keeps_claim_syntax_inside_an_ordinary_comment() {
+        let text = "<!-- ordinary <!--claim:confirmed-->\n";
+        assert!(extract_claim_marks(text).is_empty());
+        assert_eq!(strip_claim_marks(text), text);
     }
 }
