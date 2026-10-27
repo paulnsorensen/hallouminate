@@ -200,12 +200,38 @@ fn check_splice(doc: &str, body: &str, a: u8, b: u8) {
         return;
     };
     let block = format!("\n{}\n\n", body.trim_end_matches('\n'));
-    assert_eq!(
-        spliced.len(),
-        doc.len() + block.len(),
-        "splice did not add exactly one block"
+    assert!(
+        is_single_insertion(doc, &block, &spliced),
+        "splice did not insert exactly one block into the unchanged document"
     );
-    assert!(spliced.contains(&block), "splice lost the block");
+}
+
+/// `edited` is `doc` with `block` inserted at one byte offset.
+fn is_single_insertion(doc: &str, block: &str, edited: &str) -> bool {
+    let (doc, block, edited) = (doc.as_bytes(), block.as_bytes(), edited.as_bytes());
+    if edited.len() != doc.len() + block.len() {
+        return false;
+    }
+    let mut prefix = 0;
+    for (original, changed) in doc.iter().zip(edited) {
+        if original != changed {
+            break;
+        }
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    for (original, changed) in doc.iter().rev().zip(edited.iter().rev()) {
+        if original != changed {
+            break;
+        }
+        suffix += 1;
+    }
+    for offset in doc.len() - suffix..=prefix {
+        if edited[offset..offset + block.len()] == *block {
+            return true;
+        }
+    }
+    false
 }
 
 fn check_line_range(doc: &str, body: &str, a: u8, b: u8) {
@@ -220,13 +246,15 @@ fn check_line_range(doc: &str, body: &str, a: u8, b: u8) {
                 "accepted invalid range {start}..={end} of {}",
                 lines.len()
             );
-            assert!(
-                replaced.starts_with(&lines[..start - 1].concat()),
-                "line replace changed the prefix"
+            let expected = format!(
+                "{}{}\n{}",
+                lines[..start - 1].concat(),
+                body.trim_matches('\n'),
+                lines[end..].concat()
             );
-            assert!(
-                replaced.ends_with(&lines[end..].concat()),
-                "line replace changed the suffix"
+            assert_eq!(
+                replaced, expected,
+                "line replace is not prefix, trimmed body, newline, suffix"
             );
         }
         Err(RangeError::OutOfRange) => assert!(
@@ -254,10 +282,13 @@ fn check_unique_match(doc: &str, body: &str, a: u8, b: u8) {
     match replace_unique_match(doc, needle, body) {
         Ok(replaced) => {
             assert_eq!(count, 1, "replaced a needle that is not unique");
+            let Some(offset) = doc.find(needle) else {
+                panic!("replaced an absent needle");
+            };
+            let expected = format!("{}{body}{}", &doc[..offset], &doc[offset + needle.len()..]);
             assert_eq!(
-                replaced.len() + needle.len(),
-                doc.len() + body.len(),
-                "unique replace changed other bytes"
+                replaced, expected,
+                "unique replace did not put the body at the needle"
             );
         }
         Err(MatchError::NotFound) => assert_eq!(count, 0, "missed a present needle"),
