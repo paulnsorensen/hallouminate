@@ -12,7 +12,7 @@ set -euo pipefail
 repo=${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY to owner/name}
 run_id=${GITHUB_RUN_ID:?set GITHUB_RUN_ID}
 attempt=${GITHUB_RUN_ATTEMPT:-1}
-run_url="${GITHUB_SERVER_URL:-https://github.com}/$repo/actions/runs/$run_id"
+run_url="${GITHUB_SERVER_URL:-https://github.com}/$repo/actions/runs/$run_id/attempts/$attempt"
 
 run() {
   if [[ ${DRY_RUN:-} == 1 ]]; then

@@ -39,10 +39,11 @@ cat >"$root/fixtures/artifacts.json" <<'EOF'
 ]}
 EOF
 run_json() {
-  printf '{"path": ".github/workflows/fuzz.yml", "head_branch": "main", "event": "%s", "repository": {"id": 1}, "head_repository": {"id": 1}}\n' "$1"
+  printf '{"path": "%s", "head_branch": "main", "event": "%s", "repository": {"id": 1}, "head_repository": {"id": 1}}\n' "$1" "$2"
 }
-run_json schedule >"$root/fixtures/run-101.json"
-run_json pull_request >"$root/fixtures/run-202.json"
+# The API can add an @<ref> suffix to the workflow path.
+run_json .github/workflows/fuzz.yml@main schedule >"$root/fixtures/run-101.json"
+run_json .github/workflows/fuzz.yml pull_request >"$root/fixtures/run-202.json"
 
 expected=3
 for i in $(seq "$expected"); do

@@ -29,11 +29,12 @@ workdir=
 trap '[[ -z $workdir ]] || rm -rf "$workdir"' EXIT
 
 # Succeeds when the run that uploaded the artifact is trusted.
+# The API can add an @<ref> suffix to .path, so the check removes it.
 trusted_run() {
   local run_id=$1 branch=$2 run
   run=$(gh api "repos/$repo/actions/runs/$run_id") || die "cannot read run $run_id"
   jq -e --arg path "$workflow_path" --arg branch "$branch" '
-    .path == $path
+    (.path | sub("@.*$"; "")) == $path
     and .head_branch == $branch
     and (.event == "schedule" or .event == "workflow_dispatch")
     and .repository.id != null
