@@ -238,9 +238,9 @@ fn cited_window(lines: &[&str], chunk: &PreparedChunk) -> String {
     lines[chunk.line_start - 1..chunk.line_end].concat()
 }
 
-/// Markdown citations point at the on-disk lines, frontmatter included, that
-/// hold the chunk; claim marks decode, sit in their chunk's lines, and are
-/// never duplicated.
+/// Markdown citations are the raw chunk lines shifted past the frontmatter.
+/// Each claim mark goes to the last chunk whose lines hold it, as the handler
+/// documents; a mark that no chunk holds goes nowhere.
 fn check_markdown(bytes: &[u8], budget: usize, prepared: &PreparedFile) {
     let lines = utf8_lines(bytes);
     let body = lines.concat();
@@ -258,15 +258,25 @@ fn check_markdown(bytes: &[u8], budget: usize, prepared: &PreparedFile) {
     // are the witness for what the cited lines must hold.
     let raw = MarkdownChunker::new(Characters, budget).chunk(content);
     assert_eq!(raw.len(), prepared.chunks.len(), "chunk count changed");
-    let mut sources = Vec::new();
+    let mut expected = vec![Vec::new(); raw.len()];
     for mark in extract_claim_marks(content) {
-        sources.push(ClaimMark {
+        let owner = raw
+            .iter()
+            .rposition(|chunk| chunk.line_start <= mark.line && mark.line <= chunk.line_end);
+        let Some(owner) = owner else {
+            continue;
+        };
+        expected[owner].push(ClaimMark {
             line: mark.line + fm_lines,
             ..mark
         });
     }
-    let mut cited = Vec::new();
-    for (raw, chunk) in raw.iter().zip(&prepared.chunks) {
+    for ((raw, chunk), expected) in raw.iter().zip(&prepared.chunks).zip(&expected) {
+        assert_eq!(
+            (chunk.line_start, chunk.line_end),
+            (raw.line_start + fm_lines, raw.line_end + fm_lines),
+            "citation is not the raw chunk lines shifted by {fm_lines}"
+        );
         assert_eq!(
             chunk.text,
             strip_claim_marks(&raw.text),
@@ -278,40 +288,22 @@ fn check_markdown(bytes: &[u8], budget: usize, prepared: &PreparedFile) {
             chunk.line_start,
             chunk.line_end
         );
-        let Some(json) = &chunk.claim_marks else {
-            continue;
+        let marks = match &chunk.claim_marks {
+            None => Vec::new(),
+            Some(json) => {
+                let Ok(marks) = serde_json::from_str::<Vec<ClaimMark>>(json) else {
+                    panic!("claim marks JSON does not decode: {json}");
+                };
+                assert!(!marks.is_empty(), "claim marks JSON is an empty list");
+                marks
+            }
         };
-        let Ok(marks) = serde_json::from_str::<Vec<ClaimMark>>(json) else {
-            panic!("claim marks JSON does not decode: {json}");
-        };
-        assert!(!marks.is_empty(), "claim marks JSON is an empty list");
-        for mark in marks {
-            assert!(
-                chunk.line_start <= mark.line && mark.line <= chunk.line_end,
-                "claim mark line {} is outside its chunk {}..={}",
-                mark.line,
-                chunk.line_start,
-                chunk.line_end
-            );
-            cited.push(mark);
-        }
-    }
-    for mark in &cited {
-        assert!(
-            occurrences(&cited, mark) <= occurrences(&sources, mark),
-            "claim mark {mark:?} is duplicated or not in the file"
+        assert_eq!(
+            &marks, expected,
+            "chunk {}..={} has the wrong claim marks",
+            chunk.line_start, chunk.line_end
         );
     }
-}
-
-fn occurrences(marks: &[ClaimMark], wanted: &ClaimMark) -> usize {
-    let mut count = 0;
-    for mark in marks {
-        if mark == wanted {
-            count += 1;
-        }
-    }
-    count
 }
 
 /// PDF chunks carry a `page:N` breadcrumb for a real page.

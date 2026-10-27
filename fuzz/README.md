@@ -15,7 +15,7 @@ Each target checks the documented contract in `src/lib.rs`, not only "no panic".
 | `relative_path` | `safe_relative_path` | Accepted paths have only normal components |
 | `wikilinks` | `find_wikilinks`, `lint_wikilinks`, `resolve_slug` | Targets trimmed and closed; lint agrees with `resolve_slug` |
 | `text_helpers` | `make_snippet`, `extract_summary`, `split_terms`, `collapse_whitespace`, `validate_phrase`, `inject_block` | Caps kept; whitespace collapse idempotent; index prose kept |
-| `format_handlers` | `HandlerRegistry` handlers (Markdown, text, RST, CSV, workbook, PDF, JSON, JSONL), `detect_format` | Cited lines hold each chunk; claim marks decode, stay in their chunk, never repeat; PDF pages and row breadcrumbs in range; overlap held by an earlier chunk |
+| `format_handlers` | `HandlerRegistry` handlers (Markdown, text, RST, CSV, workbook, PDF, JSON, JSONL), `detect_format` | Markdown citations and claim marks match the raw chunks exactly; other cited lines hold each chunk; PDF pages and row breadcrumbs in range; overlap held by an earlier chunk |
 
 `section_edit` reads its first three bytes as the edit and its arguments.
 A NUL in the rest separates the document from the inserted body.
