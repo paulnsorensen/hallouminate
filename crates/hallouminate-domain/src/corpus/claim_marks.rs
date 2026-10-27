@@ -227,6 +227,9 @@ pub fn extract_claim_marks(content: &str) -> Vec<ClaimMark> {
 /// left intact. Only single-line claim comments are stripped (claim marks are
 /// single-line by grammar). Text that joins into a new claim comment after a
 /// removal is removed too, so the output contains no claim comment.
+///
+/// The worst case is quadratic in line length, because one pass can remove
+/// only one re-formed comment. Pass budget-bounded text, such as index chunks.
 pub fn strip_claim_marks(text: &str) -> String {
     // `lines()` drops a trailing newline; reattach the original terminator shape
     // by splitting on '\n' inclusively so line count and EOL bytes are preserved.
@@ -803,6 +806,19 @@ mod tests {
                 "strip is not idempotent on {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn strip_removes_deeply_nested_reformed_claim_comments() {
+        let depth = 200;
+        let text = format!(
+            "head{}<!--claim:confirmed-->{}tail\n",
+            "<!-".repeat(depth),
+            "-claim:confirmed-->".repeat(depth)
+        );
+        let stripped = strip_claim_marks(&text);
+        assert_eq!(stripped, "headtail\n");
+        assert!(extract_claim_marks(&stripped).is_empty());
     }
 
     #[test]
