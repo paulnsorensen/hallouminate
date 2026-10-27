@@ -398,7 +398,7 @@ pub fn check_wikilinks(input: &str) {
             paths.push(path);
         }
     }
-    let mut flagged = Vec::new();
+    let mut expected = Vec::new();
     for target in &targets {
         assert!(!target.is_empty(), "empty wikilink target");
         assert_eq!(target.trim(), target, "untrimmed wikilink target");
@@ -410,24 +410,20 @@ pub fn check_wikilinks(input: &str) {
         );
         match resolve_slug(target, &paths) {
             SlugResolution::Unique(_) => {}
-            SlugResolution::Missing => flagged.push((target, String::from("has no matching page"))),
-            SlugResolution::Ambiguous(candidates) => {
-                flagged.push((target, format!("matches {}", candidates.join(", "))));
-            }
+            SlugResolution::Missing => expected.push(format!(
+                "wikilink [[{target}]] has no matching page in the corpus"
+            )),
+            SlugResolution::Ambiguous(candidates) => expected.push(format!(
+                "wikilink [[{target}]] is ambiguous \u{2014} matches {}",
+                candidates.join(", ")
+            )),
         }
     }
     let warnings = lint_wikilinks(content, &paths);
     assert_eq!(
-        warnings.len(),
-        flagged.len(),
+        warnings, expected,
         "lint_wikilinks and resolve_slug disagree"
     );
-    for (warning, (target, reason)) in warnings.iter().zip(&flagged) {
-        assert!(
-            warning.contains(&format!("[[{target}]]")) && warning.contains(reason.as_str()),
-            "lint warning {warning:?} does not match resolve_slug for {target:?}: {reason}"
-        );
-    }
 }
 
 /// Snippet, summary, query, and index helpers keep their documented caps
