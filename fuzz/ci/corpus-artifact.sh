@@ -24,6 +24,10 @@ die() {
 
 repo=${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY to owner/name}
 
+# fetch downloads into workdir. The EXIT trap also removes it after die.
+workdir=
+trap '[[ -z $workdir ]] || rm -rf "$workdir"' EXIT
+
 # Succeeds when the run that uploaded the artifact is trusted.
 trusted_run() {
   local run_id=$1 branch=$2 run
@@ -61,19 +65,20 @@ lookup() {
 }
 
 fetch() {
-  local target=$1 dir=$2 id tmp count
+  local target=$1 dir=$2 id count
   id=$(lookup "$target")
   if [[ $id == none ]]; then
     echo "corpus-artifact: no corpus artifact for $target; start from seeds" >&2
     return
   fi
-  tmp=$(mktemp -d)
-  trap 'rm -rf "$tmp"' EXIT
-  gh api "repos/$repo/actions/artifacts/$id/zip" >"$tmp/corpus.zip" || die "cannot download artifact $id"
-  unzip -q "$tmp/corpus.zip" -d "$tmp/files" || die "cannot extract artifact $id"
-  count=$(find "$tmp/files" -type f | wc -l)
+  workdir=$(mktemp -d)
+  gh api "repos/$repo/actions/artifacts/$id/zip" >"$workdir/corpus.zip" || die "cannot download artifact $id"
+  unzip -q "$workdir/corpus.zip" -d "$workdir/files" || die "cannot extract artifact $id"
+  count=$(find "$workdir/files" -type f | wc -l)
   mkdir -p "$dir"
-  find "$tmp/files" -type f -exec mv -f -t "$dir" {} +
+  find "$workdir/files" -type f -exec mv -f -t "$dir" {} +
+  rm -rf "$workdir"
+  workdir=
   echo "corpus-artifact: restored $count inputs for $target from artifact $id" >&2
 }
 

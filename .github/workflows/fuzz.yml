@@ -165,17 +165,23 @@ jobs:
             -rss_limit_mb=2048 \
             -print_final_stats=1
           ci/check-artifacts.sh "artifacts/$TARGET"
-      # cmin keeps the old corpus when it fails, and still exits 0.
+      # cargo-fuzz 0.13.2 cmin prints "Failed to minimize corpus" when
+      # libFuzzer fails, keeps the old corpus, and still exits 0.
       - name: Minimize corpus
         if: ${{ !cancelled() && (steps.fuzz.outcome == 'success' || steps.fuzz.outcome == 'failure') }}
         timeout-minutes: 15
         run: |
           set -euo pipefail
+          log=$(mktemp)
           cargo fuzz cmin --debug-assertions "$TARGET" "corpus/$TARGET" -- \
             -max_len="$MAX_LEN" \
             -timeout=10 \
-            -rss_limit_mb=2048
+            -rss_limit_mb=2048 2>&1 | tee "$log"
           ci/check-artifacts.sh "artifacts/$TARGET"
+          if grep -q '^Failed to minimize corpus' "$log"; then
+            echo "::error::cargo fuzz cmin failed; the corpus is not minimized"
+            exit 1
+          fi
       # Upload also after a crash, so the next run keeps this run's coverage.
       - name: Upload corpus
         if: ${{ !cancelled() && (steps.fuzz.outcome == 'success' || steps.fuzz.outcome == 'failure') }}

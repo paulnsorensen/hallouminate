@@ -41,8 +41,9 @@ writes new inputs to `corpus/<target>/` and crash inputs to
   replays the seeds only.
 - **fuzz** runs daily, one leg per target. It restores the corpus, fuzzes
   for 1200 s with `--jobs $(nproc)`, minimizes the corpus with `cmin`, and
-  uploads it as the `fuzz-corpus-<target>` artifact for 90 days. The upload
-  also runs when the fuzz step fails. Crash inputs go to `fuzz-crash-<target>`.
+  uploads it as the `fuzz-corpus-<target>` artifact for 90 days. A failed
+  `cmin` fails the leg and uploads the old corpus. The upload also runs when
+  the fuzz step fails. Crash inputs go to `fuzz-crash-<target>`.
 - **report** runs when a daily leg fails. It opens one issue per target with
   the title `Fuzz failure: <target>`, or comments the run URL on the open
   issue with that title. Close the issue when the fix lands.
@@ -53,6 +54,7 @@ LRU eviction removes a daily cache entry before the next run.
 comes from a `schedule` or `workflow_dispatch` run of `fuzz.yml` on the
 default branch. It ignores artifacts from PR runs, so a PR cannot plant
 corpus inputs. No artifact means the leg starts from the seeds.
+`ci/test-corpus-artifact.sh` tests the restore offline with a `gh` stub.
 
 `--jobs N` runs libFuzzer with `-fork=N`, and new inputs go to the first
 corpus directory. Fork mode ignores timeouts and OOMs, so
