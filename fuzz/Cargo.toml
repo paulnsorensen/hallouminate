@@ -1,0 +1,49 @@
+[package]
+name = "hallouminate-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Own workspace: the root `just verify` gate never builds libFuzzer, and the
+# nightly toolchain pinned in rust-toolchain.toml applies only here.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+hallouminate-domain = { path = "../crates/hallouminate-domain" }
+# Same major as hallouminate-domain so `Characters` implements the
+# re-exported `ChunkSizer` trait.
+text-splitter = "0.33"
+
+[[bin]]
+name = "claim_marks"
+path = "fuzz_targets/claim_marks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frontmatter"
+path = "fuzz_targets/frontmatter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "footnotes"
+path = "fuzz_targets/footnotes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunker"
+path = "fuzz_targets/chunker.rs"
+test = false
+doc = false
+bench = false

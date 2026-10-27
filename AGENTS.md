@@ -20,6 +20,13 @@ This repository lease prevents same-project duplication only. Host-wide
 admission control and cgroups or equivalent resource isolation are the
 execution environment's responsibility.
 
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets in their own workspace on a pinned nightly.
+`just fuzz-build` builds them under the verification lease, and `just fuzz
+<target> <seconds>` fuzzes one target. See `fuzz/README.md` for crash
+reproduction and nightly bumps.
+
 ## Keep the wiki current after each land
 
 This repo dogfoods its own wiki at `.hallouminate/wiki/` (corpus

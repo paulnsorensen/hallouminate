@@ -1,0 +1,147 @@
+name: Fuzz
+
+# cargo-fuzz targets for the hallouminate-domain markdown parsers (fuzz/).
+#
+# - build: a PR that touches the parsers or the fuzz crate builds every target
+#   and replays the seeds once. The harness cannot rot, and a PR never fails
+#   on a random new input.
+# - fuzz: a daily run fuzzes each target from a rolling corpus in the Actions
+#   cache and uploads crash inputs as artifacts.
+#
+# The fuzz crate is its own workspace on the nightly in fuzz/rust-toolchain.toml.
+# Each job copies the root Cargo.lock into fuzz/ so the targets fuzz the same
+# dependency versions that ship.
+
+on:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "crates/hallouminate-domain/**"
+      - "Cargo.lock"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Fuzzing time per target, in seconds
+        default: "1200"
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_FUZZ_VERSION: 0.13.2
+
+jobs:
+  build:
+    name: build and replay seeds
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: fuzz
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Use the shipped lockfile
+        run: cp ../Cargo.lock Cargo.lock
+      - run: cargo fmt --check
+      - name: Build all targets
+        run: cargo fuzz build --debug-assertions
+      - name: Replay seeds
+        run: |
+          set -euo pipefail
+          for target in $(cargo fuzz list); do
+            cargo fuzz run --debug-assertions "$target" seeds ../.hallouminate/wiki -- -runs=0
+          done
+
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: claim_marks
+            max_len: 32768
+          - target: frontmatter
+            max_len: 32768
+          - target: footnotes
+            max_len: 32768
+          # Small budgets make many chunks; shorter inputs keep exec/s useful.
+          - target: chunker
+            max_len: 8192
+    defaults:
+      run:
+        working-directory: fuzz
+    env:
+      TARGET: ${{ matrix.target }}
+      MAX_LEN: ${{ matrix.max_len }}
+      SECONDS_PER_TARGET: ${{ inputs.seconds || '1200' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned nightly
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - name: Use the shipped lockfile
+        run: cp ../Cargo.lock Cargo.lock
+      # Cache keys are write-once, so each run saves a new key and the next
+      # run restores the newest one by prefix.
+      - name: Restore corpus
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Build target
+        run: cargo fuzz build --debug-assertions "$TARGET"
+      - name: Fuzz
+        run: |
+          set -euo pipefail
+          mkdir -p "corpus/$TARGET"
+          cargo fuzz run --debug-assertions "$TARGET" "corpus/$TARGET" seeds ../.hallouminate/wiki -- \
+            -dict=markdown.dict \
+            -max_len="$MAX_LEN" \
+            -max_total_time="$SECONDS_PER_TARGET" \
+            -print_final_stats=1
+      - name: Minimize corpus
+        run: cargo fuzz cmin --debug-assertions "$TARGET" "corpus/$TARGET" -- -max_len="$MAX_LEN"
+      - name: Save corpus
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30

@@ -52,6 +52,16 @@ eval-measure:
 eval:
     just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_enforce -- --ignored --nocapture --exact
 
+# Build every fuzz target on the nightly pinned in fuzz/rust-toolchain.toml.
+fuzz-build:
+    cp Cargo.lock fuzz/Cargo.lock
+    RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' fuzz/rust-toolchain.toml)" just verify cargo fuzz build --fuzz-dir fuzz --debug-assertions
+
+# Fuzz one target, e.g. `just fuzz claim_marks 300`. Crash inputs land in fuzz/artifacts/.
+fuzz target seconds="60": fuzz-build
+    mkdir -p fuzz/corpus/{{target}}
+    cd fuzz && RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" cargo fuzz run --debug-assertions {{target}} corpus/{{target}} seeds ../.hallouminate/wiki -- -dict=markdown.dict -max_total_time={{seconds}}
+
 # Prepare a new release bump PR: crate version, lockfile, and plugin manifests.
 prepare-release version:
     #!/usr/bin/env bash
