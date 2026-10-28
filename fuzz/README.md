@@ -30,6 +30,44 @@ The seeds are `seeds/` plus every page in `.hallouminate/wiki/`. libFuzzer
 writes new inputs to `corpus/<target>/` and crash inputs to
 `artifacts/<target>/`. Both directories are ignored by git.
 
+## CI
+
+`.github/workflows/fuzz.yml` has three jobs. The shell they need lives in
+`ci/`, so you can run it locally with `gh` logged in.
+
+- **build** runs on a PR that touches the parsers or this crate. It builds
+  every target and replays the seeds and the newest daily corpus once with
+  `-runs=0`. The corpus download is best effort: a fork PR or an API error
+  replays the seeds only.
+- **fuzz** runs daily, one leg per target. It restores the corpus, fuzzes
+  for 1200 s with `--jobs $(nproc)`, minimizes the corpus with `cmin`, and
+  uploads it as the `fuzz-corpus-<target>` artifact for 90 days. A failed
+  `cmin` fails the leg and uploads the old corpus. The upload also runs when
+  the fuzz step fails. Crash inputs go to `fuzz-crash-<target>`.
+- **report** runs when a daily leg fails. It opens one issue per target with
+  the title `Fuzz failure: <target>`, or comments the run URL on the open
+  issue with that title. Close the issue when the fix lands.
+
+The corpus is an artifact because the repository Actions cache is full, and
+LRU eviction removes a daily cache entry before the next run.
+`ci/corpus-artifact.sh` takes the newest artifact that is not expired and
+comes from a `schedule` or `workflow_dispatch` run of `fuzz.yml` on the
+default branch. It ignores artifacts from PR runs, so a PR cannot plant
+corpus inputs. No artifact means the leg starts from the seeds.
+`ci/test-corpus-artifact.sh` tests the restore offline with a `gh` stub.
+
+`--jobs N` runs libFuzzer with `-fork=N`, and new inputs go to the first
+corpus directory. Fork mode ignores timeouts and OOMs, so
+`ci/check-artifacts.sh` fails the leg when `artifacts/<target>/` holds a
+`crash-`, `timeout-`, `oom-`, or `leak-` file. `-timeout=10` reports an
+input that runs longer than 10 s; the libFuzzer default is 1200 s.
+
+To fuzz locally from the daily corpus:
+
+```sh
+GITHUB_REPOSITORY=paulnsorensen/hallouminate ci/corpus-artifact.sh fetch chunker corpus/chunker
+```
+
 ## Reproduce a CI crash
 
 1. Download the `fuzz-crash-<target>` artifact from the failed Fuzz run.

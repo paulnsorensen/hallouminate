@@ -3,10 +3,16 @@ name: Fuzz
 # cargo-fuzz targets for the hallouminate-domain markdown parsers (fuzz/).
 #
 # - build: a PR that touches the parsers or the fuzz crate builds every target
-#   and replays the seeds once. The harness cannot rot, and a PR never fails
-#   on a random new input.
-# - fuzz: a daily run fuzzes each target from a rolling corpus in the Actions
-#   cache and uploads crash inputs as artifacts.
+#   and replays the seeds and the newest daily corpus once. The harness cannot
+#   rot, and a PR never fails on a random new input.
+# - fuzz: a daily run fuzzes each target on all runner cores from the newest
+#   fuzz-corpus-<target> artifact, then uploads the minimized corpus as a new
+#   artifact and crash inputs as fuzz-crash-<target>.
+# - report: a failed daily leg opens or updates one issue per target.
+#
+# The corpus is an artifact, not an Actions cache entry: the repository cache
+# is at its size limit, so LRU eviction removes a daily cache entry before the
+# next run.
 #
 # The fuzz crate is its own workspace on the nightly in fuzz/rust-toolchain.toml.
 # Each job copies the root Cargo.lock into fuzz/ so the targets fuzz the same
@@ -40,10 +46,13 @@ env:
 
 jobs:
   build:
-    name: build and replay seeds
+    name: build and replay corpus
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read # download the corpus artifact
     defaults:
       run:
         working-directory: fuzz
@@ -51,6 +60,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Test the CI scripts
+        run: ci/test-corpus-artifact.sh
       - name: Install pinned nightly
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -64,11 +75,23 @@ jobs:
       - run: cargo fmt --check
       - name: Build all targets
         run: cargo fuzz build --debug-assertions
-      - name: Replay seeds
+      # Best effort: a fork PR or an API error replays the seeds only.
+      - name: Restore daily corpus
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for target in $(cargo fuzz list); do
+            ci/corpus-artifact.sh fetch "$target" "corpus/$target" \
+              || echo "::warning::cannot restore the corpus for $target"
+          done
+      - name: Replay seeds and corpus
         run: |
           set -euo pipefail
           for target in $(cargo fuzz list); do
-            cargo fuzz run --debug-assertions "$target" seeds ../.hallouminate/wiki -- -runs=0
+            dirs=(seeds ../.hallouminate/wiki)
+            [[ -d "corpus/$target" ]] && dirs+=("corpus/$target")
+            cargo fuzz run --debug-assertions "$target" "${dirs[@]}" -- \
+              -runs=0 -timeout=10 -rss_limit_mb=2048
           done
 
   fuzz:
@@ -76,6 +99,9 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 75
+    permissions:
+      contents: read
+      actions: read # download the corpus artifact
     strategy:
       fail-fast: false
       matrix:
@@ -120,33 +146,54 @@ jobs:
         run: cargo install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
       - name: Use the shipped lockfile
         run: cp ../Cargo.lock Cargo.lock
-      # Cache keys are write-once, so each run saves a new key and the next
-      # run restores the newest one by prefix.
       - name: Restore corpus
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-
-          restore-keys: fuzz-corpus-${{ matrix.target }}-
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ci/corpus-artifact.sh fetch "$TARGET" "corpus/$TARGET"
       - name: Build target
         run: cargo fuzz build --debug-assertions "$TARGET"
+      # --jobs N runs libFuzzer with -fork=N. New inputs go to the first corpus
+      # dir. Fork mode ignores timeouts and OOMs, so check the artifact dir.
       - name: Fuzz
+        id: fuzz
         run: |
           set -euo pipefail
           mkdir -p "corpus/$TARGET"
-          cargo fuzz run --debug-assertions "$TARGET" "corpus/$TARGET" seeds ../.hallouminate/wiki -- \
+          cargo fuzz run --debug-assertions --jobs "$(nproc)" "$TARGET" "corpus/$TARGET" seeds ../.hallouminate/wiki -- \
             -dict=markdown.dict \
             -max_len="$MAX_LEN" \
             -max_total_time="$SECONDS_PER_TARGET" \
+            -timeout=10 \
+            -rss_limit_mb=2048 \
             -print_final_stats=1
+          ci/check-artifacts.sh "artifacts/$TARGET"
+      # cargo-fuzz 0.13.2 cmin prints "Failed to minimize corpus" when
+      # libFuzzer fails, keeps the old corpus, and still exits 0.
       - name: Minimize corpus
-        run: cargo fuzz cmin --debug-assertions "$TARGET" "corpus/$TARGET" -- -max_len="$MAX_LEN"
-      - name: Save corpus
-        if: ${{ !cancelled() }}
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: ${{ !cancelled() && (steps.fuzz.outcome == 'success' || steps.fuzz.outcome == 'failure') }}
+        timeout-minutes: 15
+        run: |
+          set -euo pipefail
+          log=$(mktemp)
+          cargo fuzz cmin --debug-assertions "$TARGET" "corpus/$TARGET" -- \
+            -max_len="$MAX_LEN" \
+            -timeout=10 \
+            -rss_limit_mb=2048 2>&1 | tee "$log"
+          ci/check-artifacts.sh "artifacts/$TARGET"
+          if grep -q '^Failed to minimize corpus' "$log"; then
+            echo "::error::cargo fuzz cmin failed; the corpus is not minimized"
+            exit 1
+          fi
+      # Upload also after a crash, so the next run keeps this run's coverage.
+      - name: Upload corpus
+        if: ${{ !cancelled() && (steps.fuzz.outcome == 'success' || steps.fuzz.outcome == 'failure') }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          path: fuzz/corpus/${{ matrix.target }}
-          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}/
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: true
       - name: Upload crash inputs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -155,3 +202,29 @@ jobs:
           path: fuzz/artifacts/${{ matrix.target }}/
           if-no-files-found: ignore
           retention-days: 30
+          overwrite: true
+
+  # A separate job keeps issues: write away from the jobs that compile and
+  # run third-party crates.
+  report:
+    name: file failure issues
+    needs: fuzz
+    if: ${{ failure() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: fuzz-report
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read # list the jobs of this run
+      issues: write # open or comment on the issue
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: fuzz/ci
+      - name: Open or update issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: fuzz/ci/report-failures.sh
