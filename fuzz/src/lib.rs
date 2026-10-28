@@ -5,7 +5,6 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path};
-use std::sync::OnceLock;
 
 use hallouminate_domain::corpus::index_md::{INDEX_END_MARKER, INDEX_START_MARKER, inject_block};
 use hallouminate_domain::corpus::{
@@ -44,21 +43,9 @@ fn physical_lines(text: &str) -> usize {
     text.split_inclusive('\n').count()
 }
 
-/// `strip_claim_marks` keeps the line count, and extracted marks point at
-/// real body lines in line order.
-///
-/// With `HALLOUMINATE_FUZZ_STRICT_CLAIMS` set, it also asserts that stripped
-/// text has no claim mark and that stripping is idempotent. One strip pass can
-/// join the bytes around a removed comment into a new claim comment, so these
-/// checks fail on current code and stay off by default.
+/// `strip_claim_marks` keeps the line count, leaves no claim mark, and is
+/// idempotent. Extracted marks point at real body lines in line order.
 pub fn check_claim_marks(text: &str) {
-    enum ResidueCheck {
-        Skip,
-        Assert,
-    }
-    const STRICT_CLAIMS: &str = "HALLOUMINATE_FUZZ_STRICT_CLAIMS";
-    static RESIDUE_CHECK: OnceLock<ResidueCheck> = OnceLock::new();
-
     let stripped = strip_claim_marks(text);
     assert_eq!(
         newline_count(&stripped),
@@ -82,24 +69,15 @@ pub fn check_claim_marks(text: &str) {
         previous = mark.line;
     }
 
-    let residue_check = RESIDUE_CHECK.get_or_init(|| match std::env::var_os(STRICT_CLAIMS) {
-        Some(_) => ResidueCheck::Assert,
-        None => ResidueCheck::Skip,
-    });
-    match residue_check {
-        ResidueCheck::Skip => {}
-        ResidueCheck::Assert => {
-            assert!(
-                extract_claim_marks(&stripped).is_empty(),
-                "stripped text still has claim marks"
-            );
-            assert_eq!(
-                strip_claim_marks(&stripped),
-                stripped,
-                "strip_claim_marks is not idempotent"
-            );
-        }
-    }
+    assert!(
+        extract_claim_marks(&stripped).is_empty(),
+        "stripped text still has claim marks"
+    );
+    assert_eq!(
+        strip_claim_marks(&stripped),
+        stripped,
+        "strip_claim_marks is not idempotent"
+    );
 
     lint_claim_marks(text);
 }
