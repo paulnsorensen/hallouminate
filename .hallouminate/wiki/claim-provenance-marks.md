@@ -66,6 +66,7 @@ strip changes nothing. The worst case is quadratic in nesting depth, which the
 rustdoc states. Chunks are budget-bounded, so this cost stays small. An ordinary
 HTML comment inside a re-formed claim comment goes with it; a test pins that
 behavior.
+
 ## Each mark belongs to exactly one chunk
 
 The subtle correctness rule, and the easiest thing to break. `MarkdownSplitter`
