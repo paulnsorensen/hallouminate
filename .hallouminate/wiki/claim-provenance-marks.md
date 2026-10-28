@@ -56,6 +56,16 @@ embedding input and the stored snippet, so one strip cleans both — embeddings 
 `read_markdown` reads on-disk bytes directly and is unaffected — marks remain
 verbatim on disk.
 
+**Strip runs to a fixpoint.** One removal pass can join the text around a removed
+comment into a new claim comment: a claim comment nested inside the opener of
+another leaves a complete claim comment behind after the first pass.
+`strip_claim_marks` therefore repeats `strip_claim_comments_once` until the
+length stops changing (PR #666). The `claim_marks` cargo-fuzz target found this
+case; its oracle checks that no claim-comment opener remains and that a second
+strip changes nothing. The worst case is quadratic in nesting depth, which the
+rustdoc states. Chunks are budget-bounded, so this cost stays small. An ordinary
+HTML comment inside a re-formed claim comment goes with it; a test pins that
+behavior.
 ## Each mark belongs to exactly one chunk
 
 The subtle correctness rule, and the easiest thing to break. `MarkdownSplitter`
