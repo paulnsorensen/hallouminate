@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path};
+use std::sync::OnceLock;
 
 use hallouminate_domain::corpus::index_md::{INDEX_END_MARKER, INDEX_START_MARKER, inject_block};
 use hallouminate_domain::corpus::{
@@ -45,7 +46,19 @@ fn physical_lines(text: &str) -> usize {
 
 /// `strip_claim_marks` keeps the line count, and extracted marks point at
 /// real body lines in line order.
+///
+/// With `HALLOUMINATE_FUZZ_STRICT_CLAIMS` set, it also asserts that stripped
+/// text has no claim mark and that stripping is idempotent. One strip pass can
+/// join the bytes around a removed comment into a new claim comment, so these
+/// checks fail on current code and stay off by default.
 pub fn check_claim_marks(text: &str) {
+    enum ResidueCheck {
+        Skip,
+        Assert,
+    }
+    const STRICT_CLAIMS: &str = "HALLOUMINATE_FUZZ_STRICT_CLAIMS";
+    static RESIDUE_CHECK: OnceLock<ResidueCheck> = OnceLock::new();
+
     let stripped = strip_claim_marks(text);
     assert_eq!(
         newline_count(&stripped),
@@ -67,6 +80,25 @@ pub fn check_claim_marks(text: &str) {
         );
         assert!(mark.line >= previous, "claim marks are out of line order");
         previous = mark.line;
+    }
+
+    let residue_check = RESIDUE_CHECK.get_or_init(|| match std::env::var_os(STRICT_CLAIMS) {
+        Some(_) => ResidueCheck::Assert,
+        None => ResidueCheck::Skip,
+    });
+    match residue_check {
+        ResidueCheck::Skip => {}
+        ResidueCheck::Assert => {
+            assert!(
+                extract_claim_marks(&stripped).is_empty(),
+                "stripped text still has claim marks"
+            );
+            assert_eq!(
+                strip_claim_marks(&stripped),
+                stripped,
+                "strip_claim_marks is not idempotent"
+            );
+        }
     }
 
     lint_claim_marks(text);
@@ -113,33 +145,44 @@ pub enum ChunkerKind {
     Rst,
 }
 
-/// Chunks are verbatim, ordered slices whose line ranges stay inside the
-/// document.
+/// Chunks are trimmed source slices in document order. Only whitespace
+/// falls between them, and each line range is the exact span of its slice.
 pub fn check_chunks(text: &str, budget: usize, kind: ChunkerKind) {
     let chunks = match kind {
         ChunkerKind::Markdown => MarkdownChunker::new(Characters, budget).chunk(text),
         ChunkerKind::Rst => RstChunker::new(Characters, budget).chunk(text),
     };
-    let lines = physical_lines(text);
-    let mut previous_start = 1;
+    let mut cursor = 0;
+    let mut line = 1;
     for (index, chunk) in chunks.iter().enumerate() {
         assert_eq!(chunk.ord, index, "chunk ord is not sequential");
-        assert!(!chunk.text.is_empty(), "empty chunk");
+        let Some(last) = chunk.text.len().checked_sub(1) else {
+            panic!("chunk {index} is empty");
+        };
+        let Some(offset) = text[cursor..].find(&chunk.text) else {
+            panic!("chunk {index} is not a source slice at or after byte {cursor}");
+        };
+        let start = cursor + offset;
+        let skipped = &text[cursor..start];
         assert!(
-            text.contains(&chunk.text),
-            "chunk text is not a source slice"
+            skipped.trim().is_empty(),
+            "chunker dropped {skipped:?} before chunk {index}"
         );
-        assert!(
-            1 <= chunk.line_start && chunk.line_start <= chunk.line_end && chunk.line_end <= lines,
-            "chunk lines {}..={} are outside 1..={lines}",
-            chunk.line_start,
-            chunk.line_end
-        );
-        assert!(
-            chunk.line_start >= previous_start,
-            "chunks are out of document order"
-        );
-        previous_start = chunk.line_start;
+        line += newline_count(skipped);
+        assert_eq!(chunk.line_start, line, "chunk {index} line_start is wrong");
+        let (body, tail) = chunk.text.as_bytes().split_at(last);
+        for byte in body {
+            if *byte == b'\n' {
+                line += 1;
+            }
+        }
+        assert_eq!(chunk.line_end, line, "chunk {index} line_end is wrong");
+        for byte in tail {
+            if *byte == b'\n' {
+                line += 1;
+            }
+        }
+        cursor = start + chunk.text.len();
         match kind {
             ChunkerKind::Markdown => assert!(
                 chunk.heading_path.len() <= MAX_HEADING_DEPTH,
@@ -148,6 +191,11 @@ pub fn check_chunks(text: &str, budget: usize, kind: ChunkerKind) {
             ChunkerKind::Rst => {}
         }
     }
+    let rest = &text[cursor..];
+    assert!(
+        rest.trim().is_empty(),
+        "chunker dropped {rest:?} after the last chunk"
+    );
 }
 
 /// The section edit a `section_edit` input exercises.
@@ -324,18 +372,33 @@ pub fn check_relative_path(raw: &str) {
 }
 
 /// Wikilink targets are trimmed and closed, and `lint_wikilinks` flags
-/// exactly the targets that `resolve_slug` cannot resolve uniquely.
-pub fn check_wikilinks(content: &str) {
+/// exactly the targets that `resolve_slug` cannot resolve uniquely. A NUL
+/// in `input` separates the document from newline-separated extra corpus
+/// paths, so inputs can make slugs collide.
+pub fn check_wikilinks(input: &str) {
+    const MAX_EXTRA_PATHS: usize = 16;
+    let (content, extra) = input.split_once('\0').unwrap_or((input, ""));
     lint_markdown(content);
     let targets = find_wikilinks(content);
     let mut paths: Vec<String> = KNOWN_PATHS.iter().map(|path| path.to_string()).collect();
+    let mut added = 0;
+    for path in extra.split('\n') {
+        if added == MAX_EXTRA_PATHS {
+            break;
+        }
+        if path.is_empty() {
+            continue;
+        }
+        paths.push(path.to_string());
+        added += 1;
+    }
     for target in targets.iter().take(MAX_DERIVED_PATHS) {
         let path = format!("{target}.md");
         if !paths.contains(&path) {
             paths.push(path);
         }
     }
-    let mut expected = 0;
+    let mut expected = Vec::new();
     for target in &targets {
         assert!(!target.is_empty(), "empty wikilink target");
         assert_eq!(target.trim(), target, "untrimmed wikilink target");
@@ -347,12 +410,18 @@ pub fn check_wikilinks(content: &str) {
         );
         match resolve_slug(target, &paths) {
             SlugResolution::Unique(_) => {}
-            SlugResolution::Missing | SlugResolution::Ambiguous(_) => expected += 1,
+            SlugResolution::Missing => expected.push(format!(
+                "wikilink [[{target}]] has no matching page in the corpus"
+            )),
+            SlugResolution::Ambiguous(candidates) => expected.push(format!(
+                "wikilink [[{target}]] is ambiguous \u{2014} matches {}",
+                candidates.join(", ")
+            )),
         }
     }
+    let warnings = lint_wikilinks(content, &paths);
     assert_eq!(
-        lint_wikilinks(content, &paths).len(),
-        expected,
+        warnings, expected,
         "lint_wikilinks and resolve_slug disagree"
     );
 }

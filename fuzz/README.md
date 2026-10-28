@@ -6,19 +6,26 @@ Each target checks the documented contract in `src/lib.rs`, not only "no panic".
 
 | Target | Domain code | Invariant |
 | --- | --- | --- |
-| `claim_marks` | `strip_claim_marks`, `extract_claim_marks` | Line count kept; marks on real lines, in order |
+| `claim_marks` | `strip_claim_marks`, `extract_claim_marks` | Line count kept; marks on real lines, in order; strict mode below |
 | `frontmatter` | `split_frontmatter` | `rest` is a suffix; line count matches the removed block |
 | `footnotes` | `apply_footnote_mode` | `Include` is identity; `Exclude` and `Only` never grow text |
-| `chunker` | `MarkdownChunker` | Verbatim, ordered chunks; line ranges inside the document |
+| `chunker` | `MarkdownChunker` | Chunks found in order with only whitespace between them; exact line ranges |
 | `rst_chunker` | `RstChunker` | Same chunk invariants as `chunker` |
 | `section_edit` | `splice_under_heading`, `replace_line_range`, `replace_unique_match` | Bytes outside the edit kept; errors only for documented reasons |
 | `relative_path` | `safe_relative_path` | Accepted paths have only normal components |
-| `wikilinks` | `find_wikilinks`, `lint_wikilinks`, `resolve_slug` | Targets trimmed and closed; lint agrees with `resolve_slug` |
+| `wikilinks` | `find_wikilinks`, `lint_wikilinks`, `resolve_slug` | Targets trimmed and closed; each lint warning matches `resolve_slug` for its target |
 | `text_helpers` | `make_snippet`, `extract_summary`, `split_terms`, `collapse_whitespace`, `validate_phrase`, `inject_block` | Caps kept; whitespace collapse idempotent; index prose kept |
 | `format_handlers` | `HandlerRegistry` handlers (Markdown, text, RST, CSV, workbook, PDF, JSON, JSONL), `detect_format` | Markdown citations and claim marks match the raw chunks exactly; other cited lines hold each chunk; PDF pages and row breadcrumbs in range; overlap held by an earlier chunk |
 
 `section_edit` reads its first three bytes as the edit and its arguments.
 A NUL in the rest separates the document from the inserted body.
+
+`wikilinks` uses the same NUL convention. The part after the NUL holds
+extra corpus paths, one per line, so inputs can make slugs collide.
+
+`claim_marks` has a strict mode. Set `HALLOUMINATE_FUZZ_STRICT_CLAIMS=1`
+to also assert that stripped text has no claim mark and that stripping is
+idempotent. Current code fails both checks, so they are off by default.
 
 `format_handlers` reads its first byte as the file type (low three bits)
 and the chunk budget (high bits). The rest is the file. Its seeds are in
