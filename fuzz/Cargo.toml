@@ -19,6 +19,10 @@ hallouminate-domain = { path = "../crates/hallouminate-domain" }
 # Same major as hallouminate-domain so `Characters` implements the
 # re-exported `ChunkSizer` trait.
 text-splitter = "0.33"
+# Same versions as hallouminate-domain: the format_handlers oracle decodes
+# claim-mark JSON and counts PDF pages with the parsers the handlers use.
+serde_json = "1"
+pdf-extract = "0.12"
 
 [[bin]]
 name = "claim_marks"
@@ -79,6 +83,13 @@ bench = false
 [[bin]]
 name = "text_helpers"
 path = "fuzz_targets/text_helpers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "format_handlers"
+path = "fuzz_targets/format_handlers.rs"
 test = false
 doc = false
 bench = false
