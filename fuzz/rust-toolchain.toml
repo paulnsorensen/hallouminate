@@ -1,6 +1,6 @@
 # cargo-fuzz needs nightly for its sanitizer and coverage flags. Pin a dated
 # nightly so a toolchain regression cannot break the fuzz job silently.
 [toolchain]
-channel = "nightly-2026-10-26"
+channel = "nightly-2026-10-31"
 components = ["rustfmt"]
 profile = "minimal"
