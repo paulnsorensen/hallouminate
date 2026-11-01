@@ -36,6 +36,17 @@ LLM fact extraction pipelines differ mainly on whether a schema constrains extra
 All LLM-era pipelines share one shape: chunk the source, extract entities and relations per chunk, resolve duplicates, summarize or validate, and keep a link from each fact to its source chunk.
 Graphiti adds bi-temporal edges: it keeps episodes as provenance and invalidates a contradicted edge with valid and invalid timestamps.
 
+## Memory products and fact updates
+
+LLM memory products differ in how they store a fact and what happens when it changes; [[facts-layer-extraction-supersession-research]] checked three of them.
+
+- **Mem0 v2** stores free-text memories, writes add-only, and removes only exact duplicates by hash. In issue #4896, a user reported that two contradictory facts were both stored; the maintainers closed it as intended design.
+- **Zep/Graphiti** keeps a bi-temporal graph and invalidates a contradicted edge; see [[facts-layer-supersession-evidence]].
+- **Basic Memory** keeps observations and relations inline in markdown and syncs them to an SQLite index; no supersession mechanism was found.
+
+Most published memory benchmark numbers come from the vendors, and the vendors dispute each other's LoCoMo and LongMemEval results.
+A Neo4j blog lists error persistence, fidelity loss, staleness, and drift as risks of Karpathy-style markdown LLM wikis; Neo4j sells a graph database.
+
 ## Facts layer constructs hallouminate already has
 
 Hallouminate already covers part of the facts-layer landscape without a graph.
@@ -57,7 +68,8 @@ This snapshot ages quickly; check the source before choosing a dependency.
 ## Facts layer landscape gaps
 
 The facts-layer landscape research did not cover METHONTOLOGY, eXtreme Design, Text2KG, Obsidian Breadcrumbs or Dataview inline fields.
+The 2026-11-01 follow-up found no sources for Cognee, Letta memory blocks, Logseq, or Foam.
 The Open Knowledge Format (OKF) appears only in comments on the Karpathy gist; no spec was found.
 It is not known whether oxigraph, rdflib, or sophia_rs support RDF 1.2 triple terms and reifiers.
 
-_Source: [[llm-wiki-facts-layer-landscape-research]] (agent `/briesearch`, 2026-10-05) · Updated: 2026-10-21_
+_Source: [[llm-wiki-facts-layer-landscape-research]] (agent `/briesearch`, 2026-10-05), [[facts-layer-extraction-supersession-research]] (2026-11-01) · Updated: 2026-11-01_

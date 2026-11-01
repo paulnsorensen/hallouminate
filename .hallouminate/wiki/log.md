@@ -87,3 +87,15 @@
 - 2026-10-21 · 29c3ea50f7289f79 · skipped-near-duplicate · claim-provenance-marks.md · Q4 relates to supersession marks, but no decision exists, so the page stays unchanged and the forks page links to it.
 All 16 frozen retrieval probes pass on the first write: 7 exact probes at rank 1, 9 natural or central-claim probes within the top 3.
 
+
+
+
+- 2026-11-01 · 898a746602dd9471 · new-page · sources/facts-layer-extraction-supersession-research.md · source page for the 2026-11-01 follow-up deep `/briesearch` report on extraction, supersession, inline retrieval, and prior art.
+- 2026-11-01 · 898a746602dd9471 · new-page · facts-layer-extraction-evidence.md · fork Q1 evidence: closed-ontology triple F1 on 2026 models, open-extraction relation sprawl, EDC canonicalization trade-off; evidence only.
+- 2026-11-01 · 898a746602dd9471 · new-page · facts-layer-supersession-evidence.md · forks Q3/Q4 evidence: statement-model change mechanisms and STALE results on 2026 models; evidence only.
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-store-evidence.md · new section on fact text inside embedded chunks (metadata-prefix study, contextual retrieval, local embed-text facts).
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-landscape.md · memory-product update behavior (Mem0 add-only, Graphiti, Basic Memory) and new coverage gaps.
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-open-forks.md · one new evidence line per fork; all four forks stay open.
+- 2026-11-01 · 898a746602dd9471 · merged · index.md · two facts-layer evidence entries added to the curated topic list.
+All 11 frozen retrieval probes pass on the first write: 3 exact probes at rank 1, 8 natural or central-claim probes within the top 3.
+

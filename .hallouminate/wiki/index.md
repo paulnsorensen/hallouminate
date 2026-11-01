@@ -23,9 +23,11 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [domain-model](domain-model.md) — the `search_text`, root-aware `CorpusKey`, and schema-v4 model that shipped in #290 (issue #288's design).
 - [eval-baseline-rg-provenance-adrs](eval-baseline-rg-provenance-adrs.md) — why the eval was re-baselined with the divergence unexplained, and why ripgrep's version is recorded but never enforced.
 - [eval-harness-gotchas](eval-harness-gotchas.md) — operational traps running the ground-retrieval eval: ripgrep as an uninstalled hard dependency, the warning-code taxonomy three crates own, the discarded warmup sweep, and ETXTBSY in parallel tests.
+- [facts-layer-extraction-evidence](facts-layer-extraction-evidence.md) — research evidence for fork Q1: closed-schema extraction accuracy on 2026 models, open-extraction relation sprawl, and the canonicalization trade-off.
 - [facts-layer-landscape](facts-layer-landscape.md) — research evidence: no end-to-end standard for an LLM-wiki facts layer; the four layers (workflow, markdown fact syntax, formal fact models, construction methods) and a 2026-10-05 tooling snapshot.
 - [facts-layer-open-forks](facts-layer-open-forks.md) — the four open (undecided) facts-layer design forks: extraction method, where facts live, statement model, and time model.
 - [facts-layer-store-evidence](facts-layer-store-evidence.md) — research evidence on whether an RDF or graph store helps modern LLMs more than inline fact demarcation; structure helps, the store technology does not carry the gain.
+- [facts-layer-supersession-evidence](facts-layer-supersession-evidence.md) — research evidence for forks Q3 and Q4: how statement models mark a changed fact, and STALE results for outdated memories on 2026 models.
 - [ground-search-evaluation](ground-search-evaluation.md) — discriminative file/chunk relevance metrics, latency thresholds, small-reranker comparison, and scheduled regression gate.
 - [ground-search-quality](ground-search-quality.md) — issue #288's spec, shipped in #290: indexed-text cleanup, worktree isolation, eval-gated reranking (default stayed opt-in), and authoring context.
 - [ground-search-quality-adrs](ground-search-quality-adrs.md) — five decisions and their research basis for issue #288; ADR-001/002/003/005 shipped in #290, ADR-004's reranker default stayed opt-in.

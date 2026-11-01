@@ -63,6 +63,20 @@ NoLiMa found 11 of 13 models below half their short-context score at 32K tokens.
 Anthropic describes Claude Code as hybrid: `CLAUDE.md` loads up front, and glob and grep retrieve files just in time.
 No quantified comparison for a corpus under 200k tokens with a frontier model was found.
 
+## Fact text inside embedded chunks
+
+Fact or metadata text placed inside the embedded chunk text helped retrieval more than a separate vector in the studies found.
+This evidence comes from [[facts-layer-extraction-supersession-research]].
+[[anthropic-contextual-retrieval]] reports that a context prefix on each chunk cut top-20 retrieval failure by 35%, and by 49% with contextual BM25.
+A 2026 SEC-filings study (arXiv 2601.11863) raised Context@5 with a metadata prefix from 33.3 to 55.0 (text-embedding-3-small) and from 26.7 to 61.7 (bge-m3).
+In the same study, a separately embedded metadata vector with late fusion stayed near baseline (36.7 and 30.0).
+Proposition indexing (Dense X Retrieval) and index-time hypothetical questions (HyPE) also index a derived unit beside the source text.
+No study tests inline fact lines against a sidecar fact index.
+
+The hallouminate indexer already builds each chunk's embed text as heading path, file summary, and body (`crates/hallouminate-domain/src/indexer/format.rs:34-38`).
+It strips claim marks before embedding and stores them in a separate column (`format.rs:343-353`).
+The chunk budget is 384 tokens (`crates/hallouminate-daemon/src/state.rs:73`), so plain fact lines in a page would be embedded together with the prose.
+
 ## Labelled inference from the store evidence
 
 This section is inference from the store evidence, not a decision.
@@ -70,4 +84,4 @@ The evidence shows no benefit from RDF or a graph store as such.
 It shows benefits from explicit fact structure, source text kept beside extracted facts, refusal on out-of-scope queries, and timestamps for temporal questions.
 A sidecar graph has measured value only for multi-hop and temporal queries, at a measured construction cost.
 
-_Source: [[rdf-store-vs-inline-facts-research]] (agent `/briesearch` deep tier, 2026-10-18) · Updated: 2026-10-21_
+_Source: [[rdf-store-vs-inline-facts-research]] (agent `/briesearch` deep tier, 2026-10-18), [[facts-layer-extraction-supersession-research]] (2026-11-01) · Updated: 2026-11-01_
