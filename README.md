@@ -59,7 +59,13 @@ cargo install hallouminate --locked  # source build — needs Rust + protoc
 ```
 
 Prebuilts cover Apple-silicon macOS (`aarch64-apple-darwin`) and x86_64 /
-aarch64 Linux (glibc ≥ 2.39). Re-run the install command any time to upgrade.
+aarch64 Linux (glibc ≥ 2.39), plus x86_64 Windows (MSVC). Re-run the install command any time to upgrade.
+
+On Windows, use `npx hallouminate --help` or install from PowerShell:
+
+```powershell
+irm https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.ps1 | iex
+```
 
 Source builds need `protoc` (the `lancedb` build dependency:
 `brew install protobuf` / `apt install protobuf-compiler`); from a git
@@ -67,9 +73,10 @@ checkout, `cargo build --release` lands the binary at
 `target/release/hallouminate`.
 
 Intel macOS and older-glibc Linux have no prebuilt (`ort`/ONNX Runtime ships
-no Intel-mac build — pykeio/ort#556); use the source build there. **Windows
-is unsupported** — the daemon is Unix-only (Unix domain socket + `flock`);
-see [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
+no Intel-mac build — pykeio/ort#556); use the source build there. Windows source
+builds require the MSVC Rust toolchain, Visual Studio C++ Build Tools with the
+Windows SDK, and `protoc`. From a checkout, run `just verify`; the executable
+is `target/debug/hallouminate.exe`.
 
 Verify with `hallouminate --version`.
 
@@ -268,8 +275,9 @@ thin clients that talk to it over a Unix domain socket.
   `HALLOUMINATE_LOG_MAX_FILE_BYTES` / `HALLOUMINATE_LOG_MAX_TOTAL_BYTES`.
   `[watch].failure_reminder_secs` defaults to 60 seconds; override it with
   `HALLOUMINATE_WATCH_FAILURE_REMINDER_SECS` or set `0` to disable suppression.
-- **Windows** — the daemon model is Unix-only; see
-  [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
+- **Windows** — the daemon uses a local named pipe restricted to the current
+  account. `daemon stop`, `daemon restart`, and MCP use the same protocol as
+  Linux and macOS. Windows ARM64 release artifacts are not provided.
 
 ## FAQ
 
