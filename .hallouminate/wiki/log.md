@@ -75,3 +75,27 @@
 
 - 2026-10-06 · 08d6bc9aa8b975ae · merged · ground-search-quality-adrs.md · #589: ADR-003 amendment — boot rebuilds stale stores inline; per-request override stores move aside and refill through admitted catch-up; ground_dir_locks; per-open backup prune.
 
+
+
+
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · sources/llm-wiki-facts-layer-landscape-research.md · source page for the 2026-10-05 facts-layer landscape `/briesearch` report (no end-to-end LLM-wiki facts standard).
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · facts-layer-landscape.md · four layers, schema-first vs schema-emergent extraction, existing hallouminate constructs, 2026-10-05 tooling snapshot, and gaps; evidence only.
+- 2026-10-21 · 2d0458886448d862 · new-page · sources/rdf-store-vs-inline-facts-research.md · source page for the 2026-10-18 deep `/briesearch` report on RDF or graph stores vs inline fact demarcation.
+- 2026-10-21 · 2d0458886448d862 · new-page · facts-layer-store-evidence.md · query-language, graph-RAG, agent-memory, prompt-format, and long-context evidence; labelled inference only, no decision.
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · facts-layer-open-forks.md · forks Q1-Q4 recorded as open with options and evidence pointers; proposed order Q2, Q3, Q1, Q4 is unconfirmed.
+- 2026-10-21 · 29c3ea50f7289f79 · merged · index.md · three facts-layer topic entries added to the curated topic list.
+- 2026-10-21 · 29c3ea50f7289f79 · skipped-near-duplicate · claim-provenance-marks.md · Q4 relates to supersession marks, but no decision exists, so the page stays unchanged and the forks page links to it.
+All 16 frozen retrieval probes pass on the first write: 7 exact probes at rank 1, 9 natural or central-claim probes within the top 3.
+
+
+
+
+- 2026-11-01 · 898a746602dd9471 · new-page · sources/facts-layer-extraction-supersession-research.md · source page for the 2026-11-01 follow-up deep `/briesearch` report on extraction, supersession, inline retrieval, and prior art.
+- 2026-11-01 · 898a746602dd9471 · new-page · facts-layer-extraction-evidence.md · fork Q1 evidence: closed-ontology triple F1 on 2026 models, open-extraction relation sprawl, EDC canonicalization trade-off; evidence only.
+- 2026-11-01 · 898a746602dd9471 · new-page · facts-layer-supersession-evidence.md · forks Q3/Q4 evidence: statement-model change mechanisms and STALE results on 2026 models; evidence only.
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-store-evidence.md · new section on fact text inside embedded chunks (metadata-prefix study, contextual retrieval, local embed-text facts).
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-landscape.md · memory-product update behavior (Mem0 add-only, Graphiti, Basic Memory) and new coverage gaps.
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-open-forks.md · one new evidence line per fork; all four forks stay open.
+- 2026-11-01 · 898a746602dd9471 · merged · index.md · two facts-layer evidence entries added to the curated topic list.
+All 11 frozen retrieval probes pass on the first write: 3 exact probes at rank 1, 8 natural or central-claim probes within the top 3.
+
