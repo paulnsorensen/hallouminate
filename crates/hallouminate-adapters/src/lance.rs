@@ -910,6 +910,11 @@ fn refreshed_per_batch(index_type: &lancedb::index::IndexType) -> bool {
         | IndexType::BTree
         | IndexType::Bitmap
         | IndexType::LabelList
+        | IndexType::ZoneMap
+        | IndexType::NGram
+        | IndexType::BloomFilter
+        | IndexType::RTree
+        | IndexType::Custom(_)
         | IndexType::Unknown => true,
     }
 }
