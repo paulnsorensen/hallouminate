@@ -628,6 +628,7 @@ impl<'de> Deserialize<'de> for AddMarkdownParams {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
         if value.get("items").is_some() {
+            reject_unknown_batch_fields(&value, &["cwd", "corpus", "items"])?;
             serde_json::from_value(value)
                 .map(Self::Batch)
                 .map_err(serde::de::Error::custom)
@@ -637,6 +638,25 @@ impl<'de> Deserialize<'de> for AddMarkdownParams {
                 .map_err(serde::de::Error::custom)
         }
     }
+}
+
+/// Rejects single-file fields in a batch envelope before the items are parsed.
+///
+/// The check does not depend on key order, so a mixed envelope always reports
+/// `unknown field`, even when serde_json keeps the client's key order.
+fn reject_unknown_batch_fields<E: serde::de::Error>(
+    value: &serde_json::Value,
+    allowed: &'static [&'static str],
+) -> Result<(), E> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(E::unknown_field(key, allowed));
+        }
+    }
+    Ok(())
 }
 
 /// Carries one to twenty ordered markdown writes in one corpus.
@@ -684,6 +704,7 @@ impl<'de> Deserialize<'de> for ReadMarkdownParams {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
         if value.get("items").is_some() {
+            reject_unknown_batch_fields(&value, &["cwd", "corpus", "items"])?;
             serde_json::from_value(value)
                 .map(Self::Batch)
                 .map_err(serde::de::Error::custom)
