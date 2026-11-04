@@ -158,11 +158,7 @@ mod tests {
     fn cpu_no_arena_registers_exactly_one_cpu_provider() {
         let eps = cpu_no_arena();
         assert_eq!(eps.len(), 1);
-        let debug = format!("{:?}", eps[0]);
-        assert!(
-            debug.contains("CPUExecutionProvider"),
-            "expected CPUExecutionProvider, got {debug}"
-        );
+        assert_eq!(eps[0].name(), "CPUExecutionProvider");
     }
 
     #[test]
