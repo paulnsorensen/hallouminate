@@ -1,6 +1,9 @@
 //! Daemon socket path resolution.
 
-use std::ffi::{CStr, OsStr};
+#[cfg(unix)]
+use std::ffi::CStr;
+#[cfg(any(unix, test))]
+use std::ffi::OsStr;
 use std::io;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -38,15 +41,30 @@ pub(crate) fn daemon_socket_paths() -> io::Result<DaemonSocketPaths> {
         });
     }
 
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR");
-    daemon_socket_paths_from(
-        None,
-        runtime.as_deref(),
-        rustix::process::geteuid().as_raw(),
-        account_home_for_current_user()?,
-    )
+    #[cfg(unix)]
+    {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        daemon_socket_paths_from(
+            None,
+            runtime.as_deref(),
+            rustix::process::geteuid().as_raw(),
+            account_home_for_current_user()?,
+        )
+    }
+    #[cfg(windows)]
+    {
+        Ok(DaemonSocketPaths {
+            canonical: crate::windows_security::account_home()?
+                .join("AppData")
+                .join("Local")
+                .join("hallouminate")
+                .join(SOCKET_NAME),
+            legacy: None,
+        })
+    }
 }
 
+#[cfg(unix)]
 fn account_home_for_current_user() -> io::Result<PathBuf> {
     let uid = rustix::process::geteuid().as_raw();
     let mut passwd = std::mem::MaybeUninit::<libc::passwd>::uninit();
@@ -70,6 +88,7 @@ fn account_home_for_current_user() -> io::Result<PathBuf> {
     Ok(PathBuf::from(OsStr::from_bytes(home.to_bytes())))
 }
 
+#[cfg(any(unix, test))]
 fn daemon_socket_paths_from(
     explicit_socket: Option<&OsStr>,
     xdg_runtime_dir: Option<&OsStr>,
@@ -93,6 +112,7 @@ fn daemon_socket_paths_from(
     })
 }
 
+#[cfg(any(unix, test))]
 fn legacy_socket_path(xdg_runtime_dir: Option<&OsStr>, euid: u32) -> PathBuf {
     match xdg_runtime_dir.filter(|value| !value.is_empty()) {
         Some(runtime) => PathBuf::from(runtime)
