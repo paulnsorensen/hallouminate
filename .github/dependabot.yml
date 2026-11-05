@@ -36,3 +36,9 @@ updates:
       # (un-mergeable). Re-allow once lancedb ships a release built on arrow 59+.
       - dependency-name: arrow
         update-types: [version-update:semver-major]
+      # ort rc.15 bundles ONNX Runtime 1.31, which auto-selects CoreML on
+      # macOS (~21 GB footprint). Renovate holds these behind dashboard
+      # approval; Dependabot must not bump them around that gate.
+      - dependency-name: ort
+      - dependency-name: ort-sys
+      - dependency-name: fastembed
