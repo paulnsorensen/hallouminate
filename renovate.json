@@ -4,6 +4,8 @@
     "config:recommended"
   ],
   "platformAutomerge": true,
+  "minimumReleaseAge": "7 days",
+  "internalChecksFilter": "strict",
   "packageRules": [
     {
       "description": "Automerge patch updates after the required checks pass",
