@@ -40,11 +40,12 @@ tracing.workspace = true
 # Spreadsheet ingestion tests generate fixtures in-process (no committed binaries):
 # rust_xlsxwriter writes a real .xlsx calamine can read; .ods is a hand-built ZIP
 # (mimetype + content.xml + META-INF/manifest.xml — calamine requires the manifest)
-# via `zip`, pinned to the 7.x already in the tree (transitive via file-format) so
-# no second zip major is pulled. No pure-Rust .xls writer exists, so the .xls path
-# is covered by a detection/routing unit test, not a generated binary fixture.
+# via `zip`. Keep this zip major in lockstep with the one calamine and
+# rust_xlsxwriter require, so the tree holds one zip copy. The 9.0.5 floor
+# excludes the GHSA-m665-v7pm-7grj range. No pure-Rust .xls writer exists, so the
+# .xls path is covered by a detection/routing unit test, not a generated fixture.
 rust_xlsxwriter = "0.102"
-zip = "8"
+zip = "9.0.5"
 hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
 blake3.workspace = true
