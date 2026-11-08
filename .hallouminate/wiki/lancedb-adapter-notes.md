@@ -1,48 +1,77 @@
 ---
 status: reviewed
-last_verified: 2026-09-10
+last_verified: 2026-11-04
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/pull/434
-  - https://github.com/lancedb/lancedb/pull/4100
+  - https://github.com/lancedb/lancedb/pull/4233
+  - https://github.com/lancedb/lancedb/pull/4103
+  - https://github.com/lance-format/lance/pull/9481
+  - https://github.com/lance-format/lance/pull/8657
 ---
 # LanceDB adapter notes
 
 How `crates/hallouminate-adapters/src/lance.rs` uses the `lancedb` crate
-today, what it does not use, and the version traps found while reviewing
-Renovate PR #434 (lancedb 0.37 → 0.38). Research slug:
-`.cheese/research/lancedb-038-migration/lancedb-038-migration.md`.
+today, what it does not use, and the version traps found on the 0.37 → 0.41
+upgrade (PR #434). Research slug:
+`.cheese/research/lancedb-041-upgrade/lancedb-041-upgrade.md` (earlier:
+`.cheese/research/lancedb-038-migration/`).
 Ranking effects of lance major bumps live in
 [eval-harness-gotchas](eval-harness-gotchas.md); compaction and index-delta
 merging live in
 [maintenance-compaction-index-deltas](maintenance-compaction-index-deltas.md).
 
-## lancedb 0.38.0 does not compile with default features
+## lancedb 0.38–0.40 do not compile with default features
 
-PR #434 fails clippy and build on every OS with:
+lancedb 0.38.0, 0.39.0, and 0.40.0 fail with:
 
 ```
 error[E0599]: no variant named `Http` found for enum `error::Error`
-  --> lancedb-0.38.0/src/job.rs:56:40
+  --> lancedb-0.40.0/src/job.rs:102:40
 ```
 
-`src/job.rs` is new in 0.38 (async job handles). It constructs
-`Error::Http` ungated, but `src/error.rs` declares that variant under
-`#[cfg(feature = "remote")]`. lancedb's `default = []`, and
-`crates/hallouminate-adapters/Cargo.toml` uses bare `lancedb = "0.37"`, so
-the crate itself fails to build. No hallouminate call site is involved, and
-none of the 0.38 breaking changes (manifest-authoritative table existence,
-pydantic v2, branch merge, listing pagination) touch APIs we use.
+`src/job.rs` builds `Error::Http` ungated, but `src/error.rs` declares that
+variant under `#[cfg(feature = "remote")]`. lancedb's `default = []`, and
+`crates/hallouminate-adapters/Cargo.toml` uses a bare `lancedb` dependency,
+so the crate itself fails. Upstream issues #4096 and #4142 report it. The fix
+(lancedb #4233 and #4103, a `remote_job_error` helper) ships first in
+**0.41.0**; there is no 0.38.1. Dependabot PR #495 (0.40.0) was closed for
+this reason.
 
-Decision: hold #434 until 0.38.1 ships upstream fix lancedb #4100. The
-workaround `lancedb = { version = "0.38", features = ["remote"] }` compiles
-but enables an HTTP remote-table surface an embedded local store never
-uses; use it only if a 0.38 feature becomes urgent, and revert on 0.38.1.
+Rule: never take a lancedb release in that range. Do not enable `remote` as
+a workaround; it adds an HTTP remote-table surface an embedded store never
+uses.
 
-PR #473 (donor vector reuse) depends on `query().select(Select::columns(..))`,
-`execute()` as an incremental `TryStream`, and `RecordBatch` decoding. All
-three are unchanged 0.37.1 → 0.38.0, so #473 and #434 can land in either
-order.
+## 0.41 upgrade facts
+
+| lancedb | lance | arrow / datafusion | lancedb MSRV |
+|---|---|---|---|
+| 0.37.1 | 10.0.0 | 58 / 54 | 1.91 |
+| 0.41.0 | 14.0.2 | 58 / 54 | 1.94 |
+
+- The workspace `rust-version` follows the highest dependency floor, so it
+  is 1.94 from 0.41 on.
+- `IndexType` adds `ZoneMap`, `NGram`, `BloomFilter`, `RTree`, and
+  `Custom(String)`. `refreshed_per_batch` matches it exhaustively and must
+  gain an arm on each new variant.
+- `table_names().execute()` still returns `Vec<String>`. The lazy-iterator
+  breaking changes hit `list_databases` and namespace listings only.
+- On-disk compatibility: existing tables keep their data file format,
+  because appends validate against the manifest's `data_storage_format`.
+  New tables default to format 2.2 instead of 2.1 (lance #8657); lance 10
+  reads 2.2. The lance 14 BTree row-address domain (lance #9481, index
+  version 1) applies only to stable-row-id datasets, and we do not enable
+  stable row ids. No reindex is needed.
+- Our vector index is `Index::Auto`, which builds IVF_PQ with L2. The 0.41
+  cosine-distance scale fix (lancedb #3852) does not apply to us.
+- lancedb 0.41 enables serde_json `preserve_order` without a feature gate
+  (workspace `Cargo.toml`, lancedb #4292). Cargo unifies features across the
+  build graph, so `default-features = false` cannot remove it. A
+  `serde_json::Value` object now keeps the client's key order, and
+  `deny_unknown_fields` reports the first bad key in that order. MCP batch
+  envelopes therefore check unknown keys before item parsing
+  (`reject_unknown_batch_fields` in `crates/hallouminate/src/mcp/tools.rs`).
+  Do not write code or tests that depend on sorted `Value` keys.
 
 ## What the adapter uses today
 
@@ -50,30 +79,40 @@ order.
   `CorpusKey { name, canonical_root }`.
 - FTS index plus vector index through `ensure_search_indexes`
   (`Index::Auto` for the vector column).
-- `OptimizeAction` merge and compact in `LanceStore::maintain`.
+- An FM index on `search_text`. Nothing reads it; phrase mode uses a
+  `strpos(lower(..))` scan without an index (#696).
+- `OptimizeAction` merge and compact in `LanceStore::maintain`, paced by
+  `max_source_fragments`.
 - `list_versions()` for the version count only.
 - `query().select(Select::columns(..))` on the donor-reuse and staleness
   paths; `try_next()` streaming of `RecordBatch`.
 
 ## Verified available and unused (ranked backlog)
 
-Each item was checked against the 0.38 Rust API and our call sites. None
-is benchmarked; treat the value column as a hypothesis. Items 1 and 2
-shipped; the rows stay as a record.
+Each item was checked against the 0.41 Rust API and our call sites. None
+is benchmarked; treat the value column as a hypothesis.
 
 | # | Opportunity | Why | Value | Effort |
 |---|---|---|---|---|
-| 1 | **Shipped (#546).** Scalar indexes on the hot filter columns | #546 added them. The schema 7 split store (#612) moved the filters: BTree on `content_key` in `chunks`, and BTree on `corpus`, `root`, and `content_key` in `root_files` (`SCALAR_INDEXES` and `FILE_SCALAR_INDEXES`, `crates/hallouminate-adapters/src/lance.rs:884-891`). | high | low |
-| 2 | **Shipped (#542).** `.select()` projection on `fts_scan` and `vector_scan` | #542 projects the hit columns, so a hit no longer decodes the `embedding` column. | high | low |
-| 3 | Explicit `distance_type` on `nearest_to` | None is set, so lancedb uses L2. fastembed vectors are normalized and cosine is the intended metric. L2 and cosine agree on rank for unit vectors, so this is hygiene unless normalization ever changes. | medium | low |
-| 4 | BTree on `indexed_at_ms` and `ord` | Hot staleness paths use `only_if("ord = 0")` and filter on `indexed_at_ms`. | medium | low |
-| 5 | Explicit `IvfHnswSq` / `IvfHnswFlat` instead of `Index::Auto` | Memory-for-recall trade; needs a recall benchmark first. | low–medium | medium |
-| 6 | `LabelList` index on the `List<Utf8>` column | Enables `array_contains_any`; no call site filters on it today. | low | low |
-| 7 | Version checkout / restore | `list_versions()` is used but no time travel; could back "wiki as of commit X". | low | medium |
+| 1 | **Shipped (#546).** Scalar indexes on the hot filter columns | BTree on `content_key` in `chunks`, and BTree on `corpus`, `root`, and `content_key` in `root_files` (`SCALAR_INDEXES` and `FILE_SCALAR_INDEXES` in `lance.rs`). | high | low |
+| 2 | **Shipped (#542).** `.select()` projection on `fts_scan` and `vector_scan` | A hit no longer decodes the `embedding` column. | high | low |
+| 3 | Row or byte caps on paced compaction (#693) | lance 11 `max_source_rows` / `max_source_bytes`; fragment counts do not bound slice cost. | medium | low |
+| 4 | `search_effort` on vector queries (#694) | One recall-versus-latency setting for IVF_PQ. Needs a corpus large enough to have an ANN index. | medium | low |
+| 5 | BM25F `CombinedFieldsQuery` over separate fields (#695) | Native heading weighting instead of one concatenated `search_text`. Needs a schema bump and an ADR. | medium | high |
+| 6 | NGram or FM index for the phrase prefilter, or drop the FM index (#696) | Phrase mode is case-insensitive; index case folding is not verified. | medium | medium |
+| 7 | Explicit `distance_type` on `nearest_to` | None is set, so lancedb uses L2. fastembed vectors are normalized, so L2 and cosine agree on rank. Hygiene only. | low | low |
+| 8 | Explicit `IvfHnswSq` / `IvfHnswFlat` instead of `Index::Auto` | Memory-for-recall trade; needs a recall benchmark first. | low–medium | medium |
+| 9 | Version checkout / restore | Could back "wiki as of commit X". | low | medium |
 
-Do not adopt: FTS V3 `FtsIndexBuilder::block_size` (upstream flags it
-experimental and may break); computed columns, materialized views, the
-UDF catalog, LSM/MemWAL, the data loader, and `cherry_pick` are remote,
-server, or Python/Node only.
+Not candidates: a ZoneMap, BloomFilter, or BTree index on `indexed_at_ms`
+or `ord`. No query filters on `indexed_at_ms` (it is only read for stats),
+and `ord = 0` always comes with a `content_key IN (..)` filter that the
+`content_key` BTree serves. A `LabelList` index has no call site that
+filters on the list column.
 
-_Source: PR #434 review, `.cheese/research/lancedb-038-migration/` · Updated: 2026-10-15 · Supersedes: —_
+Do not adopt: FTS V3 `FtsIndexBuilder::block_size(256)` (upstream flags it
+experimental and may break); RTree (needs `geo`); computed columns,
+materialized views, Functions, MemWAL/RTE, the data loader, and
+`cherry_pick` are remote, server, or Python/Node oriented.
+
+_Source: PR #434, `.cheese/research/lancedb-041-upgrade/` · Updated: 2026-11-04 · Supersedes: the 0.38 hold decision_
