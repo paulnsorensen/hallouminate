@@ -6,7 +6,7 @@ targets = []
 
 [advisories]
 # Fail on any RustSec vulnerability (the default) and on yanked crate versions.
-# Report unmaintained-crate advisories only for direct workspace dependencies.
+# Fail on unmaintained-crate advisories only for direct workspace dependencies.
 yanked = "deny"
 unmaintained = "workspace"
 ignore = []
