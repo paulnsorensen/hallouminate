@@ -1,6 +1,6 @@
 ---
 status: reviewed
-last_verified: 2026-11-04
+last_verified: 2026-11-12
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/pull/434
@@ -8,12 +8,15 @@ sources:
   - https://github.com/lancedb/lancedb/pull/4103
   - https://github.com/lance-format/lance/pull/9481
   - https://github.com/lance-format/lance/pull/8657
+  - https://github.com/paulnsorensen/hallouminate/issues/682
 ---
 # LanceDB adapter notes
 
 How `crates/hallouminate-adapters/src/lance.rs` uses the `lancedb` crate
 today, what it does not use, and the version traps found on the 0.37 → 0.41
-upgrade (PR #434). The upgrade research is local-only and is not in git.
+upgrade (PR #434). The adapters crate pins `lancedb = "0.41"`
+(`crates/hallouminate-adapters/Cargo.toml:12`; lock: 0.41.0). The upgrade
+research is local-only and is not in git.
 Ranking effects of lance major bumps live in
 [eval-harness-gotchas](eval-harness-gotchas.md); compaction and index-delta
 merging live in
@@ -34,11 +37,21 @@ variant under `#[cfg(feature = "remote")]`. lancedb's `default = []`, and
 so the crate itself fails. Upstream issues #4096 and #4142 report it. The fix
 (lancedb #4233 and #4103, a `remote_job_error` helper) ships first in
 **0.41.0**; there is no 0.38.1. Dependabot PR #495 (0.40.0) was closed for
-this reason.
+this reason. Hallouminate issues #635 (0.39.0) and #648 (0.40.0) record the
+same defect.
 
 Rule: never take a lancedb release in that range. Do not enable `remote` as
 a workaround; it adds an HTTP remote-table surface an embedded store never
-uses.
+uses. The feature turns on `arrow-flight`, `tonic`, and `prost`. PR #434
+merged as lancedb 0.41 with the bare dependency and no `remote` feature.
+
+## lancedb 0.40 broke the exhaustive `IndexType` match
+
+`refreshed_per_batch` in `lance.rs` matches `lancedb::index::IndexType` with no wildcard arm. This is deliberate. A new index kind then fails to compile and gets a review. lancedb 0.40 added `ZoneMap`, `NGram`, `BloomFilter`, and `RTree`, and `IndexType` is not `#[non_exhaustive]`. The match now lists those four variants in the `=> true` arm. The store builds only BTree, FTS, Fm, and auto vector indexes, so runtime behavior did not change (issues #629 and #648). Do not add a `_ =>` arm.
+
+## Open risk: table existence follows the manifest
+
+lancedb 0.38 made table existence depend on the manifest. `open_or_create_table` lists names with `table_names()`, opens a listed table, and creates an unlisted one. A table directory without a manifest, for example after a crash during first `create_table`, is no longer listed. The code then calls `create_table` on an existing directory. Nobody has verified the outcome. Issue #682 asks for a recovery test and, if needed, an open-first flow. This matters only for first-open crash recovery.
 
 ## 0.41 upgrade facts
 
@@ -121,4 +134,4 @@ experimental and may break); RTree (needs `geo`); computed columns,
 materialized views, Functions, MemWAL/RTE, the data loader, and
 `cherry_pick` are remote, server, or Python/Node oriented.
 
-_Source: PR #434 and local-only research (not in git) · Updated: 2026-11-04 · Supersedes: the 0.38 hold decision_
+_Source: PR #434, issues #629, #635, #648, #682, and local-only research (not in git) · Updated: 2026-11-12 · Supersedes: the 0.38 hold decision_
