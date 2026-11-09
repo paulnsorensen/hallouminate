@@ -2245,6 +2245,30 @@ async fn eval_ground_recall_measure() -> Result<()> {
     Ok(())
 }
 
+/// Measures only the production fusion arm and writes a baseline-shaped
+/// artifact without comparing it. CI uses this for baseline updates, because
+/// the Jina arm exceeds its rerank deadline on hosted runners.
+#[tokio::test]
+#[ignore = "loads production embeddings and measures the baseline arm"]
+async fn eval_ground_recall_measure_baseline() -> Result<()> {
+    let output = env::var_os("HALLOUMINATE_EVAL_OUTPUT")
+        .context("HALLOUMINATE_EVAL_OUTPUT must name the baseline measurement artifact")?;
+    let output = measurement_output_path(Path::new(&output));
+    let baseline = baseline_path();
+    ensure_measurement_output_is_not_baseline(&output, &baseline)?;
+    let baseline_before = read_optional(&baseline)?;
+    let (queries, query_set_digest) = load_queries()?;
+    let artifact = measure_baseline(&queries, query_set_digest).await?;
+    write_measurement_artifact(&output, &baseline, &artifact)?;
+    let baseline_after = read_optional(&baseline)?;
+    ensure!(
+        baseline_before == baseline_after,
+        "measurement modified eval/baseline.json"
+    );
+    println!("{}", serde_json::to_string_pretty(&artifact)?);
+    Ok(())
+}
+
 /// `EvalArtifact` gains required fields as the schema moves, so decoding the
 /// full artifact first turns a stale baseline into a serde "missing field"
 /// error. Probe the version separately so the mismatch is reported by the

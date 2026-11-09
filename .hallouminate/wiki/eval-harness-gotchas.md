@@ -120,15 +120,21 @@ absorbs. An up-to-date `eval/baseline.json` therefore passes `just eval`
 locally, but the baseline itself must still be measured on CI — a locally
 measured baseline is not guaranteed to hold on CI's FP/SIMD ordering. Use
 the eval workflow's
-`workflow_dispatch` input `mode=measure`, which runs `just eval-measure` and
-uploads the artifact; extract the `fusion-without-rerank` arm and commit it
-as the baseline (single requested arm, no comparison, empty
-timeouts/failures/errors — see `validate_baseline_artifact`).
+`workflow_dispatch` input `mode=measure`, which runs
+`just eval-measure-baseline` and uploads
+`.context/eval-baseline-measurement.json`. That artifact already has the
+baseline shape (single requested arm, no comparison, empty
+timeouts/failures/errors — see `validate_baseline_artifact`), so it can be
+committed as `eval/baseline.json` unchanged.
 
-The upload step runs with `if: always()` on purpose: the Jina diagnostic arm
-periodically hits its 5s rerank timeout on the small runner (historically on
-query `footnote-inversion`), and the partial artifact's completed baseline
-arm is still sufficient for a baseline update.
+CI does not run the Jina diagnostic (`just eval-measure`). Jina reranks are
+too slow for its 5s evaluation deadline, so the arm always failed on the
+runner's first query (`footnote-inversion`), and every CI measure run from
+2026-09 to 2026-11 was red. Measured locally on 2026-11-08 with a 60s
+diagnostic deadline in a release build, Jina took p50 10.2s, p95 16.6s, and
+max 23s per query. The debug test profile is slower. The daemon also loads
+the crossencoder lazily inside the first rerank, under the same deadline.
+Run `just eval-measure` locally when you need the Jina comparison.
 
 ## Absolute corpus roots once shifted the `outside-root-refused` top chunk
 
