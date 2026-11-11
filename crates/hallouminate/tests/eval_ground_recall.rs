@@ -1708,15 +1708,17 @@ fn evaluation_arms_derive_from_production_defaults() {
     assert_eq!(baseline.search, SearchConfig::default());
 
     let candidate = build_config(JINA_ARM, temp.path());
+    let override_ms = env::var(EVALUATION_RERANK_TIMEOUT_ENV).ok();
     let expected_search = SearchConfig {
         crossencoder: Some(JINA_MODEL.to_string()),
-        rerank_timeout_ms: EVALUATION_RERANK_TIMEOUT_MS,
+        rerank_timeout_ms: parse_evaluation_rerank_timeout_ms(override_ms.as_deref())
+            .expect("valid rerank timeout override"),
         ..Default::default()
     };
     assert_eq!(candidate.embeddings, embeddings);
     assert_eq!(candidate.search, expected_search);
     assert!(
-        candidate.search.rerank_timeout_ms > SearchConfig::default().rerank_timeout_ms,
+        EVALUATION_RERANK_TIMEOUT_MS > SearchConfig::default().rerank_timeout_ms,
         "the Jina measurement needs its own bounded timeout so a slow valid inference does not become a fallback"
     );
 
