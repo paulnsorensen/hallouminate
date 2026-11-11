@@ -37,6 +37,7 @@ const CHUNK_BUDGET_TOKENS: usize = 384;
 const MIN_LABELLED_QUERIES: usize = 40;
 const GROUND_RPC_GRACE_MS: u64 = 60_000;
 const EVALUATION_RERANK_TIMEOUT_MS: u64 = 5_000;
+const EVALUATION_RERANK_TIMEOUT_ENV: &str = "HALLOUMINATE_EVAL_RERANK_TIMEOUT_MS";
 const FOOTNOTE_INVERSION_ID: &str = "footnote-inversion";
 const MODEL_LOAD_MARKER: &str = "cold model load failed";
 const RERANK_TIMEOUT_MARKER: &str = "rerank timeout";
@@ -464,9 +465,28 @@ fn validate_fixture_labels_with_production_tokenizer(queries: &[LabelledQuery]) 
 
 fn rerank_timeout_ms(arm: ArmSpec<'_>) -> u64 {
     match arm.model {
-        Some(_) => EVALUATION_RERANK_TIMEOUT_MS,
+        Some(_) => {
+            let raw = env::var(EVALUATION_RERANK_TIMEOUT_ENV).ok();
+            parse_evaluation_rerank_timeout_ms(raw.as_deref())
+                .unwrap_or_else(|error| panic!("{error:#}"))
+        }
         None => SearchConfig::default().rerank_timeout_ms,
     }
+}
+
+/// Lets local diagnostic runs give slow reranker hosts a longer deadline.
+fn parse_evaluation_rerank_timeout_ms(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(EVALUATION_RERANK_TIMEOUT_MS);
+    };
+    let timeout_ms: u64 = raw.trim().parse().with_context(|| {
+        format!("{EVALUATION_RERANK_TIMEOUT_ENV}={raw:?} must be a millisecond count")
+    })?;
+    ensure!(
+        timeout_ms > 0,
+        "{EVALUATION_RERANK_TIMEOUT_ENV} must be greater than zero"
+    );
+    Ok(timeout_ms)
 }
 
 fn build_config(arm: ArmSpec<'_>, ground_dir: &Path) -> Config {
@@ -1688,20 +1708,40 @@ fn evaluation_arms_derive_from_production_defaults() {
     assert_eq!(baseline.search, SearchConfig::default());
 
     let candidate = build_config(JINA_ARM, temp.path());
+    let override_ms = env::var(EVALUATION_RERANK_TIMEOUT_ENV).ok();
     let expected_search = SearchConfig {
         crossencoder: Some(JINA_MODEL.to_string()),
-        rerank_timeout_ms: EVALUATION_RERANK_TIMEOUT_MS,
+        rerank_timeout_ms: parse_evaluation_rerank_timeout_ms(override_ms.as_deref())
+            .expect("valid rerank timeout override"),
         ..Default::default()
     };
     assert_eq!(candidate.embeddings, embeddings);
     assert_eq!(candidate.search, expected_search);
     assert!(
-        candidate.search.rerank_timeout_ms > SearchConfig::default().rerank_timeout_ms,
+        EVALUATION_RERANK_TIMEOUT_MS > SearchConfig::default().rerank_timeout_ms,
         "the Jina measurement needs its own bounded timeout so a slow valid inference does not become a fallback"
     );
 
     assert_eq!(baseline_arms(), [BASELINE_ARM]);
     assert_eq!(diagnostic_arms(), [BASELINE_ARM, JINA_ARM]);
+}
+
+#[test]
+fn evaluation_rerank_timeout_override_parses_milliseconds() {
+    assert_eq!(
+        parse_evaluation_rerank_timeout_ms(None).expect("default"),
+        EVALUATION_RERANK_TIMEOUT_MS
+    );
+    assert_eq!(
+        parse_evaluation_rerank_timeout_ms(Some("60000")).expect("override"),
+        60_000
+    );
+    for invalid in ["0", "", "60s", "-1"] {
+        assert!(
+            parse_evaluation_rerank_timeout_ms(Some(invalid)).is_err(),
+            "{invalid:?} must be rejected"
+        );
+    }
 }
 
 #[test]
@@ -2235,6 +2275,30 @@ async fn eval_ground_recall_measure() -> Result<()> {
     let baseline_before = read_optional(&baseline)?;
     let (queries, query_set_digest) = load_queries()?;
     let artifact = measure_diagnostic(&queries, query_set_digest, &output, &baseline).await?;
+    write_measurement_artifact(&output, &baseline, &artifact)?;
+    let baseline_after = read_optional(&baseline)?;
+    ensure!(
+        baseline_before == baseline_after,
+        "measurement modified eval/baseline.json"
+    );
+    println!("{}", serde_json::to_string_pretty(&artifact)?);
+    Ok(())
+}
+
+/// Measures only the production fusion arm and writes a baseline-shaped
+/// artifact without comparing it. CI uses this for baseline updates, because
+/// the Jina arm exceeds its rerank deadline on hosted runners.
+#[tokio::test]
+#[ignore = "loads production embeddings and measures the baseline arm"]
+async fn eval_ground_recall_measure_baseline() -> Result<()> {
+    let output = env::var_os("HALLOUMINATE_EVAL_OUTPUT")
+        .context("HALLOUMINATE_EVAL_OUTPUT must name the baseline measurement artifact")?;
+    let output = measurement_output_path(Path::new(&output));
+    let baseline = baseline_path();
+    ensure_measurement_output_is_not_baseline(&output, &baseline)?;
+    let baseline_before = read_optional(&baseline)?;
+    let (queries, query_set_digest) = load_queries()?;
+    let artifact = measure_baseline(&queries, query_set_digest).await?;
     write_measurement_artifact(&output, &baseline, &artifact)?;
     let baseline_after = read_optional(&baseline)?;
     ensure!(

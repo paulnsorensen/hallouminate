@@ -7,8 +7,10 @@ on:
     inputs:
       mode:
         description: >-
-          enforce compares against the committed baseline; measure runs both
-          arms and uploads the artifact for a baseline update.
+          enforce compares against the committed baseline; measure records the
+          production fusion arm without comparison and uploads it for a
+          baseline update. The Jina diagnostic (`just eval-measure`) is
+          local-only because its reranks exceed the deadline on this runner.
         type: choice
         options:
           - enforce
@@ -83,17 +85,16 @@ jobs:
         if: github.event_name != 'workflow_dispatch' || inputs.mode != 'measure'
         run: just eval
 
-      - name: Measure ground retrieval artifact
+      - name: Measure ground retrieval baseline arm
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'measure'
-        run: just eval-measure
+        run: just eval-measure-baseline
 
       - name: Upload measurement artifact
         # !cancelled(): always() also fired on cancellation, which is routine
-        # under cancel-in-progress; !cancelled() keeps the partial-artifact
-        # upload after a diagnostic-arm failure without that.
+        # under cancel-in-progress.
         if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.mode == 'measure' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: eval-measurement
-          path: .context/issue-288-eval-results.json
+          path: .context/eval-baseline-measurement.json
           if-no-files-found: error
