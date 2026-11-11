@@ -79,8 +79,24 @@ winner. It cannot overwrite `eval/baseline.json`.
 
 ```sh
 just eval-measure
+just eval-measure-baseline
 just eval
 ```
+
+`just eval-measure-baseline` runs only `fusion-without-rerank` and writes
+`.context/eval-baseline-measurement.json` without a comparison. The file has
+the shape of `eval/baseline.json`. The eval workflow's `mode=measure` runs this
+recipe, because Jina reranks exceed the 5s deadline on the hosted runner.
+
+Run `just eval-measure` locally for the Jina diagnostic. Jina reranks can also
+exceed 5s on a local host. Then set a longer deadline for the Jina arm:
+
+```sh
+HALLOUMINATE_EVAL_RERANK_TIMEOUT_MS=60000 just eval-measure
+```
+
+The override applies only to the Jina arm. The baseline arm keeps the
+production rerank timeout.
 
 Both entry points are ignored tests because first use downloads production
 embedding and reranker artifacts and the full query sweep is expensive. Ordinary
