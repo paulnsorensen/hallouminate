@@ -5,10 +5,10 @@
   ],
   "packageRules": [
     {
-      "description": "ort rc.15 bundles ONNX Runtime 1.31, which auto-selects CoreML on macOS (~21 GB footprint; a 156-file index did not finish in 15 min vs 33 s on CPU). Hold ort and fastembed until the embed session pins PreferCPU. Approve from the Dependency Dashboard after the memory benchmark passes.",
+      "description": "An ort bump can change ONNX Runtime's execution-provider placement. ort rc.15 put the embedder on CoreML on macOS (~21 GB footprint) until the sessions set PreferCPU. CI does not run the placement guard, so run it before you approve: just verify cargo test -p hallouminate --test it session_device -- --ignored",
       "matchManagers": ["cargo"],
-      "matchPackageNames": ["ort", "ort-sys", "fastembed"],
-      "groupName": "onnx runtime stack",
+      "matchPackageNames": ["ort", "ort-sys"],
+      "groupName": "onnx runtime",
       "dependencyDashboardApproval": true
     }
   ]
