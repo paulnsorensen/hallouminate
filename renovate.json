@@ -2,14 +2,5 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
-  ],
-  "packageRules": [
-    {
-      "description": "ort rc.15 bundles ONNX Runtime 1.31, which auto-selects CoreML on macOS (~21 GB footprint; a 156-file index did not finish in 15 min vs 33 s on CPU). Hold ort and fastembed until the embed session pins PreferCPU. Approve from the Dependency Dashboard after the memory benchmark passes.",
-      "matchManagers": ["cargo"],
-      "matchPackageNames": ["ort", "ort-sys", "fastembed"],
-      "groupName": "onnx runtime stack",
-      "dependencyDashboardApproval": true
-    }
   ]
 }

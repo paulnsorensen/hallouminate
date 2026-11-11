@@ -17,6 +17,7 @@ mod plugin_manifests;
 mod provisioning;
 mod real_tokenizer;
 mod recovery;
+mod session_device;
 mod split_store_attacks;
 mod verification_gate;
 mod worktree_provisioning_vector_reuse;
