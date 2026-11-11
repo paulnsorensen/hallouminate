@@ -48,6 +48,11 @@ bdd-check *args:
 eval-measure:
     HALLOUMINATE_EVAL_OUTPUT=.context/issue-288-eval-results.json just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_measure -- --ignored --nocapture --exact
 
+# Measure only the production fusion baseline, without comparison. CI uses this
+# for baseline updates; the output has the shape of eval/baseline.json.
+eval-measure-baseline:
+    HALLOUMINATE_EVAL_OUTPUT=.context/eval-baseline-measurement.json just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_measure_baseline -- --ignored --nocapture --exact
+
 # Enforce the committed production fusion baseline without a crossencoder.
 eval:
     just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_enforce -- --ignored --nocapture --exact
