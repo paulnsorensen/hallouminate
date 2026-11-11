@@ -134,7 +134,10 @@ runner's first query (`footnote-inversion`), and every CI measure run from
 diagnostic deadline in a release build, Jina took p50 10.2s, p95 16.6s, and
 max 23s per query. The debug test profile is slower. The daemon also loads
 the crossencoder lazily inside the first rerank, under the same deadline.
-Run `just eval-measure` locally when you need the Jina comparison.
+Run `just eval-measure` locally when you need the Jina comparison. A local
+host can also miss the 5s deadline, so set
+`HALLOUMINATE_EVAL_RERANK_TIMEOUT_MS=60000` to give the Jina arm a longer
+deadline. The override does not change the baseline arm.
 
 ## Absolute corpus roots once shifted the `outside-root-refused` top chunk
 

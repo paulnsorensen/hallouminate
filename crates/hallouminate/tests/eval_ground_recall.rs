@@ -37,6 +37,7 @@ const CHUNK_BUDGET_TOKENS: usize = 384;
 const MIN_LABELLED_QUERIES: usize = 40;
 const GROUND_RPC_GRACE_MS: u64 = 60_000;
 const EVALUATION_RERANK_TIMEOUT_MS: u64 = 5_000;
+const EVALUATION_RERANK_TIMEOUT_ENV: &str = "HALLOUMINATE_EVAL_RERANK_TIMEOUT_MS";
 const FOOTNOTE_INVERSION_ID: &str = "footnote-inversion";
 const MODEL_LOAD_MARKER: &str = "cold model load failed";
 const RERANK_TIMEOUT_MARKER: &str = "rerank timeout";
@@ -464,9 +465,28 @@ fn validate_fixture_labels_with_production_tokenizer(queries: &[LabelledQuery]) 
 
 fn rerank_timeout_ms(arm: ArmSpec<'_>) -> u64 {
     match arm.model {
-        Some(_) => EVALUATION_RERANK_TIMEOUT_MS,
+        Some(_) => {
+            let raw = env::var(EVALUATION_RERANK_TIMEOUT_ENV).ok();
+            parse_evaluation_rerank_timeout_ms(raw.as_deref())
+                .unwrap_or_else(|error| panic!("{error:#}"))
+        }
         None => SearchConfig::default().rerank_timeout_ms,
     }
+}
+
+/// Lets local diagnostic runs give slow reranker hosts a longer deadline.
+fn parse_evaluation_rerank_timeout_ms(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(EVALUATION_RERANK_TIMEOUT_MS);
+    };
+    let timeout_ms: u64 = raw.trim().parse().with_context(|| {
+        format!("{EVALUATION_RERANK_TIMEOUT_ENV}={raw:?} must be a millisecond count")
+    })?;
+    ensure!(
+        timeout_ms > 0,
+        "{EVALUATION_RERANK_TIMEOUT_ENV} must be greater than zero"
+    );
+    Ok(timeout_ms)
 }
 
 fn build_config(arm: ArmSpec<'_>, ground_dir: &Path) -> Config {
@@ -1702,6 +1722,24 @@ fn evaluation_arms_derive_from_production_defaults() {
 
     assert_eq!(baseline_arms(), [BASELINE_ARM]);
     assert_eq!(diagnostic_arms(), [BASELINE_ARM, JINA_ARM]);
+}
+
+#[test]
+fn evaluation_rerank_timeout_override_parses_milliseconds() {
+    assert_eq!(
+        parse_evaluation_rerank_timeout_ms(None).expect("default"),
+        EVALUATION_RERANK_TIMEOUT_MS
+    );
+    assert_eq!(
+        parse_evaluation_rerank_timeout_ms(Some("60000")).expect("override"),
+        60_000
+    );
+    for invalid in ["0", "", "60s", "-1"] {
+        assert!(
+            parse_evaluation_rerank_timeout_ms(Some(invalid)).is_err(),
+            "{invalid:?} must be rejected"
+        );
+    }
 }
 
 #[test]
