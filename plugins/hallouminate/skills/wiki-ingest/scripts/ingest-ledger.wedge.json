@@ -1,0 +1,9 @@
+{
+  "asset": "ingest-ledger-84c776be5cfc.pyz",
+  "content_sha256": "84c776be5cfc2eec907d8a01a115d63c3674ef4c744de19c475424d296289bbb",
+  "format": 8,
+  "key": "547466fd8cf1dccdec5db751e85c091a79c95545418800732d946887f9516044",
+  "name": "ingest-ledger",
+  "release": "wedge",
+  "repo": "paulnsorensen/hallouminate"
+}
