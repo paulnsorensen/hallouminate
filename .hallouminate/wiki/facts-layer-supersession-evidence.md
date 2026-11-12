@@ -55,7 +55,7 @@ These are vendor-authored results on gpt-4o era models.
 ## Labelled inference from the supersession evidence
 
 This section is inference from the supersession evidence, not a decision.
-The statement models agree on keeping old facts with a status, which the existing claim marks already do.
+Wikibase, nanopublications, and Graphiti keep old facts with a status, which the existing claim marks already do.
 STALE shows that unlabelled history fails, but it does not test labelled history or removal.
 Outdated-premise queries fail even for the best model, so a storage choice alone may not fix them.
 
