@@ -7,6 +7,8 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       actions-minor-and-patch:
         update-types: [minor, patch]
@@ -16,6 +18,8 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       # text-splitter's `ChunkSizer for Tokenizer` impl targets a specific
       # tokenizers major; they must bump in one PR or the crate graph splits.
@@ -36,3 +40,8 @@ updates:
       # (un-mergeable). Re-allow once lancedb ships a release built on arrow 59+.
       - dependency-name: arrow
         update-types: [version-update:semver-major]
+      # An ort bump can move the embedder onto CoreML on macOS. Renovate holds
+      # ort behind dashboard approval and the session_device placement test;
+      # Dependabot must not bump it around that gate.
+      - dependency-name: ort
+      - dependency-name: ort-sys

@@ -12,7 +12,7 @@ hallouminate-domain.workspace = true
 lancedb = "0.41"
 async-trait.workspace = true
 futures = "0.3"
-fastembed = "7.0"
+fastembed = "7.7"
 ort = { version = "=2.0.0-rc.15", default-features = false }
 blake3.workspace = true
 rustix.workspace = true
