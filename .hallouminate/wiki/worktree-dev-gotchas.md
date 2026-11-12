@@ -61,8 +61,8 @@ follow-up `cargo test` then fails to *link* one test binary.
 
 **Workaround that worked:**
 - Point `CARGO_TARGET_DIR` and `TMPDIR` under `$HOME`, not `/tmp`.
-- Pin `RUSTUP_TOOLCHAIN` to the repo's pinned toolchain (1.91 at time of
-  writing) and call the **absolute** cargo binary, not the shell wrapper.
+- Pin `RUSTUP_TOOLCHAIN` to the channel in `rust-toolchain.toml` (1.99 at
+  time of writing) and call the **absolute** cargo binary, not the shell wrapper.
 - A mixed-toolchain target dir can also throw spurious `E0514` errors; a
   `cargo clean` + pinned rebuild clears them.
 
