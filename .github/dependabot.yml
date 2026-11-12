@@ -7,6 +7,8 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       actions-minor-and-patch:
         update-types: [minor, patch]
@@ -16,6 +18,8 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
     groups:
       # text-splitter's `ChunkSizer for Tokenizer` impl targets a specific
       # tokenizers major; they must bump in one PR or the crate graph splits.
