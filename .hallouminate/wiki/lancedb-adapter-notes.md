@@ -13,9 +13,7 @@ sources:
 
 How `crates/hallouminate-adapters/src/lance.rs` uses the `lancedb` crate
 today, what it does not use, and the version traps found on the 0.37 → 0.41
-upgrade (PR #434). Research slug:
-`.cheese/research/lancedb-041-upgrade/lancedb-041-upgrade.md` (earlier:
-`.cheese/research/lancedb-038-migration/`).
+upgrade (PR #434). The upgrade research is local-only and is not in git.
 Ranking effects of lance major bumps live in
 [eval-harness-gotchas](eval-harness-gotchas.md); compaction and index-delta
 merging live in
@@ -43,6 +41,10 @@ a workaround; it adds an HTTP remote-table surface an embedded store never
 uses.
 
 ## 0.41 upgrade facts
+
+The lancedb 0.37 → 0.41 upgrade raises the workspace MSRV to 1.94 and needs
+no reindex. The code changes are new `IndexType` arms and an unknown-key
+check that does not depend on `serde_json` key order.
 
 | lancedb | lance | arrow / datafusion | lancedb MSRV |
 |---|---|---|---|
@@ -104,15 +106,19 @@ is benchmarked; treat the value column as a hypothesis.
 | 8 | Explicit `IvfHnswSq` / `IvfHnswFlat` instead of `Index::Auto` | Memory-for-recall trade; needs a recall benchmark first. | low–medium | medium |
 | 9 | Version checkout / restore | Could back "wiki as of commit X". | low | medium |
 
-Not candidates: a ZoneMap, BloomFilter, or BTree index on `indexed_at_ms`
-or `ord`. No query filters on `indexed_at_ms` (it is only read for stats),
-and `ord = 0` always comes with a `content_key IN (..)` filter that the
-`content_key` BTree serves. A `LabelList` index has no call site that
-filters on the list column.
+Not candidates: a ZoneMap, BloomFilter, or BTree index on `indexed_at_ms`.
+No query filters on `indexed_at_ms` (it is only read for stats). A
+`LabelList` index has no call site that filters on the list column.
+
+Undecided: a scalar index on `ord`. Two call sites filter on `ord = 0`.
+`stored_content_keys` (`lance.rs:1830`) adds a `content_key IN (..)` filter
+that the `content_key` BTree serves. `delete_orphan_content`
+(`lance.rs:2312`) scans `chunks` with `ord = 0` alone, so no index serves
+that scan. Nobody has measured the orphan sweep.
 
 Do not adopt: FTS V3 `FtsIndexBuilder::block_size(256)` (upstream flags it
 experimental and may break); RTree (needs `geo`); computed columns,
 materialized views, Functions, MemWAL/RTE, the data loader, and
 `cherry_pick` are remote, server, or Python/Node oriented.
 
-_Source: PR #434, `.cheese/research/lancedb-041-upgrade/` · Updated: 2026-11-04 · Supersedes: the 0.38 hold decision_
+_Source: PR #434 and local-only research (not in git) · Updated: 2026-11-04 · Supersedes: the 0.38 hold decision_

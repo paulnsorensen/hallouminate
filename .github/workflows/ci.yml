@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
-        # installs the channel pinned in rust-toolchain.toml (the crate's MSRV)
+        # installs the channel pinned in rust-toolchain.toml
         run: rustup show && rustup component add rustfmt
       - run: cargo fmt --all --check
 
