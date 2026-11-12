@@ -4799,6 +4799,37 @@ mod tests {
         .expect("corpus key")
     }
 
+    /// Counts the cold waits that `handle_ground` runs on this thread. Each
+    /// wait emits one event, and only that event has a `waited_ms` field.
+    #[derive(Clone, Default)]
+    struct ColdWaitCapture(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl ColdWaitCapture {
+        fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+            use tracing_subscriber::layer::SubscriberExt;
+
+            let capture = Self::default();
+            let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
+            (capture, tracing::subscriber::set_default(subscriber))
+        }
+
+        fn waits(&self) -> usize {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ColdWaitCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().fields().field("waited_ms").is_some() {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
     /// WHY (AC-6): a ground call on a never-registered root registers it and
     /// returns only after that root's first reconciliation completes, so the
     /// caller gets indexed hits instead of an empty cold-start answer.
@@ -4867,6 +4898,7 @@ mod tests {
             "# Unindexed\n\nBeta content.\n",
         )
         .expect("write unindexed");
+        let (capture, _guard) = ColdWaitCapture::install();
 
         let started = std::time::Instant::now();
         let result = ground_coverage_corpus(&state, tmp.path()).await;
@@ -4875,6 +4907,11 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(5),
             "ground waits for the bound, then answers: {elapsed:?}"
+        );
+        assert_eq!(
+            capture.waits(),
+            1,
+            "a non-zero bound runs one cold wait and reports it"
         );
         let paths: Vec<&String> = result.response.docs.keys().collect();
         let indexed = result
@@ -4919,6 +4956,8 @@ mod tests {
     }
 
     /// WHY: `cold_wait_ms = 0` means never wait, even with a queued root.
+    /// The absent cold-wait event is the proof. Elapsed time of the whole
+    /// ground call depends on host load, so it cannot be.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cold_wait_ms_zero_does_not_wait() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4926,13 +4965,14 @@ mod tests {
         std::fs::write(corpus_dir.join("a.md"), "# A\n\nAlpha content.\n").expect("write a");
         let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
         let state = state_with_cold_wait(&tmp.path().join("ground"), COLD_BASELINE, 0).await;
+        let (capture, _guard) = ColdWaitCapture::install();
 
-        let started = std::time::Instant::now();
         let result = ground_coverage_corpus(&state, tmp.path()).await;
 
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "a zero bound must not wait"
+        assert_eq!(
+            capture.waits(),
+            0,
+            "a zero bound must not enter the cold wait"
         );
         assert_eq!(result.response.docs.len(), 1, "lexical fallback answers");
         assert!(
