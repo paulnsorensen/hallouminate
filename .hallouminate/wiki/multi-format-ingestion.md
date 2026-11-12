@@ -98,7 +98,7 @@ This resolves the old "corpus wiring" open question.
   routes to the text handler — acceptable, since extensionful files never reach
   the sniff.
 - `calamine` — workbook reader (`xlsx`/`xls`/`ods`); `csv` crate for CSV.
-- `pdf-extract` 0.10 — pure-Rust, page-separated text-layer PDF extraction. Its
+- `pdf-extract` 0.12 — pure-Rust, page-separated text-layer PDF extraction. Its
   page API supports `page:N` breadcrumbs without Pdfium; layout coordinates and
   OCR remain unavailable.
 
