@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use hallouminate_domain::common::{HallouminateError, Result};
 use hallouminate_domain::embeddings::{
@@ -42,6 +42,14 @@ pub(crate) fn cpu_no_arena() -> Vec<fastembed::ExecutionProviderDispatch> {
 /// at the cost of an embed pass that runs about 40% slower. See
 /// `.hallouminate/wiki/ort-arena-retention.md` and onnxruntime#29538.
 pub(crate) const DISABLE_KLEIDIAI: (&str, &str) = ("mlas.disable_kleidiai", "1");
+
+/// ONNX Runtime device policy for every session. ort sets `MaxEfficiency`
+/// by default, and ONNX Runtime 1.31 then places the graph on CoreML on
+/// macOS: the daemon footprint grew to ~21 GB and a 156-file index did not
+/// finish in 15 min. [`cpu_no_arena`] does not prevent this, because ort's
+/// CPU EP adds no provider, and ONNX Runtime applies the policy only when no
+/// provider is added. `PreferCPU` never registers an EP automatically.
+pub(crate) const CPU_DEVICE_POLICY: AutoDevicePolicy = AutoDevicePolicy::PreferCPU;
 
 /// Whether a query or a passage is being embedded. Asymmetric retrieval
 /// models (the e5 family) take different instruction prefixes for the two
@@ -105,7 +113,8 @@ impl Embedder {
             .with_show_download_progress(false)
             .with_execution_providers(cpu_no_arena())
             .with_max_length(EMBED_MAX_LENGTH)
-            .with_session_config(DISABLE_KLEIDIAI.0, DISABLE_KLEIDIAI.1);
+            .with_session_config(DISABLE_KLEIDIAI.0, DISABLE_KLEIDIAI.1)
+            .with_auto_device(CPU_DEVICE_POLICY);
         let inner = TextEmbedding::try_new(opts).map_err(|e| {
             HallouminateError::Embed(format!(
                 "init {canonical_name}: {e}\n  \
@@ -324,11 +333,7 @@ mod tests {
     fn cpu_no_arena_registers_exactly_one_cpu_provider() {
         let eps = cpu_no_arena();
         assert_eq!(eps.len(), 1);
-        let debug = format!("{:?}", eps[0]);
-        assert!(
-            debug.contains("CPUExecutionProvider"),
-            "expected CPUExecutionProvider, got {debug}"
-        );
+        assert_eq!(eps[0].name(), "CPUExecutionProvider");
     }
 
     #[test]

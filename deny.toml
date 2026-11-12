@@ -1,8 +1,15 @@
-# Crate-boundary enforcement only. Advisories, licenses, and sources checks
-# are not adopted in this pass — CI runs `cargo deny check bans` specifically.
+# Crate-boundary enforcement and RustSec advisory checks. Licenses and sources
+# checks are not adopted. CI runs `cargo deny check bans advisories`.
 
 [graph]
 targets = []
+
+[advisories]
+# Fail on any RustSec vulnerability (the default) and on yanked crate versions.
+# Fail on unmaintained-crate advisories only for direct workspace dependencies.
+yanked = "deny"
+unmaintained = "workspace"
+ignore = []
 
 [bans]
 # fastembed pins tokenizers 0.22 while hallouminate-domain pins 0.23, so

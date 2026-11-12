@@ -1,0 +1,66 @@
+# Daily security re-check. Advisories appear after a PR or commit passes its
+# checks, and the PR-triggered checks do not run again on their own. So a PR
+# can keep a stale green dependency review after a new advisory covers one of
+# its dependencies. Example: PR #655 passed before GHSA-m665-v7pm-7grj was
+# published on 2026-10-28.
+# - advisories: runs cargo-deny's RustSec check on the default branch.
+# - rerun-dependency-review: re-runs the latest dependency review of each open
+#   PR to main, so its check shows the current advisory data.
+name: security re-check
+
+on:
+  schedule:
+    - cron: "37 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo-deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories
+
+  rerun-dependency-review:
+    name: re-run stale dependency reviews
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Re-run dependency review for open PRs
+        shell: bash
+        run: |
+          set -uo pipefail
+          declare -i ok=0 failed=0
+          prs=$(gh pr list --base main --state open --limit 200 \
+            --json number,headRefOid --jq '.[] | "\(.number) \(.headRefOid)"') || exit 1
+          while read -r pr sha; do
+            [[ -n $pr ]] || continue
+            if ! run=$(gh run list --workflow dependency-review.yml --commit "$sha" --limit 1 \
+              --json databaseId,status --jq '.[0] | select(.) | "\(.databaseId) \(.status)"'); then
+              echo "::warning::PR $pr: run lookup failed"; failed+=1; continue
+            fi
+            read -r id status <<<"$run"
+            if [[ -z $id ]]; then echo "PR $pr: no dependency review run, skip"; continue; fi
+            if [[ $status != completed ]]; then echo "PR $pr -> run $id is $status, skip"; continue; fi
+            if [[ -n ${DRY_RUN:-} ]]; then echo "PR $pr -> run $id"; ok+=1; continue; fi
+            if gh run rerun "$id"; then
+              echo "PR $pr -> run $id re-run"; ok+=1
+            else
+              echo "::warning::PR $pr -> run $id: re-run failed"; failed+=1
+            fi
+          done <<<"$prs"
+          echo "re-run: $ok, errors: $failed"
+          # Fail only when every attempt errored.
+          (( failed == 0 || ok > 0 ))
