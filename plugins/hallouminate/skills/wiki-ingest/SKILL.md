@@ -33,16 +33,17 @@ harness's original directory. Pass the same `cwd` to every call in this skill.
 1. Take the source: the text after the skill name (a file path or topic). When that text is
    empty, use the pasted doc, conversation takeaway, or decision in the current turn.
 2. Pick the corpus (`repo:{name}:wiki` or ask).
-3. Run the Layer 1 hash check (Phase 3) on the whole source. A ledger hit ends the run for this
-   source: write only its `skipped-duplicate-hash` log row (Phase 4), then report (Phase 5).
+3. Run the Layer 1 hash check (Phase 3) on the whole source. A ledger `hit` ends the run for this
+   source: write only its `skipped-duplicate-hash` log row (Phase 4), then report (Phase 5). A
+   `partial` result does not end the run; continue with step 4.
 4. Split the source into **atomic claims** — one topic each, the same granularity as a wiki
    page section. Don't ingest a 10-page doc as one blob.
 5. Read `wiki-conventions.md` (the wiki's constitution) for slug/voice/merge rules.
    If absent, fall back to hallouminate's authoring conventions (one topic per file,
    H1 first line, kebab slug).
 
-Done when the source passed Layer 1, every claim is atomic, and every page that may change has
-frozen probes (below).
+Done when the source passed Layer 1, every claim is atomic, and the probe query strings for each
+claim are frozen.
 
 ### Source pages and frozen retrieval probes
 
@@ -70,12 +71,13 @@ be indexed body text. Frontmatter and footnotes may repeat them but cannot be th
 Every dependent topic page must also name the source and relevant claim in indexed prose and link
 the corpus-local source page.
 
-During claim decomposition, before any drafting, freeze the retrieval probes for every page that
-may change: the exact topic identity; two to four natural questions derived from the atomic claim
+During claim decomposition, before any drafting, freeze the retrieval probes for every atomic
+claim: the exact topic identity; two to four natural questions derived from the atomic claim
 and source; the exact external-source title for a source page; and the source's central claim for
-the dependent topic page. Record the exact query strings, expected corpus-relative page, and
-required rank. Drafting and the repair pass must use these unchanged probes; do not generate them
-from the finished prose.
+the dependent topic page. Phase 1 freezes the exact query strings only, because Phase 2 has not
+yet located a page. Phase 3 binds the expected corpus-relative page and required rank to each
+frozen probe after it decides the claim. Drafting and the repair pass must use these unchanged
+probes; do not generate them from the finished prose.
 
 ## Phase 2 — Locate (haiku, parallel)
 
@@ -123,25 +125,35 @@ Catches identical re-ingestion of a whole source before any embedding work. Run 
 command instead of hashing by hand. Its path is relative to this `SKILL.md` directory:
 
 ```bash
-python3 <this-skill-dir>/scripts/ingest-ledger check <source-file> --ledger <corpus-root>/log.md
+python3 <this-skill-dir>/scripts/ingest-ledger check <source-file> --ledger <ledger-file>
 ```
 
-- `<source-file>` holds the whole source. Save pasted or conversation material to a temporary
-  file first. Omit `--ledger` when the corpus root is not on disk, and save the `read_markdown`
-  content of `log.md` to a file when it exists.
-- Output is one JSON object: `source_id` (16 hex chars), `ledger` (`hit` / `miss` / `absent`),
-  `matches`, and `first_match` (the first matching log row, or `null`). A row matches when its
-  second ` · `-separated field equals `source_id`.
+- `<source-file>` holds the whole source. When the source is not an existing file (a topic, a
+  pasted document, or conversation material), write its exact text to a temporary file and pass
+  that path.
+- `<ledger-file>` holds the current `log.md`. Always `read_markdown { corpus, path: "log.md", cwd }`.
+  When `log.md` exists, save its content to a temporary file and pass that path as `--ledger`.
+  When `log.md` is absent, omit `--ledger`.
+- Output is one JSON object: `source_id` (16 hex chars), `ledger` (`hit` / `partial` / `miss` /
+  `absent`), `matches` (the count of matching rows), and `first_match` (the first matching log
+  row, or `null`). A row matches when its second ` · `-separated field equals `source_id`.
+  `hit` means a matching row has the action `ingested` or `skipped-duplicate-hash`. `partial`
+  means rows match, but none has one of those two actions.
 - The command collapses every whitespace run to one space and trims both ends before it hashes.
   It keeps case and markdown, so the same source always gets the same id.
 - **`hit` → skip the entire source**, append a `skipped-duplicate-hash` row, report it. No
   `ground`, no page read/merge — the only write is the `skipped-duplicate-hash` log row.
-  **`miss` or `absent`** → continue (Phase 4 scaffolds `log.md` on first write).
-- Exit 2 means an empty source or a bad argument; fix the call. Exit 3 with a `cannot read`
-  error means an unreadable input file; fix the path. Any other failure means the launcher cannot
-  fetch, verify, or run its archive (it needs Python 3.11+, and network on first run). Then
-  report the error, treat Layer 1 as a miss, and write `—` as the source hash in the log row.
-  Layers 2–3 still dedup each claim.
+- **`partial` → resume, do not skip.** An earlier run logged decisions for this source but did
+  not complete it: a claim was `blocked`, or the run stopped. Continue with the full pipeline.
+  Layers 2–3 skip the claims that already landed.
+- **`miss` or `absent`** → continue (Phase 4 scaffolds `log.md` on first write).
+- Exit 2 means an empty source or a bad argument; fix the call. Exit 3 with `cannot read source`
+  or `cannot read ledger` means an unreadable input file; fix the path. Any other failure,
+  including `cannot read lock`, a download or verify error, or a traceback, means the launcher
+  cannot run; treat it as a miss and write `—` as the hash. The launcher needs Python 3.11+, and
+  network on first run. Report the error. Layers 2–3 still dedup each claim.
+- Ledger rows written under the old hand-computed hash may not match `source_id`. Such a source
+  reads as `miss`, and Layers 2–3 dedup its claims.
 - Hash identity is **whole-source**, not per-claim — the cheap exact-dup guard. Per-claim dedup
   is Layers 2–3.
 
@@ -193,7 +205,8 @@ provenance)?
   <summary> — needs human resolution`), and flag it to the user. Never silently pick.
 
 Done when every claim has exactly one decision: skip, merge, overwrite, new page, or
-conflict-flagged.
+conflict-flagged. Bind each frozen probe's expected corpus-relative page and required rank once
+its decision is made, before any drafting.
 
 ## Phase 4 — Write (root / opus)
 
@@ -239,18 +252,24 @@ Then **journal the decision** in `log.md` (append-only, never rewritten):
 > `add_markdown { corpus, path: "log.md", under_heading: "Log", position: "append", content: <row>, cwd }`
 
 where `<row>` is one log row `<date> · <source-hash> · <action> · <target path|—> · <summary>`
-and `action ∈ {skipped-duplicate-hash, skipped-near-duplicate, merged, new-page, conflict-flagged, retrieval-warning}`.
+and `action ∈ {skipped-duplicate-hash, skipped-near-duplicate, merged, overwritten, new-page, conflict-flagged, retrieval-warning, ingested}`.
 Log **every** decision — including Layer-1 hash skips (the row *is* the ledger Layer 1 scans) and
 **every** flagged contradiction. If `log.md` is absent, scaffold it once with
 `add_markdown { corpus, path: "log.md", content: "# Ingest Log\n\n## Log\n", overwrite: false, cwd }`, then append.
 Whole-file rewrites of `log.md` are forbidden — the only writes are `under_heading: append` splices.
 
+After every claim of the source has a final non-blocked disposition, append one completion row:
+`<date> · <source-hash> · ingested · — · <claim count> claims`. Layer 1 reports `hit` only for
+a source that has this row or a `skipped-duplicate-hash` row. Do not append it while a claim is
+`blocked`; the next run then gets `partial` and resumes the source. A Layer-1 `hit` run appends
+only its `skipped-duplicate-hash` row.
+
 The daemon reindexes each written file and refreshes ancestor `index.md` link lists
 automatically; the marker rule in Phase 2 still applies. For edits made **outside** these tools,
 run `index` to re-embed.
 
-Done when every probe has a final disposition and every decision has one log row, except
-writes rolled back to `blocked`.
+Done when every probe has a final disposition, every decision has one log row except writes
+rolled back to `blocked`, and the source has its `ingested` row unless a claim is `blocked`.
 
 ## Phase 5 — Report (root / opus)
 
@@ -261,6 +280,7 @@ Summarize per claim in one table, then list every flagged contradiction by name:
 |---|---|---|---|
 ```
 
-`Outcome` is one of: skipped / merged / new / conflict-flagged / written-with-retrieval-warning /
-blocked. For retrieval warnings, `Notes` gives the query, expected page, observed top three, and
-actual rank. Note any page that's now large enough to split (one-topic-per-file drift).
+`Outcome` is one of: skipped / merged / overwritten / new / conflict-flagged /
+written-with-retrieval-warning / blocked. For retrieval warnings, `Notes` gives the query,
+expected page, observed top three, and actual rank. Note any page that's now large enough to split
+(one-topic-per-file drift).

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import subprocess
 import sys
@@ -11,7 +10,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent.parent / "ingest_ledger.py"
-HELLO_ID = hashlib.sha256(b"Hello world").hexdigest()[:16]
+HELLO_ID = "64ec88ca00b268e5"
 
 
 def run(*args: str, stdin: bytes = b"") -> subprocess.CompletedProcess[bytes]:
@@ -52,7 +51,9 @@ class IngestLedgerTest(unittest.TestCase):
 
     def test_case_and_markdown_change_the_id(self) -> None:
         lower = self.write("lower.md", b"hello world")
-        self.assertNotEqual(self.ok(lower)["source_id"], HELLO_ID)
+        bold = self.write("bold.md", b"**Hello** world")
+        for path in (lower, bold):
+            self.assertNotEqual(self.ok(path)["source_id"], HELLO_ID)
 
     def test_missing_ledger_is_absent(self) -> None:
         source = self.write("s.md", b"Hello world")
@@ -83,12 +84,32 @@ class IngestLedgerTest(unittest.TestCase):
             {"source_id": HELLO_ID, "ledger": "hit", "matches": 2, "first_match": first},
         )
 
+    def test_merged_row_alone_is_partial(self) -> None:
+        source = self.write("s.md", b"Hello world")
+        row = f"2026-10-01 · {HELLO_ID} · merged · a.md · x"
+        log = self.write("log.md", f"# Ingest Log\n\n## Log\n{row}\n".encode())
+        self.assertEqual(
+            self.ok(source, "--ledger", log),
+            {"source_id": HELLO_ID, "ledger": "partial", "matches": 1, "first_match": row},
+        )
+
+    def test_ingested_row_is_a_hit(self) -> None:
+        source = self.write("s.md", b"Hello world")
+        merged = f"2026-10-01 · {HELLO_ID} · merged · a.md · x"
+        ingested = f"2026-10-01 · {HELLO_ID} · ingested · — · 1 claim"
+        log = self.write("log.md", f"## Log\n{merged}\n{ingested}\n".encode())
+        self.assertEqual(
+            self.ok(source, "--ledger", log),
+            {"source_id": HELLO_ID, "ledger": "hit", "matches": 2, "first_match": merged},
+        )
+
     def test_repeated_runs_are_identical(self) -> None:
         source = self.write("s.md", b"Hello world")
         log = self.write("log.md", f"d · {HELLO_ID} · merged · a · b".encode())
         first = run(source, "--ledger", log)
         second = run(source, "--ledger", log)
         self.assertEqual(first.stdout, second.stdout)
+        self.assertEqual(json.loads(first.stdout)["source_id"], HELLO_ID)
 
     def test_empty_source_is_a_usage_error(self) -> None:
         result = run(self.write("empty.md", b" \n\t"))
@@ -102,6 +123,15 @@ class IngestLedgerTest(unittest.TestCase):
             result = run(*args)
             self.assertEqual(result.returncode, 3, (args, result.stderr))
             self.assertEqual(result.stdout, b"")
+
+    def test_symlink_loop_ledger_is_a_contract_error(self) -> None:
+        source = self.write("s.md", b"Hello world")
+        loop = self.root / "loop.md"
+        loop.symlink_to(loop)
+        result = run(source, "--ledger", str(loop))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"cannot read ledger", result.stderr)
 
 
 if __name__ == "__main__":
