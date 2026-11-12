@@ -508,9 +508,9 @@ fn native_update_paths(
     debouncer: &mut notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
     ops: Vec<PathOp>,
     hook: &mut Option<std::sync::Arc<std::sync::Mutex<NativeWatchHook>>>,
-) -> Result<(), UpdatePathsError> {
+) -> Result<(), Box<UpdatePathsError>> {
     let Some(hook) = hook else {
-        return debouncer.update_paths(ops);
+        return debouncer.update_paths(ops).map_err(Box::new);
     };
     let mut guard = hook.lock().expect("native watch hook mutex");
     guard.native_restarts += 1;
@@ -531,13 +531,13 @@ fn native_update_paths(
             guard.restart_failure = false;
             apply_native_effects(&mut guard.registered, &recorded);
             drop(guard);
-            return Err(UpdatePathsError {
-                source: notify::Error::generic("injected native stream restart failure"),
-                origin: None,
-                remaining: Vec::new(),
-            });
+            return Err(Box::new(UpdatePathsError::new(
+                notify::Error::generic("injected native stream restart failure"),
+                None,
+                Vec::new(),
+            )));
         };
-        return Err(error);
+        return Err(Box::new(error));
     }
     let failed_index = ops
         .iter()
@@ -549,7 +549,7 @@ fn native_update_paths(
             let mut guard = hook.lock().expect("native watch hook mutex");
             apply_native_effects(&mut guard.registered, &recorded);
         }
-        return result;
+        return result.map_err(Box::new);
     };
     let failed_path = ops[index].as_path().to_path_buf();
     let keep_failure_for_following_watch = match (&recorded[index], recorded.get(index + 1)) {
@@ -572,11 +572,11 @@ fn native_update_paths(
     let mut tail = tail.into_iter();
     let origin = tail.next();
     let remaining: Vec<_> = tail.collect();
-    Err(UpdatePathsError {
-        source: notify::Error::generic("injected native watch failure"),
+    Err(Box::new(UpdatePathsError::new(
+        notify::Error::generic("injected native watch failure"),
         origin,
         remaining,
-    })
+    )))
 }
 
 /// Bundles the watcher pump's live-reconcile state: the optional
@@ -770,7 +770,8 @@ impl PumpState {
                 return;
             };
             #[cfg(test)]
-            let result = native_update_paths(debouncer, path_ops, &mut self.native_watch_hook);
+            let result = native_update_paths(debouncer, path_ops, &mut self.native_watch_hook)
+                .map_err(|error| *error);
             #[cfg(not(test))]
             let result = debouncer.update_paths(path_ops);
             let Err(error) = result else {
