@@ -47,11 +47,26 @@ merged as lancedb 0.41 with the bare dependency and no `remote` feature.
 
 ## lancedb 0.40 broke the exhaustive `IndexType` match
 
-`refreshed_per_batch` in `lance.rs` matches `lancedb::index::IndexType` with no wildcard arm. This is deliberate. A new index kind then fails to compile and gets a review. lancedb 0.40 added `ZoneMap`, `NGram`, `BloomFilter`, and `RTree`, and `IndexType` is not `#[non_exhaustive]`. The match now lists those four variants in the `=> true` arm. The store builds only BTree, FTS, Fm, and auto vector indexes, so runtime behavior did not change (issues #629 and #648). Do not add a `_ =>` arm.
+`refreshed_per_batch` in `lance.rs` matches `lancedb::index::IndexType` with
+no wildcard arm. This is deliberate. A new index kind then fails to compile
+and gets a review. `IndexType` is not `#[non_exhaustive]`. lancedb 0.40
+added `ZoneMap`, `NGram`, `BloomFilter`, and `RTree`, and 0.41 added
+`Custom(String)`. The `=> true` arm in `refreshed_per_batch`
+(`lance.rs:899`) lists these variants. The store builds only BTree, FTS, Fm,
+and auto vector indexes, so runtime behavior did not change (issues #629 and
+#648). Do not add a `_ =>` arm.
 
-## Open risk: table existence follows the manifest
+## Open risk: first-create crash recovery
 
-lancedb 0.38 made table existence depend on the manifest. `open_or_create_table` lists names with `table_names()`, opens a listed table, and creates an unlisted one. A table directory without a manifest, for example after a crash during first `create_table`, is no longer listed. The code then calls `create_table` on an existing directory. Nobody has verified the outcome. Issue #682 asks for a recovery test and, if needed, an open-first flow. This matters only for first-open crash recovery.
+`open_or_create_table` (`lance.rs:2787`) lists names with `table_names()`,
+opens a listed table, and creates an unlisted one. The adapter connects with
+the default listing database (`lance.rs:1337`). In lancedb 0.41 that database
+lists every `<name>.lance` child directory and does not read its manifest
+(`lancedb-0.41.0/src/database/listing.rs:942-971`). A table directory without
+a manifest, for example after a crash during the first `create_table`, is
+therefore still listed, and the code calls `open_table` on it. Nobody has
+verified the outcome. Issue #682 asks for a recovery test and, if needed, an
+open-first flow. This matters only for first-open crash recovery.
 
 ## 0.41 upgrade facts
 
