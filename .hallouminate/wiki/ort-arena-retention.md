@@ -98,3 +98,8 @@ are throwaway files under `/tmp/hm-bench/` (config with an isolated
   `rust-embedding-alternatives/`.
 
 _Source: live-daemon footprint/vmmap/malloc_history investigation, 2026-09-12 · Supersedes: the arena-only explanation and the eviction-era claims_
+
+- `ort` rc.15 adds a separate macOS failure: its default device policy
+  runs the graph on CoreML (~21 GB). Every session also sets
+  `PreferCPU`. See [[ort-coreml-device-policy]].
+

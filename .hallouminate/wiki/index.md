@@ -35,6 +35,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [not-found-suggestions](not-found-suggestions.md) — how an unknown-corpus error and a `read_markdown` path miss self-enrich with `strsim` closest-match hints so a caller recovers in zero extra round trips.
 - [office-prose-extraction](office-prose-extraction.md) — deferred/future-phase plan for .docx/.pptx/.odt prose extraction (not shipped today).
 - [ort-arena-retention](ort-arena-retention.md) — why session eviction never reclaimed embedder memory: upstream ONNX Runtime BFCArena retention; superseded by daemon idle-exit.
+- [ort-coreml-device-policy](ort-coreml-device-policy.md) — why every ONNX session sets `PreferCPU`: `ort` rc.15's default policy runs the embedder on CoreML on macOS (~21 GB); the placement test and the Renovate hold that guard it.
 - [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — deferred/future-phase plan for PDF and OCR ingestion (not shipped today).
 - [racy-mtime-smudge](racy-mtime-smudge.md) — why stored file mtimes are deliberately smudged by one millisecond at the write seam rather than fixing the equality gates.
 - [release-ceremony](release-ceremony.md) — release-flow gotchas the scripts don't tell you, learned cutting real releases.
