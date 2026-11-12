@@ -80,7 +80,8 @@ jobs:
         run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
 
       - name: Disable auto-merge
-        if: steps.policy.outputs.arm != 'true'
+        # always(): a failed metadata or policy step must also turn auto-merge off.
+        if: always() && steps.policy.outputs.arm != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
