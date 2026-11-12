@@ -47,6 +47,7 @@ jobs:
         env:
           DEPS: ${{ steps.meta.outputs.updated-dependencies-json }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           arm=$(jq -r '
@@ -60,20 +61,23 @@ jobs:
                   and (.prevVersion | from_zero | not))))
           ' <<<"${DEPS:-[]}")
           # fetch-metadata reads only the first commit. A commit from another author stays with a human.
-          others=$(gh pr view "$PR_URL" --json commits \
-            --jq '[.commits[].authors[].login | select(. != "dependabot[bot]")] | length')
+          # The check counts only when the PR head is still the event head; the next synchronize run checks a newer head.
+          others=$(gh pr view "$PR_URL" --json headRefOid,commits | jq --arg sha "$HEAD_SHA" \
+            'if .headRefOid != $sha then 1 else [.commits[].authors[].login | select(. != "dependabot[bot]")] | length end')
           if (( others > 0 )); then
             arm=false
           fi
           echo "arm=$arm" >> "$GITHUB_OUTPUT"
-          echo "arm=$arm, $others commit author(s) other than dependabot, for: $(jq -r '[.[] | "\(.dependencyName) \(.prevVersion) -> \(.newVersion) (\(.updateType))"] | join(", ")' <<<"${DEPS:-[]}")"
+          echo "arm=$arm, head $HEAD_SHA, $others commit author(s) other than dependabot or a moved head, for: $(jq -r '[.[] | "\(.dependencyName) \(.prevVersion) -> \(.newVersion) (\(.updateType))"] | join(", ")' <<<"${DEPS:-[]}")"
 
       - name: Enable auto-merge
         if: steps.policy.outputs.arm == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge --auto --squash "$PR_URL"
+        # --match-head-commit makes GitHub refuse auto-merge when the head moved after the check.
+        run: gh pr merge --auto --squash --match-head-commit "$HEAD_SHA" "$PR_URL"
 
       - name: Disable auto-merge
         if: steps.policy.outputs.arm != 'true'
