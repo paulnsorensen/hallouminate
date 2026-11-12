@@ -6,6 +6,7 @@ confidence: speculating
 
 An agent-run deep-tier `/briesearch` report for the hallouminate repository, published 2026-10-18, supports one finding: explicit fact structure helps LLMs, but the store technology does not carry the gain.
 Canonical source: cheese research corpus file `research/rdf-store-vs-inline-facts-llm/rdf-store-vs-inline-facts-llm.md` (local, outside git).
+URL: none (local-only research; not reproducible from git)
 The report passed `ground-check` with 0 errors and `budget-check` with no findings; 27 raw extracts stay in that corpus directory.
 
 ## Supported claims of the store-versus-inline report

@@ -5,7 +5,8 @@ confidence: speculating
 ---
 # Facts layer supersession evidence
 
-Every fact statement model checked keeps a superseded fact and marks it; none deletes it.
+Wikibase, nanopublications, and Graphiti keep a superseded fact and mark it; none deletes it.
+The fetched RDF 1.2 sections show no supersession mechanism.
 On 2026 models, unlabelled old and new facts in context lead to wrong answers, but no study tests whether a marker fixes this.
 The evidence comes from [[facts-layer-extraction-supersession-research]]; its confidence is `speculating`.
 This page records evidence for forks Q3 and Q4 only; the decisions are open in [[facts-layer-open-forks]].
@@ -22,7 +23,7 @@ Fact statement models handle a changed value, such as a Lance store schema going
 | RDF 1.2 reifiers | A reifier points to an unasserted triple term; time semantics were not found in the fetched sections | W3C RDF 1.2 Concepts |
 
 RDF 1.2 Concepts was a Candidate Recommendation Snapshot on 2026-04-07.
-Hallouminate claim marks already record `superseded` with a `ref=` to the replacement, as [[claim-provenance-marks]] describes.
+Hallouminate claim marks already record `superseded` with an optional `ref=` pointer (page path, footnote label, or URL), as [[claim-provenance-marks]] describes.
 
 ## STALE benchmark results for outdated memories
 

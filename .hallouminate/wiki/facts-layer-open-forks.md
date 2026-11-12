@@ -36,15 +36,16 @@ Plain triples lose provenance, and a triples-only graph lost badly to plain RAG 
 Wikibase statements carry qualifiers, references, and rank, which resemble the existing [[claim-provenance-marks]] statuses.
 RDF 1.2 reifiers are a Candidate Recommendation; library support is unknown.
 Nanopublications are the heaviest option.
-Every statement model checked keeps a changed fact with a status instead of deleting it; see [[facts-layer-supersession-evidence]].
+Wikibase, nanopublications, and Graphiti keep a superseded fact and mark it; none deletes it.
+The fetched RDF 1.2 sections show no supersession mechanism; see [[facts-layer-supersession-evidence]].
 Status: open; the Q2 answer constrains it.
 
 ## Fork Q4: how facts change over time
 
 Fork Q4 asks whether the existing supersession claim marks are enough, or whether facts need time qualifiers or bi-temporal edges.
-Claim marks already record that one claim supersedes another, with a `ref=` to the replacement.
-Graphiti-style bi-temporal edges help only for "what was true at time T" questions.
-In the evidence, temporal questions are the one category where graph memory showed a consistent gain, and timestamps on facts raised temporal recall in LongMemEval.
+Hallouminate claim marks already record `superseded` with an optional `ref=` pointer (page path, footnote label, or URL), as [[claim-provenance-marks]] describes.
+Graphiti-style bi-temporal edges target "what was true at time T" questions.
+In the evidence, temporal questions are the one category where graph memory showed a consistent gain, and timestamps on facts raised temporal recall in LongMemEval; no source isolates bi-temporal edges as the cause.
 On the 2026 STALE benchmark, unlabelled old and new facts in context gave 15.7% (GPT-5.4) to 55.2% (Gemini-3.1-pro); no study tests a superseded marker against removal.
 Status: open.
 

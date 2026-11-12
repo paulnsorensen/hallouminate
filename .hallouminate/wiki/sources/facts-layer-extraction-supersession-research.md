@@ -6,6 +6,7 @@ confidence: speculating
 
 An agent-run deep-tier `/briesearch` report for the hallouminate repository, published 2026-11-01, supports one finding: no source tests the facts-layer fork options directly, but each fork has partial evidence on 2025-2026 models.
 Canonical source: cheese research corpus file `research/facts-layer-extraction-supersession-prior-art/facts-layer-extraction-supersession-prior-art.md` (local, outside git).
+URL: none (local-only research; not reproducible from git)
 The report passed `ground-check` with 0 errors and `budget-check` with no findings; it used 19 searches, 24 extracts, and 6 researcher agents.
 
 ## Supported claims of the follow-up facts-layer report

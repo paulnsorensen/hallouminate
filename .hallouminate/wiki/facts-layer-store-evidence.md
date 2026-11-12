@@ -18,7 +18,7 @@ Ontology checks plus LLM repair raised the knowledge-graph result to 72% in 2024
 A 2026 dbt rerun of the same benchmark used Claude Sonnet 4.6 and GPT-5.3 Codex.
 Text-to-SQL rose from 32.7% to 64.5%, and a modeled semantic layer scored 100% on in-scope questions.
 The semantic layer refused out-of-scope questions; text-to-SQL returned plausible wrong numbers.
-That semantic layer is dbt MetricFlow, not RDF or SPARQL, and nobody has rerun the 54% knowledge-graph result on modern models.
+That semantic layer is dbt MetricFlow, not RDF or SPARQL, and the report found no rerun of the 54% knowledge-graph result on modern models.
 SPARQL-LLM ranked first of eight systems in the TEXT2SPARQL 2026 challenge, but the abstract gives no absolute accuracy.
 
 ## Graph RAG versus plain RAG by question type
@@ -67,7 +67,7 @@ No quantified comparison for a corpus under 200k tokens with a frontier model wa
 
 Fact or metadata text placed inside the embedded chunk text helped retrieval more than a separate vector in the studies found.
 This evidence comes from [[facts-layer-extraction-supersession-research]].
-[[anthropic-contextual-retrieval]] reports that a context prefix on each chunk cut top-20 retrieval failure by 35%, and by 49% with contextual BM25.
+[[anthropic-contextual-retrieval]] reports that a context prefix on each chunk cut top-20 retrieval failure by 49% with contextual embeddings plus contextual BM25.
 A 2026 SEC-filings study (arXiv 2601.11863) raised Context@5 with a metadata prefix from 33.3 to 55.0 (text-embedding-3-small) and from 26.7 to 61.7 (bge-m3).
 In the same study, a separately embedded metadata vector with late fusion stayed near baseline (36.7 and 30.0).
 Proposition indexing (Dense X Retrieval) and index-time hypothetical questions (HyPE) also index a derived unit beside the source text.

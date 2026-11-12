@@ -6,6 +6,7 @@ confidence: speculating
 
 An agent-run `/briesearch` report for the hallouminate repository, published 2026-10-05, supports one finding: no single standard covers an LLM wiki end to end.
 Canonical source: cheese research corpus file `research/llm-wiki-ontology-facts-layer/llm-wiki-ontology-facts-layer.md` (local, outside git).
+URL: none (local-only research; not reproducible from git)
 Its raw extracts and manifest stay in that corpus directory.
 
 ## Supported claims of the facts-layer landscape report
