@@ -481,7 +481,7 @@ fn sort_tree(node: &mut TreeNode) {
 /// `ErrorData`). `Symlink` and `InvalidPath` are normalized across platforms
 /// by the `classify_*_errno` helpers so a caller sees one stable kind
 /// regardless of whether Linux or macOS raised the underlying errno.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum WriteErrorKind {
     /// File exists and `overwrite=false`.
     Exists,

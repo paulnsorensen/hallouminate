@@ -2923,6 +2923,7 @@ version = "0.11.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "chrono",
  "fastrand",
  "futures-util",
@@ -2944,6 +2945,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

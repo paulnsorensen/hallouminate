@@ -9,7 +9,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::net::UnixStream;
+use super::transport::LocalStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_primary_or_sibling;
@@ -94,7 +94,7 @@ async fn stop_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<()> {
         .await;
 
     loop {
-        if !socket.exists() || UnixStream::connect(&socket).await.is_err() {
+        if !socket.exists() || LocalStream::connect(&socket).await.is_err() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -145,7 +145,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("primary.sock");
         let sibling = dir.path().join("sibling.sock");
-        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        let listener = crate::transport::LocalListener::bind(&sibling).expect("bind sibling");
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -190,7 +190,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("primary.sock");
         let sibling = dir.path().join("sibling.sock");
-        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        let listener = crate::transport::LocalListener::bind(&sibling).expect("bind sibling");
         let sibling_for_server = sibling.clone();
         let server = tokio::spawn(async move {
             loop {
