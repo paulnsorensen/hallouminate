@@ -365,8 +365,8 @@ pub struct CorpusStatsResult {
 }
 
 /// `Ping` reply payload (Curd C — cross-version daemon skew). Carries the
-/// daemon binary's `CARGO_PKG_VERSION` so the MCP `serve` bootstrap can detect
-/// version skew — a new client adopting a daemon spawned from an older release
+/// daemon binary's [`BUILD_IDENTITY`] so the MCP `serve` bootstrap can detect
+/// version skew — a new client adopting a daemon spawned from an older build
 /// — and self-heal by restarting the stale daemon. `flock` enforces one
 /// daemon, not one version, so without this a fresh MCP server would silently
 /// drive a mismatched daemon.
@@ -380,6 +380,25 @@ pub struct CorpusStatsResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PongResult {
     pub version: String,
+}
+
+/// Identity of this binary's build, reported in [`PongResult::version`].
+///
+/// Equals the compile-time `HALLOUMINATE_BUILD_ID` when the build sets it, and
+/// `CARGO_PKG_VERSION` otherwise. Every nightly build keeps the same
+/// `CARGO_PKG_VERSION`, so the nightly workflow sets `HALLOUMINATE_BUILD_ID` to
+/// its npm version. Without it, a new nightly `serve` adopts a daemon from an
+/// older nightly as current.
+pub const BUILD_IDENTITY: &str = build_identity(
+    option_env!("HALLOUMINATE_BUILD_ID"),
+    env!("CARGO_PKG_VERSION"),
+);
+
+const fn build_identity(build_id: Option<&'static str>, pkg_version: &'static str) -> &'static str {
+    match build_id {
+        Some(id) if !id.is_empty() => id,
+        Some(_) | None => pkg_version,
+    }
 }
 
 /// `ListFiles` payload alias — daemon emits an array of [`FileEntry`].
@@ -583,5 +602,19 @@ mod tests {
         .expect("page grouping and counts output deserialize");
         assert_eq!(req.group_by, GroundGroupBy::Page);
         assert_eq!(req.output, GroundOutput::Counts);
+    }
+
+    #[test]
+    fn build_id_overrides_the_package_version() {
+        assert_eq!(
+            build_identity(Some("0.0.0-experimental.345.1"), "0.11.1"),
+            "0.0.0-experimental.345.1"
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_build_id_falls_back_to_the_package_version() {
+        assert_eq!(build_identity(None, "0.11.1"), "0.11.1");
+        assert_eq!(build_identity(Some(""), "0.11.1"), "0.11.1");
     }
 }

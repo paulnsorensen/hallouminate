@@ -56,8 +56,8 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         tracing::info!(
             target: "hallouminate::daemon",
             socket = %running_socket.display(),
-            ours = env!("CARGO_PKG_VERSION"),
-            "running daemon version mismatch or unverifiable; restarting it",
+            ours = super::ipc::BUILD_IDENTITY,
+            "running daemon build mismatch or unverifiable; restarting it",
         );
         super::lifecycle::stop().await?;
     }
@@ -172,8 +172,8 @@ fn truncate_log_if_oversized(path: &Path, max_bytes: u64) -> std::io::Result<()>
     }
 }
 
-/// Probe the already-running daemon's version via `Ping`. Returns `true` only
-/// when the daemon reports our `CARGO_PKG_VERSION`.
+/// Probe the already-running daemon's build via `Ping`. Returns `true` only
+/// when the daemon reports our [`BUILD_IDENTITY`](super::ipc::BUILD_IDENTITY).
 ///
 /// Tolerant by design (see the [`PongResult`](super::ipc::PongResult) wire-compat
 /// note): a daemon from a release before the version field answers the bare
@@ -224,14 +224,14 @@ async fn running_daemon_version_matches(socket: &Path) -> bool {
 }
 
 /// Pure skew-detection predicate: does this `Ping` response report OUR
-/// version? Split out from the I/O so the tolerance contract is unit-testable
+/// build identity? Split out from the I/O so the tolerance contract is unit-testable
 /// without a live socket. A non-`Ok` envelope, a missing `version` (the old
 /// bare-`"pong"` daemon), or a different version all yield `false` → restart.
 fn pong_reports_our_version(resp: &DaemonResponse) -> bool {
     matches!(
         resp,
         DaemonResponse::Ok { result }
-            if result.get("version").and_then(|v| v.as_str()) == Some(env!("CARGO_PKG_VERSION"))
+            if result.get("version").and_then(|v| v.as_str()) == Some(super::ipc::BUILD_IDENTITY)
     )
 }
 
@@ -281,7 +281,7 @@ mod tests {
                     continue;
                 }
                 let response = DaemonResponse::ok(&super::super::ipc::PongResult {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: super::super::ipc::BUILD_IDENTITY.to_string(),
                 });
                 let mut response = serde_json::to_string(&response).expect("serialize response");
                 response.push('\n');
@@ -307,7 +307,7 @@ mod tests {
     #[test]
     fn pong_with_our_version_is_a_match() {
         let resp = DaemonResponse::ok(&super::super::ipc::PongResult {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: super::super::ipc::BUILD_IDENTITY.to_string(),
         });
         assert!(pong_reports_our_version(&resp), "same version must match");
     }

@@ -2362,8 +2362,8 @@ async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
         .expect("ping restarted daemon");
     assert_eq!(
         pong["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
-        "restarted daemon must report the current version: {pong}"
+        Some(hallouminate_daemon::BUILD_IDENTITY),
+        "restarted daemon must report the current build identity: {pong}"
     );
 
     // Tear down the respawned daemon.
