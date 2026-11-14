@@ -195,7 +195,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 24 # bundled npm (>= 11.5.1) satisfies OIDC trusted publishing
+          node-version: 26 # bundled npm (>= 11.5.1) satisfies OIDC trusted publishing
       # This package IS the nightly channel, so its newest build is `latest`.
       - name: Publish (idempotent)
         if: matrix.os == 'ubuntu-latest'
