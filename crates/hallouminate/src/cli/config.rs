@@ -143,11 +143,7 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let (effective, layers) =
         hallouminate_config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref()))
-            .map_err(|e| {
-                // Repo-config discovery failure: format the same "baseline: ... / repo: not found"
-                // header before the error so `show` and `validate` produce a consistent failure mode.
-                anyhow!(format_no_repo_error(&baseline_src, &cwd, &e))
-            })?;
+            .map_err(|e| anyhow!(format_resolve_error(&baseline_src, &cwd, &e)))?;
     print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
     if let Some(advisory) = layers
@@ -213,7 +209,7 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     ) {
         Ok(out) => out,
         Err(e) => {
-            return Err(anyhow!(format_no_repo_error(&baseline_src, &cwd, &e)));
+            return Err(anyhow!(format_resolve_error(&baseline_src, &cwd, &e)));
         }
     };
 
@@ -316,6 +312,20 @@ fn resolve_cwd(arg_cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
 /// see the layer provenance regardless of whether the baseline came from
 /// XDG or `--config PATH`.
 fn print_layered_header(baseline: &BaselineSource, layers: &ResolvedLayers) {
+    println!("{}", baseline_header_line(baseline));
+    // `layers.xdg_path` is kept for compatibility with `ResolvedLayers`'s
+    // public shape; the header above already named it under the
+    // source-agnostic "baseline" label.
+    let _ = &layers.xdg_path;
+    match &layers.repo_path {
+        Some(p) => println!("repo: {} (loaded)", p.display()),
+        None => println!("repo: not found (baseline-only)"),
+    }
+}
+
+/// "baseline: <path> (loaded | not found, from XDG | --config)" line shared
+/// by the success header and the failure blocks.
+fn baseline_header_line(baseline: &BaselineSource) -> String {
     let status = if baseline.path.is_file() {
         "loaded"
     } else {
@@ -325,18 +335,10 @@ fn print_layered_header(baseline: &BaselineSource, layers: &ResolvedLayers) {
         BaselineOrigin::Xdg => "XDG",
         BaselineOrigin::ConfigFlag => "--config",
     };
-    println!(
+    format!(
         "baseline: {} ({status}, from {origin})",
-        baseline.path.display(),
-    );
-    // `layers.xdg_path` is kept for compatibility with `ResolvedLayers`'s
-    // public shape; the header above already named it under the
-    // source-agnostic "baseline" label.
-    let _ = &layers.xdg_path;
-    match &layers.repo_path {
-        Some(p) => println!("repo: {} (loaded)", p.display()),
-        None => println!("repo: not found (baseline-only)"),
-    }
+        baseline.path.display()
+    )
 }
 
 fn print_effective_summary(cfg: &Config) -> anyhow::Result<()> {
@@ -357,6 +359,25 @@ fn print_effective_summary(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the failure block for a `resolve_for_cwd` error. A repo config that
+/// exists but fails to load or merge is reported as such; only a failed
+/// discovery gets the "repo: not found" block.
+fn format_resolve_error(
+    baseline: &BaselineSource,
+    cwd: &Path,
+    underlying: &hallouminate_domain::common::HallouminateError,
+) -> String {
+    let Ok(Some(repo_path)) = hallouminate_config::discover_repo_config(cwd) else {
+        return format_no_repo_error(baseline, cwd, underlying);
+    };
+    format!(
+        "{}\nrepo: {} (found, failed to load)\nerror: {}",
+        baseline_header_line(baseline),
+        repo_path.display(),
+        config_error_detail(underlying),
+    )
+}
+
 /// Build the "baseline: ... / repo: not found ..." block when `resolve_for_cwd`
 /// fails because discovery couldn't locate a `.hallouminate/config.toml`.
 fn format_no_repo_error(
@@ -364,34 +385,28 @@ fn format_no_repo_error(
     cwd: &Path,
     underlying: &hallouminate_domain::common::HallouminateError,
 ) -> String {
-    let mut out = String::new();
-    let status = if baseline.path.is_file() {
-        "loaded"
-    } else {
-        "not found"
-    };
-    let origin = match baseline.origin {
-        BaselineOrigin::Xdg => "XDG",
-        BaselineOrigin::ConfigFlag => "--config",
-    };
-    out.push_str(&format!(
-        "baseline: {} ({status}, from {origin})\n",
-        baseline.path.display(),
-    ));
+    let mut out = baseline_header_line(baseline);
+    out.push('\n');
     // Surface the underlying "walked from X (stopped at repo root Y)" wording
     // verbatim — it's the load-bearing diagnostic. Wrap the whole thing as the
     // "repo: not found (...)" line the user expects.
-    let detail = match underlying {
-        hallouminate_domain::common::HallouminateError::Config(msg) => msg.clone(),
-        other => other.to_string(),
-    };
-    out.push_str(&format!("repo: not found ({detail})\n"));
+    out.push_str(&format!(
+        "repo: not found ({})\n",
+        config_error_detail(underlying)
+    ));
     out.push_str(&format!(
         "error: hallouminate requires a .hallouminate/config.toml in the \
          working directory's repo (cwd: {})",
         cwd.display()
     ));
     out
+}
+
+fn config_error_detail(err: &hallouminate_domain::common::HallouminateError) -> String {
+    match err {
+        hallouminate_domain::common::HallouminateError::Config(msg) => msg.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Single-layer wrapper kept for the existing unit tests' call shape.
@@ -933,6 +948,45 @@ mod tests {
             msg.contains("from --config"),
             "header must tag baseline origin as --config: {msg}"
         );
+    }
+
+    #[test]
+    fn show_and_validate_report_a_found_repo_config_that_fails_to_merge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = canon(dir.path());
+        std::fs::create_dir(cwd.join(".git")).expect("mkdir .git");
+        let xdg_path = cwd.join("xdg.toml");
+        fs::write(&xdg_path, "[daemon]\nidle_exit_secs = 600\n").expect("write XDG");
+        let repo_path = write_repo_config(
+            &cwd,
+            "inherit_global_corpora = false\n\n[[repository]]\nname = \"plant-planner\"\npath = \".\"\n\n[storage]\nground_dir = \".hallouminate/ground\"\n",
+        );
+        let show_err = cmd_config_show(ConfigShowArgs {
+            config: Some(xdg_path.clone()),
+            cwd: Some(cwd.clone()),
+        })
+        .expect_err("repo ground_dir override must fail");
+        let validate_err = cmd_config_validate(ConfigValidateArgs {
+            config: Some(xdg_path),
+            cwd: Some(cwd),
+        })
+        .expect_err("repo ground_dir override must fail");
+        for err in [show_err, validate_err] {
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(&format!(
+                    "repo: {} (found, failed to load)",
+                    repo_path.display()
+                )),
+                "{msg}"
+            );
+            assert!(msg.contains("storage.ground_dir is baseline-only"), "{msg}");
+            assert!(!msg.contains("repo: not found"), "{msg}");
+            assert!(
+                !msg.contains("requires a .hallouminate/config.toml"),
+                "{msg}"
+            );
+        }
     }
 
     #[test]
