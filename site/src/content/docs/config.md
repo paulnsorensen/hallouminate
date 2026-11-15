@@ -143,4 +143,4 @@ hallouminate config download
 | Rotated process logs | `hallouminate.log.1` through `.9` with default limits |
 | Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` |
 | Model cache | `~/.cache/hallouminate/fastembed` |
-| Daemon socket | `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` (cache-dir fallback) |
+| Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` |

@@ -41,7 +41,7 @@ const MAX_STORED_TRIPS: usize = 32;
 
 /// Default trip-state file location: sibling of the daemon socket, so it
 /// follows the same per-user runtime-dir conventions (`HALLOUMINATE_SOCKET`
-/// override, `$XDG_RUNTIME_DIR/hallouminate/`, or `~/.cache/hallouminate/`).
+/// override or `<account-home>/.cache/hallouminate/`).
 pub(crate) fn default_trip_state_path() -> std::io::Result<PathBuf> {
     Ok(super::socket::daemon_socket_path()?.with_file_name("watchdog-trips"))
 }

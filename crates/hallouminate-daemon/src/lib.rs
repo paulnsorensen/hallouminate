@@ -5,9 +5,8 @@
 //! See `.cheese/specs/repository-daemon-wikis.md` for the design.
 //! Operational summary:
 //!
-//! - One daemon per user-local socket (`HALLOUMINATE_SOCKET`,
-//!   `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, or
-//!   `~/.cache/hallouminate/daemon.sock`).
+//! - One daemon per user-local socket (`HALLOUMINATE_SOCKET`, or
+//!   `<account-home>/.cache/hallouminate/daemon.sock`).
 //! - Single-instance enforced via `flock` on `<socket>.lock`.
 //! - Interactive CLI subcommands (`ground`, `index`, …) become clients of
 //!   the daemon and fail loudly when it is unreachable rather than silently

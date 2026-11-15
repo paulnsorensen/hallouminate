@@ -11,15 +11,15 @@
 //! cleanly and every `serve` polls the same socket.
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use tokio::net::UnixStream;
 
-use super::client::{connect_at, connect_primary_or_sibling};
+use super::client::connect_at;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
-use super::socket::daemon_socket_paths;
+use super::socket::daemon_socket_path;
 
 const CONNECTION_BUDGET: Duration = Duration::from_secs(90);
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -45,18 +45,16 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let paths = daemon_socket_paths()?;
-    let socket = paths.canonical();
-    if let Some((running_socket, verdict, theirs)) =
-        probe_running_daemon(socket, paths.legacy()).await
-    {
+    let socket = daemon_socket_path()?;
+    let socket = socket.as_path();
+    if let Some((verdict, theirs)) = probe_running_daemon(socket).await {
         let theirs = theirs.as_deref().unwrap_or("unreported");
         match verdict {
             SkewVerdict::Adopt => return Ok(()),
             SkewVerdict::Newer => {
                 tracing::warn!(
                     target: "hallouminate::daemon",
-                    socket = %running_socket.display(),
+                    socket = %socket.display(),
                     ours = super::ipc::BUILD_IDENTITY,
                     theirs,
                     "running daemon is newer than this build in the same channel; adopting it \
@@ -67,12 +65,12 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
             SkewVerdict::Restart => {
                 tracing::info!(
                     target: "hallouminate::daemon",
-                    socket = %running_socket.display(),
+                    socket = %socket.display(),
                     ours = super::ipc::BUILD_IDENTITY,
                     theirs,
                     "running daemon is older, from another channel, or unverifiable; restarting it",
                 );
-                super::lifecycle::stop().await?;
+                super::lifecycle::stop_at(socket).await?;
             }
         }
     }
@@ -122,14 +120,9 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     .await
 }
 
-async fn probe_running_daemon(
-    primary: &Path,
-    sibling: Option<&Path>,
-) -> Option<(PathBuf, SkewVerdict, Option<String>)> {
-    let client = connect_primary_or_sibling(primary, sibling).await?;
-    let socket = client.socket_path().to_path_buf();
-    let (verdict, theirs) = running_daemon_verdict(&socket).await;
-    Some((socket, verdict, theirs))
+async fn probe_running_daemon(socket: &Path) -> Option<(SkewVerdict, Option<String>)> {
+    connect_at(socket).await.ok()?;
+    Some(running_daemon_verdict(socket).await)
 }
 
 async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
@@ -344,13 +337,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_running_daemon_adopts_live_sibling() {
+    async fn probe_running_daemon_reports_version_of_live_socket() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let primary = dir.path().join("primary.sock");
-        let sibling = dir.path().join("sibling.sock");
-        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -374,15 +366,14 @@ mod tests {
             }
         });
 
-        let (socket, verdict, theirs) = probe_running_daemon(&primary, Some(&sibling))
+        let (verdict, theirs) = probe_running_daemon(&socket)
             .await
-            .expect("live sibling must be detected");
+            .expect("live socket must be detected");
 
-        assert_eq!(socket, sibling);
         assert_eq!(
             verdict,
             SkewVerdict::Adopt,
-            "live sibling reports the current version"
+            "live socket reports the current version"
         );
         assert_eq!(theirs.as_deref(), Some(super::super::ipc::BUILD_IDENTITY));
         server.await.expect("server task");
