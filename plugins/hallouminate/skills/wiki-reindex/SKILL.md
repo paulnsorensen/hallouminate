@@ -45,14 +45,13 @@ If the daemon comes up cleanly, the store is healthy — stop here.
 ### Auto-heal (stale store) — verify, don't delete
 
 On a stale store the daemon renames it to `<ground-dir>.bak-v<found>` — no
-manual step. For the startup store, the daemon reindexes every configured
-corpus before it serves requests. For a repo-level `[storage].ground_dir`
-override, the first request opens a fresh empty store. A `ground` request
-registers the repo's corpora, and the watcher's catch-up then refills the
-store, usually within one reconcile interval (default 60 s).
-Until then, `ground` can return partial results with an `index-coverage`
-warning. Verify with `hallouminate daemon status` (expect `running`) and a
-test `hallouminate ground "<query>"`. The daemon keeps the backup for
+manual step. The daemon reindexes every baseline corpus before it serves
+requests. A corpus declared only in a repo config is indexed when a request
+first registers it. `[storage] ground_dir` is baseline-only, so every repo
+shares this one store. Until a corpus finishes its catch-up, `ground` can return partial
+results with an `index-coverage` warning. Verify with `hallouminate daemon
+status` (expect `running`) and a test `hallouminate ground "<query>"`. The
+daemon keeps the backup for
 recovery and prunes it after about 30 days (`STALE_BACKUP_MAX_AGE`). If the startup
 rebuild fails, the daemon removes the partial store, keeps the backup, and
 exits. The next start opens a fresh store, and the catch-up refills it.
@@ -72,7 +71,8 @@ error output, the default store lives at:
 ```
 
 This path is overridable via `[storage] ground_dir` in your
-`~/.config/hallouminate/config.toml`. Verify:
+`~/.config/hallouminate/config.toml` only. A repo `.hallouminate/config.toml`
+cannot set it. Verify:
 
 ```bash
 hallouminate config show | grep ground_dir

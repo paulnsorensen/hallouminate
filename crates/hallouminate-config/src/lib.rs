@@ -1238,6 +1238,10 @@ fn merge_baseline_only<T>(
 where
     T: PartialEq + std::fmt::Debug,
 {
+    let origin = match &baseline {
+        Some(value) if *value != default => ActiveOrigin::Baseline,
+        Some(_) | None => ActiveOrigin::BuiltInDefault,
+    };
     let active = baseline.unwrap_or(default);
     let Some(repo_value) = repo else {
         return Ok(Some(active));
@@ -1245,12 +1249,52 @@ where
     if repo_value == active {
         return Ok(Some(active));
     }
-    Err(scalar_conflict(
+    Err(baseline_only_conflict(
         field,
         &active,
+        origin,
         &repo_value,
         baseline_path,
         repo_path,
+    ))
+}
+
+/// Where the active value of a baseline-only field comes from.
+enum ActiveOrigin {
+    Baseline,
+    BuiltInDefault,
+}
+
+/// Build the `HallouminateError::Config` reported when a repo layer tries to
+/// change a baseline-only field. The message names the field as
+/// baseline-only, tells whether the active value is the built-in default,
+/// and says how to fix the repo config.
+fn baseline_only_conflict<T: std::fmt::Debug>(
+    field: &str,
+    active: &T,
+    origin: ActiveOrigin,
+    repo: &T,
+    baseline_path: Option<&Path>,
+    repo_path: Option<&Path>,
+) -> HallouminateError {
+    let baseline_src = match baseline_path {
+        Some(p) => format!("baseline at {}", p.display()),
+        None => "baseline layer".to_string(),
+    };
+    let active_src = match origin {
+        ActiveOrigin::Baseline => format!("set by {baseline_src}"),
+        ActiveOrigin::BuiltInDefault => {
+            format!("built-in default; not overridden by {baseline_src}")
+        }
+    };
+    let repo_src = repo_path
+        .map(|p| format!(" (repo at {})", p.display()))
+        .unwrap_or_else(|| " (repo layer)".into());
+    HallouminateError::Config(format!(
+        "scalar conflict on {field}: {field} is baseline-only, so a repo config \
+         cannot change it; active = {active:?} ({active_src}), \
+         repo = {repo:?}{repo_src}. Remove {field} from the repo config, \
+         or set it in the baseline config."
     ))
 }
 
@@ -3992,5 +4036,98 @@ path = "."
         assert_eq!(merged.embeddings.cache_dir, "/c");
         let restated = merge_layers(&baseline, &baseline).expect("restating is allowed");
         assert_eq!(restated.storage.ground_dir, "/g");
+    }
+
+    fn baseline_only_conflict_message(baseline_toml: &str, repo_toml: &str) -> String {
+        let baseline = parse(baseline_toml, None).expect("baseline");
+        let repo = parse(repo_toml, None).expect("repo");
+        let xdg = Path::new("/home/u/.config/hallouminate/config.toml");
+        let repo_p = Path::new("/work/.hallouminate/config.toml");
+        let err = merge_layers_with_sources(&baseline, &repo, Some(xdg), Some(repo_p))
+            .expect_err("repo override of a baseline-only field must fail");
+        let HallouminateError::Config(msg) = err else {
+            panic!("unexpected error: {err:?}");
+        };
+        msg
+    }
+
+    #[test]
+    fn repo_ground_dir_conflict_reports_built_in_default_when_baseline_omits_it() {
+        let msg = baseline_only_conflict_message(
+            "[daemon]\nidle_exit_secs = 600\n",
+            "[storage]\nground_dir = \".hallouminate/ground\"\n",
+        );
+        assert!(
+            msg.contains("storage.ground_dir is baseline-only"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "(built-in default; not overridden by baseline at \
+                 /home/u/.config/hallouminate/config.toml)"
+            ),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("set by baseline"), "got: {msg}");
+        assert!(
+            msg.contains("active = \"~/.local/share/hallouminate/ground\""),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "repo = \".hallouminate/ground\" (repo at /work/.hallouminate/config.toml)"
+            ),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("Remove storage.ground_dir from the repo config"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn repo_ground_dir_conflict_attributes_an_explicit_baseline_value() {
+        let msg = baseline_only_conflict_message(
+            "[storage]\nground_dir = \"/g\"\n",
+            "[storage]\nground_dir = \"/r\"\n",
+        );
+        assert!(
+            msg.contains(
+                "active = \"/g\" (set by baseline at /home/u/.config/hallouminate/config.toml)"
+            ),
+            "got: {msg}"
+        );
+        assert!(!msg.contains("built-in default"), "got: {msg}");
+    }
+
+    #[test]
+    fn repo_watch_conflict_reports_built_in_default_when_baseline_omits_or_restates_it() {
+        for baseline_toml in [
+            "[daemon]\nidle_exit_secs = 600\n",
+            "[watch]\nreconcile_interval_secs = 60\n",
+        ] {
+            let msg = baseline_only_conflict_message(
+                baseline_toml,
+                "[watch]\nreconcile_interval_secs = 30\n",
+            );
+            assert!(
+                msg.contains(
+                    "scalar conflict on watch.reconcile_interval_secs: \
+                     watch.reconcile_interval_secs is baseline-only"
+                ),
+                "got: {msg}"
+            );
+            assert!(
+                msg.contains(
+                    "active = 60 (built-in default; not overridden by baseline at \
+                     /home/u/.config/hallouminate/config.toml)"
+                ),
+                "got: {msg}"
+            );
+            assert!(
+                msg.contains("repo = 30 (repo at /work/.hallouminate/config.toml)"),
+                "got: {msg}"
+            );
+        }
     }
 }
