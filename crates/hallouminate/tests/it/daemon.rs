@@ -1277,7 +1277,7 @@ ground_dir = "{g}"
         .expect("ping ok");
     assert_eq!(
         value["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
+        Some(hallouminate_daemon::BUILD_IDENTITY),
         "ping must report the daemon binary version: {value}"
     );
 }
@@ -1499,7 +1499,10 @@ ground_dir = "{g}"
         })
         .await
         .expect("ping");
-    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        pong["version"].as_str(),
+        Some(hallouminate_daemon::BUILD_IDENTITY)
+    );
 }
 
 // ─── Curd 1: graceful shutdown ───────────────────────────────────────────
@@ -1680,7 +1683,10 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
         })
         .await
         .expect("ping before SIGTERM");
-    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        pong["version"].as_str(),
+        Some(hallouminate_daemon::BUILD_IDENTITY)
+    );
 
     // Raise SIGTERM at our own process; the installed handler cancels the
     // shutdown token, the accept loop breaks, and `serve` runs cleanup.
@@ -2446,8 +2452,8 @@ async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
         .expect("ping restarted daemon");
     assert_eq!(
         pong["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
-        "restarted daemon must report the current version: {pong}"
+        Some(hallouminate_daemon::BUILD_IDENTITY),
+        "restarted daemon must report the current build identity: {pong}"
     );
 
     // Tear down the respawned daemon.

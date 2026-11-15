@@ -53,6 +53,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
 - [worktree-corpus-identity](worktree-corpus-identity.md) — #215's root-scoped delete fix, the #290 root-aware identity that closed the sibling-worktree search leak, and #304's retired-root garbage collection.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
+- [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md) — four decisions for index-on-discovery: the retired provisioner task, file-level vector reuse by `content_hash`, the root-GC non-goal, and the durable `WatchRegistry` with bounded reconciliation (#427, #461).
 
 ## How to use this index
 

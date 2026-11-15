@@ -48,7 +48,7 @@ pub use client::{
     daemon_client_unavailable,
 };
 pub use ipc::{
-    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult, BUILD_IDENTITY,
     BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
     DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
     GroundRequest, GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest,

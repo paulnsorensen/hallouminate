@@ -951,11 +951,9 @@ fn resolve_rg_hits_to_chunks(
 /// Count, per chunk, how many distinct query `terms` appear in the
 /// chunk's `search_text`.
 ///
-/// Case-sensitive to match the FM-Index `contains()` predicate this
-/// replaces (`contains(search_text, '<term>')`, no `lower()` wrap) --
-/// `terms` arrive pre-lowercased from [`split_terms`] but `search_text`
-/// is not lowercased, so this is a deliberate asymmetry against the
-/// ripgrep signal (which matches case-insensitively), not a bug.
+/// Case-insensitive, like the ripgrep signal (`--ignore-case`): `terms`
+/// arrive pre-lowercased from [`split_terms`], so each hit's
+/// `search_text` is lowercased once before the per-term scan.
 ///
 /// Matches `search_text`, not `text` -- `search_text` is the
 /// footnote-stripped derived field; matching `text` would leak footnote
@@ -966,10 +964,13 @@ fn contains_term_counts(
 ) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for (chunk_id, hit) in hits {
-        let n = terms
-            .iter()
-            .filter(|t| hit.search_text.contains(t.as_str()))
-            .count();
+        let search_text = hit.search_text.to_lowercase();
+        let mut n = 0;
+        for term in terms {
+            if search_text.contains(term.as_str()) {
+                n += 1;
+            }
+        }
         if n > 0 {
             counts.insert(chunk_id.clone(), n);
         }
@@ -1732,6 +1733,18 @@ mod tests {
         let hits = pool(vec![hit_with_search_text("a", "alpha beta")]);
         let counts = contains_term_counts(&hits, &[]);
         assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn contains_term_counts_matches_capitalised_occurrences() {
+        let hits = pool(vec![hit_with_search_text("a", "Alpha and BETA appear")]);
+        let terms = vec!["alpha".to_string(), "beta".to_string()];
+        let counts = contains_term_counts(&hits, &terms);
+        assert_eq!(
+            counts.get("a"),
+            Some(&2),
+            "terms arrive lowercased; capitalised text must still match like ripgrep --ignore-case"
+        );
     }
 
     #[test]
