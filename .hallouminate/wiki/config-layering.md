@@ -109,7 +109,7 @@ Implemented in `crates/hallouminate-config/src/lib.rs::merge_layers`. Rules:
 Conflict messages always name the source path of the offending value:
 
 ```text
-config: scalar conflict on search.top_files_default: baseline = 10 (baseline at
+config: scalar conflict on search.top_files_default: baseline = 20 (baseline at
   /Users/paul/.config/hallouminate/config.toml), repo = 5 (repo at
   /Users/paul/Dev/hallouminate/.hallouminate/config.toml)
 ```
