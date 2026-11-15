@@ -17,6 +17,9 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [daemon-and-cli](daemon-and-cli.md) — why there's a daemon, the JSON-line socket protocol, the CLI subcommand surface.
 - [daemon-canonical-identity-001](daemon-canonical-identity-001.md) — why the default daemon socket is resolved from the OS account record instead of `XDG_RUNTIME_DIR` (#320).
 - [daemon-canonical-identity-002](daemon-canonical-identity-002.md) — the one discovery seam every client and lifecycle command shares, and the retired legacy XDG probe (#323).
+- [operation-outcome-record-001](operation-outcome-record-001.md) — why operation outcomes and stage timing go to a dedicated local log, not to OpenTelemetry or the tracing log (#454, #456; accepted, not implemented).
+- [operation-outcome-record-002](operation-outcome-record-002.md) — why one call writes a daemon row and a client row joined by `request_id`.
+- [operation-outcome-record-003](operation-outcome-record-003.md) — why every MCP tool response carries the `request_id` and no timing block.
 - [daemon-canonical-identity-003](daemon-canonical-identity-003.md) — store-lock owner diagnostics: what the `store.lock` metadata names, and why a second advisory guard proves it is current.
 - [debt-observed-test-isolation](debt-observed-test-isolation.md) — why the process-wide `debt::OBSERVED` static makes any Hard-recording test break concurrent maintenance-defer tests.
 - [design-rationale](design-rationale.md) — what hallouminate deliberately *is* and *isn't*, and why — the "why this design not that one" page.
