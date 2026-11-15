@@ -1926,6 +1926,10 @@ async fn legacy_socket_was_dialed(listener: &tokio::net::UnixListener) -> bool {
         .is_ok()
 }
 
+// The canonical path comes from the OS account record, so this test cannot
+// redirect it. On a host with a live canonical daemon, canonical-first code
+// with a legacy fallback also passes. CI runners have no canonical daemon, so
+// the test rejects a restored fallback there.
 #[tokio::test]
 async fn default_discovery_never_dials_a_socket_that_exists_only_at_the_legacy_xdg_path() {
     let _env = EnvGuard::set("HALLOUMINATE_SOCKET");

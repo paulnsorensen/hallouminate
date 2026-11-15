@@ -70,7 +70,7 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
                     theirs,
                     "running daemon is older, from another channel, or unverifiable; restarting it",
                 );
-                super::lifecycle::stop().await?;
+                super::lifecycle::stop_at(socket).await?;
             }
         }
     }

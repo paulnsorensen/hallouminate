@@ -92,8 +92,9 @@ pub fn daemon_client_unavailable(reason: impl std::fmt::Display) -> anyhow::Erro
     anyhow::anyhow!("daemon unavailable: {reason} (start it with `hallouminate daemon`)")
 }
 
-/// Test entry point: dial a specific socket path. Production code goes
-/// through `daemon_client()` or `client_for()`.
+/// Dials one explicit socket path and confirms that a daemon accepts the
+/// connection. Every discovery entry point resolves its path first, then
+/// connects through this function.
 pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {
     // Probe the socket with a quick connect to confirm a daemon is alive,
     // surfacing the failure here instead of inside the first `call`.

@@ -10,7 +10,7 @@ When `serve` finds a running daemon, it compares build identities. Inside one ch
 
 ## Skew rule
 
-`skew_verdict(ours, resp)` (`bootstrap.rs:292`) returns `Adopt`, `Restart`, or `Newer`:
+`skew_verdict(ours, resp)` (`bootstrap.rs:285`) returns `Adopt`, `Restart`, or `Newer`:
 
 | Case | Verdict |
 | --- | --- |
@@ -31,6 +31,6 @@ When `serve` finds a running daemon, it compares build identities. Inside one ch
 
 - [daemon-canonical-identity-002](daemon-canonical-identity-002.md): the discovery seam that finds the running daemon before this check runs.
 
-[^code]: `crates/hallouminate-daemon/src/bootstrap.rs`: `classify_identity` (274), `skew_verdict` (292), `reported_identity` (248); unit tests `older_serve_does_not_restart_newer_daemon`, `newer_serve_restarts_older_daemon`, `nightly_serve_restarts_release_daemon`, `release_serve_restarts_nightly_daemon`.
+[^code]: `crates/hallouminate-daemon/src/bootstrap.rs`: `classify_identity` (267), `skew_verdict` (285), `reported_identity` (241); unit tests `older_serve_does_not_restart_newer_daemon`, `newer_serve_restarts_older_daemon`, `nightly_serve_restarts_release_daemon`, `release_serve_restarts_nightly_daemon`.
 
 _Source: PR #744 · Updated: 2026-11-15_

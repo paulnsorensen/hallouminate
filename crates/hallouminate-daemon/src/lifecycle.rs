@@ -77,7 +77,7 @@ pub async fn stop() -> anyhow::Result<()> {
     stop_at(&socket).await
 }
 
-async fn stop_at(socket: &Path) -> anyhow::Result<()> {
+pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
     let Ok(client) = connect_at(socket).await else {
         return Ok(());
@@ -93,7 +93,7 @@ async fn stop_at(socket: &Path) -> anyhow::Result<()> {
         .await;
 
     loop {
-        if !socket.exists() || UnixStream::connect(&socket).await.is_err() {
+        if !socket.exists() || UnixStream::connect(socket).await.is_err() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {

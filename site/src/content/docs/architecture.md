@@ -42,7 +42,7 @@ over a Unix domain socket.
 
 ### Socket location
 
-The socket path resolves in this order (`src/app/daemon/socket.rs`):
+The socket path resolves in this order (`crates/hallouminate-daemon/src/socket.rs`):
 
 1. `HALLOUMINATE_SOCKET` env var — per-process override, used exactly.
 2. `<account-home>/.cache/hallouminate/daemon.sock` — the default. The

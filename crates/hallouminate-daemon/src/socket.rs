@@ -8,7 +8,12 @@ use std::path::PathBuf;
 
 const SOCKET_NAME: &str = "daemon.sock";
 
-/// Resolve the exact daemon socket override or canonical account-home path.
+/// Resolves the exact daemon socket override or canonical account-home path.
+///
+/// # Errors
+///
+/// Returns an error when `HALLOUMINATE_SOCKET` is unset or empty and the OS
+/// has no account record for the effective user.
 pub fn daemon_socket_path() -> io::Result<PathBuf> {
     let explicit = std::env::var_os("HALLOUMINATE_SOCKET");
     if let Some(explicit) = explicit.as_deref().filter(|value| !value.is_empty()) {
