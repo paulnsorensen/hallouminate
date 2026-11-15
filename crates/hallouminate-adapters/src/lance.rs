@@ -2784,31 +2784,41 @@ fn index_signal(
     order
 }
 
+/// Opens `name`, creating it when no manifest exists. A crash during the first
+/// `create_table` leaves a table directory without a manifest, which
+/// `create_table` cannot adopt; that stale directory is dropped and recreated.
+/// The store lock keeps a concurrent creator out.
 async fn open_or_create_table(
     connection: &lancedb::Connection,
     name: &str,
     schema: SchemaRef,
 ) -> Result<lancedb::Table> {
-    let names = connection
-        .table_names()
-        .execute()
+    let opened = connection.open_table(name).execute().await;
+    let Err(lancedb::Error::TableNotFound { .. }) = opened else {
+        return opened.map_err(map_lance_err);
+    };
+    let created = create_empty_table(connection, name, schema.clone()).await;
+    let Err(lancedb::Error::TableNotFound { .. }) = created else {
+        return created.map_err(map_lance_err);
+    };
+    connection
+        .drop_table(name, &[])
         .await
         .map_err(map_lance_err)?;
-    if names.iter().any(|n| n == name) {
-        return connection
-            .open_table(name)
-            .execute()
-            .await
-            .map_err(map_lance_err);
-    }
+    create_empty_table(connection, name, schema)
+        .await
+        .map_err(map_lance_err)
+}
+
+async fn create_empty_table(
+    connection: &lancedb::Connection,
+    name: &str,
+    schema: SchemaRef,
+) -> std::result::Result<lancedb::Table, lancedb::Error> {
     let empty: Vec<std::result::Result<RecordBatch, arrow::error::ArrowError>> = Vec::new();
     let reader = RecordBatchIterator::new(empty.into_iter(), schema);
     let reader: Box<dyn arrow::array::RecordBatchReader + Send> = Box::new(reader);
-    connection
-        .create_table(name, reader)
-        .execute()
-        .await
-        .map_err(map_lance_err)
+    connection.create_table(name, reader).execute().await
 }
 
 #[async_trait]
