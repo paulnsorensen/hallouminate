@@ -42,7 +42,7 @@ Consequences: worktrees own distinct rows; storage grew until retired-root GC sh
 
 ## ADR-003 — Rebuild older derived schemas automatically
 
-Status: shipped in #290; amends the prior fail-loud stale-schema convention. Extended to per-request `[storage].ground_dir` override stores by #589. Since #612, a repo layer cannot override `storage.ground_dir` (it is baseline-only), so in practice every request uses the boot store.
+Status: shipped in #290; amends the prior fail-loud stale-schema convention. Extended to per-request `[storage].ground_dir` override stores by #589. Since #612, a repo layer cannot override `storage.ground_dir` (it is baseline-only), so in practice every request uses the boot `ground_dir`. A request can still open a second store handle on that directory when its resource key misses (see the per-request path below).
 
 Decision: Version < 4 logs, recreates the derived chunks table, and runs catch-up indexing; = 4 opens normally; > 4 remains fatal.[^spec]
 
@@ -57,7 +57,7 @@ Consequences: first open may spend minutes re-embedding large corpora; migration
 Stale-schema recovery for a ground store has two paths, and only boot reindexes inline.[^589]
 
 - **Boot** (`DaemonState::open_with_owner` → `check_ground_dir`, `open_boot_store`): a store older than the build moves to `<ground>.bak-v<N>`, and every effective corpus reindexes before the daemon serves and before the watchdog arms. A failed move leaves the stale store in place and fails boot. A failed open or reindex removes the partial store, keeps the backup, and fails boot; the next start opens a fresh store, and boot `catch_up_index` refills it.
-- **Per request** (`resources_for_with_initializer`, a request whose `ground_dir` differs from the boot store; #612 made `storage.ground_dir` baseline-only, so a repo config no longer reaches this path): validation runs first, then embedder and tokenizer init, so an init failure leaves the stale store in place. Then the stale store moves aside, a fresh empty store opens with no in-request reindex, and the request calls `watch_registry().mark_reconcile_due_all()`. The watcher's admitted catch-up (`catch_up_corpus`: debt gate, corpus lock, write lane) refills the store, so the first request can return partial results with an `index-coverage` warning.
+- **Per request** (`resources_for_with_initializer`, a request whose resource key `{ground_dir, model, quantized, enabled}` misses the boot key; #612 made `storage.ground_dir` baseline-only, so a repo config reaches this path only through a different `[embeddings]` model, `quantized`, or `enabled` value): validation runs first, then embedder and tokenizer init, so an init failure leaves the stale store in place. Then the stale store moves aside, a fresh empty store opens with no in-request reindex, and the request calls `watch_registry().mark_reconcile_due_all()`. The watcher's admitted catch-up (`catch_up_corpus`: debt gate, corpus lock, write lane) refills the store, so the first request can return partial results with an `index-coverage` warning.
 
 Why the request path does not reindex: a multi-minute rebuild inside a request stalls the watcher pump heartbeat past `watchdog_stall_secs` (default 300 s, then a process abort). It also holds the single write-lane permit when `add_markdown` or `delete_markdown` triggers it, and it bypasses debt backpressure.
 

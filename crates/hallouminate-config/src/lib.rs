@@ -4070,6 +4070,10 @@ path = "."
         );
         assert!(!msg.contains("set by baseline"), "got: {msg}");
         assert!(
+            msg.contains("active = \"~/.local/share/hallouminate/ground\""),
+            "got: {msg}"
+        );
+        assert!(
             msg.contains(
                 "repo = \".hallouminate/ground\" (repo at /work/.hallouminate/config.toml)"
             ),
@@ -4094,5 +4098,36 @@ path = "."
             "got: {msg}"
         );
         assert!(!msg.contains("built-in default"), "got: {msg}");
+    }
+
+    #[test]
+    fn repo_watch_conflict_reports_built_in_default_when_baseline_omits_or_restates_it() {
+        for baseline_toml in [
+            "[daemon]\nidle_exit_secs = 600\n",
+            "[watch]\nreconcile_interval_secs = 60\n",
+        ] {
+            let msg = baseline_only_conflict_message(
+                baseline_toml,
+                "[watch]\nreconcile_interval_secs = 30\n",
+            );
+            assert!(
+                msg.contains(
+                    "scalar conflict on watch.reconcile_interval_secs: \
+                     watch.reconcile_interval_secs is baseline-only"
+                ),
+                "got: {msg}"
+            );
+            assert!(
+                msg.contains(
+                    "active = 60 (built-in default; not overridden by baseline at \
+                     /home/u/.config/hallouminate/config.toml)"
+                ),
+                "got: {msg}"
+            );
+            assert!(
+                msg.contains("repo = 30 (repo at /work/.hallouminate/config.toml)"),
+                "got: {msg}"
+            );
+        }
     }
 }

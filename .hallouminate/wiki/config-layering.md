@@ -103,13 +103,13 @@ Implemented in `crates/hallouminate-config/src/lib.rs::merge_layers`. Rules:
 - Arrays (`[[corpus]]`, `[[repository]]`) append repository entries after baseline entries by default. Duplicate names error.
 - Repository `inherit_global_corpora = false` excludes both baseline declaration arrays before the merge. Local declarations remain.[^corpus-policy]
 - Scalars (`top_files_default`, etc.) — repo wins if it sets a non-default value; otherwise baseline. Conflicting non-default values error with both source paths named.
-- Baseline-only scalars — `storage.ground_dir`, `embeddings.cache_dir`, `watch.reconcile_interval_secs`, and `watch.catch_up_concurrency` (`merge_baseline_only`). The active value is the baseline value, or the built-in default when the baseline omits the key. A repo layer may omit the key or restate the active value. Any other repo value is an error, even when the baseline file does not set the key.[^baseline-only] `[logging]` and `[security]` are also baseline-owned; any non-default repo block errors.
+- Baseline-only scalars — `storage.ground_dir`, `embeddings.cache_dir`, `watch.reconcile_interval_secs`, and `watch.catch_up_concurrency` (`merge_baseline_only`). The active value is the baseline value, or the built-in default when the baseline omits the key. A repo layer may omit the key or restate the active value. For `storage.ground_dir` and `embeddings.cache_dir` only, a repo value equal to the built-in default counts as omitted, so a baseline value stays active. Any other repo value is an error, even when the baseline file does not set the key.[^baseline-only] `[logging]` and `[security]` are also baseline-owned; any non-default repo block errors.
 - `inherit_global_corpora = false` does not relax these rules. A repo cannot get a private `ground_dir`; all repos share one store, and its rows are keyed by root.
 
 Conflict messages always name the source path of the offending value:
 
 ```text
-config: scalar conflict on top_files_default: baseline = 10 (baseline at
+config: scalar conflict on search.top_files_default: baseline = 10 (baseline at
   /Users/paul/.config/hallouminate/config.toml), repo = 5 (repo at
   /Users/paul/Dev/hallouminate/.hallouminate/config.toml)
 ```

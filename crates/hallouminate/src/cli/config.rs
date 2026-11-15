@@ -367,19 +367,37 @@ fn format_resolve_error(
     cwd: &Path,
     underlying: &hallouminate_domain::common::HallouminateError,
 ) -> String {
-    let Ok(Some(repo_path)) = hallouminate_config::discover_repo_config(cwd) else {
-        return format_no_repo_error(baseline, cwd, underlying);
+    render_resolve_error(
+        baseline,
+        cwd,
+        hallouminate_config::discover_repo_config(cwd),
+        underlying,
+    )
+}
+
+fn render_resolve_error(
+    baseline: &BaselineSource,
+    cwd: &Path,
+    discovery: std::result::Result<Option<PathBuf>, hallouminate_domain::common::HallouminateError>,
+    underlying: &hallouminate_domain::common::HallouminateError,
+) -> String {
+    let repo_line = match discovery {
+        Ok(Some(repo_path)) => {
+            format!("repo: {} (found, failed to load)", repo_path.display())
+        }
+        Ok(None) => "repo: none (no git repository above cwd; baseline-only mode)".to_string(),
+        Err(_) => return format_no_repo_error(baseline, cwd, underlying),
     };
     format!(
-        "{}\nrepo: {} (found, failed to load)\nerror: {}",
+        "{}\n{repo_line}\nerror: {}",
         baseline_header_line(baseline),
-        repo_path.display(),
         config_error_detail(underlying),
     )
 }
 
 /// Build the "baseline: ... / repo: not found ..." block when `resolve_for_cwd`
-/// fails because discovery couldn't locate a `.hallouminate/config.toml`.
+/// fails because discovery stopped at a repo root without a
+/// `.hallouminate/config.toml`.
 fn format_no_repo_error(
     baseline: &BaselineSource,
     cwd: &Path,
@@ -961,6 +979,7 @@ mod tests {
             &cwd,
             "inherit_global_corpora = false\n\n[[repository]]\nname = \"plant-planner\"\npath = \".\"\n\n[storage]\nground_dir = \".hallouminate/ground\"\n",
         );
+        let header = format!("baseline: {} (loaded, from --config)", xdg_path.display());
         let show_err = cmd_config_show(ConfigShowArgs {
             config: Some(xdg_path.clone()),
             cwd: Some(cwd.clone()),
@@ -973,6 +992,7 @@ mod tests {
         .expect_err("repo ground_dir override must fail");
         for err in [show_err, validate_err] {
             let msg = format!("{err:#}");
+            assert!(msg.contains(&header), "{msg}");
             assert!(
                 msg.contains(&format!(
                     "repo: {} (found, failed to load)",
@@ -987,6 +1007,27 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_error_without_a_git_repository_reports_baseline_only_mode() {
+        let baseline = BaselineSource {
+            path: PathBuf::from("/etc/hallouminate/config.toml"),
+            origin: BaselineOrigin::Xdg,
+        };
+        let err =
+            hallouminate_domain::common::HallouminateError::Config("duplicate corpus name".into());
+        let out = render_resolve_error(&baseline, Path::new("/work"), Ok(None), &err);
+        assert!(
+            out.contains("repo: none (no git repository above cwd; baseline-only mode)"),
+            "{out}"
+        );
+        assert!(out.contains("error: duplicate corpus name"), "{out}");
+        assert!(!out.contains("repo: not found"), "{out}");
+        assert!(
+            !out.contains("requires a .hallouminate/config.toml"),
+            "{out}"
+        );
     }
 
     #[test]
