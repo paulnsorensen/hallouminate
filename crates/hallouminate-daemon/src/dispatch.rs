@@ -58,9 +58,8 @@ use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name};
 use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use hallouminate_domain::search::validate_phrase;
 
-use super::ipc::BUILD_IDENTITY;
 use super::ipc::{
-    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult, BUILD_IDENTITY,
     BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
     DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
     GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,

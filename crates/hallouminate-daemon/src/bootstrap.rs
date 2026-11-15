@@ -47,15 +47,20 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
 
     let paths = daemon_socket_paths()?;
     let socket = paths.canonical();
-    if let Some((running_socket, verdict)) = probe_running_daemon(socket, paths.legacy()).await {
+    if let Some((running_socket, verdict, theirs)) =
+        probe_running_daemon(socket, paths.legacy()).await
+    {
+        let theirs = theirs.as_deref().unwrap_or("unreported");
         match verdict {
             SkewVerdict::Adopt => return Ok(()),
             SkewVerdict::Newer => {
-                tracing::info!(
+                tracing::warn!(
                     target: "hallouminate::daemon",
                     socket = %running_socket.display(),
                     ours = super::ipc::BUILD_IDENTITY,
-                    "running daemon is newer than this build in the same channel; adopting it",
+                    theirs,
+                    "running daemon is newer than this build in the same channel; adopting it \
+                     (run `hallouminate daemon restart` to replace it with this build)",
                 );
                 return Ok(());
             }
@@ -64,6 +69,7 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
                     target: "hallouminate::daemon",
                     socket = %running_socket.display(),
                     ours = super::ipc::BUILD_IDENTITY,
+                    theirs,
                     "running daemon is older, from another channel, or unverifiable; restarting it",
                 );
                 super::lifecycle::stop().await?;
@@ -119,11 +125,11 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
 async fn probe_running_daemon(
     primary: &Path,
     sibling: Option<&Path>,
-) -> Option<(PathBuf, SkewVerdict)> {
+) -> Option<(PathBuf, SkewVerdict, Option<String>)> {
     let client = connect_primary_or_sibling(primary, sibling).await?;
     let socket = client.socket_path().to_path_buf();
-    let verdict = running_daemon_verdict(&socket).await;
-    Some((socket, verdict))
+    let (verdict, theirs) = running_daemon_verdict(&socket).await;
+    Some((socket, verdict, theirs))
 }
 
 async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
@@ -192,7 +198,7 @@ fn truncate_log_if_oversized(path: &Path, max_bytes: u64) -> std::io::Result<()>
 /// `"pong"` string — which has no `version` — and any transport or daemon-side
 /// error is likewise unverifiable. All of these resolve to [`SkewVerdict::Restart`]
 /// rather than erroring, so an unverifiable daemon is replaced, never adopted.
-async fn running_daemon_verdict(socket: &Path) -> SkewVerdict {
+async fn running_daemon_verdict(socket: &Path) -> (SkewVerdict, Option<String>) {
     let client = match connect_at(socket).await {
         Ok(c) => c,
         Err(e) => {
@@ -204,7 +210,7 @@ async fn running_daemon_verdict(socket: &Path) -> SkewVerdict {
                 error = %e,
                 "version probe could not connect to the running daemon; treating as unverifiable",
             );
-            return SkewVerdict::Restart;
+            return (SkewVerdict::Restart, None);
         }
     };
     let probe = client.call_raw(DaemonRequest {
@@ -212,14 +218,17 @@ async fn running_daemon_verdict(socket: &Path) -> SkewVerdict {
         payload: DaemonRequestPayload::Ping,
     });
     match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
-        Ok(Ok(resp)) => skew_verdict(super::ipc::BUILD_IDENTITY, &resp),
+        Ok(Ok(resp)) => (
+            skew_verdict(super::ipc::BUILD_IDENTITY, &resp),
+            reported_identity(&resp).map(str::to_owned),
+        ),
         Ok(Err(e)) => {
             tracing::debug!(
                 target: "hallouminate::daemon",
                 error = %e,
                 "version probe Ping failed; treating the daemon as unverifiable",
             );
-            SkewVerdict::Restart
+            (SkewVerdict::Restart, None)
         }
         Err(_elapsed) => {
             // The daemon accepted the connection but did not answer within
@@ -230,9 +239,17 @@ async fn running_daemon_verdict(socket: &Path) -> SkewVerdict {
                 timeout_secs = PROBE_TIMEOUT.as_secs(),
                 "version probe Ping timed out; treating the daemon as unverifiable",
             );
-            SkewVerdict::Restart
+            (SkewVerdict::Restart, None)
         }
     }
+}
+
+/// The build identity a `Ping` reply reports, when the reply carries one.
+fn reported_identity(resp: &DaemonResponse) -> Option<&str> {
+    let DaemonResponse::Ok { result } = resp else {
+        return None;
+    };
+    result.get("version").and_then(|v| v.as_str())
 }
 
 /// What `serve` does with an already-running daemon.
@@ -357,7 +374,7 @@ mod tests {
             }
         });
 
-        let (socket, verdict) = probe_running_daemon(&primary, Some(&sibling))
+        let (socket, verdict, theirs) = probe_running_daemon(&primary, Some(&sibling))
             .await
             .expect("live sibling must be detected");
 
@@ -367,6 +384,7 @@ mod tests {
             SkewVerdict::Adopt,
             "live sibling reports the current version"
         );
+        assert_eq!(theirs.as_deref(), Some(super::super::ipc::BUILD_IDENTITY));
         server.await.expect("server task");
     }
 
