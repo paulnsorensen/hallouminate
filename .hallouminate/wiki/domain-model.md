@@ -136,11 +136,7 @@ The same approved design extends `SearchHit` with stored `search_text`, feeds th
 
 **Canonical daemon socket** — The sole environment-independent default transport address for one OS user.
 _Avoid_: primary socket, fallback socket
-_Code_: `DaemonSocketPaths.canonical`; `crates/hallouminate-daemon/src/socket.rs:12-15,73-94`
-
-**Legacy daemon socket** — A discoverable pre-migration XDG address probed only during the compatibility window; removal tracked by #323.
-_Avoid_: sibling socket
-_Code_: `DaemonSocketPaths.legacy`; `crates/hallouminate-daemon/src/socket.rs:96-105`
+_Code_: `daemon_socket_path`, `canonical_socket_path`; `crates/hallouminate-daemon/src/socket.rs:11-18,44-49`
 
 **Store lock owner** — The process whose open file description holds the exclusive `flock`; PID, socket, and version metadata only describe that holder.
 _Avoid_: lock metadata owner

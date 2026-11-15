@@ -12,4 +12,4 @@
 <certain> The canonical socket path is an identity key, not merely a preferred transport candidate.
 
 [^1]: [Issue #318 — sibling-socket probe does not adopt a live daemon](https://github.com/paulnsorensen/hallouminate/issues/318).
-[^2]: As shipped: `daemon_socket_path` / `daemon_socket_paths` (`crates/hallouminate-daemon/src/socket.rs:26-48`), `account_home_for_current_user` (`socket.rs:50-71`), path composition (`socket.rs:73-94`). See also [daemon-and-cli](daemon-and-cli.md).
+[^2]: As shipped: `daemon_socket_path` (`crates/hallouminate-daemon/src/socket.rs:11-18`), `account_home_for_current_user` (`socket.rs:20-42`), path composition (`socket.rs:44-49`). See also [daemon-and-cli](daemon-and-cli.md).

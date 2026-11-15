@@ -11,15 +11,15 @@
 //! cleanly and every `serve` polls the same socket.
 
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use tokio::net::UnixStream;
 
-use super::client::{connect_at, connect_primary_or_sibling};
+use super::client::connect_at;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse};
-use super::socket::daemon_socket_paths;
+use super::socket::daemon_socket_path;
 
 const CONNECTION_BUDGET: Duration = Duration::from_secs(90);
 const INITIAL_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -45,17 +45,15 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let paths = daemon_socket_paths()?;
-    let socket = paths.canonical();
-    if let Some((running_socket, version_matches)) =
-        probe_running_daemon(socket, paths.legacy()).await
-    {
+    let socket = daemon_socket_path()?;
+    let socket = socket.as_path();
+    if let Some(version_matches) = probe_running_daemon(socket).await {
         if version_matches {
             return Ok(());
         }
         tracing::info!(
             target: "hallouminate::daemon",
-            socket = %running_socket.display(),
+            socket = %socket.display(),
             ours = env!("CARGO_PKG_VERSION"),
             "running daemon version mismatch or unverifiable; restarting it",
         );
@@ -107,11 +105,9 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     .await
 }
 
-async fn probe_running_daemon(primary: &Path, sibling: Option<&Path>) -> Option<(PathBuf, bool)> {
-    let client = connect_primary_or_sibling(primary, sibling).await?;
-    let socket = client.socket_path().to_path_buf();
-    let version_matches = running_daemon_version_matches(&socket).await;
-    Some((socket, version_matches))
+async fn probe_running_daemon(socket: &Path) -> Option<bool> {
+    connect_at(socket).await.ok()?;
+    Some(running_daemon_version_matches(socket).await)
 }
 
 async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
@@ -263,13 +259,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_running_daemon_adopts_live_sibling() {
+    async fn probe_running_daemon_reports_version_of_live_socket() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let primary = dir.path().join("primary.sock");
-        let sibling = dir.path().join("sibling.sock");
-        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -293,12 +288,11 @@ mod tests {
             }
         });
 
-        let (socket, version_matches) = probe_running_daemon(&primary, Some(&sibling))
+        let version_matches = probe_running_daemon(&socket)
             .await
-            .expect("live sibling must be detected");
+            .expect("live socket must be detected");
 
-        assert_eq!(socket, sibling);
-        assert!(version_matches, "live sibling reports the current version");
+        assert!(version_matches, "live socket reports the current version");
         server.await.expect("server task");
     }
 

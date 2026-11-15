@@ -24,9 +24,9 @@ The spike does not run live launchd or systemd service tests.[^service-policy]
 Resolved in this order (`crates/hallouminate-daemon/src/socket.rs`):
 
 1. `HALLOUMINATE_SOCKET` env var — per-process override.
-2. `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` — the default when a
-   runtime dir exists.
-3. `${XDG_CACHE_HOME:-~/.cache}/hallouminate/daemon.sock` — fallback.
+2. `<account-home>/.cache/hallouminate/daemon.sock` — the default. The
+   account home comes from the OS user record; `HOME`, `XDG_RUNTIME_DIR`,
+   and `XDG_CACHE_HOME` do not change it.
 
 `--socket PATH` on `index`, `ground`, etc. overrides per-invocation.
 
@@ -34,22 +34,21 @@ The daemon takes a flock on `<socket>.lock` to enforce single-instance
 ownership. A second `hallouminate daemon` against the same socket
 errors out with "another hallouminate daemon already holds …".
 
-**Sibling adoption (#218, #318).** Single-instance ownership remains per
-socket path, but default-socket clients probe both canonical candidates
-before spawning: the resolved primary and the opposite runtime/cache
-path. `serve` bootstrap, ordinary clients, `daemon status`, and `daemon
-stop` all adopt the reachable candidate, so disagreement about
-`XDG_RUNTIME_DIR` no longer wedges startup or hides the running daemon.
-An explicit `HALLOUMINATE_SOCKET` or per-command socket path is honored
-exactly and never triggers sibling probing.[^1]
+**One socket per account (#218, #318, #323).** Single-instance ownership
+is per socket path, and the default path no longer depends on the
+environment. `serve` bootstrap, ordinary clients, `daemon status`, and
+`daemon stop` all dial that one path. A daemon that listens only at the
+old `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` path is not adopted. An
+explicit `HALLOUMINATE_SOCKET` or per-command socket path is honored
+exactly.[^1]
 
-**Cold start (#220).** When neither candidate is reachable, bootstrap
-spawns a daemon candidate and polls the primary socket for one 90-second
+**Cold start (#220).** When the socket is unreachable, bootstrap
+spawns a daemon candidate and polls the socket for one 90-second
 total budget, using exponential backoff capped at one second. A flock
 loser exits before opening daemon state, so concurrent candidates do not
 load duplicate models.[^2]
 
-[^1]: `crates/hallouminate-daemon/src/socket.rs:43-92`; `crates/hallouminate-daemon/src/client.rs:43-108`; `crates/hallouminate-daemon/src/bootstrap.rs:43-115`; `crates/hallouminate-daemon/src/lifecycle.rs:38-111`
+[^1]: `crates/hallouminate-daemon/src/socket.rs:11-49`; `crates/hallouminate-daemon/src/client.rs:30-84`; `crates/hallouminate-daemon/src/bootstrap.rs:43-115`; `crates/hallouminate-daemon/src/lifecycle.rs:38-107`
 [^2]: `crates/hallouminate-daemon/src/bootstrap.rs:24-26,94-153`; `crates/hallouminate-daemon/src/server.rs:114-117,672-694`
 
 ## Wire protocol

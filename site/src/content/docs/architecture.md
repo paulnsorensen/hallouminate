@@ -44,10 +44,10 @@ over a Unix domain socket.
 
 The socket path resolves in this order (`src/app/daemon/socket.rs`):
 
-1. `HALLOUMINATE_SOCKET` env var — per-process override.
-2. `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` — the default when a runtime
-   dir exists.
-3. `${XDG_CACHE_HOME:-~/.cache}/hallouminate/daemon.sock` — fallback.
+1. `HALLOUMINATE_SOCKET` env var — per-process override, used exactly.
+2. `<account-home>/.cache/hallouminate/daemon.sock` — the default. The
+   account home comes from the OS user record. `$HOME`, `$XDG_RUNTIME_DIR`,
+   and `$XDG_CACHE_HOME` do not change it.
 
 The daemon takes a flock on `<socket>.lock` to enforce single-instance
 ownership; a second daemon on the same socket errors out.
