@@ -47,19 +47,34 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
 
     let paths = daemon_socket_paths()?;
     let socket = paths.canonical();
-    if let Some((running_socket, version_matches)) =
+    if let Some((running_socket, verdict, theirs)) =
         probe_running_daemon(socket, paths.legacy()).await
     {
-        if version_matches {
-            return Ok(());
+        let theirs = theirs.as_deref().unwrap_or("unreported");
+        match verdict {
+            SkewVerdict::Adopt => return Ok(()),
+            SkewVerdict::Newer => {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    socket = %running_socket.display(),
+                    ours = super::ipc::BUILD_IDENTITY,
+                    theirs,
+                    "running daemon is newer than this build in the same channel; adopting it \
+                     (run `hallouminate daemon restart` to replace it with this build)",
+                );
+                return Ok(());
+            }
+            SkewVerdict::Restart => {
+                tracing::info!(
+                    target: "hallouminate::daemon",
+                    socket = %running_socket.display(),
+                    ours = super::ipc::BUILD_IDENTITY,
+                    theirs,
+                    "running daemon is older, from another channel, or unverifiable; restarting it",
+                );
+                super::lifecycle::stop().await?;
+            }
         }
-        tracing::info!(
-            target: "hallouminate::daemon",
-            socket = %running_socket.display(),
-            ours = env!("CARGO_PKG_VERSION"),
-            "running daemon version mismatch or unverifiable; restarting it",
-        );
-        super::lifecycle::stop().await?;
     }
 
     // Stderr capture for the auto-spawned daemon. Lives in the XDG state
@@ -107,11 +122,14 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     .await
 }
 
-async fn probe_running_daemon(primary: &Path, sibling: Option<&Path>) -> Option<(PathBuf, bool)> {
+async fn probe_running_daemon(
+    primary: &Path,
+    sibling: Option<&Path>,
+) -> Option<(PathBuf, SkewVerdict, Option<String>)> {
     let client = connect_primary_or_sibling(primary, sibling).await?;
     let socket = client.socket_path().to_path_buf();
-    let version_matches = running_daemon_version_matches(&socket).await;
-    Some((socket, version_matches))
+    let (verdict, theirs) = running_daemon_verdict(&socket).await;
+    Some((socket, verdict, theirs))
 }
 
 async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
@@ -172,15 +190,15 @@ fn truncate_log_if_oversized(path: &Path, max_bytes: u64) -> std::io::Result<()>
     }
 }
 
-/// Probe the already-running daemon's version via `Ping`. Returns `true` only
-/// when the daemon reports our `CARGO_PKG_VERSION`.
+/// Probe the already-running daemon's build via `Ping` and judge it against
+/// our [`BUILD_IDENTITY`](super::ipc::BUILD_IDENTITY).
 ///
 /// Tolerant by design (see the [`PongResult`](super::ipc::PongResult) wire-compat
 /// note): a daemon from a release before the version field answers the bare
 /// `"pong"` string — which has no `version` — and any transport or daemon-side
-/// error is likewise unverifiable. All of these resolve to `false` (→ restart)
+/// error is likewise unverifiable. All of these resolve to [`SkewVerdict::Restart`]
 /// rather than erroring, so an unverifiable daemon is replaced, never adopted.
-async fn running_daemon_version_matches(socket: &Path) -> bool {
+async fn running_daemon_verdict(socket: &Path) -> (SkewVerdict, Option<String>) {
     let client = match connect_at(socket).await {
         Ok(c) => c,
         Err(e) => {
@@ -192,7 +210,7 @@ async fn running_daemon_version_matches(socket: &Path) -> bool {
                 error = %e,
                 "version probe could not connect to the running daemon; treating as unverifiable",
             );
-            return false;
+            return (SkewVerdict::Restart, None);
         }
     };
     let probe = client.call_raw(DaemonRequest {
@@ -200,14 +218,17 @@ async fn running_daemon_version_matches(socket: &Path) -> bool {
         payload: DaemonRequestPayload::Ping,
     });
     match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
-        Ok(Ok(resp)) => pong_reports_our_version(&resp),
+        Ok(Ok(resp)) => (
+            skew_verdict(super::ipc::BUILD_IDENTITY, &resp),
+            reported_identity(&resp).map(str::to_owned),
+        ),
         Ok(Err(e)) => {
             tracing::debug!(
                 target: "hallouminate::daemon",
                 error = %e,
                 "version probe Ping failed; treating the daemon as unverifiable",
             );
-            false
+            (SkewVerdict::Restart, None)
         }
         Err(_elapsed) => {
             // The daemon accepted the connection but did not answer within
@@ -218,21 +239,81 @@ async fn running_daemon_version_matches(socket: &Path) -> bool {
                 timeout_secs = PROBE_TIMEOUT.as_secs(),
                 "version probe Ping timed out; treating the daemon as unverifiable",
             );
-            false
+            (SkewVerdict::Restart, None)
         }
     }
 }
 
-/// Pure skew-detection predicate: does this `Ping` response report OUR
-/// version? Split out from the I/O so the tolerance contract is unit-testable
-/// without a live socket. A non-`Ok` envelope, a missing `version` (the old
-/// bare-`"pong"` daemon), or a different version all yield `false` → restart.
-fn pong_reports_our_version(resp: &DaemonResponse) -> bool {
-    matches!(
-        resp,
-        DaemonResponse::Ok { result }
-            if result.get("version").and_then(|v| v.as_str()) == Some(env!("CARGO_PKG_VERSION"))
-    )
+/// The build identity a `Ping` reply reports, when the reply carries one.
+fn reported_identity(resp: &DaemonResponse) -> Option<&str> {
+    let DaemonResponse::Ok { result } = resp else {
+        return None;
+    };
+    result.get("version").and_then(|v| v.as_str())
+}
+
+/// What `serve` does with an already-running daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkewVerdict {
+    /// Same build: keep the daemon.
+    Adopt,
+    /// Older, other-channel, or unverifiable daemon: replace it.
+    Restart,
+    /// Newer daemon in the same channel: keep it.
+    Newer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Channel {
+    Nightly,
+    Release,
+}
+
+/// Parse an identity as semver and classify its channel. Nightlies are
+/// `0.0.0-experimental.*`; every other parseable identity is a release.
+fn classify_identity(identity: &str) -> Option<(Channel, semver::Version)> {
+    let version = semver::Version::parse(identity).ok()?;
+    let is_nightly = version.major == 0
+        && version.minor == 0
+        && version.patch == 0
+        && version.pre.as_str().split('.').next() == Some("experimental");
+    let channel = if is_nightly {
+        Channel::Nightly
+    } else {
+        Channel::Release
+    };
+    Some((channel, version))
+}
+
+/// Pure skew verdict for a `Ping` response against `ours`. Order only
+/// within one channel; across channels or on a parse failure, use exact
+/// match. A non-`Ok` envelope or a missing `version` (the old bare-`"pong"`
+/// daemon) yields [`SkewVerdict::Restart`].
+fn skew_verdict(ours: &str, resp: &DaemonResponse) -> SkewVerdict {
+    let DaemonResponse::Ok { result } = resp else {
+        return SkewVerdict::Restart;
+    };
+    let Some(theirs) = result.get("version").and_then(|v| v.as_str()) else {
+        return SkewVerdict::Restart;
+    };
+    let exact = if theirs == ours {
+        SkewVerdict::Adopt
+    } else {
+        SkewVerdict::Restart
+    };
+    let (Some((our_channel, our_version)), Some((their_channel, their_version))) =
+        (classify_identity(ours), classify_identity(theirs))
+    else {
+        return exact;
+    };
+    if our_channel != their_channel {
+        return exact;
+    }
+    match their_version.cmp(&our_version) {
+        std::cmp::Ordering::Less => SkewVerdict::Restart,
+        std::cmp::Ordering::Equal => SkewVerdict::Adopt,
+        std::cmp::Ordering::Greater => SkewVerdict::Newer,
+    }
 }
 
 #[cfg(test)]
@@ -281,7 +362,7 @@ mod tests {
                     continue;
                 }
                 let response = DaemonResponse::ok(&super::super::ipc::PongResult {
-                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    version: super::super::ipc::BUILD_IDENTITY.to_string(),
                 });
                 let mut response = serde_json::to_string(&response).expect("serialize response");
                 response.push('\n');
@@ -293,12 +374,17 @@ mod tests {
             }
         });
 
-        let (socket, version_matches) = probe_running_daemon(&primary, Some(&sibling))
+        let (socket, verdict, theirs) = probe_running_daemon(&primary, Some(&sibling))
             .await
             .expect("live sibling must be detected");
 
         assert_eq!(socket, sibling);
-        assert!(version_matches, "live sibling reports the current version");
+        assert_eq!(
+            verdict,
+            SkewVerdict::Adopt,
+            "live sibling reports the current version"
+        );
+        assert_eq!(theirs.as_deref(), Some(super::super::ipc::BUILD_IDENTITY));
         server.await.expect("server task");
     }
 
@@ -307,9 +393,13 @@ mod tests {
     #[test]
     fn pong_with_our_version_is_a_match() {
         let resp = DaemonResponse::ok(&super::super::ipc::PongResult {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: super::super::ipc::BUILD_IDENTITY.to_string(),
         });
-        assert!(pong_reports_our_version(&resp), "same version must match");
+        assert_eq!(
+            skew_verdict(super::super::ipc::BUILD_IDENTITY, &resp),
+            SkewVerdict::Adopt,
+            "same version must match"
+        );
     }
 
     #[test]
@@ -319,10 +409,89 @@ mod tests {
         let resp = DaemonResponse::ok(&super::super::ipc::PongResult {
             version: "0.0.0-stale".to_string(),
         });
-        assert!(
-            !pong_reports_our_version(&resp),
+        assert_eq!(
+            skew_verdict("0.0.0-experimental.346.1", &resp),
+            SkewVerdict::Restart,
             "a different version must not match"
         );
+    }
+
+    fn pong(version: &str) -> DaemonResponse {
+        DaemonResponse::ok(&super::super::ipc::PongResult {
+            version: version.to_string(),
+        })
+    }
+
+    #[test]
+    fn older_serve_does_not_restart_newer_daemon() {
+        assert_eq!(
+            skew_verdict(
+                "0.0.0-experimental.345.1",
+                &pong("0.0.0-experimental.346.1")
+            ),
+            SkewVerdict::Newer,
+        );
+    }
+
+    #[test]
+    fn newer_serve_restarts_older_daemon() {
+        assert_eq!(
+            skew_verdict(
+                "0.0.0-experimental.346.1",
+                &pong("0.0.0-experimental.345.1")
+            ),
+            SkewVerdict::Restart,
+        );
+    }
+
+    #[test]
+    fn nightly_numeric_prerelease_orders_numerically() {
+        assert_eq!(
+            skew_verdict(
+                "0.0.0-experimental.345.2",
+                &pong("0.0.0-experimental.346.1")
+            ),
+            SkewVerdict::Newer,
+        );
+        assert_eq!(
+            skew_verdict("0.0.0-experimental.9.1", &pong("0.0.0-experimental.10.1")),
+            SkewVerdict::Newer,
+        );
+    }
+
+    #[test]
+    fn nightly_serve_restarts_release_daemon() {
+        assert_eq!(
+            skew_verdict("0.0.0-experimental.346.1", &pong("0.11.1")),
+            SkewVerdict::Restart,
+        );
+    }
+
+    #[test]
+    fn release_serve_restarts_nightly_daemon() {
+        assert_eq!(
+            skew_verdict("0.11.1", &pong("0.0.0-experimental.346.1")),
+            SkewVerdict::Restart,
+        );
+    }
+
+    #[test]
+    fn unparseable_unequal_identities_restart_and_equal_adopt() {
+        assert_eq!(
+            skew_verdict("0.11.1", &pong("not-semver")),
+            SkewVerdict::Restart,
+        );
+        assert_eq!(skew_verdict("dev", &pong("0.11.1")), SkewVerdict::Restart,);
+        assert_eq!(skew_verdict("dev", &pong("dev")), SkewVerdict::Adopt,);
+    }
+
+    #[test]
+    fn release_versions_order_within_the_channel() {
+        assert_eq!(
+            skew_verdict("0.11.1", &pong("0.11.0")),
+            SkewVerdict::Restart,
+        );
+        assert_eq!(skew_verdict("0.11.0", &pong("0.11.1")), SkewVerdict::Newer,);
     }
 
     #[test]
@@ -331,8 +500,9 @@ mod tests {
         // has no `version`. The client must treat that as a mismatch (→
         // restart), never as a match or a hard error.
         let resp = DaemonResponse::ok(&"pong");
-        assert!(
-            !pong_reports_our_version(&resp),
+        assert_eq!(
+            skew_verdict(super::super::ipc::BUILD_IDENTITY, &resp),
+            SkewVerdict::Restart,
             "legacy bare-pong daemon must be treated as skew"
         );
     }
@@ -340,8 +510,9 @@ mod tests {
     #[test]
     fn error_response_is_a_mismatch() {
         let resp = DaemonResponse::internal("boom");
-        assert!(
-            !pong_reports_our_version(&resp),
+        assert_eq!(
+            skew_verdict(super::super::ipc::BUILD_IDENTITY, &resp),
+            SkewVerdict::Restart,
             "an error response is unverifiable → mismatch"
         );
     }

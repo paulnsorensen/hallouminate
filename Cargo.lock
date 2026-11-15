@@ -2934,6 +2934,7 @@ dependencies = [
  "notify",
  "notify-debouncer-full",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "shellexpand",

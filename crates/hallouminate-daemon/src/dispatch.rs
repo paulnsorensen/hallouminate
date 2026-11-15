@@ -59,7 +59,7 @@ use hallouminate_domain::repository::{RepositoryConfig, default_wiki_for_cwd};
 use hallouminate_domain::search::validate_phrase;
 
 use super::ipc::{
-    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult, BUILD_IDENTITY,
     BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
     DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
     GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
@@ -85,7 +85,7 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
     // Shutdown and Ping are config-independent control ops: handle them
     // before `resolve_for_cwd` so a stop request (or a liveness / version
     // probe) works even when the client's cwd has no discoverable repo
-    // config. Ping reports the daemon binary's version (Curd C) so the MCP
+    // config. Ping reports the daemon binary's build identity (Curd C) so the MCP
     // bootstrap can detect cross-version skew; that probe must succeed
     // regardless of the probing client's cwd, hence the early return.
     if let DaemonRequestPayload::Shutdown = req.payload {
@@ -94,7 +94,7 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
     }
     if let DaemonRequestPayload::Ping = req.payload {
         return DaemonResponse::ok(&PongResult {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: BUILD_IDENTITY.to_string(),
         });
     }
     let req_cwd = req.cwd.clone();
@@ -107,7 +107,7 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
         DaemonRequestPayload::Ping => {
             // Handled before `resolve_for_cwd` above; unreachable here.
             DaemonResponse::ok(&PongResult {
-                version: env!("CARGO_PKG_VERSION").to_string(),
+                version: BUILD_IDENTITY.to_string(),
             })
         }
         DaemonRequestPayload::Ground(req) => {
@@ -2685,11 +2685,11 @@ fn derived_corpus_name(repo_name: &str, kind: RepoCorpusKind) -> Result<String, 
 }
 
 /// Canonical `Ping` reply payload — dispatch() encodes a [`PongResult`]
-/// carrying the daemon binary's version; this helper lets tests match against
+/// carrying the daemon binary's build identity; this helper lets tests match against
 /// the same shape without hand-rolling the JSON.
 #[cfg(test)]
 fn pong_value() -> Value {
-    serde_json::json!({ "version": env!("CARGO_PKG_VERSION") })
+    serde_json::json!({ "version": BUILD_IDENTITY })
 }
 
 #[cfg(test)]
@@ -2780,10 +2780,10 @@ mod tests {
 
     #[test]
     fn pong_value_carries_the_daemon_binary_version() {
-        // Curd C: the Ping reply is a `{ "version": <CARGO_PKG_VERSION> }`
+        // Curd C: the Ping reply is a `{ "version": <BUILD_IDENTITY> }`
         // envelope, not the bare `"pong"` string — the MCP bootstrap reads
-        // this field to detect cross-version skew.
-        assert_eq!(pong_value()["version"], env!("CARGO_PKG_VERSION"));
+        // this field to detect cross-build skew.
+        assert_eq!(pong_value()["version"], BUILD_IDENTITY);
     }
 
     /// A normal mtime (well under `i64::MAX` ms) converts to the exact
