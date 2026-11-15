@@ -1277,7 +1277,7 @@ ground_dir = "{g}"
         .expect("ping ok");
     assert_eq!(
         value["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
+        Some(hallouminate_daemon::BUILD_IDENTITY),
         "ping must report the daemon binary version: {value}"
     );
 }
@@ -1499,7 +1499,10 @@ ground_dir = "{g}"
         })
         .await
         .expect("ping");
-    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        pong["version"].as_str(),
+        Some(hallouminate_daemon::BUILD_IDENTITY)
+    );
 }
 
 // ─── Curd 1: graceful shutdown ───────────────────────────────────────────
@@ -1680,7 +1683,10 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
         })
         .await
         .expect("ping before SIGTERM");
-    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        pong["version"].as_str(),
+        Some(hallouminate_daemon::BUILD_IDENTITY)
+    );
 
     // Raise SIGTERM at our own process; the installed handler cancels the
     // shutdown token, the accept loop breaks, and `serve` runs cleanup.
@@ -1882,6 +1888,94 @@ async fn client_for_default_socket_respawns_then_returns_the_reconnected_client(
         client.socket_path(),
         sock.as_path(),
         "the reconnected client must target the respawned socket"
+    );
+}
+
+/// Points `XDG_RUNTIME_DIR` at a directory for one test and restores the
+/// previous value on drop. Hold it only while an `EnvGuard` is alive.
+struct XdgRuntimeDir {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl XdgRuntimeDir {
+    fn set(dir: &Path) -> Self {
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir) };
+        XdgRuntimeDir { previous }
+    }
+}
+
+impl Drop for XdgRuntimeDir {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", previous) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+    }
+}
+
+fn bind_legacy_xdg_socket(runtime_dir: &Path) -> tokio::net::UnixListener {
+    let legacy_dir = runtime_dir.join("hallouminate");
+    std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy dir");
+    tokio::net::UnixListener::bind(legacy_dir.join("daemon.sock")).expect("bind legacy socket")
+}
+
+async fn legacy_socket_was_dialed(listener: &tokio::net::UnixListener) -> bool {
+    timeout(Duration::from_millis(200), listener.accept())
+        .await
+        .is_ok()
+}
+
+// The canonical path comes from the OS account record, so this test cannot
+// redirect it. On a host with a live canonical daemon, canonical-first code
+// with a legacy fallback also passes. CI runners have no canonical daemon, so
+// the test rejects a restored fallback there.
+#[tokio::test]
+async fn default_discovery_never_dials_a_socket_that_exists_only_at_the_legacy_xdg_path() {
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    unsafe { std::env::remove_var("HALLOUMINATE_SOCKET") };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _xdg = XdgRuntimeDir::set(tmp.path());
+    let legacy = bind_legacy_xdg_socket(tmp.path());
+
+    let _ = hallouminate_daemon::status().await;
+    let _ = hallouminate_daemon::daemon_client().await;
+    let _ = hallouminate_daemon::client_for_with(None, || async { anyhow::Ok(()) }).await;
+
+    assert!(
+        !legacy_socket_was_dialed(&legacy).await,
+        "default discovery must not adopt a daemon that listens only at $XDG_RUNTIME_DIR/hallouminate/daemon.sock"
+    );
+}
+
+#[tokio::test]
+async fn explicit_socket_override_wins_over_a_legacy_xdg_socket() {
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _xdg = XdgRuntimeDir::set(tmp.path());
+    let legacy = bind_legacy_xdg_socket(tmp.path());
+    let explicit = tmp.path().join("explicit.sock");
+    let explicit_listener = tokio::net::UnixListener::bind(&explicit).expect("bind explicit");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = explicit_listener.accept().await else {
+                break;
+            };
+            drop(stream);
+        }
+    });
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &explicit) };
+
+    let client = hallouminate_daemon::client_for_with(None, || async {
+        anyhow::bail!("respawn must not run while the explicit socket is live")
+    })
+    .await
+    .expect("explicit socket must connect");
+
+    assert_eq!(client.socket_path(), explicit.as_path());
+    assert!(
+        !legacy_socket_was_dialed(&legacy).await,
+        "an explicit HALLOUMINATE_SOCKET must never fall through to the legacy XDG path"
     );
 }
 
@@ -2362,8 +2456,8 @@ async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
         .expect("ping restarted daemon");
     assert_eq!(
         pong["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
-        "restarted daemon must report the current version: {pong}"
+        Some(hallouminate_daemon::BUILD_IDENTITY),
+        "restarted daemon must report the current build identity: {pong}"
     );
 
     // Tear down the respawned daemon.

@@ -16,7 +16,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [corpus-walker](corpus-walker.md) — gitignore-aware corpus walking and the explicit-root opt-in escape hatch.
 - [daemon-and-cli](daemon-and-cli.md) — why there's a daemon, the JSON-line socket protocol, the CLI subcommand surface.
 - [daemon-canonical-identity-001](daemon-canonical-identity-001.md) — why the default daemon socket is resolved from the OS account record instead of `XDG_RUNTIME_DIR` (#320).
-- [daemon-canonical-identity-002](daemon-canonical-identity-002.md) — the one ordered canonical→legacy discovery seam every client and lifecycle command shares, and the bounded migration window (#323 retires it).
+- [daemon-canonical-identity-002](daemon-canonical-identity-002.md) — the one discovery seam every client and lifecycle command shares, and the retired legacy XDG probe (#323).
 - [daemon-canonical-identity-003](daemon-canonical-identity-003.md) — store-lock owner diagnostics: what the `store.lock` metadata names, and why a second advisory guard proves it is current.
 - [debt-observed-test-isolation](debt-observed-test-isolation.md) — why the process-wide `debt::OBSERVED` static makes any Hard-recording test break concurrent maintenance-defer tests.
 - [design-rationale](design-rationale.md) — what hallouminate deliberately *is* and *isn't*, and why — the "why this design not that one" page.
@@ -53,6 +53,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
 - [worktree-corpus-identity](worktree-corpus-identity.md) — #215's root-scoped delete fix, the #290 root-aware identity that closed the sibling-worktree search leak, and #304's retired-root garbage collection.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
+- [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md) — four decisions for index-on-discovery: the retired provisioner task, file-level vector reuse by `content_hash`, the root-GC non-goal, and the durable `WatchRegistry` with bounded reconciliation (#427, #461).
 
 ## How to use this index
 

@@ -131,5 +131,5 @@ other than the current directory.
 
 `--socket PATH` on `index`, `ground`, and the other client subcommands points
 at a specific daemon socket. Otherwise the socket is resolved from
-`HALLOUMINATE_SOCKET`, then `$XDG_RUNTIME_DIR`, then the cache dir — see
+`HALLOUMINATE_SOCKET`, then the per-user cache socket — see
 [Architecture](/hallouminate/architecture/#socket-location).

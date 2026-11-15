@@ -250,8 +250,9 @@ thin clients that talk to it over a Unix domain socket.
   start by hand.
 - **Socket resolution order** — `HALLOUMINATE_SOCKET` (explicit full-path
   override; setting it also disables auto-spawn — the caller owns the daemon
-  lifecycle), else `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, else
-  `~/.cache/hallouminate/daemon.sock`.
+  lifecycle), else `<account-home>/.cache/hallouminate/daemon.sock`. The
+  account home comes from the OS user record, not `$HOME` or
+  `$XDG_RUNTIME_DIR`.
 - **Lifecycle** — `hallouminate daemon status` / `stop` / `restart`; bare
   `hallouminate daemon` runs it in the foreground. Only one instance per
   socket can run (`flock`-guarded).
