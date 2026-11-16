@@ -452,8 +452,8 @@ pub async fn dispatch(cli: Cli, startup: hallouminate_config::Config) -> anyhow:
     }
 }
 
-/// The `client_call` outcome of a CLI command when the daemon recorded none:
-/// `invalid_params` for a caller error, `internal` for any other failure.
+/// The `client_call` outcome of a CLI command for a caller result that is not
+/// `ok`: `invalid_params` for a caller error, `internal` for any other failure.
 fn fallback_outcome<T>(result: &anyhow::Result<T>) -> Outcome {
     let Err(error) = result else {
         return Outcome::Ok;

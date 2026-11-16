@@ -77,7 +77,8 @@ impl ClientCall {
 
     /// Sets the row outcome to the result that the caller receives. It
     /// replaces the outcomes of the single daemon calls, for a call that
-    /// sends more than one request or recovers from a failed one.
+    /// sends more than one request or recovers from a failed one. A later
+    /// [`Self::finish`] still keeps a recorded outcome that is not `ok`.
     pub fn settle(&mut self, outcome: Outcome) {
         self.outcome = Some(outcome);
     }
@@ -107,8 +108,9 @@ impl ClientCall {
         self.answered_at = Some(Instant::now());
     }
 
-    /// Writes the row with [`OpLog::append`]. `fallback` is the outcome when
-    /// no outcome was recorded.
+    /// Writes the row with [`OpLog::append`]. `fallback` is the outcome of the
+    /// caller result. A `fallback` that is not `ok` replaces a recorded `ok`.
+    /// A recorded outcome that is not `ok` stays.
     pub fn finish(self, fallback: Outcome) {
         let end = Instant::now();
         let Self {
@@ -125,21 +127,24 @@ impl ClientCall {
             round_trip,
             response_bytes,
         } = self;
-        let outcome = outcome.unwrap_or(fallback);
-        let answered = match outcome {
-            Outcome::Ok | Outcome::InvalidParams | Outcome::Internal | Outcome::Retryable => {
-                answered_at
-            }
-            Outcome::Cancelled(_) | Outcome::Unavailable => None,
+        let outcome = match outcome {
+            Some(Outcome::Ok) | None => fallback,
+            Some(
+                recorded @ (Outcome::InvalidParams
+                | Outcome::Internal
+                | Outcome::Retryable
+                | Outcome::Cancelled(_)
+                | Outcome::Unavailable),
+            ) => recorded,
         };
         let mut stages = Stages::default();
         if let Some(ready_at) = ready_at {
             stages.add(SETUP_STAGE, Millis::from_duration(ready_at - start));
         }
-        if let Some(answered_at) = answered {
+        if let Some(answered_at) = answered_at {
             stages.add(RENDER_STAGE, Millis::from_duration(end - answered_at));
         }
-        let (daemon_round_trip_ms, response_bytes) = match answered {
+        let (daemon_round_trip_ms, response_bytes) = match answered_at {
             Some(_) => (
                 Some(Millis::from_duration(round_trip)),
                 Some(response_bytes),
@@ -164,5 +169,94 @@ impl ClientCall {
             }),
         };
         log.append(&record);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hallouminate_config::LoggingConfig;
+
+    use super::*;
+    use crate::oplog::Reason;
+
+    fn answer() -> Answer {
+        Answer {
+            round_trip: Duration::from_millis(5),
+            response_bytes: 42,
+        }
+    }
+
+    fn written_row(dir: &std::path::Path) -> OperationRecord {
+        let mut rows = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            let text = std::fs::read_to_string(&path).expect("read segment");
+            for line in text.lines() {
+                rows.push(serde_json::from_str::<OperationRecord>(line).expect("row"));
+            }
+        }
+        assert_eq!(rows.len(), 1, "one row per call");
+        rows.remove(0)
+    }
+
+    fn call(dir: &std::path::Path) -> ClientCall {
+        let log = OpLog::in_dir(dir, &LoggingConfig::default());
+        ClientCall::start(&log, Client::Mcp, "ground", "ground", None)
+    }
+
+    fn client_fields(row: OperationRecord) -> ClientCallFields {
+        let OperationRecord { kind, .. } = row;
+        let RecordKind::ClientCall(fields) = kind else {
+            panic!("expected a client_call row");
+        };
+        fields
+    }
+
+    #[test]
+    fn client_error_after_daemon_ok_replaces_the_recorded_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut call = call(dir.path());
+        call.record(Outcome::Ok, Some(answer()));
+        call.finish(Outcome::Internal);
+        let row = written_row(dir.path());
+        assert_eq!(row.outcome, Outcome::Internal);
+    }
+
+    #[test]
+    fn recorded_non_ok_outcome_survives_an_ok_fallback() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut call = call(dir.path());
+        call.record(Outcome::Retryable, Some(answer()));
+        call.finish(Outcome::Ok);
+        let row = written_row(dir.path());
+        assert_eq!(row.outcome, Outcome::Retryable);
+    }
+
+    #[test]
+    fn answer_fields_survive_a_later_unavailable_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut call = call(dir.path());
+        call.record(Outcome::Ok, Some(answer()));
+        call.unanswered(Outcome::Unavailable);
+        call.settle(Outcome::Unavailable);
+        call.finish(Outcome::Unavailable);
+        let row = written_row(dir.path());
+        assert_eq!(row.outcome, Outcome::Unavailable);
+        let fields = client_fields(row);
+        assert!(fields.daemon_round_trip_ms.is_some());
+        assert_eq!(fields.response_bytes, Some(42));
+        let stages = serde_json::to_value(&fields.stages).expect("stages");
+        assert!(stages.get(RENDER_STAGE).is_some(), "render stage kept");
+    }
+
+    #[test]
+    fn unanswered_call_has_no_answer_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut call = call(dir.path());
+        call.unanswered(Outcome::Cancelled(Reason::Timeout));
+        call.finish(Outcome::Internal);
+        let fields = client_fields(written_row(dir.path()));
+        assert_eq!(fields.daemon_round_trip_ms, None);
+        assert_eq!(fields.response_bytes, None);
     }
 }

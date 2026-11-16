@@ -461,7 +461,7 @@ mod tests {
         status_with(&socket, Some(&mut call))
             .await
             .expect("status call");
-        call.finish(Outcome::Internal);
+        call.finish(Outcome::Ok);
         server.await.expect("server task");
 
         let [row] = <[OperationRecord; 1]>::try_from(rows(&log_dir))

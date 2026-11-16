@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Instant;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::field::{Empty, Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::span::{Attributes, Id, Record};
@@ -126,6 +126,7 @@ impl<S> Filter<S> for RowFilter {
 struct Pending {
     start: Instant,
     end: Option<Instant>,
+    end_ts: Option<DateTime<Utc>>,
     fields: RowFields,
     stages: Stages,
     stage_slot: StageSlot,
@@ -200,6 +201,7 @@ impl Pending {
         let Pending {
             start,
             end,
+            end_ts,
             fields:
                 RowFields {
                     request_id,
@@ -216,7 +218,7 @@ impl Pending {
         let end = end.unwrap_or_else(Instant::now);
         OperationRecord {
             schema_version: SCHEMA_VERSION,
-            ts: Utc::now(),
+            ts: end_ts.unwrap_or_else(Utc::now),
             request_id: request_id.unwrap_or_else(RequestId::generate),
             op: op.unwrap_or_else(|| UNKNOWN_OP.to_owned()),
             outcome: parse_outcome(outcome.as_deref(), reason.as_deref()),
@@ -304,6 +306,7 @@ where
                 span.extensions_mut().insert(Pending {
                     start: Instant::now(),
                     end: None,
+                    end_ts: None,
                     fields,
                     stages: Stages::default(),
                     stage_slot: StageSlot::Free,
@@ -325,6 +328,7 @@ where
         values.record(&mut pending.fields);
         if pending.end.is_none() && pending.fields.outcome.is_some() {
             pending.end = Some(Instant::now());
+            pending.end_ts = Some(Utc::now());
         }
     }
 
@@ -468,6 +472,24 @@ mod tests {
         assert!(
             row.duration_ms < Millis::from_duration(after_outcome),
             "duration includes the time after the outcome: {row:?}"
+        );
+    }
+
+    #[test]
+    fn timestamp_is_taken_when_the_outcome_is_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut close_time = None;
+        tracing::subscriber::with_default(production_subscriber(dir.path()), || {
+            let root = root_span(&RequestId::generate(), "ping", None);
+            record_outcome(&root, Outcome::Ok);
+            std::thread::sleep(Duration::from_millis(50));
+            close_time = Some(Utc::now());
+        });
+        let close_time = close_time.expect("closure ran");
+        let row = single_row(dir.path());
+        assert!(
+            row.ts <= close_time - chrono::Duration::milliseconds(25),
+            "ts follows the span close, not the outcome: {row:?} close {close_time}"
         );
     }
 

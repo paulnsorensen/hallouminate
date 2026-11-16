@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use chrono::{NaiveDate, Utc};
-use hallouminate_config::{Config, LoggingConfig};
+use hallouminate_config::LoggingConfig;
 use hallouminate_daemon::oplog::{
     Client, ClientCallFields, DaemonOpFields, Millis, OpLog, OperationRecord, Outcome, Reason,
     RecordKind, RequestId, SCHEMA_VERSION, Stages,
@@ -19,6 +19,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::common::daemon::DaemonHarness;
+use crate::common::oplog_support::{Fixture, docs_config, fixture_with};
 
 const CHILD_DIR_ENV: &str = "HALLOUMINATE_OPLOG_TEST_DIR";
 const CHILD_ID_ENV: &str = "HALLOUMINATE_OPLOG_TEST_CHILD";
@@ -253,50 +254,6 @@ fn size_cap_skips_directories_and_unparsable_names() {
     assert!(notes.exists(), "an undated name is not a segment");
     assert!(bad_date.exists(), "an invalid date is not a segment");
     assert_eq!(read_rows(&current), vec![row]);
-}
-
-// ---- daemon_op rows -------------------------------------------------------
-
-struct Fixture {
-    _tmp: tempfile::TempDir,
-    corpus_root: PathBuf,
-    harness: DaemonHarness,
-}
-
-fn docs_config(tmp: &Path, extra: &str) -> (Config, PathBuf) {
-    let corpus_root = tmp.join("corpus");
-    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
-    let toml = format!(
-        r#"
-[[corpus]]
-name = "docs"
-paths = ["{c}"]
-globs = ["**/*.md"]
-
-[storage]
-ground_dir = "{g}"
-
-[embeddings]
-enabled = false
-{extra}
-"#,
-        c = corpus_root.display(),
-        g = tmp.join("ground").display(),
-    );
-    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
-    (cfg, corpus_root)
-}
-
-async fn fixture_with(extra: &str) -> Fixture {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (cfg, corpus_root) = docs_config(tmp.path(), extra);
-    let logging = cfg.logging;
-    let harness = DaemonHarness::spawn_with_oplog(cfg, logging).await;
-    Fixture {
-        _tmp: tmp,
-        corpus_root,
-        harness,
-    }
 }
 
 async fn fixture() -> Fixture {

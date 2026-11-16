@@ -38,13 +38,14 @@ struct Shared {
     cap_failure: FailureLatch,
 }
 
-/// Total size of the segments older than `current`, from the last directory
-/// scan. Only the current segment grows, so the total stays valid until the
-/// UTC date changes.
+/// Sizes of the segments older than `current` and of the segments dated
+/// after it, from the last directory scan. Only the current segment grows,
+/// so the sizes stay valid until the UTC date changes.
 #[derive(Debug, Clone, Copy)]
 struct OlderSegments {
     current: NaiveDate,
     bytes: u64,
+    newer_bytes: u64,
 }
 
 /// Keeps a repeated failure to one warning until the next success.
@@ -173,8 +174,12 @@ impl OpLog {
             .unwrap_or_else(PoisonError::into_inner);
         let result = match self.check_cached(*older, current) {
             Ok(CapCheck::Within) => Ok(()),
-            Ok(CapCheck::Scan) => self.scan_and_delete(current).map(|bytes| {
-                *older = Some(OlderSegments { current, bytes });
+            Ok(CapCheck::Scan) => self.scan_and_delete(current).map(|(bytes, newer_bytes)| {
+                *older = Some(OlderSegments {
+                    current,
+                    bytes,
+                    newer_bytes,
+                });
             }),
             Err(error) => Err(error),
         };
@@ -204,6 +209,7 @@ impl OpLog {
         let Some(OlderSegments {
             current: cached,
             bytes,
+            newer_bytes,
         }) = older
         else {
             return Ok(CapCheck::Scan);
@@ -220,18 +226,21 @@ impl OpLog {
             Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
             Err(error) => return Err(error),
         };
-        match bytes.saturating_add(len) > self.max_total_bytes {
+        let total = bytes.saturating_add(newer_bytes).saturating_add(len);
+        match total > self.max_total_bytes {
             true => Ok(CapCheck::Scan),
             false => Ok(CapCheck::Within),
         }
     }
 
-    /// Deletes the oldest segments while the total is over the cap, and
-    /// returns the total size of the remaining segments older than `current`.
-    fn scan_and_delete(&self, current: NaiveDate) -> io::Result<u64> {
+    /// Deletes the oldest segments while the total is over the cap. Returns
+    /// the total size of the remaining segments older than `current` and the
+    /// total size of the segments dated after `current`.
+    fn scan_and_delete(&self, current: NaiveDate) -> io::Result<(u64, u64)> {
         let mut segments = Vec::new();
         let mut total: u64 = 0;
-        let mut current_len: u64 = 0;
+        let mut kept_len: u64 = 0;
+        let mut newer_len: u64 = 0;
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -251,8 +260,11 @@ impl OpLog {
             }
             let len = metadata.len();
             total = total.saturating_add(len);
-            if date == current {
-                current_len = len;
+            if date >= current {
+                kept_len = kept_len.saturating_add(len);
+            }
+            if date > current {
+                newer_len = newer_len.saturating_add(len);
             }
             segments.push(Segment {
                 date,
@@ -265,7 +277,7 @@ impl OpLog {
             if total <= self.max_total_bytes {
                 break;
             }
-            if date == current {
+            if date >= current {
                 continue;
             }
             match std::fs::remove_file(&path) {
@@ -275,7 +287,7 @@ impl OpLog {
             }
             total = total.saturating_sub(len);
         }
-        Ok(total.saturating_sub(current_len))
+        Ok((total.saturating_sub(kept_len), newer_len))
     }
 }
 
@@ -374,6 +386,46 @@ mod tests {
             "after the date changes, the old current segment counts and goes"
         );
         assert!(today.exists(), "the current segment is never deleted");
+    }
+
+    #[test]
+    fn size_cap_never_deletes_segments_dated_after_current() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = capped_log(dir.path(), 150);
+        let older = write_segment(&log, 15, 100);
+        let current = write_segment(&log, 16, 10);
+        let newer = write_segment(&log, 17, 1000);
+        let (remaining, newer_bytes) = log.scan_and_delete(date(16)).expect("scan");
+        assert!(!older.exists(), "over the cap: the older segment goes");
+        assert!(current.exists(), "the current segment is never deleted");
+        assert!(newer.exists(), "a segment after the current date stays");
+        assert_eq!(remaining, 0, "newer bytes are not deletable older bytes");
+        assert_eq!(
+            newer_bytes, 1000,
+            "newer bytes still count toward the total"
+        );
+    }
+
+    #[test]
+    fn size_cap_rescans_when_newer_segments_push_total_over_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = capped_log(dir.path(), 250);
+        let older = write_segment(&log, 15, 100);
+        let current = write_segment(&log, 16, 10);
+        write_segment(&log, 17, 100);
+        log.enforce_cap(date(16));
+        assert!(older.exists(), "under the cap: nothing is deleted");
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&current)
+            .expect("open current");
+        file.write_all(&[b'x'; 50]).expect("grow current");
+        log.enforce_cap(date(16));
+        assert!(
+            !older.exists(),
+            "older plus newer plus current is over the cap: the rescan deletes"
+        );
     }
 
     #[test]

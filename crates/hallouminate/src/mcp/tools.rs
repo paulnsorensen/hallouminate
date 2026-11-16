@@ -1483,8 +1483,8 @@ const REQUEST_ID_KEY: &str = "request_id";
 /// Writes the `client_call` row of `call`, then adds its request id to the
 /// structured payload of `result` or to the data of its error.
 ///
-/// The row outcome is the recorded one; with none recorded, it follows the
-/// error code of `result`.
+/// The row outcome follows the error code of `result`. An error replaces a
+/// recorded `ok`. A recorded outcome that is not `ok` stays.
 fn finish_call(
     call: ClientCall,
     result: Result<CallToolResult, ErrorData>,

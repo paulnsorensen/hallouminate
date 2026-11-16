@@ -224,7 +224,7 @@ mod tests {
         let oplog = OpLog::in_dir(&log_dir, &hallouminate_config::LoggingConfig::default());
         let mut call = ClientCall::start(&oplog, Client::Cli, "restart", "shutdown", None);
         let _ = restart_at(&socket, Some(&mut call), || async move { respawn }).await;
-        call.finish(Outcome::Internal);
+        call.finish(Outcome::Ok);
         let mut rows = Vec::new();
         for entry in std::fs::read_dir(&log_dir).expect("log dir") {
             let path = entry.expect("log dir entry").path();

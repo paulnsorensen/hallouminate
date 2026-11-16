@@ -1,9 +1,7 @@
 //! Operations log: the named stage timings of `daemon_op` rows.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
-use hallouminate_config::Config;
 use hallouminate_daemon::oplog::{OperationRecord, Outcome, RecordKind, RequestId};
 use hallouminate_daemon::{
     AddMarkdownItem, AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse,
@@ -11,7 +9,10 @@ use hallouminate_daemon::{
 };
 
 use crate::common::daemon::DaemonHarness;
-use crate::oplog_client::{dropped_connection_row, unreachable_ground_row};
+use crate::common::oplog_support::{
+    Fixture, assert_present, assert_stage_sum_within_duration, dropped_connection_row,
+    fixture_with, stage_names, stages, unreachable_ground_row,
+};
 
 const GROUND_STAGES: [&str; 7] = [
     "resolve",
@@ -43,48 +44,6 @@ const ADD_MARKDOWN_STAGES: [&str; 8] = [
 const WAIT_STAGES: [&str; 3] = ["debt_gate_wait", "corpus_lock_wait", "write_lane_wait"];
 const SOFT_DELAY_MS: f64 = 300.0;
 const BATCH_ITEMS: usize = 3;
-
-struct Fixture {
-    _tmp: tempfile::TempDir,
-    corpus_root: PathBuf,
-    harness: DaemonHarness,
-}
-
-pub(crate) fn docs_config(tmp: &Path, extra: &str) -> (Config, PathBuf) {
-    let corpus_root = tmp.join("corpus");
-    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
-    let toml = format!(
-        r#"
-[[corpus]]
-name = "docs"
-paths = ["{c}"]
-globs = ["**/*.md"]
-
-[storage]
-ground_dir = "{g}"
-
-[embeddings]
-enabled = false
-{extra}
-"#,
-        c = corpus_root.display(),
-        g = tmp.join("ground").display(),
-    );
-    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
-    (cfg, corpus_root)
-}
-
-async fn fixture_with(extra: &str) -> Fixture {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (cfg, corpus_root) = docs_config(tmp.path(), extra);
-    let logging = cfg.logging;
-    let harness = DaemonHarness::spawn_with_oplog(cfg, logging).await;
-    Fixture {
-        _tmp: tmp,
-        corpus_root,
-        harness,
-    }
-}
 
 fn request(harness: &DaemonHarness, payload: DaemonRequestPayload) -> DaemonRequest {
     DaemonRequest::new(harness.cwd().to_path_buf(), payload)
@@ -137,21 +96,6 @@ async fn run(harness: &DaemonHarness, payload: DaemonRequestPayload) -> Operatio
     row
 }
 
-fn stage_names(row: &OperationRecord) -> BTreeSet<&str> {
-    let mut names = BTreeSet::new();
-    for name in stages(row).as_map().keys() {
-        names.insert(name.as_str());
-    }
-    names
-}
-
-fn stages(row: &OperationRecord) -> &hallouminate_daemon::oplog::Stages {
-    match &row.kind {
-        RecordKind::DaemonOp(fields) => &fields.stages,
-        RecordKind::ClientCall(fields) => panic!("daemon wrote a client row: {fields:?}"),
-    }
-}
-
 fn stage_ms(row: &OperationRecord, name: &str) -> f64 {
     let Some(elapsed) = stages(row).as_map().get(name) else {
         panic!("row {} has no {name} stage: {:?}", row.op, stage_names(row));
@@ -159,36 +103,11 @@ fn stage_ms(row: &OperationRecord, name: &str) -> f64 {
     elapsed.as_f64()
 }
 
-pub(crate) fn assert_stage_sum_within_duration(row: &OperationRecord) {
-    let mut sum = 0.0;
-    for elapsed in stages(row).as_map().values() {
-        sum += elapsed.as_f64();
-    }
-    let duration = row.duration_ms.as_f64();
-    assert!(
-        sum <= duration,
-        "{} stage sum {sum} ms exceeds duration {duration} ms: {:?}",
-        row.op,
-        stages(row)
-    );
-}
-
 fn assert_subset(row: &OperationRecord, allowed: &[&str]) {
     for name in stage_names(row) {
         assert!(
             allowed.contains(&name),
             "{} row has stage {name} outside {allowed:?}",
-            row.op
-        );
-    }
-}
-
-pub(crate) fn assert_present(row: &OperationRecord, required: &[&str]) {
-    let names = stage_names(row);
-    for name in required {
-        assert!(
-            names.contains(name),
-            "{} row lacks stage {name}: {names:?}",
             row.op
         );
     }

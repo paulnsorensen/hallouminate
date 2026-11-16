@@ -95,28 +95,34 @@ error, and the row records that outcome with the stages that ran.
 
 The `outcome` of a `client_call` row is the result that the caller receives.
 For a call with one daemon request, that is the outcome that the daemon
-returned. When no answer arrives, the outcome is `unavailable` (the daemon
-cannot be reached, or the connection drops after the send) or `cancelled` with
-`reason` `timeout` (the client RPC timeout expired). On those rows
-`daemon_round_trip_ms` and `response_bytes` are `null`. When the client rejects
-a call before it sends the request, the row carries the outcome of that error
-(for example `invalid_params` for an oversized `add_markdown` batch), and the
-same two fields are `null`. A daemon shutdown during a call gives a `cancelled`
-daemon row and an `unavailable` client row. When `daemon restart` finds no
-running daemon, its row carries the outcome of the start: `ok` when the new
-daemon starts.
+returned. When the caller result is not `ok`, it replaces a recorded `ok`. A
+recorded outcome that is not `ok` stays. When no answer arrives, the outcome
+is `unavailable` (the daemon cannot be reached, or the connection drops after
+the send) or `cancelled` with `reason` `timeout` (the client RPC timeout
+expired). On those rows `daemon_round_trip_ms` and `response_bytes` are
+`null`. When the client rejects a call before it sends the request, the row
+carries the outcome of that error (for example `invalid_params` for an
+oversized `add_markdown` batch), and the same two fields are `null`. A daemon
+shutdown that kills an in-flight call gives that call no answer, so its answer
+fields are `null`. A `daemon restart` whose shutdown gets an answer but whose
+respawn fails gives an `unavailable` client row. That row keeps the round trip
+and the response size of the answer that it received. When `daemon restart`
+finds no running daemon, its row carries the outcome of the start: `ok` when
+the new daemon starts.
 
 A batch `read_markdown` call sends one daemon request per item, and every
-request carries the same `request_id`. Thus one `client_call` row joins N
-`daemon_op` rows. The `client_call` outcome is the tool result: `ok` when the
-tool returns its results, also when some items fail. Each failed item shows
-its own outcome on its `daemon_op` row. On the `client_call` row,
-`daemon_round_trip_ms` is the sum of the item round trips, and
-`response_bytes` is the sum of the item response sizes.
+request carries the same `request_id`. Thus one `client_call` row joins one
+`daemon_op` row per item that reached the daemon. The `client_call` outcome is
+the tool result: `ok` when the tool returns its results, also when some items
+fail. Each failed item shows its own outcome on its `daemon_op` row. On the
+`client_call` row, `daemon_round_trip_ms` is the sum of the round trips of the
+answered items, and `response_bytes` is the sum of their response sizes. Both
+fields are `null` when no item got an answer, even when the outcome is `ok`.
 
-A tool call that fails parameter decoding, such as a missing or relative
-`cwd`, fails before the tool runs. It writes no row and carries no
-`request_id`.
+A tool call with a missing or `null` `cwd` fails parameter decoding before the
+tool runs. It writes no row and carries no `request_id`. A relative `cwd` fails
+later, in the tool setup. It writes an `invalid_params` `client_call` row, and
+the error carries `error.data.request_id`.
 
 The handler stages and `daemon_round_trip_ms` of a `client_call` row sum to at
 most `duration_ms`.
@@ -221,22 +227,35 @@ reached. It has no `render` stage:
 
 ## Join the two rows with DuckDB
 
-DuckDB reads the segments directly. This query shows, for each call, the
-server time, the client time, and the time that passed outside the daemon:
+DuckDB reads the segments directly. This query shows, for each call with an
+`ok` outcome, the server time, the client time, and the time that passed
+outside the daemon. A batch can be `ok` when some items got no answer. For
+such a batch, `daemon_ms` includes the unanswered items, so the transport time
+can be low or negative. It sums the `daemon_op` rows of each
+`request_id` first, because a batch call has one `daemon_op` row per item:
 
 ```sql
+WITH ops AS (
+    SELECT *
+    FROM read_json_auto('~/.local/state/hallouminate/operations-*.jsonl',
+                        format = 'newline_delimited', union_by_name = true)
+),
+daemon AS (
+    SELECT request_id, SUM(duration_ms) AS daemon_ms
+    FROM ops
+    WHERE kind = 'daemon_op'
+    GROUP BY request_id
+)
 SELECT c.request_id,
        c.tool,
        c.outcome,
-       d.duration_ms AS daemon_ms,
+       d.daemon_ms,
        c.duration_ms AS handler_ms,
-       c.daemon_round_trip_ms - d.duration_ms AS transport_ms
-FROM read_json_auto('~/.local/state/hallouminate/operations-*.jsonl',
-                    format = 'newline_delimited', union_by_name = true) AS c
-JOIN read_json_auto('~/.local/state/hallouminate/operations-*.jsonl',
-                    format = 'newline_delimited', union_by_name = true) AS d
-  ON c.request_id = d.request_id
-WHERE c.kind = 'client_call' AND d.kind = 'daemon_op'
+       c.daemon_round_trip_ms - d.daemon_ms AS transport_ms
+FROM ops AS c
+JOIN daemon AS d ON c.request_id = d.request_id
+WHERE c.kind = 'client_call' AND c.outcome = 'ok'
+  AND c.daemon_round_trip_ms IS NOT NULL
 ORDER BY handler_ms DESC;
 ```
 

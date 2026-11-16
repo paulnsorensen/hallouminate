@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use hallouminate::cli::{GroundArgs, cmd_ground};
 use hallouminate_config::LoggingConfig;
 use hallouminate_daemon::oplog::{
     Client, ClientCall, ClientCallFields, OpLog, OperationRecord, Outcome, Reason, RecordKind,
@@ -16,12 +15,14 @@ use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, DaemonRpcError, ErrorKind, connect_at,
 };
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 
 use crate::common::daemon::{DaemonHarness, read_segment_rows};
+use crate::common::oplog_support::{
+    assert_present, assert_stage_sum_within_duration, docs_config, dropped_connection_row,
+    unreachable_ground_row,
+};
 use crate::mcp_serve::{Mcp, write_minimal_config, write_repo_config};
-use crate::oplog_stages::{assert_present, assert_stage_sum_within_duration, docs_config};
 
 const FRAME_LIMIT: usize = 4 * 1024 * 1024;
 const INVALID_PARAMS: i64 = -32602;
@@ -165,11 +166,11 @@ fn assert_daemon_fields_null(row: &OperationRecord) {
 fn assert_unanswered(row: &OperationRecord, outcome: Outcome, stages: &[&str]) {
     assert_eq!(row.outcome, outcome, "{row:?}");
     assert_daemon_fields_null(row);
-    assert_eq!(
-        stage_names(client_fields(row)),
-        stages.iter().copied().collect::<BTreeSet<_>>(),
-        "{row:?}"
-    );
+    let mut expected = BTreeSet::new();
+    for stage in stages {
+        expected.insert(*stage);
+    }
+    assert_eq!(stage_names(client_fields(row)), expected, "{row:?}");
 }
 
 /// Asserts that the client row and the daemon row of one call agree, and
@@ -637,34 +638,6 @@ async fn client_row_write_failure_keeps_tool_result() {
     mcp.shutdown().await;
 }
 
-/// Runs `cmd_ground` against a socket path with no daemon and returns its
-/// one client row.
-pub(crate) async fn unreachable_ground_row() -> OperationRecord {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let config = tmp.path().join("config.toml");
-    std::fs::write(&config, "").expect("write config");
-    let state = tmp.path().join("state");
-    let oplog = OpLog::in_dir(&state, &LoggingConfig::default());
-
-    cmd_ground(
-        GroundArgs {
-            query: "anything".into(),
-            config: Some(config),
-            socket: Some(tmp.path().join("absent.sock")),
-            ..Default::default()
-        },
-        &oplog,
-    )
-    .await
-    .expect_err("missing daemon socket must fail");
-
-    let rows = read_segment_rows(&state);
-    let [row] = rows.as_slice() else {
-        panic!("expected one client row: {rows:?}");
-    };
-    row.clone()
-}
-
 /// Sends `status` to a listener that never answers, with a short timeout.
 /// Returns the one client row and the error kind that the caller sees.
 async fn timed_out_status_row() -> (OperationRecord, ErrorKind) {
@@ -696,46 +669,6 @@ async fn timed_out_status_row() -> (OperationRecord, ErrorKind) {
         panic!("expected one client row: {rows:?}");
     };
     (row.clone(), kind)
-}
-
-/// Sends `status` to a listener that reads the request and closes the
-/// connection without an answer. Returns the one client row.
-pub(crate) async fn dropped_connection_row() -> OperationRecord {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let socket = tmp.path().join("dropping.sock");
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
-    let server = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                return;
-            };
-            let mut reader = tokio::io::BufReader::new(stream);
-            let mut line = String::new();
-            let _ = reader.read_line(&mut line).await;
-        }
-    });
-    let client = connect_at(&socket).await.expect("connect");
-    let state = tmp.path().join("state");
-    let oplog = OpLog::in_dir(&state, &LoggingConfig::default());
-    let mut call = ClientCall::start(&oplog, Client::Cli, "status", "status", None);
-    call.ready();
-
-    client
-        .call_raw_with_timeout_logged(
-            DaemonRequest::new(tmp.path().to_path_buf(), DaemonRequestPayload::Status),
-            Duration::from_secs(5),
-            &mut call,
-        )
-        .await
-        .expect_err("dropped connection must fail");
-    call.finish(Outcome::Internal);
-    server.abort();
-
-    let rows = read_segment_rows(&state);
-    let [row] = rows.as_slice() else {
-        panic!("expected one client row: {rows:?}");
-    };
-    row.clone()
 }
 
 #[tokio::test]

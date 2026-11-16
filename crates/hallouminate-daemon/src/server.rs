@@ -826,6 +826,17 @@ fn warning_summary(response: &DaemonResponse) -> WarningSummary {
     let DaemonResponse::Ok { result } = response else {
         return summary;
     };
+    if let Some(serde_json::Value::Array(items)) = result.get("results") {
+        for item in items {
+            let Some(serde_json::Value::Array(warnings)) = item.pointer("/result/warnings") else {
+                continue;
+            };
+            summary.count = summary
+                .count
+                .saturating_add(u64::try_from(warnings.len()).unwrap_or(u64::MAX));
+        }
+        return summary;
+    }
     let warnings = match result.pointer("/response/warnings") {
         Some(warnings) => Some(warnings),
         None => result.get("warnings"),
@@ -1048,6 +1059,23 @@ fn raw_peer_uid(_fd: std::os::fd::RawFd) -> Option<u32> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn batch_warning_summary_counts_the_warnings_of_each_ok_item() {
+        let response = DaemonResponse::Ok {
+            result: serde_json::json!({
+                "results": [
+                    {"status": "ok", "result": {"warnings": ["a", "b"]}},
+                    {"status": "err", "kind": "invalid_params", "message": "bad"},
+                    {"status": "ok", "result": {}},
+                    {"status": "ok", "result": {"warnings": ["c"]}},
+                ]
+            }),
+        };
+        let WarningSummary { count, codes } = warning_summary(&response);
+        assert_eq!(count, 3);
+        assert!(codes.is_empty());
+    }
 
     fn ping_request_bytes() -> Vec<u8> {
         serde_json::to_vec(&DaemonRequest::new(

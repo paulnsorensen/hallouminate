@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod daemon;
+pub mod oplog_support;
 
 /// Serializes tests that hammer LanceDB with real disk-backed writers.
 /// Each test uses a unique `tempfile::tempdir()` (no flock-path collision),
