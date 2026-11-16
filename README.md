@@ -269,6 +269,10 @@ thin clients that talk to it over a Unix domain socket.
   `HALLOUMINATE_LOG_MAX_FILE_BYTES` / `HALLOUMINATE_LOG_MAX_TOTAL_BYTES`.
   `[watch].failure_reminder_secs` defaults to 60 seconds; override it with
   `HALLOUMINATE_WATCH_FAILURE_REMINDER_SECS` or set `0` to disable suppression.
+- **Operations log** — each operation appends JSON rows to
+  `$XDG_STATE_HOME/hallouminate/operations-YYYY-MM-DD.jsonl` (read with the glob
+  `operations-*.jsonl`). Schema and examples:
+  [Operations log](https://paulnsorensen.github.io/hallouminate/operations-log/).
 - **Windows** — the daemon model is Unix-only; see
   [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
 

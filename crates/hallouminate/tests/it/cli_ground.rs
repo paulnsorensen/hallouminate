@@ -86,12 +86,14 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
     let harness = DaemonHarness::spawn(load_config(&config_path)).await;
     let socket = harness.socket().to_path_buf();
     let binary = env!("CARGO_BIN_EXE_hallouminate");
+    let state_home = dir.path().join("state-home");
 
     let indexed = Command::new(binary)
         .args(["index", "--config"])
         .arg(&config_path)
         .args(["--socket"])
         .arg(&socket)
+        .env("XDG_STATE_HOME", &state_home)
         .current_dir(&repo_root)
         .output()
         .await
@@ -108,6 +110,7 @@ async fn cmd_ground_returns_targeted_file_as_top_hit() {
         .args(["--socket"])
         .arg(&socket)
         .args(["--corpus", "fixtures", "--format", "json"])
+        .env("XDG_STATE_HOME", &state_home)
         .current_dir(&repo_root)
         .output()
         .await
@@ -187,12 +190,15 @@ async fn run_ground_fails_loudly_when_daemon_unreachable() {
     write_config(&config_path, &corpus_root, &ground_dir, &cache_dir);
     let missing_socket = dir.path().join("absent.sock");
 
-    let err = run_ground(GroundArgs {
-        query: "anything".into(),
-        config: Some(config_path),
-        socket: Some(missing_socket),
-        ..Default::default()
-    })
+    let err = run_ground(
+        GroundArgs {
+            query: "anything".into(),
+            config: Some(config_path),
+            socket: Some(missing_socket),
+            ..Default::default()
+        },
+        &mut crate::common::unlogged_cli_call("ground"),
+    )
     .await
     .expect_err("missing daemon socket must fail");
     let msg = format!("{err:#}");
@@ -316,10 +322,10 @@ async fn list_corpora_at(
     cwd: &Path,
 ) -> ListCorporaResult {
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: cwd.to_path_buf(),
-            payload: DaemonRequestPayload::ListCorpora,
-        })
+        .call_raw(DaemonRequest::new(
+            cwd.to_path_buf(),
+            DaemonRequestPayload::ListCorpora,
+        ))
         .await
         .expect("list_corpora transport ok");
     match resp {

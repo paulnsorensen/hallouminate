@@ -65,6 +65,7 @@ use super::ipc::{
     GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListTreeRequest,
     ListTreeResult, PongResult, Position, ReadMarkdownRequest, ReadMarkdownResult,
 };
+use super::oplog;
 use super::state::MAX_CONCURRENT_COVERAGE_CHECKS;
 use super::state::{
     DaemonState, IdleClock, RequestResources, WorkClass, corpus_lock_keys, path_lock_keys,
@@ -89,20 +90,32 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
     // bootstrap can detect cross-version skew; that probe must succeed
     // regardless of the probing client's cwd, hence the early return.
     if let DaemonRequestPayload::Shutdown = req.payload {
+        let _operation = oplog::stage("operation");
         state.shutdown_token().cancel();
         return DaemonResponse::ok(&"stopping");
     }
     if let DaemonRequestPayload::Ping = req.payload {
+        let _operation = oplog::stage("operation");
         return DaemonResponse::ok(&PongResult {
             version: BUILD_IDENTITY.to_string(),
         });
     }
+    let layout = stage_layout(&req.payload);
+    let resolve = oplog::stage(match layout {
+        StageLayout::Ground | StageLayout::Generic => "resolve",
+        StageLayout::Mutation => "validate",
+    });
     let req_cwd = req.cwd.clone();
     let (effective, layers) =
         match resolve_for_cwd(state.baseline(), &req.cwd, state.baseline_xdg_path()) {
             Ok(resolved) => resolved,
             Err(e) => return DaemonResponse::invalid_params(e.to_string()),
         };
+    drop(resolve);
+    let _operation = match layout {
+        StageLayout::Ground | StageLayout::Mutation => None,
+        StageLayout::Generic => Some(oplog::stage("operation")),
+    };
     match req.payload {
         DaemonRequestPayload::Ping => {
             // Handled before `resolve_for_cwd` above; unreachable here.
@@ -138,6 +151,37 @@ pub async fn dispatch(state: &DaemonState, req: DaemonRequest) -> DaemonResponse
             // Handled before `resolve_for_cwd` above; unreachable here.
             DaemonResponse::ok(&"stopping")
         }
+    }
+}
+
+/// Stage spans of one operation in its `daemon_op` row.
+enum StageLayout {
+    /// `resolve`, then the stages the ground handler opens.
+    Ground,
+    /// Configuration resolution counts as `validate`; the handler opens the
+    /// other stages.
+    Mutation,
+    /// `resolve`, then one `operation` stage.
+    Generic,
+}
+
+fn stage_layout(payload: &DaemonRequestPayload) -> StageLayout {
+    match payload {
+        DaemonRequestPayload::Ground(_) => StageLayout::Ground,
+        DaemonRequestPayload::AddMarkdown(_) | DaemonRequestPayload::AddMarkdownBatch { .. } => {
+            StageLayout::Mutation
+        }
+        DaemonRequestPayload::Ping
+        | DaemonRequestPayload::Index(_)
+        | DaemonRequestPayload::ListCorpora
+        | DaemonRequestPayload::ListFiles(_)
+        | DaemonRequestPayload::ListTree(_)
+        | DaemonRequestPayload::ReadMarkdown(_)
+        | DaemonRequestPayload::DeleteMarkdown(_)
+        | DaemonRequestPayload::Backlinks(_)
+        | DaemonRequestPayload::CorpusStats { .. }
+        | DaemonRequestPayload::Status
+        | DaemonRequestPayload::Shutdown => StageLayout::Generic,
     }
 }
 
@@ -682,6 +726,7 @@ async fn handle_ground(
     cwd: &Path,
     req: GroundRequest,
 ) -> DaemonResponse {
+    let resolve = oplog::stage("resolve");
     match req.match_mode {
         GroundMatch::Ranked => {}
         GroundMatch::Phrase => {
@@ -727,8 +772,10 @@ async fn handle_ground(
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
+    drop(resolve);
     let store = &res.store;
     if cfg.search.cold_wait_ms > 0 {
+        let _cold_wait = oplog::stage("cold_wait");
         let wait = Duration::from_millis(cfg.search.cold_wait_ms);
         let waited_from = std::time::Instant::now();
         let completed = state
@@ -747,11 +794,13 @@ async fn handle_ground(
         GroundMatch::Ranked => EligibleSets::Build,
         GroundMatch::Phrase => EligibleSets::Skip,
     };
+    let inventory_stage = oplog::stage("inventory");
     let RequestInventory {
         inventory,
         scan_warnings,
         coverage_warnings,
     } = request_inventory(state, store, grounded, eligible).await;
+    drop(inventory_stage);
 
     // Crossencoder admission is best-effort. Construction and rerank run
     // inside the ground timeout, and busy or failed slots use fusion fallback.
@@ -796,6 +845,7 @@ async fn handle_ground(
         Ok(r) => r,
         Err(e) => return DaemonResponse::internal(e.to_string()),
     };
+    let _render = oplog::stage("render");
     if crossencoder_unavailable {
         response.warnings.push(Warning {
             code: warning_codes::CROSSENCODER_UNAVAILABLE.to_string(),
@@ -1106,6 +1156,7 @@ async fn handle_add_markdown(
     cfg: &Config,
     mut req: AddMarkdownRequest,
 ) -> DaemonResponse {
+    let validate = oplog::stage("validate");
     let corpora = match effective_corpora(cfg) {
         Ok(v) => v,
         Err(resp) => return resp,
@@ -1120,6 +1171,7 @@ async fn handle_add_markdown(
         Ok(m) => m,
         Err(resp) => return resp,
     };
+    drop(validate);
 
     // Acquire the per-corpus mutation guard before any read-modify-write so the
     // entire read → compose → write sequence is atomic. Without this ordering
@@ -1148,6 +1200,7 @@ async fn handle_add_markdown(
             req.overwrite
         }
         EditMode::UnderHeading(heading, position) => {
+            let _edit = oplog::stage("edit");
             let existing =
                 match read_existing_text(root.clone(), relative.clone(), "under_heading").await {
                     Ok(s) => s,
@@ -1176,6 +1229,7 @@ async fn handle_add_markdown(
             true
         }
         EditMode::ReplaceLines(range) => {
+            let _edit = oplog::stage("edit");
             let existing =
                 match read_existing_text(root.clone(), relative.clone(), "replace_lines").await {
                     Ok(s) => s,
@@ -1197,6 +1251,7 @@ async fn handle_add_markdown(
             true
         }
         EditMode::ReplaceMatch(needle) => {
+            let _edit = oplog::stage("edit");
             let existing =
                 match read_existing_text(root.clone(), relative.clone(), "replace_match").await {
                     Ok(s) => s,
@@ -1225,6 +1280,7 @@ async fn handle_add_markdown(
     // Advisory-only lint of the verbatim content. Never blocks or rewrites the
     // write — the messages ride back in the response so the author can fix in
     // a follow-up instead of discovering breakage on a later read.
+    let lint = oplog::stage("validate");
     let mut warnings = hallouminate_domain::corpus::lint_markdown(&req.content);
     warnings.extend(hallouminate_domain::corpus::lint_frontmatter(&req.content));
     warnings.extend(hallouminate_domain::corpus::lint_claim_marks(&req.content));
@@ -1245,6 +1301,7 @@ async fn handle_add_markdown(
             );
         }
     }
+    drop(lint);
 
     // Symlink-safe atomic write via the shared sandbox helper. Walks every
     // path component with `O_NOFOLLOW | O_DIRECTORY`, so a symlinked
@@ -1258,6 +1315,7 @@ async fn handle_add_markdown(
     let overwrite = force_overwrite;
     let content_is_empty = req.content.trim().is_empty();
     let content_bytes = req.content.into_bytes();
+    let write = oplog::stage("write");
     let written = tokio::task::spawn_blocking(move || {
         let result =
             atomic_write_no_follow(&write_root, &write_relative, &content_bytes, overwrite);
@@ -1293,6 +1351,7 @@ async fn handle_add_markdown(
             return DaemonResponse::internal(format!("write task panicked: {join_err}"));
         }
     };
+    drop(write);
 
     // Empty content produces zero chunks; the indexer would just count the
     // file as `files_skipped_empty` and burn an embedder call on a no-op.
@@ -1306,6 +1365,7 @@ async fn handle_add_markdown(
     if content_is_empty {
         stats.files_skipped_empty = 1;
         if overwrite {
+            let _reindex = oplog::stage("reindex");
             let file_ref = canonicalize_or_passthrough(&dest);
             if let Some(file_ref_str) = file_ref.as_path().to_str() {
                 let store = &res.store;
@@ -1334,6 +1394,7 @@ async fn handle_add_markdown(
     let mut ancestors = AncestorIndexWrites::default();
     let mut ancestors_skipped: Vec<String> = Vec::new();
     if is_wiki_corpus(&corpus) {
+        let _ancestor_index = oplog::stage("ancestor_index");
         ancestors = timed_step(
             "ancestor_compose_write",
             write_ancestor_indexes(&root, &relative),
@@ -1351,11 +1412,13 @@ async fn handle_add_markdown(
     if page.is_some() || !ancestors.rewritten.is_empty() {
         let store = &res.store;
         let registry = state.make_registry();
+        let reindex = oplog::stage("reindex");
         let indexed = timed_step(
             "batched_reindex",
             index_files_batched(store, &registry, &corpus, page, &ancestors.rewritten),
         )
         .await;
+        drop(reindex);
         match indexed {
             Ok(batch) => {
                 stats.merge(batch.stats);
@@ -3108,10 +3171,7 @@ mod tests {
         let ground = tmp.path().join("ground");
         let state = state_with_ground(&ground, "").await;
 
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::Ping,
-        };
+        let req = DaemonRequest::new(cwd, DaemonRequestPayload::Ping);
         let resp = dispatch(&state, req).await;
         match resp {
             DaemonResponse::Ok { result } => {
@@ -3143,10 +3203,7 @@ mod tests {
 
         // ListCorpora is config-dependent (it runs `resolve_for_cwd`); from
         // above all repos it must list the baseline corpus, not error.
-        let req = DaemonRequest {
-            cwd: cwd.clone(),
-            payload: DaemonRequestPayload::ListCorpora,
-        };
+        let req = DaemonRequest::new(cwd.clone(), DaemonRequestPayload::ListCorpora);
         let resp = dispatch(&state, req).await;
         match resp {
             DaemonResponse::Ok { result } => {
@@ -3184,10 +3241,7 @@ mod tests {
         let ground = tmp.path().join("ground");
         let state = state_with_ground(&ground, "").await;
 
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::ListCorpora,
-        };
+        let req = DaemonRequest::new(cwd, DaemonRequestPayload::ListCorpora);
         let resp = dispatch(&state, req).await;
         match resp {
             DaemonResponse::Err { kind, message } => {
@@ -3220,10 +3274,7 @@ mod tests {
         let state = state_with_ground(&ground, "[embeddings]\ncache_dir = \"/a\"\n").await;
 
         // ListCorpora runs `resolve_for_cwd`; Ping no longer does (Curd C).
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::ListCorpora,
-        };
+        let req = DaemonRequest::new(cwd, DaemonRequestPayload::ListCorpora);
         let resp = dispatch(&state, req).await;
         match resp {
             DaemonResponse::Err { kind, message } => {
@@ -3273,10 +3324,7 @@ mod tests {
             .expect("open with xdg_path");
 
         // ListCorpora runs `resolve_for_cwd`; Ping no longer does (Curd C).
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::ListCorpora,
-        };
+        let req = DaemonRequest::new(cwd, DaemonRequestPayload::ListCorpora);
         let resp = dispatch(&state, req).await;
         let DaemonResponse::Err { message, .. } = resp else {
             panic!("scalar conflict must error");
@@ -3455,15 +3503,15 @@ mod tests {
 
         let index_resp = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::Index(IndexRequest {
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::Index(IndexRequest {
                     corpus: Some("test".to_string()),
                     paths_from: None,
                     strict: false,
                     background: false,
                 }),
-            },
+            ),
         )
         .await;
         assert!(
@@ -3486,15 +3534,15 @@ mod tests {
         std::fs::write(&root_b_file, "# Doc B\n\nContent B updated.\n").expect("rewrite b");
         let reindex_resp = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::Index(IndexRequest {
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::Index(IndexRequest {
                     corpus: Some("test".to_string()),
                     paths_from: None,
                     strict: false,
                     background: false,
                 }),
-            },
+            ),
         )
         .await;
         assert!(
@@ -3532,12 +3580,12 @@ mod tests {
         std::fs::write(root_b.join("c.md"), "# Doc C\n\nUnindexed.\n").expect("write c");
         let resp = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::CorpusStats {
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::CorpusStats {
                     corpus: Some("test".to_string()),
                 },
-            },
+            ),
         )
         .await;
         let DaemonResponse::Ok { result } = resp else {
@@ -3607,15 +3655,15 @@ mod tests {
             .expect("write indexed");
         let index_resp = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::Index(IndexRequest {
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::Index(IndexRequest {
                     corpus: Some("test".to_string()),
                     paths_from: None,
                     strict: false,
                     background: false,
                 }),
-            },
+            ),
         )
         .await;
         assert!(
@@ -3633,10 +3681,10 @@ mod tests {
 
         let resp = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::CorpusStats { corpus: None },
-            },
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::CorpusStats { corpus: None },
+            ),
         )
         .await;
         let DaemonResponse::Ok { result } = resp else {
@@ -3672,12 +3720,12 @@ mod tests {
 
         let resp = dispatch(
             &state,
-            DaemonRequest {
-                cwd: repo_root.to_path_buf(),
-                payload: DaemonRequestPayload::CorpusStats {
+            DaemonRequest::new(
+                repo_root.to_path_buf(),
+                DaemonRequestPayload::CorpusStats {
                     corpus: Some("repo:myrepo:wiki".to_string()),
                 },
-            },
+            ),
         )
         .await;
 
@@ -3718,15 +3766,15 @@ mod tests {
     async fn index_coverage_corpus(state: &DaemonState, cwd: &Path) {
         let resp = dispatch(
             state,
-            DaemonRequest {
-                cwd: cwd.to_path_buf(),
-                payload: DaemonRequestPayload::Index(IndexRequest {
+            DaemonRequest::new(
+                cwd.to_path_buf(),
+                DaemonRequestPayload::Index(IndexRequest {
                     corpus: Some("test".to_string()),
                     paths_from: None,
                     strict: false,
                     background: false,
                 }),
-            },
+            ),
         )
         .await;
         let DaemonResponse::Ok { result } = resp else {
@@ -3749,16 +3797,16 @@ mod tests {
     async fn ground_named_corpus(state: &DaemonState, cwd: &Path, corpus: &str) -> GroundResult {
         let resp = dispatch(
             state,
-            DaemonRequest {
-                cwd: cwd.to_path_buf(),
-                payload: DaemonRequestPayload::Ground(
+            DaemonRequest::new(
+                cwd.to_path_buf(),
+                DaemonRequestPayload::Ground(
                     serde_json::from_value(serde_json::json!({
                         "query": "content",
                         "corpus": corpus,
                     }))
                     .expect("ground request"),
                 ),
-            },
+            ),
         )
         .await;
         let DaemonResponse::Ok { result } = resp else {
@@ -4557,16 +4605,16 @@ mod tests {
 
         let response = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::Ground(
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::Ground(
                     serde_json::from_value(serde_json::json!({
                         "query": "content",
                         "corpus": "docs",
                     }))
                     .expect("ground request"),
                 ),
-            },
+            ),
         )
         .await;
         let DaemonResponse::Ok { .. } = response else {
@@ -4668,10 +4716,7 @@ mod tests {
         let started = std::time::Instant::now();
         let response = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload,
-            },
+            DaemonRequest::new(tmp.path().to_path_buf(), payload),
         )
         .await;
         let DaemonResponse::Ok { .. } = response else {
@@ -4740,13 +4785,13 @@ mod tests {
 
         let response = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::ListTree(
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::ListTree(
                     serde_json::from_value(serde_json::json!({ "corpus": "test" }))
                         .expect("list_tree request"),
                 ),
-            },
+            ),
         )
         .await;
         let DaemonResponse::Ok { .. } = response else {
@@ -5050,15 +5095,15 @@ mod tests {
 
         let response = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::Index(IndexRequest {
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::Index(IndexRequest {
                     corpus: None,
                     paths_from: None,
                     strict: true,
                     background: true,
                 }),
-            },
+            ),
         )
         .await;
 
@@ -5082,16 +5127,16 @@ mod tests {
         let started = std::time::Instant::now();
         let response = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::Ground(
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::Ground(
                     serde_json::from_value(serde_json::json!({
                         "query": "content",
                         "corpus": "no-such-corpus",
                     }))
                     .expect("ground request"),
                 ),
-            },
+            ),
         )
         .await;
 
@@ -5117,15 +5162,15 @@ mod tests {
         let started = std::time::Instant::now();
         let response = dispatch(
             &state,
-            DaemonRequest {
-                cwd: tmp.path().to_path_buf(),
-                payload: DaemonRequestPayload::Index(IndexRequest {
+            DaemonRequest::new(
+                tmp.path().to_path_buf(),
+                DaemonRequestPayload::Index(IndexRequest {
                     corpus: None,
                     paths_from: None,
                     strict: false,
                     background: true,
                 }),
-            },
+            ),
         )
         .await;
         assert!(

@@ -184,3 +184,24 @@ the indexer counts on:
 When the daemon is unreachable, calls return `-32603` — the MCP server does
 **not** fall back to opening a local LanceDB handle, since that's exactly the
 multi-process race the daemon exists to prevent.
+
+## Request IDs
+
+Each tool call gets one `request_id`, a 32-character lowercase hex string.
+The server generates it before it contacts the daemon and sends it with each
+daemon request of that call.
+
+- On success, `structuredContent.request_id` holds the ID.
+- On a tool error, `error.data.request_id` holds the ID.
+
+The operations log uses this ID to join the `client_call` row of the server
+with the `daemon_op` rows of the daemon. A batch `read_markdown` call sends one
+daemon request per item, so its one `client_call` row joins one `daemon_op` row
+per item. Quote the ID when you report a slow or failed call. When
+`[logging] operations = false`, the server writes no row, but the response
+still carries the ID.
+See [Operations log](/hallouminate/operations-log/) for the row schema.
+
+A call that fails parameter decoding, such as a missing or relative `cwd`,
+fails before the tool runs. It writes no operations-log row, and the error
+carries no `request_id`.

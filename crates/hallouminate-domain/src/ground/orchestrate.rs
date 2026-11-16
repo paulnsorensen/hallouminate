@@ -444,6 +444,7 @@ pub async fn ground_union_inventoried(
     // future. `buffered` keeps per-root order, which warning order relies on.
     match opts.match_mode {
         GroundMatch::Ranked => {
+            let search = oplog_stage("search");
             let mut searches = Vec::with_capacity(corpus_keys.len());
             for (corpus_key, corpus) in &corpus_keys {
                 let root = inventory.get(corpus_key).cloned().unwrap_or_default();
@@ -468,9 +469,13 @@ pub async fn ground_union_inventoried(
                 fallback_hits.extend(fallback);
                 roots.push(signals);
             }
+            drop(search);
+            let fuse = oplog_stage("fuse");
             hits = fuse_roots(roots, query, priority_corpus);
+            drop(fuse);
         }
         GroundMatch::Phrase => {
+            let _search = oplog_stage("search");
             let mut searches = Vec::with_capacity(corpus_keys.len());
             for (corpus_key, _) in &corpus_keys {
                 let handle = inventory.get(corpus_key).and_then(RootInventory::handle);
@@ -497,6 +502,7 @@ pub async fn ground_union_inventoried(
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
+        let _rerank = oplog_stage("rerank");
         let (reranked, fallback) =
             rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await;
         hits = reranked;
@@ -522,6 +528,7 @@ pub async fn ground_union_inventoried(
         }
     }
 
+    let _render = oplog_stage("render");
     rank_after(&mut fallback_hits, &hits);
     hits.extend(fallback_hits);
 
@@ -625,6 +632,14 @@ pub async fn ground_union_inventoried(
         code: BTreeMap::new(),
         warnings,
     })
+}
+
+/// Opens an operations-log stage span under the daemon's root span.
+///
+/// The target and names mirror `hallouminate_daemon::oplog::stage`; this crate
+/// cannot depend on the daemon crate.
+fn oplog_stage(name: &'static str) -> tracing::Span {
+    tracing::info_span!(target: "hallouminate_daemon::oplog", "stage", stage = name)
 }
 
 /// Keeps up to `RESERVED_LOCAL_SLOTS` docs of `priority_corpus` in the final

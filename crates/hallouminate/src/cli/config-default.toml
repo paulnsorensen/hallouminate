@@ -56,6 +56,11 @@ cache_dir = "~/.cache/hallouminate/fastembed"
 [logging]
 max_file_bytes  = 10485760
 max_total_bytes = 104857600
+# Operations log: one JSON row per operation in
+# $XDG_STATE_HOME/hallouminate/operations-YYYY-MM-DD.jsonl.
+operations = true
+# Size cap across all operations log segments (50 MiB).
+operations_max_total_bytes = 52428800
 [watch]
 debounce_ms = 500
 failure_reminder_secs = 60

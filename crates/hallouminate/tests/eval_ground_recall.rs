@@ -568,15 +568,15 @@ async fn index_fixture(
     arm: ArmSpec<'_>,
 ) -> Result<IndexReport> {
     let report: IndexReport = client
-        .call(DaemonRequest {
-            cwd: cwd.to_path_buf(),
-            payload: DaemonRequestPayload::Index(IndexRequest {
+        .call(DaemonRequest::new(
+            cwd.to_path_buf(),
+            DaemonRequestPayload::Index(IndexRequest {
                 corpus: Some(CORPUS_NAME.into()),
                 paths_from: None,
                 strict: true,
                 background: false,
             }),
-        })
+        ))
         .await
         .with_context(|| format!("index fixture for {}", arm.id))?;
     Ok(report)
@@ -594,9 +594,9 @@ async fn ground_query(
 ) -> Result<GroundResponse> {
     let response = client
         .call_raw_with_timeout(
-            DaemonRequest {
-                cwd: cwd.to_path_buf(),
-                payload: DaemonRequestPayload::Ground(GroundRequest {
+            DaemonRequest::new(
+                cwd.to_path_buf(),
+                DaemonRequestPayload::Ground(GroundRequest {
                     query: query.query.clone(),
                     corpus: Some(CORPUS_NAME.into()),
                     top_files: Some(10),
@@ -608,7 +608,7 @@ async fn ground_query(
                     group_by: Default::default(),
                     output: Default::default(),
                 }),
-            },
+            ),
             ground_rpc_timeout(arm),
         )
         .await

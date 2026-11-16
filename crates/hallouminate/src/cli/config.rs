@@ -88,7 +88,12 @@ const KNOWN_SEARCH_KEYS: &[&str] = &[
     "rerank_timeout_ms",
     "cold_wait_ms",
 ];
-const KNOWN_LOGGING_KEYS: &[&str] = &["max_file_bytes", "max_total_bytes"];
+const KNOWN_LOGGING_KEYS: &[&str] = &[
+    "max_file_bytes",
+    "max_total_bytes",
+    "operations",
+    "operations_max_total_bytes",
+];
 const KNOWN_STORAGE_KEYS: &[&str] = &["ground_dir"];
 const KNOWN_DAEMON_KEYS: &[&str] = &[
     "idle_exit_secs",

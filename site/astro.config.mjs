@@ -19,6 +19,7 @@ export default defineConfig({
         { label: 'CLI reference', slug: 'cli' },
         { label: 'MCP surface', slug: 'mcp' },
         { label: 'Configuration', slug: 'config' },
+        { label: 'Operations log', slug: 'operations-log' },
         { label: 'Architecture', slug: 'architecture' },
         { label: 'Development verification', slug: 'development-verification' },
         { label: 'Releasing crates', slug: 'releasing' },

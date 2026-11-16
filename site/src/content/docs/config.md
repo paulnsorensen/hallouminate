@@ -84,6 +84,27 @@ Both limits must be nonzero and the total must be at least the per-file limit.
 stop startup and name the offending variable. Log filtering remains
 `HALLOUMINATE_LOG`, then `RUST_LOG`, then `hallouminate=info`.
 
+### Operations log
+
+Each operation appends one JSON row to a daily segment file
+`$XDG_STATE_HOME/hallouminate/operations-YYYY-MM-DD.jsonl`, named by UTC date.
+Read the log with the glob `operations-*.jsonl`.
+
+```toml
+[logging]
+operations = true                    # set false to write no rows
+operations_max_total_bytes = 52428800 # 50 MiB across all segments
+```
+
+The log is on by default. When the segments together pass
+`operations_max_total_bytes`, the daemon deletes the oldest segments after its
+own append. It never deletes the segment for the current UTC date, and other
+processes never delete segments. Each process reads both keys once at its
+start. Both keys are baseline-owned like the rest of `[logging]`, so a
+repository configuration that sets them to a non-default value is an error.
+
+See [Operations log](/hallouminate/operations-log/) for the row schema.
+
 ## Watcher failure reminders
 
 `[watch].failure_reminder_secs` defaults to `60`. Identical watcher reindex

@@ -24,6 +24,7 @@ const DEFAULT_FAILURE_REMINDER_SECS: u64 = 60;
 const DEFAULT_RECONCILE_INTERVAL_SECS: u64 = 60;
 const DEFAULT_MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const DEFAULT_MAX_LOG_TOTAL_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_OPERATIONS_MAX_TOTAL_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_EMBED_CACHE: &str = "~/.cache/hallouminate/fastembed";
 const DEFAULT_GROUND_DIR: &str = "~/.local/share/hallouminate/ground";
 // #139: crossencoder rerank timeout, configurable via `[search].rerank_timeout_ms`.
@@ -140,6 +141,12 @@ pub struct LoggingConfig {
     /// Maximum bytes retained across the active log and all archives (default 100 MiB).
     #[serde(default = "default_max_log_total_bytes")]
     pub max_total_bytes: u64,
+    /// Append rows to the operations log (default `true`).
+    #[serde(default = "default_operations")]
+    pub operations: bool,
+    /// Maximum bytes retained across all operations log segments (default 50 MiB).
+    #[serde(default = "default_operations_max_total_bytes")]
+    pub operations_max_total_bytes: u64,
 }
 
 impl Default for LoggingConfig {
@@ -147,6 +154,8 @@ impl Default for LoggingConfig {
         Self {
             max_file_bytes: DEFAULT_MAX_LOG_FILE_BYTES,
             max_total_bytes: DEFAULT_MAX_LOG_TOTAL_BYTES,
+            operations: default_operations(),
+            operations_max_total_bytes: DEFAULT_OPERATIONS_MAX_TOTAL_BYTES,
         }
     }
 }
@@ -1615,6 +1624,14 @@ fn default_max_log_file_bytes() -> u64 {
 fn default_max_log_total_bytes() -> u64 {
     DEFAULT_MAX_LOG_TOTAL_BYTES
 }
+
+fn default_operations() -> bool {
+    true
+}
+
+fn default_operations_max_total_bytes() -> u64 {
+    DEFAULT_OPERATIONS_MAX_TOTAL_BYTES
+}
 fn default_enabled() -> bool {
     true
 }
@@ -1853,6 +1870,25 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(explicit.logging.max_file_bytes, 64);
         assert_eq!(explicit.logging.max_total_bytes, 192);
         assert_eq!(explicit.watch.failure_reminder_secs, 0);
+    }
+
+    #[test]
+    fn operations_cap_defaults_to_50_mib() {
+        let defaults = parse("[logging]\nmax_file_bytes = 64\n", None).expect("config parses");
+        assert!(defaults.logging.operations);
+        assert_eq!(defaults.logging.operations_max_total_bytes, 52_428_800);
+        assert_eq!(
+            LoggingConfig::default().operations_max_total_bytes,
+            52_428_800
+        );
+
+        let explicit = parse(
+            "[logging]\noperations = false\noperations_max_total_bytes = 4096\n",
+            None,
+        )
+        .expect("explicit operations keys parse");
+        assert!(!explicit.logging.operations);
+        assert_eq!(explicit.logging.operations_max_total_bytes, 4096);
     }
 
     #[test]
@@ -3187,6 +3223,33 @@ path = "/b"
                 );
             }
             other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repo_layer_operations_keys_are_rejected() {
+        let baseline = Config::default();
+        let repo_p = Path::new("/work/.hallouminate/config.toml");
+        for text in [
+            "[logging]\noperations = false\n",
+            "[logging]\noperations_max_total_bytes = 1024\n",
+        ] {
+            let repo = parse(text, None).expect("repo");
+            let err = merge_layers_with_sources(&baseline, &repo, None, Some(repo_p))
+                .expect_err("repo [logging] operations keys must fail");
+            match err {
+                HallouminateError::Config(msg) => {
+                    assert!(
+                        msg.contains("[logging] is baseline-owned"),
+                        "{text}: got {msg}"
+                    );
+                    assert!(
+                        msg.contains("/work/.hallouminate/config.toml"),
+                        "{text}: got {msg}"
+                    );
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
         }
     }
 

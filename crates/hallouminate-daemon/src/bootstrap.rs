@@ -206,10 +206,10 @@ async fn running_daemon_verdict(socket: &Path) -> (SkewVerdict, Option<String>) 
             return (SkewVerdict::Restart, None);
         }
     };
-    let probe = client.call_raw(DaemonRequest {
-        cwd: std::env::current_dir().unwrap_or_default(),
-        payload: DaemonRequestPayload::Ping,
-    });
+    let probe = client.call_raw(DaemonRequest::new(
+        std::env::current_dir().unwrap_or_default(),
+        DaemonRequestPayload::Ping,
+    ));
     match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
         Ok(Ok(resp)) => (
             skew_verdict(super::ipc::BUILD_IDENTITY, &resp),
@@ -377,6 +377,101 @@ mod tests {
         );
         assert_eq!(theirs.as_deref(), Some(super::super::ipc::BUILD_IDENTITY));
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn version_probe_writes_no_client_row_and_status_writes_one() {
+        use super::super::ipc::{DebtLevel, PongResult, StatusReport, TripState, WatcherCounters};
+        use super::super::lifecycle::status_with;
+        use super::super::oplog::{
+            Client, ClientCall, OpLog, OperationRecord, Outcome, RecordKind,
+        };
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let log_dir = dir.path().join("state");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let server = tokio::spawn(async move {
+            let responses = [
+                DaemonResponse::ok(&PongResult {
+                    version: super::super::ipc::BUILD_IDENTITY.to_string(),
+                }),
+                DaemonResponse::ok(&StatusReport {
+                    per_task: Vec::new(),
+                    debt: DebtLevel::Ok,
+                    defer_count: 0,
+                    watcher: WatcherCounters::default(),
+                    trips: TripState::None,
+                    degraded_watch_roots: 0,
+                }),
+            ];
+            for response in responses {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = tokio::io::BufReader::new(read_half);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.expect("read request");
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut response =
+                        serde_json::to_string(&response).expect("serialize response");
+                    response.push('\n');
+                    write_half
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write response");
+                    break;
+                }
+            }
+        });
+        let oplog = OpLog::in_dir(&log_dir, &hallouminate_config::LoggingConfig::default());
+        let rows = |dir: &Path| -> Vec<OperationRecord> {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return Vec::new();
+            };
+            let mut rows = Vec::new();
+            for entry in entries {
+                let path = entry.expect("log dir entry").path();
+                for line in std::fs::read_to_string(&path)
+                    .expect("read segment")
+                    .lines()
+                {
+                    rows.push(serde_json::from_str::<OperationRecord>(line).expect("row json"));
+                }
+            }
+            rows
+        };
+
+        let (verdict, _) = running_daemon_verdict(&socket).await;
+
+        assert_eq!(
+            verdict,
+            SkewVerdict::Adopt,
+            "the probe reached the test daemon"
+        );
+        assert!(
+            rows(&log_dir).is_empty(),
+            "the bootstrap version probe must write no client_call row"
+        );
+
+        let mut call = ClientCall::start(&oplog, Client::Cli, "status", "status", None);
+        status_with(&socket, Some(&mut call))
+            .await
+            .expect("status call");
+        call.finish(Outcome::Internal);
+        server.await.expect("server task");
+
+        let [row] = <[OperationRecord; 1]>::try_from(rows(&log_dir))
+            .expect("the lifecycle status command writes exactly one row");
+        assert_eq!(row.op, "status");
+        assert_eq!(row.outcome, Outcome::Ok);
+        let RecordKind::ClientCall(fields) = row.kind else {
+            panic!("status row must be a client_call row, got {:?}", row.kind);
+        };
+        assert_eq!(fields.client, Client::Cli);
     }
 
     // ── Curd C: version-skew detection ───────────────────────────────────

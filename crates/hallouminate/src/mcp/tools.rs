@@ -20,6 +20,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use hallouminate_daemon::oplog::{Client, ClientCall, OpLog, Outcome};
 use hallouminate_daemon::{
     AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
     BacklinksRequest, BacklinksResult, CorpusStatsResult, DaemonClient, DaemonRequest,
@@ -843,7 +844,7 @@ pub struct BacklinksParams {
 }
 
 /// Long-lived MCP server handle. Every tool method dials the daemon over a
-/// fresh `UnixStream`, so the server is stateless beyond `tool_router`.
+/// fresh `UnixStream` and writes one `client_call` row to `oplog`.
 #[derive(Debug, Clone)]
 pub struct HallouminateTools {
     // The `tool_router` field is read by `#[tool_handler]`-generated code
@@ -851,14 +852,20 @@ pub struct HallouminateTools {
     // macro expansion, so silence the warning here.
     #[allow(dead_code)]
     tool_router: ToolRouter<HallouminateTools>,
+    oplog: OpLog,
 }
 
 #[tool_router]
 impl HallouminateTools {
-    pub fn new() -> Self {
+    pub fn new(oplog: OpLog) -> Self {
         Self {
             tool_router: Self::tool_router(),
+            oplog,
         }
+    }
+
+    fn start_call(&self, tool: &str, op: &str, corpus: Option<&str>) -> ClientCall {
+        ClientCall::start(&self.oplog, Client::Mcp, tool, op, corpus)
     }
 
     /// Shared per-call preamble: validate the request's `cwd`, then dial the
@@ -866,9 +873,20 @@ impl HallouminateTools {
     /// `DaemonRequest`. Validation happens before any daemon dispatch, and
     /// there is no fallback for an invalid `cwd` — no MCP roots, no startup
     /// cwd, no mutable session-wide directory.
-    async fn tool_setup(&self, cwd: &str) -> Result<(DaemonClient, PathBuf), ErrorData> {
+    async fn tool_setup(
+        &self,
+        cwd: &str,
+        call: &mut ClientCall,
+    ) -> Result<(DaemonClient, PathBuf), ErrorData> {
         let cwd = validate_cwd(cwd)?;
-        let client = daemon_for_tool().await?;
+        let client = match daemon_for_tool().await {
+            Ok(client) => client,
+            Err(error) => {
+                call.unanswered(Outcome::Unavailable);
+                return Err(error);
+            }
+        };
+        call.ready();
         Ok((client, cwd))
     }
 
@@ -889,28 +907,37 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<GroundParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::Ground(GroundRequest {
-                query: params.query,
-                corpus: params.corpus,
-                top_files: params.top_files,
-                chunks_per_file: params.chunks_per_file,
-                limit: params.limit,
-                snippet_chars: params.snippet_chars,
-                footnote_mode: params.footnotes,
-                match_mode: params.r#match,
-                group_by: params.group_by,
-                output: params.output,
-            }),
-        };
-        // `footnote_mode` rides the IPC request and the daemon filters each
-        // chunk snippet in `roll_up`, so the response is already filtered,
-        // trimmed, and rendered for every transport.
-        let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
-        let structured = to_structured(&result.response)?;
-        Ok(tool_ok(result.outline, structured))
+        let mut call = self.start_call("ground", "ground", params.corpus.as_deref());
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::Ground(GroundRequest {
+                    query: params.query,
+                    corpus: params.corpus,
+                    top_files: params.top_files,
+                    chunks_per_file: params.chunks_per_file,
+                    limit: params.limit,
+                    snippet_chars: params.snippet_chars,
+                    footnote_mode: params.footnotes,
+                    match_mode: params.r#match,
+                    group_by: params.group_by,
+                    output: params.output,
+                }),
+            );
+            // `footnote_mode` rides the IPC request and the daemon filters each
+            // chunk snippet in `roll_up`, so the response is already filtered,
+            // trimmed, and rendered for every transport.
+            let result: GroundResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let structured = to_structured(&result.response)?;
+            Ok::<_, ErrorData>(tool_ok(result.outline, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -927,21 +954,29 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::Index(IndexRequest {
-                corpus: params.corpus,
-                paths_from: None,
-                strict: false,
-                background: false,
-            }),
-        };
-        let report: hallouminate_daemon::IndexReport =
-            client.call(req).await.map_err(map_daemon_err)?;
-        let summary = index_summary(&report);
-        let structured = to_structured(&report)?;
-        Ok(tool_ok(summary, structured))
+        let mut call = self.start_call("index", "index", params.corpus.as_deref());
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::Index(IndexRequest {
+                    corpus: params.corpus,
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            );
+            let report: hallouminate_daemon::IndexReport = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let summary = index_summary(&report);
+            let structured = to_structured(&report)?;
+            Ok::<_, ErrorData>(tool_ok(summary, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -961,21 +996,30 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<ListTreeParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::ListTree(ListTreeRequest {
-                corpus: params.corpus,
-            }),
-        };
-        let result: ListTreeResult = client.call(req).await.map_err(map_daemon_err)?;
-        let mut outline = String::new();
-        render_tree_outline(&result.root, 0, &mut outline);
-        for warning in &result.warnings {
-            outline.push_str(&format!("warning: {warning}\n"));
+        let mut call = self.start_call("list_tree", "list_tree", params.corpus.as_deref());
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::ListTree(ListTreeRequest {
+                    corpus: params.corpus,
+                }),
+            );
+            let result: ListTreeResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let mut outline = String::new();
+            render_tree_outline(&result.root, 0, &mut outline);
+            for warning in &result.warnings {
+                outline.push_str(&format!("warning: {warning}\n"));
+            }
+            let structured = to_structured(&result)?;
+            Ok::<_, ErrorData>(tool_ok(outline, structured))
         }
-        let structured = to_structured(&result)?;
-        Ok(tool_ok(outline, structured))
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -992,23 +1036,32 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
-                corpus: params.corpus,
-            }),
-        };
-        let entries: ListFilesResult = client.call(req).await.map_err(map_daemon_err)?;
-        let mut text = String::new();
-        for e in entries.iter() {
-            if !text.is_empty() {
-                text.push('\n');
+        let mut call = self.start_call("list_files", "list_files", params.corpus.as_deref());
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::ListFiles(ListFilesRequest {
+                    corpus: params.corpus,
+                }),
+            );
+            let entries: ListFilesResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let mut text = String::new();
+            for e in entries.iter() {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(e.path.as_str());
             }
-            text.push_str(e.path.as_str());
+            let structured = serde_json::json!({ "files": &entries });
+            Ok::<_, ErrorData>(tool_ok(text, structured))
         }
-        let structured = serde_json::json!({ "files": &entries });
-        Ok(tool_ok(text, structured))
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -1027,26 +1080,44 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let params = match params {
             AddMarkdownParams::Single(params) => params,
-            AddMarkdownParams::Batch(params) => return self.add_markdown_batch(params).await,
+            AddMarkdownParams::Batch(params) => {
+                let mut call = self.start_call(
+                    "add_markdown",
+                    "add_markdown_batch",
+                    Some(params.corpus.as_str()),
+                );
+                let result = self.add_markdown_batch(params, &mut call).await;
+                return finish_call(call, result);
+            }
         };
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
-                corpus: params.corpus,
-                path: params.path,
-                content: params.content,
-                overwrite: params.overwrite,
-                under_heading: params.under_heading,
-                position: params.position,
-                replace_lines: params.replace_lines,
-                replace_match: params.replace_match,
-            }),
-        };
-        let response: AddMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let text = render_add_markdown(&response);
-        let structured = to_structured(&response)?;
-        Ok(tool_ok(text, structured))
+        let mut call =
+            self.start_call("add_markdown", "add_markdown", Some(params.corpus.as_str()));
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                    corpus: params.corpus,
+                    path: params.path,
+                    content: params.content,
+                    overwrite: params.overwrite,
+                    under_heading: params.under_heading,
+                    position: params.position,
+                    replace_lines: params.replace_lines,
+                    replace_match: params.replace_match,
+                }),
+            );
+            let response: AddMarkdownResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let text = render_add_markdown(&response);
+            let structured = to_structured(&response)?;
+            Ok::<_, ErrorData>(tool_ok(text, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -1065,25 +1136,39 @@ impl HallouminateTools {
     ) -> Result<CallToolResult, ErrorData> {
         let params = match params {
             ReadMarkdownParams::Single(params) => params,
-            ReadMarkdownParams::Batch(params) => return self.read_markdown_batch(params).await,
+            ReadMarkdownParams::Batch(params) => {
+                let mut call =
+                    self.start_call("read_markdown", "read_markdown", params.corpus.as_deref());
+                let result = self.read_markdown_batch(params, &mut call).await;
+                return finish_call(call, result);
+            }
         };
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                corpus: params.corpus,
-                path: params.path,
-            }),
-        };
-        let response: ReadMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let structured = to_structured(&response)?;
-        let body = apply_footnote_mode(&response.content, params.footnotes);
-        let text = if params.line_numbers {
-            number_lines(&body)
-        } else {
-            body
-        };
-        Ok(tool_ok(text, structured))
+        let mut call = self.start_call("read_markdown", "read_markdown", params.corpus.as_deref());
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                    corpus: params.corpus,
+                    path: params.path,
+                }),
+            );
+            let response: ReadMarkdownResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let structured = to_structured(&response)?;
+            let body = apply_footnote_mode(&response.content, params.footnotes);
+            let text = if params.line_numbers {
+                number_lines(&body)
+            } else {
+                body
+            };
+            Ok::<_, ErrorData>(tool_ok(text, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -1100,18 +1185,31 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<DeleteMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
-                corpus: params.corpus,
-                path: params.path,
-            }),
-        };
-        let response: DeleteMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let text = format!("deleted {} from corpus {}", response.path, response.corpus);
-        let structured = to_structured(&response)?;
-        Ok(tool_ok(text, structured))
+        let mut call = self.start_call(
+            "delete_markdown",
+            "delete_markdown",
+            Some(params.corpus.as_str()),
+        );
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
+                    corpus: params.corpus,
+                    path: params.path,
+                }),
+            );
+            let response: DeleteMarkdownResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let text = format!("deleted {} from corpus {}", response.path, response.corpus);
+            let structured = to_structured(&response)?;
+            Ok::<_, ErrorData>(tool_ok(text, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -1141,19 +1239,26 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<CorpusStatsParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let result: CorpusStatsResult = client
-            .call(DaemonRequest {
+        let mut call = self.start_call("corpus_stats", "corpus_stats", params.corpus.as_deref());
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
                 cwd,
-                payload: DaemonRequestPayload::CorpusStats {
+                DaemonRequestPayload::CorpusStats {
                     corpus: params.corpus,
                 },
-            })
-            .await
-            .map_err(map_daemon_err)?;
-        let text = render_corpus_stats_text(&result);
-        let structured = to_structured(&result)?;
-        Ok(tool_ok(text, structured))
+            );
+            let result: CorpusStatsResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let text = render_corpus_stats_text(&result);
+            let structured = to_structured(&result)?;
+            Ok::<_, ErrorData>(tool_ok(text, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -1170,21 +1275,27 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<ListCorporaParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let entries: ListCorporaResult = client
-            .call(DaemonRequest {
-                cwd,
-                payload: DaemonRequestPayload::ListCorpora,
-            })
-            .await
-            .map_err(map_daemon_err)?;
-        let names = entries
-            .iter()
-            .map(|e| e.name.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        let structured = serde_json::json!({ "corpora": &entries });
-        Ok(tool_ok(names, structured))
+        let mut call = self.start_call("list_corpora", "list_corpora", None);
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let entries: ListCorporaResult = client
+                .call_logged(
+                    DaemonRequest::new(cwd, DaemonRequestPayload::ListCorpora),
+                    call_ref,
+                )
+                .await
+                .map_err(map_daemon_err)?;
+            let names = entries
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let structured = serde_json::json!({ "corpora": &entries });
+            Ok::<_, ErrorData>(tool_ok(names, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 
     #[tool(
@@ -1201,22 +1312,31 @@ impl HallouminateTools {
         _cwd: RequireCwd,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let (client, cwd) = self.tool_setup(&params.cwd).await?;
-        let req = DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
-                corpus: params.corpus,
-                path: params.path,
-            }),
-        };
-        let response: BacklinksResult = client.call(req).await.map_err(map_daemon_err)?;
-        let structured = to_structured(&response)?;
-        let text = if response.backlinks.is_empty() {
-            format!("no backlinks found for {}", response.path)
-        } else {
-            response.backlinks.join("\n")
-        };
-        Ok(tool_ok(text, structured))
+        let mut call = self.start_call("backlinks", "backlinks", params.corpus.as_deref());
+        let call_ref = &mut call;
+        let result = async move {
+            let (client, cwd) = self.tool_setup(&params.cwd, call_ref).await?;
+            let req = DaemonRequest::new(
+                cwd,
+                DaemonRequestPayload::Backlinks(BacklinksRequest {
+                    corpus: params.corpus,
+                    path: params.path,
+                }),
+            );
+            let response: BacklinksResult = client
+                .call_logged(req, call_ref)
+                .await
+                .map_err(map_daemon_err)?;
+            let structured = to_structured(&response)?;
+            let text = if response.backlinks.is_empty() {
+                format!("no backlinks found for {}", response.path)
+            } else {
+                response.backlinks.join("\n")
+            };
+            Ok::<_, ErrorData>(tool_ok(text, structured))
+        }
+        .await;
+        finish_call(call, result)
     }
 }
 
@@ -1224,10 +1344,11 @@ impl HallouminateTools {
     async fn read_markdown_batch(
         &self,
         params: ReadMarkdownBatchParams,
+        call: &mut ClientCall,
     ) -> Result<CallToolResult, ErrorData> {
         let ReadMarkdownBatchParams { cwd, corpus, items } = params;
         validate_batch_count(items.len())?;
-        let (client, cwd) = self.tool_setup(&cwd).await?;
+        let (client, cwd) = self.tool_setup(&cwd, call).await?;
         let mut results = Vec::with_capacity(items.len());
         let mut texts = Vec::with_capacity(items.len());
         for (
@@ -1240,13 +1361,16 @@ impl HallouminateTools {
         ) in items.into_iter().enumerate()
         {
             let response = client
-                .call::<ReadMarkdownResult>(DaemonRequest {
-                    cwd: cwd.clone(),
-                    payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
-                        corpus: corpus.clone(),
-                        path: path.clone(),
-                    }),
-                })
+                .call_logged::<ReadMarkdownResult>(
+                    DaemonRequest::new(
+                        cwd.clone(),
+                        DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                            corpus: corpus.clone(),
+                            path: path.clone(),
+                        }),
+                    ),
+                    call,
+                )
                 .await
                 .map_err(map_daemon_err);
             let outcome = response.and_then(|response| {
@@ -1263,6 +1387,7 @@ impl HallouminateTools {
             texts.push(text);
             results.push(result);
         }
+        call.settle(Outcome::Ok);
         Ok(tool_ok(
             texts.join("\n\n"),
             serde_json::json!({ "results": results }),
@@ -1272,6 +1397,7 @@ impl HallouminateTools {
     async fn add_markdown_batch(
         &self,
         params: AddMarkdownBatchParams,
+        call: &mut ClientCall,
     ) -> Result<CallToolResult, ErrorData> {
         let AddMarkdownBatchParams { cwd, corpus, items } = params;
         validate_batch_count(items.len())?;
@@ -1306,15 +1432,18 @@ impl HallouminateTools {
                 replace_match,
             });
         }
-        let (client, cwd) = self.tool_setup(&cwd).await?;
+        let (client, cwd) = self.tool_setup(&cwd, call).await?;
         let response: AddMarkdownBatchResult = client
-            .call(DaemonRequest {
-                cwd,
-                payload: DaemonRequestPayload::AddMarkdownBatch {
-                    corpus,
-                    items: requests,
-                },
-            })
+            .call_logged(
+                DaemonRequest::new(
+                    cwd,
+                    DaemonRequestPayload::AddMarkdownBatch {
+                        corpus,
+                        items: requests,
+                    },
+                ),
+                call,
+            )
             .await
             .map_err(map_batch_write_error)?;
         if response.results.len() != paths.len() {
@@ -1349,13 +1478,40 @@ impl HallouminateTools {
     }
 }
 
-impl Default for HallouminateTools {
-    /// `#[derive(Default)]` would construct `ToolRouter::default()` (an empty
-    /// router) and skip the `#[tool_router]`-generated registration. Manual
-    /// impl routes through `new()` so `HallouminateTools::default()` exposes
-    /// the same tool set as `new()`.
-    fn default() -> Self {
-        Self::new()
+const REQUEST_ID_KEY: &str = "request_id";
+
+/// Writes the `client_call` row of `call`, then adds its request id to the
+/// structured payload of `result` or to the data of its error.
+///
+/// The row outcome is the recorded one; with none recorded, it follows the
+/// error code of `result`.
+fn finish_call(
+    call: ClientCall,
+    result: Result<CallToolResult, ErrorData>,
+) -> Result<CallToolResult, ErrorData> {
+    let request_id = serde_json::Value::String(call.request_id().to_string());
+    let fallback = match &result {
+        Ok(_) => Outcome::Ok,
+        Err(error) if error.code == ErrorCode::INVALID_PARAMS => Outcome::InvalidParams,
+        Err(_) => Outcome::Internal,
+    };
+    call.finish(fallback);
+    match result {
+        Ok(mut result) => {
+            if let Some(serde_json::Value::Object(structured)) = &mut result.structured_content {
+                structured.insert(REQUEST_ID_KEY.to_owned(), request_id);
+            }
+            Ok(result)
+        }
+        Err(mut error) => {
+            if let serde_json::Value::Object(data) = error
+                .data
+                .get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            {
+                data.insert(REQUEST_ID_KEY.to_owned(), request_id);
+            }
+            Err(error)
+        }
     }
 }
 

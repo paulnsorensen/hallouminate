@@ -24,6 +24,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::oplog::RequestId;
 use crate::report::IndexReport;
 use hallouminate_domain::corpus::{FileEntry, TreeNode};
 use hallouminate_domain::ground::{GroundGroupBy, GroundMatch, GroundOutput, GroundResponse};
@@ -37,10 +38,74 @@ pub use hallouminate_domain::corpus::{LineRange, Position};
 /// walks it on every request to discover the active repo-layer config
 /// (`.hallouminate/config.toml`) and merge it with the boot baseline. See
 /// `.cheese/specs/repo-config-discovery.md`.
+///
+/// `request_id` correlates the client's operation record with the daemon's.
+/// The daemon generates one when the client sends none.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonRequest {
     pub cwd: PathBuf,
     pub payload: DaemonRequestPayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<RequestId>,
+}
+
+impl DaemonRequest {
+    /// Builds a request with no [`RequestId`].
+    pub fn new(cwd: impl Into<PathBuf>, payload: DaemonRequestPayload) -> Self {
+        Self {
+            cwd: cwd.into(),
+            payload,
+            request_id: None,
+        }
+    }
+
+    /// Returns the request with `request_id` set to `id`.
+    #[must_use]
+    pub fn with_request_id(self, id: RequestId) -> Self {
+        Self {
+            request_id: Some(id),
+            ..self
+        }
+    }
+}
+
+impl DaemonRequestPayload {
+    /// Returns the snake_case operation name, equal to the wire `op` tag.
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Self::Ping => "ping",
+            Self::Ground(_) => "ground",
+            Self::Index(_) => "index",
+            Self::ListCorpora => "list_corpora",
+            Self::ListFiles(_) => "list_files",
+            Self::ListTree(_) => "list_tree",
+            Self::AddMarkdown(_) => "add_markdown",
+            Self::AddMarkdownBatch { .. } => "add_markdown_batch",
+            Self::ReadMarkdown(_) => "read_markdown",
+            Self::DeleteMarkdown(_) => "delete_markdown",
+            Self::Backlinks(_) => "backlinks",
+            Self::CorpusStats { .. } => "corpus_stats",
+            Self::Status => "status",
+            Self::Shutdown => "shutdown",
+        }
+    }
+
+    /// Returns the corpus the request names, or `None` when it names none.
+    pub fn corpus(&self) -> Option<&str> {
+        match self {
+            Self::Ping | Self::ListCorpora | Self::Status | Self::Shutdown => None,
+            Self::Ground(GroundRequest { corpus, .. })
+            | Self::Index(IndexRequest { corpus, .. })
+            | Self::ListFiles(ListFilesRequest { corpus, .. })
+            | Self::ListTree(ListTreeRequest { corpus, .. })
+            | Self::ReadMarkdown(ReadMarkdownRequest { corpus, .. })
+            | Self::Backlinks(BacklinksRequest { corpus, .. })
+            | Self::CorpusStats { corpus } => corpus.as_deref(),
+            Self::AddMarkdown(AddMarkdownRequest { corpus, .. })
+            | Self::AddMarkdownBatch { corpus, .. }
+            | Self::DeleteMarkdown(DeleteMarkdownRequest { corpus, .. }) => Some(corpus.as_str()),
+        }
+    }
 }
 
 /// The discriminated request body. One variant per CLI/MCP operation the

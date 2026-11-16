@@ -17,14 +17,18 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::codec::LinesCodecError;
+use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
 
 use hallouminate_config::{self, Config};
 
 use super::dispatch::dispatch;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::heartbeat::TaskName;
-use super::ipc::{DaemonRequest, DaemonResponse};
+use super::ipc::{DaemonRequest, DaemonResponse, ErrorKind};
 use super::ladder::LadderAction;
+use super::oplog::{self, Outcome, Reason, RequestId};
 use super::socket::daemon_socket_path;
 use super::state::{DaemonState, IdleClock, WorkClass};
 use super::watchdog;
@@ -591,19 +595,22 @@ async fn serve_on_listener(
         };
         let state = state.clone();
         let conn = state.enter_connection(WorkClass::External);
-        handlers.spawn(async move {
-            // Held for the handler's lifetime; decrements the active-connection
-            // count on drop so idle-exit never fires mid-request (ADR-003).
-            let _conn = conn;
-            let _permit = permit;
-            if let Err(e) = handle_connection(state, stream, idle_timeout).await {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    error = %e,
-                    "connection handler errored"
-                );
+        handlers.spawn(
+            async move {
+                // Held for the handler's lifetime; decrements the active-connection
+                // count on drop so idle-exit never fires mid-request (ADR-003).
+                let _conn = conn;
+                let _permit = permit;
+                if let Err(e) = handle_connection(state, stream, idle_timeout).await {
+                    tracing::warn!(
+                        target: "hallouminate::daemon",
+                        error = %e,
+                        "connection handler errored"
+                    );
+                }
             }
-        });
+            .with_current_subscriber(),
+        );
     }
     let shutdown_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
     drain_handlers(&mut handlers, shutdown_deadline).await;
@@ -650,7 +657,7 @@ async fn handle_connection(
     // allowlist (B6 defense-in-depth). Captured before `into_split` since the
     // whole `UnixStream` (not either half) implements `AsRawFd`.
     let peer_uid = peer_credential_uid(&stream);
-    let effective_uid = rustix::process::geteuid().as_raw();
+    let effective_uid = state.authorized_uid();
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = ipc_lines(read_half);
     let frame = match tokio::time::timeout(idle_timeout, lines.next()).await {
@@ -667,19 +674,12 @@ async fn handle_connection(
     let Some(frame) = frame else {
         return Ok(());
     };
-    let mut idle_clock = IdleClock::Keep;
-    let response = match frame {
+    let request = match frame {
         Ok(line) => match serde_json::from_str::<DaemonRequest>(&line) {
-            Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
-                Some(denied) => denied,
-                None => {
-                    let candidate_idle_clock = idle_clock_for(&req.payload);
-                    let response = dispatch(&state, req).await;
-                    idle_clock = idle_clock_for_response(candidate_idle_clock, &response);
-                    response
-                }
-            },
-            Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
+            Ok(req) => Ok(req),
+            Err(e) => Err(DaemonResponse::invalid_params(format!(
+                "invalid request: {e}"
+            ))),
         },
         Err(LinesCodecError::MaxLineLengthExceeded) => {
             tracing::warn!(
@@ -687,19 +687,52 @@ async fn handle_connection(
                 cap_bytes = MAX_IPC_LINE_BYTES,
                 "request line exceeded the size cap; returning structured error",
             );
-            DaemonResponse::invalid_params(format!(
+            Err(DaemonResponse::invalid_params(format!(
                 "request line exceeds {MAX_IPC_LINE_BYTES}-byte cap"
-            ))
+            )))
         }
-        Err(LinesCodecError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
-            DaemonResponse::invalid_params(format!("invalid request: {error}"))
-        }
+        Err(LinesCodecError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => Err(
+            DaemonResponse::invalid_params(format!("invalid request: {error}")),
+        ),
         Err(LinesCodecError::Io(error)) => return Err(error.into()),
+    };
+    let span = match &request {
+        Ok(req) => {
+            let request_id = match &req.request_id {
+                Some(request_id) => request_id.clone(),
+                None => RequestId::generate(),
+            };
+            oplog::root_span(&request_id, req.payload.op_name(), req.payload.corpus())
+        }
+        Err(_rejected) => oplog::root_span(&RequestId::generate(), oplog::UNKNOWN_OP, None),
+    };
+    let mut outcome = OutcomeGuard::new(span.clone(), state.shutdown_token().clone());
+    state.note_dispatch();
+    let mut idle_clock = IdleClock::Keep;
+    let response = match request {
+        Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
+            Some(denied) => denied,
+            None => {
+                let candidate_idle_clock = idle_clock_for(&req.payload);
+                let response = dispatch(&state, req).instrument(span).await;
+                idle_clock = idle_clock_for_response(candidate_idle_clock, &response);
+                response
+            }
+        },
+        Err(rejected) => rejected,
     };
     // Request completed. Every request stamps the External clock; only
     // inference-bearing requests restart the idle-exit window (ADR-004).
     state.touch_activity(WorkClass::External, idle_clock);
-    let text = response_frame(&response)?;
+    let Frame { text, fit } = response_frame(&response)?;
+    match fit {
+        FrameFit::Fits => {
+            let WarningSummary { count, codes } = warning_summary(&response);
+            oplog::record_warnings(outcome.span(), count, &codes);
+            outcome.record(response_outcome(&response));
+        }
+        FrameFit::Oversize => outcome.record(Outcome::InvalidParams),
+    }
     let write_result = tokio::time::timeout(idle_timeout, async {
         write_half.write_all(text.as_bytes()).await?;
         write_half.flush().await
@@ -718,21 +751,128 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Records the outcome of one operation on its root span. An operation that
+/// ends without a recorded outcome is `cancelled`/`shutdown` when the daemon
+/// is shutting down, and `internal` otherwise.
+struct OutcomeGuard {
+    span: tracing::Span,
+    shutdown: CancellationToken,
+    state: OutcomeState,
+}
+
+enum OutcomeState {
+    Open,
+    Recorded,
+}
+
+impl OutcomeGuard {
+    fn new(span: tracing::Span, shutdown: CancellationToken) -> Self {
+        Self {
+            span,
+            shutdown,
+            state: OutcomeState::Open,
+        }
+    }
+
+    fn span(&self) -> &tracing::Span {
+        &self.span
+    }
+
+    fn record(&mut self, outcome: Outcome) {
+        oplog::record_outcome(&self.span, outcome);
+        self.state = OutcomeState::Recorded;
+    }
+}
+
+impl Drop for OutcomeGuard {
+    fn drop(&mut self) {
+        match self.state {
+            OutcomeState::Recorded => {}
+            OutcomeState::Open => {
+                let outcome = match self.shutdown.is_cancelled() {
+                    true => Outcome::Cancelled(Reason::Shutdown),
+                    false => Outcome::Internal,
+                };
+                oplog::record_outcome(&self.span, outcome);
+            }
+        }
+    }
+}
+
+fn response_outcome(response: &DaemonResponse) -> Outcome {
+    match response {
+        DaemonResponse::Ok { .. } => Outcome::Ok,
+        DaemonResponse::Err { kind, .. } => match kind {
+            ErrorKind::InvalidParams => Outcome::InvalidParams,
+            ErrorKind::Internal => Outcome::Internal,
+            ErrorKind::Retryable => Outcome::Retryable,
+        },
+    }
+}
+
+struct WarningSummary {
+    count: u64,
+    codes: Vec<String>,
+}
+
+/// Counts the warnings of a success response. `ground` nests its coded
+/// warnings under `response`; other operations return free-text warnings at
+/// the top level, which have no code. Free text never leaves this function.
+fn warning_summary(response: &DaemonResponse) -> WarningSummary {
+    let mut summary = WarningSummary {
+        count: 0,
+        codes: Vec::new(),
+    };
+    let DaemonResponse::Ok { result } = response else {
+        return summary;
+    };
+    let warnings = match result.pointer("/response/warnings") {
+        Some(warnings) => Some(warnings),
+        None => result.get("warnings"),
+    };
+    let Some(serde_json::Value::Array(warnings)) = warnings else {
+        return summary;
+    };
+    summary.count = u64::try_from(warnings.len()).unwrap_or(u64::MAX);
+    for warning in warnings {
+        if let Some(code) = warning.get("code").and_then(serde_json::Value::as_str) {
+            summary.codes.push(code.to_owned());
+        }
+    }
+    summary
+}
+
+struct Frame {
+    text: String,
+    fit: FrameFit,
+}
+
+enum FrameFit {
+    Fits,
+    Oversize,
+}
+
 /// Serializes one response line. A response that cannot fit one IPC frame
 /// becomes an `invalid_params` error that names the byte counts, because the
 /// client would otherwise fail on the frame limit without a reason.
-fn response_frame(response: &DaemonResponse) -> serde_json::Result<String> {
+fn response_frame(response: &DaemonResponse) -> serde_json::Result<Frame> {
     let mut text = serde_json::to_string(response)?;
     text.push('\n');
     if text.len() <= MAX_IPC_LINE_BYTES {
-        return Ok(text);
+        return Ok(Frame {
+            text,
+            fit: FrameFit::Fits,
+        });
     }
     let oversize = text.len();
     let mut error = serde_json::to_string(&DaemonResponse::invalid_params(format!(
         "response is {oversize} bytes; the IPC limit is {MAX_IPC_LINE_BYTES} bytes. Narrow the request, for example with a smaller limit or corpus"
     )))?;
     error.push('\n');
-    Ok(error)
+    Ok(Frame {
+        text: error,
+        fit: FrameFit::Oversize,
+    })
 }
 
 /// Classify a request for the idle-exit window (ADR daemon-idle-exit-004).
@@ -910,10 +1050,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn ping_request_bytes() -> Vec<u8> {
-        serde_json::to_vec(&DaemonRequest {
-            cwd: PathBuf::from("."),
-            payload: super::super::ipc::DaemonRequestPayload::Ping,
-        })
+        serde_json::to_vec(&DaemonRequest::new(
+            PathBuf::from("."),
+            super::super::ipc::DaemonRequestPayload::Ping,
+        ))
         .expect("serialize request")
     }
 
@@ -970,7 +1110,10 @@ mod tests {
     #[test]
     fn oversize_response_becomes_an_invalid_params_error_naming_byte_counts() {
         let oversize = DaemonResponse::ok(&"x".repeat(MAX_IPC_LINE_BYTES));
-        let frame = response_frame(&oversize).expect("frame");
+        let Frame { text: frame, fit } = response_frame(&oversize).expect("frame");
+        let FrameFit::Oversize = fit else {
+            panic!("an oversize response must report the oversize fit");
+        };
         assert!(frame.len() <= MAX_IPC_LINE_BYTES, "{}", frame.len());
         let DaemonResponse::Err { kind, message } =
             serde_json::from_str(frame.trim_end()).expect("parse frame")
@@ -988,7 +1131,10 @@ mod tests {
     #[test]
     fn response_at_the_frame_cap_passes_through() {
         let text = "x".repeat(MAX_IPC_LINE_BYTES - 64);
-        let frame = response_frame(&DaemonResponse::ok(&text)).expect("frame");
+        let Frame { text: frame, fit } = response_frame(&DaemonResponse::ok(&text)).expect("frame");
+        let FrameFit::Fits = fit else {
+            panic!("a response inside the limit must report the fits fit");
+        };
         assert!(frame.len() <= MAX_IPC_LINE_BYTES);
         let DaemonResponse::Ok { .. } = serde_json::from_str(frame.trim_end()).expect("parse")
         else {

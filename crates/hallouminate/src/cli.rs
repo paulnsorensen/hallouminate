@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use hallouminate_daemon::oplog::{Client, ClientCall, OpLog, Outcome};
+
+use crate::input_error::InputError;
 
 mod config;
 mod ground;
@@ -380,9 +383,10 @@ pub enum ConfigAction {
 }
 
 pub async fn dispatch(cli: Cli, startup: hallouminate_config::Config) -> anyhow::Result<()> {
+    let oplog = OpLog::from_config(&startup.logging);
     match cli.command {
-        Command::Index(args) => cmd_index(args.into()).await,
-        Command::Ground(args) => cmd_ground(args.into()).await,
+        Command::Index(args) => cmd_index(args.into(), &oplog).await,
+        Command::Ground(args) => cmd_ground(args.into(), &oplog).await,
         Command::Hook { action } => match action {
             HookAction::Install { repo } => cmd_hook_install(HookArgs { repo }),
             HookAction::Uninstall { repo } => cmd_hook_uninstall(HookArgs { repo }),
@@ -403,33 +407,60 @@ pub async fn dispatch(cli: Cli, startup: hallouminate_config::Config) -> anyhow:
         },
         Command::Serve => {
             hallouminate_daemon::ensure_daemon_running().await?;
-            crate::mcp::serve_stdio().await
+            crate::mcp::serve_stdio(oplog).await
         }
         Command::Daemon(args) => {
             let action = args.action.clone().unwrap_or(DaemonAction::Run);
             match action {
                 DaemonAction::Run => hallouminate_daemon::run_daemon(startup, args.into()).await,
                 DaemonAction::Stop => {
-                    hallouminate_daemon::stop().await?;
-                    println!("daemon stopped");
-                    Ok(())
+                    let mut call = ClientCall::start(&oplog, Client::Cli, "stop", "shutdown", None);
+                    let result = hallouminate_daemon::stop_logged(&mut call).await;
+                    if let Ok(()) = result {
+                        println!("daemon stopped");
+                    }
+                    call.finish(fallback_outcome(&result));
+                    result
                 }
                 DaemonAction::Restart => {
-                    hallouminate_daemon::restart().await?;
-                    println!("daemon restarted");
-                    Ok(())
+                    let mut call =
+                        ClientCall::start(&oplog, Client::Cli, "restart", "shutdown", None);
+                    let result = hallouminate_daemon::restart_logged(&mut call).await;
+                    if let Ok(()) = result {
+                        println!("daemon restarted");
+                    }
+                    call.finish(fallback_outcome(&result));
+                    result
                 }
                 DaemonAction::Status => {
-                    match hallouminate_daemon::status().await? {
-                        hallouminate_daemon::DaemonStatus::Running(report) => {
-                            print!("{}", render_status_report(&report));
+                    let mut call = ClientCall::start(&oplog, Client::Cli, "status", "status", None);
+                    let result = hallouminate_daemon::status_logged(&mut call).await;
+                    match &result {
+                        Ok(hallouminate_daemon::DaemonStatus::Running(report)) => {
+                            print!("{}", render_status_report(report));
                         }
-                        hallouminate_daemon::DaemonStatus::NotRunning => println!("not running"),
+                        Ok(hallouminate_daemon::DaemonStatus::NotRunning) => {
+                            println!("not running")
+                        }
+                        Err(_) => {}
                     }
-                    Ok(())
+                    call.finish(fallback_outcome(&result));
+                    result.map(|_| ())
                 }
             }
         }
+    }
+}
+
+/// The `client_call` outcome of a CLI command when the daemon recorded none:
+/// `invalid_params` for a caller error, `internal` for any other failure.
+fn fallback_outcome<T>(result: &anyhow::Result<T>) -> Outcome {
+    let Err(error) = result else {
+        return Outcome::Ok;
+    };
+    match error.downcast_ref::<InputError>() {
+        Some(_) => Outcome::InvalidParams,
+        None => Outcome::Internal,
     }
 }
 

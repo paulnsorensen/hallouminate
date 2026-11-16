@@ -458,6 +458,13 @@ struct DaemonStateInner {
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
     shutdown: CancellationToken,
+    /// Test override for the uid that mutating peers must match.
+    authorized_uid: std::sync::OnceLock<u32>,
+    /// Test override for the maintenance debt level that the mutation gate reads.
+    debt_level: std::sync::OnceLock<super::debt::DebtLevel>,
+    /// Requests that connection handlers started to dispatch.
+    #[cfg(feature = "test-hooks")]
+    dispatched: std::sync::atomic::AtomicU64,
 }
 
 /// Both guards a mutating handler takes in the documented
@@ -726,6 +733,10 @@ impl DaemonState {
                     maintenance_task: Mutex::new(None),
                     watch_registry: Arc::new(super::watch::WatchRegistry::new()),
                     shutdown,
+                    authorized_uid: std::sync::OnceLock::new(),
+                    debt_level: std::sync::OnceLock::new(),
+                    #[cfg(feature = "test-hooks")]
+                    dispatched: std::sync::atomic::AtomicU64::new(0),
                 }
             }),
         };
@@ -774,6 +785,55 @@ impl DaemonState {
     /// signal handlers call [`CancellationToken::cancel`].
     pub fn shutdown_token(&self) -> &CancellationToken {
         &self.inner.shutdown
+    }
+
+    /// Makes mutating requests require peer uid `uid` instead of the daemon's
+    /// effective uid. Integration tests use this to reach the unauthorized-peer
+    /// rejection. The first call wins.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn set_authorized_uid_for_tests(&self, uid: u32) {
+        let _ = self.inner.authorized_uid.set(uid);
+    }
+
+    /// Uid that a peer must have to send a mutating request.
+    pub(crate) fn authorized_uid(&self) -> u32 {
+        match self.inner.authorized_uid.get() {
+            Some(uid) => *uid,
+            None => rustix::process::geteuid().as_raw(),
+        }
+    }
+
+    /// Makes the mutation gate of this daemon read `Hard` maintenance debt.
+    /// Integration tests use this to reach the retryable outcome without a
+    /// process-wide debt observation. The first call wins.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn force_hard_debt_for_tests(&self) {
+        let _ = self.inner.debt_level.set(super::debt::DebtLevel::Hard);
+    }
+
+    /// Debt level that a test forced, if any.
+    pub(crate) fn forced_debt_level(&self) -> Option<super::debt::DebtLevel> {
+        self.inner.debt_level.get().copied()
+    }
+
+    /// Counts a request that a connection handler starts to dispatch.
+    pub(crate) fn note_dispatch(&self) {
+        #[cfg(feature = "test-hooks")]
+        self.inner
+            .dispatched
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Number of requests that connection handlers started to dispatch.
+    /// Integration tests poll it to know that a request is in flight.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn dispatched_requests_for_tests(&self) -> u64 {
+        self.inner
+            .dispatched
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) async fn take_maintenance_task(&self) -> Option<JoinHandle<()>> {

@@ -17,8 +17,24 @@ pub mod daemon;
 pub static LANCE_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use hallouminate_adapters::{EMBEDDING_DIM, EmbedBatch, EmbedRole};
+use hallouminate_config::LoggingConfig;
+use hallouminate_daemon::oplog::{Client, ClientCall, OpLog};
 use hallouminate_domain::common::{CorpusKey, Result};
 use hallouminate_domain::indexer::{PreparedChunk, PreparedFile};
+
+/// An operations log that writes no row, for tests that do not check rows.
+pub fn unlogged_oplog() -> OpLog {
+    let config = LoggingConfig {
+        operations: false,
+        ..LoggingConfig::default()
+    };
+    OpLog::in_dir(std::path::PathBuf::new(), &config)
+}
+
+/// A CLI `client_call` for `tool` on [`unlogged_oplog`].
+pub fn unlogged_cli_call(tool: &str) -> ClientCall {
+    ClientCall::start(&unlogged_oplog(), Client::Cli, tool, tool, None)
+}
 
 pub struct StubEmbedder;
 
