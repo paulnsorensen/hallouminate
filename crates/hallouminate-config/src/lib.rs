@@ -3804,10 +3804,13 @@ path = "."
         let dir = tempfile::tempdir().expect("tempdir");
         let outer = canon(dir.path());
         let repo_root = outer.join("repo");
+        let outside = toml::Value::String(outer.join("outside").display().to_string()).to_string();
         write_repo_config(
             &repo_root,
-            "[security]\nallow_repo_paths_outside_root = [\"/etc\"]\n\n\
-             [[corpus]]\nname = \"etc\"\npaths = [\"/etc\"]\n",
+            &format!(
+                "[security]\nallow_repo_paths_outside_root = [{outside}]\n\n\
+                 [[corpus]]\nname = \"etc\"\npaths = [{outside}]\n"
+            ),
         );
 
         let err = resolve_for_cwd(&Config::default(), &repo_root, None)
@@ -3932,8 +3935,10 @@ path = "."
                 other => panic!("unexpected error: {other:?}"),
             }
         }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absolute = toml::Value::String(canon(dir.path()).display().to_string()).to_string();
         parse(
-            "[security]\nallow_repo_paths_outside_root = [\"/abs\", \"~/docs\"]\n",
+            &format!("[security]\nallow_repo_paths_outside_root = [{absolute}, \"~/docs\"]\n"),
             None,
         )
         .expect("absolute and ~/ entries stay valid");
