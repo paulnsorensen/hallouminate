@@ -214,6 +214,12 @@ fn session_start_hook_runs_background_index_and_always_exits_zero() {
         "codex plugin must reference the shared hook file"
     );
 
+    #[cfg(unix)]
+    check_session_start_hook_execution(command);
+}
+
+#[cfg(unix)]
+fn check_session_start_hook_execution(command: &str) {
     let empty = tempfile::tempdir().expect("tempdir");
     let status = std::process::Command::new("/bin/sh")
         .args(["-c", command])

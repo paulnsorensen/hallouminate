@@ -430,6 +430,7 @@ async fn lexical_fallback_term_in_indexed_and_unindexed_file_lists_each_once() {
     }
 }
 
+#[cfg(unix)]
 fn hook_command() -> String {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let path = Path::new(manifest).join("../../plugins/hallouminate/hooks/hooks.json");
@@ -441,6 +442,7 @@ fn hook_command() -> String {
         .to_string()
 }
 
+#[cfg(unix)]
 fn run_hook_with_fake(script: &str) -> (Option<i32>, std::time::Duration) {
     let bin = tempfile::tempdir().expect("bin dir");
     let fake = bin.path().join("hallouminate");
@@ -457,12 +459,14 @@ fn run_hook_with_fake(script: &str) -> (Option<i32>, std::time::Duration) {
     (output.status.code(), started.elapsed())
 }
 
+#[cfg(unix)]
 #[test]
 fn session_start_hook_exits_zero_when_hallouminate_fails() {
     let (code, _) = run_hook_with_fake("#!/bin/sh\necho boom >&2\nexit 7\n");
     assert_eq!(code, Some(0), "a failing index must not fail the hook");
 }
 
+#[cfg(unix)]
 #[test]
 fn session_start_hook_does_not_hold_the_output_pipes_of_a_blocked_index() {
     let (code, elapsed) = run_hook_with_fake("#!/bin/sh\necho started\nsleep 5\n");

@@ -743,19 +743,33 @@ mod tests {
         );
     }
 
-    fn which(bin: &str) -> std::io::Result<std::path::PathBuf> {
-        let path = std::env::var_os("PATH")
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "PATH not set"))?;
-        for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(bin);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("{bin} not on PATH"),
-        ))
+    fn rg_command_succeeds(program: &std::ffi::OsStr, arg: &str) -> bool {
+        std::process::Command::new(program)
+            .arg(arg)
+            .output()
+            .is_ok_and(|output| output.status.success())
+    }
+
+    #[test]
+    fn rg_detector_checks_executable_and_exit_status() {
+        let executable = std::env::current_exe().expect("test executable path");
+        assert!(rg_command_succeeds(executable.as_os_str(), "--help"));
+        assert!(!rg_command_succeeds(
+            executable.as_os_str(),
+            "--invalid-option"
+        ));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing-rg");
+        assert!(!rg_command_succeeds(missing.as_os_str(), "--version"));
+
+        let invalid = dir.path().join(if cfg!(windows) {
+            "invalid.exe"
+        } else {
+            "invalid"
+        });
+        std::fs::write(&invalid, "not an executable").expect("write invalid executable");
+        assert!(!rg_command_succeeds(invalid.as_os_str(), "--version"));
     }
 
     /// `rg` is a hard runtime dependency of this crate. On a developer
@@ -764,14 +778,14 @@ mod tests {
     /// this guards the per-term matching and determinism regression
     /// coverage that is the point of this file.
     fn require_rg() -> bool {
-        if which("rg").is_ok() {
+        if rg_command_succeeds(std::ffi::OsStr::new("rg"), "--version") {
             return true;
         }
         assert!(
             std::env::var_os("CI").is_none(),
-            "rg not found on PATH; rg is a hard runtime dependency and must be installed in CI"
+            "rg is missing or unusable on PATH; rg is a hard runtime dependency and must be installed in CI"
         );
-        eprintln!("SKIP: rg not found on PATH; skipping ripgrep test locally");
+        eprintln!("SKIP: rg is missing or unusable on PATH; skipping ripgrep test locally");
         false
     }
 }
