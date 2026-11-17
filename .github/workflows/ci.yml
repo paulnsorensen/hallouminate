@@ -249,10 +249,10 @@ jobs:
   # matrix gains or loses an OS.
   build-test:
     name: build & test
-    needs: build-test-matrix
+    needs: [build-test-matrix, windows, verification-lease, npm-installer]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Require all matrix legs to pass
-        if: needs.build-test-matrix.result != 'success'
+        if: needs.build-test-matrix.result != 'success' || needs.windows.result != 'success' || needs.verification-lease.result != 'success' || needs.npm-installer.result != 'success'
         run: exit 1
