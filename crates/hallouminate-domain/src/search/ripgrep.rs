@@ -601,7 +601,13 @@ mod tests {
         .hits;
         let files: std::collections::HashSet<&str> = hits
             .iter()
-            .map(|h| h.file_ref.rsplit('/').next().unwrap())
+            .map(|h| {
+                Path::new(&h.file_ref)
+                    .file_name()
+                    .expect("fixture filename")
+                    .to_str()
+                    .expect("UTF-8 fixture filename")
+            })
             .collect();
         assert!(
             files.contains("bbb.md") && files.contains("ccc.md") && files.contains("ddd.md"),
@@ -629,7 +635,13 @@ mod tests {
         .hits;
         let files: std::collections::HashSet<&str> = hits
             .iter()
-            .map(|h| h.file_ref.rsplit('/').next().unwrap())
+            .map(|h| {
+                Path::new(&h.file_ref)
+                    .file_name()
+                    .expect("fixture filename")
+                    .to_str()
+                    .expect("UTF-8 fixture filename")
+            })
             .collect();
         assert_eq!(
             files,
