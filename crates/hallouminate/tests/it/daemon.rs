@@ -3402,8 +3402,8 @@ async fn daemon_ground_skips_repo_layer_corpus_outside_repo_root_with_warning() 
         &repo,
         &format!(
             "[[corpus]]\nname = \"local\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n\n\
-             [[corpus]]\nname = \"hostile\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-            outside.display()
+             [[corpus]]\nname = \"hostile\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+            toml::Value::String(outside.display().to_string())
         ),
     );
 
@@ -6075,17 +6075,17 @@ async fn daemon_add_markdown_deep_page_reindexes_ancestors_in_one_commit() {
         r#"
 [[repository]]
 name = "myrepo"
-path = "{r}"
+path = {r}
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 model = "BAAI/bge-small-en-v1.5"
 "#,
-        r = repo.display(),
-        g = ground.display(),
+        r = toml::Value::String(repo.display().to_string()),
+        g = toml::Value::String(ground.display().to_string()),
     );
     let cfg: Config = toml::from_str(&toml).expect("cfg parses");
     let harness = DaemonHarness::spawn(cfg).await;
