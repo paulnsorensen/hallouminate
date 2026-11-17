@@ -1874,7 +1874,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("secret.md"), b"shh\n").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("docs")).unwrap();
+        symlink(&outside, root.join("docs")).unwrap();
         let err = open_existing_file_no_follow(&root, Path::new("docs/secret.md"))
             .expect_err("swapped parent must bounce");
         assert!(matches!(err.kind, WriteErrorKind::Symlink), "{err:?}");
@@ -1889,6 +1889,7 @@ mod tests {
         assert!(!tmp.path().join("missing").exists(), "parent was created");
     }
 
+    #[cfg(unix)]
     #[test]
     fn open_existing_file_no_follow_rejects_a_fifo_leaf_without_blocking() {
         let tmp = tempfile::tempdir().unwrap();
