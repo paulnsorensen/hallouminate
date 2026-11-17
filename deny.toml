@@ -9,7 +9,9 @@ targets = []
 # Fail on unmaintained-crate advisories only for direct workspace dependencies.
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+ignore = [
+  { id = "RUSTSEC-2026-0543", reason = "chrono has no patched release; accept maintenance risk pending replacement" },
+]
 
 [bans]
 # fastembed pins tokenizers 0.22 while hallouminate-domain pins 0.23, so
