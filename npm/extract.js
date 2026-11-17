@@ -26,7 +26,7 @@ async function installArchive(buffer, artifact, binDir, platform = process.platf
     if (platform === "win32") {
       await run("powershell.exe", [
         "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-        "$ErrorActionPreference = 'Stop'; Expand-Archive -LiteralPath $env:HALLOUMINATE_ARCHIVE -DestinationPath $env:HALLOUMINATE_EXTRACTED",
+        "$ErrorActionPreference = 'Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($env:HALLOUMINATE_ARCHIVE, $env:HALLOUMINATE_EXTRACTED)",
       ], { env: { ...process.env, HALLOUMINATE_ARCHIVE: archive, HALLOUMINATE_EXTRACTED: extracted } });
     } else {
       await run("tar", ["-xJf", archive, "--strip-components=1", "-C", extracted]);
