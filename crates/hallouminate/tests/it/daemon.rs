@@ -1892,10 +1892,12 @@ async fn client_for_default_socket_respawns_then_returns_the_reconnected_client(
 
 /// Points `XDG_RUNTIME_DIR` at a directory for one test and restores the
 /// previous value on drop. Hold it only while an `EnvGuard` is alive.
+#[cfg(unix)]
 struct XdgRuntimeDir {
     previous: Option<std::ffi::OsString>,
 }
 
+#[cfg(unix)]
 impl XdgRuntimeDir {
     fn set(dir: &Path) -> Self {
         let previous = std::env::var_os("XDG_RUNTIME_DIR");
@@ -1904,6 +1906,7 @@ impl XdgRuntimeDir {
     }
 }
 
+#[cfg(unix)]
 impl Drop for XdgRuntimeDir {
     fn drop(&mut self) {
         match self.previous.take() {
@@ -1913,12 +1916,14 @@ impl Drop for XdgRuntimeDir {
     }
 }
 
+#[cfg(unix)]
 fn bind_legacy_xdg_socket(runtime_dir: &Path) -> tokio::net::UnixListener {
     let legacy_dir = runtime_dir.join("hallouminate");
     std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy dir");
     tokio::net::UnixListener::bind(legacy_dir.join("daemon.sock")).expect("bind legacy socket")
 }
 
+#[cfg(unix)]
 async fn legacy_socket_was_dialed(listener: &tokio::net::UnixListener) -> bool {
     timeout(Duration::from_millis(200), listener.accept())
         .await
@@ -1929,6 +1934,7 @@ async fn legacy_socket_was_dialed(listener: &tokio::net::UnixListener) -> bool {
 // redirect it. On a host with a live canonical daemon, canonical-first code
 // with a legacy fallback also passes. CI runners have no canonical daemon, so
 // the test rejects a restored fallback there.
+#[cfg(unix)]
 #[tokio::test]
 async fn default_discovery_never_dials_a_socket_that_exists_only_at_the_legacy_xdg_path() {
     let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
@@ -1947,6 +1953,7 @@ async fn default_discovery_never_dials_a_socket_that_exists_only_at_the_legacy_x
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn explicit_socket_override_wins_over_a_legacy_xdg_socket() {
     let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
