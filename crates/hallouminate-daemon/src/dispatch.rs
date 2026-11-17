@@ -3778,8 +3778,8 @@ mod tests {
             std::fs::write(corpus_dir.join("pending.md"), "# Pending\n\ncontent\n")
                 .expect("write pending");
             repo_config.push_str(&format!(
-                "[[corpus]]\nname = \"test{number}\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-                corpus_dir.display()
+                "[[corpus]]\nname = \"test{number}\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+                toml::Value::String(corpus_dir.display().to_string())
             ));
         }
         write_repo_layer(tmp.path(), &repo_config);
@@ -4653,8 +4653,8 @@ mod tests {
         write_repo_layer(
             tmp.path(),
             &format!(
-                "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-                corpus_dir.display()
+                "[[corpus]]\nname = \"docs\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+                toml::Value::String(corpus_dir.display().to_string())
             ),
         );
         let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
@@ -4778,8 +4778,8 @@ mod tests {
         write_repo_layer(
             tmp,
             &format!(
-                "[[corpus]]\nname = \"test\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-                corpus_dir.display()
+                "[[corpus]]\nname = \"test\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+                toml::Value::String(corpus_dir.display().to_string())
             ),
         );
         corpus_dir
@@ -4808,6 +4808,10 @@ mod tests {
         fn install() -> (Self, tracing::subscriber::DefaultGuard) {
             use tracing_subscriber::layer::SubscriberExt;
 
+            static GLOBAL: std::sync::Once = std::sync::Once::new();
+            GLOBAL.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+            });
             let capture = Self::default();
             let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
             (capture, tracing::subscriber::set_default(subscriber))
@@ -5205,8 +5209,14 @@ mod tests {
 
         let paths: Vec<&String> = result.response.docs.keys().collect();
         assert_eq!(paths.len(), 1, "{paths:?}");
-        assert!(
-            paths[0].contains("/repo-b/") && paths[0].ends_with("alpha.md"),
+        assert_eq!(
+            Path::new(paths[0])
+                .canonicalize()
+                .expect("canonical hit path"),
+            wiki_b
+                .join("alpha.md")
+                .canonicalize()
+                .expect("canonical wiki path"),
             "hits come from the worktree's own paths: {paths:?}"
         );
         for doc in result.response.docs.values() {
