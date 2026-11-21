@@ -1,0 +1,137 @@
+name: Windows stack proof
+
+on:
+  push:
+    branches: [t3/windows-stack-proof-20261121]
+
+permissions:
+  contents: read
+
+jobs:
+  release-archive:
+    name: Build and install the Windows release archive
+    runs-on: windows-2022
+    timeout-minutes: 100
+    steps:
+      - name: Enable Windows long paths
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install protoc
+        run: choco install protoc --yes --no-progress
+      - name: Install cargo-dist 0.32.0
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'cargo-dist.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'cargo-dist'
+          $url = 'https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-x86_64-pc-windows-msvc.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $sha = (Get-FileHash -Algorithm SHA256 $zip).Hash
+          if ($sha -ne '26e845cabff12a92911ce960af73a86c8f9b2b2d9072b01dfe5b662acf044fa3') {
+            throw 'cargo-dist checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest
+          $dist = Get-ChildItem -Path $dest -Filter dist.exe -Recurse -File | Select-Object -First 1
+          if (-not $dist) { throw 'dist.exe is missing' }
+          $dist.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Build the release archive and installer
+        run: |
+          dist build --artifacts=local --target=x86_64-pc-windows-msvc --print=linkage
+          if ($LASTEXITCODE -ne 0) { throw 'Windows artifact build failed' }
+          dist build --artifacts=global --target=x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+      - name: Check the archive checksum and launch the executable
+        run: |
+          $zip = 'target/distrib/hallouminate-x86_64-pc-windows-msvc.zip'
+          $expected = ((Get-Content -Raw "$zip.sha256").Trim() -split '\s+')[0]
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash
+          if ($actual -ne $expected) { throw 'Release archive checksum mismatch' }
+          $dest = Join-Path $env:RUNNER_TEMP 'release-smoke'
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest
+          $version = & (Join-Path $dest 'hallouminate.exe') --version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^hallouminate \d+\.\d+\.\d+') {
+            throw "Unexpected executable version: $version"
+          }
+          Write-Output $version
+      - name: Run the generated PowerShell installer
+        run: |
+          $distrib = (Resolve-Path 'target/distrib').Path
+          $server = Start-Job -ArgumentList $distrib -ScriptBlock {
+            param($root)
+            python -m http.server 49176 --bind 127.0.0.1 --directory $root
+          }
+          try {
+            $env:INSTALLER_DOWNLOAD_URL = 'http://127.0.0.1:49176'
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 30; ++$attempt) {
+              try {
+                Invoke-WebRequest -Uri $env:INSTALLER_DOWNLOAD_URL -TimeoutSec 2 | Out-Null
+                $ready = $true
+                break
+              } catch {
+                Start-Sleep -Seconds 1
+              }
+            }
+            if (-not $ready) { throw 'Loopback artifact server did not start' }
+            $env:CARGO_DIST_FORCE_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'ps-installer-smoke'
+            $env:XDG_CONFIG_HOME = Join-Path $env:RUNNER_TEMP 'ps-installer-receipts'
+            powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $distrib 'hallouminate-installer.ps1') -NoModifyPath
+            if ($LASTEXITCODE -ne 0) { throw 'PowerShell installer failed' }
+            $exe = Get-ChildItem -Path $env:CARGO_DIST_FORCE_INSTALL_DIR -Filter hallouminate.exe -Recurse -File | Select-Object -First 1
+            if (-not $exe) { throw 'Installer did not install hallouminate.exe' }
+            $version = & $exe.FullName --version
+            if ($LASTEXITCODE -ne 0 -or $version -notmatch '^hallouminate \d+\.\d+\.\d+') {
+              throw "Unexpected installed version: $version"
+            }
+            Write-Output $version
+          } finally {
+            Remove-Job -Id $server.Id -Force
+          }
+      - name: Install the same ZIP with the npm extractor and run the launcher
+        run: |
+          @'
+          const fs = require("node:fs");
+          const { installArchive } = require("./npm/extract");
+          const archive = "hallouminate-x86_64-pc-windows-msvc.zip";
+          installArchive(fs.readFileSync("target/distrib/" + archive),
+            { archive, binary: "hallouminate.exe" }, "npm/bin").catch((error) => {
+              console.error(error);
+              process.exitCode = 1;
+            });
+          '@ | node --input-type=commonjs -
+          if ($LASTEXITCODE -ne 0) { throw 'npm extraction failed' }
+          $version = node npm/run.js --version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^hallouminate \d+\.\d+\.\d+') {
+            throw "Unexpected npm launcher version: $version"
+          }
+          Write-Output $version
+
+  shutdown-regression:
+    name: Reject the old Windows daemon shutdown code
+    runs-on: windows-2022
+    timeout-minutes: 85
+    steps:
+      - name: Enable Windows long paths
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+      - name: Install protoc
+        run: choco install protoc --yes --no-progress
+      - name: Run the regression on the fixed tree
+        run: just verify cargo test --locked -p hallouminate-daemon --lib server::tests::stop_waits_for_windows_daemon_to_drain -- --exact
+      - name: Check that the same test catches the old shutdown behavior
+        run: |
+          git restore --source=fe311b7416ae89156a507fb17919f0428cc0481a -- crates/hallouminate-daemon/src/lifecycle.rs
+          if ($LASTEXITCODE -ne 0) { throw 'Could not load the original lifecycle implementation' }
+          $PSNativeCommandUseErrorActionPreference = $false
+          $log = just verify cargo test --locked -p hallouminate-daemon --lib server::tests::stop_waits_for_windows_daemon_to_drain -- --exact 2>&1
+          $exitCode = $LASTEXITCODE
+          $log | Write-Output
+          if ($exitCode -eq 0 -or ($log -join "`n") -notmatch 'stop must wait while the daemon drains a connection') {
+            throw "The test did not reject the old shutdown behavior (exit $exitCode)"
+          }
+          exit 0
