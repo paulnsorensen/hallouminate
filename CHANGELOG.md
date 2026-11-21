@@ -9,6 +9,45 @@ for each release window.
 
 ## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.11.1...HEAD)
 
+### Added
+
+- Ground: exact phrase match mode
+- Ground: chunk overlap, page rollup, and phrase counts in results
+- Ground: useful results on the first call in a fresh worktree
+- Indexer: index JSON and JSONL source files
+- MCP: batch markdown operations and clearer retrieval recovery messages
+- Adapters: scalar indexes on `corpus`, `root`, and `content_hash`
+- Skills: `wiki-ingest` bundles the `ingest-ledger` CLI
+- Fuzz: `cargo-fuzz` targets and a Fuzz workflow for domain parsers and indexer format handlers
+- Build: Windows verification leases
+- Site: illuminated halloumi favicon
+
+### Changed
+
+- Lance: defer FTS and FM index rebuilds from `apply_batch` to maintenance, and project only hit columns in `fts_scan` and `vector_scan`
+- Daemon: batch the ancestor reindex for `add_markdown` and add timing spans
+- Build: sccache locally and in CI; Rust nightly pin moves to nightly-2026-11-12; MSRV rises to 1.94 for lancedb 0.41
+- CI: daily security re-check for advisories and stale dependency reviews; auto-merge for bot patch and minor bumps
+- Docs: document body-only phrase matching and the daemon reply-size guard
+- Dependencies: lancedb 0.41, rmcp 3.9.0, ort pinned to 2.0.0-rc.15, zip 9.x (via calamine 0.38), notify 9.0.0-rc.8, notify-debouncer-full 0.8.0-rc.3, fastembed 7.7, rust_xlsxwriter 0.102.0, text-splitter 0.33.2, TypeScript 7, Node 26, pnpm 12.19.0, Astro 7.4.8, Starlight 0.42.10
+
+### Fixed
+
+- Search: match wrapped phrases and name skipped index files
+- Search: prioritize headings and lower the ranking of generated index pages
+- Search: match the FM literal signal case-insensitively
+- Ground: rank corpora together and skip missing corpus roots
+- Daemon: recover stale `ground_dir` override stores per request
+- Daemon: report a per-build identity in Ping so a new build restarts stale nightlies
+- Daemon: remove legacy XDG socket probing from default discovery
+- Adapters: recover table directories left without a manifest
+- Adapters: keep ONNX sessions on CPU with fastembed 7.7 `PreferCPU` to stop CoreML auto-selection on macOS
+- MCP: return an actionable `InvalidParams` error when `cwd` is missing
+- Config: explain baseline-only conflicts and stop reporting a found repo config as missing
+- Claim marks: strip claim comments until none remain
+- Eval: measure only the baseline arm in CI measure mode
+- Security: bump rmcp to 3.9.0 for RUSTSEC-2026-0462, and pulldown-cmark to 0.13.5 to stop an offset-iterator panic
+
 ## [0.11.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.11.1) - 2026-09-23
 
 ### Changed
