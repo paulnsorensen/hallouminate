@@ -64,10 +64,8 @@ fn resolve_effective_prefix_strip(args: &GroundArgs) -> Option<String> {
     resolve_path_prefix_strip(&effective, args.corpus.as_deref())
 }
 
-/// When exactly one corpus is in scope and that corpus has exactly one root
-/// path, return that path (with a trailing `/`) so the outline format can
-/// strip it for readability. Multi-path or multi-corpus situations return
-/// `None` — the full absolute path stays so paths remain unambiguous.
+/// Returns the root prefix when exactly one corpus with one root is in scope.
+/// The outline keeps absolute paths when multiple corpora or roots are in scope.
 ///
 /// Resolves against `effective_corpora()` so a single configured
 /// `[[repository]]` (which derives `repo:{name}:wiki` as its sole corpus)
@@ -88,11 +86,7 @@ fn resolve_path_prefix_strip(cfg: &Config, requested_corpus: Option<&str>) -> Op
     }
     let expanded = expand_tilde(&corpus.paths[0]);
     let canonical = canonicalize_or_passthrough(&expanded).into_path_buf();
-    let mut prefix = canonical.to_string_lossy().into_owned();
-    if !prefix.ends_with('/') {
-        prefix.push('/');
-    }
-    Some(prefix)
+    Some(canonical.to_string_lossy().into_owned())
 }
 
 /// Route a ground request through the local daemon. Corpus name
@@ -139,7 +133,7 @@ mod tests {
     use hallouminate_domain::repository::RepositoryConfig;
 
     #[test]
-    fn path_prefix_strip_returns_sole_corpus_path_with_trailing_slash() {
+    fn path_prefix_strip_returns_sole_corpus_path() {
         let cfg = Config {
             corpora: vec![CorpusConfig {
                 name: "only".into(),
@@ -150,7 +144,7 @@ mod tests {
         };
         assert_eq!(
             resolve_path_prefix_strip(&cfg, None),
-            Some("/abs/cheese/".to_string())
+            Some("/abs/cheese".to_string())
         );
     }
 
@@ -167,7 +161,7 @@ mod tests {
         assert_eq!(
             resolve_path_prefix_strip(&cfg, None),
             Some("/abs/cheese/".to_string()),
-            "single trailing slash, not two"
+            "keep the configured slash when canonical resolution fails"
         );
     }
 
@@ -185,9 +179,63 @@ mod tests {
             }],
             ..Default::default()
         };
-        let expected = format!("{}/", std::fs::canonicalize(wiki)?.display());
+        let expected = std::fs::canonicalize(wiki)?.to_string_lossy().into_owned();
 
         assert_eq!(resolve_path_prefix_strip(&cfg, None), Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn outline_uses_relative_paths_for_a_canonical_root() -> anyhow::Result<()> {
+        use hallouminate_domain::ground::DocFile;
+
+        let directory = tempfile::tempdir()?;
+        let document = directory.path().join("INDEX.md");
+        std::fs::write(&document, "# Index\n")?;
+        let canonical = std::fs::canonicalize(&document)?;
+        let config = Config {
+            corpora: vec![CorpusConfig {
+                name: "wiki".into(),
+                paths: vec![directory.path().to_string_lossy().into_owned()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let response = GroundResponse {
+            query: "index".into(),
+            took_ms: 0,
+            stats: Default::default(),
+            docs: [(
+                canonical.to_string_lossy().into_owned(),
+                DocFile {
+                    summary: None,
+                    keywords: Vec::new(),
+                    score: 1.0,
+                    z_score: None,
+                    mtime: String::new(),
+                    corpus: "wiki".into(),
+                    path: Some("INDEX.md".into()),
+                    stale: false,
+                    chunks: Vec::new(),
+                    coverage: None,
+                },
+            )]
+            .into(),
+            code: Default::default(),
+            warnings: Vec::new(),
+        };
+        let outline = render(
+            &response,
+            Format::Outline,
+            &RenderOpts {
+                path_prefix_strip: resolve_path_prefix_strip(&config, None),
+                ..Default::default()
+            },
+        );
+        assert!(
+            outline.lines().any(|line| line == "INDEX.md  (1.000)"),
+            "{outline}"
+        );
         Ok(())
     }
 
@@ -207,7 +255,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let expected = format!("{}/", std::fs::canonicalize(wiki)?.display());
+        let expected = std::fs::canonicalize(wiki)?.to_string_lossy().into_owned();
 
         assert_eq!(resolve_path_prefix_strip(&cfg, None), Some(expected));
         Ok(())
@@ -265,7 +313,7 @@ mod tests {
         };
         assert_eq!(
             resolve_path_prefix_strip(&cfg, Some("b")),
-            Some("/b/".to_string()),
+            Some("/b".to_string()),
         );
     }
 
@@ -297,7 +345,7 @@ mod tests {
             !prefix.starts_with('~'),
             "tilde must be expanded: got {prefix:?}"
         );
-        assert!(prefix.ends_with("/.cheese/"), "trailing slash: {prefix:?}");
+        assert!(std::path::Path::new(&prefix).ends_with(".cheese"));
     }
 
     #[test]
@@ -315,12 +363,12 @@ mod tests {
         };
         assert_eq!(
             resolve_path_prefix_strip(&cfg, None),
-            Some(format!(
-                "{}/",
+            Some(
                 std::path::Path::new("/repos/tern")
                     .join(".hallouminate/wiki")
-                    .display()
-            ))
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
     }
 }
