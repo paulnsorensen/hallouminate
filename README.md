@@ -256,19 +256,19 @@ explicit single-root corpus — the multi-root union is read- and search-only.
 
 A long-lived local daemon owns the LanceDB ground directory, the repository
 registry, and per-corpus mutation locks. The CLI and the stdio MCP server are
-thin clients that talk to it over a Unix domain socket.
+thin clients that use a Unix domain socket or a Windows named pipe.
 
 - **Auto-spawn** — `hallouminate serve`, `index`, and `ground` start a
   detached daemon automatically when none is listening; there is nothing to
   start by hand.
-- **Socket resolution order** — `HALLOUMINATE_SOCKET` (explicit full-path
-  override; setting it also disables auto-spawn — the caller owns the daemon
-  lifecycle), else `<account-home>/.cache/hallouminate/daemon.sock`. The
-  account home comes from the OS user record, not `$HOME` or
-  `$XDG_RUNTIME_DIR`.
+- **Endpoint** — set `HALLOUMINATE_SOCKET` to an explicit full path to override
+  the default and disable auto-spawn. The default on Unix is
+  `<account-home>/.cache/hallouminate/daemon.sock`. On Windows it is
+  `<account-home>\AppData\Local\hallouminate\daemon.sock`. The OS supplies
+  the account home. On Windows this path identifies the named pipe.
 - **Lifecycle** — `hallouminate daemon status` / `stop` / `restart`; bare
-  `hallouminate daemon` runs it in the foreground. Only one instance per
-  socket can run (`flock`-guarded).
+  `hallouminate daemon` runs it in the foreground. A lock permits only one
+  daemon per endpoint.
 - **Version-skew respawn** — after a binary upgrade, the next client pings
   the running daemon and compares versions; a mismatch stops the stale daemon
   and spawns a fresh one. No manual restart needed after upgrades.
