@@ -798,7 +798,7 @@ fn idle_clock_for_response(
     }
 }
 
-fn lock_path_for(socket_path: &Path) -> PathBuf {
+pub(super) fn lock_path_for(socket_path: &Path) -> PathBuf {
     let mut s = socket_path.as_os_str().to_os_string();
     s.push(".lock");
     PathBuf::from(s)
@@ -1093,6 +1093,61 @@ mod tests {
         let mut lines = ipc_lines(client);
         assert_eq!(lines.next().await.transpose().expect("read idle EOF"), None);
     }
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_waits_for_windows_daemon_to_drain() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.embeddings.enabled = false;
+        config.daemon.maintenance_interval_secs = 0;
+        config.storage.ground_dir = directory
+            .path()
+            .join("ground")
+            .to_string_lossy()
+            .into_owned();
+        let state = DaemonState::open(config, None).await?;
+        let shutdown = state.shutdown_token().clone();
+        let socket = directory.path().join("daemon.sock");
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move { serve(&state, &server_socket).await });
+
+        let mut draining = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match LocalStream::connect(&socket).await {
+                    Ok(stream) => break Ok(stream),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => break Err(error),
+                }
+            }
+        })
+        .await??;
+        draining.write_all(b"{").await?;
+
+        let stop = super::super::lifecycle::stop_at(&socket);
+        tokio::pin!(stop);
+        tokio::select! {
+            result = &mut stop => panic!("stop returned before shutdown: {result:?}"),
+            requested = tokio::time::timeout(Duration::from_secs(2), shutdown.cancelled()) => {
+                requested?;
+            }
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(7), &mut stop)
+                .await
+                .is_err(),
+            "stop must wait while the daemon drains a connection"
+        );
+        drop(draining);
+        stop.await?;
+        assert!(!socket.exists(), "stop must wait for endpoint cleanup");
+        let _next_daemon = acquire_single_instance(&lock_path_for(&socket))?;
+        let served = tokio::time::timeout(Duration::from_secs(5), server).await?;
+        served??;
+        Ok(())
+    }
+
     #[test]
     fn lock_path_appends_dot_lock_suffix() {
         let sock = PathBuf::from("/tmp/hallouminate/daemon.sock");
