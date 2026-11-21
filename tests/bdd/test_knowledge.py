@@ -250,7 +250,7 @@ def new_fact_only(app: Application, client: Mcp) -> None:
 def external_delete(app: Application, client: Mcp) -> None:
     external_page(app).write_text(OLD)
     reindex(app, client)
-    assert found(app, client, "cobaltbeacon") == [PATH]
+    _assert_indexed_facts(app, client, {"cobaltbeacon": "# Answer The answer is cobaltbeacon."})
     external_page(app).unlink()
     reindex(app, client)
 
@@ -259,7 +259,7 @@ def external_delete(app: Application, client: Mcp) -> None:
 def external_absent(app: Application, client: Mcp) -> None:
     files = tool_result(client.call(app, "list_files", corpus=CORPUS))
     assert PATH not in [entry["path"] for entry in files["files"]], files
-    assert found(app, client, "cobaltbeacon") == []
+    _assert_indexed_facts(app, client, {"cobaltbeacon": None})
     response = client.call(app, "read_markdown", corpus=CORPUS, path=PATH)
     assert response["error"]["code"] == -32602, response
 
