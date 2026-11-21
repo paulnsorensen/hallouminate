@@ -29,7 +29,7 @@ for each release window.
 - Build: sccache locally and in CI; Rust nightly pin moves to nightly-2026-11-12; MSRV rises to 1.94 for lancedb 0.41
 - CI: daily security re-check for advisories and stale dependency reviews; auto-merge for bot patch and minor bumps
 - Docs: document body-only phrase matching and the daemon reply-size guard
-- Dependencies: lancedb 0.41, rmcp 3.9.0, ort pinned to rc.13, zip 9.x (via calamine 0.38), notify 9.0.0-rc.8, notify-debouncer-full 0.8.0-rc.3, fastembed 7.1.1, rust_xlsxwriter 0.102.0, text-splitter 0.33.2, TypeScript 7, Node 26, pnpm 12.19.0, Astro 7.4.8, Starlight 0.42.10
+- Dependencies: lancedb 0.41, rmcp 3.9.0, ort pinned to 2.0.0-rc.15, zip 9.x (via calamine 0.38), notify 9.0.0-rc.8, notify-debouncer-full 0.8.0-rc.3, fastembed 7.7, rust_xlsxwriter 0.102.0, text-splitter 0.33.2, TypeScript 7, Node 26, pnpm 12.19.0, Astro 7.4.8, Starlight 0.42.10
 
 ### Fixed
 
@@ -41,7 +41,7 @@ for each release window.
 - Daemon: report a per-build identity in Ping so a new build restarts stale nightlies
 - Daemon: remove legacy XDG socket probing from default discovery
 - Adapters: recover table directories left without a manifest
-- Adapters: keep ONNX sessions on CPU with fastembed 7.7 `PreferCPU`, and pin `ort` to rc.13 to stop CoreML auto-selection on macOS
+- Adapters: keep ONNX sessions on CPU with fastembed 7.7 `PreferCPU` to stop CoreML auto-selection on macOS
 - MCP: return an actionable `InvalidParams` error when `cwd` is missing
 - Config: explain baseline-only conflicts and stop reporting a found repo config as missing
 - Claim marks: strip claim comments until none remain
