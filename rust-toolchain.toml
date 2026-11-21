@@ -2,4 +2,4 @@
 # The MSRV is `rust-version` in Cargo.toml. lancedb 0.41 and lance 14
 # require rustc 1.94, so the channel must not go below 1.94.
 [toolchain]
-channel = "1.99"
+channel = "1.100"
