@@ -20,7 +20,9 @@ installers = ["shell"]
 # Target platforms to build apps for (Rust target-triple syntax)
 # x86_64-apple-darwin dropped: ort (ONNX Runtime, via fastembed) ships no prebuilt
 # for it (pykeio/ort#556); it can't link without a from-source build (out of scope).
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+targets = ["aarch64-apple-darwin"]
+# TEMPORARY test harness: build the macOS target on this PR. Revert before merge.
+pr-run-mode = "upload"
 
 # Pin the runners so the ort/onnxruntime prebuilt links cleanly:
 #  - x86_64 Linux on ubuntu-24.04 (glibc 2.39) resolves the prebuilt's glibc-2.38
