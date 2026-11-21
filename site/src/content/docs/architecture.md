@@ -2,7 +2,7 @@
 title: "Architecture"
 ---
 
-Hallouminate uses a [Sliced Bread](https://github.com/paulnsorensen/hallouminate)
+Hallouminate uses a [Sliced Bread](https://github.com/paulnsorensen/sliced-bread-architecture)
 layout — vertical slices with public APIs at slice boundaries, no cross-slice
 peeks at internals. Three top-level concerns under `src/`.
 
