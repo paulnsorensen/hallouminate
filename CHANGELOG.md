@@ -7,7 +7,13 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.12.1...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.12.2...HEAD)
+
+## [0.12.2](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.2) - 2026-11-21
+
+### Fixed
+
+- Release: link the Xcode clang runtime into the macOS dist build. The dist profile's thin LTO drops the `___isPlatformVersionAtLeast` symbol that the prebuilt onnxruntime needs (rust-lang/rust#164915), so the v0.12.1 macOS build failed to link. v0.12.1 published only to crates.io and the skill pack, with no GitHub release, binaries, or npm package
 
 ## [0.12.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.1) - 2026-11-21
 
