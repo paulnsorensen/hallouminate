@@ -137,6 +137,8 @@ jobs:
           path: target/distrib/
           merge-multiple: true
       - name: Install dependencies
+        if: runner.os != 'Windows'
+        shell: bash
         # Retry: GitHub-hosted runners (esp. ubuntu-24.04-arm) intermittently
         # can't reach ports.ubuntu.com / brew's mirror (transient network
         # blip, not a repo issue) — a bare apt-get/brew failure here should
@@ -153,6 +155,9 @@ jobs:
           done
           echo "::error::package install failed after 5 attempts"
           exit 1
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        run: choco install protoc --yes --no-progress
       - name: Expose Xcode compiler runtime
         if: ${{ startsWith(matrix.runner, 'macos-') }}
         run: |
@@ -170,6 +175,13 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Smoke-test the Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $destination = Join-Path $env:RUNNER_TEMP 'hallouminate-release-smoke'
+          Expand-Archive -LiteralPath target/distrib/hallouminate-x86_64-pc-windows-msvc.zip -DestinationPath $destination -Force
+          & (Join-Path $destination 'hallouminate.exe') --version
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

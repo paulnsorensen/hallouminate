@@ -40,7 +40,8 @@ mod status;
 mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;
-mod transport;
+#[doc(hidden)]
+pub mod transport;
 mod watch;
 mod watchdog;
 #[cfg(windows)]

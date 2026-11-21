@@ -59,7 +59,15 @@ cargo install hallouminate --locked  # source build — needs Rust + protoc
 ```
 
 Prebuilts cover Apple-silicon macOS (`aarch64-apple-darwin`) and x86_64 /
-aarch64 Linux (glibc ≥ 2.39). Re-run the install command any time to upgrade.
+aarch64 Linux (glibc ≥ 2.39), plus x86_64 Windows (MSVC). Re-run the install command any time to upgrade.
+
+On Windows, use `npx hallouminate --help` or install from PowerShell:
+
+```powershell
+irm https://github.com/paulnsorensen/hallouminate/releases/latest/download/hallouminate-installer.ps1 | iex
+```
+
+Windows binaries require the [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe).
 
 Source builds need `protoc` (the `lancedb` build dependency:
 `brew install protobuf` / `apt install protobuf-compiler`); from a git
@@ -67,9 +75,14 @@ checkout, `cargo build --release` lands the binary at
 `target/release/hallouminate`.
 
 Intel macOS and older-glibc Linux have no prebuilt (`ort`/ONNX Runtime ships
-no Intel-mac build — pykeio/ort#556); use the source build there. **Windows
-is unsupported** — the daemon is Unix-only (Unix domain socket + `flock`);
-see [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
+no Intel-mac build — pykeio/ort#556); use the source build there. Windows source
+builds require the MSVC Rust toolchain, Visual Studio C++ Build Tools with the
+Windows SDK, and `protoc`. From a checkout, run `just verify`; the executable
+is `target/debug/hallouminate.exe`.
+
+The Windows verification gate also needs Python, `just`, ripgrep, and the Rust
+`rustfmt` and `clippy` components. Enable Windows Developer Mode before running
+the sandbox tests: they create symbolic links to verify filesystem containment.
 
 Verify with `hallouminate --version`.
 
@@ -243,19 +256,19 @@ explicit single-root corpus — the multi-root union is read- and search-only.
 
 A long-lived local daemon owns the LanceDB ground directory, the repository
 registry, and per-corpus mutation locks. The CLI and the stdio MCP server are
-thin clients that talk to it over a Unix domain socket.
+thin clients that use a Unix domain socket or a Windows named pipe.
 
 - **Auto-spawn** — `hallouminate serve`, `index`, and `ground` start a
   detached daemon automatically when none is listening; there is nothing to
   start by hand.
-- **Socket resolution order** — `HALLOUMINATE_SOCKET` (explicit full-path
-  override; setting it also disables auto-spawn — the caller owns the daemon
-  lifecycle), else `<account-home>/.cache/hallouminate/daemon.sock`. The
-  account home comes from the OS user record, not `$HOME` or
-  `$XDG_RUNTIME_DIR`.
+- **Endpoint** — set `HALLOUMINATE_SOCKET` to an explicit full path to override
+  the default and disable auto-spawn. The default on Unix is
+  `<account-home>/.cache/hallouminate/daemon.sock`. On Windows it is
+  `<account-home>\AppData\Local\hallouminate\daemon.sock`. The OS supplies
+  the account home. On Windows this path identifies the named pipe.
 - **Lifecycle** — `hallouminate daemon status` / `stop` / `restart`; bare
-  `hallouminate daemon` runs it in the foreground. Only one instance per
-  socket can run (`flock`-guarded).
+  `hallouminate daemon` runs it in the foreground. A lock permits only one
+  daemon per endpoint.
 - **Version-skew respawn** — after a binary upgrade, the next client pings
   the running daemon and compares versions; a mismatch stops the stale daemon
   and spawns a fresh one. No manual restart needed after upgrades.
@@ -269,8 +282,9 @@ thin clients that talk to it over a Unix domain socket.
   `HALLOUMINATE_LOG_MAX_FILE_BYTES` / `HALLOUMINATE_LOG_MAX_TOTAL_BYTES`.
   `[watch].failure_reminder_secs` defaults to 60 seconds; override it with
   `HALLOUMINATE_WATCH_FAILURE_REMINDER_SECS` or set `0` to disable suppression.
-- **Windows** — the daemon model is Unix-only; see
-  [#48](https://github.com/paulnsorensen/hallouminate/issues/48).
+- **Windows** — the daemon uses a local named pipe restricted to the current
+  account. `daemon stop`, `daemon restart`, and MCP use the same protocol as
+  Linux and macOS. Windows ARM64 release artifacts are not provided.
 
 ## FAQ
 

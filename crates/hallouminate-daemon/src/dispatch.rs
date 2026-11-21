@@ -2494,11 +2494,19 @@ fn enrich_read_not_found(
     req_path: &str,
 ) -> DaemonResponse {
     let bare = format!("{req_path} does not exist");
-    let is_bare_not_found = matches!(
-        &resp,
-        DaemonResponse::Err { kind: ErrorKind::InvalidParams, message } if *message == bare
-    );
-    if !is_bare_not_found {
+    let DaemonResponse::Err {
+        kind: ErrorKind::InvalidParams,
+        message,
+    } = &resp
+    else {
+        return resp;
+    };
+    let is_windows_citation = cfg!(windows)
+        && message == "path contains a Windows reserved character"
+        && citation_bare_path(req_path).is_some_and(|candidate| {
+            validate_wiki_read_path(corpora, corpus_name, candidate).is_ok()
+        });
+    if *message != bare && !is_windows_citation {
         return resp;
     }
     let Some(corpus) = corpora.iter().find(|c| c.name == corpus_name) else {
@@ -2978,8 +2986,8 @@ mod tests {
         cold_wait_ms: u64,
     ) -> DaemonState {
         let toml = format!(
-            "{baseline_toml}\n[storage]\nground_dir = \"{}\"\n",
-            ground_dir.display(),
+            "{baseline_toml}\n[storage]\nground_dir = {}\n",
+            toml::Value::String(ground_dir.display().to_string()),
         );
         let mut cfg: Config = toml::from_str(&toml).expect("baseline toml parses");
         cfg.search.cold_wait_ms = cold_wait_ms;
@@ -3003,9 +3011,9 @@ mod tests {
         std::fs::create_dir_all(&root_b).expect("mkdir docs_b");
         let ground = tmp.path().join("ground");
         let baseline = format!(
-            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\", \"{}\"]\nglobs = [\"**/*.md\"]\n[embeddings]\nenabled = false\n",
-            root_a.display(),
-            root_b.display(),
+            "[[corpus]]\nname = \"docs\"\npaths = [{}, {}]\nglobs = [\"**/*.md\"]\n[embeddings]\nenabled = false\n",
+            toml::Value::String(root_a.display().to_string()),
+            toml::Value::String(root_b.display().to_string()),
         );
         let state = state_with_ground(&ground, &baseline).await;
         std::fs::write(root_a.join("a.md"), "# Root A\n\nbody a\n").expect("write a.md");
@@ -3237,7 +3245,7 @@ mod tests {
                     "conflict error must name the field: {message}",
                 );
                 assert!(
-                    message.contains("\"/a\"") && message.contains("\"/b\""),
+                    message.contains("\"/a\"") && message.contains("/b\""),
                     "conflict error must show both values: {message}",
                 );
             }
@@ -3264,8 +3272,8 @@ mod tests {
         // already has the parsed Config in memory by this point); we just
         // need a sentinel string to verify it lands in the diagnostic.
         let baseline_toml = format!(
-            "[embeddings]\ncache_dir = \"/a\"\n[storage]\nground_dir = \"{}\"\n",
-            ground.display(),
+            "[embeddings]\ncache_dir = \"/a\"\n[storage]\nground_dir = {}\n",
+            toml::Value::String(ground.display().to_string()),
         );
         let cfg: Config = toml::from_str(&baseline_toml).expect("baseline parses");
         let state = DaemonState::open(cfg, Some(baseline_path.clone()))
@@ -3442,10 +3450,10 @@ mod tests {
             global: false,
         };
         let repo_config = format!(
-            "[[corpus]]\nname = \"test\"\npaths = [\"{}\", \"{}\", \"{}\"]\nglobs = [\"**/*.md\"]\n",
-            root_a.display(),
-            root_a.display(),
-            root_b.display(),
+            "[[corpus]]\nname = \"test\"\npaths = [{}, {}, {}]\nglobs = [\"**/*.md\"]\n",
+            toml::Value::String(root_a.display().to_string()),
+            toml::Value::String(root_a.display().to_string()),
+            toml::Value::String(root_b.display().to_string()),
         );
         write_repo_layer(tmp.path(), &repo_config);
         let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
@@ -3594,10 +3602,10 @@ mod tests {
         let repo_config = format!(
             concat!(
                 "[[corpus]]\nname = \"test\"\n",
-                "paths = [\"{}\"]",
+                "paths = [{}]",
                 "\nglobs = [\"**/*.md\"]\nexclude = [\"**/excluded.md\"]\n"
             ),
-            corpus_dir.display()
+            toml::Value::String(corpus_dir.display().to_string())
         );
         write_repo_layer(tmp.path(), &repo_config);
         let state = state_with_ground(&ground, "[embeddings]\nenabled = false\n").await;
@@ -3664,8 +3672,8 @@ mod tests {
         let ground = tmp.path().join("ground");
 
         let repo_config = format!(
-            "[[repository]]\nname = \"myrepo\"\npath = \"{}\"\n",
-            repo_root.display()
+            "[[repository]]\nname = \"myrepo\"\npath = {}\n",
+            toml::Value::String(repo_root.display().to_string()),
         );
         write_repo_layer(repo_root, &repo_config);
         let state = state_with_ground(&ground, "").await;
@@ -3705,8 +3713,8 @@ mod tests {
         let corpus_dir = tmp.join("wiki");
         std::fs::create_dir_all(&corpus_dir).expect("mkdir wiki");
         let repo_config = format!(
-            "[[corpus]]\nname = \"test\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-            corpus_dir.display()
+            "[[corpus]]\nname = \"test\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+            toml::Value::String(corpus_dir.display().to_string()),
         );
         write_repo_layer(tmp, &repo_config);
         let state = state_with_ground(&tmp.join("ground"), "[embeddings]\nenabled = false\n").await;
@@ -3778,8 +3786,8 @@ mod tests {
             std::fs::write(corpus_dir.join("pending.md"), "# Pending\n\ncontent\n")
                 .expect("write pending");
             repo_config.push_str(&format!(
-                "[[corpus]]\nname = \"test{number}\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-                corpus_dir.display()
+                "[[corpus]]\nname = \"test{number}\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+                toml::Value::String(corpus_dir.display().to_string())
             ));
         }
         write_repo_layer(tmp.path(), &repo_config);
@@ -4250,7 +4258,9 @@ mod tests {
         // silently routed into the upsert path as if it were a brand-new file.
         let indexed_mtime = std::fs::metadata(&file).unwrap().modified().unwrap();
         std::fs::write(&file, "").unwrap();
-        std::fs::File::open(&file)
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
             .unwrap()
             .set_modified(indexed_mtime)
             .unwrap();
@@ -4546,8 +4556,8 @@ mod tests {
         std::fs::write(corpus_dir.join("initial.md"), "# Initial\n\ncontent\n")
             .expect("write initial");
         let repo_config = format!(
-            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-            corpus_dir.display()
+            "[[corpus]]\nname = \"docs\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+            toml::Value::String(corpus_dir.display().to_string()),
         );
         write_repo_layer(tmp.path(), &repo_config);
         let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
@@ -4653,8 +4663,8 @@ mod tests {
         write_repo_layer(
             tmp.path(),
             &format!(
-                "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-                corpus_dir.display()
+                "[[corpus]]\nname = \"docs\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+                toml::Value::String(corpus_dir.display().to_string())
             ),
         );
         let _coord = crate::debt::OBSERVED_HARD_COORD.read().await;
@@ -4778,8 +4788,8 @@ mod tests {
         write_repo_layer(
             tmp,
             &format!(
-                "[[corpus]]\nname = \"test\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
-                corpus_dir.display()
+                "[[corpus]]\nname = \"test\"\npaths = [{}]\nglobs = [\"**/*.md\"]\n",
+                toml::Value::String(corpus_dir.display().to_string())
             ),
         );
         corpus_dir
@@ -4808,6 +4818,10 @@ mod tests {
         fn install() -> (Self, tracing::subscriber::DefaultGuard) {
             use tracing_subscriber::layer::SubscriberExt;
 
+            static GLOBAL: std::sync::Once = std::sync::Once::new();
+            GLOBAL.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+            });
             let capture = Self::default();
             let subscriber = tracing_subscriber::Registry::default().with(capture.clone());
             (capture, tracing::subscriber::set_default(subscriber))
@@ -5205,8 +5219,14 @@ mod tests {
 
         let paths: Vec<&String> = result.response.docs.keys().collect();
         assert_eq!(paths.len(), 1, "{paths:?}");
-        assert!(
-            paths[0].contains("/repo-b/") && paths[0].ends_with("alpha.md"),
+        assert_eq!(
+            Path::new(paths[0])
+                .canonicalize()
+                .expect("canonical hit path"),
+            wiki_b
+                .join("alpha.md")
+                .canonicalize()
+                .expect("canonical wiki path"),
             "hits come from the worktree's own paths: {paths:?}"
         );
         for doc in result.response.docs.values() {
