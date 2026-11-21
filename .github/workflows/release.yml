@@ -155,6 +155,12 @@ jobs:
           exit 1
       - name: Expose Xcode compiler runtime
         if: ${{ startsWith(matrix.runner, 'macos-') }}
+        # The prebuilt onnxruntime (ort-sys) uses Objective-C `@available`, which
+        # calls ___isPlatformVersionAtLeast. Rust std defines that symbol, but
+        # the dist profile's LTO drops it (rust-lang/rust#164915), and rustc
+        # links with -nodefaultlibs, so clang does not add its runtime. Link
+        # the Xcode clang runtime archive explicitly. Use RUSTFLAGS: dist sets
+        # RUSTFLAGS from this env, which overrides CARGO_TARGET_*_RUSTFLAGS.
         run: |
           set -euo pipefail
           clang_bin="$(xcrun --toolchain XcodeDefault --find clang)"
@@ -164,7 +170,13 @@ jobs:
             echo "::error::could not find Xcode compiler runtime under $clang_usr/lib/clang"
             exit 1
           fi
+          runtime_lib="$runtime_dir/libclang_rt.osx.a"
+          if [ ! -f "$runtime_lib" ]; then
+            echo "::error::could not find $runtime_lib"
+            exit 1
+          fi
           echo "LIBRARY_PATH=$runtime_dir${LIBRARY_PATH:+:$LIBRARY_PATH}" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }-Clink-arg=$runtime_lib" >> "$GITHUB_ENV"
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

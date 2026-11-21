@@ -41,55 +41,14 @@ def read(app: Application, client: Mcp, path: str = PATH, **options: Any) -> str
     return tool_result(client.call(app, "read_markdown", path=path, **options))["content"]
 
 
-def ground(app: Application, client: Mcp, fact: str, corpus: str = CORPUS) -> Any:
-    return tool_result(client.call(app, "ground", corpus=corpus, query=fact, **{"match": "phrase"}))
-
-
-def hits(result: Any, fact: str, corpus: str) -> list[str]:
+def found(app: Application, client: Mcp, fact: str, corpus: str = CORPUS) -> list[str]:
+    result = tool_result(client.call(app, "ground", corpus=corpus, query=fact, **{"match": "phrase"}))
+    assert result["warnings"] == [], result
     documents = list(result["docs"].values())
     for document in documents:
         assert document["corpus"] == corpus, document
         assert any(fact in chunk["snippet"] for chunk in document["chunks"]), document
     return [document["path"] for document in documents]
-
-
-def found(app: Application, client: Mcp, fact: str, corpus: str = CORPUS) -> list[str]:
-    result = ground(app, client, fact, corpus)
-    assert result["warnings"] == [], result
-    return hits(result, fact, corpus)
-
-
-def pending_reconciliation(warning: dict[str, Any], corpus: str) -> bool:
-    if warning["code"] != "index-reconciliation":
-        return False
-    name, separator, detail = warning["message"].partition(": ")
-    clauses = detail.split("; ")
-    return (
-        name == corpus
-        and separator == ": "
-        and len(clauses) >= 3
-        and clauses[0].startswith("root ")
-        and clauses[1] in {"recovery state queued", "recovery state in-flight"}
-        and set(clauses[2:]) <= {"reconciliation pending", "reconciliation not complete"}
-    )
-
-
-def found_after_outside_edit(app: Application, client: Mcp, fact: str, corpus: str = CORPUS) -> list[str]:
-    # The watcher can observe an outside edit after `index` returns. Ground
-    # then reports pending reconciliation until the background pass ends.
-    # The hits must be final at once, and the warning must clear.
-    first = ground(app, client, fact, corpus)
-    paths = hits(first, fact, corpus)
-    result = first
-    deadline = time.monotonic() + 20
-    while result["warnings"]:
-        for warning in result["warnings"]:
-            assert pending_reconciliation(warning, corpus), result
-        assert time.monotonic() < deadline, f"reconciliation did not settle: {result}"
-        time.sleep(0.05)
-        result = ground(app, client, fact, corpus)
-        assert hits(result, fact, corpus) == paths, (first, result)
-    return paths
 
 
 def wait_running(app: Application, process: subprocess.Popen[bytes]) -> None:
@@ -231,11 +190,49 @@ def watched_fact(app: Application, client: Mcp) -> None:
     pytest.fail(f"external edit did not become searchable: {latest}")
 
 
+def _assert_indexed_facts(
+    app: Application, client: Mcp, facts: dict[str, str | None],
+) -> None:
+    root = (app.repo / ".hallouminate/wiki").resolve()
+    transient_messages = {
+        f"{CORPUS}: root {root}; recovery state {state}; {reason}"
+        for state in ("queued", "in-flight")
+        for reason in ("reconciliation not complete", "reconciliation pending")
+    }
+    deadline = time.monotonic() + 5
+    while True:
+        pending = None
+        for fact, snippet in facts.items():
+            result = tool_result(client.call(
+                app, "ground", corpus=CORPUS, query=fact, **{"match": "phrase"},
+            ))
+            hits = [
+                (doc["corpus"], doc["path"], [chunk["snippet"] for chunk in doc["chunks"]])
+                for doc in result["docs"].values()
+            ]
+            # Check the index result before waiting for the watcher.
+            expected = [] if snippet is None else [(CORPUS, PATH, [snippet])]
+            assert hits == expected, result
+
+            warnings = result["warnings"]
+            if warnings:
+                assert len(warnings) == 1, result
+                (warning,) = warnings
+                assert warning["code"] == "index-reconciliation", result
+                assert warning["message"] in transient_messages, result
+                pending = warning
+
+        if pending is None:
+            return
+        assert time.monotonic() < deadline, f"Watcher did not settle: {pending}"
+        time.sleep(0.05)
+
+
 @when("I change an external page and index the wiki again")
 def external_update(app: Application, client: Mcp) -> None:
     external_page(app).write_text(OLD)
     reindex(app, client)
-    assert found(app, client, "cobaltbeacon") == [PATH]
+    _assert_indexed_facts(app, client, {"cobaltbeacon": "# Answer The answer is cobaltbeacon."})
     external_page(app).write_text(NEW)
     reindex(app, client)
 
@@ -243,15 +240,17 @@ def external_update(app: Application, client: Mcp) -> None:
 @then("search finds the new fact and not the old fact")
 def new_fact_only(app: Application, client: Mcp) -> None:
     assert read(app, client) == NEW
-    assert found_after_outside_edit(app, client, "amberbeacon") == [PATH]
-    assert found_after_outside_edit(app, client, "cobaltbeacon") == []
+    _assert_indexed_facts(app, client, {
+        "amberbeacon": "# Answer The answer is amberbeacon.",
+        "cobaltbeacon": None,
+    })
 
 
 @when("I remove an external page and index the wiki again")
 def external_delete(app: Application, client: Mcp) -> None:
     external_page(app).write_text(OLD)
     reindex(app, client)
-    assert found(app, client, "cobaltbeacon") == [PATH]
+    _assert_indexed_facts(app, client, {"cobaltbeacon": "# Answer The answer is cobaltbeacon."})
     external_page(app).unlink()
     reindex(app, client)
 
@@ -260,7 +259,7 @@ def external_delete(app: Application, client: Mcp) -> None:
 def external_absent(app: Application, client: Mcp) -> None:
     files = tool_result(client.call(app, "list_files", corpus=CORPUS))
     assert PATH not in [entry["path"] for entry in files["files"]], files
-    assert found_after_outside_edit(app, client, "cobaltbeacon") == []
+    _assert_indexed_facts(app, client, {"cobaltbeacon": None})
     response = client.call(app, "read_markdown", corpus=CORPUS, path=PATH)
     assert response["error"]["code"] == -32602, response
 
