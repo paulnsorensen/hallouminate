@@ -10,7 +10,8 @@ targets = []
 yanked = "deny"
 unmaintained = "workspace"
 ignore = [
-  { id = "RUSTSEC-2026-0543", reason = "chrono has no patched release; accept maintenance risk pending replacement" },
+  # Tracked in https://github.com/paulnsorensen/hallouminate/issues/771.
+  { id = "RUSTSEC-2026-0543", reason = "chrono has no patched release; accept maintenance risk pending replacement (#771)" },
 ]
 
 [bans]
