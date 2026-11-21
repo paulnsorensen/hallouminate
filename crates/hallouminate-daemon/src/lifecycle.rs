@@ -9,7 +9,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use tokio::net::UnixStream;
+#[cfg(unix)]
+use super::transport::LocalStream;
 
 use super::bootstrap::ensure_daemon_running;
 use super::client::connect_at;
@@ -66,12 +67,15 @@ async fn status_at(socket: &Path) -> anyhow::Result<DaemonStatus> {
     }
 }
 
-/// Ask the running daemon to shut down and wait until the socket is gone.
+/// Requests shutdown and waits for the daemon to release its endpoint.
 ///
-/// No-ops (returns `Ok`) when no daemon is reachable — stopping an
-/// already-stopped daemon is success, not an error. The `Shutdown` request
-/// is config-independent on the server side, so `cwd` does not need to
-/// resolve a repo config.
+/// Stopping an already-stopped daemon succeeds. Shutdown does not require a
+/// repository configuration.
+///
+/// # Errors
+///
+/// Returns an error if the daemon does not stop before the deadline, or if
+/// the Windows endpoint or single-instance lock cannot be checked.
 pub async fn stop() -> anyhow::Result<()> {
     let socket = daemon_socket_path()?;
     stop_at(&socket).await
@@ -79,31 +83,67 @@ pub async fn stop() -> anyhow::Result<()> {
 
 pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
-    let Ok(client) = connect_at(socket).await else {
-        return Ok(());
+    let client = match connect_at(socket).await {
+        Ok(client) => Some(client),
+        #[cfg(unix)]
+        Err(_error) => return Ok(()),
+        #[cfg(windows)]
+        Err(error) => {
+            if !error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound)
+            {
+                return Err(error);
+            }
+            None
+        }
     };
-    let _ = client
-        .call_raw_with_timeout(
-            DaemonRequest {
-                cwd: std::env::current_dir().unwrap_or_default(),
-                payload: DaemonRequestPayload::Shutdown,
-            },
-            STOP_TIMEOUT,
-        )
-        .await;
+    if let Some(client) = client {
+        let _ = client
+            .call_raw_with_timeout(
+                DaemonRequest {
+                    cwd: std::env::current_dir().unwrap_or_default(),
+                    payload: DaemonRequestPayload::Shutdown,
+                },
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            )
+            .await;
+    }
 
     loop {
-        if !socket.exists() || UnixStream::connect(socket).await.is_err() {
+        #[cfg(unix)]
+        let stopped = !socket.exists() || LocalStream::connect(socket).await.is_err();
+        #[cfg(windows)]
+        let stopped = daemon_lock_released(socket)?;
+        if stopped {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "daemon did not stop within {}s (socket {} still reachable)",
+                "daemon did not stop within {}s (endpoint {})",
                 STOP_TIMEOUT.as_secs(),
                 socket.display(),
             );
         }
         tokio::time::sleep(STOP_POLL).await;
+    }
+}
+
+#[cfg(windows)]
+fn daemon_lock_released(socket: &Path) -> std::io::Result<bool> {
+    use std::fs::{OpenOptions, TryLockError};
+
+    // The pipe can stop accepting clients before the daemon releases its lock.
+    let path = super::server::lock_path_for(socket);
+    let file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(TryLockError::WouldBlock) => Ok(false),
+        Err(TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -143,7 +183,7 @@ mod tests {
     async fn status_reports_running_for_live_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind socket");
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -181,11 +221,12 @@ mod tests {
         server.await.expect("server task");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn stop_shuts_down_live_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let listener = crate::transport::LocalListener::bind(&socket).expect("bind socket");
         let socket_for_server = socket.clone();
         let server = tokio::spawn(async move {
             loop {
