@@ -30,6 +30,7 @@ mod ipc;
 mod ladder;
 mod lifecycle;
 mod maintenance;
+pub mod oplog;
 mod pressure;
 mod report;
 mod scan_cache;
@@ -59,7 +60,9 @@ pub use ipc::{
     DebtLevel, LadderAction, StatusReport, TaskName, TaskState, TaskStatus, TripState,
     WatcherCounters,
 };
-pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
+pub use lifecycle::{
+    DaemonStatus, restart, restart_logged, restart_with, status, status_logged, stop, stop_logged,
+};
 pub use report::{
     CorpusReport, IndexReport, QueuedIndexReport, SkippedFileReason, SkippedFileReport,
 };

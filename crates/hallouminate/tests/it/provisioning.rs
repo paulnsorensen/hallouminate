@@ -68,10 +68,10 @@ fn seed_repo_layer_root(repo_root: &Path, repo_name: &str) -> std::path::PathBuf
 
 async fn corpus_stats(client: &hallouminate_daemon::DaemonClient, cwd: &Path) -> CorpusStatsResult {
     client
-        .call(DaemonRequest {
-            cwd: cwd.to_path_buf(),
-            payload: DaemonRequestPayload::CorpusStats { corpus: None },
-        })
+        .call(DaemonRequest::new(
+            cwd.to_path_buf(),
+            DaemonRequestPayload::CorpusStats { corpus: None },
+        ))
         .await
         .expect("corpus_stats call")
 }
@@ -96,9 +96,9 @@ async fn poll_indexed_files_above_zero(
 
 async fn ground(client: &hallouminate_daemon::DaemonClient, cwd: &Path) -> GroundResult {
     client
-        .call(DaemonRequest {
-            cwd: cwd.to_path_buf(),
-            payload: DaemonRequestPayload::Ground(GroundRequest {
+        .call(DaemonRequest::new(
+            cwd.to_path_buf(),
+            DaemonRequestPayload::Ground(GroundRequest {
                 query: "body".to_string(),
                 corpus: None,
                 top_files: None,
@@ -110,7 +110,7 @@ async fn ground(client: &hallouminate_daemon::DaemonClient, cwd: &Path) -> Groun
                 group_by: Default::default(),
                 output: Default::default(),
             }),
-        })
+        ))
         .await
         .expect("ground call")
 }
@@ -200,10 +200,10 @@ async fn a_failed_catch_up_pass_indexes_once_the_root_is_readable_and_reconciled
     // either reports zero indexed files or fails on the same permission
     // error that made the catch-up pass fail. Both prove nothing was indexed.
     match client
-        .call::<CorpusStatsResult>(DaemonRequest {
-            cwd: repo_root.clone(),
-            payload: DaemonRequestPayload::CorpusStats { corpus: None },
-        })
+        .call::<CorpusStatsResult>(DaemonRequest::new(
+            repo_root.clone(),
+            DaemonRequestPayload::CorpusStats { corpus: None },
+        ))
         .await
     {
         Ok(stats) => assert_eq!(
@@ -244,20 +244,20 @@ async fn corpus_stats_enqueues_catch_up_after_read_only_calls() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let _list: ListFilesResult = client
-        .call(DaemonRequest {
-            cwd: repo_root.to_path_buf(),
-            payload: DaemonRequestPayload::ListFiles(ListFilesRequest { corpus: None }),
-        })
+        .call(DaemonRequest::new(
+            repo_root.to_path_buf(),
+            DaemonRequestPayload::ListFiles(ListFilesRequest { corpus: None }),
+        ))
         .await
         .expect("list_files call");
     let _read: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: repo_root.to_path_buf(),
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+        .call(DaemonRequest::new(
+            repo_root.to_path_buf(),
+            DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: None,
                 path: "a.md".to_string(),
             }),
-        })
+        ))
         .await
         .expect("read_markdown call");
 

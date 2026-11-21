@@ -13,13 +13,16 @@
 //! `hallouminate=info`. Use the same syntax as `RUST_LOG`
 //! (`hallouminate=debug,lance=warn`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use chrono::NaiveDate;
 use file_rotate::compression::Compression;
 use file_rotate::suffix::AppendCount;
 use file_rotate::{ContentLimit, FileRotate};
+use hallouminate_config::xdg::state_dir;
+use hallouminate_daemon::oplog::{self, OpLog};
 use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -31,16 +34,25 @@ const LEGACY_LOG_SUFFIX: &str = ".log";
 /// Install the global tracing subscriber. Returns a guard that must be held
 /// while logging is active. Dropping the guard drains and flushes queued records
 /// before joining the background writer.
+///
+/// The subscriber also carries the operations-log layer, which writes one
+/// `daemon_op` row per daemon operation. The log filter does not apply to it.
 pub fn init(config: &hallouminate_config::LoggingConfig) -> anyhow::Result<WorkerGuard> {
-    let (non_blocking, guard) = log_writer(&state_dir(), config)?;
+    let state_dir = state_dir();
+    let (non_blocking, guard) = log_writer(&state_dir, config)?;
 
     let filter = EnvFilter::try_from_env("HALLOUMINATE_LOG")
         .or_else(|_| EnvFilter::try_from_default_env())
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
     tracing_subscriber::registry()
-        .with(filter)
-        .with(fmt::layer().with_writer(non_blocking).with_ansi(false))
+        .with(
+            fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_filter(filter),
+        )
+        .with(oplog::layer(OpLog::in_dir(state_dir, config)))
         .try_init()
         .map_err(|e| anyhow::anyhow!("install tracing subscriber: {e}"))?;
 
@@ -54,6 +66,8 @@ fn log_writer(
     let hallouminate_config::LoggingConfig {
         max_file_bytes,
         max_total_bytes,
+        operations: _,
+        operations_max_total_bytes: _,
     } = *config;
     let max_file_bytes = usize::try_from(max_file_bytes)
         .map_err(|_| anyhow::anyhow!("logging.max_file_bytes exceeds this platform's usize"))?;
@@ -114,10 +128,6 @@ fn reap_legacy_dated_log(entry: std::fs::DirEntry) -> std::io::Result<()> {
     }
 }
 
-fn state_dir() -> PathBuf {
-    hallouminate_config::xdg::xdg_path("XDG_STATE_HOME", "~/.local/state", &["hallouminate"])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +166,7 @@ mod tests {
         let config = hallouminate_config::LoggingConfig {
             max_file_bytes: 64,
             max_total_bytes: 192,
+            ..Default::default()
         };
 
         let (_writer, guard) = log_writer(dir.path(), &config)?;
@@ -196,6 +207,7 @@ mod tests {
         let config = hallouminate_config::LoggingConfig {
             max_file_bytes: MAX_FILE_BYTES,
             max_total_bytes: MAX_TOTAL_BYTES,
+            ..Default::default()
         };
         let (writer, guard) = log_writer(dir.path(), &config)?;
         let mut writer = writer.make_writer();
@@ -280,6 +292,7 @@ mod tests {
         let config = hallouminate_config::LoggingConfig {
             max_file_bytes: MAX_FILE_BYTES,
             max_total_bytes: MAX_FILE_BYTES,
+            ..Default::default()
         };
         let (writer, guard) = log_writer(dir.path(), &config)?;
         let mut writer = writer.make_writer();

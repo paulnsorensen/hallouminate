@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 
 use hallouminate_config::{self, Config};
+use hallouminate_daemon::oplog::{Client, ClientCall, OpLog, Outcome};
 use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, GroundRequest, GroundResult, client_for,
 };
@@ -31,7 +32,20 @@ pub struct GroundArgs {
     pub socket: Option<PathBuf>,
 }
 
-pub async fn cmd_ground(args: GroundArgs) -> anyhow::Result<()> {
+pub async fn cmd_ground(args: GroundArgs, oplog: &OpLog) -> anyhow::Result<()> {
+    let mut call = ClientCall::start(
+        oplog,
+        Client::Cli,
+        "ground",
+        "ground",
+        args.corpus.as_deref(),
+    );
+    let result = ground_and_print(args, &mut call).await;
+    call.finish(super::fallback_outcome(&result));
+    result
+}
+
+async fn ground_and_print(args: GroundArgs, call: &mut ClientCall) -> anyhow::Result<()> {
     let format = args.format;
     let snippet_chars = args.snippet_chars;
     // Build the *effective* (XDG-baseline ⊕ repo-layer) view locally so the
@@ -42,7 +56,7 @@ pub async fn cmd_ground(args: GroundArgs) -> anyhow::Result<()> {
     // here: prefix-strip is cosmetic, and the daemon will repeat the same
     // resolution and surface any real error on the dispatch path below.
     let path_prefix_strip = resolve_effective_prefix_strip(&args);
-    let response = run_ground(args).await?;
+    let response = run_ground(args, call).await?;
     let opts = RenderOpts {
         snippet_chars,
         path_prefix_strip,
@@ -105,17 +119,26 @@ fn resolve_path_prefix_strip(cfg: &Config, requested_corpus: Option<&str>) -> Op
 /// Fails loudly when the daemon is unreachable rather than silently
 /// falling back to a direct store open — that fallback is what the spec
 /// exists to remove.
-pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
-    let client = client_for(args.socket.as_deref()).await?;
+///
+/// Sends the request id of `call` and records the daemon answer on it.
+pub async fn run_ground(args: GroundArgs, call: &mut ClientCall) -> anyhow::Result<GroundResponse> {
+    let client = match client_for(args.socket.as_deref()).await {
+        Ok(client) => client,
+        Err(error) => {
+            call.unanswered(Outcome::Unavailable);
+            return Err(error);
+        }
+    };
+    call.ready();
     // Capture CWD at the CLI entry so the daemon can run repo-config
     // discovery against the user's working directory rather than its own
     // (`.cheese/specs/repo-config-discovery.md`, AC #3). `PathBuf::new()`
     // was a seed placeholder; replacing it here is what makes the per-
     // request layered-config path effective end-to-end.
     let cwd = std::env::current_dir().context("capture current_dir for daemon request")?;
-    let req = DaemonRequest {
+    let req = DaemonRequest::new(
         cwd,
-        payload: DaemonRequestPayload::Ground(GroundRequest {
+        DaemonRequestPayload::Ground(GroundRequest {
             query: args.query,
             corpus: args.corpus,
             top_files: args.top_files,
@@ -127,8 +150,8 @@ pub async fn run_ground(args: GroundArgs) -> anyhow::Result<GroundResponse> {
             group_by: args.group_by,
             output: args.output,
         }),
-    };
-    let result: GroundResult = client.call(req).await?;
+    );
+    let result: GroundResult = client.call_logged(req, call).await?;
     Ok(result.response)
 }
 

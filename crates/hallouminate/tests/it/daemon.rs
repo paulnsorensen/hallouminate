@@ -136,10 +136,10 @@ ground_dir = "{g}"
     // Daemon is already dead — call_raw fails at the socket connect before
     // ever reaching dispatch, so cwd does not need to be a valid path here.
     let err = client
-        .call_raw(DaemonRequest {
-            cwd: PathBuf::new(),
-            payload: DaemonRequestPayload::Ping,
-        })
+        .call_raw(DaemonRequest::new(
+            PathBuf::new(),
+            DaemonRequestPayload::Ping,
+        ))
         .await
         .expect_err("reconnect must fail after daemon shutdown");
     let msg = format!("{err:#}");
@@ -195,15 +195,17 @@ ground_dir = "{}"
     // path avoids the embedding model entirely, keeping this test
     // hermetic.
     let cwd = harness.cwd().to_path_buf();
-    let make_req = || DaemonRequest {
-        cwd: cwd.clone(),
-        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
-            corpus: "docs".into(),
-            path: "race.md".into(),
-            content: "".into(),
-            overwrite: false,
-            ..Default::default()
-        }),
+    let make_req = || {
+        DaemonRequest::new(
+            cwd.clone(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                corpus: "docs".into(),
+                path: "race.md".into(),
+                content: "".into(),
+                overwrite: false,
+                ..Default::default()
+            }),
+        )
     };
 
     let client_a = connect_at(harness.socket()).await.expect("client a");
@@ -290,26 +292,26 @@ ground_dir = "{g}"
     let client_a = connect_at(harness.socket()).await.expect("client a");
     let client_b = connect_at(harness.socket()).await.expect("client b");
 
-    let req_a = DaemonRequest {
-        cwd: harness.cwd().to_path_buf(),
-        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+    let req_a = DaemonRequest::new(
+        harness.cwd().to_path_buf(),
+        DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: "a".into(),
             path: "alpha.md".into(),
             content: "".into(),
             overwrite: false,
             ..Default::default()
         }),
-    };
-    let req_b = DaemonRequest {
-        cwd: harness.cwd().to_path_buf(),
-        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+    );
+    let req_b = DaemonRequest::new(
+        harness.cwd().to_path_buf(),
+        DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: "b".into(),
             path: "beta.md".into(),
             content: "".into(),
             overwrite: false,
             ..Default::default()
         }),
-    };
+    );
 
     let (res_a, res_b) = tokio::join!(client_a.call_raw(req_a), client_b.call_raw(req_b));
     let res_a = res_a.expect("a transport ok");
@@ -339,10 +341,10 @@ async fn daemon_resolves_repository_derived_corpora_in_list_corpora() {
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::ListCorpora,
-        })
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::ListCorpora,
+        ))
         .await
         .expect("list_corpora ok");
     let names: Vec<String> = value
@@ -380,16 +382,16 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let body = "# Cheese\n\nHalloumi grills better than most.\n";
-    let req = DaemonRequest {
-        cwd: harness.cwd().to_path_buf(),
-        payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+    let req = DaemonRequest::new(
+        harness.cwd().to_path_buf(),
+        DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
             corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
             path: "cheese.md".into(),
             content: body.into(),
             overwrite: false,
             ..Default::default()
         }),
-    };
+    );
     let value: serde_json::Value = timeout(Duration::from_secs(60), client.call(req))
         .await
         .expect("timeout")
@@ -427,13 +429,13 @@ async fn daemon_add_markdown_to_repository_wiki_writes_under_dot_hallouminate_wi
     // Reading back through the daemon returns the verbatim bytes (the
     // wiki tree is the source of truth).
     let read_value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: Some(repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap()),
                 path: "cheese.md".into(),
             }),
-        })
+        ))
         .await
         .expect("read_markdown ok");
     assert_eq!(read_value["content"].as_str(), Some(body));
@@ -473,16 +475,16 @@ enabled = false
     // Two flaggable issues: an empty-destination link and an empty mermaid block.
     let body = "# Notes\n\nSee [the spec]() for details.\n\n```mermaid\n```\n";
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "notes.md".into(),
                 content: body.into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown ok");
 
@@ -507,16 +509,16 @@ enabled = false
 
     // A clean write omits the warnings field entirely (skip_serializing_if).
     let clean: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "clean.md".into(),
                 content: "# Clean\n\nNothing to flag here.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown clean ok");
     assert!(
@@ -559,16 +561,16 @@ enabled = false
 
     // Dangling wikilink: no `missing-page.md` exists in the corpus.
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "notes.md".into(),
                 content: "# Notes\n\nSee [[missing-page]] for details.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown ok");
     let warnings = value["warnings"]
@@ -586,29 +588,29 @@ enabled = false
 
     // real-page.md already exists, so a wikilink to it is not flagged.
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "real-page.md".into(),
                 content: "# Real page\n\nNothing to see here.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown real-page ok");
     let clean: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "links-to-real.md".into(),
                 content: "# Links to real\n\nSee [[real-page]] for details.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown links-to-real ok");
     assert!(
@@ -649,53 +651,53 @@ enabled = false
     let client = connect_at(harness.socket()).await.expect("connect");
 
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "other-page.md".into(),
                 content: "# Other page\n\nNothing links here.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown other-page ok");
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "linker.md".into(),
                 content: "# Linker\n\nSee [[other-page]] for details.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown linker ok");
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "unrelated.md".into(),
                 content: "# Unrelated\n\nNo links at all.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown unrelated ok");
 
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Backlinks(BacklinksRequest {
                 corpus: Some("docs".into()),
                 path: "other-page.md".into(),
             }),
-        })
+        ))
         .await
         .expect("backlinks ok");
     let backlinks = value["backlinks"]
@@ -742,13 +744,13 @@ enabled = false
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Backlinks(BacklinksRequest {
                 corpus: Some("repo:repo1:wiki".into()),
                 path: "missing-page.md".into(),
             }),
-        })
+        ))
         .await
         .expect("backlinks on a fresh wiki must succeed, not error");
     let backlinks = value["backlinks"]
@@ -806,28 +808,28 @@ enabled = false
         ),
     ] {
         client
-            .call::<serde_json::Value>(DaemonRequest {
-                cwd: harness.cwd().to_path_buf(),
-                payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+            .call::<serde_json::Value>(DaemonRequest::new(
+                harness.cwd().to_path_buf(),
+                DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                     corpus: "docs".into(),
                     path: path.into(),
                     content: content.into(),
                     overwrite: false,
                     ..Default::default()
                 }),
-            })
+            ))
             .await
             .unwrap_or_else(|e| panic!("add_markdown {path} ok: {e}"));
     }
 
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Backlinks(BacklinksRequest {
                 corpus: Some("docs".into()),
                 path: "a/index.md".into(),
             }),
-        })
+        ))
         .await
         .expect("backlinks ok");
     let backlinks = value["backlinks"]
@@ -879,29 +881,29 @@ enabled = false
     let client = connect_at(harness.socket()).await.expect("connect");
 
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "locked.md".into(),
                 content: "# Locked\n\nSee [[other-page]] for details.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown locked ok");
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "other-page.md".into(),
                 content: "# Other page\n\nNothing links here.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown other-page ok");
 
@@ -911,13 +913,13 @@ enabled = false
         .expect("chmod locked.md");
 
     let result: Result<serde_json::Value, _> = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Backlinks(BacklinksRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Backlinks(BacklinksRequest {
                 corpus: Some("docs".into()),
                 path: "other-page.md".into(),
             }),
-        })
+        ))
         .await;
     // Restore perms before any potential assertion failure unwinds, so the
     // tempdir can be cleaned up.
@@ -989,16 +991,16 @@ async fn daemon_add_markdown_reports_ancestor_index_refresh_failure_as_warning()
 
     let is_root = nix_getuid_is_zero();
     let result: Result<serde_json::Value, _> = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
                 path: "a/b/page.md".into(),
                 content: "# Page\n\nBody text.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await;
     // Restore perms before any potential assertion failure unwinds, so the
     // tempdir can be cleaned up.
@@ -1066,16 +1068,16 @@ enabled = false
     // A closed `---…---` block whose body is not a YAML mapping → malformed.
     let malformed = "---\n: : : not valid : :\n---\n# Notes\n\nplain body text\n";
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "bad-fm.md".into(),
                 content: malformed.into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown ok despite malformed frontmatter");
 
@@ -1101,16 +1103,16 @@ enabled = false
 
     // A well-formed frontmatter page produces no frontmatter advisory.
     let clean: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "good-fm.md".into(),
                 content: "---\nstatus: reviewed\nowner: cheese-lord\n---\n# Notes\n\nbody\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown ok for well-formed frontmatter");
     let clean_fm_advisories = clean["warnings"]
@@ -1165,16 +1167,16 @@ enabled = false
     // status. The ordinary HTML comment must not warn.
     let body = "# Notes\n\nA contradicted claim.<!--claim:contradicted-->\n\nBogus.<!--claim:bananas-->\n\nFine.<!--claim:confirmed-->\n\nPlain <!-- ordinary note -->\n";
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "claims.md".into(),
                 content: body.into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown ok despite claim advisories");
 
@@ -1211,16 +1213,16 @@ enabled = false
     // A page whose marks are all well-formed (and confirmed/qualified need no
     // ref) produces no claim advisory.
     let clean: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "clean-claims.md".into(),
                 content: "# Notes\n\nGood.<!--claim:superseded ref=old.md-->\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("add_markdown ok for well-formed claim marks");
     let clean_claim_advisories = clean["warnings"]
@@ -1269,10 +1271,10 @@ ground_dir = "{g}"
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
     let value: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Ping,
-        })
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Ping,
+        ))
         .await
         .expect("ping ok");
     assert_eq!(
@@ -1309,15 +1311,15 @@ ground_dir = "{g}"
     let harness = DaemonHarness::spawn(cfg).await;
     let client = connect_at(harness.socket()).await.expect("connect");
     let response = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
                 strict: false,
                 background: false,
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     match response {
@@ -1493,10 +1495,10 @@ ground_dir = "{g}"
         .await
         .expect("first daemon alive");
     let pong: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Ping,
-        })
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Ping,
+        ))
         .await
         .expect("ping");
     assert_eq!(
@@ -1606,10 +1608,10 @@ async fn ipc_shutdown_removes_socket_and_lockfile_and_refuses_new_connections() 
 
     let client = connect_at(&socket).await.expect("connect");
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: cwd.clone(),
-            payload: DaemonRequestPayload::Shutdown,
-        })
+        .call_raw(DaemonRequest::new(
+            cwd.clone(),
+            DaemonRequestPayload::Shutdown,
+        ))
         .await
         .expect("shutdown transport ok");
     match resp {
@@ -1677,10 +1679,10 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
     // Sanity: the daemon is reachable before the signal.
     let client = connect_at(&socket).await.expect("connect before SIGTERM");
     let pong: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: seed_cwd(tmp.path()),
-            payload: DaemonRequestPayload::Ping,
-        })
+        .call(DaemonRequest::new(
+            seed_cwd(tmp.path()),
+            DaemonRequestPayload::Ping,
+        ))
         .await
         .expect("ping before SIGTERM");
     assert_eq!(
@@ -2201,10 +2203,10 @@ async fn status_reports_running_then_not_running_across_shutdown() {
     // Drive a graceful shutdown via the IPC path, then assert NotRunning.
     let client = connect_at(&socket).await.expect("connect");
     let _ = client
-        .call_raw(DaemonRequest {
-            cwd: seed_cwd(tmp.path()),
-            payload: DaemonRequestPayload::Shutdown,
-        })
+        .call_raw(DaemonRequest::new(
+            seed_cwd(tmp.path()),
+            DaemonRequestPayload::Shutdown,
+        ))
         .await;
     let served = timeout(Duration::from_secs(5), handle)
         .await
@@ -2393,10 +2395,10 @@ async fn restart_stops_the_old_daemon_then_brings_up_a_reachable_one() {
         .expect("respawn must have stored the second serve handle");
     let client = connect_at(&socket).await.expect("connect to second daemon");
     let _ = client
-        .call_raw(DaemonRequest {
-            cwd: seed_cwd(tmp.path()),
-            payload: DaemonRequestPayload::Shutdown,
-        })
+        .call_raw(DaemonRequest::new(
+            seed_cwd(tmp.path()),
+            DaemonRequestPayload::Shutdown,
+        ))
         .await;
     let second_result = timeout(Duration::from_secs(5), second)
         .await
@@ -2448,10 +2450,10 @@ async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
         .await
         .expect("connect to restarted daemon");
     let pong: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: seed_cwd(tmp.path()),
-            payload: DaemonRequestPayload::Ping,
-        })
+        .call(DaemonRequest::new(
+            seed_cwd(tmp.path()),
+            DaemonRequestPayload::Ping,
+        ))
         .await
         .expect("ping restarted daemon");
     assert_eq!(
@@ -2467,10 +2469,10 @@ async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
         .take()
         .expect("respawn must have stored the second serve handle");
     let _ = client
-        .call_raw(DaemonRequest {
-            cwd: seed_cwd(tmp.path()),
-            payload: DaemonRequestPayload::Shutdown,
-        })
+        .call_raw(DaemonRequest::new(
+            seed_cwd(tmp.path()),
+            DaemonRequestPayload::Shutdown,
+        ))
         .await;
     let second_result = timeout(Duration::from_secs(5), second)
         .await
@@ -2543,10 +2545,10 @@ async fn await_watcher_reindex(
         let value: serde_json::Value = connect_at(socket)
             .await
             .expect("connect")
-            .call(DaemonRequest {
-                cwd: cwd.to_path_buf(),
-                payload: DaemonRequestPayload::Status,
-            })
+            .call(DaemonRequest::new(
+                cwd.to_path_buf(),
+                DaemonRequestPayload::Status,
+            ))
             .await
             .expect("status ok");
         let report: StatusReport = serde_json::from_value(value).expect("status payload");
@@ -2620,9 +2622,9 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
 
     let ground_hits = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
         let res: hallouminate_daemon::GroundResult = client
-            .call(DaemonRequest {
+            .call(DaemonRequest::new(
                 cwd,
-                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
                     query: "rarespiceword".into(),
                     corpus: Some("docs".into()),
                     top_files: None,
@@ -2634,7 +2636,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     group_by: Default::default(),
                     output: Default::default(),
                 }),
-            })
+            ))
             .await
             .expect("ground ok");
         res.response.docs.len()
@@ -2642,9 +2644,9 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
 
     let recovery_ready = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
         let res: hallouminate_daemon::GroundResult = client
-            .call(DaemonRequest {
+            .call(DaemonRequest::new(
                 cwd,
-                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
                     query: "rarespiceword".into(),
                     corpus: Some("docs".into()),
                     top_files: None,
@@ -2656,7 +2658,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                     group_by: Default::default(),
                     output: Default::default(),
                 }),
-            })
+            ))
             .await
             .expect("ground ok");
         !res.response
@@ -2666,10 +2668,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
     };
     let watcher_reindexes = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
         let value: serde_json::Value = client
-            .call(DaemonRequest {
-                cwd,
-                payload: DaemonRequestPayload::Status,
-            })
+            .call(DaemonRequest::new(cwd, DaemonRequestPayload::Status))
             .await
             .expect("status ok");
         let report: StatusReport = serde_json::from_value(value).expect("status payload");
@@ -2679,9 +2678,9 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
     let ground_matches =
         |query: &'static str, client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
             let res: hallouminate_daemon::GroundResult = client
-                .call(DaemonRequest {
+                .call(DaemonRequest::new(
                     cwd,
-                    payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                    DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
                         query: query.into(),
                         corpus: Some("docs".into()),
                         top_files: None,
@@ -2693,7 +2692,7 @@ async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() 
                         group_by: Default::default(),
                         output: Default::default(),
                     }),
-                })
+                ))
                 .await
                 .expect("ground ok");
             res.response
@@ -2964,9 +2963,9 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
 
     let ground_hits = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
         let res: hallouminate_daemon::GroundResult = client
-            .call(DaemonRequest {
+            .call(DaemonRequest::new(
                 cwd,
-                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
                     query: "rarespiceword".into(),
                     corpus: Some("docs".into()),
                     top_files: None,
@@ -2978,7 +2977,7 @@ async fn reconcile_tick_repairs_dropped_remove_event() {
                     group_by: Default::default(),
                     output: Default::default(),
                 }),
-            })
+            ))
             .await
             .expect("ground ok");
         res.response.docs.len()
@@ -3070,15 +3069,15 @@ async fn index_corpus_through_ipc(
 ) -> (hallouminate_daemon::IndexReport, serde_json::Value) {
     let wire = daemon_ok_payload(
         client
-            .call_raw(DaemonRequest {
-                cwd: cwd.to_path_buf(),
-                payload: DaemonRequestPayload::Index(IndexRequest {
+            .call_raw(DaemonRequest::new(
+                cwd.to_path_buf(),
+                DaemonRequestPayload::Index(IndexRequest {
                     corpus: Some(corpus.into()),
                     paths_from: None,
                     strict: false,
                     background: false,
                 }),
-            })
+            ))
             .await
             .expect("index through daemon IPC"),
         "index",
@@ -3095,9 +3094,9 @@ async fn ground_through_ipc(
 ) -> (GroundResult, serde_json::Value) {
     let wire = daemon_ok_payload(
         client
-            .call_raw(DaemonRequest {
-                cwd: cwd.to_path_buf(),
-                payload: DaemonRequestPayload::Ground(GroundRequest {
+            .call_raw(DaemonRequest::new(
+                cwd.to_path_buf(),
+                DaemonRequestPayload::Ground(GroundRequest {
                     query: query.into(),
                     corpus: Some(corpus.into()),
                     top_files: Some(10),
@@ -3109,7 +3108,7 @@ async fn ground_through_ipc(
                     group_by: Default::default(),
                     output: Default::default(),
                 }),
-            })
+            ))
             .await
             .expect("ground through daemon IPC"),
         "ground",
@@ -3404,9 +3403,9 @@ async fn daemon_ground_skips_repo_layer_corpus_outside_repo_root_with_warning() 
     let client = connect_at(harness.socket()).await.expect("connect");
     let wire = daemon_ok_payload(
         client
-            .call_raw(DaemonRequest {
-                cwd: cwd.clone(),
-                payload: DaemonRequestPayload::Ground(GroundRequest {
+            .call_raw(DaemonRequest::new(
+                cwd.clone(),
+                DaemonRequestPayload::Ground(GroundRequest {
                     query: "repoconfinementquery".into(),
                     corpus: None,
                     top_files: Some(10),
@@ -3418,7 +3417,7 @@ async fn daemon_ground_skips_repo_layer_corpus_outside_repo_root_with_warning() 
                     group_by: Default::default(),
                     output: Default::default(),
                 }),
-            })
+            ))
             .await
             .expect("ground through daemon IPC"),
         "ground",
@@ -3533,12 +3532,12 @@ async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance()
 
     let stats_wire = daemon_ok_payload(
         client
-            .call_raw(DaemonRequest {
-                cwd: harness.cwd().to_path_buf(),
-                payload: DaemonRequestPayload::CorpusStats {
+            .call_raw(DaemonRequest::new(
+                harness.cwd().to_path_buf(),
+                DaemonRequestPayload::CorpusStats {
                     corpus: Some("multi".into()),
                 },
-            })
+            ))
             .await
             .expect("multi-root stats through daemon IPC"),
         "corpus stats",
@@ -3605,25 +3604,25 @@ async fn daemon_read_markdown_resolves_file_under_a_non_first_root() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let read_b: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: Some("multi".into()),
                 path: "only-b.md".into(),
             }),
-        })
+        ))
         .await
         .expect("read of paths[1] file must succeed");
     assert_eq!(read_b["content"].as_str(), Some(body));
 
     let read_a: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: Some("multi".into()),
                 path: "only-a.md".into(),
             }),
-        })
+        ))
         .await
         .expect("read of paths[0] file must succeed");
     assert_eq!(read_a["content"].as_str(), Some(body_a));
@@ -3643,13 +3642,13 @@ async fn daemon_read_markdown_missing_in_all_roots_reports_does_not_exist() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: Some("multi".into()),
                 path: "nowhere.md".into(),
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     match resp {
@@ -3687,13 +3686,13 @@ enabled = false
 /// `wiki` corpus and return the InvalidParams error message.
 async fn read_miss_message(client: &DaemonClient, cwd: &Path, path: &str) -> String {
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: cwd.to_path_buf(),
-            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            cwd.to_path_buf(),
+            DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                 corpus: Some("wiki".into()),
                 path: path.into(),
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     match resp {
@@ -3814,13 +3813,13 @@ async fn daemon_read_markdown_citation_exact_colon_filename_wins() {
         ("notes.md:12-30", "exact colon content"),
     ] {
         let result: serde_json::Value = client
-            .call(DaemonRequest {
-                cwd: harness.cwd().to_path_buf(),
-                payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+            .call(DaemonRequest::new(
+                harness.cwd().to_path_buf(),
+                DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
                     corpus: Some("wiki".into()),
                     path: path.into(),
                 }),
-            })
+            ))
             .await
             .expect("exact read");
         assert_eq!(result["path"], path);
@@ -4045,16 +4044,16 @@ async fn daemon_add_markdown_to_multi_root_corpus_is_rejected() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "multi".into(),
                 path: "new.md".into(),
                 content: "# nope\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     match resp {
@@ -4095,13 +4094,13 @@ async fn daemon_delete_markdown_from_multi_root_corpus_is_rejected() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::DeleteMarkdown(DeleteMarkdownRequest {
                 corpus: "multi".into(),
                 path: "doomed.md".into(),
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     match resp {
@@ -4177,15 +4176,15 @@ async fn index_skips_missing_corpus_root_and_indexes_the_rest() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
                 corpus: None,
                 paths_from: None,
                 strict: false,
                 background: false,
             }),
-        })
+        ))
         .await
         .expect("index transport ok");
 
@@ -4240,15 +4239,15 @@ async fn index_strict_aborts_on_missing_corpus_root() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Index(hallouminate_daemon::IndexRequest {
                 corpus: None,
                 paths_from: None,
                 strict: true,
                 background: false,
             }),
-        })
+        ))
         .await
         .expect("index transport ok");
 
@@ -4307,15 +4306,15 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
     // Index both files through the daemon.
     let client = connect_at(harness.socket()).await.expect("connect");
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(IndexRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Index(IndexRequest {
                 corpus: Some("docs".into()),
                 paths_from: None,
                 strict: false,
                 background: false,
             }),
-        })
+        ))
         .await
         .expect("index transport ok");
     match resp {
@@ -4335,9 +4334,9 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
     // Issue a ground query for the stale file through the real daemon.
     let client = connect_at(harness.socket()).await.expect("reconnect");
     let result: GroundResult = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Ground(GroundRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Ground(GroundRequest {
                 query: "staletoken9182".into(),
                 corpus: Some("docs".into()),
                 top_files: None,
@@ -4349,7 +4348,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 group_by: Default::default(),
                 output: Default::default(),
             }),
-        })
+        ))
         .await
         .expect("ground ok");
 
@@ -4369,9 +4368,9 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
     // Query for the unchanged file and verify it is NOT stale.
     let client = connect_at(harness.socket()).await.expect("reconnect2");
     let result2: GroundResult = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Ground(GroundRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Ground(GroundRequest {
                 query: "freshtoken7364".into(),
                 corpus: Some("docs".into()),
                 top_files: None,
@@ -4383,7 +4382,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 group_by: Default::default(),
                 output: Default::default(),
             }),
-        })
+        ))
         .await
         .expect("ground ok 2");
 
@@ -4433,15 +4432,15 @@ async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queri
     let harness = DaemonHarness::spawn(cfg_stale_corpus(&ground, &corpus_root)).await;
     let client = connect_at(harness.socket()).await.expect("connect");
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::Index(IndexRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::Index(IndexRequest {
                 corpus: Some("docs".into()),
                 paths_from: None,
                 strict: false,
                 background: false,
             }),
-        })
+        ))
         .await
         .expect("index transport ok");
     match resp {
@@ -4451,10 +4450,10 @@ async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queri
 
     let client = connect_at(harness.socket()).await.expect("reconnect");
     let result: GroundResult = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: phrase_ground_request("the art of x".into()),
-        })
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            phrase_ground_request("the art of x".into()),
+        ))
         .await
         .expect("phrase ground ok");
     let abs_full = std::fs::canonicalize(&full).expect("canonical full");
@@ -4475,10 +4474,10 @@ async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queri
     for query in ["  \t ".to_string(), "x".repeat(513)] {
         let client = connect_at(harness.socket()).await.expect("reconnect");
         let resp = client
-            .call_raw(DaemonRequest {
-                cwd: harness.cwd().to_path_buf(),
-                payload: phrase_ground_request(query),
-            })
+            .call_raw(DaemonRequest::new(
+                harness.cwd().to_path_buf(),
+                phrase_ground_request(query),
+            ))
             .await
             .expect("transport ok");
         match resp {
@@ -4498,10 +4497,10 @@ async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queri
         request.output = hallouminate_domain::ground::GroundOutput::Counts;
     }
     let counted: GroundResult = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: counts_request,
-        })
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            counts_request,
+        ))
         .await
         .expect("phrase counts ok");
     let Some(doc) = counted
@@ -4527,10 +4526,10 @@ async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queri
         request.output = hallouminate_domain::ground::GroundOutput::Counts;
     }
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: ranked_counts,
-        })
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            ranked_counts,
+        ))
         .await
         .expect("transport ok");
     match resp {
@@ -4566,25 +4565,25 @@ async fn t20_mode_exclusivity_under_heading_plus_replace_lines_rejected() {
 
     // Write a file first so it exists.
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "## Section\n\nBody.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("initial write");
 
     let original = std::fs::read_to_string(corpus_root.join("page.md")).unwrap();
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "x".into(),
@@ -4593,7 +4592,7 @@ async fn t20_mode_exclusivity_under_heading_plus_replace_lines_rejected() {
                 replace_lines: Some(LineRange { start: 1, end: 1 }),
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     match resp {
@@ -4634,23 +4633,23 @@ async fn t21_mode_exclusivity_replace_lines_plus_replace_match_rejected() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "Line one.\nLine two.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("initial write");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "new".into(),
@@ -4659,7 +4658,7 @@ async fn t21_mode_exclusivity_replace_lines_plus_replace_match_rejected() {
                 replace_match: Some("Line one".into()),
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     match resp {
@@ -4701,9 +4700,9 @@ async fn t22_under_heading_on_missing_file_returns_invalid_params() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "nonexistent.md".into(),
                 content: "stuff".into(),
@@ -4711,7 +4710,7 @@ async fn t22_under_heading_on_missing_file_returns_invalid_params() {
                 under_heading: Some("Section".into()),
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     assert!(
@@ -4749,9 +4748,9 @@ async fn t23_replace_lines_on_missing_file_returns_invalid_params() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "nonexistent.md".into(),
                 content: "replacement".into(),
@@ -4759,7 +4758,7 @@ async fn t23_replace_lines_on_missing_file_returns_invalid_params() {
                 replace_lines: Some(LineRange { start: 1, end: 1 }),
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     assert!(
@@ -4797,9 +4796,9 @@ async fn t24_replace_match_on_missing_file_returns_invalid_params() {
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "nonexistent.md".into(),
                 content: "replacement".into(),
@@ -4807,7 +4806,7 @@ async fn t24_replace_match_on_missing_file_returns_invalid_params() {
                 replace_match: Some("needle".into()),
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("transport ok");
     assert!(
@@ -4847,24 +4846,24 @@ async fn t25_section_write_reindexes_file() {
 
     // Write initial file.
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "wiki.md".into(),
                 content: "## Notes\n\nOriginal content.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("initial write");
 
     // Section splice.
     let resp: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "wiki.md".into(),
                 content: "Added bullet.".into(),
@@ -4873,7 +4872,7 @@ async fn t25_section_write_reindexes_file() {
                 position: Position::Append,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("section write ok");
 
@@ -4917,24 +4916,24 @@ async fn t26_replace_lines_write_reindexes_file() {
 
     // Write a 3-line file.
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "alpha\nbeta\ngamma\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("initial write");
 
     // Replace line 2.
     let resp: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "REPLACED".into(),
@@ -4942,7 +4941,7 @@ async fn t26_replace_lines_write_reindexes_file() {
                 replace_lines: Some(LineRange { start: 2, end: 2 }),
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("replace_lines ok");
 
@@ -4982,16 +4981,16 @@ async fn t27_whole_file_write_with_new_fields_omitted_is_unchanged() {
 
     let body = "# Whole File\n\nContent unchanged.\n";
     let resp: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "whole.md".into(),
                 content: body.into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("whole-file write ok");
 
@@ -5033,24 +5032,24 @@ async fn t28_edit_mode_lint_warnings_ride_back_on_composed_file() {
 
     // Write a clean initial page.
     client
-        .call::<serde_json::Value>(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call::<serde_json::Value>(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "## Section\n\nClean content.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("initial write");
 
     // Splice a fragment with an empty-destination link (triggers lint).
     let resp: serde_json::Value = client
-        .call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        .call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: "docs".into(),
                 path: "page.md".into(),
                 content: "See [broken link]() for details.".into(),
@@ -5059,7 +5058,7 @@ async fn t28_edit_mode_lint_warnings_ride_back_on_composed_file() {
                 position: Position::Append,
                 ..Default::default()
             }),
-        })
+        ))
         .await
         .expect("edit-mode write ok despite lint");
 
@@ -5277,12 +5276,12 @@ async fn stale_v3_daemon_startup_rebuilds_without_touching_markdown_and_logs_pro
         let harness = DaemonHarness::spawn(cfg).await;
         let client = connect_at(harness.socket()).await.expect("connect");
         let result: ListFilesResult = client
-            .call(DaemonRequest {
-                cwd: harness.cwd().to_path_buf(),
-                payload: DaemonRequestPayload::ListFiles(ListFilesRequest {
+            .call(DaemonRequest::new(
+                harness.cwd().to_path_buf(),
+                DaemonRequestPayload::ListFiles(ListFilesRequest {
                     corpus: Some("docs".into()),
                 }),
-            })
+            ))
             .await
             .expect("list_files after daemon startup rebuild");
         assert_eq!(result.len(), 1, "{result:#?}");
@@ -5567,10 +5566,7 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
     // Trigger shutdown from a second, independent connection.
     let client = connect_at(&socket).await.expect("connect for shutdown");
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd,
-            payload: DaemonRequestPayload::Shutdown,
-        })
+        .call_raw(DaemonRequest::new(cwd, DaemonRequestPayload::Shutdown))
         .await
         .expect("shutdown transport ok");
     match resp {
@@ -5641,12 +5637,12 @@ async fn resources_for_observes_repo_layer_embeddings_enabled_override_without_r
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let baseline_resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::CorpusStats {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::CorpusStats {
                 corpus: Some("docs".into()),
             },
-        })
+        ))
         .await
         .expect("baseline request transport ok");
     match baseline_resp {
@@ -5665,12 +5661,12 @@ async fn resources_for_observes_repo_layer_embeddings_enabled_override_without_r
         "[embeddings]\nenabled = false\n",
     );
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: override_cwd,
-            payload: DaemonRequestPayload::CorpusStats {
+        .call_raw(DaemonRequest::new(
+            override_cwd,
+            DaemonRequestPayload::CorpusStats {
                 corpus: Some("docs".into()),
             },
-        })
+        ))
         .await
         .expect("override request transport ok");
     match resp {
@@ -5722,12 +5718,12 @@ async fn resources_for_observes_repo_layer_embeddings_model_override_without_res
     let client = connect_at(harness.socket()).await.expect("connect");
 
     let baseline_resp = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::CorpusStats {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::CorpusStats {
                 corpus: Some("docs".into()),
             },
-        })
+        ))
         .await
         .expect("baseline request transport ok");
     match baseline_resp {
@@ -5746,12 +5742,12 @@ async fn resources_for_observes_repo_layer_embeddings_model_override_without_res
         "[embeddings]\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
     );
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: override_cwd,
-            payload: DaemonRequestPayload::CorpusStats {
+        .call_raw(DaemonRequest::new(
+            override_cwd,
+            DaemonRequestPayload::CorpusStats {
                 corpus: Some("docs".into()),
             },
-        })
+        ))
         .await
         .expect("override request transport ok");
     match resp {
@@ -5817,16 +5813,16 @@ async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
     let body = "# Cheese\n\nHalloumi grills better than most.\n";
     let _: serde_json::Value = timeout(
         Duration::from_secs(120),
-        client.call(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        client.call(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
                 path: "cheese.md".into(),
                 content: body.into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        }),
+        )),
     )
     .await
     .expect("timeout")
@@ -5845,16 +5841,16 @@ async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
 
     let value: serde_json::Value = timeout(
         Duration::from_secs(120),
-        client.call(DaemonRequest {
-            cwd: override_cwd,
-            payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+        client.call(DaemonRequest::new(
+            override_cwd,
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                 corpus: repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap(),
                 path: "brie.md".into(),
                 content: "# Brie\n\nSofter, but still cheese.\n".into(),
                 overwrite: false,
                 ..Default::default()
             }),
-        }),
+        )),
     )
     .await
     .expect("timeout")
@@ -6077,16 +6073,16 @@ model = "BAAI/bge-small-en-v1.5"
 
     let add = async |path: &str| -> serde_json::Value {
         client
-            .call::<serde_json::Value>(DaemonRequest {
-                cwd: harness.cwd().to_path_buf(),
-                payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+            .call::<serde_json::Value>(DaemonRequest::new(
+                harness.cwd().to_path_buf(),
+                DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
                     corpus: corpus.clone(),
                     path: path.into(),
                     content: format!("# Page\n\nBody of {path}.\n"),
                     overwrite: false,
                     ..Default::default()
                 }),
-            })
+            ))
             .await
             .unwrap_or_else(|e| panic!("add_markdown {path} ok: {e}"))
     };
@@ -6126,12 +6122,12 @@ model = "BAAI/bge-small-en-v1.5"
     );
 
     let stats_wire = client
-        .call_raw(DaemonRequest {
-            cwd: harness.cwd().to_path_buf(),
-            payload: DaemonRequestPayload::CorpusStats {
+        .call_raw(DaemonRequest::new(
+            harness.cwd().to_path_buf(),
+            DaemonRequestPayload::CorpusStats {
                 corpus: Some(corpus.clone()),
             },
-        })
+        ))
         .await
         .expect("corpus stats");
     let stats: CorpusStatsResult = serde_json::from_value(daemon_ok_payload(stats_wire, "stats"))

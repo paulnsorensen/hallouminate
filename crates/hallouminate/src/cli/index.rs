@@ -5,6 +5,7 @@ use anyhow::Context;
 
 use crate::input_error::InputError;
 use hallouminate_config::Config;
+use hallouminate_daemon::oplog::{Client, ClientCall, OpLog, Outcome};
 use hallouminate_daemon::{
     DaemonRequest, DaemonRequestPayload, IndexReport, IndexRequest, QueuedIndexReport, client_for,
 };
@@ -27,20 +28,30 @@ pub struct IndexArgs {
     pub background: bool,
 }
 
-pub async fn cmd_index(args: IndexArgs) -> anyhow::Result<()> {
+pub async fn cmd_index(args: IndexArgs, oplog: &OpLog) -> anyhow::Result<()> {
+    let mut call = ClientCall::start(oplog, Client::Cli, "index", "index", args.corpus.as_deref());
+    let result = index_and_print(args, &mut call).await;
+    call.finish(super::fallback_outcome(&result));
+    result
+}
+
+async fn index_and_print(args: IndexArgs, call: &mut ClientCall) -> anyhow::Result<()> {
     if args.background {
-        let report = run_index_background(args).await?;
+        let report = run_index_background(args, call).await?;
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
-    let report = run_index(args).await?;
+    let report = run_index(args, call).await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
 /// Ask the daemon to queue the catch-up for the working directory and return
 /// as soon as it acknowledges, without waiting for indexing to finish.
-pub async fn run_index_background(args: IndexArgs) -> anyhow::Result<QueuedIndexReport> {
+pub async fn run_index_background(
+    args: IndexArgs,
+    call: &mut ClientCall,
+) -> anyhow::Result<QueuedIndexReport> {
     if let Some(paths_from) = args.paths_from.as_deref() {
         return Err(ad_hoc_corpus_unsupported(paths_from));
     }
@@ -50,7 +61,7 @@ pub async fn run_index_background(args: IndexArgs) -> anyhow::Result<QueuedIndex
         )
         .into());
     }
-    let report: QueuedIndexReport = send_index(args).await?;
+    let report: QueuedIndexReport = send_index(args, call).await?;
     require_background_ack(report)
 }
 
@@ -76,7 +87,7 @@ fn require_background_ack(report: QueuedIndexReport) -> anyhow::Result<QueuedInd
 /// behaviour. The list is read into an in-memory `[[corpus]]`-shaped entry
 /// and shipped through `--corpus ad-hoc` after the daemon learns to register
 /// transient corpora; until then, surface a clear error early.
-pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
+pub async fn run_index(args: IndexArgs, call: &mut ClientCall) -> anyhow::Result<IndexReport> {
     // `--paths-from` short-circuits to a clear "not supported via the daemon
     // yet" error so callers don't see an opaque daemon-side InvalidParams
     // later. Everything else (config layering, corpus name resolution) is
@@ -87,31 +98,44 @@ pub async fn run_index(args: IndexArgs) -> anyhow::Result<IndexReport> {
         return Err(ad_hoc_corpus_unsupported(paths_from));
     }
 
-    send_index(IndexArgs {
-        background: false,
-        ..args
-    })
+    send_index(
+        IndexArgs {
+            background: false,
+            ..args
+        },
+        call,
+    )
     .await
 }
 
-async fn send_index<T: serde::de::DeserializeOwned>(args: IndexArgs) -> anyhow::Result<T> {
-    let client = client_for(args.socket.as_deref()).await?;
+async fn send_index<T: serde::de::DeserializeOwned>(
+    args: IndexArgs,
+    call: &mut ClientCall,
+) -> anyhow::Result<T> {
+    let client = match client_for(args.socket.as_deref()).await {
+        Ok(client) => client,
+        Err(error) => {
+            call.unanswered(Outcome::Unavailable);
+            return Err(error);
+        }
+    };
+    call.ready();
     // Capture CWD at the CLI entry so the daemon can run repo-config
     // discovery against the user's working directory rather than its own
     // (`.cheese/specs/repo-config-discovery.md`, AC #3). `PathBuf::new()`
     // was a seed placeholder; replacing it here is what makes the per-
     // request layered-config path effective end-to-end on the index lane.
     let cwd = std::env::current_dir().context("capture current_dir for daemon request")?;
-    let req = DaemonRequest {
+    let req = DaemonRequest::new(
         cwd,
-        payload: DaemonRequestPayload::Index(IndexRequest {
+        DaemonRequestPayload::Index(IndexRequest {
             corpus: args.corpus.clone(),
             paths_from: None,
             strict: args.strict,
             background: args.background,
         }),
-    };
-    let report: T = client.call(req).await?;
+    );
+    let report: T = client.call_logged(req, call).await?;
     Ok(report)
 }
 
@@ -318,11 +342,16 @@ mod tests {
         // Empty config: no corpora, no repositories. Doesn't matter because
         // paths_from short-circuits config lookup.
         fs::write(&cfg_path, "").unwrap();
-        let err = run_index(IndexArgs {
-            paths_from: Some(list),
-            config: Some(cfg_path),
-            ..Default::default()
-        })
+        let oplog = OpLog::in_dir(dir.path(), &hallouminate_config::LoggingConfig::default());
+        let mut call = ClientCall::start(&oplog, Client::Cli, "index", "index", None);
+        let err = run_index(
+            IndexArgs {
+                paths_from: Some(list),
+                config: Some(cfg_path),
+                ..Default::default()
+            },
+            &mut call,
+        )
         .await
         .expect_err("paths_from must surface a clear error");
         let msg = err.to_string();

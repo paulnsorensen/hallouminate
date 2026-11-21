@@ -10,6 +10,7 @@ use hallouminate_daemon::{
 
 use crate::common::LANCE_WRITE_LOCK;
 use crate::common::daemon::DaemonHarness;
+use crate::common::{unlogged_cli_call, unlogged_oplog};
 
 const MODEL: &str = "BAAI/bge-small-en-v1.5";
 
@@ -73,11 +74,14 @@ async fn cmd_index_indexes_fixture_corpus_end_to_end() {
     let cfg = load_config(&config_path);
     let harness = DaemonHarness::spawn(cfg).await;
 
-    cmd_index(IndexArgs {
-        config: Some(config_path),
-        socket: Some(harness.socket().to_path_buf()),
-        ..Default::default()
-    })
+    cmd_index(
+        IndexArgs {
+            config: Some(config_path),
+            socket: Some(harness.socket().to_path_buf()),
+            ..Default::default()
+        },
+        &unlogged_oplog(),
+    )
     .await
     .expect("first index run");
     // Stop and await the daemon before reopening its exclusively owned store.
@@ -113,11 +117,14 @@ async fn run_index_fails_loudly_when_daemon_unreachable() {
     write_config(&config_path, &corpus_root, &ground_dir, &cache_dir);
     let missing_socket = dir.path().join("absent.sock");
 
-    let err = run_index(IndexArgs {
-        config: Some(config_path),
-        socket: Some(missing_socket.clone()),
-        ..Default::default()
-    })
+    let err = run_index(
+        IndexArgs {
+            config: Some(config_path),
+            socket: Some(missing_socket.clone()),
+            ..Default::default()
+        },
+        &mut unlogged_cli_call("index"),
+    )
     .await
     .expect_err("missing daemon socket must fail");
     let msg = format!("{err:#}");
@@ -169,7 +176,7 @@ async fn index_background_returns_after_daemon_queues_catch_up() {
         ..Default::default()
     };
 
-    let first = run_index_background(args.clone())
+    let first = run_index_background(args.clone(), &mut unlogged_cli_call("index"))
         .await
         .expect("background index request");
     assert!(first.acknowledged, "the daemon must acknowledge the queue");
@@ -184,7 +191,7 @@ async fn index_background_returns_after_daemon_queues_catch_up() {
         "the catch-up stays stalled while the test holds the lane"
     );
 
-    let second = run_index_background(args.clone())
+    let second = run_index_background(args.clone(), &mut unlogged_cli_call("index"))
         .await
         .expect("second background request");
     assert!(
@@ -192,7 +199,9 @@ async fn index_background_returns_after_daemon_queues_catch_up() {
         "a registered corpus must not queue again: {:?}",
         second.queued
     );
-    cmd_index(args).await.expect("cmd_index exits Ok");
+    cmd_index(args, &unlogged_oplog())
+        .await
+        .expect("cmd_index exits Ok");
     drop(held);
 }
 
@@ -201,12 +210,15 @@ async fn index_background_rejects_paths_from_before_dialing_daemon() {
     let dir = tempfile::tempdir().expect("tempdir");
     let list = dir.path().join("paths.txt");
     fs::write(&list, "/tmp/a\n").unwrap();
-    let err = run_index_background(IndexArgs {
-        socket: Some("/nonexistent/absent.sock".into()),
-        background: true,
-        paths_from: Some(list),
-        ..Default::default()
-    })
+    let err = run_index_background(
+        IndexArgs {
+            socket: Some("/nonexistent/absent.sock".into()),
+            background: true,
+            paths_from: Some(list),
+            ..Default::default()
+        },
+        &mut unlogged_cli_call("index"),
+    )
     .await
     .expect_err("--paths-from with --background must fail");
     let msg = format!("{err:#}");
@@ -218,12 +230,15 @@ async fn index_background_rejects_paths_from_before_dialing_daemon() {
 
 #[tokio::test]
 async fn index_background_rejects_strict_before_dialing_daemon() {
-    let err = run_index_background(IndexArgs {
-        socket: Some("/nonexistent/absent.sock".into()),
-        background: true,
-        strict: true,
-        ..Default::default()
-    })
+    let err = run_index_background(
+        IndexArgs {
+            socket: Some("/nonexistent/absent.sock".into()),
+            background: true,
+            strict: true,
+            ..Default::default()
+        },
+        &mut unlogged_cli_call("index"),
+    )
     .await
     .expect_err("--strict with --background must fail");
     let msg = format!("{err:#}");
@@ -295,15 +310,15 @@ path = "."
     // the repo-layer config and the indexer sees the derived
     // `repo:rcd-test:wiki` corpus.
     let resp = client
-        .call_raw(DaemonRequest {
-            cwd: repo_root.clone(),
-            payload: DaemonRequestPayload::Index(IndexRequest {
+        .call_raw(DaemonRequest::new(
+            repo_root.clone(),
+            DaemonRequestPayload::Index(IndexRequest {
                 corpus: Some("repo:rcd-test:wiki".into()),
                 paths_from: None,
                 strict: false,
                 background: false,
             }),
-        })
+        ))
         .await
         .expect("index transport ok");
 

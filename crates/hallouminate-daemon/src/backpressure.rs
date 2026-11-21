@@ -20,6 +20,7 @@ use hallouminate_domain::common::CorpusKey;
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::debt::{self, DebtLevel, MaintenanceDebt};
+use super::oplog;
 use super::state::{DaemonState, MutationGuard};
 
 /// Error for a mutation that timed out waiting out `DebtLevel::Hard`. The
@@ -35,13 +36,19 @@ pub(super) async fn acquire(
     state: &DaemonState,
     keys: &[CorpusKey],
 ) -> Result<MutationGuard, &'static str> {
+    let debt_gate_wait = oplog::stage("debt_gate_wait");
     await_debt_gate(state).await?;
+    drop(debt_gate_wait);
+    let corpus_lock_wait = oplog::stage("corpus_lock_wait");
     let corpus_guard = state.lock_corpus(keys).await;
+    drop(corpus_lock_wait);
+    let write_lane_wait = oplog::stage("write_lane_wait");
     let permit = state
         .write_lane()
         .acquire_owned()
         .await
         .map_err(|_| "write lane closed")?;
+    drop(write_lane_wait);
     Ok(MutationGuard::new(permit, corpus_guard))
 }
 
@@ -107,6 +114,9 @@ async fn probe_admitting_hard_debt_without_maintenance(
 /// `debt_cache_ttl_secs`, else a fresh re-read via [`refresh_observed`]. The
 /// cache addresses the spec risk of a metadata read on every mutation.
 async fn observed_level(state: &DaemonState) -> DebtLevel {
+    if let Some(level) = state.forced_debt_level() {
+        return level;
+    }
     let daemon_cfg = &state.baseline().daemon;
     let ttl = Duration::from_secs(daemon_cfg.debt_cache_ttl_secs);
     if let Some(level) = debt::OBSERVED.fresh_level(ttl) {

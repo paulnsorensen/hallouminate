@@ -14,6 +14,12 @@ pub fn xdg_path(env_var: &str, fallback_base: &str, subpath: &[&str]) -> PathBuf
     xdg_path_from(std::env::var_os(env_var).as_deref(), fallback_base, subpath)
 }
 
+/// Resolve the Hallouminate state directory, `$XDG_STATE_HOME/hallouminate`
+/// (fallback `~/.local/state/hallouminate`).
+pub fn state_dir() -> PathBuf {
+    xdg_path("XDG_STATE_HOME", "~/.local/state", &["hallouminate"])
+}
+
 /// Pure resolver split out so tests can exercise both branches without
 /// mutating process env (unsafe on edition 2024) or relying on the
 /// developer's local shell environment.
