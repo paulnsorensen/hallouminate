@@ -7,7 +7,17 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.12.0...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.12.1...HEAD)
+
+## [0.12.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.1) - 2026-11-21
+
+### Fixed
+
+- Release: build `aarch64-apple-darwin` on `macos-latest`. dist's default `macos-14` runner is no longer supported, so v0.12.0 published only to crates.io and the skill pack, with no GitHub release, binaries, or npm package
+
+### Changed
+
+- Dependencies: pnpm 12.20.0
 
 ## [0.12.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.0) - 2026-11-21
 
@@ -31,7 +41,7 @@ for each release window.
 - Build: sccache locally and in CI; Rust nightly pin moves to nightly-2026-11-12; MSRV rises to 1.94 for lancedb 0.41
 - CI: daily security re-check for advisories and stale dependency reviews; auto-merge for bot patch and minor bumps
 - Docs: document body-only phrase matching and the daemon reply-size guard
-- Dependencies: lancedb 0.41, rmcp 3.9.0, ort pinned to 2.0.0-rc.15, zip 9.x (via calamine 0.38), notify 9.0.0-rc.8, notify-debouncer-full 0.8.0-rc.3, fastembed 7.7, rust_xlsxwriter 0.102.0, text-splitter 0.33.2, TypeScript 7, Node 26, pnpm 12.19.0, Astro 7.4.8, Starlight 0.42.10
+- Dependencies: lancedb 0.41, rmcp 3.10.0, ort pinned to 2.0.0-rc.15, zip 9.x (via calamine 0.38), notify 9.0.0-rc.8, notify-debouncer-full 0.8.0-rc.3, fastembed 7.7, rust_xlsxwriter 0.102.0, text-splitter 0.33.2, TypeScript 7, Node 26, pnpm 12.19.0, Astro 7.4.8, Starlight 0.42.10
 
 ### Fixed
 
