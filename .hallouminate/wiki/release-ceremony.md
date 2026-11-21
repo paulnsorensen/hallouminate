@@ -31,11 +31,18 @@ A `permissions:` block on a job that `uses:` a reusable workflow REPLACES the wo
 
 ## A failed Release run half-publishes the version
 
-A `v*` tag starts three workflows, and they do not wait for each other. `publish-crates.yml` and `release-skills.yml` publish to crates.io and `skills-v<ver>`. `release.yml` builds the binaries, then creates the GitHub Release and calls npm. If one dist build fails, crates.io and skills still publish, but the GitHub Release and npm do not. A crates.io version cannot be reused, and a published tag must not move. So the only recovery is a new patch version.
+A `v*` tag starts three workflows, and they do not wait for each other. `publish-crates.yml` and `release-skills.yml` publish to crates.io and `skills-v<ver>`. `release.yml` builds the binaries, then creates the GitHub Release and calls npm. If one dist build fails, the GitHub Release and npm do not publish. crates.io and skills can still publish, but each workflow can also fail on its own. After a failed tag, check every channel before you decide which version to cut next: `gh release view v<ver>`, `gh release view skills-v<ver>`, the crates.io `max_version`, and `npm view hallouminate dist-tags.latest --prefer-online`.
+
+Choose the recovery from the cause:
+
+- **Transient failure** (runner capacity, an internal GitHub error): rerun the failed Release jobs with `gh run rerun <run-id> --failed`. A rerun uses the original tag ref, so it completes the same version without a tag move or a second crates.io publish.
+- **Failure that needs a code or config change:** the tag's own files drive the run, so a rerun fails the same way. A crates.io version cannot be reused, and a published tag must not move. Cut a new patch version.
 
 This happened twice on 2026-11-21. v0.12.0 and v0.12.1 exist on crates.io and as skills releases, with no GitHub Release or npm package. v0.12.2 is the first complete 0.12 release.
 
-Prove a release.yml change on a PR before you tag. release.yml runs on `pull_request`, but dist builds only `plan` there. On a throwaway branch, set `pr-run-mode = "upload"` in `[dist]`, and limit `targets` if you need to. A PR run has `publishing: false`, so it builds every artifact and publishes nothing. Revert the harness before merge. PR #780 used this method (run 44938778934).
+Prove a release.yml change on a PR before you tag. release.yml runs on `pull_request`, but dist builds only `plan` there. On a throwaway branch, set `pr-run-mode = "upload"` in `[dist]`, and limit `targets` if you need to. A PR run has `publishing: false`, so it builds the artifacts for the configured `targets` and publishes nothing. Revert the harness before merge. PR #780 used this method (run 44938778934).
+
+A PR run does not test the publish path. The `host`, `custom-publish-npm`, and `announce` jobs skip, and the plan step runs `dist plan`, not the tag path `dist host --steps=create --tag=<tag>`. A green PR run therefore proves the builds, not the GitHub Release, the npm publish, or the announcement.
 
 ## macOS dist build needs two pins
 
