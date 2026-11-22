@@ -230,6 +230,15 @@ impl ReloadFailureMemo {
     fn record_success(&mut self, path: &Path) -> bool {
         self.failures.remove(path).is_some()
     }
+
+    /// Drops failure and warning records for paths that are no longer
+    /// repo-layer sources, so retired paths neither accumulate nor silence a
+    /// re-registered path that fails with the same error.
+    fn retain_sources(&mut self, sources: &[PathBuf]) {
+        self.failures.retain(|path, _error| sources.contains(path));
+        self.path_warnings
+            .retain(|path, _warnings| sources.contains(path));
+    }
 }
 
 /// Owns the background debouncer and event-pump task.
@@ -368,7 +377,12 @@ fn run_reconcile_tick(
     reload_failures: &mut ReloadFailureMemo,
 ) {
     retire_missing_registrations(state, tracker);
-    for path in state.watch_registry().repo_layer_sources() {
+    for registration in state.watch_registry().take_pending_cleanups() {
+        spawn_retired_cleanup(state, tracker, registration);
+    }
+    let sources = state.watch_registry().repo_layer_sources();
+    reload_failures.retain_sources(&sources);
+    for path in sources {
         reload_repo_layer(state, &path, tracker, reload_failures);
     }
     state.watch_registry().mark_reconcile_due_all();
@@ -431,47 +445,81 @@ fn spawn_retired_cleanup(
     let state = state.clone();
     tracker.spawn(async move {
         let _conn = state.enter_connection(WorkClass::Internal);
-        cleanup_retired_registration(&state, registration).await;
+        if let Some(failed) = cleanup_retired_registration(&state, registration).await {
+            state.watch_registry().park_failed_cleanup(failed);
+        }
         state.touch_activity(WorkClass::Internal, IdleClock::Keep);
     });
 }
 
+/// Deletes the storage rows of every retired watch root that is still
+/// absent. Returns the registration narrowed to the roots whose cleanup
+/// failed, so the caller can retry it, or `None` when nothing remains.
+/// A root that reappeared is dropped, not deleted.
+///
+/// Lock order matches catch-up: the corpus lock first, then the write
+/// lane. The absence recheck runs under both, so a recreated root cannot
+/// race a catch-up that is indexing it.
 async fn cleanup_retired_registration(
     state: &DaemonState,
     registration: registry::RetiredRegistration,
-) {
-    let root_path = registration.root.clone();
-    let retired = match tokio::task::spawn_blocking(move || {
-        hallouminate_domain::common::retired_roots(std::slice::from_ref(&registration.root))
-            .into_iter()
-            .next()
-            .map(|root| (root, registration.cfg))
-    })
-    .await
-    {
-        Ok(Some(retired)) => retired,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(target: "hallouminate::daemon", root = %root_path.display(), error = %error, "watcher: retired-root check failed; retaining storage rows");
-            return;
-        }
+) -> Option<registry::RetiredRegistration> {
+    let _corpus_guard = state.lock_corpus(&registration.lock_keys).await;
+    let shutdown = state.shutdown_token().clone();
+    let _lane = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Some(registration),
+        permit = state.acquire_write_lane() => match permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                tracing::warn!(target: "hallouminate::daemon", corpus = %registration.corpus, error = %error, "watcher: retired-root cleanup could not take the write lane; will retry on next reconcile");
+                return Some(registration);
+            }
+        },
     };
-    let (root, cfg) = retired;
-    let resources = match state.resources_for(&cfg).await {
-        Ok(resources) => resources,
-        Err(error) => {
-            tracing::warn!(target: "hallouminate::daemon", root = %root.as_path().display(), error = %error, "watcher: retired-root storage access failed; retaining storage rows");
-            return;
-        }
-    };
-    match resources.store.delete_root(&root).await {
-        Ok(_) => {
-            tracing::info!(target: "hallouminate::daemon", root = %root.as_path().display(), ground_dir = %cfg.storage.ground_dir, "watcher: retired root rows deleted");
-        }
-        Err(error) => {
-            tracing::warn!(target: "hallouminate::daemon", root = %root.as_path().display(), error = %error, "watcher: retired-root cleanup failed; retaining retry work");
+    let mut failed = Vec::new();
+    for path in &registration.roots {
+        let probe = path.clone();
+        let root = match tokio::task::spawn_blocking(move || {
+            hallouminate_domain::common::retired_roots(std::slice::from_ref(&probe))
+                .into_iter()
+                .next()
+        })
+        .await
+        {
+            Ok(Some(root)) => root,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                failed.push(path.clone());
+                continue;
+            }
+        };
+        let resources = match state.resources_for(&registration.cfg).await {
+            Ok(resources) => resources,
+            Err(error) => {
+                tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+                failed.push(path.clone());
+                continue;
+            }
+        };
+        match resources.store.delete_root(&root).await {
+            Ok(_) => {
+                tracing::info!(target: "hallouminate::daemon", root = %path.display(), ground_dir = %registration.cfg.storage.ground_dir, "watcher: retired root rows deleted");
+            }
+            Err(error) => {
+                tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root cleanup failed; will retry on next reconcile");
+                failed.push(path.clone());
+            }
         }
     }
+    if failed.is_empty() {
+        return None;
+    }
+    Some(registry::RetiredRegistration {
+        roots: failed,
+        ..registration
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5761,6 +5809,124 @@ body
         assert!(
             !registered(&state, "discovered"),
             "an undeclared baseline root must retire once it stays missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_a_registration_deletes_rows_under_every_watch_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let tmp_path = tmp.path().canonicalize().expect("canonicalize tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp_path.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let repo = tmp_path.join("repo");
+        let first = tmp_path.join("first");
+        let second = tmp_path.join("second");
+        std::fs::create_dir_all(repo.join(".hallouminate")).expect("create config dir");
+        for (dir, name) in [(&first, "a.md"), (&second, "b.md")] {
+            std::fs::create_dir_all(dir).expect("create root");
+            std::fs::write(dir.join(name), "# Note\n\nbody\n").expect("write note");
+        }
+        let config_path = repo.join(".hallouminate").join("config.toml");
+        std::fs::write(&config_path, "").expect("write repo config");
+        let mut multi = corpus("multi", first.to_str().unwrap(), &["**/*.md"]);
+        multi.paths.push(second.to_string_lossy().into_owned());
+        let keys = multi.corpus_keys();
+        assert_eq!(keys.len(), 2, "the corpus must span two roots");
+        register_runtime_corpora(&state, Some(&config_path), &[multi], &cfg).expect("register");
+        let (id, _) = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .next()
+            .expect("registration root");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        crate::test_support::wait_until(Duration::from_secs(5), "initial catch-up", || async {
+            state.watch_registry().catch_up_state(&id) == Some(registry::CatchUpState::Done)
+        })
+        .await;
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        for key in &keys {
+            let files = resources.store.list_files(key).await.expect("list files");
+            assert!(!files.is_empty(), "catch-up must index root {key:?}");
+        }
+
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+        std::fs::remove_dir_all(&first).expect("delete first root");
+        std::fs::remove_dir_all(&second).expect("delete second root");
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS,
+        );
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(!registered(&state, "multi"), "the registration must retire");
+        for key in &keys {
+            let files = resources.store.list_files(key).await.expect("list files");
+            assert!(
+                files.is_empty(),
+                "retirement must delete the rows stored under {key:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_retired_cleanup_is_retried_on_the_next_reconcile_tick() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "not a directory").expect("write blocker file");
+        let mut broken = hallouminate_config::Config::default();
+        broken.embeddings.enabled = false;
+        broken.storage.ground_dir = blocker.join("ground").to_string_lossy().into_owned();
+        let retired = registry::RetiredRegistration {
+            corpus: "gone".into(),
+            root: tmp.path().join("gone"),
+            roots: vec![tmp.path().join("gone")],
+            lock_keys: Vec::new(),
+            cfg: std::sync::Arc::new(broken),
+        };
+
+        let failed = cleanup_retired_registration(&state, retired)
+            .await
+            .expect("cleanup against unusable storage must report retry work");
+        assert_eq!(failed.roots, vec![tmp.path().join("gone")]);
+        state.watch_registry().park_failed_cleanup(failed);
+
+        std::fs::remove_file(&blocker).expect("remove blocker");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(
+            state.watch_registry().take_pending_cleanups().is_empty(),
+            "the next tick must retry the parked cleanup and clear it once storage works"
+        );
+    }
+
+    #[test]
+    fn reload_failure_memo_forgets_paths_that_are_no_longer_sources() {
+        let mut memo = ReloadFailureMemo::new();
+        let path = PathBuf::from("/repo/.hallouminate/config.toml");
+        assert!(memo.record_failure(&path, "bad"));
+        assert!(!memo.record_failure(&path, "bad"));
+
+        memo.retain_sources(&[]);
+
+        assert!(
+            memo.record_failure(&path, "bad"),
+            "a re-registered path must warn again after its memo was dropped"
         );
     }
 

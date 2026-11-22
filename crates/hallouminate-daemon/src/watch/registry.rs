@@ -221,7 +221,16 @@ struct Registration {
     /// Consecutive reconcile ticks that found this registration's root
     /// absent; `record_absent_roots` resets it when the root reappears.
     absent_ticks: u32,
+    /// Consecutive identical reconcile failures `repeats_last_error` has
+    /// suppressed; resets at each reminder.
+    error_repeats: u32,
 }
+
+/// Identical reconcile failures between repeated `warn` reminders.
+const REPEAT_FAILURE_REMINDER_EVERY: u32 = 60;
+
+/// Cap on retired registrations awaiting a storage-cleanup retry.
+const MAX_PENDING_CLEANUPS: usize = 64;
 
 /// Result of a `register` call: whether this call created a new logical
 /// registration or found an existing one for the same `(source, corpus
@@ -235,11 +244,38 @@ pub(crate) enum RegisterOutcome {
 }
 
 /// Retired registration data needed for fail-closed storage cleanup.
+/// `roots` lists every watch root the registration stored rows under, and
+/// `lock_keys` is the corpus-lock set cleanup takes before touching them.
 #[derive(Debug, Clone)]
 pub(crate) struct RetiredRegistration {
     pub(crate) corpus: String,
     pub(crate) root: PathBuf,
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) lock_keys: Vec<CorpusKey>,
     pub(crate) cfg: Arc<Config>,
+}
+
+impl RetiredRegistration {
+    fn from_registration(id: &RegistrationId, registration: &Registration) -> Self {
+        let mut roots: Vec<PathBuf> = registration
+            .roots
+            .iter()
+            .map(|root| match &root.canonical_file_root {
+                Some(file) => file.clone(),
+                None => root.canonical_watched.clone(),
+            })
+            .collect();
+        if roots.is_empty() {
+            roots.push(id.corpus_key.canonical_root.clone());
+        }
+        Self {
+            corpus: id.corpus_key.name.clone(),
+            root: id.corpus_key.canonical_root.clone(),
+            roots,
+            lock_keys: registration.lock_keys.clone(),
+            cfg: registration.cfg.clone(),
+        }
+    }
 }
 
 /// One registration's identity, corpus, and the root paths whose absence
@@ -292,6 +328,8 @@ pub(crate) struct WatchRegistry {
     /// Set while the boot `catch_up_index` task runs. Baseline registrations
     /// start `Done`, so this is the only signal that their index may lag.
     boot_catch_up_running: std::sync::atomic::AtomicBool,
+    /// Retired registrations whose storage cleanup failed and must retry.
+    pending_cleanups: Mutex<Vec<RetiredRegistration>>,
 }
 
 /// Whether the boot catch-up sweep is still reconciling baseline corpora.
@@ -324,6 +362,7 @@ impl WatchRegistry {
             settled: tokio::sync::Notify::new(),
             pump_unavailable: std::sync::atomic::AtomicBool::new(false),
             boot_catch_up_running: std::sync::atomic::AtomicBool::new(false),
+            pending_cleanups: Mutex::new(Vec::new()),
         }
     }
 
@@ -385,6 +424,7 @@ impl WatchRegistry {
                 reconciled_once: true,
                 retry_on_tick: false,
                 absent_ticks: 0,
+                error_repeats: 0,
             },
         );
         guard.generation += 1;
@@ -491,6 +531,7 @@ impl WatchRegistry {
                 reconciled_once: false,
                 retry_on_tick: false,
                 absent_ticks: 0,
+                error_repeats: 0,
             },
         );
         guard.queue.push_back(id);
@@ -676,11 +717,10 @@ impl WatchRegistry {
         let retired = removed
             .iter()
             .filter_map(|id| {
-                guard.regs.get(id).map(|registration| RetiredRegistration {
-                    corpus: id.corpus_key.name.clone(),
-                    root: id.corpus_key.canonical_root.clone(),
-                    cfg: registration.cfg.clone(),
-                })
+                guard
+                    .regs
+                    .get(id)
+                    .map(|registration| RetiredRegistration::from_registration(id, registration))
             })
             .collect();
         for id in &removed {
@@ -719,6 +759,7 @@ impl WatchRegistry {
                     reconciled_once: false,
                     retry_on_tick: false,
                     absent_ticks: 0,
+                    error_repeats: 0,
                 },
             );
             guard.queue.push_back(id);
@@ -804,11 +845,50 @@ impl WatchRegistry {
     /// Whether `error` equals the error that `id`'s previous catch-up pass
     /// recorded, so the caller can log a repeated failure below `warn`.
     pub(crate) fn repeats_last_error(&self, id: &RegistrationId, error: &str) -> bool {
-        self.lock()
-            .regs
-            .get(id)
-            .and_then(|reg| reg.last_error.as_deref())
-            == Some(error)
+        let mut guard = self.lock();
+        let Some(reg) = guard.regs.get_mut(id) else {
+            return false;
+        };
+        if reg.last_error.as_deref() != Some(error) {
+            reg.error_repeats = 0;
+            return false;
+        }
+        reg.error_repeats = reg.error_repeats.saturating_add(1);
+        if reg.error_repeats >= REPEAT_FAILURE_REMINDER_EVERY {
+            reg.error_repeats = 0;
+            return false;
+        }
+        true
+    }
+
+    /// Parks a retired registration whose storage cleanup failed. The pump
+    /// retries parked entries on each reconcile tick. The list holds at
+    /// most `MAX_PENDING_CLEANUPS`; the oldest entry drops first.
+    pub(crate) fn park_failed_cleanup(&self, registration: RetiredRegistration) {
+        let mut pending = self
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pending.len() >= MAX_PENDING_CLEANUPS {
+            let dropped = pending.remove(0);
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                corpus = %dropped.corpus,
+                root = %dropped.root.display(),
+                "watcher: pending retired-root cleanups full; dropping the oldest",
+            );
+        }
+        pending.push(registration);
+    }
+
+    /// Drains the parked cleanups so the caller can retry them.
+    pub(crate) fn take_pending_cleanups(&self) -> Vec<RetiredRegistration> {
+        std::mem::take(
+            &mut *self
+                .pending_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
     /// Every registration with its corpus and the root paths that
@@ -865,11 +945,7 @@ impl WatchRegistry {
                 continue;
             };
             release_admission(&mut guard, id);
-            retired.push(RetiredRegistration {
-                corpus: id.corpus_key.name.clone(),
-                root: id.corpus_key.canonical_root.clone(),
-                cfg: reg.cfg,
-            });
+            retired.push(RetiredRegistration::from_registration(id, &reg));
         }
         guard.queue.retain(|id| !expired.contains(id));
         guard.generation += 1;
@@ -1866,6 +1942,55 @@ mod tests {
             RegisterOutcome::New
         );
         assert_eq!(registry.pending(&id), Some(PendingWork::Idle));
+    }
+
+    #[test]
+    fn identical_reconcile_failures_re_warn_at_the_reminder_cadence() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo"));
+        let wiki = corpus("wiki");
+        let wiki_root = root("/repo", wiki.clone());
+        registry.register(source.clone(), wiki, cfg, vec![wiki_root]);
+        let id = RegistrationId {
+            source,
+            corpus_key: CorpusKey {
+                name: "wiki".into(),
+                canonical_root: PathBuf::from("/repo"),
+            },
+        };
+        assert!(!registry.repeats_last_error(&id, "boom"));
+        registry.finish_catch_up(&id, Err("boom".into()));
+
+        let mut warned = 0;
+        for _ in 0..REPEAT_FAILURE_REMINDER_EVERY * 2 {
+            if !registry.repeats_last_error(&id, "boom") {
+                warned += 1;
+            }
+        }
+        assert_eq!(
+            warned, 2,
+            "a long identical failure run must re-warn periodically"
+        );
+    }
+
+    #[test]
+    fn pending_cleanups_are_bounded_and_drop_the_oldest() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        for index in 0..=MAX_PENDING_CLEANUPS {
+            registry.park_failed_cleanup(RetiredRegistration {
+                corpus: format!("c{index}"),
+                root: PathBuf::from("/gone"),
+                roots: vec![PathBuf::from("/gone")],
+                lock_keys: Vec::new(),
+                cfg: cfg.clone(),
+            });
+        }
+        let pending = registry.take_pending_cleanups();
+        assert_eq!(pending.len(), MAX_PENDING_CLEANUPS);
+        assert_eq!(pending[0].corpus, "c1");
+        assert!(registry.take_pending_cleanups().is_empty());
     }
 
     #[test]
