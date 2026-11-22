@@ -1,8 +1,8 @@
 # Multi-format ingestion
 
 Hallouminate is **no longer markdown-only**. The indexer routes five format
-families — markdown, plain text, reStructuredText, spreadsheets, and text-layer
-PDFs — each to its own handler, following the per-format-dispatch design this
+families — markdown, plain text, reStructuredText, spreadsheets, text-layer
+PDFs, and JSON or JSON Lines — each to its own handler, following the per-format-dispatch design this
 page previously argued for. The single most important nuance: **the wiki corpus
 you author into is still markdown-only**; multi-format applies to the non-wiki
 corpora (`repo:NAME:corpus` and explicit `[[corpus]]` entries). This page records
@@ -21,7 +21,7 @@ converges on. Three seams, all in
 `crates/hallouminate-domain/src/indexer/format.rs`:
 
 1. **`Format` enum** (`format.rs::Format`): `Markdown`, `PlainText`, `Rst`,
-   `Spreadsheet`, and `Pdf`.
+   `Spreadsheet`, `Pdf`, `Json`, and `Jsonl`.
 2. **`detect_format`** (`format.rs::detect_format`): **extension is decisive**.
    `format_from_extension` maps the extension; a *known-but-unsupported*
    extension returns `None` and is skipped **without a magic-byte sniff** —
@@ -48,6 +48,8 @@ still matter is extensionless files.
 | `rst` | `Rst` | `RstHandler` | `RstChunker`: plain `TextSplitter` windows **plus a section-adornment side-pass** that recovers RST heading breadcrumbs; no frontmatter/claim marks |
 | `csv`, `xlsx`, `xls`, `ods` | `Spreadsheet` | `SpreadsheetHandler` | one chunk **per data row**; first row is the header; each row renders `col: val` lines so the chunk self-describes; breadcrumb `sheet:row-N`. CSV via the `csv` crate, workbooks via `calamine` |
 | `pdf` | `Pdf` | `PdfHandler<S>` | pure-Rust `pdf-extract` page extraction followed by per-page `TextSplitter` windows; breadcrumb `page:N`; empty pages warn and are omitted |
+| `json` | `Json` | `JsonHandler<S>` | the body must parse as JSON, else the file is skipped as an extraction failure; the valid text then goes through the plain-text splitter, so `heading_path` is empty |
+| `jsonl` | `Jsonl` | `JsonlHandler<S>` | each nonblank line must parse as JSON; one `TextSplitter` pass per record; breadcrumb `jsonl:row-N`, where N counts nonblank records; the chunk keeps the physical line number (#543) |
 
 `.md`/AsciiDoc/`.org` note: AsciiDoc and Org route to the *plain-text*
 handler — there is no AsciiDoc/Org structure parser, they just chunk as text.
@@ -86,7 +88,7 @@ there is **no `Code` variant** (`RepoCorpusKind::Code` finds nothing in the
 tree). The derived wiki corpus keeps `globs: ["**/*.md"]`
 (`crates/hallouminate-domain/src/repository.rs::repository_wiki_corpus`), so
 authored wikis stay markdown-only; the derived `repo:NAME:corpus` source corpus
-and user `[[corpus]]` entries are where text, RST, spreadsheet, and PDF files get
+and user `[[corpus]]` entries are where text, RST, spreadsheet, PDF, and JSON files get
 indexed when their globs select those extensions.
 This resolves the old "corpus wiring" open question.
 
