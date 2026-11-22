@@ -333,23 +333,14 @@ pub(crate) async fn gather_signals(
         }
     };
     if signals.hits.is_empty() {
-        let _ = resolve_rg_run(
-            rg_res,
-            RIPGREP_TIMEOUT,
-            &corpus_key.canonical_root,
-            &mut warnings,
-        );
+        let _ = resolve_rg_run(rg_res, RIPGREP_TIMEOUT, corpus_key, &mut warnings);
         return Ok(RootSignals {
             warnings,
             ..RootSignals::default()
         });
     }
-    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) = resolve_rg_run(
-        rg_res,
-        RIPGREP_TIMEOUT,
-        &corpus_key.canonical_root,
-        &mut warnings,
-    );
+    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) =
+        resolve_rg_run(rg_res, RIPGREP_TIMEOUT, corpus_key, &mut warnings);
 
     let (rg_chunk_counts, rg_stats) = resolve_rg_hits_to_chunks(&signals.hits, &rg_hits);
     let resolved_chunks = rg_chunk_counts.len();
@@ -401,6 +392,7 @@ pub(crate) async fn gather_signals(
     if rg_unparseable > 0 {
         tracing::warn!(
             target: "hallouminate::search",
+            corpus = %corpus_key.name,
             rg_unparseable,
             "ripgrep produced unparseable match events; the rg output schema may have changed"
         );
@@ -989,13 +981,14 @@ fn contains_term_counts(
 fn resolve_rg_run(
     rg_res: std::result::Result<Result<ripgrep::RipgrepRun>, tokio::time::error::Elapsed>,
     timeout: std::time::Duration,
-    root: &Path,
+    corpus_key: &CorpusKey,
     warnings: &mut Vec<Warning>,
 ) -> (Vec<RipgrepHit>, bool, u64, usize) {
+    let root = &corpus_key.canonical_root;
     match rg_res {
         Ok(Ok(run)) => (run.hits, run.truncated, run.elapsed_ms, run.unparseable),
         Ok(Err(error)) => {
-            tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
+            tracing::warn!(target: "hallouminate::search", corpus = %corpus_key.name, err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
             warnings.push(Warning {
                 code: warning_codes::RIPGREP_FAILED.to_string(),
                 message: format!(
@@ -1008,6 +1001,7 @@ fn resolve_rg_run(
         Err(_elapsed) => {
             tracing::warn!(
                 target: "hallouminate::search",
+                corpus = %corpus_key.name,
                 timeout_ms = timeout.as_millis() as u64,
                 "ripgrep pass timed out; ranking without the ripgrep signal"
             );
@@ -2002,7 +1996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_not_in_pool_only_drops_log_at_debug_and_still_warn_the_caller() {
+    async fn file_not_in_pool_only_drops_log_at_debug_and_still_warns_the_caller() {
         use tracing::instrument::WithSubscriber;
 
         let UnresolvedRgFixture {
@@ -2053,6 +2047,27 @@ mod tests {
                 .map(String::as_str),
             Some("0")
         );
+    }
+
+    #[test]
+    fn failed_ripgrep_pass_warns_with_the_corpus() {
+        let UnresolvedRgFixture {
+            _root,
+            corpus_key,
+            store: _store,
+        } = unresolved_rg_fixture(0, 0);
+        let capture = SearchTraceCapture::default();
+        let mut warnings = Vec::new();
+        let failure = Err(crate::common::HallouminateError::Config(
+            "rg exploded".to_string(),
+        ));
+        tracing::subscriber::with_default(capture.clone(), || {
+            resolve_rg_run(Ok(failure), RIPGREP_TIMEOUT, &corpus_key, &mut warnings)
+        });
+
+        let warns = capture.events_at(tracing::Level::WARN);
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert_eq!(warns[0].get("corpus").map(String::as_str), Some("fixtures"));
     }
 
     #[tokio::test]
