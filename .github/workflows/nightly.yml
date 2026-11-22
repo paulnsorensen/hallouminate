@@ -96,6 +96,9 @@ jobs:
       # this ID instead, so a new nightly `serve` replaces an older nightly
       # daemon. Keep it equal to the npm VERSION in publish-and-smoke.
       HALLOUMINATE_BUILD_ID: 0.0.0-experimental.${{ github.run_number }}.${{ github.run_attempt }}
+      # Release marker: keeps the installed default data, cache, state, and
+      # socket paths. Builds without it use hallouminate-dev directories.
+      HALLOUMINATE_RELEASE_CHANNEL: nightly
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

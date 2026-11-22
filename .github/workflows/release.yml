@@ -112,6 +112,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      # Release marker: keeps the installed default data, cache, state, and
+      # socket paths. Builds without it use hallouminate-dev directories.
+      HALLOUMINATE_RELEASE_CHANNEL: stable
     steps:
       - name: enable windows longpaths
         run: |

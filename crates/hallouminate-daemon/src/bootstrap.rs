@@ -83,7 +83,10 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
     let log_path = hallouminate_config::xdg::xdg_path(
         "XDG_STATE_HOME",
         "~/.local/state",
-        &["hallouminate", "daemon-bootstrap.log"],
+        &[
+            hallouminate_config::channel::BUILD_CHANNEL.app_dir(),
+            "daemon-bootstrap.log",
+        ],
     );
     if let Some(dir) = log_path.parent() {
         std::fs::create_dir_all(dir)?;

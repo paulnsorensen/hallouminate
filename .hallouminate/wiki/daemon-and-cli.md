@@ -24,15 +24,24 @@ The spike does not run live launchd or systemd service tests.[^service-policy]
 Resolved in this order (`crates/hallouminate-daemon/src/socket.rs`):
 
 1. `HALLOUMINATE_SOCKET` env var — per-process override.
-2. `<account-home>/.cache/hallouminate/daemon.sock` — the default. The
+2. `<account-home>/.cache/<app-dir>/daemon.sock` — the default. The
    account home comes from the OS user record; `HOME`, `XDG_RUNTIME_DIR`,
-   and `XDG_CACHE_HOME` do not change it.
+   and `XDG_CACHE_HOME` do not change it. `<app-dir>` is `hallouminate`
+   for a release build and `hallouminate-dev` for any other build (see
+   [build-channel-paths](build-channel-paths.md)).
+
+The resolver rejects a path that does not fit in `sockaddr_un.sun_path`
+(108 bytes on Linux, 104 on macOS, NUL included) with an error that names
+`HALLOUMINATE_SOCKET`, before any bind or connect.
 
 `--socket PATH` on `index`, `ground`, etc. overrides per-invocation.
 
 The daemon takes a flock on `<socket>.lock` to enforce single-instance
-ownership. A second `hallouminate daemon` against the same socket
-errors out with "another hallouminate daemon already holds …".
+ownership. A second `hallouminate daemon` against the same socket sees
+`EWOULDBLOCK`, logs at `info`, and exits 0 before it opens daemon state:
+losing the start race is not a failure, because every client polls the
+socket. Other lock errors still fail. The library `serve` entry point
+keeps returning an "already holds" error.
 
 **One socket per account (#218, #318, #323).** Single-instance ownership
 is per socket path, and the default path no longer depends on the
