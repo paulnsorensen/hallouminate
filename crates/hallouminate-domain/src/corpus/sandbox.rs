@@ -1170,7 +1170,9 @@ const EINVAL: i32 = windows_sys::Win32::Foundation::ERROR_INVALID_NAME as i32;
 
 fn is_symlink_error(raw: i32) -> bool {
     #[cfg(windows)]
-    if raw == windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME as i32 {
+    if raw == windows_sys::Win32::Foundation::ERROR_CANT_RESOLVE_FILENAME as i32
+        || raw == windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK as i32
+    {
         return true;
     }
     raw == ELOOP
@@ -1287,9 +1289,13 @@ mod tests {
     fn windows_errors_preserve_sandbox_error_categories() {
         use windows_sys::Win32::Foundation::{
             ERROR_CANT_RESOLVE_FILENAME, ERROR_DIRECTORY, ERROR_DIRECTORY_NOT_SUPPORTED,
-            ERROR_INVALID_NAME, ERROR_TOO_MANY_LINKS,
+            ERROR_INVALID_NAME, ERROR_STOPPED_ON_SYMLINK, ERROR_TOO_MANY_LINKS,
         };
-        for code in [ERROR_TOO_MANY_LINKS, ERROR_CANT_RESOLVE_FILENAME] {
+        for code in [
+            ERROR_TOO_MANY_LINKS,
+            ERROR_CANT_RESOLVE_FILENAME,
+            ERROR_STOPPED_ON_SYMLINK,
+        ] {
             let error = classify_path_io_error(std::io::Error::from_raw_os_error(code as i32));
             assert_eq!(error.kind, WriteErrorKind::Symlink);
         }
