@@ -4258,8 +4258,12 @@ mod tests {
             .crossencoder(Some("bge-reranker-base"))
             .expect("second")
             .expect("configured");
+        let second_opts = GroundOpts {
+            rerank_timeout: Duration::from_secs(1),
+            ..rerank_opts()
+        };
         let second_started = Instant::now();
-        let second = ground("q", &corpus, &store, Some(Box::new(second)), rerank_opts())
+        let second = ground("q", &corpus, &store, Some(Box::new(second)), second_opts)
             .await
             .expect("second ground request");
         assert!(second_started.elapsed() < Duration::from_millis(100));
@@ -4269,9 +4273,9 @@ mod tests {
                 .iter()
                 .any(|warning| warning.code == "crossencoder-unavailable")
         );
-        drop(release_guard);
-        let first = first_task
+        let first = tokio::time::timeout(Duration::from_secs(5), first_task)
             .await
+            .expect("first request falls back while construction is blocked")
             .expect("first ground task")
             .expect("first ground request");
         assert!(
@@ -4280,6 +4284,7 @@ mod tests {
                 .iter()
                 .any(|warning| warning.code == "rerank-timeout")
         );
+        drop(release_guard);
         assert_eq!(entered.load(Ordering::SeqCst), 1);
     }
 
