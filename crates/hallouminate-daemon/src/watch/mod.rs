@@ -342,12 +342,7 @@ fn reload_repo_layer(
                 tracing::info!(target: "hallouminate::daemon", path = %path.display(), "watcher: repo-layer reload recovered");
             }
             for registration in retired {
-                let state = state.clone();
-                tracker.spawn(async move {
-                    let _conn = state.enter_connection(WorkClass::Internal);
-                    cleanup_retired_registration(&state, registration).await;
-                    state.touch_activity(WorkClass::Internal, IdleClock::Keep);
-                });
+                spawn_retired_cleanup(state, tracker, registration);
             }
         }
         Err(error) => {
@@ -357,6 +352,88 @@ fn reload_repo_layer(
             );
         }
     }
+}
+
+/// Consecutive reconcile ticks that a retirable registration's root must
+/// stay absent before `retire_missing_registrations` retires it.
+const MISSING_ROOT_RETIRE_TICKS: u32 = 3;
+
+/// Runs the periodic reconcile tick: retires registrations whose root has
+/// been absent for `MISSING_ROOT_RETIRE_TICKS`, reloads every repo-layer
+/// source, marks every registration due, and reconciles the debouncer.
+fn run_reconcile_tick(
+    state: &DaemonState,
+    pump: &mut PumpState,
+    tracker: &TaskTracker,
+    reload_failures: &mut ReloadFailureMemo,
+) {
+    retire_missing_registrations(state, tracker);
+    for path in state.watch_registry().repo_layer_sources() {
+        reload_repo_layer(state, &path, tracker, reload_failures);
+    }
+    state.watch_registry().mark_reconcile_due_all();
+    pump.reconcile(state, tracker, WatchRetry::ReconcileTick);
+}
+
+/// Counts one tick of root absence for every retirable registration and
+/// retires each one that reached `MISSING_ROOT_RETIRE_TICKS`.
+///
+/// A registration is retirable only when nothing will declare it again:
+/// a repo-layer registration whose config file is gone, or a baseline
+/// registration that the baseline config does not declare. A declared
+/// baseline root stays registered while absent, so a later directory
+/// creation still installs its watch. A root that exists, or whose
+/// existence check fails, never counts as absent.
+fn retire_missing_registrations(state: &DaemonState, tracker: &TaskTracker) {
+    let registry = state.watch_registry();
+    let declared = state.baseline().effective_corpora().ok();
+    let mut absent = HashSet::new();
+    for probe in registry.root_probes() {
+        let retirable = match &probe.id.source {
+            ConfigSource::RepoLayer(config_path) => confirmed_absent(config_path),
+            ConfigSource::Baseline => match &declared {
+                Some(declared) => !declared.iter().any(|corpus| {
+                    corpus.name == probe.corpus.name && corpus.paths == probe.corpus.paths
+                }),
+                None => false,
+            },
+        };
+        if retirable && probe.roots.iter().all(|root| confirmed_absent(root)) {
+            absent.insert(probe.id);
+        }
+    }
+    for registration in registry.record_absent_roots(&absent, MISSING_ROOT_RETIRE_TICKS) {
+        tracing::info!(
+            target: "hallouminate::daemon",
+            corpus = %registration.corpus,
+            root = %registration.root.display(),
+            absent_ticks = MISSING_ROOT_RETIRE_TICKS,
+            "watcher: retired registration; watch root is missing",
+        );
+        spawn_retired_cleanup(state, tracker, registration);
+    }
+}
+
+/// Whether `path` is confirmed absent. A failed existence check is not
+/// absence, so a permission error never retires a live root.
+fn confirmed_absent(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(exists) => !exists,
+        Err(_error) => false,
+    }
+}
+
+fn spawn_retired_cleanup(
+    state: &DaemonState,
+    tracker: &TaskTracker,
+    registration: registry::RetiredRegistration,
+) {
+    let state = state.clone();
+    tracker.spawn(async move {
+        let _conn = state.enter_connection(WorkClass::Internal);
+        cleanup_retired_registration(&state, registration).await;
+        state.touch_activity(WorkClass::Internal, IdleClock::Keep);
+    });
 }
 
 async fn cleanup_retired_registration(
@@ -985,26 +1062,14 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
                             Ok(())
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                target: "hallouminate::daemon",
-                                corpus = %corpus.name,
-                                source = ?id.source,
-                                error = %e,
-                                "watcher: reconcile pass failed; will retry on the next reconcile tick",
-                            );
+                            report_reconcile_failure(&state, &id, &corpus.name, &e.to_string());
                             state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                             Err(e.to_string())
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        corpus = %corpus.name,
-                        source = ?id.source,
-                        error = %e,
-                        "watcher: reconcile pass failed; will retry on the next reconcile tick",
-                    );
+                    report_reconcile_failure(&state, &id, &corpus.name, &e.to_string());
                     state.touch_activity(WorkClass::Internal, IdleClock::Keep);
                     Err(e.to_string())
                 }
@@ -1021,6 +1086,28 @@ fn spawn_registration_catch_up(state: DaemonState, id: RegistrationId, tracker: 
             );
         }
     });
+}
+
+/// Logs a failed catch-up pass at `warn`, or at `debug` when the pass
+/// failed with the same error as the registration's previous pass.
+fn report_reconcile_failure(state: &DaemonState, id: &RegistrationId, corpus: &str, error: &str) {
+    if state.watch_registry().repeats_last_error(id, error) {
+        tracing::debug!(
+            target: "hallouminate::daemon",
+            corpus = %corpus,
+            source = ?id.source,
+            error = %error,
+            "watcher: reconcile pass failed; will retry on the next reconcile tick",
+        );
+    } else {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            corpus = %corpus,
+            source = ?id.source,
+            error = %error,
+            "watcher: reconcile pass failed; will retry on the next reconcile tick",
+        );
+    }
 }
 
 /// What one `register_runtime_corpora` call did.
@@ -1203,11 +1290,7 @@ async fn run_pump(
                 continue;
             }
             _ = reconcile_tick.tick() => {
-                for path in state.watch_registry().repo_layer_sources() {
-                    reload_repo_layer(&state, &path, &tracker, &mut reload_failures);
-                }
-                state.watch_registry().mark_reconcile_due_all();
-                pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+                run_reconcile_tick(&state, &mut pump, &tracker, &mut reload_failures);
                 last_reconciled = state.watch_registry().generation();
                 state
                     .heartbeat()
@@ -1610,10 +1693,10 @@ async fn handle_changed_path(
         ) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    path = %path.display(),
-                    error = ?e,
+                report_path_failure(
+                    failures,
+                    path,
+                    &format!("{e:?}"),
                     "watcher: skipping reindex, no-follow read failed",
                 );
                 return false;
@@ -1649,23 +1732,7 @@ async fn handle_changed_path(
                 );
             }
             Err(e) => {
-                let error = e.to_string();
-                match failures.record(path, &error, Instant::now()) {
-                    FailureDecision::First => tracing::warn!(
-                        target: "hallouminate::daemon",
-                        path = %path.display(),
-                        error = %error,
-                        "watcher: reindex failed",
-                    ),
-                    FailureDecision::Suppress => {}
-                    FailureDecision::Reminder { suppressed } => tracing::warn!(
-                        target: "hallouminate::daemon",
-                        path = %path.display(),
-                        error = %error,
-                        suppressed,
-                        "watcher: reindex failed",
-                    ),
-                }
+                report_path_failure(failures, path, &e.to_string(), "watcher: reindex failed");
             }
         }
     } else {
@@ -1699,6 +1766,33 @@ async fn handle_changed_path(
     }
     drop(guard);
     restarts_idle_clock
+}
+
+/// Logs a per-path watcher failure through `failures`: `warn` on the first
+/// occurrence and on each reminder, nothing while the signature is
+/// suppressed.
+fn report_path_failure(
+    failures: &mut FailureCoalescer,
+    path: &Path,
+    error: &str,
+    message: &'static str,
+) {
+    match failures.record(path, error, Instant::now()) {
+        FailureDecision::First => tracing::warn!(
+            target: "hallouminate::daemon",
+            path = %path.display(),
+            error = %error,
+            "{message}",
+        ),
+        FailureDecision::Suppress => {}
+        FailureDecision::Reminder { suppressed } => tracing::warn!(
+            target: "hallouminate::daemon",
+            path = %path.display(),
+            error = %error,
+            suppressed,
+            "{message}",
+        ),
+    }
 }
 
 /// Stage-1 change gate (ADR daemon-rework-003): does `path`'s on-disk mtime
@@ -5414,5 +5508,300 @@ body
             "cancelled catch-up must return an error instead of applying the plan"
         );
         drop(held_permit);
+    }
+
+    type CapturedEvents = Vec<(tracing::Level, HashMap<String, String>)>;
+
+    /// Records every event's level and fields on the thread that installs it.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<std::sync::Mutex<CapturedEvents>>);
+
+    impl LogCapture {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            use tracing_subscriber::layer::SubscriberExt;
+            // A permanent permissive global default keeps the callsite
+            // interest caches stable while parallel tests swap scoped
+            // subscribers (see `churn.rs` `captured_warns`).
+            static GLOBAL: std::sync::Once = std::sync::Once::new();
+            GLOBAL.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+            });
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        }
+
+        fn events(&self, level: tracing::Level, message: &str) -> Vec<HashMap<String, String>> {
+            let mut matched = Vec::new();
+            for (event_level, fields) in self.0.lock().expect("capture lock").iter() {
+                if *event_level == level
+                    && fields.get("message").map(String::as_str) == Some(message)
+                {
+                    matched.push(fields.clone());
+                }
+            }
+            matched
+        }
+    }
+
+    struct FieldMap<'a>(&'a mut HashMap<String, String>);
+
+    impl tracing::field::Visit for FieldMap<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LogCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = HashMap::new();
+            event.record(&mut FieldMap(&mut fields));
+            self.0
+                .lock()
+                .expect("capture lock")
+                .push((*event.metadata().level(), fields));
+        }
+    }
+
+    const RETIRED_MESSAGE: &str = "watcher: retired registration; watch root is missing";
+
+    /// Opens a daemon state under `tmp` and registers the repo-layer corpus
+    /// `cheese` at `<tmp>/repo/.cheese`, sourced from
+    /// `<tmp>/repo/.hallouminate/config.toml`. Returns the state, the repo
+    /// directory, and the corpus root.
+    async fn repo_layer_fixture(tmp: &Path) -> (DaemonState, PathBuf, PathBuf) {
+        let tmp = tmp.canonicalize().expect("canonicalize tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let repo = tmp.join("repo");
+        let root = repo.join(".cheese");
+        std::fs::create_dir_all(&root).expect("create corpus root");
+        std::fs::create_dir_all(repo.join(".hallouminate")).expect("create config dir");
+        let config_path = repo.join(".hallouminate").join("config.toml");
+        std::fs::write(&config_path, "").expect("write repo config");
+        register_runtime_corpora(
+            &state,
+            Some(&config_path),
+            &[corpus("cheese", root.to_str().unwrap(), &["**/*.md"])],
+            &cfg,
+        )
+        .expect("register");
+        assert!(registered(&state, "cheese"));
+        (state, repo, root)
+    }
+
+    fn registered(state: &DaemonState, name: &str) -> bool {
+        let mut found = false;
+        for (id, _root) in state.watch_registry().snapshot_roots() {
+            if id.corpus_key.name == name {
+                found = true;
+            }
+        }
+        found
+    }
+
+    fn reconcile_ticks(
+        state: &DaemonState,
+        pump: &mut PumpState,
+        tracker: &TaskTracker,
+        memo: &mut ReloadFailureMemo,
+        count: u32,
+    ) {
+        for _ in 0..count {
+            run_reconcile_tick(state, pump, tracker, memo);
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_repo_layer_root_retires_after_consecutive_missing_ticks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        let capture = LogCapture::default();
+        let guard = capture.install();
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS - 1,
+        );
+        assert!(
+            registered(&state, "cheese"),
+            "a registration must survive fewer than the threshold of missing ticks"
+        );
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        assert!(
+            !registered(&state, "cheese"),
+            "the registration must retire once its root stays missing for the threshold"
+        );
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 2);
+        drop(guard);
+        tracker.close();
+        tracker.wait().await;
+
+        let retired = capture.events(tracing::Level::INFO, RETIRED_MESSAGE);
+        assert_eq!(
+            retired.len(),
+            1,
+            "retirement must log exactly one info event"
+        );
+        assert_eq!(retired[0].get("corpus").map(String::as_str), Some("cheese"));
+        assert_eq!(
+            retired[0].get("root").map(String::as_str),
+            Some(root.to_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_layer_root_that_reappears_before_the_threshold_is_not_retired() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        let capture = LogCapture::default();
+        let guard = capture.install();
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        let below = MISSING_ROOT_RETIRE_TICKS - 1;
+
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, below);
+        std::fs::create_dir_all(&root).expect("recreate corpus root");
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS + 1,
+        );
+        assert!(
+            registered(&state, "cheese"),
+            "a root that exists must never retire"
+        );
+        std::fs::remove_dir_all(&repo).expect("delete repo again");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, below);
+        assert!(
+            registered(&state, "cheese"),
+            "a reappearing root must reset the missing-tick count"
+        );
+        drop(guard);
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(
+            capture
+                .events(tracing::Level::INFO, RETIRED_MESSAGE)
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_baseline_root_retires_only_when_the_baseline_does_not_declare_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let declared_root = tmp.path().join("declared");
+        let discovered_root = tmp.path().join("discovered");
+        let declared = corpus("declared", declared_root.to_str().unwrap(), &["**/*.md"]);
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        cfg.corpora = vec![declared];
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let baseline_cfg = std::sync::Arc::new(state.baseline().clone());
+        for corpus in state
+            .baseline()
+            .effective_corpora()
+            .expect("baseline corpora")
+        {
+            let roots = watch_roots_for(&corpus);
+            state
+                .watch_registry()
+                .seed_baseline(corpus, baseline_cfg.clone(), roots);
+        }
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus(
+                "discovered",
+                discovered_root.to_str().unwrap(),
+                &["**/*.md"],
+            )],
+            &cfg,
+        )
+        .expect("register discovered");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS + 1,
+        );
+        tracker.close();
+        tracker.wait().await;
+
+        assert!(
+            registered(&state, "declared"),
+            "a declared baseline root must stay registered while absent"
+        );
+        assert!(
+            !registered(&state, "discovered"),
+            "an undeclared baseline root must retire once it stays missing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_symlink_events_warn_once_per_coalescing_window() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let corpus_dir = tmp.path().join("wiki");
+        std::fs::create_dir_all(&corpus_dir).expect("mkdir corpus");
+        let corpus_dir = corpus_dir.canonicalize().expect("canonicalize corpus dir");
+        let outside = tmp.path().join("outside.md");
+        std::fs::write(&outside, "# Outside\n").expect("write outside");
+        let note = corpus_dir.join("note.md");
+        std::os::unix::fs::symlink(&outside, &note).expect("symlink note -> outside");
+        let roots = vec![watch_root(
+            corpus_dir.to_str().unwrap(),
+            corpus("wiki", corpus_dir.to_str().unwrap(), &["**/*.md"]),
+            None,
+        )];
+        let mut failures = FailureCoalescer::new(Duration::from_secs(60), MAX_FAILURE_SIGNATURES);
+        let mut churn = disabled_churn();
+        let capture = LogCapture::default();
+        let guard = capture.install();
+
+        for _ in 0..5 {
+            handle_changed_path(&state, &roots, &note, &mut failures, &mut churn).await;
+        }
+        drop(guard);
+
+        let warns = capture.events(
+            tracing::Level::WARN,
+            "watcher: skipping reindex, no-follow read failed",
+        );
+        assert_eq!(
+            warns.len(),
+            1,
+            "five events on one symlinked file must warn once per window"
+        );
     }
 }

@@ -218,6 +218,9 @@ struct Registration {
     /// clears it on the next reconcile tick, preventing a failing pass from
     /// busy-looping.
     retry_on_tick: bool,
+    /// Consecutive reconcile ticks that found this registration's root
+    /// absent; `record_absent_roots` resets it when the root reappears.
+    absent_ticks: u32,
 }
 
 /// Result of a `register` call: whether this call created a new logical
@@ -234,8 +237,18 @@ pub(crate) enum RegisterOutcome {
 /// Retired registration data needed for fail-closed storage cleanup.
 #[derive(Debug, Clone)]
 pub(crate) struct RetiredRegistration {
+    pub(crate) corpus: String,
     pub(crate) root: PathBuf,
     pub(crate) cfg: Arc<Config>,
+}
+
+/// One registration's identity, corpus, and the root paths whose absence
+/// can retire it. `WatchRegistry::root_probes` copies these out so the
+/// caller checks the filesystem without the registry lock.
+pub(crate) struct RootProbe {
+    pub(crate) id: RegistrationId,
+    pub(crate) corpus: CorpusConfig,
+    pub(crate) roots: Vec<PathBuf>,
 }
 
 /// One admitted catch-up: a leader plus every compatible registration that
@@ -371,6 +384,7 @@ impl WatchRegistry {
                 last_error: None,
                 reconciled_once: true,
                 retry_on_tick: false,
+                absent_ticks: 0,
             },
         );
         guard.generation += 1;
@@ -476,6 +490,7 @@ impl WatchRegistry {
                 last_error: None,
                 reconciled_once: false,
                 retry_on_tick: false,
+                absent_ticks: 0,
             },
         );
         guard.queue.push_back(id);
@@ -662,6 +677,7 @@ impl WatchRegistry {
             .iter()
             .filter_map(|id| {
                 guard.regs.get(id).map(|registration| RetiredRegistration {
+                    corpus: id.corpus_key.name.clone(),
                     root: id.corpus_key.canonical_root.clone(),
                     cfg: registration.cfg.clone(),
                 })
@@ -702,6 +718,7 @@ impl WatchRegistry {
                     last_error: None,
                     reconciled_once: false,
                     retry_on_tick: false,
+                    absent_ticks: 0,
                 },
             );
             guard.queue.push_back(id);
@@ -782,6 +799,84 @@ impl WatchRegistry {
             .regs
             .get(id)
             .is_some_and(|reg| reg.last_error.is_some())
+    }
+
+    /// Whether `error` equals the error that `id`'s previous catch-up pass
+    /// recorded, so the caller can log a repeated failure below `warn`.
+    pub(crate) fn repeats_last_error(&self, id: &RegistrationId, error: &str) -> bool {
+        self.lock()
+            .regs
+            .get(id)
+            .and_then(|reg| reg.last_error.as_deref())
+            == Some(error)
+    }
+
+    /// Every registration with its corpus and the root paths that
+    /// `record_absent_roots` judges absence by: the identity root plus each
+    /// watch root's declared file or watched directory.
+    pub(crate) fn root_probes(&self) -> Vec<RootProbe> {
+        let guard = self.lock();
+        let mut probes = Vec::new();
+        for (id, reg) in &guard.regs {
+            let mut roots = vec![id.corpus_key.canonical_root.clone()];
+            for root in &reg.roots {
+                let path = match &root.canonical_file_root {
+                    Some(file) => file.clone(),
+                    None => root.canonical_watched.clone(),
+                };
+                roots.push(path);
+            }
+            probes.push(RootProbe {
+                id: id.clone(),
+                corpus: reg.corpus.clone(),
+                roots,
+            });
+        }
+        probes
+    }
+
+    /// Records one reconcile tick of root absence. Each registration in
+    /// `absent` advances its consecutive-absence count; every other
+    /// registration resets it. A registration whose count reaches
+    /// `threshold` is removed, and its data returns for retired-root cleanup.
+    pub(crate) fn record_absent_roots(
+        &self,
+        absent: &HashSet<RegistrationId>,
+        threshold: u32,
+    ) -> Vec<RetiredRegistration> {
+        let mut guard = self.lock();
+        let mut expired = HashSet::new();
+        for (id, reg) in guard.regs.iter_mut() {
+            if !absent.contains(id) {
+                reg.absent_ticks = 0;
+                continue;
+            }
+            reg.absent_ticks = reg.absent_ticks.saturating_add(1);
+            if reg.absent_ticks >= threshold {
+                expired.insert(id.clone());
+            }
+        }
+        if expired.is_empty() {
+            return Vec::new();
+        }
+        let mut retired = Vec::new();
+        for id in &expired {
+            let Some(reg) = guard.regs.remove(id) else {
+                continue;
+            };
+            release_admission(&mut guard, id);
+            retired.push(RetiredRegistration {
+                corpus: id.corpus_key.name.clone(),
+                root: id.corpus_key.canonical_root.clone(),
+                cfg: reg.cfg,
+            });
+        }
+        guard.queue.retain(|id| !expired.contains(id));
+        guard.generation += 1;
+        drop(guard);
+        self.signal_changed();
+        self.settled.notify_waiters();
+        retired
     }
 
     /// Count of registrations currently observed as [`Observation::Degraded`]
@@ -2062,6 +2157,54 @@ mod tests {
             Some(PendingWork::FullRoot),
             "pending work stays FullRoot until a pass succeeds"
         );
+    }
+
+    #[test]
+    fn repeated_pass_failure_is_recognized_until_a_success_clears_it() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        registry.register(ConfigSource::Baseline, corpus("wiki"), cfg, vec![]);
+        let id = baseline_id("wiki");
+
+        assert!(!registry.repeats_last_error(&id, "walk error"));
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
+        registry.finish_catch_up(&id, Err("walk error".into()));
+        assert!(registry.repeats_last_error(&id, "walk error"));
+        assert!(!registry.repeats_last_error(&id, "other error"));
+
+        registry.mark_reconcile_due_all();
+        assert_eq!(registry.begin_next_catch_up(1), Some(id.clone()));
+        registry.finish_catch_up(&id, Ok(()));
+        assert!(!registry.repeats_last_error(&id, "walk error"));
+    }
+
+    #[test]
+    fn absent_root_count_resets_on_return_and_retires_at_threshold() {
+        let registry = WatchRegistry::new();
+        let a = register_baseline(&registry, "a");
+        let b = register_baseline(&registry, "b");
+        let only_a = HashSet::from([a.clone()]);
+
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(registry.record_absent_roots(&HashSet::new(), 3).is_empty());
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(registry.record_absent_roots(&only_a, 3).is_empty());
+        assert!(
+            registry.observation(&a).is_some(),
+            "a reset count must restart from zero"
+        );
+
+        let generation = registry.generation();
+        let retired = registry.record_absent_roots(&only_a, 3);
+        let names: Vec<&str> = retired.iter().map(|r| r.corpus.as_str()).collect();
+        assert_eq!(names, vec!["a"]);
+        assert_eq!(retired[0].root, a.corpus_key.canonical_root);
+        assert!(registry.observation(&a).is_none());
+        assert!(registry.observation(&b).is_some());
+        assert_eq!(registry.catch_up_state(&a), None);
+        assert!(registry.generation() > generation);
+        assert_ne!(registry.begin_next_catch_up(2), Some(a));
     }
 
     #[test]
