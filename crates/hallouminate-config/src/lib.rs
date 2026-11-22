@@ -134,10 +134,11 @@ impl Default for EmbeddingsConfig {
 /// Process-wide file logging limits loaded from the XDG baseline config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoggingConfig {
-    /// Maximum bytes in the active log or any numbered archive (default 10 MiB).
+    /// Maximum bytes in any one log file, active or archived (default 10 MiB).
     #[serde(default = "default_max_log_file_bytes")]
     pub max_file_bytes: u64,
-    /// Maximum bytes retained across the active log and all archives (default 100 MiB).
+    /// Maximum bytes retained across all hallouminate log files in the state
+    /// directory, for every process together (default 100 MiB).
     #[serde(default = "default_max_log_total_bytes")]
     pub max_total_bytes: u64,
 }

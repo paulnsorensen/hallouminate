@@ -262,9 +262,12 @@ thin clients that talk to it over a Unix domain socket.
 - **Diagnostics** — anything the auto-spawned daemon emits before its logger
   is up (panics, early config errors) lands in
   `~/.local/state/hallouminate/daemon-bootstrap.log` (`$XDG_STATE_HOME`).
-- **Process logs** — `$XDG_STATE_HOME/hallouminate/hallouminate.log`
-  (default `~/.local/state/hallouminate/hallouminate.log`) rotates exactly at
-  10 MiB into numbered archives and retains at most 100 MiB. Configure
+- **Process logs** — each process writes its own file in
+  `$XDG_STATE_HOME/hallouminate/` (default `~/.local/state/hallouminate/`):
+  `daemon.log`, `serve-<pid>.log` per MCP server, and `cli-<pid>.log` per
+  CLI command that logs. Each file rotates at 10 MiB into numbered archives,
+  and all of them together retain at most 100 MiB. Panics are logged with a
+  backtrace. Configure
   `[logging].max_file_bytes` / `max_total_bytes`, or override them with
   `HALLOUMINATE_LOG_MAX_FILE_BYTES` / `HALLOUMINATE_LOG_MAX_TOTAL_BYTES`.
   `[watch].failure_reminder_secs` defaults to 60 seconds; override it with

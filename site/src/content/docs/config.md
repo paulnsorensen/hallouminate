@@ -63,10 +63,17 @@ so the wiki lands at `<repo>/.hallouminate/wiki` and is searchable as
 
 ## Logging
 
-The active process log is
-`$XDG_STATE_HOME/hallouminate/hallouminate.log` (default
-`~/.local/state/hallouminate/hallouminate.log`). Size rotation creates
-numbered archives `hallouminate.log.1`, `.2`, and so on, with `.1` newest.
+Each process writes its own log file in `$XDG_STATE_HOME/hallouminate/`
+(default `~/.local/state/hallouminate/`). Only one process writes each file:
+
+| Process | Log file |
+|---|---|
+| Daemon | `daemon.log` (`daemon-<pid>.log` if another live daemon holds `daemon.log`) |
+| MCP stdio server (`hallouminate serve`) | `serve-<pid>.log` |
+| Any other CLI command | `cli-<pid>.log`, created only when the command logs |
+
+A file rotates before a record would take it past `max_file_bytes`. Archives
+are `<name>.log.1`, `.2`, and so on, with the highest number newest.
 
 ```toml
 [logging]
@@ -74,10 +81,20 @@ max_file_bytes = 10485760   # 10 MiB
 max_total_bytes = 104857600 # 100 MiB
 ```
 
-Every active or archived file is capped at `max_file_bytes`. Retention keeps at
-most `floor(max_total_bytes / max_file_bytes)` files including the active file,
-so defaults retain the active file plus nine archives and never exceed 100 MiB.
-Both limits must be nonzero and the total must be at least the per-file limit.
+`max_total_bytes` bounds all of these files together, plus legacy
+`hallouminate.log` and `hallouminate.log.N` files from older versions. At
+startup and after each rotation, a process deletes files oldest-first until
+the directory has room for one more full file. It deletes files of dead
+processes and its own archives only. Each writer holds an advisory lock on
+`<name>.log.lock` while it runs, and a file is dead only when its lock is
+free, so a reused pid cannot expose a live file to deletion. Live files of
+other processes can therefore keep the total above the limit until those
+processes exit. Both limits must be nonzero and the total must be at least
+the per-file limit.
+
+A panic in any thread is logged as an `ERROR` event with target
+`hallouminate::panic`. The event carries the thread name, location, payload,
+and a backtrace. The panic message also still goes to stderr.
 
 `HALLOUMINATE_LOG_MAX_FILE_BYTES` and
 `HALLOUMINATE_LOG_MAX_TOTAL_BYTES` override the baseline limits. Invalid values
@@ -139,8 +156,8 @@ hallouminate config download
 |---|---|
 | Baseline config | `$XDG_CONFIG_HOME/hallouminate/config.toml` |
 | Repo-layer config | `<repo>/.hallouminate/config.toml` |
-| Active process log | `$XDG_STATE_HOME/hallouminate/hallouminate.log` (state-dir fallback) |
-| Rotated process logs | `hallouminate.log.1` through `.9` with default limits |
+| Process logs | `$XDG_STATE_HOME/hallouminate/` (state-dir fallback): `daemon.log`, `serve-<pid>.log`, `cli-<pid>.log` |
+| Rotated process logs | `<name>.log.1`, `.2`, and so on, highest newest |
 | Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` |
 | Model cache | `~/.cache/hallouminate/fastembed` |
 | Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` |
