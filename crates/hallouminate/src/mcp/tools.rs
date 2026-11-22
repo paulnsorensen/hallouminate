@@ -1335,6 +1335,13 @@ impl HallouminateTools {
                     }
                 }
                 DaemonResponse::Err { kind, message } => {
+                    tracing::debug!(
+                        target: "hallouminate::client",
+                        op = "add_markdown_batch",
+                        item = index,
+                        kind = ?kind,
+                        "daemon returned an item error: {message}",
+                    );
                     Err(map_daemon_err(DaemonRpcError { kind, message }.into()))
                 }
             };

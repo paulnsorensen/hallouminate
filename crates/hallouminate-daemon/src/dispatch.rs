@@ -1024,12 +1024,6 @@ async fn read_existing_text(
                             "{mode_label} requires an existing file; {rel_disp} not found"
                         ))
                     } else {
-                        tracing::error!(
-                            target: "hallouminate::daemon",
-                            error = %source,
-                            path = %rel_disp,
-                            "read_existing_text io error",
-                        );
                         DaemonResponse::internal(format!("failed to read {rel_disp}: {source}"))
                     }
                 }
@@ -1047,11 +1041,6 @@ async fn read_existing_text(
             });
         }
         Err(e) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "read_existing_text read task panicked",
-            );
             return Err(DaemonResponse::internal(format!("read task panicked: {e}")));
         }
     };
@@ -1096,7 +1085,9 @@ async fn handle_add_markdown_batch(
     }
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
-        results.push(handle_add_markdown(state, cfg, request).await);
+        let response = handle_add_markdown(state, cfg, request).await;
+        super::server::log_error_response(Some("add_markdown_batch"), &response);
+        results.push(response);
     }
     DaemonResponse::ok(&AddMarkdownBatchResult { results })
 }
@@ -1283,13 +1274,6 @@ async fn handle_add_markdown(
             return resp;
         }
         Err(join_err) => {
-            // Non-retriable: a panicked blocking task means the write lane is
-            // in an unknown state, so log at error (not warn) for alerting.
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "add_markdown write task panicked",
-            );
             return DaemonResponse::internal(format!("write task panicked: {join_err}"));
         }
     };
@@ -1461,11 +1445,6 @@ async fn handle_read_markdown(
         Ok(Ok(t)) => t,
         Ok(Err(resp)) => return resp,
         Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "read_markdown read task panicked",
-            );
             return DaemonResponse::internal(format!("read task panicked: {join_err}"));
         }
     };
@@ -1541,11 +1520,6 @@ async fn handle_backlinks(cfg: &Config, cwd: &Path, req: BacklinksRequest) -> Da
     let (backlinks, failures) = match scanned {
         Ok(r) => r,
         Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "backlinks scan task panicked",
-            );
             return DaemonResponse::internal(format!("backlinks task panicked: {join_err}"));
         }
     };
@@ -1655,11 +1629,6 @@ async fn handle_delete_markdown(
             return map_delete_error(kind, source, &error_relative);
         }
         Err(join_err) => {
-            tracing::error!(
-                target: "hallouminate::daemon",
-                error = %join_err,
-                "delete_markdown unlink task panicked",
-            );
             return DaemonResponse::internal(format!("unlink task panicked: {join_err}"));
         }
     }
