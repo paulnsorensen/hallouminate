@@ -137,8 +137,12 @@ pub struct LoggingConfig {
     /// Maximum bytes in any one log file, active or archived (default 10 MiB).
     #[serde(default = "default_max_log_file_bytes")]
     pub max_file_bytes: u64,
-    /// Maximum bytes retained across all hallouminate log files in the state
-    /// directory, for every process together (default 100 MiB).
+    /// Target for the bytes retained across all hallouminate log files in the
+    /// state directory (default 100 MiB).
+    ///
+    /// This is a soft bound. Pruning reserves room for one active file and
+    /// never deletes files of a live process, so the directory can reach
+    /// `max_total_bytes` plus `max_file_bytes` for each live process.
     #[serde(default = "default_max_log_total_bytes")]
     pub max_total_bytes: u64,
 }

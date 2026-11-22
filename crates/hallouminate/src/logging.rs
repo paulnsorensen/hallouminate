@@ -19,7 +19,8 @@
 //! owner is dead, so a reused pid cannot make a live file look dead. The file
 //! and its lock appear on the first record, so a command that logs nothing
 //! leaves no file. A second daemon that finds `daemon.log` locked writes
-//! `daemon-<pid>.log` instead.
+//! `daemon-<pid>.log` instead and switches to `daemon.log` at a later rotation
+//! once the lock frees.
 //!
 //! After the subscriber installs, a panic hook records every panic as an
 //! `ERROR` event with target `hallouminate::panic`, then runs the previous
@@ -32,13 +33,14 @@
 //! `hallouminate=info`. Use the same syntax as `RUST_LOG`
 //! (`hallouminate=debug,lance=warn`).
 
-use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::fs::{File, OpenOptions, TryLockError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::NaiveDate;
 use tracing_appender::non_blocking::{NonBlocking, NonBlockingBuilder, WorkerGuard};
@@ -54,6 +56,9 @@ const LEGACY_FAMILY: &str = "hallouminate";
 const PID_FAMILY_PREFIXES: [&str; 3] = ["daemon-", "serve-", "cli-"];
 const LOCK_ATTEMPTS: u32 = 50;
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+const CLI_FAMILY_PREFIX: &str = "cli-";
+const MAX_CLI_FAMILIES: usize = 32;
+const OPEN_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 /// The kind of hallouminate process, which selects its log file name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +124,12 @@ fn install(
     Ok(guard)
 }
 
+/// Record every panic as an `ERROR` event with target `hallouminate::panic`,
+/// then run the previous hook so stderr output stays.
+///
+/// The event passes through the subscriber filter. A `HALLOUMINATE_LOG` (or
+/// `RUST_LOG`) filter without a `hallouminate` directive filters it out. The
+/// backtrace is empty unless `RUST_BACKTRACE` enables it.
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -129,11 +140,9 @@ fn install_panic_hook() {
             None => "<unknown location>".to_owned(),
         };
         let payload = info.payload_as_str().unwrap_or("non-string panic payload");
-        let backtrace = std::backtrace::Backtrace::force_capture();
+        let backtrace = std::backtrace::Backtrace::capture();
         tracing::error!(
             target: "hallouminate::panic",
-            thread,
-            %location,
             %backtrace,
             "thread '{thread}' panicked at {location}: {payload}"
         );
@@ -148,8 +157,12 @@ fn log_writer(
     config: &hallouminate_config::LoggingConfig,
 ) -> anyhow::Result<(NonBlocking, LogGuard)> {
     std::fs::create_dir_all(dir)?;
-    reap_legacy_dated_logs(dir)?;
-    prune(dir, None, config)?;
+    if let Err(error) = reap_legacy_dated_logs(dir) {
+        report_once("remove legacy log files", &error);
+    }
+    if let Err(error) = prune(dir, None, config) {
+        report_once("prune log files", &error);
+    }
     let slot = Arc::new(Mutex::new(Slot::Unopened));
     let sink = LogSink {
         dir: dir.to_path_buf(),
@@ -284,6 +297,42 @@ fn list_log_files(dir: &Path) -> io::Result<Vec<LogFile>> {
     Ok(files)
 }
 
+static OWNED_LOCKS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+static REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn owned_locks() -> MutexGuard<'static, BTreeSet<PathBuf>> {
+    match OWNED_LOCKS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Print the first logging problem of this process on stderr and stay silent
+/// about later ones.
+fn report_once(context: &str, error: &io::Error) {
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!("hallouminate: {context}: {error}");
+}
+
+fn keep_first(slot: &mut Option<io::Error>, error: io::Error) {
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+#[cfg(unix)]
+fn same_file(a: &Metadata, b: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(_a: &Metadata, _b: &Metadata) -> bool {
+    true
+}
+
 /// Exclusive advisory lock on a family's `<name>.log.lock` file. Dropping it
 /// removes the lock file before the lock is released.
 struct FamilyLock {
@@ -298,9 +347,17 @@ enum Claim {
 
 impl FamilyLock {
     /// One non-blocking attempt. `Held` means a live owner or another cleaner
-    /// holds the lock, or the lock file changed during the attempt.
+    /// holds the lock, this process already owns it, or the lock file changed
+    /// during the attempt.
+    ///
+    /// A family this process owns is never probed: on filesystems with
+    /// per-process POSIX lock emulation, opening and closing a second handle
+    /// would drop our own lock.
     fn try_claim(dir: &Path, family: &LogFamily) -> io::Result<Claim> {
         let path = family.lock_path(dir);
+        if owned_locks().contains(&path) {
+            return Ok(Claim::Held);
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -313,18 +370,20 @@ impl FamilyLock {
             Err(TryLockError::Error(error)) => return Err(error),
         }
         // A cleaner may unlink the lock file between our open and our lock.
-        // A second handle on the path conflicts with our lock only when the
-        // path still names the file we locked.
-        let probe = match File::open(&path) {
-            Ok(probe) => probe,
+        // The lock counts only when the path still names the locked file.
+        let locked = file.metadata()?;
+        let current = match std::fs::metadata(&path) {
+            Ok(current) => current,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Claim::Held),
             Err(error) => return Err(error),
         };
-        match probe.try_lock() {
-            Err(TryLockError::WouldBlock) => Ok(Claim::Acquired(Self { path, _file: file })),
-            Ok(()) => Ok(Claim::Held),
-            Err(TryLockError::Error(error)) => Err(error),
+        if !same_file(&locked, &current) {
+            return Ok(Claim::Held);
         }
+        if !owned_locks().insert(path.clone()) {
+            return Ok(Claim::Held);
+        }
+        Ok(Claim::Acquired(Self { path, _file: file }))
     }
 
     fn wait_for(dir: &Path, family: &LogFamily) -> io::Result<Option<Self>> {
@@ -341,6 +400,7 @@ impl FamilyLock {
 impl Drop for FamilyLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        let _ = owned_locks().remove(&self.path);
     }
 }
 
@@ -349,10 +409,20 @@ enum Owner {
     Live,
 }
 
+fn remove_log_file(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Delete log files oldest-first until all of them fit in
 /// `max_total_bytes - max_file_bytes`, which leaves room for one active file.
 /// Only files of `own`'s archives and of families whose lock can be claimed
-/// are deleted.
+/// are deleted. Without `own` (startup), it also keeps only the newest
+/// `MAX_CLI_FAMILIES` dead `cli-*` families and removes orphan lock files.
+/// A failed removal does not stop the pass; the first error is returned.
 fn prune(
     dir: &Path,
     own: Option<&LogFamily>,
@@ -364,30 +434,91 @@ fn prune(
     for file in &files {
         total = total.saturating_add(file.bytes);
     }
-    if total <= budget {
-        return Ok(());
-    }
     files.sort_by(|a, b| {
         a.modified
             .cmp(&b.modified)
             .then_with(|| a.path.cmp(&b.path))
     });
     let mut owners = BTreeMap::new();
+    let mut first_error = None;
+    let mut remaining = Vec::new();
     for file in files {
-        if total <= budget {
-            break;
-        }
-        if !is_removable(dir, own, &file, &mut owners) {
+        if total <= budget || !is_removable(dir, own, &file, &mut owners) {
+            remaining.push(file);
             continue;
         }
-        match std::fs::remove_file(&file.path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        match remove_log_file(&file.path) {
+            Ok(()) => total = total.saturating_sub(file.bytes),
+            Err(error) => {
+                keep_first(&mut first_error, error);
+                remaining.push(file);
+            }
         }
-        total = total.saturating_sub(file.bytes);
+    }
+    if own.is_none() {
+        prune_startup_extras(dir, &remaining, &mut owners, &mut first_error)?;
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn prune_startup_extras(
+    dir: &Path,
+    remaining: &[LogFile],
+    owners: &mut BTreeMap<LogFamily, Owner>,
+    first_error: &mut Option<io::Error>,
+) -> io::Result<()> {
+    let mut newest: BTreeMap<LogFamily, SystemTime> = BTreeMap::new();
+    for file in remaining {
+        if !file.family.0.starts_with(CLI_FAMILY_PREFIX) {
+            continue;
+        }
+        let modified = newest.entry(file.family.clone()).or_insert(file.modified);
+        if file.modified > *modified {
+            *modified = file.modified;
+        }
+    }
+    let mut dead = Vec::new();
+    for (family, modified) in newest {
+        if owner_is_dead(dir, &family, owners) {
+            dead.push((modified, family));
+        }
+    }
+    dead.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    for (_, family) in dead.into_iter().skip(MAX_CLI_FAMILIES) {
+        for file in remaining {
+            if file.family != family {
+                continue;
+            }
+            if let Err(error) = remove_log_file(&file.path) {
+                keep_first(first_error, error);
+            }
+        }
+    }
+    for family in list_lock_families(dir)? {
+        owner_is_dead(dir, &family, owners);
     }
     Ok(())
+}
+
+fn list_lock_families(dir: &Path) -> io::Result<Vec<LogFamily>> {
+    let mut families = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(".log.lock") else {
+            continue;
+        };
+        if let Some(family) = LogFamily::parse(stem) {
+            families.push(family);
+        }
+    }
+    Ok(families)
 }
 
 fn is_removable(
@@ -402,10 +533,16 @@ fn is_removable(
             LogFileKind::Archive(_) => true,
         };
     }
-    let owner = match owners.entry(file.family.clone()) {
+    owner_is_dead(dir, &file.family, owners)
+}
+
+/// Claim a family's lock once per pass. A claimed lock stays held, and its
+/// file is removed, when `owners` drops.
+fn owner_is_dead(dir: &Path, family: &LogFamily, owners: &mut BTreeMap<LogFamily, Owner>) -> bool {
+    let owner = match owners.entry(family.clone()) {
         Entry::Occupied(entry) => entry.into_mut(),
         Entry::Vacant(entry) => {
-            let owner = match FamilyLock::try_claim(dir, &file.family) {
+            let owner = match FamilyLock::try_claim(dir, family) {
                 Ok(Claim::Acquired(lock)) => Owner::Claimed { _lock: lock },
                 Ok(Claim::Held) => Owner::Live,
                 Err(_) => Owner::Live,
@@ -422,6 +559,7 @@ fn is_removable(
 enum Slot {
     Unopened,
     Open(ActiveLog),
+    Failed { retry_at: Instant },
     Closed,
 }
 
@@ -430,6 +568,11 @@ fn lock_slot(slot: &Mutex<Slot>) -> MutexGuard<'_, Slot> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn write_stderr(buf: &[u8]) -> io::Result<usize> {
+    io::stderr().write_all(buf)?;
+    Ok(buf.len())
 }
 
 struct LogSink {
@@ -444,13 +587,28 @@ impl Write for LogSink {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut slot = lock_slot(&self.slot);
         match *slot {
-            Slot::Unopened => *slot = Slot::Open(ActiveLog::open(&self.dir, self.role, self.pid)?),
-            Slot::Open(_) => {}
-            Slot::Closed => {}
+            Slot::Failed { retry_at } if Instant::now() < retry_at => return write_stderr(buf),
+            Slot::Failed { retry_at: _ } => *slot = Slot::Unopened,
+            Slot::Unopened | Slot::Open(_) | Slot::Closed => {}
+        }
+        match *slot {
+            Slot::Unopened => match ActiveLog::open(&self.dir, self.role, self.pid) {
+                Ok(active) => *slot = Slot::Open(active),
+                Err(error) => {
+                    report_once("open log file", &error);
+                    *slot = Slot::Failed {
+                        retry_at: Instant::now() + OPEN_RETRY_DELAY,
+                    };
+                    return write_stderr(buf);
+                }
+            },
+            Slot::Failed { retry_at: _ } | Slot::Open(_) | Slot::Closed => {}
         }
         let active = match &mut *slot {
             Slot::Open(active) => active,
-            Slot::Unopened => return Err(io::Error::other("log file is not open")),
+            Slot::Unopened | Slot::Failed { retry_at: _ } => {
+                return Err(io::Error::other("log file is not open"));
+            }
             Slot::Closed => return Err(io::Error::other("log file is closed")),
         };
         active.write_record(&self.dir, &self.config, buf)?;
@@ -460,45 +618,55 @@ impl Write for LogSink {
     fn flush(&mut self) -> io::Result<()> {
         match &mut *lock_slot(&self.slot) {
             Slot::Open(active) => active.file.flush(),
-            Slot::Unopened => Ok(()),
-            Slot::Closed => Ok(()),
+            Slot::Unopened | Slot::Failed { retry_at: _ } | Slot::Closed => Ok(()),
         }
     }
 }
 
 struct ActiveLog {
     family: LogFamily,
+    /// The preferred family when `family` is a fallback for it.
+    promotable: Option<LogFamily>,
     file: File,
     len: u64,
     next_archive: u64,
     _lock: FamilyLock,
 }
 
+fn next_archive_index(dir: &Path, family: &LogFamily) -> io::Result<u64> {
+    let mut next = 1;
+    for existing in list_log_files(dir)? {
+        let LogFile {
+            family: existing_family,
+            kind,
+            ..
+        } = existing;
+        let LogFileKind::Archive(index) = kind else {
+            continue;
+        };
+        if existing_family == *family && index >= next {
+            next = index.saturating_add(1);
+        }
+    }
+    Ok(next)
+}
+
 impl ActiveLog {
     fn open(dir: &Path, role: LogRole, pid: u32) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        for family in LogFamily::candidates(role, pid) {
+        let candidates = LogFamily::candidates(role, pid);
+        let primary = candidates.first().cloned();
+        for (index, family) in candidates.into_iter().enumerate() {
             let Some(lock) = FamilyLock::wait_for(dir, &family)? else {
                 continue;
             };
             let file = open_append(&family.active_path(dir))?;
             let len = file.metadata()?.len();
-            let mut next_archive = 1;
-            for existing in list_log_files(dir)? {
-                let LogFile {
-                    family: existing_family,
-                    kind,
-                    ..
-                } = existing;
-                let LogFileKind::Archive(index) = kind else {
-                    continue;
-                };
-                if existing_family == family && index >= next_archive {
-                    next_archive = index.saturating_add(1);
-                }
-            }
+            let next_archive = next_archive_index(dir, &family)?;
+            let promotable = if index == 0 { None } else { primary };
             return Ok(Self {
                 family,
+                promotable,
                 file,
                 len,
                 next_archive,
@@ -511,6 +679,10 @@ impl ActiveLog {
         ))
     }
 
+    fn is_full(&self, incoming: u64, config: &hallouminate_config::LoggingConfig) -> bool {
+        self.len > 0 && self.len.saturating_add(incoming) > config.max_file_bytes
+    }
+
     fn write_record(
         &mut self,
         dir: &Path,
@@ -518,30 +690,59 @@ impl ActiveLog {
         buf: &[u8],
     ) -> io::Result<()> {
         let incoming = u64::try_from(buf.len()).unwrap_or(u64::MAX);
-        if self.len > 0 && self.len.saturating_add(incoming) > config.max_file_bytes {
-            self.rotate(dir, config)?;
+        if self.is_full(incoming, config) {
+            self.try_promote(dir);
+        }
+        let rotated = self.is_full(incoming, config);
+        if rotated {
+            self.rotate(dir);
         }
         self.file.write_all(buf)?;
         self.len = self.len.saturating_add(incoming);
+        if rotated && let Err(error) = prune(dir, Some(&self.family), config) {
+            report_once("prune log files", &error);
+        }
         Ok(())
     }
 
-    fn rotate(
-        &mut self,
-        dir: &Path,
-        config: &hallouminate_config::LoggingConfig,
-    ) -> io::Result<()> {
+    /// Switch from a fallback family to the preferred one when its owner is gone.
+    fn try_promote(&mut self, dir: &Path) {
+        let Some(primary) = self.promotable.clone() else {
+            return;
+        };
+        let Ok(Claim::Acquired(lock)) = FamilyLock::try_claim(dir, &primary) else {
+            return;
+        };
+        let Ok(file) = open_append(&primary.active_path(dir)) else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        let Ok(next_archive) = next_archive_index(dir, &primary) else {
+            return;
+        };
+        self.family = primary;
+        self.promotable = None;
+        self.file = file;
+        self.len = metadata.len();
+        self.next_archive = next_archive;
+        self._lock = lock;
+    }
+
+    fn rotate(&mut self, dir: &Path) {
         let active = self.family.active_path(dir);
         let archive = self.family.archive_path(dir, self.next_archive);
         match std::fs::rename(&active, &archive) {
-            Ok(()) => {}
+            Ok(()) => self.next_archive = self.next_archive.saturating_add(1),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => report_once("rotate log file", &error),
         }
-        self.next_archive = self.next_archive.saturating_add(1);
-        self.file = open_append(&active)?;
+        match open_append(&active) {
+            Ok(file) => self.file = file,
+            Err(error) => report_once("reopen log file", &error),
+        }
         self.len = 0;
-        prune(dir, Some(&self.family), config)
     }
 }
 
@@ -550,11 +751,16 @@ fn open_append(path: &Path) -> io::Result<File> {
 }
 
 fn reap_legacy_dated_logs(dir: &Path) -> std::io::Result<()> {
+    let mut first_error = None;
     for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        reap_legacy_dated_log(entry)?;
+        if let Err(error) = entry.and_then(reap_legacy_dated_log) {
+            keep_first(&mut first_error, error);
+        }
     }
-    Ok(())
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 fn reap_legacy_dated_log(entry: std::fs::DirEntry) -> std::io::Result<()> {
@@ -784,6 +990,281 @@ mod tests {
             !dir.path().join("hallouminate.log").exists(),
             "no process may write the shared legacy log"
         );
+        Ok(())
+    }
+
+    const CHILD_MODE_VAR: &str = "HALLOUMINATE_LOG_TEST_CHILD";
+    const CHILD_DIR_VAR: &str = "HALLOUMINATE_LOG_TEST_DIR";
+    const CHILD_LINES: usize = 150;
+    const HELD_FAMILY: &str = "serve-7";
+
+    /// Body of the child processes that the multi-process tests spawn. It does
+    /// nothing in a normal run, where `CHILD_MODE_VAR` is unset.
+    #[test]
+    fn child_entry() -> anyhow::Result<()> {
+        let Ok(mode) = std::env::var(CHILD_MODE_VAR) else {
+            return Ok(());
+        };
+        let dir = PathBuf::from(std::env::var(CHILD_DIR_VAR)?);
+        match mode.as_str() {
+            "write" => {
+                let config = LoggingConfig {
+                    max_file_bytes: 64,
+                    max_total_bytes: 1 << 20,
+                };
+                let pid = std::process::id();
+                let (writer, guard) = log_writer(&dir, LogRole::Serve, pid, &config)?;
+                let mut writer = writer.make_writer();
+                for index in 0..CHILD_LINES {
+                    writer.write_all(format!("p{pid}-{index:04}\n").as_bytes())?;
+                }
+                drop(writer);
+                drop(guard);
+                Ok(())
+            }
+            "hold" => {
+                let family = LogFamily(HELD_FAMILY.to_owned());
+                let Claim::Acquired(lock) = FamilyLock::try_claim(&dir, &family)? else {
+                    anyhow::bail!("child could not claim the family lock");
+                };
+                println!("held");
+                io::stdout().flush()?;
+                let mut sink = String::new();
+                io::stdin().read_line(&mut sink)?;
+                drop(lock);
+                Ok(())
+            }
+            other => anyhow::bail!("unknown child mode {other}"),
+        }
+    }
+
+    fn child_command(mode: &str, dir: &Path) -> anyhow::Result<std::process::Command> {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args([
+                "--exact",
+                "logging::tests::child_entry",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_MODE_VAR, mode)
+            .env(CHILD_DIR_VAR, dir);
+        Ok(command)
+    }
+
+    #[test]
+    fn concurrent_writer_processes_keep_complete_ordered_files() -> anyhow::Result<()> {
+        const CHILDREN: usize = 4;
+        let dir = tempfile::tempdir()?;
+        let mut children = Vec::new();
+        for _ in 0..CHILDREN {
+            let child = child_command("write", dir.path())?
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            children.push(child);
+        }
+        let mut pids = Vec::new();
+        for mut child in children {
+            pids.push(child.id());
+            assert!(child.wait()?.success(), "child writer failed");
+        }
+
+        for pid in pids {
+            let mut expected = Vec::new();
+            for index in 0..CHILD_LINES {
+                expected.push(format!("p{pid}-{index:04}"));
+            }
+            let (files, lines) = family_lines(dir.path(), &format!("serve-{pid}"))?;
+            assert!(files > 1, "child {pid} must rotate, found {files} files");
+            assert_eq!(lines, expected, "serve-{pid} files hold exactly its lines");
+        }
+        for (path, _) in regular_files(dir.path())? {
+            let name = path.to_string_lossy();
+            assert!(
+                !name.ends_with(".lock"),
+                "lock file outlived its owner: {name}"
+            );
+            assert!(
+                !name.ends_with("hallouminate.log"),
+                "shared log written: {name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn family_lock_is_held_during_another_process_and_acquired_after_it_exits() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut child = child_command("hold", dir.path())?
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        let (Some(stdout), Some(stdin)) = (child.stdout.take(), child.stdin.take()) else {
+            anyhow::bail!("child pipes missing");
+        };
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if std::io::BufRead::read_line(&mut reader, &mut line)? == 0 {
+                anyhow::bail!("child exited before it held the lock");
+            }
+            if line.trim().ends_with("held") {
+                break;
+            }
+        }
+
+        let family = LogFamily(HELD_FAMILY.to_owned());
+        let Claim::Held = FamilyLock::try_claim(dir.path(), &family)? else {
+            panic!("a family locked by a live child process must be held");
+        };
+        drop(stdin);
+        assert!(child.wait()?.success(), "child holder failed");
+        let Claim::Acquired(lock) = FamilyLock::try_claim(dir.path(), &family)? else {
+            panic!("a family whose owner exited must be acquirable");
+        };
+        drop(lock);
+        Ok(())
+    }
+
+    #[test]
+    fn claiming_a_family_this_process_owns_reports_held_without_dropping_the_lock()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let family = LogFamily("serve-8".to_owned());
+        let Claim::Acquired(lock) = FamilyLock::try_claim(dir.path(), &family)? else {
+            panic!("first claim must succeed");
+        };
+        for _ in 0..2 {
+            let Claim::Held = FamilyLock::try_claim(dir.path(), &family)? else {
+                panic!("an owned family must never be probed as free");
+            };
+        }
+        assert!(family.lock_path(dir.path()).exists());
+        drop(lock);
+        assert!(!family.lock_path(dir.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn startup_removes_orphan_lock_files_but_keeps_live_ones() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("serve-5.log.lock"), b"")?;
+        let live = LogFamily("serve-6".to_owned());
+        let Claim::Acquired(live_lock) = FamilyLock::try_claim(dir.path(), &live)? else {
+            panic!("test must hold the live family's lock");
+        };
+        let config = LoggingConfig {
+            max_file_bytes: 1024,
+            max_total_bytes: 1 << 20,
+        };
+
+        let (_writer, guard) = log_writer(dir.path(), LogRole::Cli, 99, &config)?;
+        drop(guard);
+
+        assert!(
+            !dir.path().join("serve-5.log.lock").exists(),
+            "orphan lock file must be removed"
+        );
+        assert!(live.lock_path(dir.path()).exists());
+        drop(live_lock);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_keeps_only_the_newest_dead_cli_families() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let total = MAX_CLI_FAMILIES + 8;
+        for index in 0..total {
+            let path = dir.path().join(format!("cli-{}.log", index + 100));
+            std::fs::write(&path, b"x")?;
+            let age = u64::try_from(index + 1)?;
+            File::options()
+                .write(true)
+                .open(&path)?
+                .set_modified(UNIX_EPOCH + Duration::from_secs(age * 1000))?;
+        }
+        let config = LoggingConfig {
+            max_file_bytes: 1024,
+            max_total_bytes: 1 << 20,
+        };
+
+        let (_writer, guard) = log_writer(dir.path(), LogRole::Cli, 99_999, &config)?;
+        drop(guard);
+
+        let mut kept = 0;
+        for index in 0..total {
+            let exists = dir.path().join(format!("cli-{}.log", index + 100)).exists();
+            if exists {
+                kept += 1;
+                assert!(
+                    index >= total - MAX_CLI_FAMILIES,
+                    "old family {index} survived"
+                );
+            }
+        }
+        assert_eq!(kept, MAX_CLI_FAMILIES);
+        Ok(())
+    }
+
+    #[test]
+    fn restarted_daemon_returns_to_daemon_log_once_it_is_free() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let daemon = LogFamily(DAEMON_FAMILY.to_owned());
+        let Claim::Acquired(daemon_lock) = FamilyLock::try_claim(dir.path(), &daemon)? else {
+            panic!("test must hold the daemon family's lock");
+        };
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 1 << 20,
+        };
+        let first = format!("{}\n", "1".repeat(40));
+        let second = format!("{}\n", "2".repeat(40));
+
+        let (writer, guard) = log_writer(dir.path(), LogRole::Daemon, 555, &config)?;
+        let mut writer = writer.make_writer();
+        writer.write_all(first.as_bytes())?;
+        let fallback = dir.path().join("daemon-555.log");
+        for _ in 0..500 {
+            if fallback.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fallback.exists(), "fallback file never appeared");
+        drop(daemon_lock);
+        writer.write_all(second.as_bytes())?;
+        drop(writer);
+        drop(guard);
+
+        assert_eq!(std::fs::read_to_string(&fallback)?, first);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("daemon.log"))?,
+            second
+        );
+        assert!(!dir.path().join("daemon-555.log.lock").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_housekeeping_failure_does_not_fail_log_writer() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir()?;
+        std::fs::write(dir.path().join("hallouminate.2026-07-04.log"), b"old")?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 192,
+        };
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555))?;
+        let result = log_writer(dir.path(), LogRole::Cli, 1, &config);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))?;
+
+        assert!(result.is_ok(), "housekeeping errors must not fail startup");
         Ok(())
     }
 
