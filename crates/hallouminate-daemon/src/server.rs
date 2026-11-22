@@ -21,9 +21,10 @@ use tokio_util::codec::LinesCodecError;
 use hallouminate_config::{self, Config};
 
 use super::dispatch::dispatch;
+use super::failure_log::log_error_response;
 use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::heartbeat::TaskName;
-use super::ipc::{DaemonRequest, DaemonResponse, ErrorKind};
+use super::ipc::{DaemonRequest, DaemonResponse};
 use super::ladder::LadderAction;
 use super::socket::daemon_socket_path;
 use super::state::{DaemonState, IdleClock, WorkClass};
@@ -674,7 +675,16 @@ async fn handle_connection(
             Ok(req) => {
                 op = Some(req.payload.op_name());
                 match authorize_peer(peer_uid, effective_uid, &req.payload) {
-                    Some(denied) => denied,
+                    Some(denied) => {
+                        tracing::warn!(
+                            target: "hallouminate::daemon",
+                            op,
+                            peer_uid = ?peer_uid,
+                            effective_uid,
+                            "mutating request denied by peer authorization",
+                        );
+                        denied
+                    }
                     None => {
                         let candidate_idle_clock = idle_clock_for(&req.payload);
                         let response = dispatch(&state, req).await;
@@ -740,36 +750,6 @@ fn response_frame(response: DaemonResponse) -> serde_json::Result<(DaemonRespons
     let mut text = serde_json::to_string(&response)?;
     text.push('\n');
     Ok((response, text))
-}
-
-/// Writes one tracing event for an error response that the daemon sends to a
-/// client. `op` is the request's operation name when the request parsed.
-/// Request bodies and query text are never logged.
-pub(crate) fn log_error_response(op: Option<&'static str>, response: &DaemonResponse) {
-    let (kind, message) = match response {
-        DaemonResponse::Ok { .. } => return,
-        DaemonResponse::Err { kind, message } => (kind, message),
-    };
-    match kind {
-        ErrorKind::Internal => tracing::error!(
-            target: "hallouminate::daemon",
-            op,
-            kind = ?kind,
-            "request failed: {message}",
-        ),
-        ErrorKind::Retryable => tracing::warn!(
-            target: "hallouminate::daemon",
-            op,
-            kind = ?kind,
-            "request failed: {message}",
-        ),
-        ErrorKind::InvalidParams => tracing::debug!(
-            target: "hallouminate::daemon",
-            op,
-            kind = ?kind,
-            "request failed: {message}",
-        ),
-    }
 }
 
 /// Classify a request for the idle-exit window (ADR daemon-idle-exit-004).
@@ -1121,21 +1101,24 @@ mod tests {
         .await;
         let message = match response.expect("response") {
             DaemonResponse::Err { kind, message } => {
-                assert_eq!(kind, ErrorKind::Internal, "{message}");
+                assert_eq!(kind, super::super::ipc::ErrorKind::Internal, "{message}");
                 message
             }
             DaemonResponse::Ok { result } => panic!("invalid glob listed files: {result:?}"),
         };
         let events = daemon_events(&capture);
-        let mut failures = Vec::new();
+        let mut errors = Vec::new();
         for event in &events {
-            if event.fields.get("kind").map(String::as_str) == Some("Internal") {
-                failures.push(event);
+            if event.level == tracing::Level::ERROR {
+                errors.push(event);
             }
         }
-        assert_eq!(failures.len(), 1, "{events:?}");
-        let event = failures[0];
-        assert_eq!(event.level, tracing::Level::ERROR);
+        assert_eq!(errors.len(), 1, "{events:?}");
+        let event = errors[0];
+        assert_eq!(
+            event.fields.get("kind").map(String::as_str),
+            Some("Internal")
+        );
         assert_eq!(
             event.fields.get("op").map(String::as_str),
             Some("list_files")
@@ -1190,7 +1173,7 @@ mod tests {
         assert_eq!(
             levels,
             vec![
-                tracing::Level::WARN,
+                tracing::Level::DEBUG,
                 tracing::Level::DEBUG,
                 tracing::Level::ERROR
             ]

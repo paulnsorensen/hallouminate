@@ -149,9 +149,24 @@ impl DaemonClient {
     }
 
     /// Send one request, parse one response. The daemon protocol is
-    /// one-shot per connection, so each call opens a new socket.
+    /// one-shot per connection, so each call opens a new socket. A
+    /// transport failure logs one WARN event; callers that tolerate an
+    /// absent daemon use [`Self::call_raw_quiet`] instead.
     pub async fn call_raw(&self, req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
         let op = req.payload.op_name();
+        let result = self.call_raw_quiet(req).await;
+        if let Err(error) = &result {
+            self.log_call_failure(op, error);
+        }
+        result
+    }
+
+    /// [`Self::call_raw`] without the failure log, for probes whose callers
+    /// treat an unreachable daemon as a normal answer.
+    pub(crate) async fn call_raw_quiet(
+        &self,
+        req: DaemonRequest,
+    ) -> anyhow::Result<DaemonResponse> {
         let mut text = serde_json::to_string(&req)?;
         text.push('\n');
         if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload
@@ -162,80 +177,62 @@ impl DaemonClient {
             )
             .into());
         }
-        let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
-            self.transport_failure(
-                op,
-                format!("connect to {} failed: {e}", self.socket.display()),
-            )
-        })?;
         // Wrap mid-call I/O errors with the same `daemon unavailable` hint
         // the initial connect uses. Without this, a daemon that dies after
         // the connect succeeds (write fails, read returns EOF, response
         // truncates) surfaces as a bare I/O / JSON error and MCP/CLI
         // callers lose the actionable "start it with `hallouminate daemon`"
         // recovery suffix.
+        let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
+            daemon_client_unavailable(format!("connect to {} failed: {e}", self.socket.display()))
+        })?;
         stream.write_all(text.as_bytes()).await.map_err(|e| {
-            self.transport_failure(
-                op,
-                format!("write to {} failed: {e}", self.socket.display()),
-            )
+            daemon_client_unavailable(format!("write to {} failed: {e}", self.socket.display()))
         })?;
         stream.flush().await.map_err(|e| {
-            self.transport_failure(op, format!("flush {} failed: {e}", self.socket.display()))
+            daemon_client_unavailable(format!("flush {} failed: {e}", self.socket.display()))
         })?;
         let (read_half, _) = stream.into_split();
         let mut lines = ipc_lines(read_half);
         let Some(line) = lines.next().await else {
-            return Err(self.transport_failure(
-                op,
-                format!(
-                    "daemon at {} closed the connection before responding",
-                    self.socket.display(),
-                ),
-            ));
+            return Err(daemon_client_unavailable(format!(
+                "daemon at {} closed the connection before responding",
+                self.socket.display(),
+            )));
         };
         let line = line.map_err(|e| {
-            self.transport_failure(
-                op,
-                format!("read from {} failed: {e}", self.socket.display()),
-            )
+            daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
         })?;
-        let response: DaemonResponse = match serde_json::from_str(&line) {
-            Ok(response) => response,
-            Err(e) => {
-                tracing::warn!(
-                    target: "hallouminate::client",
-                    op,
-                    socket = %self.socket.display(),
-                    error = %e,
-                    "daemon sent an invalid response",
-                );
-                return Err(daemon_client_unavailable(format!(
-                    "invalid daemon response from {}: {e} (response: {line:?})",
-                    self.socket.display(),
-                )));
-            }
-        };
-        Ok(response)
+        serde_json::from_str(&line).map_err(|e| {
+            daemon_client_unavailable(format!(
+                "invalid daemon response from {}: {e} (response: {line:?})",
+                self.socket.display(),
+            ))
+        })
     }
 
-    /// Logs a transport failure and wraps `reason` with the "daemon
-    /// unavailable" hint.
-    fn transport_failure(&self, op: &'static str, reason: String) -> anyhow::Error {
+    /// Logs one WARN event for a failed call. A local `InvalidParams`
+    /// rejection is the caller's mistake, not a daemon failure.
+    fn log_call_failure(&self, op: &'static str, error: &anyhow::Error) {
+        if let Some(rpc) = error.downcast_ref::<DaemonRpcError>()
+            && rpc.kind == ErrorKind::InvalidParams
+        {
+            return;
+        }
         tracing::warn!(
             target: "hallouminate::client",
             op,
-            reason = %reason,
+            socket = %self.socket.display(),
+            error = %format_args!("{error:#}"),
             "daemon call failed",
         );
-        daemon_client_unavailable(reason)
     }
 
     /// [`call_raw`] with a bounded round-trip deadline. `call_raw` itself
     /// has no timeout — a daemon that accepts the connection but never
     /// writes/reads would otherwise hang the caller forever. Lifecycle
     /// commands (`stop`, `status`) that must never wait indefinitely for an
-    /// accepted-but-silent socket use this instead of bare `call_raw`.
+    /// accepted-but-silent socket use [`Self::call_raw_with_timeout_quiet`].
     ///
     /// Deadline expiry is typed [`DaemonRpcError`] with
     /// [`ErrorKind::Retryable`] (#216): the daemon accepted the connection,
@@ -243,34 +240,40 @@ impl DaemonClient {
     /// Batch deadlines leave completion uncertain; callers must inspect files before retrying.
     /// Transport failures inside `call_raw` (connect/write/read/EOF) keep
     /// the untyped "daemon unavailable" shape with its restart hint —
-    /// retrying against a dead daemon cannot succeed.
+    /// retrying against a dead daemon cannot succeed. Any failure logs one
+    /// WARN event.
     pub async fn call_raw_with_timeout(
         &self,
         req: DaemonRequest,
         timeout: Duration,
     ) -> anyhow::Result<DaemonResponse> {
         let op = req.payload.op_name();
+        let result = self.call_raw_with_timeout_quiet(req, timeout).await;
+        if let Err(error) = &result {
+            self.log_call_failure(op, error);
+        }
+        result
+    }
+
+    /// [`Self::call_raw_with_timeout`] without the failure log, for
+    /// lifecycle commands that treat an unreachable daemon as a normal answer.
+    pub(crate) async fn call_raw_with_timeout_quiet(
+        &self,
+        req: DaemonRequest,
+        timeout: Duration,
+    ) -> anyhow::Result<DaemonResponse> {
         let mut timeout_hint = "the daemon may be busy — retry";
         if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload {
             timeout_hint = "batch completion is uncertain; inspect files before retrying. No automatic retry or rollback occurred";
         }
-        match tokio::time::timeout(timeout, self.call_raw(req)).await {
+        match tokio::time::timeout(timeout, self.call_raw_quiet(req)).await {
             Ok(result) => result,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    target: "hallouminate::client",
-                    op,
-                    socket = %self.socket.display(),
-                    timeout_secs = timeout.as_secs_f64(),
-                    "daemon call timed out",
-                );
-                Err(DaemonRpcError::retryable(format!(
-                    "no response from {} within {}s; {timeout_hint}",
-                    self.socket.display(),
-                    timeout.as_secs(),
-                ))
-                .into())
-            }
+            Err(_elapsed) => Err(DaemonRpcError::retryable(format!(
+                "no response from {} within {}s; {timeout_hint}",
+                self.socket.display(),
+                timeout.as_secs(),
+            ))
+            .into()),
         }
     }
 
@@ -445,6 +448,48 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         let error = warnings[0].fields.get("error").expect("error field");
         assert!(error.contains("spawn refused"), "{error}");
+    }
+
+    async fn hangup_client() -> (tempfile::TempDir, DaemonClient) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sock_path = tmp.path().join("hangup.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).expect("bind");
+        let client = connect_at(&sock_path).await.expect("connect");
+        tokio::spawn(async move {
+            loop {
+                let (stream, _addr) = listener.accept().await.expect("accept");
+                drop(stream);
+            }
+        });
+        (tmp, client)
+    }
+
+    #[tokio::test]
+    async fn transport_failure_logs_one_warning_at_the_public_boundary() {
+        let (_tmp, client) = hangup_client().await;
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        client
+            .call_raw(ping_request())
+            .await
+            .expect_err("a hung-up peer must fail");
+        let warnings = client_events(&capture, tracing::Level::WARN);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[tokio::test]
+    async fn quiet_calls_log_no_warning_on_transport_failure() {
+        let (_tmp, client) = hangup_client().await;
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        client
+            .call_raw_quiet(ping_request())
+            .await
+            .expect_err("a hung-up peer must fail");
+        client
+            .call_raw_with_timeout_quiet(ping_request(), Duration::from_secs(5))
+            .await
+            .expect_err("a hung-up peer must fail");
+        let warnings = client_events(&capture, tracing::Level::WARN);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[tokio::test]

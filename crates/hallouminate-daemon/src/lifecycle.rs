@@ -45,7 +45,7 @@ async fn status_at(socket: &Path) -> anyhow::Result<DaemonStatus> {
         return Ok(DaemonStatus::NotRunning);
     };
     match client
-        .call_raw_with_timeout(
+        .call_raw_with_timeout_quiet(
             DaemonRequest {
                 cwd: std::env::current_dir().unwrap_or_default(),
                 payload: DaemonRequestPayload::Status,
@@ -83,7 +83,7 @@ pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
         return Ok(());
     };
     let _ = client
-        .call_raw_with_timeout(
+        .call_raw_with_timeout_quiet(
             DaemonRequest {
                 cwd: std::env::current_dir().unwrap_or_default(),
                 payload: DaemonRequestPayload::Shutdown,
@@ -179,6 +179,49 @@ mod tests {
             DaemonStatus::NotRunning => panic!("live socket must report Running"),
         }
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn status_of_a_daemon_that_hangs_up_is_not_running_without_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+
+        let status = status_at(&socket).await.expect("status");
+        server.await.expect("server task");
+
+        match status {
+            DaemonStatus::NotRunning => {}
+            DaemonStatus::Running(_) => panic!("a hung-up peer must report NotRunning"),
+        }
+        for target in ["hallouminate::client", "hallouminate::daemon"] {
+            for event in capture.events_for(target) {
+                assert!(event.level > tracing::Level::INFO, "{event:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn status_without_a_socket_is_not_running_without_warnings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+
+        let status = status_at(&dir.path().join("none.sock"))
+            .await
+            .expect("status");
+
+        match status {
+            DaemonStatus::NotRunning => {}
+            DaemonStatus::Running(_) => panic!("a missing socket must report NotRunning"),
+        }
+        for target in ["hallouminate::client", "hallouminate::daemon"] {
+            assert!(capture.events_for(target).is_empty());
+        }
     }
 
     #[tokio::test]

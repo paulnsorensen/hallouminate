@@ -794,7 +794,17 @@ async fn handle_ground(
     .await;
     let mut response = match response {
         Ok(r) => r,
-        Err(e) => return DaemonResponse::internal(e.to_string()),
+        Err(e) => {
+            tracing::debug!(
+                target: "hallouminate::daemon",
+                error = %e,
+                "ground failed",
+            );
+            return DaemonResponse::internal(format!(
+                "ground failed ({} error); the daemon debug log has the cause",
+                ground_error_class(&e),
+            ));
+        }
     };
     if crossencoder_unavailable {
         response.warnings.push(Warning {
@@ -853,6 +863,21 @@ async fn handle_ground(
         },
     );
     DaemonResponse::ok(&GroundResult { outline, response })
+}
+
+/// Names the failing subsystem of a ground error without its text, which
+/// can echo the query or file paths.
+fn ground_error_class(error: &hallouminate_domain::common::HallouminateError) -> &'static str {
+    use hallouminate_domain::common::HallouminateError;
+    match error {
+        HallouminateError::Io(_) => "io",
+        HallouminateError::Db(_) => "db",
+        HallouminateError::Embed(_) => "embed",
+        HallouminateError::Config(_) => "config",
+        HallouminateError::Indexer(_) => "indexer",
+        HallouminateError::Search(_) => "search",
+        HallouminateError::StoreSchemaStale { .. } => "store schema",
+    }
 }
 
 /// Map a mutation-guard acquisition failure onto the wire. The Hard-debt
@@ -1030,14 +1055,9 @@ async fn read_existing_text(
                 WriteErrorKind::Symlink | WriteErrorKind::InvalidPath => {
                     DaemonResponse::invalid_params(format!("refusing unsafe path {rel_disp}"))
                 }
-                WriteErrorKind::Exists => {
-                    tracing::error!(
-                        target: "hallouminate::daemon",
-                        path = %rel_disp,
-                        "read_existing_text: unexpected Exists variant on read path",
-                    );
-                    DaemonResponse::internal("unexpected Exists on read")
-                }
+                WriteErrorKind::Exists => DaemonResponse::internal(format!(
+                    "unexpected Exists variant on read of {rel_disp}"
+                )),
             });
         }
         Err(e) => {
@@ -1086,7 +1106,7 @@ async fn handle_add_markdown_batch(
     let mut results = Vec::with_capacity(requests.len());
     for request in requests {
         let response = handle_add_markdown(state, cfg, request).await;
-        super::server::log_error_response(Some("add_markdown_batch"), &response);
+        super::failure_log::log_error_response(Some("add_markdown_batch"), &response);
         results.push(response);
     }
     DaemonResponse::ok(&AddMarkdownBatchResult { results })
@@ -2317,14 +2337,7 @@ async fn write_ancestor_index(root: &Path, dir: &Path) -> Result<Option<WrittenI
             .map(|path| WrittenIndex { path, bytes })
     })
     .await
-    .map_err(|e| {
-        tracing::error!(
-            target: "hallouminate::daemon",
-            error = %e,
-            "write_ancestor_index write task panicked",
-        );
-        format!("index write task panicked: {e}")
-    })?;
+    .map_err(|e| format!("index write task panicked: {e}"))?;
     match written {
         Ok(written) => Ok(Some(written)),
         Err(WriteError { kind, source }) => Err(format!(
