@@ -420,3 +420,14 @@ fn copy_wiki(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DAEMON_CONFIG;
+
+    #[test]
+    fn private_daemon_disables_idle_exit() {
+        let config: toml::Value = toml::from_str(DAEMON_CONFIG).unwrap();
+        assert_eq!(config["daemon"]["idle_exit_secs"].as_integer(), Some(0));
+    }
+}

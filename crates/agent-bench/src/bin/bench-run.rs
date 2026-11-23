@@ -13,7 +13,7 @@ use std::time::Instant;
 use agent_bench::provenance::{RunMeta, fingerprint, load_questions, resolve_executable};
 use agent_bench::{
     Arm, Manifest, Question, SessionRecord, TokenUsage, blake3_file_hash, load_toml, read_jsonl,
-    replace_jsonl, repo_root, verify_agent_cli_version,
+    replace_jsonl, repo_root,
 };
 use anyhow::{Context, bail, ensure};
 use clap::{Parser, ValueEnum};
@@ -84,10 +84,7 @@ fn main() -> anyhow::Result<()> {
     let bin = offline_agent
         .canonicalize()
         .context("resolving offline agent")?;
-    verify_agent_cli_version(
-        bin.to_str().context("agent executable path is not UTF-8")?,
-        &manifest.claude_code_version,
-    )?;
+    verify_offline_agent_version(&bin, &manifest.claude_code_version)?;
     let checkouts = resolve_checkouts(&repo_root(), &manifest)?;
     let hallouminate = resolve_executable("AGENT_BENCH_HALLOUMINATE_BIN", "hallouminate")?;
     let agent_hash = blake3_file_hash(&bin)?;
@@ -179,6 +176,23 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn verify_offline_agent_version(bin: &Path, expected: &str) -> anyhow::Result<()> {
+    let output = Command::new(bin)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--version")
+        .output()
+        .context("running offline agent --version")?;
+    ensure!(output.status.success(), "offline agent --version failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let actual = stdout.split_whitespace().next().unwrap_or("");
+    ensure!(
+        actual == expected,
+        "agent CLI version drift: manifest.claude_code_version = {expected}, but the offline agent reports {actual:?}"
+    );
     Ok(())
 }
 
