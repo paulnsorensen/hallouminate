@@ -1,5 +1,5 @@
-use std::fs::OpenOptions;
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -155,7 +155,13 @@ impl OpLog {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         std::fs::create_dir_all(&self.dir)?;
-        let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)?;
+        file.lock()?;
+        recover_unterminated_row(&mut file)?;
         file.write_all(&line)
     }
 
@@ -291,6 +297,44 @@ impl OpLog {
     }
 }
 
+fn recover_unterminated_row(file: &mut File) -> io::Result<()> {
+    let end = file.seek(SeekFrom::End(0))?;
+    let start = last_row_start(file, end)?;
+    if start == end {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(start))?;
+    let tail = BufReader::new((&mut *file).take(end - start));
+    let row = serde_json::from_reader::<_, serde_json::Value>(tail);
+    if file.seek(SeekFrom::End(0))? != end {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "operation log changed during recovery",
+        ));
+    }
+    match row {
+        Ok(_value) => file.write_all(b"\n"),
+        Err(error) if error.is_eof() => file.set_len(start),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn last_row_start(file: &mut File, end: u64) -> io::Result<u64> {
+    let mut block = [0; 4096];
+    let mut offset = end;
+    while offset > 0 {
+        let len = offset.min(block.len() as u64) as usize;
+        offset -= len as u64;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut block[..len])?;
+        if let Some(newline) = block[..len].iter().rposition(|&byte| byte == b'\n') {
+            return Ok(offset + newline as u64 + 1);
+        }
+    }
+    Ok(0)
+}
+
 fn segment_date(name: &str) -> Option<NaiveDate> {
     let date = name.strip_prefix(SEGMENT_PREFIX)?;
     let date = date.strip_suffix(SEGMENT_SUFFIX)?;
@@ -339,6 +383,70 @@ mod tests {
         let path = log.segment_path(date(day));
         std::fs::write(&path, vec![b'x'; bytes]).expect("write segment");
         path
+    }
+
+    #[test]
+    fn append_recovers_a_partial_row_without_losing_complete_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let before = record();
+        let after = [record(), record()];
+        let writer = capped_log(dir.path(), u64::MAX);
+        let path = writer.segment_path(date(16));
+        writer.write_line(&path, &before).expect("write first row");
+        let interrupted = OperationRecord {
+            corpus: Some("é".repeat(8192)),
+            ..record()
+        };
+        let mut fragment = serde_json::to_vec(&interrupted).expect("serialize interrupted row");
+        fragment.truncate(fragment.len() / 2);
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open segment");
+        file.write_all(&fragment).expect("leave partial row");
+        drop(file);
+        drop(writer);
+
+        std::thread::scope(|scope| {
+            for row in &after {
+                let path = &path;
+                scope.spawn(move || {
+                    let dir = path.parent().expect("segment parent");
+                    let reopened = capped_log(dir, u64::MAX);
+                    reopened.write_line(path, row).expect("write recovery row");
+                });
+            }
+        });
+
+        let contents = std::fs::read_to_string(&path).expect("read recovered segment");
+        assert!(contents.ends_with('\n'), "segment must end with a newline");
+        let mut rows = Vec::new();
+        for line in contents.lines() {
+            rows.push(serde_json::from_str::<OperationRecord>(line).expect("read complete row"));
+        }
+        assert_eq!(rows.first(), Some(&before));
+        assert_eq!(rows.len(), 3);
+        for row in &after {
+            assert!(
+                rows.contains(row),
+                "missing recovery row: {:?}",
+                row.request_id
+            );
+        }
+    }
+
+    #[test]
+    fn append_preserves_a_complete_row_without_its_newline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let writer = capped_log(dir.path(), u64::MAX);
+        let path = writer.segment_path(date(16));
+        let before = serde_json::to_string(&record()).expect("serialize first row");
+        std::fs::write(&path, &before).expect("write first row without newline");
+        let row = record();
+        writer.write_line(&path, &row).expect("write second row");
+        let after = serde_json::to_string(&row).expect("serialize second row");
+        let contents = std::fs::read_to_string(&path).expect("read recovered segment");
+        assert_eq!(contents, format!("{before}\n{after}\n"));
     }
 
     #[test]
