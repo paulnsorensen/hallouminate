@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(
             levels,
             vec![
-                tracing::Level::DEBUG,
+                tracing::Level::INFO,
                 tracing::Level::DEBUG,
                 tracing::Level::ERROR
             ]

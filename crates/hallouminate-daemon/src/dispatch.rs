@@ -794,17 +794,7 @@ async fn handle_ground(
     .await;
     let mut response = match response {
         Ok(r) => r,
-        Err(e) => {
-            tracing::debug!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "ground failed",
-            );
-            return DaemonResponse::internal(format!(
-                "ground failed ({} error); the daemon debug log has the cause",
-                ground_error_class(&e),
-            ));
-        }
+        Err(e) => return ground_failure_response(&e),
     };
     if crossencoder_unavailable {
         response.warnings.push(Warning {
@@ -865,18 +855,36 @@ async fn handle_ground(
     DaemonResponse::ok(&GroundResult { outline, response })
 }
 
-/// Names the failing subsystem of a ground error without its text, which
-/// can echo the query or file paths.
-fn ground_error_class(error: &hallouminate_domain::common::HallouminateError) -> &'static str {
+/// Logs a ground failure with its cause and builds the client response.
+///
+/// The daemon log is a local file, so it carries the raw error. The client
+/// message carries the error text only for classes that cannot echo the
+/// query; the other classes name the subsystem alone.
+fn ground_failure_response(
+    error: &hallouminate_domain::common::HallouminateError,
+) -> DaemonResponse {
     use hallouminate_domain::common::HallouminateError;
-    match error {
-        HallouminateError::Io(_) => "io",
-        HallouminateError::Db(_) => "db",
-        HallouminateError::Embed(_) => "embed",
-        HallouminateError::Config(_) => "config",
-        HallouminateError::Indexer(_) => "indexer",
-        HallouminateError::Search(_) => "search",
-        HallouminateError::StoreSchemaStale { .. } => "store schema",
+    let (class, echoes_query) = match error {
+        HallouminateError::Io(_) => ("io", false),
+        HallouminateError::Db(_) => ("db", false),
+        HallouminateError::StoreSchemaStale { .. } => ("store schema", false),
+        HallouminateError::Embed(_) => ("embed", true),
+        HallouminateError::Config(_) => ("config", true),
+        HallouminateError::Indexer(_) => ("indexer", true),
+        HallouminateError::Search(_) => ("search", true),
+    };
+    tracing::warn!(
+        target: "hallouminate::daemon",
+        error = %error,
+        class,
+        "ground failed",
+    );
+    if echoes_query {
+        DaemonResponse::internal(format!(
+            "ground failed ({class} error); the daemon log has the cause"
+        ))
+    } else {
+        DaemonResponse::internal(format!("ground failed ({class} error): {error}"))
     }
 }
 
@@ -1389,6 +1397,13 @@ async fn handle_add_markdown(
     let mut ancestor_problems: Vec<String> = ancestors.failure.into_iter().collect();
     ancestor_problems.extend(ancestors_skipped);
     if !ancestor_problems.is_empty() {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            count = ancestor_problems.len(),
+            first = %ancestor_problems[0],
+            path = %dest.display(),
+            "add_markdown: ancestor index refresh failed after durable write",
+        );
         warnings.push(format!(
             "wrote {} but ancestor index refresh failed: {}; run `index` to repair",
             relative.display(),
@@ -4810,6 +4825,44 @@ mod tests {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         }
+    }
+
+    /// WHY: a failed ground must leave its cause in the daemon log at WARN,
+    /// and the client text must hold the cause only for classes that cannot
+    /// echo the query.
+    #[test]
+    fn ground_failure_logs_cause_and_gates_client_text_by_class() {
+        use hallouminate_domain::common::HallouminateError;
+
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        let stale = HallouminateError::StoreSchemaStale {
+            found: 1,
+            expected: 2,
+            ground_dir: std::path::PathBuf::from("/stale/ground"),
+        };
+        let search = HallouminateError::Search("rg: secret-query-text".to_string());
+
+        let stale_message = match ground_failure_response(&stale) {
+            DaemonResponse::Err { message, .. } => message,
+            DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
+        };
+        let search_message = match ground_failure_response(&search) {
+            DaemonResponse::Err { message, .. } => message,
+            DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
+        };
+
+        assert!(stale_message.contains("/stale/ground"), "{stale_message}");
+        assert!(
+            !search_message.contains("secret-query-text"),
+            "{search_message}"
+        );
+        let events = capture.events_for("hallouminate::daemon");
+        assert_eq!(events.len(), 2, "{events:?}");
+        for event in &events {
+            assert_eq!(event.level, tracing::Level::WARN);
+        }
+        assert!(events[0].fields["error"].contains("/stale/ground"));
+        assert!(events[1].fields["error"].contains("secret-query-text"));
     }
 
     /// WHY (AC-6): a ground call on a never-registered root registers it and
