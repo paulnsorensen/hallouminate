@@ -5,5 +5,7 @@ pub(crate) use tokio::net::{UnixListener as LocalListener, UnixStream as LocalSt
 
 #[cfg(windows)]
 mod windows;
+#[cfg(all(windows, test))]
+pub(crate) use windows::pipe_name;
 #[cfg(windows)]
 pub(crate) use windows::{LocalListener, LocalStream};

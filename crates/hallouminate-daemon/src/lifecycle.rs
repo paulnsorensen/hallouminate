@@ -83,21 +83,13 @@ pub async fn stop() -> anyhow::Result<()> {
 
 pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
+    #[cfg(unix)]
     let client = match connect_at(socket).await {
         Ok(client) => Some(client),
-        #[cfg(unix)]
         Err(_error) => return Ok(()),
-        #[cfg(windows)]
-        Err(error) => {
-            if !error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|cause| cause.kind() == std::io::ErrorKind::NotFound)
-            {
-                return Err(error);
-            }
-            None
-        }
     };
+    #[cfg(windows)]
+    let client = connect_for_stop(socket, deadline).await?;
     if let Some(client) = client {
         let _ = client
             .call_raw_with_timeout(
@@ -117,6 +109,41 @@ pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
         let stopped = daemon_lock_released(socket)?;
         if stopped {
             return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "daemon did not stop within {}s (endpoint {})",
+                STOP_TIMEOUT.as_secs(),
+                socket.display(),
+            );
+        }
+        tokio::time::sleep(STOP_POLL).await;
+    }
+}
+
+/// Connects for `stop`, retrying a busy pipe until `deadline`.
+///
+/// `Ok(None)` means the endpoint is gone. Access and account errors fail at once.
+#[cfg(windows)]
+async fn connect_for_stop(
+    socket: &Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Option<super::client::DaemonClient>> {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+    loop {
+        let error = match connect_at(socket).await {
+            Ok(client) => return Ok(Some(client)),
+            Err(error) => error,
+        };
+        let Some(cause) = error.downcast_ref::<std::io::Error>() else {
+            return Err(error);
+        };
+        if cause.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if cause.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
+            return Err(error);
         }
         if std::time::Instant::now() >= deadline {
             anyhow::bail!(
@@ -262,5 +289,40 @@ mod tests {
 
         assert!(!socket.exists(), "socket must be removed");
         server.await.expect("server task");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn stop_retries_busy_pipe_until_deadline() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        let name = crate::transport::pipe_name(&socket).expect("pipe name");
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .create(&name)
+            .expect("create single-instance pipe");
+        let held = ClientOptions::new().open(&name).expect("occupy pipe");
+        server.connect().await.expect("accept occupying client");
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(Duration::from_secs(30), stop_at(&socket))
+            .await
+            .expect("stop_at must finish");
+        let elapsed = started.elapsed();
+
+        let error = outcome.expect_err("a permanently busy pipe must time out");
+        assert!(
+            error.to_string().contains("daemon did not stop within"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            elapsed >= STOP_TIMEOUT,
+            "stop_at gave up after {elapsed:?}, before the deadline"
+        );
+        drop(held);
+        drop(server);
     }
 }

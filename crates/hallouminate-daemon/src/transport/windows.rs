@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPip
 
 use crate::windows_security::{OwnerSecurity, UserSid, current_user_sid, process_user_sid};
 
-fn pipe_name(path: &Path) -> io::Result<String> {
+pub(crate) fn pipe_name(path: &Path) -> io::Result<String> {
     let path = hallouminate_domain::common::best_effort_canonical(path);
     let mut hash = blake3::Hasher::new();
     for unit in path.as_os_str().encode_wide() {
