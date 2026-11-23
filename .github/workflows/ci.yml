@@ -108,7 +108,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked -p hallouminate-daemon --all-targets -- -D warnings
       - name: Test
-        run: cargo nextest run --locked -p hallouminate-daemon
+        run: cargo nextest run --locked --no-fail-fast -p hallouminate-daemon
 
   build-test-matrix:
     name: build & test (${{ matrix.os }})
