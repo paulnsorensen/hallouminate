@@ -222,3 +222,63 @@ async fn multiple_independent_apply_batches_are_durable_across_opens() {
     let snaps = store.list_files(&corpus_key).await.expect("list");
     assert_eq!(snaps.len(), 3, "all three files snapshotted");
 }
+
+/// Rewinds a store to the state a crash during first `create_table` leaves:
+/// the table directory exists, holds a partial data file, and has no manifest.
+fn leave_tables_without_manifest(store_dir: &std::path::Path) {
+    for table in ["chunks.lance", "root_files.lance"] {
+        let table_dir = store_dir.join(table);
+        assert!(table_dir.is_dir(), "{table} must exist before the rewind");
+        fs::remove_dir_all(table_dir.join("_versions")).expect("remove manifests");
+        let data_dir = table_dir.join("data");
+        fs::create_dir_all(&data_dir).expect("data dir");
+        fs::write(data_dir.join("orphan.lance"), b"partial write").expect("orphan data file");
+    }
+}
+
+#[tokio::test]
+async fn first_open_recovers_table_directory_left_without_manifest() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().expect("tempdir store");
+
+    {
+        LanceStore::open_or_create(
+            store_dir.path(),
+            MODEL,
+            false,
+            true,
+            Some(Box::new(StubEmbedder)),
+        )
+        .await
+        .expect("initial create");
+    }
+    leave_tables_without_manifest(store_dir.path());
+
+    let store = LanceStore::open_or_create(
+        store_dir.path(),
+        MODEL,
+        false,
+        true,
+        Some(Box::new(StubEmbedder)),
+    )
+    .await
+    .expect("first open must recover manifest-less table directories");
+    assert_eq!(store.count_rows().await.unwrap(), 0);
+
+    let corpus_key = hallouminate_domain::common::CorpusKey::from_configured_root("docs", "/tmp");
+    let pf = placeholder_prepared_file("/tmp/a.md", &corpus_key, 3);
+    store
+        .apply_batch(vec![pf])
+        .await
+        .expect("apply after recovery");
+    drop(store);
+
+    let store = LanceStore::open_or_create(store_dir.path(), MODEL, false, true, None)
+        .await
+        .expect("reopen after recovery");
+    assert_eq!(
+        store.count_rows().await.unwrap(),
+        3,
+        "rows written after recovery must persist"
+    );
+}

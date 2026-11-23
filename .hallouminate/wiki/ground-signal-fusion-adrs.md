@@ -1,7 +1,7 @@
 ---
-status: draft
-last_verified: 2026-07-26
-confidence: medium
+status: reviewed
+last_verified: 2026-08-09
+confidence: high
 sources:
   - .cheese/specs/ground-signal-fusion.md
   - .cheese/notes/ground-ranking-fusion-audit.md
@@ -9,7 +9,13 @@ sources:
 ---
 # Ground signal fusion ADRs
 
-Six decisions from the ranking audit that followed PR #290, plus one criterion-2 resolution decided after review (ADR-006). The approved implementation contract is [.cheese/specs/ground-signal-fusion.md]; these records preserve the rationale behind it.
+Ranked ground combines four retrieval signals with bounded heading and authored-content signals. Phrase search remains separate, and generated navigation stays searchable.[^structure]
+
+ADR-001 through ADR-007 preserve the earlier fusion decisions. ADR-008 records the structural ranking added in PR #575.
+
+**This page is the durable record, not a companion to one.** The implementation contract it was written against, `.cheese/specs/ground-signal-fusion.md`, lives under the gitignored `.cheese/` tree and is not in the repository — a future reader has these ADRs and the code, nothing else. Cite the code seams, not the spec.
+
+The decisions shipped. Verified against the tree at 2026-08-09: `WeightedRRFReranker` is gone, weighted N-list RRF lives in `crates/hallouminate-domain/src/search/fuse.rs`, and the four signal weights ADR-006 argues about are live constants — `FTS_WEIGHT = 2.0`, `VECTOR_WEIGHT = 1.0`, `RIPGREP_WEIGHT = 0.5`, `CONTAINS_WEIGHT = 0.5` in `crates/hallouminate-domain/src/search.rs`. `fuse` breaks score ties toward the chunk more signals agreed on, then by `chunk_id` for determinism, and a chunk repeated within one list contributes only from its best rank.
 
 ### ADR-001: Move N-signal fusion into the domain layer [status: accepted]
 
@@ -60,4 +66,36 @@ Six decisions from the ranking audit that followed PR #290, plus one criterion-2
 - **Alternatives:** Making the literal signals peer retrieval paths, rejected for this pass because it requires two new retrieval paths, not one round trip, and would change ranking output. Resolving a ripgrep `(file, line)` hit to a chunk id independent of the pool requires a store lookup by `(file_ref, line)` containment — chunk line ranges are only known for chunks already retrieved — which is a new query shape, not a resolve-in-place function. The FM signal would need a corpus-wide `contains()` scan rather than a scan over the pooled `search_text`, which is also a new retrieval path. Both changes would move ranking output and therefore invalidate the hand-committed `eval/baseline.json`, which ADR-005 requires be regenerated only after human review — an unreviewed baseline invalidation is not acceptable inside a documentation-accuracy fix.
 - **Consequences:** The pool constraint stands as shipped behavior, now documented rather than overstated. A chunk that only the ripgrep or FM-Index signal would find, and that lies outside the FTS/vector top-`limit` pool, is not retrieved. Making the two literal signals true independent retrieval paths — the union case ADR-001 gestures at when it says peers — is filed as follow-up work, not fixed here.
 
+### ADR-008: Add bounded heading and authored-content evidence [status: accepted]
+
+Structural ranking gives relevant H1 titles stronger evidence than lower headings, while keeping generated index navigation available for retrieval and drift diagnosis.[^structure]
+
+- **Decision:** Add ranked RRF lists for H1 evidence (0.5), lower-heading evidence (0.35), and authored or unclassified content (0.35). Preserve the four retrieval weights.
+- **Matching:** Count distinct query terms in parsed headings. Require meaningful overlap rather than one incidental shared word. Repeated terms do not add evidence.
+- **Ordering:** Use the original four-signal order to break structural ties. Fuse the original lists with the structural lists; do not count the baseline twice.
+- **Section evidence:** Add lower-heading evidence only when its query coverage exceeds the document title's coverage. H1 evidence is bounded, not unconditional title precedence.
+- **Navigation:** Classify parsed generated-marker spans, not filenames or link counts. Mixed indexes retain normal relevance for authored prose. Generated navigation remains eligible.
+- **Split files:** Classify heading-only chunks in generated-only documents as navigation. This prevents a title chunk from defeating navigation weighting during maximum-chunk file rollup.
+- **Boundaries:** Apply structural signals before optional crossencoder reranking and file rollup. They reorder existing candidates and cannot recover missing candidates.
+- **Phrase search:** Keep literal phrase matching and occurrence-count ordering unchanged. Structural weights apply only to ranked search.
+- **Validation:** Keep the existing 73-query evaluation unchanged. Separate synthetic fixtures cover titles, nearby leads, H2 answers, mixed indexes, and split navigation.[^structure]
+
+See [Domain model](domain-model.md) for the stored metadata and schema-rebuild contract.
+
+### Ripgrep resolution diagnostics
+
+Ground emits `ripgrep-unresolved` only when the candidate pool and ripgrep hits are nonempty, but no hits resolve to chunks.
+This warning reports hits dropped because their path is outside the retrieved candidate pool.
+It separately reports hits whose line falls outside that path's retrieved chunk ranges.
+The warning also states whether ripgrep output is truncated.
+These diagnostics reuse resolver counters; they do not add candidates, change ranking, or change the literal-signal weights.[^diagnostics]
+
+[^diagnostics]: crates/hallouminate-domain/src/search.rs::search_fused; crates/hallouminate-domain/src/search/ripgrep.rs
+
+_Source: PR #561 diagnostics · Updated: 2026-10-01 · Supersedes: —_
+
 _Source: ranking audit session 2026-07-25 · Spec: .cheese/specs/ground-signal-fusion.md · Supersedes: —_
+
+[^structure]: [PR #575](https://github.com/paulnsorensen/hallouminate/pull/575); `crates/hallouminate-domain/src/search.rs:234-354`; `crates/hallouminate-domain/src/indexer/format.rs:46-181`; `eval/ranked-heading-relevance-573.json`.
+
+_Source: landed PR #575 · Updated: 2026-10-04 · Supersedes: the four-retrieval-signal-only ranking description; original retrieval weights remain unchanged._

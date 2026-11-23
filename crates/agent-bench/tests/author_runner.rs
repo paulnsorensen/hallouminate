@@ -269,6 +269,32 @@ fn malformed_response_fails_loudly_and_never_logs_zero_usage() {
 }
 
 #[test]
+fn incomplete_usage_aborts_authoring_without_recording_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "demo-repo");
+    write_manifest(&manifest_path, "demo-repo", &checkout_root, &commit);
+
+    let fake_cli = dir.path().join("fake-claude.sh");
+    let out_dir = dir.path().join("out");
+    write_fake_cli(
+        &fake_cli,
+        r#"echo '{"is_error":false,"subtype":"success","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0}}'"#,
+    );
+
+    let output = run_bench_author(&manifest_path, "demo-repo", 100_000, &out_dir, &fake_cli);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("turn 0") && stderr.contains("cache_creation_input_tokens"),
+        "{stderr}"
+    );
+    assert!(read_log_lines(&out_dir).is_empty());
+    assert!(!out_dir.join("authoring-summary.json").exists());
+}
+
+#[test]
 fn prompt_is_loaded_from_disk_and_hash_matches_independent_computation() {
     let dir = tempfile::tempdir().unwrap();
     let manifest_path = dir.path().join("manifest.json");

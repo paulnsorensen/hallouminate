@@ -14,9 +14,11 @@ use clap::Parser;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+use agent_bench::grading::{Grading, index_sessions};
+use agent_bench::provenance::grade_key;
 use agent_bench::{
-    Arm, ArmSummary, BenchReport, GradeRecord, PairedCi, Question, QuestionArmStat, QuestionRow,
-    QuestionSet, QuestionTag, SessionRecord, TokenUsage, load_json, read_jsonl,
+    Arm, ArmSummary, BenchReport, PairedCi, Question, QuestionArmStat, QuestionRow, QuestionTag,
+    SessionRecord, TokenUsage, read_jsonl,
 };
 
 #[derive(Debug, Parser)]
@@ -30,6 +32,12 @@ struct Cli {
     /// Path to the QuestionSet JSON file.
     #[arg(long)]
     questions: PathBuf,
+    /// Path to the provenance manifest used for the run and grading.
+    #[arg(long)]
+    manifest: PathBuf,
+    /// Pass threshold used for grading.
+    #[arg(long, default_value_t = 4)]
+    pass_threshold: u8,
     /// Directory to write report.json and report.md into.
     #[arg(long)]
     out_dir: PathBuf,
@@ -42,8 +50,16 @@ struct Cli {
     #[arg(long)]
     seed: u64,
     /// Confidence level for the paired bootstrap interval.
-    #[arg(long, default_value_t = 0.95)]
+    #[arg(long, default_value_t = 0.95, value_parser = parse_confidence)]
     confidence: f64,
+}
+
+fn parse_confidence(value: &str) -> Result<f64, String> {
+    let confidence = value.parse::<f64>().map_err(|err| err.to_string())?;
+    if !(0.0..=1.0).contains(&confidence) {
+        return Err("confidence must be between 0 and 1".to_string());
+    }
+    Ok(confidence)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,19 +68,21 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<()> {
-    let question_set: QuestionSet = load_json(&cli.questions)?;
-    let questions_by_id: HashMap<&str, &Question> = question_set
+    let grading = Grading::load(
+        &cli.manifest,
+        &cli.questions,
+        &cli.sessions,
+        cli.pass_threshold,
+    )?;
+    let questions_by_id: HashMap<&str, &Question> = grading
         .questions
         .iter()
         .map(|q| (q.id.as_str(), q))
         .collect();
 
     let sessions: Vec<SessionRecord> = read_jsonl(&cli.sessions)?;
-    let sessions_by_key: HashMap<(String, Arm, u32), &SessionRecord> = sessions
-        .iter()
-        .map(|s| ((s.question_id.clone(), s.arm, s.run_index), s))
-        .collect();
-    let grades: Vec<GradeRecord> = read_jsonl(&cli.grades)?;
+    let sessions_by_key = index_sessions(&sessions)?;
+    let grades = grading.read_grades(&cli.grades, &sessions_by_key)?;
 
     // A session that failed to spawn, exited non-zero, or returned
     // unparseable JSON is recorded with a non-zero `exit_status` and
@@ -86,19 +104,9 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // error and aborts the report rather than being silently skipped.
     let mut per_question: BTreeMap<String, BTreeMap<Arm, Vec<(bool, TokenUsage)>>> =
         BTreeMap::new();
-    for grade in &grades {
-        let key = (grade.question_id.clone(), grade.arm, grade.run_index);
-        let session = sessions_by_key.get(&key).ok_or_else(|| {
-            anyhow::anyhow!(
-                "grade for question {:?} (arm {:?}, run {}) has no matching session",
-                grade.question_id,
-                grade.arm,
-                grade.run_index
-            )
-        })?;
-        if session.exit_status != 0 {
-            continue;
-        }
+    for entry in &grades {
+        let grade = &entry.grade;
+        let session = sessions_by_key[&grade_key(grade)];
         per_question
             .entry(grade.question_id.clone())
             .or_default()
@@ -121,12 +129,15 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 
         let mut row_per_arm = BTreeMap::new();
         for (&arm, runs) in by_arm {
-            let stat = question_arm_stat(runs);
-            groups.entry((arm, None)).or_default().add(&stat);
+            let (stat, passing_tokens) = question_arm_stat(runs);
+            groups
+                .entry((arm, None))
+                .or_default()
+                .add(&stat, passing_tokens);
             groups
                 .entry((arm, Some(question.tag)))
                 .or_default()
-                .add(&stat);
+                .add(&stat, passing_tokens);
             row_per_arm.insert(arm, stat);
         }
 
@@ -148,11 +159,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             pass_at_k: aggregate_pass_at_k(&group.pairs),
             pass_pow_k: aggregate_pass_pow_k(&group.pairs),
             usage: group.usage,
-            tokens_to_correct_answer: if group.passes > 0 {
-                Some(group.usage.total() as f64 / group.passes as f64)
-            } else {
-                None
-            },
+            tokens_to_correct_answer: mean_passing_tokens(group.passing_tokens, group.passes),
         })
         .collect();
 
@@ -207,14 +214,16 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 struct GroupAgg {
     pairs: Vec<(usize, usize)>,
     usage: TokenUsage,
+    passing_tokens: u64,
     passes: usize,
     runs: usize,
 }
 
 impl GroupAgg {
-    fn add(&mut self, stat: &QuestionArmStat) {
+    fn add(&mut self, stat: &QuestionArmStat, passing_tokens: u64) {
         self.pairs.push((stat.runs, stat.passes));
         self.usage += stat.usage;
+        self.passing_tokens += passing_tokens;
         self.passes += stat.passes;
         self.runs += stat.runs;
     }
@@ -233,24 +242,31 @@ fn count_failed_sessions(sessions: &[SessionRecord]) -> BTreeMap<Arm, usize> {
     failed
 }
 
-fn question_arm_stat(runs: &[(bool, TokenUsage)]) -> QuestionArmStat {
-    let passes = runs.iter().filter(|(p, _)| *p).count();
-    let usage: TokenUsage = runs.iter().map(|(_, u)| *u).sum();
-    QuestionArmStat {
+fn question_arm_stat(runs: &[(bool, TokenUsage)]) -> (QuestionArmStat, u64) {
+    let mut passes = 0;
+    let mut usage = TokenUsage::default();
+    let mut passing_tokens = 0;
+    for &(pass, tokens) in runs {
+        usage += tokens;
+        if pass {
+            passes += 1;
+            passing_tokens += tokens.total();
+        }
+    }
+    let stat = QuestionArmStat {
         runs: runs.len(),
         passes,
         usage,
-        // A question with zero correct runs in this arm has no defined
-        // "tokens spent per correct answer" — represented as `None`, not 0
-        // or silently omitted, so the hardest (never-solved) questions
-        // stay visible in the report rather than dropping out of the
-        // average.
-        tokens_to_correct_answer: if passes > 0 {
-            Some(usage.total() as f64 / passes as f64)
-        } else {
-            None
-        },
+        tokens_to_correct_answer: mean_passing_tokens(passing_tokens, passes),
+    };
+    (stat, passing_tokens)
+}
+
+fn mean_passing_tokens(passing_tokens: u64, passes: usize) -> Option<f64> {
+    if passes == 0 {
+        return None;
     }
+    Some(passing_tokens as f64 / passes as f64)
 }
 
 /// Unbiased pass@k estimator (Chen et al. 2021, "Evaluating Large Language

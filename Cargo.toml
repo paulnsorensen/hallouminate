@@ -3,9 +3,9 @@ members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
-version = "0.6.1"
+version = "0.12.2"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.94"
 license = "MIT"
 repository = "https://github.com/paulnsorensen/hallouminate"
 authors = ["Paul Sorensen <paulnsorensen@gmail.com>"]
@@ -23,17 +23,26 @@ blake3 = "1"
 chrono = { version = "0.4", features = ["serde"] }
 shellexpand = "3"
 schemars = "1"
+# Fuzzy ranking for not-found suggestions (corpus names, wiki paths). Already
+# transitive in the tree via clap, so this direct dep resolves no new version.
+strsim = "0.11"
 toml = "1.1"
 # Page-level frontmatter parsing via serde_yaml_ng, the maintained fork of the
 # archived serde_yaml. lindera 3.x already pulls serde_yaml_ng into the build
 # graph, so this direct dep adds zero new compilation and keeps a single YAML
 # crate in the tree.
 serde_yaml_ng = "0.10"
+cap-tempfile = "4"
 
-hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.6.1" }
-hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.6.1" }
-hallouminate-config = { path = "crates/hallouminate-config", version = "0.6.1" }
-hallouminate-daemon = { path = "crates/hallouminate-daemon", version = "0.6.1" }
+hallouminate-domain = { path = "crates/hallouminate-domain", version = "0.12.2" }
+hallouminate-adapters = { path = "crates/hallouminate-adapters", version = "0.12.2" }
+hallouminate-config = { path = "crates/hallouminate-config", version = "0.12.2" }
+hallouminate-daemon = { path = "crates/hallouminate-daemon", version = "0.12.2" }
+
+[profile.dev]
+# Slim debug info: smaller target dir + lower build memory for parallel agent
+# gates; backtraces keep file:line. Matches tern/oh-my-pi. (see crabbot#46)
+debug = "line-tables-only"
 
 # The profile that 'dist' will build with
 [profile.dist]

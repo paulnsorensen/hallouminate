@@ -25,13 +25,18 @@
 
 pub mod crossencoder;
 pub mod fuse;
+mod lexical_fallback;
+pub mod phrase;
 pub mod ripgrep;
 pub mod terms;
 
-use std::collections::HashMap;
+use std::any::Any;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
 
-use crate::common::{CorpusKey, Result};
-use crate::ground::Warning;
+use crate::common::{CorpusKey, FileRef, Result};
+use crate::ground::{Warning, warning_codes};
 use crate::indexer::{SearchHit, SignalLists};
 use async_trait::async_trait;
 use fuse::{RankedList, fuse};
@@ -41,6 +46,10 @@ pub use crossencoder::Noop as NoopCrossencoder;
 pub use crossencoder::{
     Crossencoder, DEFAULT_CROSSENCODER_MODEL, SUPPORTED_CROSSENCODER_MODELS,
     canonical_crossencoder_model,
+};
+pub use phrase::{
+    MAX_PHRASE_CHARS, MAX_PHRASE_SCAN_ROWS, PhraseError, collapse_whitespace, search_phrase,
+    validate_phrase,
 };
 pub use ripgrep::RipgrepHit;
 
@@ -68,6 +77,37 @@ pub const RIPGREP_WEIGHT: f32 = 0.5;
 /// literal signals are weighted together and for the same reason.
 pub const CONTAINS_WEIGHT: f32 = 0.5;
 
+/// An opaque, store-owned view of one root's file map, loaded once per
+/// request. The store that made it downcasts it back; no other code reads it.
+#[derive(Clone)]
+pub struct RootHandle(Arc<dyn Any + Send + Sync>);
+
+impl RootHandle {
+    /// Wraps a store-owned value.
+    pub fn new<T: Any + Send + Sync>(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+
+    /// Returns the wrapped value when it has type `T`.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+}
+
+impl std::fmt::Debug for RootHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RootHandle(..)")
+    }
+}
+
+/// One root's indexed files plus the store's optional handle on the same
+/// read.
+#[derive(Debug, Clone)]
+pub struct RootIndex {
+    pub files: Arc<HashSet<FileRef>>,
+    pub handle: Option<RootHandle>,
+}
+
 /// Storage-agnostic port for chunk retrieval (ranking-time reads).
 ///
 /// Split from `ChunkStore` so the ranking path can depend on retrieval
@@ -81,10 +121,84 @@ pub trait ChunkRetrieval: Send + Sync {
         query: &str,
         limit: usize,
     ) -> Result<SignalLists>;
+
+    /// Retrieves up to `limit` chunks whose body text can contain `phrase`
+    /// as a case-insensitive substring, unranked.
+    ///
+    /// The store lowercases the chunk text and replaces each run of Unicode
+    /// whitespace with one ASCII space, as [`collapse_whitespace`] does.
+    /// The result is a superset of the body matches: a chunk that holds the
+    /// phrase only in its breadcrumb or file summary is not returned.
+    /// The caller passes `phrase` already collapsed. All other characters
+    /// match literally: no tokenization, no stopword removal, and no
+    /// pattern metacharacters. Returns an empty list when nothing matches.
+    async fn retrieve_phrase(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>>;
+
+    /// Lists the `file_ref` of every file that has indexed rows under
+    /// `corpus_key`'s root.
+    ///
+    /// `None` means the store cannot tell. [`lexical_fallback_search`] then
+    /// returns no hits, because it cannot know which files the index
+    /// already covers.
+    async fn indexed_file_refs(&self, _corpus_key: &CorpusKey) -> Result<Option<HashSet<FileRef>>> {
+        Ok(None)
+    }
+
+    /// Reads the root's file map once: the indexed files plus an optional
+    /// handle that [`retrieve_signals_in`] and [`retrieve_phrase_in`] reuse
+    /// instead of reading the map again. `None` means the store cannot tell.
+    ///
+    /// [`retrieve_signals_in`]: ChunkRetrieval::retrieve_signals_in
+    /// [`retrieve_phrase_in`]: ChunkRetrieval::retrieve_phrase_in
+    async fn load_root_index(&self, corpus_key: &CorpusKey) -> Result<Option<RootIndex>> {
+        let Some(files) = self.indexed_file_refs(corpus_key).await? else {
+            return Ok(None);
+        };
+        Ok(Some(RootIndex {
+            files: Arc::new(files),
+            handle: None,
+        }))
+    }
+
+    /// [`retrieve_signals`](ChunkRetrieval::retrieve_signals) with the handle
+    /// from [`load_root_index`](ChunkRetrieval::load_root_index), when the
+    /// caller has one.
+    async fn retrieve_signals_in(
+        &self,
+        corpus_key: &CorpusKey,
+        query: &str,
+        limit: usize,
+        _handle: Option<&RootHandle>,
+    ) -> Result<SignalLists> {
+        self.retrieve_signals(corpus_key, query, limit).await
+    }
+
+    /// [`retrieve_phrase`](ChunkRetrieval::retrieve_phrase) with the handle
+    /// from [`load_root_index`](ChunkRetrieval::load_root_index), when the
+    /// caller has one.
+    async fn retrieve_phrase_in(
+        &self,
+        corpus_key: &CorpusKey,
+        phrase: &str,
+        limit: usize,
+        _handle: Option<&RootHandle>,
+    ) -> Result<Vec<SearchHit>> {
+        self.retrieve_phrase(corpus_key, phrase, limit).await
+    }
 }
 
 /// Outcome of [`search_fused`]: the fused hits plus any warnings raised
 /// while assembling the four signals (e.g. a degraded ripgrep pass).
+///
+/// The `ripgrep-unresolved` warning retains the hit count and corpus root.
+/// It also reports `dropped_file_not_in_pool`, `dropped_line_out_of_range`,
+/// and `truncated` from the same ripgrep resolver pass.
+#[derive(Default)]
 pub struct FusedSearch {
     pub hits: Vec<SearchHit>,
     pub warnings: Vec<Warning>,
@@ -105,16 +219,82 @@ pub async fn search_fused(
     globs: &[String],
     limit: usize,
 ) -> Result<FusedSearch> {
+    let root = store.load_root_index(corpus_key).await.ok().flatten();
+    let (indexed, handle) = match &root {
+        Some(RootIndex { files, handle }) => (Some(files.as_ref()), handle.as_ref()),
+        None => (None, None),
+    };
+    search_fused_indexed(store, corpus_key, query, globs, limit, indexed, handle).await
+}
+
+/// [`search_fused`] with the root's indexed-file membership supplied by the
+/// caller, so one `indexed_file_refs` read serves both the cold-root skip
+/// and the lexical fallback. `handle` is the same read's store handle.
+pub(crate) async fn search_fused_indexed(
+    store: &dyn ChunkRetrieval,
+    corpus_key: &CorpusKey,
+    query: &str,
+    globs: &[String],
+    limit: usize,
+    indexed: Option<&HashSet<FileRef>>,
+    handle: Option<&RootHandle>,
+) -> Result<FusedSearch> {
+    let mut signals =
+        gather_signals(store, corpus_key, query, globs, limit, indexed, handle).await?;
+    let warnings = std::mem::take(&mut signals.warnings);
+    Ok(FusedSearch {
+        hits: fuse_roots(vec![signals], query, None),
+        warnings,
+    })
+}
+
+/// One chunk of a signal list, with the raw strength the list is ordered by.
+struct SignalEntry {
+    chunk_id: String,
+    /// Higher is better. `None` when the store reported no raw score.
+    strength: Option<f32>,
+}
+
+/// One root's signal lists before fusion. [`fuse_roots`] fuses the lists of
+/// one or more roots as one ranking.
+#[derive(Default)]
+pub(crate) struct RootSignals {
+    /// The corpus name of the root. Empty for a root with no signals.
+    corpus: String,
+    fts: Vec<SignalEntry>,
+    vector: Vec<SignalEntry>,
+    rg: Vec<SignalEntry>,
+    contains: Vec<SignalEntry>,
+    hits: HashMap<String, SearchHit>,
+    pub(crate) warnings: Vec<Warning>,
+    /// Files whose ripgrep hits missed the retrieval pool, set only when the
+    /// `ripgrep-unresolved` warning has no other cause. A lexical fallback
+    /// that covers every file here makes that warning stale.
+    pub(crate) unpooled_files: Option<BTreeSet<String>>,
+}
+
+/// Retrieves one root's four signal lists, unfused.
+///
+/// The ripgrep and FM-Index `contains()` passes below only filter and
+/// rank `signals.hits` — the pool `store.retrieve_signals` returned —
+/// so a chunk outside that FTS/vector pool is invisible to both.
+pub(crate) async fn gather_signals(
+    store: &dyn ChunkRetrieval,
+    corpus_key: &CorpusKey,
+    query: &str,
+    globs: &[String],
+    limit: usize,
+    indexed: Option<&HashSet<FileRef>>,
+    handle: Option<&RootHandle>,
+) -> Result<RootSignals> {
     let terms = cap_terms(split_terms(query));
     let mut warnings = Vec::new();
-    // Bound on the rg subprocess. The `max_hits` truncation only fires when
-    // matches are plentiful; a sparse-or-empty match still forces rg to walk
-    // the whole corpus root under `--sort path`'s single traversal thread.
-    // This deadline caps that worst case instead of letting a rare query
-    // stall Ground on however long the corpus takes to walk exhaustively.
-    const RIPGREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
-    let root = corpus_key.canonical_root.to_string_lossy().into_owned();
-    let roots = [root];
+    let mut roots = Vec::new();
+    // A gitignored root such as `.cheese` is absent from a fresh worktree.
+    // It holds nothing to grep, and rg would fail the pass for it.
+    if let Ok(true) | Err(_) = corpus_key.canonical_root.try_exists() {
+        roots.push(corpus_key.canonical_root.to_string_lossy().into_owned());
+    }
     // Bound on total rg hits collected. Hits are pool-gated downstream by
     // `resolve_rg_hits_to_chunks`, which attributes them to at most the
     // pool's `limit` chunks -- and that mapping is lossy in both directions:
@@ -126,27 +306,54 @@ pub async fn search_fused(
     // a term first appearing past that cap is missed regardless of this total.
     let rg_budget = limit;
 
-    let signals_fut = store.retrieve_signals(corpus_key, query, limit);
+    let signals_fut = store.retrieve_signals_in(corpus_key, query, limit, handle);
     let rg_fut = tokio::time::timeout(
         RIPGREP_TIMEOUT,
         ripgrep::run(&roots, &terms, globs, rg_budget),
     );
-    let (signals_res, rg_res) = tokio::join!(signals_fut, rg_fut);
-
-    let signals = signals_res?;
+    tokio::pin!(signals_fut);
+    tokio::pin!(rg_fut);
+    let mut rg_done = None;
+    let signals = loop {
+        tokio::select! {
+            signals_res = &mut signals_fut => break signals_res?,
+            rg_res = &mut rg_fut, if rg_done.is_none() => rg_done = Some(rg_res),
+        }
+    };
+    let rg_res = match rg_done {
+        Some(rg_res) => rg_res,
+        None => {
+            // A cold root (empty pool, no indexed files) leaves ripgrep
+            // nothing to rank, so its pass is dropped. The lexical
+            // fallback owns that root.
+            if signals.hits.is_empty() && indexed.is_some_and(HashSet::is_empty) {
+                return Ok(RootSignals::default());
+            }
+            rg_fut.await
+        }
+    };
     if signals.hits.is_empty() {
-        let _ = resolve_rg_run(rg_res, RIPGREP_TIMEOUT, &mut warnings);
-        return Ok(FusedSearch {
-            hits: Vec::new(),
+        let _ = resolve_rg_run(
+            rg_res,
+            RIPGREP_TIMEOUT,
+            &corpus_key.canonical_root,
+            &mut warnings,
+        );
+        return Ok(RootSignals {
             warnings,
+            ..RootSignals::default()
         });
     }
-    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) =
-        resolve_rg_run(rg_res, RIPGREP_TIMEOUT, &mut warnings);
+    let (rg_hits, rg_truncated, rg_elapsed_ms, rg_unparseable) = resolve_rg_run(
+        rg_res,
+        RIPGREP_TIMEOUT,
+        &corpus_key.canonical_root,
+        &mut warnings,
+    );
 
     let (rg_chunk_counts, rg_stats) = resolve_rg_hits_to_chunks(&signals.hits, &rg_hits);
     let resolved_chunks = rg_chunk_counts.len();
-    let rg_list = ranked_by_term_count(rg_chunk_counts);
+    let rg = ranked_by_term_count(rg_chunk_counts, &signals.hits, &corpus_key.canonical_root);
 
     tracing::debug!(
         target: "hallouminate::search",
@@ -159,7 +366,15 @@ pub async fn search_fused(
         elapsed_ms = rg_elapsed_ms,
         "ripgrep signal resolved"
     );
+    let mut unpooled_files = None;
     if !rg_hits.is_empty() && resolved_chunks == 0 {
+        if rg_stats.dropped_line_out_of_range == 0 {
+            let mut files = BTreeSet::new();
+            for rg_hit in &rg_hits {
+                files.insert(rg_hit.file_ref.clone());
+            }
+            unpooled_files = Some(files);
+        }
         tracing::warn!(
             target: "hallouminate::search",
             rg_hits = rg_hits.len(),
@@ -168,11 +383,14 @@ pub async fn search_fused(
             "ripgrep signal produced hits but resolved to zero chunks"
         );
         warnings.push(Warning {
-            code: "ripgrep-unresolved".to_string(),
+            code: warning_codes::RIPGREP_UNRESOLVED.to_string(),
             message: format!(
-                "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}",
+                "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}; dropped_file_not_in_pool={}, dropped_line_out_of_range={}, truncated={}",
                 rg_hits.len(),
-                corpus_key.canonical_root.display()
+                corpus_key.canonical_root.display(),
+                rg_stats.dropped_file_not_in_pool,
+                rg_stats.dropped_line_out_of_range,
+                rg_truncated
             ),
         });
     }
@@ -184,7 +402,7 @@ pub async fn search_fused(
             "ripgrep produced unparseable match events; the rg output schema may have changed"
         );
         warnings.push(Warning {
-            code: "ripgrep-unparseable".to_string(),
+            code: warning_codes::RIPGREP_UNPARSEABLE.to_string(),
             message: format!(
                 "ripgrep produced {} unparseable match events in corpus root {}",
                 rg_unparseable,
@@ -193,43 +411,448 @@ pub async fn search_fused(
         });
     }
 
-    let fm_list = ranked_by_term_count(contains_term_counts(&signals.hits, &terms));
-
-    let fused = fuse(
-        &[
-            RankedList {
-                weight: FTS_WEIGHT,
-                chunk_ids: signals.fts,
-            },
-            RankedList {
-                weight: VECTOR_WEIGHT,
-                chunk_ids: signals.vector,
-            },
-            RankedList {
-                weight: RIPGREP_WEIGHT,
-                chunk_ids: rg_list,
-            },
-            RankedList {
-                weight: CONTAINS_WEIGHT,
-                chunk_ids: fm_list,
-            },
-        ],
-        RRF_K,
+    let contains = ranked_by_term_count(
+        contains_term_counts(&signals.hits, &terms),
+        &signals.hits,
+        &corpus_key.canonical_root,
     );
+    let SignalLists {
+        fts,
+        vector,
+        fts_scores,
+        vector_distances,
+        hits,
+    } = signals;
+    let fts = raw_entries(fts, &fts_scores, |score| score);
+    let vector = raw_entries(vector, &vector_distances, |distance| -distance);
 
-    let mut hits = signals.hits;
+    tracing::debug!(
+        target: "hallouminate::search",
+        fts = %signal_order_log(&fts, &hits),
+        vector = %signal_order_log(&vector, &hits),
+        rg = %signal_order_log(&rg, &hits),
+        fm = %signal_order_log(&contains, &hits),
+        "pre-fusion signal order"
+    );
+    Ok(RootSignals {
+        corpus: corpus_key.name.clone(),
+        fts,
+        vector,
+        rg,
+        contains,
+        hits,
+        warnings,
+        unpooled_files,
+    })
+}
+
+/// Pairs each chunk_id with its raw store score, mapped so higher is better.
+fn raw_entries(
+    chunk_ids: Vec<String>,
+    raw: &HashMap<String, f32>,
+    strength: fn(f32) -> f32,
+) -> Vec<SignalEntry> {
+    let mut entries = Vec::with_capacity(chunk_ids.len());
+    for chunk_id in chunk_ids {
+        let strength = raw.get(&chunk_id).copied().map(strength);
+        entries.push(SignalEntry { chunk_id, strength });
+    }
+    entries
+}
+
+/// One root's signal entry, keyed for a ranking that spans roots.
+struct MergedEntry {
+    key: String,
+    strength: Option<f32>,
+    priority: bool,
+    rank: usize,
+    root: usize,
+}
+
+/// Orders one signal's entries from every root as one list, best first:
+/// by raw strength, then the priority corpus on equal strength, then by
+/// rank within the root.
+fn merge_signal(mut entries: Vec<MergedEntry>) -> Vec<String> {
+    entries.sort_by(|left, right| {
+        let by_strength = match (left.strength, right.strength) {
+            (Some(left), Some(right)) => right.total_cmp(&left),
+            (Some(_), None) | (None, Some(_)) | (None, None) => std::cmp::Ordering::Equal,
+        };
+        by_strength
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| left.rank.cmp(&right.rank))
+            .then_with(|| left.root.cmp(&right.root))
+    });
+    let mut keys = Vec::with_capacity(entries.len());
+    for entry in entries {
+        keys.push(entry.key);
+    }
+    keys
+}
+
+/// Whether every full-text and vector entry of every root carries a raw
+/// store score, so ranks can compare across roots.
+fn report_raw_scores(roots: &[RootSignals]) -> bool {
+    for root in roots {
+        for entry in root.fts.iter().chain(&root.vector) {
+            if entry.strength.is_none() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Fuses the signal lists of one or more roots as one weighted RRF ranking.
+///
+/// Every signal merges its lists across roots before fusion, so each rank is
+/// global. A root's best chunk then outranks another root's chunks only on
+/// the evidence, not because it led its own root. On equal evidence, chunks
+/// of `priority_corpus` rank first. A store that reports no raw scores gives
+/// no basis to compare roots, so each root then fuses alone.
+///
+/// Every returned hit's `score` is the fused RRF score, not the
+/// per-signal score the storage layer supplied.
+pub(crate) fn fuse_roots(
+    roots: Vec<RootSignals>,
+    query: &str,
+    priority_corpus: Option<&str>,
+) -> Vec<SearchHit> {
+    let terms = cap_terms(split_terms(query));
+    if report_raw_scores(&roots) {
+        return fuse_together(roots, &terms, priority_corpus);
+    }
+    let mut hits = Vec::new();
+    for root in roots {
+        hits.extend(fuse_together(vec![root], &terms, priority_corpus));
+    }
+    hits
+}
+
+fn fuse_together(
+    roots: Vec<RootSignals>,
+    terms: &[String],
+    priority_corpus: Option<&str>,
+) -> Vec<SearchHit> {
+    let mut fts = Vec::new();
+    let mut vector = Vec::new();
+    let mut rg = Vec::new();
+    let mut contains = Vec::new();
+    let mut hits = HashMap::new();
+    for (root, signals) in roots.into_iter().enumerate() {
+        let RootSignals {
+            corpus,
+            fts: root_fts,
+            vector: root_vector,
+            rg: root_rg,
+            contains: root_contains,
+            hits: root_hits,
+            warnings: _,
+            unpooled_files: _,
+        } = signals;
+        let priority = priority_corpus == Some(corpus.as_str());
+        // Two roots can return the same chunk_id for a file that both
+        // corpora select, so keys carry the root.
+        let key = |chunk_id: &str| format!("{root}/{chunk_id}");
+        for (merged, list) in [
+            (&mut fts, root_fts),
+            (&mut vector, root_vector),
+            (&mut rg, root_rg),
+            (&mut contains, root_contains),
+        ] {
+            for (rank, entry) in list.into_iter().enumerate() {
+                merged.push(MergedEntry {
+                    key: key(&entry.chunk_id),
+                    strength: entry.strength,
+                    priority,
+                    rank,
+                    root,
+                });
+            }
+        }
+        for (chunk_id, hit) in root_hits {
+            hits.insert(key(&chunk_id), hit);
+        }
+    }
+    let mut lists = vec![
+        RankedList {
+            weight: FTS_WEIGHT,
+            chunk_ids: merge_signal(fts),
+        },
+        RankedList {
+            weight: VECTOR_WEIGHT,
+            chunk_ids: merge_signal(vector),
+        },
+        RankedList {
+            weight: RIPGREP_WEIGHT,
+            chunk_ids: merge_signal(rg),
+        },
+        RankedList {
+            weight: CONTAINS_WEIGHT,
+            chunk_ids: merge_signal(contains),
+        },
+    ];
+    let baseline = fuse(&lists, RRF_K);
+    lists.extend(structural_lists(&hits, terms, &baseline));
+    let fused = fuse(&lists, RRF_K);
+
     let mut ranked = Vec::with_capacity(fused.len());
-    for (chunk_id, score) in fused {
-        let Some(mut hit) = hits.remove(&chunk_id) else {
+    for (key, score) in fused {
+        let Some(mut hit) = hits.remove(&key) else {
             continue;
         };
         hit.score = score;
         ranked.push(hit);
     }
-    Ok(FusedSearch {
-        hits: ranked,
-        warnings,
-    })
+    ranked
+}
+
+/// Bound on the rg subprocess. The `max_hits` truncation only fires when
+/// matches are plentiful; a sparse-or-empty match still forces rg to walk
+/// every path under `--sort path`'s single traversal thread. This deadline
+/// caps that worst case instead of letting a rare query stall Ground on
+/// however long the corpus takes to walk exhaustively.
+const RIPGREP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Most files one lexical fallback pass hands to ripgrep as explicit paths.
+const FALLBACK_MAX_FILES: usize = 1_000;
+
+/// Searches the files that the indexer would index for `corpus_key` but
+/// that have no indexed rows, and returns ripgrep line-window hits.
+///
+/// `eligible` lists the files the indexer scan selects for this corpus key.
+/// It carries the include, exclude, and nested-root rules, so this pass
+/// never admits a file the indexer would skip. `indexed` lists the files
+/// that have indexed rows; the caller reads it once per root. Ripgrep
+/// searches only the unindexed files, so indexed files cannot starve them
+/// of the hit budget. The hits carry `score` `0.0`; rank them with
+/// [`rank_after`].
+///
+/// `None` for `indexed` means the store cannot list its indexed files, and
+/// the pass yields no hits.
+pub async fn lexical_fallback_search(
+    corpus_key: &CorpusKey,
+    query: &str,
+    eligible: &HashSet<FileRef>,
+    indexed: Option<&HashSet<FileRef>>,
+    limit: usize,
+) -> FusedSearch {
+    let mut warnings = Vec::new();
+    let terms = cap_terms(split_terms(query));
+    let Some(indexed) = indexed else {
+        return FusedSearch::default();
+    };
+    if eligible.is_empty() || terms.is_empty() {
+        return FusedSearch::default();
+    }
+    let (candidates, dropped) = unindexed_candidates(eligible, indexed);
+    if candidates.is_empty() {
+        return FusedSearch::default();
+    }
+    let root = corpus_key.canonical_root.display();
+    if dropped > 0 {
+        warnings.push(Warning {
+            code: warning_codes::LEXICAL_FALLBACK_TRUNCATED.to_string(),
+            message: format!(
+                "{dropped} unindexed file(s) in corpus root {root} were not searched; the lexical fallback covers {FALLBACK_MAX_FILES} files per query"
+            ),
+        });
+    }
+    let budget = limit.saturating_mul(terms.len());
+    let mut rg_paths = Vec::with_capacity(candidates.len());
+    for candidate in &candidates {
+        rg_paths.push(candidate.as_path().to_string_lossy().into_owned());
+    }
+    let rg_res = tokio::time::timeout(
+        RIPGREP_TIMEOUT,
+        ripgrep::run(&rg_paths, &terms, &[], budget),
+    )
+    .await;
+    let rg_hits = match rg_res {
+        Ok(Ok(run)) => run.hits,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "hallouminate::search", err = %error, "lexical fallback ripgrep pass failed");
+            warnings.push(Warning {
+                code: warning_codes::LEXICAL_FALLBACK_FAILED.to_string(),
+                message: format!(
+                    "lexical fallback ripgrep pass failed in corpus root {root} ({error}); unindexed files were not searched"
+                ),
+            });
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(target: "hallouminate::search", "lexical fallback ripgrep pass timed out");
+            warnings.push(Warning {
+                code: warning_codes::LEXICAL_FALLBACK_TIMEOUT.to_string(),
+                message: format!(
+                    "lexical fallback ripgrep pass timed out after {} ms in corpus root {root}; unindexed files were not searched",
+                    RIPGREP_TIMEOUT.as_millis()
+                ),
+            });
+            Vec::new()
+        }
+    };
+    let mut candidate_paths: HashSet<&Path> = HashSet::with_capacity(candidates.len());
+    for candidate in &candidates {
+        candidate_paths.insert(candidate.as_path());
+    }
+    let mut scoped_hits = Vec::with_capacity(rg_hits.len());
+    for rg_hit in rg_hits {
+        if candidate_paths.contains(Path::new(&rg_hit.file_ref)) {
+            scoped_hits.push(rg_hit);
+        }
+    }
+    let hits = lexical_fallback::line_window_hits(corpus_key, &scoped_hits, limit).await;
+    if !hits.is_empty() {
+        warnings.push(Warning {
+            code: warning_codes::LEXICAL_FALLBACK.to_string(),
+            message: format!(
+                "{} file(s) in corpus root {root} have no indexed rows; returning ripgrep line-window hits ranked after indexed hits",
+                hits.len()
+            ),
+        });
+    }
+    FusedSearch { hits, warnings }
+}
+
+/// Eligible files with no indexed rows, sorted and capped at
+/// [`FALLBACK_MAX_FILES`], plus the count the cap dropped.
+///
+/// An empty result means the index covers every eligible file, so the
+/// caller skips ripgrep and reads no file.
+fn unindexed_candidates(
+    eligible: &HashSet<FileRef>,
+    indexed: &HashSet<FileRef>,
+) -> (Vec<FileRef>, usize) {
+    let mut candidates: Vec<FileRef> = Vec::new();
+    for file_ref in eligible {
+        if !indexed.contains(file_ref) {
+            candidates.push(file_ref.clone());
+        }
+    }
+    candidates.sort_by(|a, b| a.as_path().as_os_str().cmp(b.as_path().as_os_str()));
+    let dropped = candidates.len().saturating_sub(FALLBACK_MAX_FILES);
+    candidates.truncate(FALLBACK_MAX_FILES);
+    (candidates, dropped)
+}
+
+/// Scores `fallback` hits strictly below every hit in `fused`, in list order.
+///
+/// Call it after reranking and after the cross-corpus merge, so no
+/// fallback hit can outrank a fused hit from any corpus.
+pub fn rank_after(fallback: &mut [SearchHit], fused: &[SearchHit]) {
+    let mut floor = RIPGREP_WEIGHT / RRF_K;
+    for hit in fused {
+        floor = floor.min(hit.score);
+    }
+    for (rank, hit) in fallback.iter_mut().enumerate() {
+        let step = (rank + 1) as f32;
+        hit.score = if floor > 0.0 {
+            floor * 0.5 / step
+        } else {
+            floor - step
+        };
+    }
+}
+
+fn heading_overlap(terms: &[String], heading: &str) -> usize {
+    let heading_terms = split_terms(heading);
+    if heading_terms.is_empty() {
+        return 0;
+    }
+    let mut overlap = 0;
+    for term in terms {
+        if heading_terms.contains(term) {
+            overlap += 1;
+        }
+    }
+    if terms.len() > 1 && overlap < 2 {
+        return 0;
+    }
+    if overlap * 2 < terms.len() || overlap * 2 < heading_terms.len() {
+        return 0;
+    }
+    overlap
+}
+
+fn structural_lists(
+    hits: &HashMap<String, SearchHit>,
+    terms: &[String],
+    baseline: &[(String, f32)],
+) -> Vec<RankedList> {
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let mut titles = Vec::new();
+    let mut sections = Vec::new();
+    let mut authored = Vec::new();
+    for (rank, (chunk_id, _score)) in baseline.iter().enumerate() {
+        let Some(hit) = hits.get(chunk_id) else {
+            continue;
+        };
+        let Some(structure) = &hit.structure else {
+            authored.push(chunk_id.clone());
+            continue;
+        };
+        let title_overlap = match &structure.title {
+            Some(title) => heading_overlap(terms, title),
+            None => 0,
+        };
+        if title_overlap > 0 {
+            titles.push((title_overlap, rank, chunk_id.clone()));
+        }
+        let mut section_overlap = 0;
+        for (level, heading) in &structure.headings {
+            if *level > 1 {
+                section_overlap = section_overlap.max(heading_overlap(terms, heading));
+            }
+        }
+        if section_overlap > title_overlap {
+            sections.push((section_overlap, rank, chunk_id.clone()));
+        }
+        if !structure.generated_navigation {
+            authored.push(chunk_id.clone());
+        }
+    }
+    titles.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    sections.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    let mut title_ids = Vec::new();
+    for (_, _, chunk_id) in titles {
+        title_ids.push(chunk_id);
+    }
+    let mut section_ids = Vec::new();
+    for (_, _, chunk_id) in sections {
+        section_ids.push(chunk_id);
+    }
+    vec![
+        RankedList {
+            weight: 0.5,
+            chunk_ids: title_ids,
+        },
+        RankedList {
+            weight: 0.35,
+            chunk_ids: section_ids,
+        },
+        RankedList {
+            weight: 0.35,
+            chunk_ids: authored,
+        },
+    ]
+}
+
+/// Diagnostic-only rendering of a ranked chunk-id list as `file:line`
+/// pairs, root-relativized, for the `hallouminate::search` debug log above.
+/// Not read by production ranking — a seam for `#[ignore]`d eval
+/// diagnostics to recover per-signal rank without a schema change.
+fn signal_order_log(list: &[SignalEntry], hits: &HashMap<String, SearchHit>) -> String {
+    list.iter()
+        .take(20)
+        .map(|entry| match hits.get(&entry.chunk_id) {
+            Some(hit) => format!("{}:{}", hit.file_ref, hit.line_start),
+            None => format!("{}:?", entry.chunk_id),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Ceiling on how many query terms reach the two literal signals.
@@ -328,11 +951,9 @@ fn resolve_rg_hits_to_chunks(
 /// Count, per chunk, how many distinct query `terms` appear in the
 /// chunk's `search_text`.
 ///
-/// Case-sensitive to match the FM-Index `contains()` predicate this
-/// replaces (`contains(search_text, '<term>')`, no `lower()` wrap) --
-/// `terms` arrive pre-lowercased from [`split_terms`] but `search_text`
-/// is not lowercased, so this is a deliberate asymmetry against the
-/// ripgrep signal (which matches case-insensitively), not a bug.
+/// Case-insensitive, like the ripgrep signal (`--ignore-case`): `terms`
+/// arrive pre-lowercased from [`split_terms`], so each hit's
+/// `search_text` is lowercased once before the per-term scan.
 ///
 /// Matches `search_text`, not `text` -- `search_text` is the
 /// footnote-stripped derived field; matching `text` would leak footnote
@@ -343,10 +964,13 @@ fn contains_term_counts(
 ) -> HashMap<String, usize> {
     let mut counts = HashMap::new();
     for (chunk_id, hit) in hits {
-        let n = terms
-            .iter()
-            .filter(|t| hit.search_text.contains(t.as_str()))
-            .count();
+        let search_text = hit.search_text.to_lowercase();
+        let mut n = 0;
+        for term in terms {
+            if search_text.contains(term.as_str()) {
+                n += 1;
+            }
+        }
         if n > 0 {
             counts.insert(chunk_id.clone(), n);
         }
@@ -362,6 +986,7 @@ fn contains_term_counts(
 fn resolve_rg_run(
     rg_res: std::result::Result<Result<ripgrep::RipgrepRun>, tokio::time::error::Elapsed>,
     timeout: std::time::Duration,
+    root: &Path,
     warnings: &mut Vec<Warning>,
 ) -> (Vec<RipgrepHit>, bool, u64, usize) {
     match rg_res {
@@ -369,9 +994,10 @@ fn resolve_rg_run(
         Ok(Err(error)) => {
             tracing::warn!(target: "hallouminate::search", err = %error, "ripgrep pass failed; ranking without the ripgrep signal");
             warnings.push(Warning {
-                code: "ripgrep-failed".to_string(),
+                code: warning_codes::RIPGREP_FAILED.to_string(),
                 message: format!(
-                    "ripgrep pass failed ({error}); ranking without the ripgrep signal"
+                    "ripgrep pass failed in corpus root {} ({error}); ranking without the ripgrep signal",
+                    root.display()
                 ),
             });
             (Vec::new(), false, 0, 0)
@@ -383,7 +1009,7 @@ fn resolve_rg_run(
                 "ripgrep pass timed out; ranking without the ripgrep signal"
             );
             warnings.push(Warning {
-                code: "ripgrep-timeout".to_string(),
+                code: warning_codes::RIPGREP_TIMEOUT.to_string(),
                 message: format!(
                     "ripgrep pass timed out after {} ms; ranking without the ripgrep signal",
                     timeout.as_millis()
@@ -395,12 +1021,62 @@ fn resolve_rg_run(
 }
 
 /// Order chunks by how many distinct query terms they matched, best
-/// first, with `chunk_id` settling ties so the list is deterministic.
-fn ranked_by_term_count(counts: HashMap<String, usize>) -> Vec<String> {
-    let mut ranked: Vec<(String, usize)> =
-        counts.into_iter().filter(|(_, count)| *count > 0).collect();
-    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    ranked.into_iter().map(|(chunk_id, _)| chunk_id).collect()
+/// first. Ties settle on the chunk's path relative to `canonical_root`,
+/// then `line_start`, then `chunk_id` as a last resort.
+///
+/// `chunk_id` alone is unsuitable here: it is blake3 of the *absolute*
+/// `file_ref` (`chunk_id_for` in hallouminate-adapters), so its byte
+/// order -- and therefore which of two near-tied chunks this lexical
+/// signal ranks first -- depends on where the corpus happens to be
+/// checked out, not on its content. Root-relative path is stable across
+/// checkouts of identical content.
+fn ranked_by_term_count(
+    counts: HashMap<String, usize>,
+    hits: &HashMap<String, SearchHit>,
+    canonical_root: &Path,
+) -> Vec<SignalEntry> {
+    let mut decorated: Vec<((String, usize, String), usize, String)> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(chunk_id, count)| {
+            let key = tie_break_key(&chunk_id, hits, canonical_root);
+            (key, count, chunk_id)
+        })
+        .collect();
+    decorated.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut entries = Vec::with_capacity(decorated.len());
+    for (_, count, chunk_id) in decorated {
+        entries.push(SignalEntry {
+            chunk_id,
+            strength: Some(count as f32),
+        });
+    }
+    entries
+}
+
+/// Deterministic, root-relative sort key for a chunk_id tie: the file's
+/// path relative to `canonical_root` (falling back to the full
+/// `file_ref` when it isn't under `canonical_root`, e.g. a canonicalized
+/// mismatch), then `line_start`, then `chunk_id` itself as the final
+/// tiebreak when both are identical.
+fn tie_break_key(
+    chunk_id: &str,
+    hits: &HashMap<String, SearchHit>,
+    canonical_root: &Path,
+) -> (String, usize, String) {
+    match hits.get(chunk_id) {
+        Some(hit) => hit_tie_break_key(hit, canonical_root),
+        None => (chunk_id.to_string(), 0, chunk_id.to_string()),
+    }
+}
+
+/// The [`tie_break_key`] of one resolved hit.
+fn hit_tie_break_key(hit: &SearchHit, canonical_root: &Path) -> (String, usize, String) {
+    let rel = Path::new(&hit.file_ref)
+        .strip_prefix(canonical_root)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| hit.file_ref.clone());
+    (rel, hit.line_start, hit.chunk_id.clone())
 }
 
 #[cfg(test)]
@@ -432,6 +1108,8 @@ mod tests {
             score: 0.0,
             mtime_ms: 0,
             claim_marks: Vec::new(),
+            structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
     }
@@ -453,6 +1131,283 @@ mod tests {
 
     fn pool(hits: Vec<SearchHit>) -> HashMap<String, SearchHit> {
         hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect()
+    }
+
+    #[test]
+    fn structural_evidence_favors_h1_then_h2_without_repeating_title_or_navigation() {
+        use crate::indexer::ChunkStructure;
+        let mut body = hit("body", "/repo/wiki/body.md", 1, 1);
+        body.structure = Some(ChunkStructure {
+            title: Some("Generic guide".into()),
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut section = hit("section", "/repo/wiki/section.md", 1, 1);
+        section.structure = Some(ChunkStructure {
+            title: None,
+            headings: vec![(2, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut title = hit("title", "/repo/wiki/title.md", 1, 1);
+        title.structure = Some(ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into()), (2, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut navigation = hit("navigation", "/repo/wiki/index.md", 1, 1);
+        navigation.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: true,
+        });
+        let neutral = hit("neutral", "/repo/wiki/record.json", 1, 1);
+        let hits = pool(vec![body, section, title, navigation, neutral]);
+        let baseline = vec![
+            ("body".into(), 1.0),
+            ("section".into(), 1.0),
+            ("title".into(), 1.0),
+            ("navigation".into(), 1.0),
+            ("neutral".into(), 1.0),
+        ];
+        let terms = vec!["lantern".into(), "cache".into()];
+        let lists = structural_lists(&hits, &terms, &baseline);
+        assert_eq!(lists[0].chunk_ids, ["title"]);
+        assert_eq!(lists[1].chunk_ids, ["section"]);
+        assert_eq!(lists[2].chunk_ids, ["body", "section", "title", "neutral"]);
+        for list in &lists {
+            assert!(list.weight >= 0.0);
+        }
+    }
+
+    #[test]
+    fn strong_body_evidence_outweighs_a_heading_only_match() {
+        use crate::indexer::ChunkStructure;
+        let mut body = hit("body", "/repo/wiki/body.md", 1, 1);
+        body.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut title = hit("title", "/repo/wiki/title.md", 1, 1);
+        title.structure = Some(ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let hits = pool(vec![body, title]);
+        let mut ids = vec!["body".to_string()];
+        for index in 0..10 {
+            ids.push(format!("filler-{index}"));
+        }
+        ids.push("title".into());
+        let mut lists = vec![
+            RankedList {
+                weight: FTS_WEIGHT,
+                chunk_ids: ids.clone(),
+            },
+            RankedList {
+                weight: VECTOR_WEIGHT,
+                chunk_ids: ids.clone(),
+            },
+            RankedList {
+                weight: RIPGREP_WEIGHT,
+                chunk_ids: ids.clone(),
+            },
+            RankedList {
+                weight: CONTAINS_WEIGHT,
+                chunk_ids: ids,
+            },
+        ];
+        let baseline = fuse(&lists, RRF_K);
+        let terms = vec!["lantern".into(), "cache".into()];
+        lists.extend(structural_lists(&hits, &terms, &baseline));
+        let ranked = fuse(&lists, RRF_K);
+        assert_eq!(ranked[0].0, "body");
+        let mut body_rank = None;
+        let mut title_rank = None;
+        for (rank, (id, _)) in ranked.iter().enumerate() {
+            if id == "body" {
+                body_rank = Some(rank);
+            }
+            if id == "title" {
+                title_rank = Some(rank);
+            }
+        }
+        let (Some(body_rank), Some(title_rank)) = (body_rank, title_rank) else {
+            panic!("both body and title must be ranked: {ranked:?}");
+        };
+        assert!(body_rank < title_rank);
+    }
+
+    #[test]
+    fn quoted_title_uses_the_same_heading_overlap() {
+        let plain = split_terms("lantern cache");
+        let quoted = split_terms("\"lantern cache\"");
+        assert_eq!(heading_overlap(&plain, "Lantern cache"), 2);
+        assert_eq!(heading_overlap(&quoted, "Lantern cache"), 2);
+    }
+
+    fn calibration_lists(fts: &[String], others: &[String]) -> Vec<RankedList> {
+        vec![
+            RankedList {
+                weight: FTS_WEIGHT,
+                chunk_ids: fts.to_vec(),
+            },
+            RankedList {
+                weight: VECTOR_WEIGHT,
+                chunk_ids: others.to_vec(),
+            },
+            RankedList {
+                weight: RIPGREP_WEIGHT,
+                chunk_ids: others.to_vec(),
+            },
+            RankedList {
+                weight: CONTAINS_WEIGHT,
+                chunk_ids: others.to_vec(),
+            },
+        ]
+    }
+
+    fn calibration_order(
+        hits: &HashMap<String, SearchHit>,
+        lists: &[RankedList],
+        terms: &[String],
+        weights: [f32; 3],
+    ) -> Vec<String> {
+        let baseline = fuse(lists, RRF_K);
+        let mut lists = lists.to_vec();
+        let mut structural = structural_lists(hits, terms, &baseline);
+        for index in 0..3 {
+            structural[index].weight = weights[index];
+        }
+        lists.extend(structural);
+        let mut order = Vec::new();
+        for (id, _) in fuse(&lists, RRF_K) {
+            order.push(id);
+        }
+        order
+    }
+
+    fn before(order: &[String], left: &str, right: &str) -> bool {
+        let mut left_rank = None;
+        let mut right_rank = None;
+        for (rank, id) in order.iter().enumerate() {
+            if id == left {
+                left_rank = Some(rank);
+            }
+            if id == right {
+                right_rank = Some(rank);
+            }
+        }
+        let (Some(left_rank), Some(right_rank)) = (left_rank, right_rank) else {
+            return false;
+        };
+        left_rank < right_rank
+    }
+
+    #[test]
+    fn structural_weight_calibration_on_separate_synthetic_controls() {
+        use crate::indexer::ChunkStructure;
+        let mut h1 = hit("h1", "/repo/wiki/h1.md", 1, 1);
+        h1.structure = Some(ChunkStructure {
+            title: Some("Lantern cache".into()),
+            headings: vec![(1, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut h2 = hit("h2", "/repo/wiki/h2.md", 1, 1);
+        h2.structure = Some(ChunkStructure {
+            title: None,
+            headings: vec![(2, "Lantern cache".into())],
+            generated_navigation: false,
+        });
+        let mut generic = hit("generic", "/repo/wiki/generic.md", 1, 1);
+        generic.structure = Some(ChunkStructure {
+            title: Some("Generic guide".into()),
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut body = hit("body", "/repo/wiki/body.md", 1, 1);
+        body.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: false,
+        });
+        let mut answer = hit("answer", "/repo/wiki/answer.md", 1, 1);
+        answer.structure = body.structure.clone();
+        let mut navigation = hit("navigation", "/repo/wiki/navigation.md", 1, 1);
+        navigation.structure = Some(ChunkStructure {
+            title: None,
+            headings: Vec::new(),
+            generated_navigation: true,
+        });
+        let hits = pool(vec![h1, h2, generic, body, answer, navigation]);
+        let terms = vec!["lantern".into(), "cache".into()];
+
+        let equal_fts = vec!["body".into(), "h2".into(), "h1".into()];
+        let equal_other = vec!["h1".into(), "h2".into(), "body".into()];
+        let equal = calibration_lists(&equal_fts, &equal_other);
+        let mut h1_deficit = vec!["generic".into()];
+        for index in 0..5 {
+            h1_deficit.push(format!("filler-{index}"));
+        }
+        h1_deficit.push("h1".into());
+        let h1_deficit = calibration_lists(&h1_deficit, &h1_deficit);
+        let mut h2_deficit = vec!["generic".into()];
+        for index in 0..3 {
+            h2_deficit.push(format!("filler-{index}"));
+        }
+        h2_deficit.push("h2".into());
+        let h2_deficit = calibration_lists(&h2_deficit, &h2_deficit);
+        let mut strong_body = vec!["body".into(), "generic".into()];
+        for index in 0..9 {
+            strong_body.push(format!("filler-{index}"));
+        }
+        strong_body.push("h1".into());
+        let strong_body = calibration_lists(&strong_body, &strong_body);
+        let mut content_answer = vec!["navigation".into()];
+        for index in 0..4 {
+            content_answer.push(format!("filler-{index}"));
+        }
+        content_answer.push("answer".into());
+        let content_answer = calibration_lists(&content_answer, &content_answer);
+
+        let candidates = [
+            ("low", [0.25, 0.2, 0.25]),
+            ("medium", [0.35, 0.25, 0.25]),
+            ("bounded", [0.5, 0.35, 0.35]),
+            ("high", [0.75, 0.5, 0.5]),
+            ("draft", [1.0, 0.75, 0.75]),
+        ];
+        let mut passing = Vec::new();
+        for (name, weights) in candidates {
+            let equal_order = calibration_order(&hits, &equal, &terms, weights);
+            let h1_order = calibration_order(&hits, &h1_deficit, &terms, weights);
+            let h2_order = calibration_order(&hits, &h2_deficit, &terms, weights);
+            let body_order = calibration_order(&hits, &strong_body, &terms, weights);
+            let answer_order = calibration_order(&hits, &content_answer, &terms, weights);
+            let equal_ok = before(&equal_order, "h1", "h2") && before(&equal_order, "h2", "body");
+            let h1_ok = before(&h1_order, "h1", "generic");
+            let h2_ok = before(&h2_order, "h2", "generic");
+            let body_ok =
+                before(&body_order, "body", "h1") && before(&body_order, "body", "generic");
+            let answer_ok = before(&answer_order, "answer", "navigation")
+                && answer_order.contains(&"navigation".to_string());
+            println!(
+                "{name} {weights:?}: equal={equal_ok} h1={h1_ok} h2={h2_ok} strong_body={body_ok} answer_navigation={answer_ok}"
+            );
+            if equal_ok && h1_ok && h2_ok && body_ok && answer_ok {
+                passing.push(name);
+            }
+        }
+        assert_eq!(passing, ["bounded"]);
+        let baseline = fuse(&equal, RRF_K);
+        let structural = structural_lists(&hits, &terms, &baseline);
+        let actual = [
+            structural[0].weight,
+            structural[1].weight,
+            structural[2].weight,
+        ];
+        assert_eq!(actual, [0.5, 0.35, 0.35]);
     }
 
     #[test]
@@ -500,6 +1455,23 @@ mod tests {
             "a file the pool never retrieved must bump dropped_file_not_in_pool, not dropped_line_out_of_range"
         );
         assert_eq!(stats.dropped_line_out_of_range, 0);
+    }
+
+    #[test]
+    fn rg_drop_counts_separate_mixed_causes() {
+        let candidates = pool(vec![hit("a", "/repo/wiki/x.md", 10, 20)]);
+        let (counts, stats) = resolve_rg_hits_to_chunks(
+            &candidates,
+            &[
+                rg_hit("/repo/wiki/missing.md", 1, &["alpha", "beta"]),
+                rg_hit("/repo/wiki/other.md", 1, &["alpha"]),
+                rg_hit("/repo/wiki/x.md", 1, &["alpha"]),
+                rg_hit("/repo/wiki/x.md", 15, &["alpha"]),
+            ],
+        );
+        assert_eq!(counts, HashMap::from([("a".to_string(), 1)]));
+        assert_eq!(stats.dropped_file_not_in_pool, 2);
+        assert_eq!(stats.dropped_line_out_of_range, 1);
     }
 
     /// Term count sizes both the rg argument list and the rg budget, so an
@@ -580,13 +1552,32 @@ mod tests {
         assert_eq!(stats.dropped_line_out_of_range, 1);
     }
 
+    fn ids(entries: Vec<SignalEntry>) -> Vec<String> {
+        let mut ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            ids.push(entry.chunk_id);
+        }
+        ids
+    }
     #[test]
     fn chunk_matching_more_distinct_terms_ranks_first() {
         let mut counts = HashMap::new();
         counts.insert("few".to_string(), 1);
         counts.insert("many".to_string(), 3);
         counts.insert("some".to_string(), 2);
-        assert_eq!(ranked_by_term_count(counts), vec!["many", "some", "few"]);
+        let hits = pool(vec![
+            hit("few", "/repo/wiki/few.md", 1, 10),
+            hit("many", "/repo/wiki/many.md", 1, 10),
+            hit("some", "/repo/wiki/some.md", 1, 10),
+        ]);
+        assert_eq!(
+            ids(ranked_by_term_count(
+                counts,
+                &hits,
+                &corpus_key().canonical_root
+            )),
+            vec!["many", "some", "few"]
+        );
     }
 
     #[test]
@@ -595,7 +1586,108 @@ mod tests {
         counts.insert("zzz".to_string(), 2);
         counts.insert("aaa".to_string(), 2);
         counts.insert("none".to_string(), 0);
-        assert_eq!(ranked_by_term_count(counts), vec!["aaa", "zzz"]);
+        // Same root-relative path and line_start: the tie has nothing left
+        // to settle on but chunk_id.
+        let hits = pool(vec![
+            hit("zzz", "/repo/wiki/x.md", 1, 10),
+            hit("aaa", "/repo/wiki/x.md", 1, 10),
+            hit("none", "/repo/wiki/x.md", 1, 10),
+        ]);
+        assert_eq!(
+            ids(ranked_by_term_count(
+                counts,
+                &hits,
+                &corpus_key().canonical_root
+            )),
+            vec!["aaa", "zzz"]
+        );
+    }
+
+    #[test]
+    fn ranked_by_term_count_tie_order_is_root_relative_not_absolute_chunk_id() {
+        // chunk_id is blake3 of the ABSOLUTE file_ref (`chunk_id_for` in
+        // hallouminate-adapters), so identical content checked out under
+        // two different roots hashes to a different byte order. Under
+        // root_a below, plain chunk_id order happens to agree with
+        // root-relative order; under root_b it disagrees -- reproducing
+        // the swap measured between corpus-walker.md and
+        // sandbox-and-workspace-roots.md
+        // (.hallouminate/wiki/eval-harness-gotchas.md:135-147) for content
+        // whose root-relative identity never changed.
+        let counts_for = |walker_id: &str, sandbox_id: &str| {
+            let mut c = HashMap::new();
+            c.insert(walker_id.to_string(), 1);
+            c.insert(sandbox_id.to_string(), 1);
+            c
+        };
+
+        let hits_for = |root: &str, walker_id: &str, sandbox_id: &str| {
+            pool(vec![
+                SearchHit {
+                    chunk_id: walker_id.into(),
+                    corpus_key: CorpusKey {
+                        name: "wiki".into(),
+                        canonical_root: PathBuf::from(root),
+                    },
+                    file_ref: format!("{root}/corpus-walker.md"),
+                    ..hit(walker_id, &format!("{root}/corpus-walker.md"), 19, 37)
+                },
+                SearchHit {
+                    chunk_id: sandbox_id.into(),
+                    corpus_key: CorpusKey {
+                        name: "wiki".into(),
+                        canonical_root: PathBuf::from(root),
+                    },
+                    file_ref: format!("{root}/sandbox-and-workspace-roots.md"),
+                    ..hit(
+                        sandbox_id,
+                        &format!("{root}/sandbox-and-workspace-roots.md"),
+                        20,
+                        24,
+                    )
+                },
+            ])
+        };
+
+        let root_a = PathBuf::from("/a/wiki");
+        let root_b = PathBuf::from("/zz/other/wiki");
+
+        // Root A: absolute chunk_id order happens to agree with
+        // root-relative order.
+        let (walker_a, sandbox_a) = ("aaa111", "bbb222");
+        let hits_a = hits_for("/a/wiki", walker_a, sandbox_a);
+        // Root B: absolute chunk_id order disagrees with root-relative
+        // order -- this is the byte-order flip the defect depends on.
+        let (walker_b, sandbox_b) = ("zzz999", "aaa000");
+        let hits_b = hits_for("/zz/other/wiki", walker_b, sandbox_b);
+
+        let order_a = ids(ranked_by_term_count(
+            counts_for(walker_a, sandbox_a),
+            &hits_a,
+            &root_a,
+        ));
+        let order_b = ids(ranked_by_term_count(
+            counts_for(walker_b, sandbox_b),
+            &hits_b,
+            &root_b,
+        ));
+
+        assert_eq!(
+            order_a,
+            vec![walker_a, sandbox_a],
+            "root-relative path orders corpus-walker.md before sandbox-and-workspace-roots.md"
+        );
+        assert_eq!(
+            order_a
+                .iter()
+                .map(|id| hits_a[id].file_ref.as_str().rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            order_b
+                .iter()
+                .map(|id| hits_b[id].file_ref.as_str().rsplit('/').next().unwrap())
+                .collect::<Vec<_>>(),
+            "identical content's tie order must not depend on the corpus's absolute root"
+        );
     }
 
     #[test]
@@ -641,6 +1733,18 @@ mod tests {
         let hits = pool(vec![hit_with_search_text("a", "alpha beta")]);
         let counts = contains_term_counts(&hits, &[]);
         assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn contains_term_counts_matches_capitalised_occurrences() {
+        let hits = pool(vec![hit_with_search_text("a", "Alpha and BETA appear")]);
+        let terms = vec!["alpha".to_string(), "beta".to_string()];
+        let counts = contains_term_counts(&hits, &terms);
+        assert_eq!(
+            counts.get("a"),
+            Some(&2),
+            "terms arrive lowercased; capitalised text must still match like ripgrep --ignore-case"
+        );
     }
 
     #[test]
@@ -690,8 +1794,19 @@ mod tests {
             Ok(SignalLists {
                 fts: self.fts.clone(),
                 vector: self.vector.clone(),
+                fts_scores: HashMap::new(),
+                vector_distances: HashMap::new(),
                 hits: self.hits.clone(),
             })
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
         }
     }
 
@@ -733,15 +1848,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unresolved_warning_reports_exact_drop_counts_and_truncation() {
+        for (file_drops, line_drops, limit, truncated) in [
+            (2, 0, 10, false),
+            (0, 3, 10, false),
+            (2, 3, 10, false),
+            (2, 0, 2, true),
+            (50, 0, 100, false),
+        ] {
+            let root = tempfile::tempdir().expect("ripgrep fixture root");
+            let corpus_key = CorpusKey {
+                name: "fixtures".into(),
+                canonical_root: root.path().canonicalize().expect("canonical fixture root"),
+            };
+            let mut candidates = vec![
+                hit("first", "/outside/first.md", 1, 1),
+                hit("second", "/outside/second.md", 1, 1),
+            ];
+            for index in 0..file_drops + line_drops {
+                let path = corpus_key
+                    .canonical_root
+                    .join(format!("match-{index:03}.md"));
+                std::fs::write(&path, "distinctiveterm private matched text\n")
+                    .expect("write real ripgrep match");
+                if index >= file_drops {
+                    candidates.push(hit(
+                        &format!("range-{index}"),
+                        path.to_str().expect("UTF-8 fixture path"),
+                        2,
+                        3,
+                    ));
+                }
+            }
+            let store = FakeFusionStore {
+                fts: vec!["first".into(), "second".into()],
+                vector: vec!["second".into()],
+                hits: pool(candidates),
+            };
+            let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], limit)
+                .await
+                .expect("search with unresolved real ripgrep hits");
+
+            assert_eq!(result.hits.len(), 2);
+            assert_eq!(result.hits[0].chunk_id, "second");
+            assert_eq!(result.hits[0].score, 2.0 / 61.0 + 1.0 / 60.0 + 0.35 / 60.0);
+            assert_eq!(result.hits[1].chunk_id, "first");
+            assert_eq!(result.hits[1].score, 2.0 / 60.0 + 0.35 / 61.0);
+            assert_eq!(result.warnings.len(), 1);
+            assert_eq!(result.warnings[0].code, "ripgrep-unresolved");
+            assert_eq!(
+                result.warnings[0].message,
+                format!(
+                    "ripgrep signal produced {} hits but resolved to zero chunks in corpus root {}; dropped_file_not_in_pool={file_drops}, dropped_line_out_of_range={line_drops}, truncated={truncated}",
+                    file_drops + line_drops,
+                    corpus_key.canonical_root.display(),
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolved_or_absent_ripgrep_hits_do_not_warn() {
+        for (contents, expected_score) in [
+            ("distinctiveterm\n", 2.0 / 60.0 + 0.5 / 60.0 + 0.35 / 60.0),
+            ("unrelated\n", 2.0 / 60.0 + 0.35 / 60.0),
+        ] {
+            let root = tempfile::tempdir().expect("ripgrep fixture root");
+            let corpus_key = CorpusKey {
+                name: "fixtures".into(),
+                canonical_root: root.path().canonicalize().expect("canonical fixture root"),
+            };
+            let path = corpus_key.canonical_root.join("candidate.md");
+            std::fs::write(&path, contents).expect("write real ripgrep candidate");
+            let store = FakeFusionStore {
+                fts: vec!["candidate".into()],
+                vector: Vec::new(),
+                hits: pool(vec![hit(
+                    "candidate",
+                    path.to_str().expect("UTF-8 fixture path"),
+                    1,
+                    1,
+                )]),
+            };
+            let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
+                .await
+                .expect("search with resolved or absent real ripgrep hits");
+
+            assert!(result.warnings.is_empty());
+            assert_eq!(result.hits.len(), 1);
+            assert_eq!(result.hits[0].chunk_id, "candidate");
+            assert_eq!(result.hits[0].score, expected_score);
+        }
+    }
+
+    #[tokio::test]
     async fn a_failed_ripgrep_pass_warns_the_caller_instead_of_ranking_silently() {
         // A Ground response that claims four-signal fusion while actually
         // ranked on fewer is the failure this warning exists to prevent: the
         // degradation is already logged, but logs do not reach the caller.
+        // An unclosed glob class makes rg exit 2 on an existing root.
+        let root = tempfile::tempdir().expect("tempdir");
         let corpus_key = CorpusKey {
             name: "fixtures".into(),
-            canonical_root: std::path::PathBuf::from(
-                "/nonexistent/hallouminate-rg-failure-fixture",
-            ),
+            canonical_root: root.path().to_path_buf(),
         };
         let store = FakeFusionStore {
             fts: vec!["a".into()],
@@ -749,9 +1958,15 @@ mod tests {
             hits: pool(vec![hit_with_search_text("a", "unrelated")]),
         };
 
-        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
-            .await
-            .expect("a failed ripgrep pass must degrade the ranking, not fail the query");
+        let result = search_fused(
+            &store,
+            &corpus_key,
+            "distinctiveterm",
+            &["[".to_string()],
+            10,
+        )
+        .await
+        .expect("a failed ripgrep pass must degrade the ranking, not fail the query");
 
         assert_eq!(
             result
@@ -773,11 +1988,10 @@ mod tests {
     async fn empty_pool_early_return_still_surfaces_a_failed_ripgrep_warning() {
         // Finding 6: the empty-pool early return used to discard rg_res
         // outright, so a failed/timed-out rg on this path warned nobody.
+        let root = tempfile::tempdir().expect("tempdir");
         let corpus_key = CorpusKey {
             name: "fixtures".into(),
-            canonical_root: std::path::PathBuf::from(
-                "/nonexistent/hallouminate-rg-failure-fixture-empty-pool",
-            ),
+            canonical_root: root.path().to_path_buf(),
         };
         let store = FakeFusionStore {
             fts: Vec::new(),
@@ -785,9 +1999,15 @@ mod tests {
             hits: HashMap::new(),
         };
 
-        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
-            .await
-            .expect("an empty pool must not fail the query");
+        let result = search_fused(
+            &store,
+            &corpus_key,
+            "distinctiveterm",
+            &["[".to_string()],
+            10,
+        )
+        .await
+        .expect("an empty pool must not fail the query");
 
         assert_eq!(
             result
@@ -799,5 +2019,504 @@ mod tests {
             "a failed ripgrep pass must be reported even when the FTS/vector pool was empty"
         );
         assert!(result.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_root_skips_ripgrep_without_a_warning() {
+        // A gitignored corpus root such as `.cheese` is absent from a fresh
+        // worktree. It has nothing to grep, so it must not report a failure.
+        let parent = tempfile::tempdir().expect("tempdir");
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root: parent.path().join(".cheese"),
+        };
+        let store = FakeFusionStore {
+            fts: vec!["a".into()],
+            vector: Vec::new(),
+            hits: pool(vec![hit_with_search_text("a", "unrelated")]),
+        };
+
+        let result = search_fused(&store, &corpus_key, "distinctiveterm", &[], 10)
+            .await
+            .expect("a missing root must not fail the query");
+
+        assert!(
+            result.warnings.is_empty(),
+            "a missing root has nothing to grep: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.hits.len(), 1);
+    }
+
+    fn root_signals(
+        corpus: &str,
+        fts: &[(&str, f32)],
+        vector: &[(&str, f32)],
+        hits: Vec<SearchHit>,
+    ) -> RootSignals {
+        let mut fts_entries = Vec::new();
+        for (chunk_id, score) in fts {
+            fts_entries.push(SignalEntry {
+                chunk_id: (*chunk_id).to_string(),
+                strength: Some(*score),
+            });
+        }
+        let mut vector_entries = Vec::new();
+        for (chunk_id, distance) in vector {
+            vector_entries.push(SignalEntry {
+                chunk_id: (*chunk_id).to_string(),
+                strength: Some(-distance),
+            });
+        }
+        RootSignals {
+            corpus: corpus.to_string(),
+            fts: fts_entries,
+            vector: vector_entries,
+            hits: pool(hits),
+            ..RootSignals::default()
+        }
+    }
+
+    fn fused_ids(hits: &[SearchHit]) -> Vec<&str> {
+        let mut ids = Vec::with_capacity(hits.len());
+        for hit in hits {
+            ids.push(hit.chunk_id.as_str());
+        }
+        ids
+    }
+
+    #[test]
+    fn a_weak_root_leader_does_not_outrank_stronger_chunks_of_another_root() {
+        // Per-root fusion gave every root's first chunk the top score, so
+        // an irrelevant page that led a small foreign corpus outranked the
+        // relevant pages of the local corpus.
+        let local = root_signals(
+            "local",
+            &[("local-a", 9.0), ("local-b", 7.0)],
+            &[("local-a", 0.20), ("local-b", 0.25)],
+            vec![
+                hit("local-a", "/repo/wiki/a.md", 1, 5),
+                hit("local-b", "/repo/wiki/b.md", 1, 5),
+            ],
+        );
+        let foreign = root_signals(
+            "foreign",
+            &[("foreign", 0.4)],
+            &[("foreign", 0.90)],
+            vec![hit("foreign", "/other/wiki/loudness.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![foreign, local], "watcher reconciliation", None);
+
+        assert_eq!(fused_ids(&fused), vec!["local-a", "local-b", "foreign"]);
+        assert!(fused[1].score > fused[2].score);
+    }
+
+    #[test]
+    fn equal_evidence_ranks_the_priority_corpus_first() {
+        let first = root_signals(
+            "neighbor",
+            &[("neighbor", 3.0)],
+            &[("neighbor", 0.5)],
+            vec![hit("neighbor", "/other/wiki/a.md", 1, 5)],
+        );
+        let second = root_signals(
+            "local",
+            &[("local", 3.0)],
+            &[("local", 0.5)],
+            vec![hit("local", "/repo/wiki/a.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![first, second], "term", Some("local"));
+
+        assert_eq!(fused_ids(&fused), vec!["local", "neighbor"]);
+    }
+
+    #[test]
+    fn roots_without_raw_scores_fuse_alone_with_equal_leaders() {
+        let mut first = root_signals(
+            "first",
+            &[],
+            &[],
+            vec![
+                hit("first-a", "/repo/wiki/a.md", 1, 5),
+                hit("first-b", "/repo/wiki/b.md", 1, 5),
+            ],
+        );
+        first.fts = vec![
+            SignalEntry {
+                chunk_id: "first-a".into(),
+                strength: None,
+            },
+            SignalEntry {
+                chunk_id: "first-b".into(),
+                strength: None,
+            },
+        ];
+        let second = root_signals(
+            "second",
+            &[("second-a", 100.0)],
+            &[],
+            vec![hit("second-a", "/other/wiki/a.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![first, second], "term", None);
+
+        assert_eq!(fused_ids(&fused), vec!["first-a", "first-b", "second-a"]);
+        assert!((fused[0].score - fused[2].score).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_same_chunk_id_in_two_roots_stays_two_hits() {
+        let first = root_signals(
+            "first",
+            &[("shared", 2.0)],
+            &[],
+            vec![hit("shared", "/repo/wiki/a.md", 1, 5)],
+        );
+        let second = root_signals(
+            "second",
+            &[("shared", 1.0)],
+            &[],
+            vec![hit("shared", "/repo/wiki/a.md", 1, 5)],
+        );
+
+        let fused = fuse_roots(vec![first, second], "term", None);
+
+        assert_eq!(fused.len(), 2);
+    }
+
+    struct FakeMembershipStore {
+        indexed: Option<HashSet<FileRef>>,
+    }
+
+    fn file_ref(path: &str) -> FileRef {
+        FileRef::new(PathBuf::from(path))
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for FakeMembershipStore {
+        async fn retrieve_signals(
+            &self,
+            _corpus_key: &CorpusKey,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<SignalLists> {
+            Ok(SignalLists {
+                fts: Vec::new(),
+                vector: Vec::new(),
+                fts_scores: HashMap::new(),
+                vector_distances: HashMap::new(),
+                hits: HashMap::new(),
+            })
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn indexed_file_refs(
+            &self,
+            _corpus_key: &CorpusKey,
+        ) -> Result<Option<HashSet<FileRef>>> {
+            Ok(self.indexed.clone())
+        }
+    }
+
+    fn fixture_root() -> (tempfile::TempDir, CorpusKey) {
+        let dir = tempfile::tempdir().expect("root");
+        let canonical_root = crate::common::canonicalize_or_passthrough(dir.path()).into_path_buf();
+        let corpus_key = CorpusKey {
+            name: "fixtures".into(),
+            canonical_root,
+        };
+        (dir, corpus_key)
+    }
+
+    fn write_lines(path: &Path, lines: &[&str]) -> String {
+        std::fs::write(path, lines.join("\n")).expect("write fixture file");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[tokio::test]
+    async fn search_fused_leaves_unindexed_files_to_the_fallback_pass() {
+        let (_dir, corpus_key) = fixture_root();
+        write_lines(&corpus_key.canonical_root.join("cold.md"), &["zebrafish"]);
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::new()),
+        };
+
+        let result = search_fused(&store, &corpus_key, "zebrafish", &[], 10)
+            .await
+            .expect("search");
+
+        assert!(result.hits.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_returns_line_window_for_unindexed_file() {
+        let (_dir, corpus_key) = fixture_root();
+        let file = write_lines(
+            &corpus_key.canonical_root.join("cold.md"),
+            &[
+                "l1",
+                "l2",
+                "l3",
+                "l4",
+                "l5",
+                "zebrafish here",
+                "l7",
+                "l8",
+                "l9",
+                "l10",
+                "l11",
+            ],
+        );
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::new()),
+        };
+        let eligible = HashSet::from([file_ref(&file)]);
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.file_ref, file);
+        assert_eq!((hit.line_start, hit.line_end), (3, 9));
+        assert!(hit.text.contains("zebrafish here"));
+        assert!(!hit.text.contains("l2") && !hit.text.contains("l10"));
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert_eq!(codes, vec!["lexical-fallback"]);
+    }
+
+    #[test]
+    fn unindexed_candidates_is_empty_when_the_index_covers_every_file() {
+        let eligible = HashSet::from([file_ref("a.md"), file_ref("b.md")]);
+        let indexed = eligible.clone();
+
+        let (candidates, dropped) = unindexed_candidates(&eligible, &indexed);
+
+        assert!(candidates.is_empty());
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn unindexed_candidates_reports_files_past_the_cap() {
+        let mut eligible = HashSet::new();
+        for index in 0..FALLBACK_MAX_FILES + 5 {
+            eligible.insert(file_ref(&format!("f{index:05}.md")));
+        }
+
+        let (candidates, dropped) = unindexed_candidates(&eligible, &HashSet::new());
+
+        assert_eq!(candidates.len(), FALLBACK_MAX_FILES);
+        assert_eq!(dropped, 5);
+        assert_eq!(candidates[0], file_ref("f00000.md"));
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_warns_when_the_file_cap_drops_files() {
+        let (_dir, corpus_key) = fixture_root();
+        let root = &corpus_key.canonical_root;
+        let hit_file = write_lines(&root.join("f00000.md"), &["zebrafish here"]);
+        let mut eligible = HashSet::from([file_ref(&hit_file)]);
+        for index in 1..FALLBACK_MAX_FILES + 3 {
+            eligible.insert(FileRef::new(root.join(format!("f{index:05}.md"))));
+        }
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::new()),
+        };
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        let codes: Vec<&str> = result.warnings.iter().map(|w| w.code.as_str()).collect();
+        assert!(
+            codes.contains(&"lexical-fallback-truncated"),
+            "codes: {codes:?}"
+        );
+        let truncated = result
+            .warnings
+            .iter()
+            .find(|w| w.code == "lexical-fallback-truncated")
+            .expect("truncated warning");
+        assert!(truncated.message.starts_with("3 unindexed file(s)"));
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_skips_indexed_and_ineligible_files() {
+        let (_dir, corpus_key) = fixture_root();
+        let root = &corpus_key.canonical_root;
+        let indexed = write_lines(&root.join("indexed.md"), &["zebrafish indexed"]);
+        let cold = write_lines(&root.join("cold.md"), &["zebrafish cold"]);
+        // On disk and matching, but the indexer scan does not select it
+        // (excluded by pattern or owned by a nested root).
+        write_lines(&root.join("excluded.md"), &["zebrafish excluded"]);
+        let store = FakeMembershipStore {
+            indexed: Some(HashSet::from([file_ref(&indexed)])),
+        };
+        let eligible = HashSet::from([file_ref(&indexed), file_ref(&cold)]);
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        let files: Vec<&str> = result.hits.iter().map(|h| h.file_ref.as_str()).collect();
+        assert_eq!(files, vec![cold.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_reaches_unindexed_file_behind_many_indexed_matches() {
+        let (_dir, corpus_key) = fixture_root();
+        let root = &corpus_key.canonical_root;
+        let mut eligible = HashSet::new();
+        let mut indexed = HashSet::new();
+        for number in 0..30 {
+            let file = write_lines(
+                &root.join(format!("a{number:02}.md")),
+                &["zebrafish indexed"],
+            );
+            indexed.insert(file_ref(&file));
+            eligible.insert(file_ref(&file));
+        }
+        let cold = write_lines(&root.join("zz-cold.md"), &["zebrafish cold"]);
+        eligible.insert(file_ref(&cold));
+        let store = FakeMembershipStore {
+            indexed: Some(indexed),
+        };
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            3,
+        )
+        .await;
+
+        let files: Vec<&str> = result.hits.iter().map(|h| h.file_ref.as_str()).collect();
+        assert_eq!(files, vec![cold.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn lexical_fallback_is_off_when_membership_is_unknown() {
+        let (_dir, corpus_key) = fixture_root();
+        let cold = write_lines(
+            &corpus_key.canonical_root.join("cold.md"),
+            &["zebrafish cold"],
+        );
+        let store = FakeMembershipStore { indexed: None };
+        let eligible = HashSet::from([file_ref(&cold)]);
+
+        let result = lexical_fallback_search(
+            &corpus_key,
+            "zebrafish",
+            &eligible,
+            store.indexed.as_ref(),
+            10,
+        )
+        .await;
+
+        assert!(result.hits.is_empty());
+        assert!(result.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_drops_a_candidate_swapped_for_an_outside_symlink() {
+        let (_dir, corpus_key) = fixture_root();
+        let outside = tempfile::tempdir().expect("outside dir");
+        let secret = write_lines(&outside.path().join("secret.md"), &["zebrafish secret"]);
+        let swapped = corpus_key.canonical_root.join("cold.md");
+        std::os::unix::fs::symlink(&secret, &swapped).expect("swap candidate for symlink");
+        let eligible = HashSet::from([FileRef::new(swapped)]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(
+            result.hits.is_empty(),
+            "a symlink swapped in after the scan must not leak outside text: {:?}",
+            result.hits
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_drops_a_candidate_whose_parent_dir_became_a_symlink() {
+        let (_dir, corpus_key) = fixture_root();
+        let outside = tempfile::tempdir().expect("outside dir");
+        write_lines(&outside.path().join("secret.md"), &["zebrafish secret"]);
+        let swapped_dir = corpus_key.canonical_root.join("docs");
+        std::os::unix::fs::symlink(outside.path(), &swapped_dir).expect("swap parent for symlink");
+        let eligible = HashSet::from([FileRef::new(swapped_dir.join("secret.md"))]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(
+            result.hits.is_empty(),
+            "a parent symlink must not leak outside text: {:?}",
+            result.hits
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lexical_fallback_does_not_create_a_missing_parent_directory() {
+        let (_dir, corpus_key) = fixture_root();
+        let ghost = corpus_key.canonical_root.join("ghost");
+        let eligible = HashSet::from([FileRef::new(ghost.join("cold.md"))]);
+        let indexed = HashSet::new();
+
+        let result =
+            lexical_fallback_search(&corpus_key, "zebrafish", &eligible, Some(&indexed), 10).await;
+
+        assert!(result.hits.is_empty());
+        assert!(!ghost.exists(), "the fallback must not create directories");
+    }
+
+    #[test]
+    fn rank_after_scores_every_fallback_hit_below_every_fused_hit() {
+        let fused = |score: f32| SearchHit {
+            score,
+            ..hit("f", "/repo/wiki/f.md", 1, 2)
+        };
+        for fused_scores in [vec![0.04, 0.02], vec![3.5, -1.0], vec![-4.0]] {
+            let fused_hits: Vec<SearchHit> = fused_scores.iter().map(|s| fused(*s)).collect();
+            let mut fallback = vec![hit("a", "/repo/a.md", 1, 2), hit("b", "/repo/b.md", 1, 2)];
+
+            rank_after(&mut fallback, &fused_hits);
+
+            let lowest = fused_scores.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(fallback[0].score < lowest, "{fused_scores:?}");
+            assert!(fallback[1].score < fallback[0].score, "{fused_scores:?}");
+        }
     }
 }

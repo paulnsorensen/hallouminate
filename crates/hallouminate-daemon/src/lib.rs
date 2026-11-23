@@ -5,9 +5,8 @@
 //! See `.cheese/specs/repository-daemon-wikis.md` for the design.
 //! Operational summary:
 //!
-//! - One daemon per user-local socket (`HALLOUMINATE_SOCKET`,
-//!   `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, or
-//!   `~/.cache/hallouminate/daemon.sock`).
+//! - One daemon per user-local socket (`HALLOUMINATE_SOCKET`, or
+//!   `<account-home>/.cache/hallouminate/daemon.sock`).
 //! - Single-instance enforced via `flock` on `<socket>.lock`.
 //! - Interactive CLI subcommands (`ground`, `index`, …) become clients of
 //!   the daemon and fail loudly when it is unreachable rather than silently
@@ -25,6 +24,7 @@ mod churn;
 mod client;
 mod debt;
 mod dispatch;
+mod framing;
 mod heartbeat;
 mod ipc;
 mod ladder;
@@ -32,11 +32,14 @@ mod lifecycle;
 mod maintenance;
 mod pressure;
 mod report;
+mod scan_cache;
 mod server;
 mod socket;
 mod state;
 mod status;
 mod supervisor;
+#[cfg(test)]
+pub(crate) mod test_support;
 mod watch;
 mod watchdog;
 pub use bootstrap::ensure_daemon_running;
@@ -45,18 +48,21 @@ pub use client::{
     daemon_client_unavailable,
 };
 pub use ipc::{
-    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusEntry,
-    CorpusStatsResult, DaemonRequest, DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest,
-    DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
-    ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
-    Position, ReadMarkdownRequest, ReadMarkdownResult,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult, BUILD_IDENTITY,
+    BacklinksRequest, BacklinksResult, CorpusEntry, CorpusStatsResult, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DeleteMarkdownRequest, DeleteMarkdownResult, ErrorKind,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListCorporaResult, ListFilesRequest,
+    ListFilesResult, ListTreeRequest, ListTreeResult, Position, ReadMarkdownRequest,
+    ReadMarkdownResult,
 };
 pub use ipc::{
     DebtLevel, LadderAction, StatusReport, TaskName, TaskState, TaskStatus, TripState,
     WatcherCounters,
 };
 pub use lifecycle::{DaemonStatus, restart, restart_with, status, stop};
-pub use report::{CorpusReport, IndexReport};
+pub use report::{
+    CorpusReport, IndexReport, QueuedIndexReport, SkippedFileReason, SkippedFileReport,
+};
 pub use server::{
     DaemonArgs, IDLE_READ_TIMEOUT, run_daemon, serve, serve_with_idle_timeout,
     spawn_signal_handlers,

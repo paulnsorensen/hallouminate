@@ -12,10 +12,12 @@ hallouminate-domain.workspace = true
 hallouminate-adapters.workspace = true
 hallouminate-config.workspace = true
 tokio.workspace = true
-tokio-util = "0.7"
-notify = "8"
-notify-debouncer-full = "0.7"
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+notify = "=9.0.0-rc.8"
+notify-debouncer-full = "=0.8.0-rc.3"
 rustix.workspace = true
+strsim.workspace = true
 libc = "0.2"
 fastrand = "2"
 shellexpand.workspace = true
@@ -23,11 +25,13 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 anyhow.workspace = true
+semver = "1"
 tracing.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+async-trait.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
-text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
+text-splitter = { version = "0.33", features = ["markdown", "tokenizers"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

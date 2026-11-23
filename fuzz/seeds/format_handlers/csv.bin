@@ -1,0 +1,6 @@
+Cname,role,note
+ada,admin,"multi
+line"
+bob,,plain
+,,
+"q""uote",x,y,extra

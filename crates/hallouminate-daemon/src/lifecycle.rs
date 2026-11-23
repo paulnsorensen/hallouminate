@@ -12,9 +12,9 @@ use std::time::Duration;
 use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
-use super::client::connect_primary_or_sibling;
+use super::client::connect_at;
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, StatusReport};
-use super::socket::daemon_socket_paths;
+use super::socket::daemon_socket_path;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_POLL: Duration = Duration::from_millis(50);
@@ -36,12 +36,12 @@ pub enum DaemonStatus {
 /// an unparseable payload is a real fault and surfaces as `Err` — it IS
 /// running, so reporting `NotRunning` would be a lie.
 pub async fn status() -> anyhow::Result<DaemonStatus> {
-    let paths = daemon_socket_paths()?;
-    status_at(paths.canonical(), paths.legacy()).await
+    let socket = daemon_socket_path()?;
+    status_at(&socket).await
 }
 
-async fn status_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<DaemonStatus> {
-    let Some(client) = connect_primary_or_sibling(primary, sibling).await else {
+async fn status_at(socket: &Path) -> anyhow::Result<DaemonStatus> {
+    let Ok(client) = connect_at(socket).await else {
         return Ok(DaemonStatus::NotRunning);
     };
     match client
@@ -73,16 +73,15 @@ async fn status_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<Dae
 /// is config-independent on the server side, so `cwd` does not need to
 /// resolve a repo config.
 pub async fn stop() -> anyhow::Result<()> {
-    let paths = daemon_socket_paths()?;
-    stop_at(paths.canonical(), paths.legacy()).await
+    let socket = daemon_socket_path()?;
+    stop_at(&socket).await
 }
 
-async fn stop_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<()> {
+pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + STOP_TIMEOUT;
-    let Some(client) = connect_primary_or_sibling(primary, sibling).await else {
+    let Ok(client) = connect_at(socket).await else {
         return Ok(());
     };
-    let socket = client.socket_path().to_path_buf();
     let _ = client
         .call_raw_with_timeout(
             DaemonRequest {
@@ -94,7 +93,7 @@ async fn stop_at(primary: &Path, sibling: Option<&Path>) -> anyhow::Result<()> {
         .await;
 
     loop {
-        if !socket.exists() || UnixStream::connect(&socket).await.is_err() {
+        if !socket.exists() || UnixStream::connect(socket).await.is_err() {
             return Ok(());
         }
         if std::time::Instant::now() >= deadline {
@@ -141,11 +140,10 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     #[tokio::test]
-    async fn status_uses_live_sibling_when_primary_is_unreachable() {
+    async fn status_reports_running_for_live_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let primary = dir.path().join("primary.sock");
-        let sibling = dir.path().join("sibling.sock");
-        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -162,6 +160,7 @@ mod tests {
                     defer_count: 0,
                     watcher: WatcherCounters::default(),
                     trips: TripState::None,
+                    degraded_watch_roots: 0,
                 });
                 let mut response = serde_json::to_string(&response).expect("serialize response");
                 response.push('\n');
@@ -173,24 +172,21 @@ mod tests {
             }
         });
 
-        let status = status_at(&primary, Some(&sibling))
-            .await
-            .expect("status through sibling");
+        let status = status_at(&socket).await.expect("status");
 
         match status {
             DaemonStatus::Running(report) => assert_eq!(report.defer_count, 0),
-            DaemonStatus::NotRunning => panic!("live sibling must report Running"),
+            DaemonStatus::NotRunning => panic!("live socket must report Running"),
         }
         server.await.expect("server task");
     }
 
     #[tokio::test]
-    async fn stop_shuts_down_live_sibling_when_primary_is_unreachable() {
+    async fn stop_shuts_down_live_socket() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let primary = dir.path().join("primary.sock");
-        let sibling = dir.path().join("sibling.sock");
-        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
-        let sibling_for_server = sibling.clone();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
+        let socket_for_server = socket.clone();
         let server = tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -216,16 +212,14 @@ mod tests {
                     .expect("write response");
                 drop(write_half);
                 drop(listener);
-                std::fs::remove_file(&sibling_for_server).expect("remove sibling socket");
+                std::fs::remove_file(&socket_for_server).expect("remove socket");
                 break;
             }
         });
 
-        stop_at(&primary, Some(&sibling))
-            .await
-            .expect("stop through sibling");
+        stop_at(&socket).await.expect("stop");
 
-        assert!(!sibling.exists(), "sibling socket must be removed");
+        assert!(!socket.exists(), "socket must be removed");
         server.await.expect("server task");
     }
 }

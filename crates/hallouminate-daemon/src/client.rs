@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
+use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 use super::bootstrap::ensure_daemon_running;
+use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind};
-use super::socket::daemon_socket_paths;
+use super::socket::daemon_socket_path;
 
 /// Client handle: just remembers which socket path to dial. Stateless
 /// otherwise — every `call` opens a fresh connection.
@@ -28,10 +30,10 @@ pub struct DaemonClient {
 /// Connect to the daemon. Returns `Err` with a clear "daemon unavailable"
 /// message when the socket is missing, unreadable, or the connect fails.
 pub async fn daemon_client() -> anyhow::Result<DaemonClient> {
-    let paths = daemon_socket_paths()?;
-    connect_primary_or_sibling(paths.canonical(), paths.legacy())
+    let socket = daemon_socket_path()?;
+    connect_at(&socket)
         .await
-        .ok_or_else(|| daemon_client_unavailable(paths.canonical().display()))
+        .map_err(|_| daemon_client_unavailable(socket.display()))
 }
 
 /// Connect to the daemon at an explicit socket path when set, otherwise
@@ -45,9 +47,9 @@ pub async fn client_for(socket: Option<&Path>) -> anyhow::Result<DaemonClient> {
 /// `client_for` with an injectable respawn step — the test seam behind it,
 /// mirroring [`super::lifecycle::restart_with`]. Production passes
 /// `ensure_daemon_running` (which no-ops under `HALLOUMINATE_SOCKET`). Only the
-/// canonical/default path (`None`) self-heals: on connection failure it probes
-/// the legacy candidate, then runs `respawn` once and retries the canonical
-/// socket. Explicit-socket callers (`Some(path)`) never spawn or probe legacy.
+/// default path (`None`) self-heals: on connection failure it runs `respawn`
+/// once and retries the same socket. Explicit-socket callers (`Some(path)`)
+/// never spawn.
 pub async fn client_for_with<F, Fut>(
     socket: Option<&Path>,
     respawn: F,
@@ -59,45 +61,24 @@ where
     match socket {
         Some(path) => connect_at(path).await,
         None => {
-            let paths = daemon_socket_paths()?;
-            connect_or_spawn(paths.canonical(), paths.legacy(), respawn).await
+            let socket = daemon_socket_path()?;
+            connect_or_spawn(&socket, respawn).await
         }
     }
 }
 
-/// Connect to the canonical socket or adopt a reachable legacy socket.
-pub(crate) async fn connect_primary_or_sibling(
-    canonical: &Path,
-    legacy: Option<&Path>,
-) -> Option<DaemonClient> {
-    if let Ok(client) = connect_at(canonical).await {
-        return Some(client);
-    }
-    let legacy = legacy?;
-    let client = connect_at(legacy).await.ok()?;
-    tracing::debug!(legacy = %legacy.display(), "adopted live legacy daemon (#218)");
-    Some(client)
-}
-
-/// Connect to the canonical socket; on failure, probe the legacy candidate
-/// before falling back to `respawn` (#218). Clients launched from environments
-/// that disagree on `XDG_RUNTIME_DIR` can otherwise resolve separate legacy
-/// sockets. `legacy: None` means an explicit `HALLOUMINATE_SOCKET` override,
-/// so respawn proceeds without legacy discovery.
-async fn connect_or_spawn<F, Fut>(
-    primary: &Path,
-    sibling: Option<&Path>,
-    respawn: F,
-) -> anyhow::Result<DaemonClient>
+/// Connect to `socket`; on failure run `respawn` once and retry the same
+/// socket.
+async fn connect_or_spawn<F, Fut>(socket: &Path, respawn: F) -> anyhow::Result<DaemonClient>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    match connect_primary_or_sibling(primary, sibling).await {
-        Some(client) => Ok(client),
-        None => {
+    match connect_at(socket).await {
+        Ok(client) => Ok(client),
+        Err(_) => {
             respawn().await?;
-            connect_at(primary).await
+            connect_at(socket).await
         }
     }
 }
@@ -111,8 +92,9 @@ pub fn daemon_client_unavailable(reason: impl std::fmt::Display) -> anyhow::Erro
     anyhow::anyhow!("daemon unavailable: {reason} (start it with `hallouminate daemon`)")
 }
 
-/// Test entry point: dial a specific socket path. Production code goes
-/// through `daemon_client()` or `client_for()`.
+/// Dials one explicit socket path and confirms that a daemon accepts the
+/// connection. Every discovery entry point resolves its path first, then
+/// connects through this function.
 pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {
     // Probe the socket with a quick connect to confirm a daemon is alive,
     // surfacing the failure here instead of inside the first `call`.
@@ -136,11 +118,19 @@ impl DaemonClient {
     /// Send one request, parse one response. The daemon protocol is
     /// one-shot per connection, so each call opens a new socket.
     pub async fn call_raw(&self, req: DaemonRequest) -> anyhow::Result<DaemonResponse> {
+        let mut text = serde_json::to_string(&req)?;
+        text.push('\n');
+        if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload
+            && text.len() > MAX_IPC_LINE_BYTES
+        {
+            return Err(DaemonRpcError::invalid_params(
+                "serialized markdown batch exceeds the 4 MiB IPC frame limit",
+            )
+            .into());
+        }
         let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
             daemon_client_unavailable(format!("connect to {} failed: {e}", self.socket.display()))
         })?;
-        let mut text = serde_json::to_string(&req)?;
-        text.push('\n');
         // Wrap mid-call I/O errors with the same `daemon unavailable` hint
         // the initial connect uses. Without this, a daemon that dies after
         // the connect succeeds (write fails, read returns EOF, response
@@ -154,18 +144,17 @@ impl DaemonClient {
             daemon_client_unavailable(format!("flush {} failed: {e}", self.socket.display()))
         })?;
         let (read_half, _) = stream.into_split();
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).await.map_err(|e| {
-            daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
-        })?;
-        if n == 0 {
+        let mut lines = ipc_lines(read_half);
+        let Some(line) = lines.next().await else {
             return Err(daemon_client_unavailable(format!(
                 "daemon at {} closed the connection before responding",
                 self.socket.display(),
             )));
-        }
-        let response: DaemonResponse = serde_json::from_str(line.trim_end()).map_err(|e| {
+        };
+        let line = line.map_err(|e| {
+            daemon_client_unavailable(format!("read from {} failed: {e}", self.socket.display()))
+        })?;
+        let response: DaemonResponse = serde_json::from_str(&line).map_err(|e| {
             daemon_client_unavailable(format!(
                 "invalid daemon response from {}: {e} (response: {line:?})",
                 self.socket.display(),
@@ -183,6 +172,7 @@ impl DaemonClient {
     /// Deadline expiry is typed [`DaemonRpcError`] with
     /// [`ErrorKind::Retryable`] (#216): the daemon accepted the connection,
     /// so it is likely busy rather than down, and the caller can retry.
+    /// Batch deadlines leave completion uncertain; callers must inspect files before retrying.
     /// Transport failures inside `call_raw` (connect/write/read/EOF) keep
     /// the untyped "daemon unavailable" shape with its restart hint —
     /// retrying against a dead daemon cannot succeed.
@@ -191,10 +181,14 @@ impl DaemonClient {
         req: DaemonRequest,
         timeout: Duration,
     ) -> anyhow::Result<DaemonResponse> {
+        let mut timeout_hint = "the daemon may be busy — retry";
+        if let DaemonRequestPayload::AddMarkdownBatch { .. } = &req.payload {
+            timeout_hint = "batch completion is uncertain; inspect files before retrying. No automatic retry or rollback occurred";
+        }
         match tokio::time::timeout(timeout, self.call_raw(req)).await {
             Ok(result) => result,
             Err(_elapsed) => Err(DaemonRpcError::retryable(format!(
-                "no response from {} within {}s; the daemon may be busy — retry",
+                "no response from {} within {}s; {timeout_hint}",
                 self.socket.display(),
                 timeout.as_secs(),
             ))
@@ -234,6 +228,7 @@ fn timeout_for(payload: &DaemonRequestPayload) -> Duration {
         DaemonRequestPayload::Ground(_) => Duration::from_secs(120),
         DaemonRequestPayload::Index(_)
         | DaemonRequestPayload::AddMarkdown(_)
+        | DaemonRequestPayload::AddMarkdownBatch { .. }
         | DaemonRequestPayload::DeleteMarkdown(_) => Duration::from_secs(15 * 60),
         DaemonRequestPayload::Ping
         | DaemonRequestPayload::ListCorpora
@@ -293,6 +288,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, BufReader};
 
     #[tokio::test]
     async fn client_for_with_explicit_socket_never_respawns() {
@@ -316,19 +312,11 @@ mod tests {
         );
     }
 
-    // ── sibling probe before spawn (#218) ─────────────────────────────
-
     #[tokio::test]
-    async fn connect_or_spawn_prefers_live_sibling_over_spawning() {
-        // The core #218 regression: clients that disagree with each other
-        // on `XDG_RUNTIME_DIR` resolve different primary socket paths. If
-        // the primary is dead but a daemon already answers at the sibling
-        // candidate, the client must adopt it instead of spawning a second
-        // resident daemon (doubled ONNX/LanceDB memory).
+    async fn connect_or_spawn_prefers_live_socket_over_spawning() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let primary = tmp.path().join("primary.sock");
-        let sibling = tmp.path().join("sibling.sock");
-        let listener = tokio::net::UnixListener::bind(&sibling).expect("bind sibling");
+        let socket = tmp.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
@@ -340,59 +328,33 @@ mod tests {
 
         let respawn_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&respawn_calls);
-        let client = connect_or_spawn(&primary, Some(&sibling), || {
+        let client = connect_or_spawn(&socket, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async { anyhow::Ok(()) }
         })
         .await
-        .expect("must connect to the live sibling instead of spawning");
+        .expect("must connect to the live socket instead of spawning");
 
-        assert_eq!(client.socket_path(), sibling.as_path());
+        assert_eq!(client.socket_path(), socket.as_path());
         assert_eq!(
             respawn_calls.load(Ordering::SeqCst),
             0,
-            "must not spawn a daemon when a sibling already answers",
+            "must not spawn a daemon when the socket already answers",
         );
     }
 
     #[tokio::test]
-    async fn connect_or_spawn_spawns_when_no_sibling_candidate() {
-        // Mirrors `HALLOUMINATE_SOCKET` being set: `sibling_socket_path()`
-        // returns `None` (see `socket::tests`), so `connect_or_spawn` must
-        // fall straight through to `respawn`, exactly as before the sibling
-        // probe was added — no sibling probing on an explicit override.
+    async fn connect_or_spawn_spawns_once_when_socket_is_dead() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let primary = tmp.path().join("primary.sock");
+        let socket = tmp.path().join("daemon.sock");
         let respawn_calls = Arc::new(AtomicUsize::new(0));
         let calls = Arc::clone(&respawn_calls);
-        let result = connect_or_spawn(&primary, None, || {
+        let result = connect_or_spawn(&socket, || {
             calls.fetch_add(1, Ordering::SeqCst);
             async { anyhow::Ok(()) }
         })
         .await;
         result.expect_err("a still-missing socket after respawn must fail");
-        assert_eq!(
-            respawn_calls.load(Ordering::SeqCst),
-            1,
-            "must respawn when there is no sibling candidate to try",
-        );
-    }
-
-    #[tokio::test]
-    async fn connect_or_spawn_spawns_when_sibling_also_dead() {
-        // A sibling candidate that isn't actually live (no listener bound)
-        // must not block the fallback to `respawn`.
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let primary = tmp.path().join("primary.sock");
-        let sibling = tmp.path().join("sibling.sock");
-        let respawn_calls = Arc::new(AtomicUsize::new(0));
-        let calls = Arc::clone(&respawn_calls);
-        let result = connect_or_spawn(&primary, Some(&sibling), || {
-            calls.fetch_add(1, Ordering::SeqCst);
-            async { anyhow::Ok(()) }
-        })
-        .await;
-        result.expect_err("both candidates dead must still fail");
         assert_eq!(respawn_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -482,6 +444,10 @@ mod tests {
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
+                match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
             })),
             ground_class,
         );
@@ -491,6 +457,7 @@ mod tests {
                 corpus: None,
                 paths_from: None,
                 strict: false,
+                background: false,
             })),
             mutation_class,
         );
@@ -583,5 +550,227 @@ mod tests {
             err.downcast_ref::<DaemonRpcError>().is_none(),
             "transport EOF must not be classified retryable: {err:#}",
         );
+    }
+
+    use super::super::framing::MAX_IPC_LINE_BYTES;
+
+    fn ping_request() -> DaemonRequest {
+        DaemonRequest {
+            cwd: PathBuf::from("."),
+            payload: DaemonRequestPayload::Ping,
+        }
+    }
+
+    enum LineEnding {
+        Lf,
+        Eof,
+    }
+
+    fn response_bytes(total_bytes: usize, ending: LineEnding) -> Vec<u8> {
+        let empty = serde_json::to_vec(&DaemonResponse::Ok {
+            result: serde_json::Value::String(String::new()),
+        })
+        .expect("serialize empty response");
+        let newline_bytes = match ending {
+            LineEnding::Lf => 1,
+            LineEnding::Eof => 0,
+        };
+        let payload_bytes = total_bytes
+            .checked_sub(empty.len() + newline_bytes)
+            .expect("response size must fit JSON envelope");
+        let mut bytes = serde_json::to_vec(&DaemonResponse::Ok {
+            result: serde_json::Value::String("a".repeat(payload_bytes)),
+        })
+        .expect("serialize response");
+        match ending {
+            LineEnding::Lf => bytes.push(b'\n'),
+            LineEnding::Eof => {}
+        }
+        assert_eq!(bytes.len(), total_bytes);
+        bytes
+    }
+
+    async fn call_with_response(bytes: Vec<u8>) -> anyhow::Result<DaemonResponse> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("response.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (probe, _) = listener.accept().await.expect("accept probe");
+            drop(probe);
+            let (stream, _) = listener.accept().await.expect("accept request");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.expect("read request");
+            let _ = write_half.write_all(&bytes).await;
+        });
+        let client = connect_at(&socket).await.expect("connect client");
+        let result = client.call_raw(ping_request()).await;
+        server.await.expect("response server");
+        result
+    }
+
+    #[tokio::test]
+    async fn response_below_byte_cap_is_accepted() {
+        let bytes = response_bytes(MAX_IPC_LINE_BYTES - 1, LineEnding::Lf);
+        call_with_response(bytes)
+            .await
+            .expect("response below cap must decode");
+    }
+
+    #[tokio::test]
+    async fn response_at_newline_inclusive_byte_cap_is_accepted() {
+        let bytes = response_bytes(MAX_IPC_LINE_BYTES, LineEnding::Lf);
+        call_with_response(bytes)
+            .await
+            .expect("response at cap must decode");
+    }
+
+    #[tokio::test]
+    async fn response_above_newline_inclusive_byte_cap_is_rejected() {
+        let bytes = response_bytes(MAX_IPC_LINE_BYTES + 1, LineEnding::Lf);
+        let error = call_with_response(bytes)
+            .await
+            .expect_err("response above cap must fail");
+        assert!(error.to_string().contains("max line length exceeded"));
+    }
+
+    #[tokio::test]
+    async fn response_without_lf_is_decoded_at_eof() {
+        let bytes = response_bytes(128, LineEnding::Eof);
+        call_with_response(bytes)
+            .await
+            .expect("complete response at EOF must decode");
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_response_is_rejected() {
+        let error = call_with_response(vec![0xff, b'\n'])
+            .await
+            .expect_err("invalid UTF-8 must fail");
+        assert!(error.to_string().contains("Unable to decode input as UTF8"));
+    }
+
+    #[tokio::test]
+    async fn empty_response_is_rejected_as_transport_eof() {
+        let error = call_with_response(Vec::new())
+            .await
+            .expect_err("empty response must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("closed the connection before responding")
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_response_is_rejected_as_invalid_json() {
+        let error = call_with_response(br#"{"Ok":"#.to_vec())
+            .await
+            .expect_err("truncated response must fail");
+        assert!(error.to_string().contains("invalid daemon response"));
+    }
+
+    fn markdown_batch_request(content: String) -> DaemonRequest {
+        DaemonRequest {
+            cwd: PathBuf::from("/"),
+            payload: DaemonRequestPayload::AddMarkdownBatch {
+                corpus: "wiki".into(),
+                items: vec![crate::ipc::AddMarkdownItem {
+                    path: "once.md".into(),
+                    content,
+                    overwrite: false,
+                    under_heading: None,
+                    position: crate::ipc::Position::default(),
+                    replace_lines: None,
+                    replace_match: None,
+                }],
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn markdown_batch_frame_limit_includes_the_newline_before_connect() {
+        let base = serde_json::to_vec(&markdown_batch_request(String::new()))
+            .expect("serialize")
+            .len();
+        let request = markdown_batch_request(" ".repeat(MAX_IPC_LINE_BYTES - base - 1));
+        assert_eq!(
+            serde_json::to_vec(&request).expect("serialize").len() + 1,
+            MAX_IPC_LINE_BYTES
+        );
+        let tmp = tempfile::tempdir().expect("temp");
+        let socket = tmp.path().join("frame.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read, mut write) = stream.into_split();
+            let mut lines = ipc_lines(read);
+            let line = lines.next().await.expect("line").expect("valid frame");
+            assert_eq!(line.len() + 1, MAX_IPC_LINE_BYTES);
+            write
+                .write_all(b"{\"status\":\"ok\",\"result\":\"accepted\"}\n")
+                .await
+                .expect("response");
+        });
+        let client = DaemonClient { socket };
+        let response = client.call_raw(request).await.expect("exact cap accepted");
+        let DaemonResponse::Ok { result } = response else {
+            panic!("cap rejected");
+        };
+        assert_eq!(result, "accepted");
+        server.await.expect("server");
+
+        let request = markdown_batch_request(" ".repeat(MAX_IPC_LINE_BYTES - base));
+        let client = DaemonClient {
+            socket: tmp.path().join("missing.sock"),
+        };
+        let error = client
+            .call_raw(request)
+            .await
+            .expect_err("one byte over cap");
+        let error = error
+            .downcast_ref::<DaemonRpcError>()
+            .expect("input error before connection");
+        assert_eq!(error.kind, ErrorKind::InvalidParams);
+        assert!(error.message.contains("4 MiB"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn markdown_batch_timeout_reports_uncertainty_without_replay() {
+        let tmp = tempfile::tempdir().expect("temp");
+        let socket = tmp.path().join("timeout.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut lines = ipc_lines(stream);
+            let line = lines.next().await.expect("request").expect("frame");
+            let request: DaemonRequest = serde_json::from_str(&line).expect("request");
+            assert_eq!(timeout_for(&request.payload), Duration::from_secs(15 * 60));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "no replay"
+            );
+        });
+        let client = DaemonClient { socket };
+        let error = client
+            .call_raw_with_timeout(
+                markdown_batch_request(String::new()),
+                Duration::from_millis(50),
+            )
+            .await
+            .expect_err("timeout");
+        let error = error
+            .downcast_ref::<DaemonRpcError>()
+            .expect("typed timeout");
+        assert_eq!(error.kind, ErrorKind::Retryable);
+        assert!(
+            error.message.contains("completion is uncertain"),
+            "{}",
+            error.message
+        );
+        server.await.expect("server");
     }
 }

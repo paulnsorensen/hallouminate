@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use agent_bench::provenance::{RunMeta, fingerprint};
+
 use agent_bench::{
     Arm, GradeRecord, Manifest, ModelIds, PromptRef, Question, QuestionSet, QuestionTag,
     SessionRecord, TokenUsage,
@@ -32,39 +34,43 @@ fn write_manifest(dir: &Path, judge_model: &str) -> PathBuf {
             path: PathBuf::from(RUBRIC_RELATIVE_PATH),
             blake3: agent_bench::blake3_file_hash(&rubric_path).unwrap(),
         }],
-        question_set_hash: String::new(),
+        question_set_hash: agent_bench::blake3_file_hash(&dir.join("questions.json")).unwrap(),
         container_image_refs: Vec::new(),
         results_dir: dir.join("results"),
         checkout_root: dir.join("checkouts"),
     };
     let path = dir.join("manifest.toml");
     fs::write(&path, toml::to_string(&manifest).unwrap()).unwrap();
+    let fake = dir.join("fake-claude.sh");
+    if fake.is_file() {
+        bind_session_fixture(dir, &fake);
+    }
     path
 }
-
-/// The version probe every fake judge answers before its own body runs.
-/// `bench-judge` verifies the CLI against `manifest.claude_code_version`
-/// before grading anything, and a version probe is not a grading
-/// invocation, so it must not reach the body (which counts invocations and
-/// consumes stdin). `FAKE_CLI_VERSION` overrides the reported version so a
-/// test can drive the drift abort.
-const FAKE_JUDGE_VERSION_PROBE: &str = r#"if [ "$1" = "--version" ]; then
-  printf '%s\n' "${FAKE_CLI_VERSION:-0.0.0-test} (Claude Code)"
-  exit 0
-fi"#;
 
 /// Write an executable `#!/bin/sh` fake judge script.
 fn write_fake_judge(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    fs::write(
-        &path,
-        format!("#!/bin/sh\n{FAKE_JUDGE_VERSION_PROBE}\n{body}\n"),
-    )
-    .unwrap();
+    fs::write(&path, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"${{FAKE_CLI_VERSION:-0.0.0-test}} (Claude Code)\"; exit 0; fi\n{body}\n")).unwrap();
     let mut perms = fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms).unwrap();
+    if dir.join("manifest.toml").is_file() {
+        bind_session_fixture(dir, &path);
+    }
     path
+}
+
+fn bind_session_fixture(dir: &Path, fake: &Path) {
+    let manifest: Manifest = agent_bench::load_toml(&dir.join("manifest.toml")).unwrap();
+    let sessions = dir.join("sessions.jsonl");
+    RunMeta {
+        manifest_hash: fingerprint(&manifest).unwrap(),
+        measurement_hash: "synthetic-measurement".to_string(),
+        agent_hash: agent_bench::blake3_file_hash(fake).unwrap(),
+    }
+    .initialize(&sessions)
+    .unwrap();
 }
 
 fn write_question_set(dir: &Path, questions: &[Question]) -> PathBuf {
@@ -276,6 +282,44 @@ fn unparseable_judge_reply_is_a_hard_error_naming_the_value_and_writes_nothing()
         !out_path.exists(),
         "grades.jsonl should not exist after a hard error"
     );
+}
+
+#[test]
+fn failed_session_does_not_invoke_the_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions_path =
+        write_question_set(dir.path(), &[sample_question("q1", QuestionTag::Greppable)]);
+    let mut failed = sample_session("q1", Arm::Wiki, 0, "MCP startup failed");
+    failed.exit_status = 3;
+    let sessions_path = write_sessions(dir.path(), &[failed]);
+    let out_path = dir.path().join("grades.jsonl");
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        "if [ \"$1\" = --version ]; then echo '0.0.0-test (Claude Code)'; exit 0; fi\nexit 99",
+    );
+
+    let output = Command::new(bin_path())
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+        .arg("--sessions")
+        .arg(sessions_path)
+        .arg("--questions")
+        .arg(questions_path)
+        .arg("--out")
+        .arg(&out_path)
+        .arg("--manifest")
+        .arg(manifest_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let grades: Vec<GradeRecord> = agent_bench::read_jsonl(&out_path).unwrap();
+    assert!(grades.is_empty());
 }
 
 #[test]
@@ -610,6 +654,33 @@ fn judge_agent_cli_version_mismatch_aborts_before_grading_anything() {
         stderr.contains("0.0.0-test") && stderr.contains("9.9.9"),
         "stderr must name both the pinned and the actual version: {stderr}"
     );
+}
+
+#[test]
+fn calibration_rejects_nonfinite_min_kappa_before_grading() {
+    let dir = tempfile::tempdir().unwrap();
+    for threshold in ["NaN", "inf", "-inf"] {
+        let out = dir.path().join("grades.jsonl");
+        let output = Command::new(bin_path())
+            .arg("--sessions")
+            .arg(dir.path().join("missing-sessions.jsonl"))
+            .arg("--questions")
+            .arg(dir.path().join("missing-questions.json"))
+            .arg("--out")
+            .arg(&out)
+            .arg("--manifest")
+            .arg(dir.path().join("missing-manifest.toml"))
+            .arg("--calibrate")
+            .arg(dir.path().join("missing-labels.jsonl"))
+            .arg(format!("--min-kappa={threshold}"))
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "accepted {threshold}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("minimum kappa must be finite"), "{stderr}");
+        assert!(!out.exists());
+    }
 }
 
 #[test]

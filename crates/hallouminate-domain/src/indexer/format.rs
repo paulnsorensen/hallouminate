@@ -16,14 +16,16 @@ use std::path::Path;
 
 use calamine::{Data, Reader, open_workbook_auto_from_rs};
 use file_format::FileFormat;
+use pdf_extract::{Document, PlainTextOutput, output_doc_page};
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use text_splitter::{ChunkConfig, ChunkSizer, TextSplitter};
 
-use super::chunk::{PreparedChunk, PreparedFile};
+use super::chunk::{ChunkStructure, PreparedChunk, PreparedFile};
 use crate::common::{CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::{
-    ClaimMark, CorpusChunker, Frontmatter, build_line_starts, byte_to_line, extract_claim_marks,
-    extract_keywords, extract_summary, marks_to_canonical_json, split_frontmatter,
-    strip_claim_marks,
+    Chunk, ClaimMark, CorpusChunker, Frontmatter, INDEX_END_MARKER, INDEX_START_MARKER,
+    build_line_starts, byte_to_line, extract_claim_marks, extract_keywords, extract_summary,
+    marks_to_canonical_json, split_frontmatter, strip_claim_marks,
 };
 use crate::footnotes::{FootnoteMode, apply_footnote_mode};
 
@@ -35,20 +37,167 @@ fn build_search_text(heading_path: &[String], summary: &str, text: &str) -> Stri
     format!("{breadcrumb}\n{summary}\n{body}")
 }
 
-/// The set of formats Phase 1 can ingest. Extended in later phases (PDF,
-/// office-prose, code-aware).
+fn build_record_search_text(heading_path: &[String], text: &str) -> String {
+    let breadcrumb = heading_path.join(" > ");
+    let body = apply_footnote_mode(text, FootnoteMode::Exclude);
+    format!("{breadcrumb}\n{body}")
+}
+
+fn markdown_structures(content: &str, chunks: &[Chunk]) -> Vec<ChunkStructure> {
+    let line_starts = build_line_starts(content);
+    let lines: Vec<&str> = content.lines().collect();
+    let mut heading_lines = vec![false; lines.len() + 1];
+    let mut events = Vec::new();
+    let mut stack: [Option<String>; 6] = Default::default();
+    let mut title = None;
+    let mut markers = Vec::new();
+    let mut parser = Parser::new(content).into_offset_iter();
+    while let Some((event, range)) = parser.next() {
+        if let Event::Html(html) = &event {
+            let marker = html.trim();
+            if marker == INDEX_START_MARKER || marker == INDEX_END_MARKER {
+                markers.push((
+                    byte_to_line(range.start, &line_starts),
+                    marker == INDEX_START_MARKER,
+                ));
+            }
+        }
+        let Event::Start(Tag::Heading { level, .. }) = event else {
+            continue;
+        };
+        let level = match level {
+            HeadingLevel::H1 => 1,
+            HeadingLevel::H2 => 2,
+            HeadingLevel::H3 => 3,
+            HeadingLevel::H4 => 4,
+            HeadingLevel::H5 => 5,
+            HeadingLevel::H6 => 6,
+        };
+        let mut text = String::new();
+        let mut heading_end = range.end;
+        for (event, range) in parser.by_ref() {
+            heading_end = range.end;
+            if let Event::End(TagEnd::Heading(_)) = event {
+                break;
+            }
+            if let Event::SoftBreak | Event::HardBreak = event {
+                text.push(' ');
+            }
+            if let Event::Text(part) | Event::Code(part) = event {
+                text.push_str(&part);
+            }
+        }
+        let text = text.trim().to_string();
+        if level == 1 && title.is_none() && !text.is_empty() {
+            title = Some(text.clone());
+        }
+        for slot in &mut stack[level - 1..] {
+            *slot = None;
+        }
+        stack[level - 1] = Some(text);
+        let line = byte_to_line(range.start, &line_starts);
+        let end_line = byte_to_line(heading_end.saturating_sub(1), &line_starts);
+        for heading_line in &mut heading_lines[line..=end_line] {
+            *heading_line = true;
+        }
+        let mut active = Vec::new();
+        for (index, text) in stack.iter().enumerate() {
+            if let Some(text) = text {
+                active.push(((index + 1) as u8, text.clone()));
+            }
+        }
+        events.push((line, active));
+    }
+    let mut generated_lines = vec![false; lines.len() + 1];
+    let mut marker_lines = vec![false; lines.len() + 1];
+    let mut start = None;
+    let mut valid_markers = true;
+    for (line, is_start) in markers {
+        marker_lines[line] = true;
+        if is_start {
+            if start.replace(line).is_some() {
+                valid_markers = false;
+            }
+        } else {
+            let Some(start_line) = start.take() else {
+                valid_markers = false;
+                continue;
+            };
+            for generated in &mut generated_lines[start_line + 1..line] {
+                *generated = true;
+            }
+        }
+    }
+    if start.is_some() || !valid_markers {
+        generated_lines.fill(false);
+    }
+    let mut document_generated = false;
+    let mut document_authored = false;
+    for line in 1..=lines.len() {
+        if marker_lines[line] || lines[line - 1].trim().is_empty() {
+            continue;
+        }
+        if generated_lines[line] {
+            document_generated = true;
+        } else if !heading_lines[line] {
+            document_authored = true;
+        }
+    }
+    let generated_only_document = document_generated && !document_authored;
+    let mut structures = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let mut headings = Vec::new();
+        for (line, active) in &events {
+            if *line <= chunk.line_start {
+                headings = active.clone();
+            } else if *line <= chunk.line_end {
+                if let Some(heading) = active.last()
+                    && !headings.contains(heading)
+                {
+                    headings.push(heading.clone());
+                }
+            } else {
+                break;
+            }
+        }
+        let mut generated = false;
+        let mut authored = false;
+        for line in chunk.line_start..=chunk.line_end.min(lines.len()) {
+            if marker_lines[line] || lines[line - 1].trim().is_empty() {
+                continue;
+            }
+            if generated_lines[line] {
+                generated = true;
+            } else if !heading_lines[line] {
+                authored = true;
+            }
+        }
+        structures.push(ChunkStructure {
+            title: title.clone(),
+            headings,
+            generated_navigation: generated_only_document || (generated && !authored),
+        });
+    }
+    structures
+}
+
+/// The set of formats the indexer can ingest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Markdown,
     PlainText,
+    Rst,
     Spreadsheet,
+    Pdf,
+    Json,
+    Jsonl,
 }
 
 /// Resolve a file's [`Format`] from its extension first, falling back to a
 /// magic-byte sniff for extensionless names only (a known-but-unsupported
 /// extension returns `None`, never a sniff).
 ///
-/// Returns `None` for any type Phase 1 does not handle — the caller logs a
+/// Returns `None` for any type the registry does not handle — the caller logs a
 /// warning and skips the file.
 pub fn detect_format(path: &Path, bytes: &[u8]) -> Option<Format> {
     match format_from_extension(path) {
@@ -70,8 +219,12 @@ pub fn format_from_extension(path: &Path) -> Option<Option<Format>> {
     let ext = path.extension().and_then(|e| e.to_str())?;
     Some(match ext.to_ascii_lowercase().as_str() {
         "md" | "markdown" => Some(Format::Markdown),
-        "txt" | "text" => Some(Format::PlainText),
+        "txt" | "text" | "adoc" | "asciidoc" | "org" => Some(Format::PlainText),
+        "rst" => Some(Format::Rst),
         "csv" | "xlsx" | "xls" | "ods" => Some(Format::Spreadsheet),
+        "pdf" => Some(Format::Pdf),
+        "json" => Some(Format::Json),
+        "jsonl" => Some(Format::Jsonl),
         // A known-but-unsupported extension is decisive: do NOT fall through
         // to a magic-byte sniff that might mislabel it (e.g. a `.docx` is a
         // ZIP and could be mistaken for a spreadsheet container).
@@ -80,19 +233,21 @@ pub fn format_from_extension(path: &Path) -> Option<Option<Format>> {
 }
 
 /// Magic-byte fallback for inputs with no usable extension. Maps `file-format`'s
-/// content sniff onto the Phase 1 set; everything else is unsupported.
+/// content sniff onto the supported set; everything else is unsupported.
 ///
 /// `file-format` 0.29 detects the binary spreadsheet containers (OOXML xlsx,
-/// OLE2 xls, ODF ods) by magic bytes but has **no CSV variant** — CSV is a plain
-/// text shape with no signature, so an extensionless CSV sniffs as `PlainText`
-/// and routes to the text handler. Markdown likewise has no variant and sniffs
-/// as `PlainText`. Both are acceptable: extensionful files never reach here.
+/// OLE2 xls, ODF ods) and PDF by magic bytes but has **no CSV variant** — CSV
+/// is a plain text shape with no signature, so an extensionless CSV sniffs as
+/// `PlainText` and routes to the text handler. Markdown likewise has no variant
+/// and sniffs as `PlainText`. Both are acceptable: extensionful files never
+/// reach here.
 fn detect_by_magic(bytes: &[u8]) -> Option<Format> {
     match FileFormat::from_bytes(bytes) {
         FileFormat::OfficeOpenXmlSpreadsheet
         | FileFormat::MicrosoftExcelSpreadsheet
         | FileFormat::OpendocumentSpreadsheet => Some(Format::Spreadsheet),
         FileFormat::PlainText => Some(Format::PlainText),
+        FileFormat::PortableDocumentFormat => Some(Format::Pdf),
         _ => None,
     }
 }
@@ -142,6 +297,7 @@ impl FormatHandler for MarkdownHandler {
         // back to each chunk's line numbers so citations point at on-disk lines.
         let (frontmatter, content, fm_lines) = split_frontmatter(body);
         let chunks_raw = self.chunker.chunk_text(content);
+        let structures = markdown_structures(content, &chunks_raw);
         // Claim marks are parsed once on the (frontmatter-stripped) body; their
         // lines are body-relative, matching the chunker's body-relative chunk
         // line ranges. Each mark is bucketed into exactly one chunk below.
@@ -186,6 +342,7 @@ impl FormatHandler for MarkdownHandler {
                 .collect();
             let text = strip_claim_marks(&c.text);
             let search_text = build_search_text(&c.heading_path, &summary, &text);
+            let structure = Some(structures[c.ord].clone());
             chunks.push(PreparedChunk {
                 ord: c.ord,
                 heading_path: c.heading_path,
@@ -194,6 +351,8 @@ impl FormatHandler for MarkdownHandler {
                 text,
                 search_text,
                 claim_marks: marks_to_canonical_json(&chunk_marks),
+                structure,
+                overlap_bytes: 0,
             });
         }
         Ok(PreparedFile {
@@ -204,6 +363,63 @@ impl FormatHandler for MarkdownHandler {
             summary,
             keywords,
             frontmatter: frontmatter.as_ref().map(Frontmatter::to_canonical_json),
+            indexed_at_ms: ctx.indexed_at_ms,
+            chunks,
+        })
+    }
+}
+
+// ── reStructuredText ──────────────────────────────────────
+
+/// reStructuredText handler: breadcrumb-bearing chunks from an [`RstChunker`]
+/// with the same summary/keyword/search-text metadata as plain text. RST has
+/// no frontmatter or claim-mark conventions, so neither is parsed here.
+pub struct RstHandler {
+    chunker: Box<dyn CorpusChunker>,
+}
+
+impl RstHandler {
+    pub fn new(chunker: Box<dyn CorpusChunker>) -> Self {
+        Self { chunker }
+    }
+}
+
+impl FormatHandler for RstHandler {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
+            HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
+        })?;
+        let fallback = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let summary = extract_summary(body, &fallback);
+        let keywords = extract_keywords(body);
+        let chunks_raw = self.chunker.chunk_text(body);
+        let mut chunks: Vec<PreparedChunk> = Vec::with_capacity(chunks_raw.len());
+        for c in chunks_raw {
+            let search_text = build_search_text(&c.heading_path, &summary, &c.text);
+            chunks.push(PreparedChunk {
+                ord: c.ord,
+                heading_path: c.heading_path,
+                line_start: c.line_start,
+                line_end: c.line_end,
+                text: c.text,
+                search_text,
+                claim_marks: None,
+                structure: None,
+                overlap_bytes: 0,
+            });
+        }
+        Ok(PreparedFile {
+            file_ref: file_ref_string(ctx.file)?,
+            corpus_key: ctx.corpus_key.clone(),
+            mtime_ms: ctx.mtime.0,
+            content_hash: ctx.content_hash.clone(),
+            summary,
+            keywords,
+            frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
         })
@@ -225,10 +441,31 @@ pub struct TextHandler<S: ChunkSizer> {
 
 impl<S: ChunkSizer> TextHandler<S> {
     pub fn new(sizer: S, budget_tokens: usize) -> Self {
-        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
         Self {
-            splitter: TextSplitter::new(config),
+            splitter: overlapping_splitter(sizer, budget_tokens),
         }
+    }
+
+    fn prepare_body(&self, ctx: &PrepareCtx<'_>, body: &str) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let fallback = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let summary = extract_summary(body, &fallback);
+        let mut chunks: Vec<PreparedChunk> = Vec::new();
+        split_into_chunks(&self.splitter, body, &[], &summary, &mut chunks);
+        Ok(PreparedFile {
+            file_ref: file_ref_string(ctx.file)?,
+            corpus_key: ctx.corpus_key.clone(),
+            mtime_ms: ctx.mtime.0,
+            content_hash: ctx.content_hash.clone(),
+            summary,
+            keywords: extract_keywords(body),
+            frontmatter: None,
+            indexed_at_ms: ctx.indexed_at_ms,
+            chunks,
+        })
     }
 }
 
@@ -238,34 +475,79 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
         let body = std::str::from_utf8(ctx.bytes).map_err(|e| {
             HallouminateError::Indexer(format!("non-utf8 file {}: {e}", path.display()))
         })?;
+        self.prepare_body(ctx, body)
+    }
+}
+
+/// JSON handler: validate the document, then preserve its original UTF-8 text.
+pub struct JsonHandler<S: ChunkSizer> {
+    text: TextHandler<S>,
+}
+
+impl<S: ChunkSizer> JsonHandler<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        Self {
+            text: TextHandler::new(sizer, budget_tokens),
+        }
+    }
+}
+
+impl<S: ChunkSizer + Send + Sync> FormatHandler for JsonHandler<S> {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let body = std::str::from_utf8(ctx.bytes).map_err(|error| {
+            HallouminateError::Indexer(format!("non-utf8 file {}: {error}", path.display()))
+        })?;
+        serde_json::from_str::<serde_json::Value>(body)
+            .map_err(|error| extract_err(path, &error))?;
+        self.text.prepare_body(ctx, body)
+    }
+}
+
+/// JSON Lines handler: validate each nonblank record and retain its line.
+pub struct JsonlHandler<S: ChunkSizer> {
+    splitter: TextSplitter<S>,
+}
+
+impl<S: ChunkSizer> JsonlHandler<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
+        Self {
+            splitter: TextSplitter::new(config),
+        }
+    }
+}
+
+impl<S: ChunkSizer + Send + Sync> FormatHandler for JsonlHandler<S> {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let body = std::str::from_utf8(ctx.bytes).map_err(|error| {
+            HallouminateError::Indexer(format!("non-utf8 file {}: {error}", path.display()))
+        })?;
         let fallback = path
             .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
+            .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
         let summary = extract_summary(body, &fallback);
-        let line_starts = build_line_starts(body);
-        let mut chunks: Vec<PreparedChunk> = Vec::new();
-        for (byte_off, slice) in self.splitter.chunk_indices(body) {
-            if slice.is_empty() {
+        let mut chunks = Vec::new();
+        let mut ordinal = 0;
+        for (line_index, line) in body.split('\n').enumerate() {
+            let physical_line = line_index + 1;
+            let record = line.strip_suffix('\r').unwrap_or(line);
+            if record.trim().is_empty() {
                 continue;
             }
-            let line_start = byte_to_line(byte_off, &line_starts);
-            let end_byte = byte_off + slice.len();
-            let line_end = if end_byte == 0 {
-                line_start
-            } else {
-                byte_to_line(end_byte - 1, &line_starts)
-            };
-            let heading_path = Vec::new();
-            chunks.push(PreparedChunk {
-                ord: chunks.len(),
-                search_text: build_search_text(&heading_path, &summary, slice),
-                heading_path,
-                line_start,
-                line_end,
-                text: slice.to_string(),
-                claim_marks: None,
-            });
+            serde_json::from_str::<serde_json::Value>(record)
+                .map_err(|error| extract_err(path, &error))?;
+            ordinal += 1;
+            let heading_path = vec![format!("jsonl:row-{ordinal}")];
+            split_record_into_chunks(
+                &self.splitter,
+                record,
+                &heading_path,
+                physical_line,
+                &mut chunks,
+            );
         }
         Ok(PreparedFile {
             file_ref: file_ref_string(ctx.file)?,
@@ -274,6 +556,182 @@ impl<S: ChunkSizer + Send + Sync> FormatHandler for TextHandler<S> {
             content_hash: ctx.content_hash.clone(),
             summary,
             keywords: extract_keywords(body),
+            frontmatter: None,
+            indexed_at_ms: ctx.indexed_at_ms,
+            chunks,
+        })
+    }
+}
+
+fn split_record_into_chunks<S: ChunkSizer>(
+    splitter: &TextSplitter<S>,
+    text: &str,
+    heading_path: &[String],
+    physical_line: usize,
+    chunks: &mut Vec<PreparedChunk>,
+) {
+    for (_, slice) in splitter.chunk_indices(text) {
+        if slice.is_empty() {
+            continue;
+        }
+        chunks.push(PreparedChunk {
+            ord: chunks.len(),
+            search_text: build_record_search_text(heading_path, slice),
+            heading_path: heading_path.to_vec(),
+            line_start: physical_line,
+            line_end: physical_line,
+            text: slice.to_string(),
+            claim_marks: None,
+            structure: None,
+            overlap_bytes: 0,
+        });
+    }
+}
+
+/// Share of the chunk budget that consecutive plain-text, JSON, and PDF chunks
+/// repeat, as a divisor: 8 gives 12.5 percent. A phrase that crosses a split
+/// point and is shorter than the overlap lies whole in one of the two chunks.
+const CHUNK_OVERLAP_DIVISOR: usize = 8;
+
+/// Builds a splitter whose consecutive chunks repeat
+/// `budget_tokens / CHUNK_OVERLAP_DIVISOR` tokens. A budget too small for a
+/// non-zero overlap gets a splitter with no overlap.
+fn overlapping_splitter<S: ChunkSizer>(sizer: S, budget_tokens: usize) -> TextSplitter<S> {
+    let config = ChunkConfig::new(budget_tokens)
+        .with_overlap(budget_tokens / CHUNK_OVERLAP_DIVISOR)
+        .unwrap_or_else(|_| ChunkConfig::new(budget_tokens));
+    TextSplitter::new(config.with_sizer(sizer))
+}
+
+/// Splits `text` with `splitter`, pushing one [`PreparedChunk`] per non-empty
+/// piece. Shared by [`TextHandler`] (whole document, empty `heading_path`) and
+/// [`PdfHandler`] (called once per page, so line numbers stay page-local).
+/// Each chunk records how many of its leading bytes an earlier chunk from the
+/// same call already holds.
+fn split_into_chunks<S: ChunkSizer>(
+    splitter: &TextSplitter<S>,
+    text: &str,
+    heading_path: &[String],
+    summary: &str,
+    chunks: &mut Vec<PreparedChunk>,
+) {
+    let line_starts = build_line_starts(text);
+    let mut covered_end: usize = 0;
+    for (byte_off, slice) in splitter.chunk_indices(text) {
+        if slice.is_empty() {
+            continue;
+        }
+        let slice_end = byte_off + slice.len();
+        let overlap_bytes = covered_end.saturating_sub(byte_off).min(slice.len());
+        covered_end = covered_end.max(slice_end);
+        let line_start = byte_to_line(byte_off, &line_starts);
+        let line_end = byte_to_line(slice_end - 1, &line_starts);
+        chunks.push(PreparedChunk {
+            ord: chunks.len(),
+            search_text: build_search_text(heading_path, summary, slice),
+            heading_path: heading_path.to_vec(),
+            line_start,
+            line_end,
+            text: slice.to_string(),
+            claim_marks: None,
+            structure: None,
+            overlap_bytes,
+        });
+    }
+}
+
+// ── PDF ───────────────────────────────────────────────────────────────────
+
+// `pdf_extract`'s own `extract_text_from_mem_by_pages` iterator treats a
+// later-page decode error as end-of-document rather than propagating it, so
+// this explicit per-page loop with `?` is deliberate: any page's failure must
+// fail the whole file. `output_doc_page` re-walks the page tree on each call,
+// which is negligible at document scale.
+fn extract_pdf_pages(path: &Path, bytes: &[u8]) -> Result<Vec<String>> {
+    let doc = Document::load_mem(bytes).map_err(|error| extract_err(path, &error))?;
+    if doc.is_encrypted() {
+        return Err(extract_err(
+            path,
+            &"encrypted PDF documents are not supported",
+        ));
+    }
+
+    let mut pages = Vec::new();
+    for page_num in doc.get_pages().keys().copied() {
+        let mut page = String::new();
+        let mut output = PlainTextOutput::new(&mut page);
+        output_doc_page(&doc, &mut output, page_num).map_err(|error| extract_err(path, &error))?;
+        pages.push(page);
+    }
+    Ok(pages)
+}
+
+/// Prefix of the one-element breadcrumb that marks a PDF chunk's page, as in
+/// `page:3`. `ground` groups and counts pages by this breadcrumb.
+pub const PAGE_BREADCRUMB_PREFIX: &str = "page:";
+/// Text-layer PDF handler: split each extracted page independently with the
+/// configured text splitter and retain page-local line ranges. Empty pages are
+/// skipped, while a wholly empty document is an extraction failure.
+pub struct PdfHandler<S: ChunkSizer> {
+    splitter: TextSplitter<S>,
+}
+
+impl<S: ChunkSizer> PdfHandler<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        Self {
+            splitter: overlapping_splitter(sizer, budget_tokens),
+        }
+    }
+}
+
+impl<S: ChunkSizer + Send + Sync> FormatHandler for PdfHandler<S> {
+    fn prepare(&self, ctx: &PrepareCtx<'_>) -> Result<PreparedFile> {
+        let path = ctx.file.as_path();
+        let pages = extract_pdf_pages(path, ctx.bytes)?;
+        let mut empty_pages = Vec::new();
+        let mut text_pages = Vec::new();
+        for (page_idx, page) in pages.iter().enumerate() {
+            if page.trim().is_empty() {
+                empty_pages.push(page_idx + 1);
+            } else {
+                text_pages.push(page_idx);
+            }
+        }
+        if text_pages.is_empty() {
+            return Err(extract_err(
+                path,
+                &"PDF has no extractable text (all pages empty)",
+            ));
+        }
+        if !empty_pages.is_empty() {
+            tracing::warn!(
+                target: "hallouminate::indexer",
+                file = %path.display(),
+                empty_pages = ?empty_pages,
+                "PDF contains empty pages; indexing text-bearing pages only"
+            );
+        }
+
+        let fallback = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let extracted = pages.join("\n");
+        let summary = extract_summary(&extracted, &fallback);
+        let keywords = extract_keywords(&extracted);
+        let mut chunks = Vec::new();
+        for page_idx in text_pages {
+            let page = &pages[page_idx];
+            let heading_path = vec![format!("{PAGE_BREADCRUMB_PREFIX}{}", page_idx + 1)];
+            split_into_chunks(&self.splitter, page, &heading_path, &summary, &mut chunks);
+        }
+        Ok(PreparedFile {
+            file_ref: file_ref_string(ctx.file)?,
+            corpus_key: ctx.corpus_key.clone(),
+            mtime_ms: ctx.mtime.0,
+            content_hash: ctx.content_hash.clone(),
+            summary,
+            keywords,
             frontmatter: None,
             indexed_at_ms: ctx.indexed_at_ms,
             chunks,
@@ -431,6 +889,8 @@ fn push_row_chunk(
         text,
         search_text: String::new(),
         claim_marks: None,
+        structure: None,
+        overlap_bytes: 0,
     });
 }
 
@@ -443,7 +903,7 @@ fn cell_to_string(cell: &Data) -> String {
     }
 }
 
-fn extract_err(path: &Path, e: &dyn std::fmt::Display) -> HallouminateError {
+pub(super) fn extract_err(path: &Path, e: &dyn std::fmt::Display) -> HallouminateError {
     HallouminateError::Indexer(format!("extract {}: {e}", path.display()))
 }
 
@@ -458,14 +918,17 @@ fn extract_err(path: &Path, e: &dyn std::fmt::Display) -> HallouminateError {
 pub struct HandlerRegistry {
     markdown: Box<dyn FormatHandler>,
     text: Box<dyn FormatHandler>,
+    rst: Box<dyn FormatHandler>,
     spreadsheet: Box<dyn FormatHandler>,
+    pdf: Box<dyn FormatHandler>,
+    json: Box<dyn FormatHandler>,
+    jsonl: Box<dyn FormatHandler>,
 }
 
 impl HandlerRegistry {
     /// Build a registry over a single shared sizer (cloned into each text
-    /// splitter). `S: Clone` so the markdown and plain-text splitters can each
-    /// own a copy; production passes a `tokenizers::Tokenizer`, tests pass
-    /// `Characters`.
+    /// splitter). `S: Clone` so each format splitter can own a copy; production
+    /// passes a `tokenizers::Tokenizer`, tests pass `Characters`.
     pub fn new<S>(sizer: S, budget_tokens: usize) -> Self
     where
         S: ChunkSizer + Clone + Send + Sync + 'static,
@@ -473,19 +936,29 @@ impl HandlerRegistry {
         let markdown_chunker: Box<dyn CorpusChunker> = Box::new(
             crate::corpus::MarkdownChunker::new(sizer.clone(), budget_tokens),
         );
+        let rst_chunker: Box<dyn CorpusChunker> =
+            Box::new(crate::corpus::RstChunker::new(sizer.clone(), budget_tokens));
         Self {
             markdown: Box::new(MarkdownHandler::new(markdown_chunker)),
-            text: Box::new(TextHandler::new(sizer, budget_tokens)),
+            rst: Box::new(RstHandler::new(rst_chunker)),
             spreadsheet: Box::new(SpreadsheetHandler),
+            text: Box::new(TextHandler::new(sizer.clone(), budget_tokens)),
+            pdf: Box::new(PdfHandler::new(sizer.clone(), budget_tokens)),
+            json: Box::new(JsonHandler::new(sizer.clone(), budget_tokens)),
+            jsonl: Box::new(JsonlHandler::new(sizer, budget_tokens)),
         }
     }
 
-    /// The handler for a detected format. Total over the Phase 1 set.
+    /// The handler for a detected format. Total over the supported set.
     pub fn handler(&self, format: Format) -> &dyn FormatHandler {
         match format {
             Format::Markdown => self.markdown.as_ref(),
             Format::PlainText => self.text.as_ref(),
+            Format::Rst => self.rst.as_ref(),
             Format::Spreadsheet => self.spreadsheet.as_ref(),
+            Format::Pdf => self.pdf.as_ref(),
+            Format::Json => self.json.as_ref(),
+            Format::Jsonl => self.jsonl.as_ref(),
         }
     }
 }
@@ -505,6 +978,158 @@ mod tests {
                 line_end: text.lines().count().max(1),
                 text: text.to_string(),
             }]
+        }
+    }
+
+    #[test]
+    fn markdown_structure_uses_real_heading_levels_and_full_source_markers() {
+        let content = "## H2 only\n\nAuthored answer.\n<!-- HALLOUMINATE:INDEX-START -->\n- [Nav](./nav.md)\n- [More](./more.md)\n<!-- HALLOUMINATE:INDEX-END -->\nAuthored close.\n";
+        let chunks = vec![
+            Chunk {
+                ord: 0,
+                heading_path: vec!["H2 only".into()],
+                line_start: 1,
+                line_end: 3,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 1,
+                heading_path: vec!["H2 only".into()],
+                line_start: 4,
+                line_end: 5,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 2,
+                heading_path: vec!["H2 only".into()],
+                line_start: 6,
+                line_end: 7,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 3,
+                heading_path: vec!["H2 only".into()],
+                line_start: 8,
+                line_end: 8,
+                text: String::new(),
+            },
+        ];
+        let structures = markdown_structures(content, &chunks);
+        assert_eq!(structures[0].title, None);
+        assert_eq!(structures[0].headings, vec![(2, "H2 only".into())]);
+        let expected = [false, true, true, false];
+        for (structure, expected) in structures.iter().zip(expected) {
+            assert_eq!(structure.generated_navigation, expected);
+        }
+    }
+
+    #[test]
+    fn markdown_structure_ignores_code_markers_and_setext_rule() {
+        let content = "Setext title\n============\n\n```html\n<!-- HALLOUMINATE:INDEX-START -->\n```\nAuthored answer.\n<!-- HALLOUMINATE:INDEX-START -->\n- [Nav](./nav.md)\n<!-- HALLOUMINATE:INDEX-END -->\n";
+        let chunks = vec![
+            Chunk {
+                ord: 0,
+                heading_path: vec!["Setext title".into()],
+                line_start: 1,
+                line_end: 2,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 1,
+                heading_path: vec!["Setext title".into()],
+                line_start: 7,
+                line_end: 7,
+                text: String::new(),
+            },
+            Chunk {
+                ord: 2,
+                heading_path: vec!["Setext title".into()],
+                line_start: 8,
+                line_end: 10,
+                text: String::new(),
+            },
+        ];
+        let structures = markdown_structures(content, &chunks);
+        assert_eq!(structures[0].title.as_deref(), Some("Setext title"));
+        assert!(!structures[0].generated_navigation);
+        assert!(!structures[1].generated_navigation);
+        assert!(structures[2].generated_navigation);
+    }
+
+    #[test]
+    fn markdown_handler_marks_every_generated_only_index_chunk() {
+        let bytes = b"# Cache recovery\n\n## Files\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Cache recovery restores the archive](./answer.md)\n- [Cache recovery restores the archive again](./answer.md)\n- [Cache recovery restores the archive safely](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n";
+        let corpus_key = CorpusKey::from_configured_root("docs", "/tmp/docs");
+        let file = FileRef::new(std::path::PathBuf::from("index.md"));
+        let ctx = PrepareCtx {
+            corpus_key: &corpus_key,
+            file: &file,
+            mtime: Mtime(1),
+            bytes,
+            content_hash: "hash".into(),
+            indexed_at_ms: 2,
+        };
+        let handler = MarkdownHandler::new(Box::new(crate::corpus::MarkdownChunker::new(
+            text_splitter::Characters,
+            75,
+        )));
+        let prepared = handler.prepare(&ctx).expect("prepare generated index");
+        let mut title_only_chunk = false;
+        for chunk in &prepared.chunks {
+            if chunk.text.trim() == "# Cache recovery" {
+                title_only_chunk = true;
+            }
+            let Some(structure) = &chunk.structure else {
+                panic!("Markdown chunk lacks structure: {chunk:?}");
+            };
+            assert!(
+                structure.generated_navigation,
+                "a generated-only file must not expose a non-generated chunk: {chunk:?}"
+            );
+        }
+        assert!(
+            title_only_chunk,
+            "the real chunker must produce a title-only chunk: {:?}",
+            prepared.chunks
+        );
+    }
+
+    #[test]
+    fn markdown_handler_multiline_setext_heading_does_not_make_generated_links_authored() {
+        let bytes = b"Cache recovery\nfiles and references\n====================\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Cache recovery guide](./guide.md)\n- [Cache recovery answer](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n";
+        let corpus_key = CorpusKey::from_configured_root("docs", "/tmp/docs");
+        let file = FileRef::new(std::path::PathBuf::from("index.md"));
+        let ctx = PrepareCtx {
+            corpus_key: &corpus_key,
+            file: &file,
+            mtime: Mtime(1),
+            bytes,
+            content_hash: "hash".into(),
+            indexed_at_ms: 2,
+        };
+        let handler = MarkdownHandler::new(Box::new(crate::corpus::MarkdownChunker::new(
+            text_splitter::Characters,
+            90,
+        )));
+        let prepared = handler.prepare(&ctx).expect("prepare Setext index");
+        assert!(
+            prepared.chunks.len() > 1,
+            "fixture must split: {:?}",
+            prepared.chunks
+        );
+        for chunk in &prepared.chunks {
+            let Some(structure) = &chunk.structure else {
+                panic!("Markdown chunk lacks structure: {chunk:?}");
+            };
+            assert_eq!(
+                structure.title.as_deref(),
+                Some("Cache recovery files and references"),
+                "multiline Setext title must preserve word boundaries: {chunk:?}"
+            );
+            assert!(
+                structure.generated_navigation,
+                "multiline Setext heading must not make generated-only index authored: {chunk:?}"
+            );
         }
     }
 
@@ -545,6 +1170,34 @@ mod tests {
     }
 
     #[test]
+    fn rst_handler_attaches_section_breadcrumb_and_omits_frontmatter() {
+        let bytes = b"Overview\n========\n\nThe melange flows.\n";
+        let corpus_key = CorpusKey::from_configured_root("docs", "/tmp/docs");
+        let file = FileRef::new(std::path::PathBuf::from("guide.rst"));
+        let ctx = PrepareCtx {
+            corpus_key: &corpus_key,
+            file: &file,
+            mtime: Mtime(1),
+            bytes,
+            content_hash: "hash".into(),
+            indexed_at_ms: 2,
+        };
+        let chunker: Box<dyn CorpusChunker> = Box::new(crate::corpus::RstChunker::new(
+            text_splitter::Characters,
+            2000,
+        ));
+        let handler = RstHandler::new(chunker);
+
+        let prepared = handler.prepare(&ctx).expect("prepare rst");
+        assert!(prepared.frontmatter.is_none(), "RST has no frontmatter");
+        let chunk = &prepared.chunks[0];
+        assert_eq!(chunk.heading_path, vec!["Overview".to_string()]);
+        assert!(chunk.text.contains("The melange flows."));
+        assert!(chunk.claim_marks.is_none());
+        assert!(chunk.structure.is_none());
+    }
+
+    #[test]
     fn csv_line_range_tracks_physical_lines_across_quoted_newlines() {
         // `alice`'s note contains a quoted newline, so her record spans
         // physical lines 2-3 and `bob` starts on physical line 4. The
@@ -564,5 +1217,43 @@ mod tests {
             (4, 4),
             "bob is on physical line 4, not logical-record line 3"
         );
+    }
+
+    #[test]
+    fn split_into_chunks_records_the_prefix_each_chunk_repeats() {
+        let mut words = Vec::new();
+        for index in 0..60 {
+            words.push(format!("w{index:03}"));
+        }
+        let text = words.join(" ");
+        let splitter = overlapping_splitter(text_splitter::Characters, 80);
+        let mut chunks = Vec::new();
+        split_into_chunks(&splitter, &text, &[], "", &mut chunks);
+
+        assert!(chunks.len() > 2, "fixture must split: {}", chunks.len());
+        assert_eq!(chunks[0].overlap_bytes, 0);
+        for pair in chunks.windows(2) {
+            let [previous, current] = pair else {
+                panic!("windows(2) yields pairs");
+            };
+            assert!(current.overlap_bytes > 0, "{:?}", current.text);
+            let repeated = &current.text[..current.overlap_bytes];
+            assert!(
+                previous.text.ends_with(repeated),
+                "{repeated:?} must end {:?}",
+                previous.text
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_splitter_keeps_no_overlap_for_a_tiny_budget() {
+        let splitter = overlapping_splitter(text_splitter::Characters, 7);
+        let mut chunks = Vec::new();
+        split_into_chunks(&splitter, "aaaa bbbb cccc dddd", &[], "", &mut chunks);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert_eq!(chunk.overlap_bytes, 0, "{:?}", chunk.text);
+        }
     }
 }

@@ -18,6 +18,9 @@ struct Args {
     /// Path to the Manifest TOML file.
     #[arg(long)]
     manifest: PathBuf,
+    /// Print only the resolved results directory after successful validation.
+    #[arg(long)]
+    print_results_dir: bool,
 }
 
 fn main() {
@@ -42,11 +45,15 @@ fn run(args: &Args) -> anyhow::Result<bool> {
     let violations = validate(&manifest, &repo_root);
 
     if violations.is_empty() {
-        println!(
-            "OK: manifest with {} subject repos and {} prompt hashes passed all validation rules",
-            manifest.subject_repos.len(),
-            manifest.prompt_hashes.len()
-        );
+        if args.print_results_dir {
+            println!("{}", repo_root.join(&manifest.results_dir).display());
+        } else {
+            println!(
+                "OK: manifest with {} subject repos and {} prompt hashes passed all validation rules",
+                manifest.subject_repos.len(),
+                manifest.prompt_hashes.len()
+            );
+        }
         Ok(true)
     } else {
         for violation in &violations {

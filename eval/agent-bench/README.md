@@ -33,65 +33,40 @@ and the same native tools (file read, grep, shell). The sole delta between
 arms is whether the hallouminate MCP server is attached and, if attached,
 what corpus it exposes:
 
-- `wiki` — hallouminate MCP server attached, exposing the repository's
-  `repo:<name>:wiki` corpus and no `repo:<name>:corpus` (semantic source
-  search) corpus. Wiki-only scoping is what keeps the measured effect "the
-  wiki helped" rather than "semantic source search helped" — mixing the two
-  corpora would confound the claim under test.
-- `baseline` — hallouminate MCP server not attached. The agent has only its
-  native tools against the checked-out repository at the pinned commit.
+- `wiki` — one private Hallouminate MCP server. It exposes only the frozen
+  `benchmark-wiki` corpus. The daemon mounts the wiki read-only.
+- `baseline` — no Hallouminate MCP server, wiki files, or wiki socket.
 
-Tasks are paired: the same question, the same subject repo and commit, and
-the same non-hallouminate tool set run once per arm. Any difference in
-outcome is attributable to wiki presence, not to a different task or a
-different toolset.
+### Measurement isolation
 
-### How wiki-only scoping is actually enforced
+`bench-run` extracts the same pinned commit into two separate read-only
+source views. Both arms see `/workspace`. Neither can read the host
+checkout, its Git metadata, its `.hallouminate` directory, or the host home.
+Both arms use fresh homes and ignore ambient Claude Code settings and MCP
+servers. Only the wiki arm can reach the private daemon's Unix socket.
 
-`hallouminate serve` takes no corpus-scope flag or environment variable, so
-the restriction cannot be imposed at spawn time. It rests on three
-mechanisms, two structural and one checked by this harness:
+Before running either arm, the harness starts the daemon with one explicit
+corpus. It calls `list_corpora` and `read_markdown` through the wiki arm's
+MCP server. It checks the exact corpus list and the bytes of a known page.
+A failure stops the run before it writes results.
 
-1. A source corpus is *derived*, not merely named. `repository_source_corpus`
-   in `crates/hallouminate-domain/src/repository.rs` returns `None` when a
-   `[[repository]]` entry's `corpus_paths` is empty, which it is by default.
-   A repository configured without `corpus_paths` therefore has no
-   `repo:<name>:corpus` at all — the corpus is absent from `effective_corpora`,
-   not just conventionally avoided. `repository_wiki_corpus` always derives
-   `repo:<name>:wiki`.
-2. Corpora resolve per request from the requesting process's cwd
-   (`crates/hallouminate-daemon/src/dispatch.rs`), not once at daemon startup.
-3. `bench-run` refuses to start. Before any wiki-arm session spawns, it reads
-   each subject repo's `<checkout>/.hallouminate/config.toml` and hard-fails
-   if that repo's entry declares a non-empty `corpus_paths`, naming the repo
-   and the offending value.
-4. Every session spawns with `--strict-mcp-config` and `--setting-sources ""`,
-   so each arm's server set is exactly what its `--mcp-config` declares and no
-   ambient user/project settings, hooks, or MCP entries reach the run. Without
-   the first flag an operator's own hallouminate entry attaches a server to
-   the baseline arm, whose defining property is having none. `--safe-mode` is
-   not used: it also strips `--mcp-config` servers, which would run every arm
-   native-tools-only and turn every reported delta into noise.
-
-**Unverified assumption.** Mechanisms 1 and 2 only bind if the hallouminate
-server that Claude Code spawns inherits the cwd `bench-run` sets on the agent
-process (the subject-repo checkout), so that the daemon resolves corpora from
-that checkout's configuration. Ordinary Unix subprocesses inherit cwd, but
-**Claude Code's MCP-server spawn behaviour has not been verified against this
-expectation**, and the pilot's central claim depends on it. Confirm it against
-a real transcript before treating any wiki-arm number as meaningful, and treat
-this paragraph as an open audit item rather than a settled property.
-
-An earlier revision of `config/wiki-arm.mcp.json` carried a
-`HALLOUMINATE_CORPUS_SCOPE` environment variable. No such variable exists in
-hallouminate; it was removed. A configuration that implies enforcement it does
-not deliver is worse than an honest statement of a procedural restriction.
+This verifies the endpoint, not whether Claude Code attaches to it or
+uses it on each trial. Confirm attachment separately before interpreting
+pilot results.
 
 ### Preparing subject-repo checkouts
 
-Both runners operate inside a real checkout rather than the harness tree. For
-each subject repo in the manifest, clone it to `<checkout_root>/<name>` and
-check out the pinned commit:
+Run the measurement on Linux with Bubblewrap at `/usr/bin/bwrap` and user
+namespaces enabled. Use standalone Claude Code and Hallouminate executables.
+Set `AGENT_BENCH_CLAUDE_BIN` or `AGENT_BENCH_HALLOUMINATE_BIN` if the PATH
+entry is a package-manager wrapper. Authenticate via `ANTHROPIC_API_KEY`
+or `CLAUDE_CODE_OAUTH_TOKEN`; the measurement cannot use host home files.
+The agent retains network access to the model service. The daemon can
+fetch its default retrieval model. Neither gets the host home or socket
+directories.
+
+Clone each subject repo to `<checkout_root>/<name>`. Check out the pinned
+commit. Author the wiki in the checkout before measuring.
 
 ```sh
 git clone <subject_repo.url> <checkout_root>/<subject_repo.name>
@@ -213,9 +188,9 @@ gold answer and `rubric_notes` (`agent_bench::Question`):
 the answer text, never which arm produced it. A human-graded subset is used
 to calibrate the automated judge. Exact-score agreement and pass-threshold
 agreement are both reported, but the gate (`--min-kappa`, default 0.60) is on
-Cohen's kappa. Raw agreement is inflated by class skew: on a question set
-curated so a competent agent passes most items, a judge that returns "pass"
-unconditionally scores raw agreement equal to the pass rate while kappa = 0.
+Cohen's kappa. The threshold must be finite. Class skew can inflate raw
+agreement. If a judge always says "pass", its raw agreement equals the
+pass rate, but its kappa is zero when the labels vary.
 A labelled subset with no variance (every item passes, or every item fails,
 under both raters) leaves kappa undefined and fails calibration — such a
 subset cannot certify a judge at all.
@@ -235,7 +210,9 @@ Every run is reproducible from its manifest (`agent_bench::Manifest`):
 - `question_set_hash` — blake3 hash of the frozen question set.
 - `container_image_refs` — digests of every container image the run executed
   in.
-- `results_dir` — where this run's raw session and grade records live.
+- `results_dir` — the directory for session records, grades, and reports.
+  The sweep, judge, calibration, and report recipes use this path relative to
+  the benchmark repository root.
 
 Raw traces (`SessionRecord.transcript_path`, one full transcript per run) are
 retained under `results_dir` for every run, not just failures, so a
@@ -248,21 +225,24 @@ re-hashed and every run measured against the old hash is no longer valid
 evidence for the claim under test:
 
 - Editing a subject repo's wiki after question authoring for that repo has
-  begun. `bench-run` records a blake3 digest of every subject repo's
-  `.hallouminate/wiki` tree in `<out-dir>/run-meta.json` and refuses to
-  resume a ledger whose digests no longer match, so a mid-run re-authoring
-  aborts instead of averaging two treatments into one arm.
+  begun.
 - Changing a prompt's text without rotating its recorded hash in
   `prompt_hashes`.
 - Changing either model ID in `model_ids` (subject or judge).
 - Editing the question set after `question_set_hash` has been recorded.
-- Declaring a non-empty `corpus_paths` on a subject repo's checkout
-  configuration. That derives a `repo:<name>:corpus` source corpus and voids
-  the wiki-only claim for every wiki-arm run against that repo. `bench-run`
-  refuses to start in this state, so it invalidates prior results rather than
-  producing new bad ones.
 - Repointing `checkout_root`, or moving a checkout to a different commit,
   between runs that are compared to each other.
+
+`run-meta.json` binds the session ledger to the manifest and the actual
+question set, source snapshots, frozen wikis, binaries, and isolation
+configuration. A mismatch or missing metadata on an existing ledger
+requires a fresh results directory. `--force` replaces trials only under
+the same fingerprint and never overwrites an earlier transcript.
+
+Automated grades bind the complete session record and exact grading inputs.
+`bench-judge` and `bench-report` reject stale or legacy grades.
+After replacing a session, use `bench-judge --force` to regenerate grades.
+For a custom `--pass-threshold`, pass the same value to `bench-report`.
 
 ## Known confounds
 

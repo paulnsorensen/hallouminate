@@ -1,0 +1,6 @@
+target/
+corpus/
+artifacts/
+coverage/
+# Generated from the root Cargo.lock by `just fuzz-build` and the Fuzz workflow.
+Cargo.lock

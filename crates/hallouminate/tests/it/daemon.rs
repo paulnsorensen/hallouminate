@@ -18,14 +18,15 @@ use std::time::Duration;
 use hallouminate_adapters::LanceStore;
 use hallouminate_config::Config;
 use hallouminate_daemon::{
-    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonRequest, DaemonRequestPayload,
-    DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind, GroundRequest, GroundResult,
-    IndexRequest, LineRange, ListFilesRequest, ListFilesResult, Position, ReadMarkdownRequest,
-    connect_at, serve, spawn_signal_handlers,
+    AddMarkdownRequest, BacklinksRequest, CorpusStatsResult, DaemonClient, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DaemonState, DeleteMarkdownRequest, ErrorKind,
+    GroundRequest, GroundResult, IndexRequest, LineRange, ListFilesRequest, ListFilesResult,
+    Position, ReadMarkdownRequest, StatusReport, connect_at, serve, spawn_signal_handlers,
 };
 use hallouminate_domain::common::CorpusKey;
 use hallouminate_domain::indexer::ChunkStore;
 use hallouminate_domain::repository::{RepoCorpusKind, repo_corpus_name, wiki_directory};
+use hallouminate_domain::search::ChunkRetrieval;
 use tokio::time::timeout;
 
 use crate::common::daemon::DaemonHarness;
@@ -1276,7 +1277,7 @@ ground_dir = "{g}"
         .expect("ping ok");
     assert_eq!(
         value["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
+        Some(hallouminate_daemon::BUILD_IDENTITY),
         "ping must report the daemon binary version: {value}"
     );
 }
@@ -1314,6 +1315,7 @@ ground_dir = "{g}"
                 corpus: None,
                 paths_from: Some(PathBuf::from("/tmp/list.txt")),
                 strict: false,
+                background: false,
             }),
         })
         .await
@@ -1497,7 +1499,10 @@ ground_dir = "{g}"
         })
         .await
         .expect("ping");
-    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        pong["version"].as_str(),
+        Some(hallouminate_daemon::BUILD_IDENTITY)
+    );
 }
 
 // ─── Curd 1: graceful shutdown ───────────────────────────────────────────
@@ -1678,7 +1683,10 @@ async fn sigterm_removes_socket_and_refuses_new_connections() {
         })
         .await
         .expect("ping before SIGTERM");
-    assert_eq!(pong["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
+    assert_eq!(
+        pong["version"].as_str(),
+        Some(hallouminate_daemon::BUILD_IDENTITY)
+    );
 
     // Raise SIGTERM at our own process; the installed handler cancels the
     // shutdown token, the accept loop breaks, and `serve` runs cleanup.
@@ -1880,6 +1888,94 @@ async fn client_for_default_socket_respawns_then_returns_the_reconnected_client(
         client.socket_path(),
         sock.as_path(),
         "the reconnected client must target the respawned socket"
+    );
+}
+
+/// Points `XDG_RUNTIME_DIR` at a directory for one test and restores the
+/// previous value on drop. Hold it only while an `EnvGuard` is alive.
+struct XdgRuntimeDir {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl XdgRuntimeDir {
+    fn set(dir: &Path) -> Self {
+        let previous = std::env::var_os("XDG_RUNTIME_DIR");
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir) };
+        XdgRuntimeDir { previous }
+    }
+}
+
+impl Drop for XdgRuntimeDir {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(previous) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", previous) },
+            None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+        }
+    }
+}
+
+fn bind_legacy_xdg_socket(runtime_dir: &Path) -> tokio::net::UnixListener {
+    let legacy_dir = runtime_dir.join("hallouminate");
+    std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy dir");
+    tokio::net::UnixListener::bind(legacy_dir.join("daemon.sock")).expect("bind legacy socket")
+}
+
+async fn legacy_socket_was_dialed(listener: &tokio::net::UnixListener) -> bool {
+    timeout(Duration::from_millis(200), listener.accept())
+        .await
+        .is_ok()
+}
+
+// The canonical path comes from the OS account record, so this test cannot
+// redirect it. On a host with a live canonical daemon, canonical-first code
+// with a legacy fallback also passes. CI runners have no canonical daemon, so
+// the test rejects a restored fallback there.
+#[tokio::test]
+async fn default_discovery_never_dials_a_socket_that_exists_only_at_the_legacy_xdg_path() {
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    unsafe { std::env::remove_var("HALLOUMINATE_SOCKET") };
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _xdg = XdgRuntimeDir::set(tmp.path());
+    let legacy = bind_legacy_xdg_socket(tmp.path());
+
+    let _ = hallouminate_daemon::status().await;
+    let _ = hallouminate_daemon::daemon_client().await;
+    let _ = hallouminate_daemon::client_for_with(None, || async { anyhow::Ok(()) }).await;
+
+    assert!(
+        !legacy_socket_was_dialed(&legacy).await,
+        "default discovery must not adopt a daemon that listens only at $XDG_RUNTIME_DIR/hallouminate/daemon.sock"
+    );
+}
+
+#[tokio::test]
+async fn explicit_socket_override_wins_over_a_legacy_xdg_socket() {
+    let _env = EnvGuard::set("HALLOUMINATE_SOCKET");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _xdg = XdgRuntimeDir::set(tmp.path());
+    let legacy = bind_legacy_xdg_socket(tmp.path());
+    let explicit = tmp.path().join("explicit.sock");
+    let explicit_listener = tokio::net::UnixListener::bind(&explicit).expect("bind explicit");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = explicit_listener.accept().await else {
+                break;
+            };
+            drop(stream);
+        }
+    });
+    unsafe { std::env::set_var("HALLOUMINATE_SOCKET", &explicit) };
+
+    let client = hallouminate_daemon::client_for_with(None, || async {
+        anyhow::bail!("respawn must not run while the explicit socket is live")
+    })
+    .await
+    .expect("explicit socket must connect");
+
+    assert_eq!(client.socket_path(), explicit.as_path());
+    assert!(
+        !legacy_socket_was_dialed(&legacy).await,
+        "an explicit HALLOUMINATE_SOCKET must never fall through to the legacy XDG path"
     );
 }
 
@@ -2360,8 +2456,8 @@ async fn restart_via_lifecycle_leaves_a_daemon_reporting_the_current_version() {
         .expect("ping restarted daemon");
     assert_eq!(
         pong["version"].as_str(),
-        Some(env!("CARGO_PKG_VERSION")),
-        "restarted daemon must report the current version: {pong}"
+        Some(hallouminate_daemon::BUILD_IDENTITY),
+        "restarted daemon must report the current build identity: {pong}"
     );
 
     // Tear down the respawned daemon.
@@ -2405,13 +2501,89 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Quiet window held after each filesystem mutation before the test speaks to
+/// the daemon again. Every request carries a `cwd` and re-resolves its config
+/// layers, which re-arms the registration catch-up lane; a request that lands
+/// inside the watcher's debounce window therefore races the native event and
+/// can win, leaving `watcher.reindexes` stuck (see the module comment on
+/// `watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root`).
+/// Comfortably larger than the test's `debounce_ms = 100` so the native lane
+/// gets its turn uncontended.
+const WATCH_QUIESCE: Duration = Duration::from_secs(2);
+
+/// Poll cadence once the quiet window has elapsed. Deliberately slow: each
+/// poll is itself a perturbation, so a tight loop would re-open the race the
+/// quiet window just closed.
+const WATCH_POLL_EVERY: Duration = Duration::from_millis(250);
+
+/// Waits until the daemon's native-watcher reindex counter passes `before`,
+/// polling **`Status` only**.
+///
+/// `ground` must never be used to wait for a watcher event. Two lanes can
+/// index a changed file: the native watcher, and the registration catch-up
+/// lane that a `ground` request itself provokes. Whichever writes first wins,
+/// and the loser is then shed by the watcher's stage-1 mtime gate
+/// (`hallouminate-daemon/src/watch/mod.rs:1027`, "watcher: skipped event,
+/// mtime matches last-indexed snapshot") — which deliberately does **not**
+/// call `record_watcher_reindex`. Polling `ground` every 50ms is therefore not
+/// a passive observation: it races the lane under test and can permanently
+/// stall `watcher.reindexes` even though the rows land correctly. `Status`
+/// touches no corpus, so this wait leaves the debounce window uncontended.
+///
+/// Returns the observed counter (unchanged if the deadline expired).
+async fn await_watcher_reindex(
+    socket: &std::path::Path,
+    cwd: &std::path::Path,
+    before: u64,
+    timeout: Duration,
+) -> u64 {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut observed = before;
+    while std::time::Instant::now() < deadline {
+        let value: serde_json::Value = connect_at(socket)
+            .await
+            .expect("connect")
+            .call(DaemonRequest {
+                cwd: cwd.to_path_buf(),
+                payload: DaemonRequestPayload::Status,
+            })
+            .await
+            .expect("status ok");
+        let report: StatusReport = serde_json::from_value(value).expect("status payload");
+        observed = report.watcher.reindexes;
+        if observed > before {
+            return observed;
+        }
+        tokio::time::sleep(WATCH_POLL_EVERY).await;
+    }
+    observed
+}
 // ─── Curd 3: corpus watcher ──────────────────────────────────────────────
 
+// Exercises the LIVE native watcher across five sequential filesystem events
+// (create/edit/rename/atomic-replace/delete). Every stage asserts a
+// `report.watcher.reindexes` delta, which is what proves the *native* lane —
+// not a manual `index` and not the reconcile backstop — produced each
+// observable change. That attribution only holds when the native lane is the
+// only writer, so the periodic backstop is disarmed here
+// (`reconcile_interval_secs = 3600`) and each stage waits on the counter via
+// `await_watcher_reindex` (`Status` only) BEFORE it touches `ground`.
+//
+// Both of those matter for the same reason. The daemon has a second lane that
+// indexes a changed file: the registration catch-up pass, which the reconcile
+// tick schedules and which a `ground` request also provokes. When that lane
+// writes first, the watcher correctly sheds its own debounced event on the
+// stage-1 mtime gate (`hallouminate-daemon/src/watch/mod.rs:1027`) without
+// calling `record_watcher_reindex`. The rows still land, so the content
+// assertions pass — but the counter never moves, and a loop that polls
+// `ground` while waiting on the counter re-arms the very lane that steals the
+// event, so it can never converge. Reconciliation-based recovery is covered
+// separately by `reconcile_tick_repairs_dropped_remove_event`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
-    // Quality gate (Curd 3): editing a file in a baseline corpus root triggers
-    // a reindex within ~debounce_ms; deleting prunes its rows. Both legs are
-    // asserted via `ground` — the watcher's *unique* observable effect on the
+async fn watcher_reindexes_then_prunes_file_in_runtime_discovered_corpus_root() {
+    // Quality gate (Curd 3): the watcher handles edits and deletes first.
+    // Periodic reconciliation recovers any remove event that the platform drops.
+    // Both legs are asserted via `ground` — the watcher's *unique* observable effect on the
     // LanceDB rows — never via a manual `index` (which would index the file
     // itself, so the old assertion passed even with the watcher disabled) nor
     // `list_files` (a filesystem scan that sees the on-disk file regardless of
@@ -2424,19 +2596,365 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     // precisely this file and nothing else.
     let tmp = tempfile::tempdir().expect("tempdir");
     let ground = tmp.path().join("ground");
-    let corpus_root = tmp.path().join("corpus");
-    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\n\n[storage]\nground_dir = \"{g}\"\n",
-        c = corpus_root.display(),
+        "[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
         g = ground.display(),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let harness = DaemonHarness::spawn(cfg).await;
 
-    // Write a NON-EMPTY file directly on disk (outside the add_markdown lane)
-    // with a unique token. Only the background watcher can index it — the test
-    // never calls `index`, so a hit in `ground` proves the watcher reindexed.
+    // Discover the repository after daemon startup, then register its corpus on the first request.
+    let repo_root = tmp.path().join("runtime-repo");
+    let corpus_root = repo_root.join("docs");
+    std::fs::create_dir_all(repo_root.join(".git")).expect("mkdir repo marker");
+    std::fs::create_dir_all(repo_root.join(".hallouminate")).expect("mkdir repo config");
+    std::fs::write(
+        repo_root.join(".hallouminate/config.toml"),
+        format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            corpus_root.display()
+        ),
+    )
+    .expect("write runtime repo config");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+
+    let ground_hits = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let res: hallouminate_daemon::GroundResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                    query: "rarespiceword".into(),
+                    corpus: Some("docs".into()),
+                    top_files: None,
+                    chunks_per_file: None,
+                    limit: None,
+                    snippet_chars: None,
+                    footnote_mode: Default::default(),
+                    match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
+                }),
+            })
+            .await
+            .expect("ground ok");
+        res.response.docs.len()
+    };
+
+    let recovery_ready = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let res: hallouminate_daemon::GroundResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                    query: "rarespiceword".into(),
+                    corpus: Some("docs".into()),
+                    top_files: None,
+                    chunks_per_file: None,
+                    limit: None,
+                    snippet_chars: None,
+                    footnote_mode: Default::default(),
+                    match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
+                }),
+            })
+            .await
+            .expect("ground ok");
+        !res.response
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "index-reconciliation")
+    };
+    let watcher_reindexes = |client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+        let value: serde_json::Value = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::Status,
+            })
+            .await
+            .expect("status ok");
+        let report: StatusReport = serde_json::from_value(value).expect("status payload");
+        report.watcher.reindexes
+    };
+
+    let ground_matches =
+        |query: &'static str, client: hallouminate_daemon::DaemonClient, cwd: PathBuf| async move {
+            let res: hallouminate_daemon::GroundResult = client
+                .call(DaemonRequest {
+                    cwd,
+                    payload: DaemonRequestPayload::Ground(hallouminate_daemon::GroundRequest {
+                        query: query.into(),
+                        corpus: Some("docs".into()),
+                        top_files: None,
+                        chunks_per_file: None,
+                        limit: None,
+                        snippet_chars: None,
+                        footnote_mode: Default::default(),
+                        match_mode: Default::default(),
+                        group_by: Default::default(),
+                        output: Default::default(),
+                    }),
+                })
+                .await
+                .expect("ground ok");
+            res.response
+                .docs
+                .into_iter()
+                .flat_map(|(path, doc)| {
+                    doc.chunks
+                        .into_iter()
+                        .map(move |chunk| (path.clone(), chunk.snippet))
+                })
+                .collect::<Vec<_>>()
+        };
+
+    // Register the runtime-discovered corpus and wait for its initial catch-up.
+    // The watcher event assertions below must not pass through a second catch-up path.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if recovery_ready(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        ready,
+        "runtime corpus registration must finish before watcher assertions"
+    );
+    // Prime the native watcher with a sentinel event before the target file.
+    let sentinel = corpus_root.join("sentinel.md");
+    let sentinel_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::write(&sentinel, "# Sentinel\n\n sentinelwatcherready\n").expect("write sentinel");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        sentinel_reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > sentinel_reindexes_before,
+        "native watcher must index the sentinel event (counter stuck at {reindexes})"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut watcher_ready = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "sentinelwatcherready",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if matches.iter().any(|(path, snippet)| {
+            path.ends_with("sentinel.md") && snippet.contains("sentinelwatcherready")
+        }) {
+            watcher_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        watcher_ready,
+        "native watcher must index the sentinel event"
+    );
+    std::fs::remove_file(&sentinel).expect("remove sentinel");
+
+    let reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+
+    // Write a NON-EMPTY file directly on disk (outside the add_markdown lane).
+    // Only the background watcher can index it because the corpus was empty at registration.
+    let watched = corpus_root.join("watched.md");
+    std::fs::write(
+        &watched,
+        "# Spice\n\nthe rarespiceword melange flows here\n",
+    )
+    .expect("write watched file");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+
+    // The watcher must reindex the created file within a few debounce windows.
+    // Require its native reindex counter and the exact stored path and content.
+    // The counter is awaited via `Status` FIRST (see `await_watcher_reindex`):
+    // polling `ground` here would provoke the catch-up lane, which indexes the
+    // file first and makes the watcher shed its own event on the mtime gate.
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > reindexes_before,
+        "native watcher must reindex watched.md, not the catch-up lane (counter stuck at {reindexes})"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut indexed = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "rarespiceword",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if matches.iter().any(|(path, snippet)| {
+            path.ends_with("watched.md") && snippet.contains("rarespiceword")
+        }) {
+            indexed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        indexed,
+        "native watcher reindex must store watched.md with its exact content"
+    );
+
+    // RENAME → reindex: move the file outside the watcher callback's original path.
+    let renamed = corpus_root.join("renamed.md");
+    let rename_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::rename(&watched, &renamed).expect("rename watched file");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        rename_reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > rename_reindexes_before,
+        "native watcher must reindex the rename destination (counter stuck at {reindexes})"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut renamed_indexed = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "rarespiceword",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        let has_renamed = matches.iter().any(|(path, _)| path.ends_with("renamed.md"));
+        let has_old = matches.iter().any(|(path, _)| path.ends_with("watched.md"));
+        if has_renamed && !has_old {
+            renamed_indexed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        renamed_indexed,
+        "watcher must replace the old indexed path with renamed.md"
+    );
+
+    // ATOMIC REPLACE → the replacement event must reach storage without reconciliation.
+    let replacement = corpus_root.join("replacement.tmp");
+    std::fs::write(
+        &replacement,
+        "# Spice\n\nthe rarespiceword atomicreplacementverified flows here\n",
+    )
+    .expect("write replacement");
+    let replace_reindexes_before = watcher_reindexes(
+        connect_at(harness.socket()).await.expect("connect"),
+        repo_root.clone(),
+    )
+    .await;
+    std::fs::rename(&replacement, &renamed).expect("replace renamed file atomically");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+    let reindexes = await_watcher_reindex(
+        harness.socket(),
+        &repo_root,
+        replace_reindexes_before,
+        Duration::from_secs(20),
+    )
+    .await;
+    assert!(
+        reindexes > replace_reindexes_before,
+        "native watcher must reindex the atomic replacement (counter stuck at {reindexes})"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut replaced = false;
+    while std::time::Instant::now() < deadline {
+        let matches = ground_matches(
+            "atomicreplacementverified",
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await;
+        if matches.iter().any(|(path, snippet)| {
+            path.ends_with("renamed.md") && snippet.contains("atomicreplacementverified")
+        }) {
+            replaced = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        replaced,
+        "watcher must store the exact atomic replacement content"
+    );
+
+    // DELETE → prune: remove the file and let the debounced watcher observe it.
+    std::fs::remove_file(&renamed).expect("remove renamed file");
+    tokio::time::sleep(WATCH_QUIESCE).await;
+    // 20s ceiling: same load-tolerant margin for the prune leg.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut pruned = false;
+    while std::time::Instant::now() < deadline {
+        if ground_hits(
+            connect_at(harness.socket()).await.expect("connect"),
+            repo_root.clone(),
+        )
+        .await
+            == 0
+        {
+            pruned = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        pruned,
+        "watcher must prune watched.md's rows on delete so `ground` no longer returns it"
+    );
+}
+
+/// Pins AC-5: reconciliation (not the live watcher) repairs a remove event
+/// dropped while nothing was watching. The file is deleted after the first
+/// daemon shuts down (watcher not running to observe it), then a second
+/// daemon boots against the same ground dir with a short reconcile interval
+/// and must prune the stale row on its own, unprompted by any live event.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_tick_repairs_dropped_remove_event() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let toml = format!(
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[embeddings]\nenabled = false\n\n[watch]\ndebounce_ms = 100\nreconcile_interval_secs = 3600\n\n[storage]\nground_dir = \"{g}\"\n",
+        c = corpus_root.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     let watched = corpus_root.join("watched.md");
     std::fs::write(
         &watched,
@@ -2455,6 +2973,10 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
                     chunks_per_file: None,
                     limit: None,
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
+                    match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             })
             .await
@@ -2462,16 +2984,13 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
         res.response.docs.len()
     };
 
-    // The watcher must reindex the created file within a few debounce windows.
-    // Assert a `ground` hit appears that could only come from the watcher.
-    // 20s ceiling: free in the passing case (loop exits on condition); guards against
-    // parallel-suite CPU contention slowing the watcher event → reindex → ground path.
+    let first = DaemonHarness::spawn(cfg.clone()).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     let mut indexed = false;
     while std::time::Instant::now() < deadline {
         if ground_hits(
-            connect_at(harness.socket()).await.expect("connect"),
-            harness.cwd().to_path_buf(),
+            connect_at(first.socket()).await.expect("connect"),
+            first.cwd().to_path_buf(),
         )
         .await
             >= 1
@@ -2483,20 +3002,24 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     }
     assert!(
         indexed,
-        "watcher must reindex watched.md so `ground` returns it (no manual index was issued)"
+        "first daemon's watcher must index watched.md before shutdown"
     );
+    first
+        .shutdown()
+        .await
+        .expect("first daemon shuts down cleanly");
 
-    // DELETE → prune: remove the file and let the debounced watcher observe it.
-    // The rows must disappear from `ground` — proving the prune ran, not merely
-    // that the daemon survived.
-    std::fs::remove_file(&watched).expect("remove watched file");
-    // 20s ceiling: same load-tolerant margin for the prune leg.
-    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    std::fs::remove_file(&watched).expect("remove watched file while no daemon runs");
+
+    let mut reconcile_cfg = cfg;
+    reconcile_cfg.watch.reconcile_interval_secs = Some(1);
+    let second = DaemonHarness::spawn(reconcile_cfg).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut pruned = false;
     while std::time::Instant::now() < deadline {
         if ground_hits(
-            connect_at(harness.socket()).await.expect("connect"),
-            harness.cwd().to_path_buf(),
+            connect_at(second.socket()).await.expect("connect"),
+            second.cwd().to_path_buf(),
         )
         .await
             == 0
@@ -2508,7 +3031,7 @@ async fn watcher_reindexes_then_prunes_file_in_baseline_corpus_root() {
     }
     assert!(
         pruned,
-        "watcher must prune watched.md's rows on delete so `ground` no longer returns it"
+        "reconciliation must prune watched.md's stale row within ~5s of the second daemon's tick"
     );
 }
 
@@ -2553,6 +3076,7 @@ async fn index_corpus_through_ipc(
                     corpus: Some(corpus.into()),
                     paths_from: None,
                     strict: false,
+                    background: false,
                 }),
             })
             .await
@@ -2580,6 +3104,10 @@ async fn ground_through_ipc(
                     chunks_per_file: Some(3),
                     limit: Some(50),
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
+                    match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             })
             .await
@@ -2605,20 +3133,32 @@ fn assert_index_report_wire_shape(value: &serde_json::Value) {
         .as_array()
         .expect("index report corpora must be an array");
     for corpus in corpora {
-        assert_exact_object_keys(
-            corpus,
-            &[
-                "chunks_inserted",
-                "embeddings_inserted",
-                "files_deleted",
-                "files_skipped_empty",
-                "files_skipped_unreadable",
-                "files_touched",
-                "files_upserted",
-                "name",
-            ],
-            "index corpus report",
-        );
+        let mut expected = vec![
+            "chunks_inserted",
+            "embeddings_inserted",
+            "files_deleted",
+            "files_skipped_empty",
+            "files_skipped_unreadable",
+            "files_touched",
+            "files_upserted",
+            "name",
+        ];
+        if let Some(skipped) = corpus.get("skipped_unreadable") {
+            expected.push("skipped_unreadable");
+            let entries = skipped
+                .as_array()
+                .expect("skipped_unreadable must be an array");
+            for entry in entries {
+                let reason = entry["reason"].as_str().unwrap_or_default();
+                let entry_keys: &[&str] = if reason == "extraction_failed" {
+                    &["error", "path", "reason"]
+                } else {
+                    &["path", "reason"]
+                };
+                assert_exact_object_keys(entry, entry_keys, "skipped file report");
+            }
+        }
+        assert_exact_object_keys(corpus, &expected, "index corpus report");
     }
 }
 
@@ -2708,6 +3248,7 @@ fn assert_corpus_stats_wire_shape(value: &serde_json::Value) {
             "last_indexed_ms",
             "total_chunks",
             "unindexed_files",
+            "warnings",
         ],
         "corpus stats",
     );
@@ -2831,6 +3372,74 @@ async fn daemon_ground_isolates_same_name_corpus_by_request_cwd_root() {
     assert_ground_result_wire_shape(&result_b_wire);
 }
 
+#[tokio::test]
+async fn daemon_ground_skips_repo_layer_corpus_outside_repo_root_with_warning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo = tmp.path().join("repo");
+    let local_docs = repo.join("docs");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&local_docs).expect("mkdir repo docs");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    std::fs::write(
+        local_docs.join("local.md"),
+        "# Local\n\nrepoconfinementquery local page.\n",
+    )
+    .expect("write local doc");
+    std::fs::write(
+        outside.join("secret.md"),
+        "# Secret\n\nrepoconfinementquery secretoutsidemarker.\n",
+    )
+    .expect("write outside doc");
+    let cwd = repo_override_cwd(
+        &repo,
+        &format!(
+            "[[corpus]]\nname = \"local\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n\n\
+             [[corpus]]\nname = \"hostile\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n",
+            outside.display()
+        ),
+    );
+
+    let harness = DaemonHarness::spawn(cfg_request_scoped_corpora(&ground)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let wire = daemon_ok_payload(
+        client
+            .call_raw(DaemonRequest {
+                cwd: cwd.clone(),
+                payload: DaemonRequestPayload::Ground(GroundRequest {
+                    query: "repoconfinementquery".into(),
+                    corpus: None,
+                    top_files: Some(10),
+                    chunks_per_file: Some(3),
+                    limit: Some(50),
+                    snippet_chars: None,
+                    footnote_mode: Default::default(),
+                    match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
+                }),
+            })
+            .await
+            .expect("ground through daemon IPC"),
+        "ground",
+    );
+    let result: GroundResult = serde_json::from_value(wire).expect("decode ground result");
+
+    let mut codes = Vec::new();
+    for warning in &result.response.warnings {
+        codes.push(warning.code.as_str());
+    }
+    assert!(
+        codes.contains(&"config-path-outside-repo"),
+        "missing outside-repo warning: {:?}",
+        result.response.warnings
+    );
+    for (path, doc) in &result.response.docs {
+        assert!(!path.contains("secret.md"), "outside file leaked: {path}");
+        assert_ne!(doc.corpus, "hostile");
+    }
+}
+
 /// Build a daemon config with one explicit corpus that has TWO roots, plus a
 /// ground dir. Mirrors the `SPEC_EXAMPLE` multi-root shape (a single
 /// `[[corpus]]` aggregating several paths) that `ground`/`list_files` already
@@ -2841,7 +3450,7 @@ fn cfg_two_root_corpus(ground: &Path, root_a: &Path, root_b: &Path) -> Config {
 [[corpus]]
 name = "multi"
 paths = ["{a}", "{b}"]
-globs = ["**/*.md"]
+globs = ["**/*.md", "**/*.png"]
 
 [storage]
 ground_dir = "{g}"
@@ -2876,6 +3485,7 @@ async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance()
         "# Beta\n\nmultirootuniontoken relevant beta marker\n",
     )
     .expect("write root B document");
+    std::fs::write(root_a.join("photo.png"), [0x89_u8, 0x50, 0x4e, 0x47]).expect("write photo");
     let cfg = cfg_two_root_corpus(&ground, &root_a, &root_b);
     let model = cfg.embeddings.model.clone();
     let quantized = cfg.embeddings.quantized;
@@ -2886,6 +3496,15 @@ async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance()
     assert_eq!(report.corpora[0].files_upserted, 2, "{report:#?}");
     assert_eq!(report.corpora[0].chunks_inserted, 2, "{report:#?}");
     assert_index_report_wire_shape(&report_wire);
+    let corpus_wire = &report_wire["corpora"][0];
+    assert_eq!(corpus_wire["files_skipped_unreadable"], 1, "{report_wire}");
+    let skipped = corpus_wire["skipped_unreadable"]
+        .as_array()
+        .unwrap_or_else(|| panic!("skipped_unreadable must be on the wire: {report_wire}"));
+    assert_eq!(skipped.len(), 1, "{report_wire}");
+    assert_eq!(skipped[0]["reason"], "unsupported_format", "{report_wire}");
+    let skipped_path = skipped[0]["path"].as_str().unwrap_or_default();
+    assert!(skipped_path.ends_with("photo.png"), "{report_wire}");
 
     let (result, result_wire) =
         ground_through_ipc(&client, harness.cwd(), "multi", "multirootuniontoken").await;
@@ -2929,7 +3548,10 @@ async fn daemon_multi_root_ground_unions_roots_and_retains_internal_provenance()
     assert_eq!(stats.corpus, "multi");
     assert_eq!(stats.indexed_files, 2);
     assert_eq!(stats.total_chunks, 2);
-    assert_eq!(stats.unindexed_files, 0);
+    assert_eq!(
+        stats.unindexed_files, 1,
+        "the unsupported photo stays unindexed"
+    );
     assert!(stats.last_indexed_ms.is_some());
     assert_ground_result_wire_shape(&result_wire);
     assert_corpus_stats_wire_shape(&stats_wire);
@@ -3037,6 +3659,375 @@ async fn daemon_read_markdown_missing_in_all_roots_reports_does_not_exist() {
         }
         DaemonResponse::Ok { result } => panic!("missing file must error; got Ok({result:?})"),
     }
+}
+
+/// Single-root variant of `cfg_two_root_corpus` for the read-miss suggestion
+/// tests. Embeddings disabled so reads don't touch the model.
+fn cfg_single_root_corpus(ground: &Path, root: &Path) -> Config {
+    let toml = format!(
+        r#"
+[[corpus]]
+name = "wiki"
+paths = ["{r}"]
+globs = ["**/*.md"]
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+"#,
+        r = root.display(),
+        g = ground.display(),
+    );
+    toml::from_str(&toml).expect("single-root corpus toml parses")
+}
+
+/// Issue a `read_markdown` for a path expected to be missing against the
+/// `wiki` corpus and return the InvalidParams error message.
+async fn read_miss_message(client: &DaemonClient, cwd: &Path, path: &str) -> String {
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: cwd.to_path_buf(),
+            payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                corpus: Some("wiki".into()),
+                path: path.into(),
+            }),
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            message
+        }
+        DaemonResponse::Ok { result } => panic!("missing file must error; got Ok({result:?})"),
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_suggests_bare_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("other.md"), "other").expect("seed other");
+    let harness =
+        DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for path in ["notes.md:12", "notes.md:12-30", "notes.md:12-12"] {
+        let message = read_miss_message(&client, harness.cwd(), path).await;
+        assert!(
+            message.contains("Use path=\"notes.md\" with line_numbers=true; line ranges belong in citations, not path."),
+            "{message}"
+        );
+        assert!(
+            message.starts_with(&format!("{path} does not exist")),
+            "{message}"
+        );
+        assert!(!message.contains("private-content-sentinel"), "{message}");
+        assert!(
+            message.contains("corpus root contains: other.md"),
+            "{message}"
+        );
+        assert_eq!(message.matches("notes.md").count(), 2, "{message}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_deduplicates_repeated_separators() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("sub")).expect("mkdir sub");
+    std::fs::write(root.join("sub/notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("sub/other.md"), "other").expect("seed other");
+    let harness =
+        DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "sub//notes.md:12").await;
+    assert!(
+        message.contains("Use path=\"sub//notes.md\" with line_numbers=true"),
+        "{message}"
+    );
+    assert!(message.contains("other.md"), "{message}");
+    assert_eq!(message.matches("notes.md").count(), 2, "{message}");
+    assert!(!message.contains("private-content-sentinel"), "{message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_rejects_invalid_suffixes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("notes.txt"), "private-content-sentinel").expect("seed text");
+    let harness =
+        DaemonHarness::spawn(cfg_single_root_corpus(&tmp.path().join("ground"), &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for path in [
+        "missing.md:12",
+        "notes.txt:12",
+        "notes.md:",
+        "notes.md:0",
+        "notes.md:0-12",
+        "notes.md:12-0",
+        "notes.md:30-12",
+        "notes.md:-12",
+        "notes.md:+12",
+        "notes.md:12-",
+        "notes.md:12-30-40",
+        "notes.md:1.2",
+        "notes.md: 12",
+        "notes.md:12 ",
+        "notes.md:１２",
+        "notes.md:12x",
+        "notes.md:18446744073709551616",
+        "notes.md:1-18446744073709551616",
+    ] {
+        let message = read_miss_message(&client, harness.cwd(), path).await;
+        assert!(
+            message.starts_with(&format!("{path} does not exist")),
+            "{message}"
+        );
+        assert!(!message.contains("Use path="), "{message}");
+        assert!(!message.contains("private-content-sentinel"), "{message}");
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_exact_colon_filename_wins() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "bare content").expect("seed bare");
+    std::fs::write(root.join("notes.md:12-30"), "exact colon content").expect("seed exact");
+    let mut cfg = cfg_single_root_corpus(&tmp.path().join("ground"), &root);
+    cfg.corpora[0].globs = vec!["**/*".into()];
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    for (path, content) in [
+        ("notes.md", "bare content"),
+        ("notes.md:12-30", "exact colon content"),
+    ] {
+        let result: serde_json::Value = client
+            .call(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                    corpus: Some("wiki".into()),
+                    path: path.into(),
+                }),
+            })
+            .await
+            .expect("exact read");
+        assert_eq!(result["path"], path);
+        assert_eq!(result["content"], content);
+    }
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_preserves_path_protections() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(&root).expect("mkdir wiki");
+    std::fs::write(root.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root.join("excluded.md"), "private-content-sentinel").expect("seed excluded");
+    let mut cfg = cfg_single_root_corpus(&tmp.path().join("ground"), &root);
+    cfg.corpora[0].exclude = vec!["**/excluded.md".into()];
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let absolute = format!("{}:12", root.join("notes.md").display());
+    for (path, expected) in [
+        (absolute.as_str(), "path must be a non-empty relative path"),
+        (
+            "../notes.md:12",
+            "path must contain only normal file components",
+        ),
+        (
+            "./notes.md:12",
+            "path must contain only normal file components",
+        ),
+    ] {
+        let message = read_miss_message(&client, harness.cwd(), path).await;
+        assert_eq!(message, expected);
+    }
+    let message = read_miss_message(&client, harness.cwd(), "excluded.md:12").await;
+    assert!(
+        message.starts_with("excluded.md:12 does not exist"),
+        "{message}"
+    );
+    assert!(!message.contains("Use path="), "{message}");
+    assert!(!message.contains("private-content-sentinel"), "{message}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn daemon_read_markdown_citation_miss_rejects_symlinks_and_respects_root_order() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root_a = tmp.path().join("a");
+    let root_b = tmp.path().join("b");
+    std::fs::create_dir_all(&root_a).expect("mkdir a");
+    std::fs::create_dir_all(&root_b).expect("mkdir b");
+    std::fs::write(root_b.join("notes.md"), "private-content-sentinel").expect("seed notes");
+    std::fs::write(root_b.join("blocked.md"), "private-content-sentinel").expect("seed blocked");
+    std::os::unix::fs::symlink(root_b.join("blocked.md"), root_a.join("blocked.md"))
+        .expect("symlink");
+    std::os::unix::fs::symlink(&root_b, root_a.join("linked")).expect("symlink directory");
+    let mut cfg = cfg_two_root_corpus(&tmp.path().join("ground"), &root_a, &root_b);
+    cfg.corpora[0].name = "wiki".into();
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "notes.md:12").await;
+    assert!(
+        message.contains("Use path=\"notes.md\" with line_numbers=true"),
+        "{message}"
+    );
+    assert!(!message.contains("private-content-sentinel"), "{message}");
+    let message = read_miss_message(&client, harness.cwd(), "blocked.md:12").await;
+    assert!(
+        message.starts_with("blocked.md:12 does not exist"),
+        "{message}"
+    );
+    assert!(!message.contains("Use path="), "{message}");
+    let message = read_miss_message(&client, harness.cwd(), "linked/notes.md:12").await;
+    assert!(message.contains("symlink"), "{message}");
+    assert!(!message.contains("Use path="), "{message}");
+    assert!(!message.contains("contains:"), "{message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_lists_parent_directory_entries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("architecture")).expect("mkdir architecture");
+    std::fs::write(
+        root.join("architecture/agent-routing.md"),
+        "# Agent routing\n",
+    )
+    .expect("seed");
+    std::fs::write(root.join("architecture/subagents.md"), "# Subagents\n").expect("seed");
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(
+        &client,
+        harness.cwd(),
+        "architecture/subagent-routing-policy.md",
+    )
+    .await;
+    assert!(
+        message.contains("architecture/subagent-routing-policy.md does not exist"),
+        "got: {message}"
+    );
+    assert!(
+        message.contains("architecture/ contains:"),
+        "got: {message}"
+    );
+    assert!(message.contains("agent-routing.md"), "got: {message}");
+    assert!(message.contains("subagents.md"), "got: {message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_caps_directory_listing_at_20() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("big")).expect("mkdir big");
+    for i in 0..23 {
+        std::fs::write(root.join(format!("big/entry-{i:02}.md")), "# Entry\n").expect("seed");
+    }
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "big/missing.md").await;
+    // Fuzzy suggestions may legitimately surface the unlisted entries, so the
+    // cap assertions target the directory-listing block only.
+    let listing = message.split("closest matches:").next().expect("listing");
+    assert!(listing.contains("big/ contains:"), "got: {message}");
+    assert!(listing.contains("entry-00.md"), "got: {message}");
+    assert!(listing.contains("entry-19.md"), "got: {message}");
+    assert!(
+        !listing.contains("entry-20.md"),
+        "cap must cut at 20: {message}"
+    );
+    assert!(listing.contains("… and 3 more"), "got: {message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_lists_nearest_existing_ancestor() {
+    // deep/ does not exist at all → the nearest existing ancestor is the
+    // corpus root; its entries (files and subdirs) are listed.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("guides")).expect("mkdir guides");
+    std::fs::write(root.join("readme.md"), "# Readme\n").expect("seed");
+    std::fs::write(root.join("guides/setup.md"), "# Setup\n").expect("seed");
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(&client, harness.cwd(), "deep/missing/dir/note.md").await;
+    assert!(
+        message.contains("deep/missing/dir/note.md does not exist"),
+        "got: {message}"
+    );
+    assert!(message.contains("corpus root contains:"), "got: {message}");
+    assert!(message.contains("readme.md"), "got: {message}");
+    assert!(message.contains("guides/"), "got: {message}");
+}
+
+#[tokio::test]
+async fn daemon_read_markdown_miss_suggests_closest_matches_excluding_listed() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let root = tmp.path().join("wiki");
+    std::fs::create_dir_all(root.join("architecture")).expect("mkdir architecture");
+    std::fs::create_dir_all(root.join("notes")).expect("mkdir notes");
+    std::fs::write(
+        root.join("architecture/agent-routing.md"),
+        "# Agent routing\n",
+    )
+    .expect("seed");
+    std::fs::write(root.join("architecture/subagents.md"), "# Subagents\n").expect("seed");
+    std::fs::write(
+        root.join("notes/subagent-routing.md"),
+        "# Subagent routing\n",
+    )
+    .expect("seed");
+    std::fs::write(root.join("notes/policy.md"), "# Policy\n").expect("seed");
+    let harness = DaemonHarness::spawn(cfg_single_root_corpus(&ground, &root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+
+    let message = read_miss_message(
+        &client,
+        harness.cwd(),
+        "architecture/subagent-routing-policy.md",
+    )
+    .await;
+    // Top strsim match by filename stem ranks first in the fuzzy block.
+    assert!(
+        message.contains("closest matches: notes/subagent-routing.md"),
+        "got: {message}"
+    );
+    // Paths already shown by the directory listing must not repeat here.
+    let fuzzy = message
+        .split("closest matches:")
+        .nth(1)
+        .expect("fuzzy block");
+    assert!(
+        !fuzzy.contains("architecture/agent-routing.md"),
+        "got: {message}"
+    );
+    assert!(
+        !fuzzy.contains("architecture/subagents.md"),
+        "got: {message}"
+    );
 }
 
 #[tokio::test]
@@ -3192,6 +4183,7 @@ async fn index_skips_missing_corpus_root_and_indexes_the_rest() {
                 corpus: None,
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         })
         .await
@@ -3254,6 +4246,7 @@ async fn index_strict_aborts_on_missing_corpus_root() {
                 corpus: None,
                 paths_from: None,
                 strict: true,
+                background: false,
             }),
         })
         .await
@@ -3279,7 +4272,7 @@ async fn index_strict_aborts_on_missing_corpus_root() {
 /// Build a single-corpus daemon config with embeddings disabled.
 fn cfg_stale_corpus(ground: &Path, corpus_root: &Path) -> Config {
     let toml = format!(
-        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n",
+        "[[corpus]]\nname = \"docs\"\npaths = [\"{c}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{g}\"\n\n[embeddings]\nenabled = false\n\n[search]\ncold_wait_ms = 0\n",
         c = corpus_root.display(),
         g = ground.display(),
     );
@@ -3320,6 +4313,7 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 corpus: Some("docs".into()),
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         })
         .await
@@ -3350,6 +4344,10 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
+                match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
             }),
         })
         .await
@@ -3380,6 +4378,10 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
                 chunks_per_file: None,
                 limit: None,
                 snippet_chars: None,
+                footnote_mode: Default::default(),
+                match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
             }),
         })
         .await
@@ -3396,6 +4398,150 @@ async fn ground_marks_stale_true_when_file_modified_after_index() {
         !fresh_doc.stale,
         "file unchanged since index must NOT be marked stale"
     );
+}
+
+fn phrase_ground_request(query: String) -> DaemonRequestPayload {
+    DaemonRequestPayload::Ground(GroundRequest {
+        query,
+        corpus: Some("docs".into()),
+        top_files: None,
+        chunks_per_file: None,
+        limit: None,
+        snippet_chars: None,
+        footnote_mode: Default::default(),
+        match_mode: hallouminate_domain::ground::GroundMatch::Phrase,
+        group_by: Default::default(),
+        output: Default::default(),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ground_phrase_mode_matches_the_literal_phrase_and_rejects_invalid_queries() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let full = corpus_root.join("full.md");
+    let partial = corpus_root.join("partial.md");
+    std::fs::write(
+        &full,
+        "# Review\n\nA review of The Art of X, second edition.\n",
+    )
+    .expect("write full");
+    std::fs::write(&partial, "# Notes\n\nNotes on art, and on x.\n").expect("write partial");
+
+    let harness = DaemonHarness::spawn(cfg_stale_corpus(&ground, &corpus_root)).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some("docs".into()),
+                paths_from: None,
+                strict: false,
+                background: false,
+            }),
+        })
+        .await
+        .expect("index transport ok");
+    match resp {
+        DaemonResponse::Ok { .. } => {}
+        DaemonResponse::Err { kind, message } => panic!("index failed ({kind:?}): {message}"),
+    }
+
+    let client = connect_at(harness.socket()).await.expect("reconnect");
+    let result: GroundResult = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: phrase_ground_request("the art of x".into()),
+        })
+        .await
+        .expect("phrase ground ok");
+    let abs_full = std::fs::canonicalize(&full).expect("canonical full");
+    let mut paths = Vec::new();
+    for path in result.response.docs.keys() {
+        paths.push(path.clone());
+    }
+    assert_eq!(paths, vec![abs_full.to_string_lossy().into_owned()]);
+    for warning in &result.response.warnings {
+        assert_ne!(warning.code, "phrase-truncated", "{}", warning.message);
+        assert_ne!(
+            warning.code, "crossencoder-unavailable",
+            "{}",
+            warning.message
+        );
+    }
+
+    for query in ["  \t ".to_string(), "x".repeat(513)] {
+        let client = connect_at(harness.socket()).await.expect("reconnect");
+        let resp = client
+            .call_raw(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: phrase_ground_request(query),
+            })
+            .await
+            .expect("transport ok");
+        match resp {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+                assert!(message.contains("phrase match"), "got: {message}");
+            }
+            DaemonResponse::Ok { result } => {
+                panic!("an invalid phrase must error; got Ok({result:?})")
+            }
+        }
+    }
+
+    let client = connect_at(harness.socket()).await.expect("reconnect");
+    let mut counts_request = phrase_ground_request("the art of x".into());
+    if let DaemonRequestPayload::Ground(request) = &mut counts_request {
+        request.output = hallouminate_domain::ground::GroundOutput::Counts;
+    }
+    let counted: GroundResult = client
+        .call(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: counts_request,
+        })
+        .await
+        .expect("phrase counts ok");
+    let Some(doc) = counted
+        .response
+        .docs
+        .get(abs_full.to_string_lossy().as_ref())
+    else {
+        panic!("counts must report the matching file");
+    };
+    assert_eq!(
+        doc.coverage,
+        Some(hallouminate_domain::ground::FileCoverage {
+            chunks: 1,
+            pages: None
+        })
+    );
+    assert!(doc.chunks.is_empty(), "counts output carries no snippets");
+
+    let client = connect_at(harness.socket()).await.expect("reconnect");
+    let mut ranked_counts = phrase_ground_request("the art of x".into());
+    if let DaemonRequestPayload::Ground(request) = &mut ranked_counts {
+        request.match_mode = hallouminate_domain::ground::GroundMatch::Ranked;
+        request.output = hallouminate_domain::ground::GroundOutput::Counts;
+    }
+    let resp = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: ranked_counts,
+        })
+        .await
+        .expect("transport ok");
+    match resp {
+        DaemonResponse::Err { kind, message } => {
+            assert_eq!(kind, ErrorKind::InvalidParams, "{message}");
+            assert!(message.contains("requires match"), "got: {message}");
+        }
+        DaemonResponse::Ok { result } => {
+            panic!("counts output in ranked mode must error; got Ok({result:?})")
+        }
+    }
 }
 
 // ─── Issue #134: add_markdown section / range / match-scoped writes ──────────
@@ -3992,7 +5138,8 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     let ground = tmp.path().join("ground");
     let corpus_root = tmp.path().join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
-    std::fs::write(corpus_root.join("hello.md"), "# Hello\n\nworld\n").expect("seed");
+    let source = "# Hello\n\nworld\n";
+    std::fs::write(corpus_root.join("hello.md"), source).expect("seed");
 
     // Write a stale meta at schema_version = current - 1.
     let current = hallouminate_adapters::default_schema_version_pub();
@@ -4001,7 +5148,7 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
 
     let cfg = cfg_with_corpus(&ground, &corpus_root);
     // DaemonState::open must succeed (no crash).
-    DaemonState::open(cfg, None)
+    let state = DaemonState::open(cfg, None)
         .await
         .expect("stale store must be auto-rebuilt, not fatal");
 
@@ -4024,6 +5171,22 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     assert_eq!(
         fresh_version, current,
         "fresh meta.toml must record the current schema version"
+    );
+    let root = corpus_root.to_str().expect("UTF-8 corpus root");
+    let key = CorpusKey::from_configured_root("docs", root);
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "world", 10)
+        .await
+        .expect("retrieve rebuilt source");
+    let hit = signals.hits.get(&signals.fts[0]).expect("rebuilt hit");
+    let structure = hit.structure.as_ref().expect("rebuilt Markdown structure");
+    assert_eq!(structure.title.as_deref(), Some("Hello"));
+    assert_eq!(structure.headings, [(1, "Hello".into())]);
+    assert!(!structure.generated_navigation);
+    assert_eq!(
+        std::fs::read_to_string(corpus_root.join("hello.md")).expect("read source"),
+        source
     );
 }
 
@@ -4277,9 +5440,8 @@ async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
 
 #[tokio::test]
 async fn daemon_returns_structured_error_when_request_line_exceeds_cap() {
-    // MAX_REQUEST_LINE_BYTES (4 MiB) bounds the newline-delimited request
-    // line's allocation via a `.take()`-wrapped reader. A line that never
-    // hits its newline within the cap must yield a structured
+    // LinesCodec bounds the request to a 4 MiB newline-inclusive cap.
+    // A line that exceeds the cap must yield a structured
     // `DaemonResponse::Err { kind: InvalidParams }` naming the cap, not a
     // bare transport EOF with no error payload (a legitimate oversized
     // `add_markdown.content` write would otherwise look identical to a
@@ -4360,7 +5522,7 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
     // Quality gate: `drain_handlers` (SHUTDOWN_DRAIN_TIMEOUT) must let an
     // in-flight connection handler finish before `serve_with_idle_timeout`
     // releases the socket + single-instance flock. A connection that never
-    // sends its request line stays "in-flight" (blocked on `read_line`)
+    // sends its request line stays "in-flight" while awaiting a codec frame
     // until the per-connection idle timeout elapses, giving us a real
     // in-flight handler without any test-only injection seam.
     use hallouminate_daemon::serve_with_idle_timeout;
@@ -4376,7 +5538,12 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
 
     let state = DaemonState::open(cfg, None).await.expect("open state");
     let socket_clone = socket.clone();
-    let idle_timeout = Duration::from_millis(500);
+    // Generous drain window: the assertion below checks the socket still exists
+    // ~150ms after the shutdown ack, so the in-flight handler must not drain
+    // before then even under heavy CI parallelism that stretches wall-clock
+    // sleeps. 2s keeps a wide margin over the ~150ms check without slowing the
+    // test meaningfully (serve returns as soon as the handler drains).
+    let idle_timeout = Duration::from_secs(2);
     let handle =
         tokio::spawn(
             async move { serve_with_idle_timeout(&state, &socket_clone, idle_timeout).await },
@@ -4391,8 +5558,8 @@ async fn ipc_shutdown_waits_for_in_flight_handler_before_releasing_socket() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    // Open a connection and never write to it: its handler stays alive,
-    // blocked on `read_line` under `idle_timeout`, until that timeout fires.
+    // Open a connection and never write to it.
+    // Its handler stays alive while awaiting a codec frame under `idle_timeout`.
     let _in_flight = UnixStream::connect(&socket)
         .await
         .expect("connect in-flight handler");
@@ -4704,4 +5871,272 @@ async fn rebuild_wiki_indexes_uses_per_request_embedder_not_baseline() {
          a dimension-mismatch warning here means the bug (state.embedder() \
          instead of res.embedder()) regressed: {warnings:?}"
     );
+}
+
+#[tokio::test]
+async fn daemon_markdown_batch_enforces_bounds_before_side_effects() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().join("corpus");
+    std::fs::create_dir(&root).expect("root");
+    let cfg: Config = toml::from_str(&format!(
+        r#"
+[[corpus]]
+name = "docs"
+paths = ["{}"]
+globs = ["**/*.md"]
+[storage]
+ground_dir = "{}"
+[embeddings]
+enabled = false
+"#,
+        root.display(),
+        tmp.path().join("ground").display()
+    ))
+    .expect("config");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("client");
+    for count in [0, 21] {
+        let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "cwd": harness.cwd(),
+            "payload": {"op": "add_markdown_batch", "corpus": "docs", "items":
+                vec![serde_json::json!({"path": "never.md", "content": ""}); count]
+            }
+        }))
+        .expect("request");
+        let response = client.call_raw(request).await.expect("response");
+        let DaemonResponse::Err { kind, message } = response else {
+            panic!("invalid count succeeded");
+        };
+        assert_eq!(kind, ErrorKind::InvalidParams);
+        assert!(message.contains("1–20"), "{message}");
+        assert_eq!(std::fs::read_dir(&root).expect("entries").count(), 0);
+    }
+    let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+        "cwd": harness.cwd(),
+        "payload": {"op": "add_markdown_batch", "corpus": "docs", "items": [
+            {"path": "never.md", "content": ""},
+            {"path": "bad.md", "content": "", "replace_match": "x", "under_heading": "x"}
+        ]}
+    }))
+    .expect("request");
+    let response = client.call_raw(request).await.expect("response");
+    let DaemonResponse::Err { kind, message } = response else {
+        panic!("mixed modes succeeded");
+    };
+    assert_eq!(kind, ErrorKind::InvalidParams);
+    assert!(message.contains("at most one"), "{message}");
+    assert_eq!(std::fs::read_dir(&root).expect("entries").count(), 0);
+
+    let mut items = Vec::new();
+    for index in 0..20 {
+        items.push(serde_json::json!({"path": format!("item-{index}.md"), "content": ""}));
+    }
+    let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+        "cwd": harness.cwd(),
+        "payload": {"op": "add_markdown_batch", "corpus": "docs", "items": items}
+    }))
+    .expect("request");
+    let response = client.call_raw(request).await.expect("response");
+    let DaemonResponse::Ok { result } = response else {
+        panic!("20 items rejected");
+    };
+    let results = result["results"].as_array().expect("results");
+    assert_eq!(results.len(), 20);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(result["result"]["path"], format!("item-{index}.md"));
+        assert_eq!(
+            std::fs::read_to_string(root.join(format!("item-{index}.md"))).expect("written"),
+            ""
+        );
+    }
+    harness.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn daemon_markdown_batch_retains_exclusion_and_multi_root_guards() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    std::fs::create_dir(&first).expect("first");
+    std::fs::create_dir(&second).expect("second");
+    let cfg: Config = toml::from_str(&format!(
+        r#"
+[[corpus]]
+name = "excluded"
+paths = ["{}"]
+globs = ["**/*.md"]
+exclude = ["private/**"]
+[[corpus]]
+name = "multi"
+paths = ["{}", "{}"]
+globs = ["**/*.md"]
+[storage]
+ground_dir = "{}"
+[embeddings]
+enabled = false
+"#,
+        first.display(),
+        first.display(),
+        second.display(),
+        tmp.path().join("ground").display()
+    ))
+    .expect("config");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("client");
+    for (corpus, path, expected) in [
+        ("excluded", "private/secret.md", "exclude"),
+        ("multi", "never.md", "single"),
+    ] {
+        let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+            "cwd": harness.cwd(),
+            "payload": {"op": "add_markdown_batch", "corpus": corpus, "items": [{"path": path, "content": ""}]}
+        })).expect("request");
+        let response = client.call_raw(request).await.expect("response");
+        let DaemonResponse::Ok { result } = response else {
+            panic!("batch handler failed");
+        };
+        assert_eq!(result["results"][0]["status"], "err");
+        assert_eq!(result["results"][0]["kind"], "invalid_params");
+        assert!(
+            result["results"][0]["message"]
+                .as_str()
+                .expect("message")
+                .contains(expected),
+            "{result}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(&first).expect("first entries").count(), 0);
+    assert_eq!(
+        std::fs::read_dir(&second).expect("second entries").count(),
+        0
+    );
+    harness.shutdown().await.expect("shutdown");
+}
+
+// Issue #642: add_markdown batches the ancestor index reindex into a fixed
+// number of commits per mutation, independent of depth.
+
+/// Count manifest files of the LanceDB file-map table (`root_files`) under
+/// `dir`. The store merge-inserts into that table exactly once per
+/// `commit_batch`, so the count measures commit cycles without depending on
+/// the search-index refresh heuristic.
+fn lance_file_map_manifest_count(dir: &Path) -> usize {
+    let mut total = 0;
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(current) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .is_some_and(|name| name == "root_files.lance")
+            {
+                total += std::fs::read_dir(path.join("_versions"))
+                    .expect("read root_files _versions")
+                    .count();
+            } else {
+                pending.push(path);
+            }
+        }
+    }
+    total
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_add_markdown_deep_page_reindexes_ancestors_in_one_commit() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let repo = tmp.path().join("my-repo");
+    std::fs::create_dir_all(&repo).expect("mkdir repo");
+    let toml = format!(
+        r#"
+[[repository]]
+name = "myrepo"
+path = "{r}"
+
+[storage]
+ground_dir = "{g}"
+
+[embeddings]
+enabled = false
+model = "BAAI/bge-small-en-v1.5"
+"#,
+        r = repo.display(),
+        g = ground.display(),
+    );
+    let cfg: Config = toml::from_str(&toml).expect("cfg parses");
+    let harness = DaemonHarness::spawn(cfg).await;
+    let client = connect_at(harness.socket()).await.expect("connect");
+    let corpus = repo_corpus_name("myrepo", RepoCorpusKind::Wiki).unwrap();
+
+    let add = async |path: &str| -> serde_json::Value {
+        client
+            .call::<serde_json::Value>(DaemonRequest {
+                cwd: harness.cwd().to_path_buf(),
+                payload: DaemonRequestPayload::AddMarkdown(AddMarkdownRequest {
+                    corpus: corpus.clone(),
+                    path: path.into(),
+                    content: format!("# Page\n\nBody of {path}.\n"),
+                    overwrite: false,
+                    ..Default::default()
+                }),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("add_markdown {path} ok: {e}"))
+    };
+
+    // Warm up: creates the table, its search indexes, and the root index.md.
+    add("warm.md").await;
+
+    let before_shallow = lance_file_map_manifest_count(&ground);
+    let shallow = add("shallow.md").await;
+    let shallow_commits = lance_file_map_manifest_count(&ground)
+        .checked_sub(before_shallow)
+        .expect("file-map manifest count must not shrink after a shallow add");
+    assert!(
+        shallow_commits > 0,
+        "a shallow add must commit to the file-map table"
+    );
+    assert_eq!(shallow["indexed"]["corpora"][0]["files_upserted"], 2);
+
+    let before_deep = lance_file_map_manifest_count(&ground);
+    let deep = add("a/b/c/deep.md").await;
+    let deep_commits = lance_file_map_manifest_count(&ground)
+        .checked_sub(before_deep)
+        .expect("file-map manifest count must not shrink after a deep add");
+    // Page plus root, a, a/b, a/b/c index.md files.
+    assert_eq!(deep["indexed"]["corpora"][0]["files_upserted"], 5);
+    assert!(
+        deep["warnings"]
+            .as_array()
+            .is_none_or(|warnings| warnings.is_empty()),
+        "no warnings expected: {deep}"
+    );
+
+    assert_eq!(
+        deep_commits, shallow_commits,
+        "a page three directories deep must reindex its ancestors in the same \
+         number of commits as a root-level page, independent of depth"
+    );
+
+    let stats_wire = client
+        .call_raw(DaemonRequest {
+            cwd: harness.cwd().to_path_buf(),
+            payload: DaemonRequestPayload::CorpusStats {
+                corpus: Some(corpus.clone()),
+            },
+        })
+        .await
+        .expect("corpus stats");
+    let stats: CorpusStatsResult = serde_json::from_value(daemon_ok_payload(stats_wire, "stats"))
+        .expect("decode corpus stats");
+    // warm, shallow, deep, and the four index.md files (root, a, a/b, a/b/c).
+    assert_eq!(stats.indexed_files, 7);
+    assert_eq!(stats.unindexed_files, 0);
 }

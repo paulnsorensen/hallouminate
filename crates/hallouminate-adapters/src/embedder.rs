@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{AutoDevicePolicy, EmbeddingModel, TextEmbedding, TextInitOptions};
 
 use hallouminate_domain::common::{HallouminateError, Result};
 use hallouminate_domain::embeddings::{
@@ -10,12 +10,46 @@ use hallouminate_domain::embeddings::{
 /// Output dimensionality shared by every supported model. All three embed to
 /// 384-dim vectors, so the rest of the pipeline can use a fixed-size array.
 pub const EMBEDDING_DIM: usize = 384;
-/// Bounded fastembed batch size for ONNX runs. Passing `None` selects
-/// fastembed's internal default (256 sequences × 512 tokens), which sets the
-/// ORT CPU arena's high-water mark in the multi-GB range and is never
-/// reclaimed afterwards (see `.hallouminate/wiki/ort-arena-retention.md`).
-/// `Some(32)` is the measured, verified mitigation.
+/// Bounded fastembed batch size for ONNX runs. The ORT CPU arena is now
+/// disabled outright (see [`cpu_no_arena`]), so this batch cap is a
+/// secondary bound on transient peak memory during one embed call, not
+/// the primary arena-growth mitigation (see
+/// `.hallouminate/wiki/ort-arena-retention.md`).
 const EMBED_BATCH_SIZE: usize = 32;
+
+/// Tokenizer max sequence length for embed sessions. ORT allocates
+/// attention-score scratch proportional to `seq_len²`, so an unbounded
+/// max_length inflates the arena high-water mark. 384 is
+/// `CHUNK_BUDGET_TOKENS` (`crates/hallouminate-daemon/src/state.rs`); 32 is
+/// headroom for `[CLS]`/`[SEP]` and the e5 `query: `/`passage: ` prefix.
+/// See `.hallouminate/wiki/ort-arena-retention.md`.
+pub const EMBED_MAX_LENGTH: usize = 416;
+
+/// Build the CPU execution provider with the memory arena disabled. ORT's
+/// BFCArena grows in ~128MB extents to the inference high-water mark and
+/// never shrinks; dropping the session does not release it either. ORT
+/// maintainers recommend disabling the arena on CPU. See
+/// `.hallouminate/wiki/ort-arena-retention.md`.
+pub(crate) fn cpu_no_arena() -> Vec<fastembed::ExecutionProviderDispatch> {
+    vec![ort::ep::CPU::default().with_arena_allocator(false).build()]
+}
+
+/// ONNX Runtime session config entry that turns off KleidiAI, Arm's SME
+/// matmul kernel library. On Apple SME hardware, KleidiAI keeps thread-local
+/// GEMM scratch buffers alive for the life of the process instead of the
+/// session, so they are never reclaimed even after the arena mitigation
+/// above. Measured: 2189 MB -> 216 MB resident after embedding 240 files,
+/// at the cost of an embed pass that runs about 40% slower. See
+/// `.hallouminate/wiki/ort-arena-retention.md` and onnxruntime#29538.
+pub(crate) const DISABLE_KLEIDIAI: (&str, &str) = ("mlas.disable_kleidiai", "1");
+
+/// ONNX Runtime device policy for every session. ort sets `MaxEfficiency`
+/// by default, and ONNX Runtime 1.31 then places the graph on CoreML on
+/// macOS: the daemon footprint grew to ~21 GB and a 156-file index did not
+/// finish in 15 min. [`cpu_no_arena`] does not prevent this, because ort's
+/// CPU EP adds no provider, and ONNX Runtime applies the policy only when no
+/// provider is added. `PreferCPU` never registers an EP automatically.
+pub(crate) const CPU_DEVICE_POLICY: AutoDevicePolicy = AutoDevicePolicy::PreferCPU;
 
 /// Whether a query or a passage is being embedded. Asymmetric retrieval
 /// models (the e5 family) take different instruction prefixes for the two
@@ -76,7 +110,11 @@ impl Embedder {
         let model = resolve_model(canonical_name, quantized.into())?;
         let opts = TextInitOptions::new(model)
             .with_cache_dir(PathBuf::from(cache_dir))
-            .with_show_download_progress(false);
+            .with_show_download_progress(false)
+            .with_execution_providers(cpu_no_arena())
+            .with_max_length(EMBED_MAX_LENGTH)
+            .with_session_config(DISABLE_KLEIDIAI.0, DISABLE_KLEIDIAI.1)
+            .with_auto_device(CPU_DEVICE_POLICY);
         let inner = TextEmbedding::try_new(opts).map_err(|e| {
             HallouminateError::Embed(format!(
                 "init {canonical_name}: {e}\n  \
@@ -289,6 +327,24 @@ mod tests {
     fn finalize_vector_rejects_wrong_dim() {
         let err = finalize_vector(vec![0.5; 100]).expect_err("must reject");
         assert!(err.to_string().contains("384-dim"), "{err}");
+    }
+
+    #[test]
+    fn cpu_no_arena_registers_exactly_one_cpu_provider() {
+        let eps = cpu_no_arena();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].name(), "CPUExecutionProvider");
+    }
+
+    #[test]
+    fn try_new_options_carry_disable_kleidiai_session_config() {
+        let opts = TextInitOptions::new(EmbeddingModel::BGESmallENV15)
+            .with_execution_providers(cpu_no_arena())
+            .with_session_config(DISABLE_KLEIDIAI.0, DISABLE_KLEIDIAI.1);
+        assert_eq!(
+            opts.session_config,
+            vec![("mlas.disable_kleidiai".to_string(), "1".to_string())]
+        );
     }
 
     #[test]

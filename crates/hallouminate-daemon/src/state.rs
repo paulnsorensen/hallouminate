@@ -12,6 +12,27 @@
 //! LanceDB commit so we never hit LanceDB's retry-limit warning around
 //! many simultaneous writers.
 //!
+//! `acquire_mutation_guard` still hands out both locks together for
+//! read-modify-write handlers (`handle_add_markdown`, `handle_index`) where
+//! the whole operation is cheap and atomic. The catch-up scan/plan/apply
+//! path (`dispatch::catch_up_corpus`) is different: scanning disk and
+//! diffing against the store can be slow and touches nothing shared, so
+//! those callers hold only `lock_corpus` across scan + plan and call
+//! `acquire_write_lane` themselves just before `apply`, once there is
+//! confirmed work to do. The corpus lock is held continuously from scan
+//! through apply, so no other *corpus-locked* writer can interleave; only
+//! the lane acquisition — the part that actually needs cross-corpus
+//! serialization — moves later. The GC sweep in `maintenance::gc_delete` is
+//! the deliberate exception: it takes only the write lane, so its row
+//! deletions can land between another writer's scan and apply. That is safe
+//! because GC only removes rows already proven unreferenced by the scan that
+//! produced its candidate list.
+//!
+//! The maintenance-debt gate (`backpressure::await_debt_gate`) runs before
+//! any of this: every catch-up call site clears the gate before calling
+//! `lock_corpus`, so a bounded Hard-debt block never holds a corpus lock
+//! that would head-of-line-block an unrelated mutation on the same corpus.
+//!
 //! Stores, tokenizers, and embedders are cached by effective request config.
 //! A baseline embedder that fails during startup remains retryable: the next
 //! normal request for that resource key initializes and installs it in place.
@@ -19,11 +40,13 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(test)]
+use std::sync::Condvar;
 use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -38,16 +61,150 @@ use hallouminate_adapters::{
     EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, StoreLockOwner,
 };
 use hallouminate_config::Config;
-use hallouminate_domain::common::{HallouminateError, expand_tilde};
+use hallouminate_domain::common::{CorpusConfig, CorpusKey, HallouminateError, expand_tilde};
 use hallouminate_domain::corpus::{Tokenizer, load_tokenizer, missing_roots};
 use hallouminate_domain::indexer::{HandlerRegistry, SearchHit, index_corpus};
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 
 use super::ladder::LadderAction;
 use super::maintenance::{DeferReason, maintenance_loop};
+use super::supervisor::SupervisorAction;
 
-const CHUNK_BUDGET_TOKENS: usize = 384;
+pub(crate) const CHUNK_BUDGET_TOKENS: usize = 384;
 
+/// Maximum number of daemon-wide Ground coverage checks that may run at once.
+pub(crate) const MAX_CONCURRENT_COVERAGE_CHECKS: usize = 6;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct CoverageProbe {
+    active_store: Arc<AtomicUsize>,
+    max_store: Arc<AtomicUsize>,
+    requested_store: Arc<AtomicUsize>,
+    store_release: Arc<tokio::sync::watch::Sender<bool>>,
+    active_walk: Arc<AtomicUsize>,
+    max_walk: Arc<AtomicUsize>,
+    walk_release: Arc<(StdMutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+impl Default for CoverageProbe {
+    fn default() -> Self {
+        Self {
+            active_store: Arc::new(AtomicUsize::new(0)),
+            max_store: Arc::new(AtomicUsize::new(0)),
+            requested_store: Arc::new(AtomicUsize::new(0)),
+            store_release: Arc::new(tokio::sync::watch::channel(true).0),
+            active_walk: Arc::new(AtomicUsize::new(0)),
+            max_walk: Arc::new(AtomicUsize::new(0)),
+            walk_release: Arc::new((StdMutex::new(true), Condvar::new())),
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct CoveragePhaseGuard {
+    active: Arc<AtomicUsize>,
+    activity: Arc<(StdMutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+impl Drop for CoveragePhaseGuard {
+    fn drop(&mut self) {
+        let (activity, wake) = &*self.activity;
+        let _activity = activity.lock().expect("coverage probe lock");
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl CoverageProbe {
+    fn enter(
+        active: &Arc<AtomicUsize>,
+        maximum: &Arc<AtomicUsize>,
+        activity: &Arc<(StdMutex<bool>, Condvar)>,
+    ) -> CoveragePhaseGuard {
+        let (activity_lock, wake) = &**activity;
+        let _activity = activity_lock.lock().expect("coverage probe lock");
+        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+        maximum.fetch_max(current, Ordering::SeqCst);
+        wake.notify_all();
+        CoveragePhaseGuard {
+            active: Arc::clone(active),
+            activity: Arc::clone(activity),
+        }
+    }
+
+    pub(crate) fn enter_store(&self) -> CoveragePhaseGuard {
+        Self::enter(&self.active_store, &self.max_store, &self.walk_release)
+    }
+
+    pub(crate) fn enter_walk(&self) -> CoveragePhaseGuard {
+        Self::enter(&self.active_walk, &self.max_walk, &self.walk_release)
+    }
+
+    pub(crate) fn block_walk(&self) {
+        let (release, _) = &*self.walk_release;
+        *release.lock().expect("coverage probe lock") = false;
+    }
+
+    pub(crate) fn release_walk(&self) {
+        let (release, wake) = &*self.walk_release;
+        *release.lock().expect("coverage probe lock") = true;
+        wake.notify_all();
+    }
+
+    pub(crate) fn wait_for_walk_release(&self) {
+        let (release, wake) = &*self.walk_release;
+        let mut released = release.lock().expect("coverage probe lock");
+        while !*released {
+            released = wake.wait(released).expect("coverage probe lock");
+        }
+    }
+
+    pub(crate) fn wait_for_active_walks(&self, expected: usize) -> bool {
+        let (activity, wake) = &*self.walk_release;
+        let mut activity = activity.lock().expect("coverage probe lock");
+        while self.active_walk.load(Ordering::SeqCst) < expected && !*activity {
+            activity = wake.wait(activity).expect("coverage probe lock");
+        }
+        self.active_walk.load(Ordering::SeqCst) >= expected
+    }
+
+    pub(crate) fn active_walk(&self) -> usize {
+        self.active_walk.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn max_walk(&self) -> usize {
+        self.max_walk.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn max_store(&self) -> usize {
+        self.max_store.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn note_store_request(&self) {
+        self.requested_store.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub(crate) fn requested_store(&self) -> usize {
+        self.requested_store.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn block_store(&self) {
+        self.store_release.send_replace(false);
+    }
+
+    pub(crate) fn release_store(&self) {
+        self.store_release.send_replace(true);
+    }
+
+    pub(crate) async fn wait_for_store_release(&self) {
+        let mut receiver = self.store_release.subscribe();
+        let _released = receiver.wait_for(|released| *released).await;
+    }
+}
 /// Backup ground-store directories (`<ground>.bak-v{N}`, left behind by
 /// `move_stale_store` on a schema-version rebuild) older than this are
 /// pruned at daemon boot; they're recoverable-until-pruned, not permanent.
@@ -82,7 +239,7 @@ fn is_idle(last_use_secs: u64, now_secs: u64, idle_secs: u64) -> bool {
 
 /// Map of key → per-key async mutex, created on first use. Two callers
 /// holding the same key serialize on its mutex; distinct keys never collide.
-/// Backs both the per-corpus write lock (keyed by corpus name) and the
+/// Backs both the per-corpus write lock (keyed by `CorpusKey`) and the
 /// per-`ResourceKey` build lock in `resources_for`. For corpus writes, every
 /// mutating handler also takes the single-permit global `write_lane` (see
 /// `DaemonStateInner.write_lane`), so cross-corpus writes still serialize at
@@ -114,6 +271,29 @@ impl<K: Eq + Hash> KeyedLockMap<K> {
     }
 }
 
+/// Every lock key a whole-corpus operation must hold. A corpus with no
+/// configured root still gets one key (empty root) so it keeps mutual
+/// exclusion by name.
+pub(crate) fn corpus_lock_keys(corpus: &CorpusConfig) -> Vec<CorpusKey> {
+    let keys = corpus.corpus_keys();
+    if keys.is_empty() {
+        return vec![CorpusKey {
+            name: corpus.name.clone(),
+            canonical_root: PathBuf::new(),
+        }];
+    }
+    keys
+}
+
+/// The lock key a single-file operation at `path` must hold: the root that
+/// owns `path`, or every key of the corpus when no root owns it.
+pub(crate) fn path_lock_keys(corpus: &CorpusConfig, path: &Path) -> Vec<CorpusKey> {
+    let Some(key) = corpus.corpus_key_for_path(path) else {
+        return corpus_lock_keys(corpus);
+    };
+    vec![key]
+}
+
 /// Key identifying one distinct resource set: a `[storage].ground_dir` +
 /// `[embeddings]` combination. Repo-layer config resolved per request
 /// selects (or lazily builds) the `RequestResources` entry for its key, so
@@ -138,8 +318,25 @@ impl ResourceKey {
     }
 }
 
-/// Resources effective for one repo-layer config. Keyed cache entry —
-/// mirrors the `crossencoders: Arc<Mutex<HashMap<..>>>` cache precedent.
+type CrossencoderInitializer =
+    Box<dyn Fn() -> hallouminate_domain::common::Result<Box<dyn Crossencoder>> + Send + Sync>;
+
+struct CrossencoderSlot {
+    model: Option<Box<dyn Crossencoder>>,
+    initialize: CrossencoderInitializer,
+}
+
+fn crossencoder_initializer(model_name: String, cache_dir: PathBuf) -> CrossencoderInitializer {
+    Box::new(move || {
+        FastembedCrossencoder::try_new(&model_name, &cache_dir)
+            .map(|model| Box::new(model) as Box<dyn Crossencoder>)
+            .map_err(|error| {
+                HallouminateError::Embed(format!("init crossencoder ({model_name}): {error}"))
+            })
+    })
+}
+
+/// Resources effective for one repo-layer config, cached by resource key.
 pub struct RequestResources {
     pub store: Arc<LanceStore>,
     pub tokenizer: Tokenizer,
@@ -162,7 +359,7 @@ struct DaemonStateInner {
     /// (`.hallouminate/config.toml` walk from the request's `cwd`) on top of
     /// this via `Config::resolve_for_cwd` in the dispatcher — the baseline
     /// never changes once the daemon is running.
-    baseline: Config,
+    baseline: Arc<Config>,
     /// Source path of the baseline (the XDG config path or the `--config
     /// PATH` override). Threaded into `resolve_for_cwd` so scalar-conflict
     /// diagnostics name the actual file that owns the baseline value, per
@@ -188,19 +385,28 @@ struct DaemonStateInner {
     /// dir concurrently (the single-open-per-ground-dir invariant), without
     /// holding the `resources` map lock across that async open.
     resource_build_locks: KeyedLockMap<ResourceKey>,
+    /// Per-ground-dir lock. Two `ResourceKey`s can name one ground dir, so
+    /// the stale-store check, move, and open serialize on the dir itself.
+    ground_dir_locks: KeyedLockMap<PathBuf>,
     store_lock_owner: StoreLockOwner,
-    corpus_locks: KeyedLockMap<String>,
+    corpus_locks: KeyedLockMap<CorpusKey>,
     write_lane: Arc<Semaphore>,
+    /// In-flight corpus walks shared by concurrent `ground` requests. Every
+    /// walk takes a permit from the daemon-wide coverage gate.
+    scan_cache: crate::scan_cache::ScanCache,
+    /// Daemon-wide cap on concurrent store listings for coverage checks.
+    coverage_listing_gate: Semaphore,
+    #[cfg(test)]
+    coverage_probe: Arc<CoverageProbe>,
     /// Lazy-loaded crossencoder rerankers, keyed by canonical model name.
-    /// A per-model cache (rather than a single slot) so that repos
-    /// selecting different `[search].crossencoder` models via repo-layer
-    /// config each get their own loaded model instead of clobbering a
-    /// shared one. Empty until the first `ground` request that resolves a
-    /// configured model; the baseline model (if any) is pre-warmed at boot.
-    crossencoders: Arc<Mutex<HashMap<String, FastembedCrossencoder>>>,
+    /// Each model has an independent slot, constructed on its first rerank.
+    /// The map lock guards only a synchronous entry lookup, never an await.
+    crossencoders: StdMutex<HashMap<&'static str, Arc<StdMutex<CrossencoderSlot>>>>,
     /// Monotonic (`Instant`-based) seconds-since-process-start timestamp of
-    /// completion (handle_connection) plus embedder/crossencoder acquire and
-    /// guard drop. Idle-exit (server.rs) fires when this is quiet for
+    /// the last inference-bearing work: a completed `IdleClock::Restart`
+    /// unit plus crossencoder acquire and guard drop. A timed-out rerank can
+    /// drop its blocking task's guard later and stamp the clock after the
+    /// request response. Idle-exit (server.rs) fires when this is quiet for
     /// `[daemon].idle_exit_secs` and no connection is active (ADR-003).
     last_activity_secs: Arc<AtomicU64>,
     /// Count of connection handlers in flight. Idle-exit defers while non-zero
@@ -232,9 +438,9 @@ struct DaemonStateInner {
     /// completed, and reindexes that upserted nothing) -- additive storage
     /// for curd 9's status surface.
     watcher_counters: WatcherCounters,
-    /// Most recent ladder trip, if any (written by `watch.rs`'s churn
-    /// ladder and `state.rs`'s supervisor WatchdogTrip escalation hook;
-    /// curd 9's status surface reads it).
+    /// Most recent in-process ladder trip. Supervisor and churn writes may
+    /// wait for this lock; watchdog writes are best-effort because abort must
+    /// never wait. Durable watchdog history lives in its trip-state file.
     last_ladder_trip: std::sync::Mutex<Option<LadderTrip>>,
     /// Supervisor owning the daemon's five long-lived loops (G5). Holds the
     /// escalation hook below; loops route through `supervisor().spawn(..)`
@@ -245,29 +451,33 @@ struct DaemonStateInner {
     heartbeat: Arc<super::heartbeat::HeartbeatRegistry>,
     /// Retained so shutdown drains maintenance before releasing the daemon flock.
     maintenance_task: Mutex<Option<JoinHandle<()>>>,
+    /// Live-registration ledger backing the watcher pump (baseline +
+    /// runtime-discovered corpus roots). See `watch::registry`.
+    watch_registry: Arc<super::watch::WatchRegistry>,
     /// Shutdown signal shared by the accept loop, the IPC `Shutdown`
     /// dispatcher, and the SIGINT/SIGTERM handlers. Cancelling it breaks the
     /// `serve_on_listener` select and triggers flock-drop + socket cleanup.
     shutdown: CancellationToken,
 }
 
-/// Both guards a mutating handler takes in the documented `corpus → write_lane`
-/// order. Dropping it releases the write-lane permit first (LIFO drop order),
-/// then the corpus lock; that matches the acquisition order's inverse and
-/// keeps the per-corpus serial chain visible to the next waiter.
+/// Both guards a mutating handler takes in the documented
+/// `corpus keys → write_lane` order. Dropping it releases the write-lane
+/// permit first, then the corpus-key locks; that matches the acquisition
+/// order's inverse and keeps the per-key serial chain visible to the next
+/// waiter.
 pub struct MutationGuard {
     // Drop order: `_permit` first, then `_corpus`. The fields are private to
     // make the order an invariant rather than a convention.
     _permit: OwnedSemaphorePermit,
-    _corpus: OwnedMutexGuard<()>,
+    _corpus: Vec<OwnedMutexGuard<()>>,
 }
 
 impl MutationGuard {
-    /// Constructs a guard from its two held locks. `pub(super)` so only
+    /// Constructs a guard from its held locks. `pub(super)` so only
     /// `backpressure::acquire` (the sole place that assembles a
     /// `MutationGuard`) can build one -- the private fields above stay an
     /// invariant, not a convention, for every other caller in the crate.
-    pub(super) fn new(permit: OwnedSemaphorePermit, corpus: OwnedMutexGuard<()>) -> Self {
+    pub(super) fn new(permit: OwnedSemaphorePermit, corpus: Vec<OwnedMutexGuard<()>>) -> Self {
         Self {
             _permit: permit,
             _corpus: corpus,
@@ -288,6 +498,16 @@ impl MutationGuard {
 pub enum WorkClass {
     External,
     Internal,
+}
+
+/// Effect of one completed unit of work on the idle-exit window (ADR
+/// daemon-idle-exit-004). Idle-exit exists to reclaim inference memory, so
+/// only inference-bearing work restarts the window. Cheap work keeps it;
+/// its `ConnectionGuard` still defers exit while the work is in flight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleClock {
+    Restart,
+    Keep,
 }
 
 /// Decrements the daemon's active-connection count when dropped. Held by a
@@ -316,8 +536,9 @@ struct WatcherCounters {
 }
 
 /// Snapshot of the most recent ladder trip: which escalation action fired
-/// and when (monotonic seconds). Written by the churn ladder (`watch.rs`)
-/// and the supervisor's WatchdogTrip escalation hook (`state.rs`).
+/// and when (monotonic seconds). Written by the churn ladder (`watch.rs`),
+/// the supervisor's RestartTask escalation hook (`state.rs`), and the
+/// watchdog's stall-triggered WatchdogTrip (`server.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LadderTrip {
     pub(crate) action: LadderAction,
@@ -343,39 +564,7 @@ impl DaemonState {
         store_lock_owner: StoreLockOwner,
     ) -> anyhow::Result<Self> {
         let ground_dir = expand_tilde(&cfg.storage.ground_dir);
-        if let Some(parent) = ground_dir.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
-        }
-        let stale_version = match LanceStore::validate_existing_metadata(
-            &ground_dir,
-            &cfg.embeddings.model,
-            cfg.embeddings.quantized,
-            cfg.embeddings.enabled,
-        ) {
-            Ok(()) => None,
-            Err(HallouminateError::StoreSchemaStale {
-                found, expected, ..
-            }) => {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    %found,
-                    %expected,
-                    "ground store schema v{found} < expected v{expected}; rebuilding from source",
-                );
-                move_stale_store(&ground_dir, found).await?;
-                Some(found)
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "validate ground dir {}: {e}",
-                    ground_dir.display()
-                ));
-            }
-        };
+        let stale = check_ground_dir(&cfg, &ground_dir).await?;
 
         // Model construction and ONNX session setup are synchronous and
         // CPU-heavy. Keep them off Tokio's async worker capacity.
@@ -407,110 +596,35 @@ impl DaemonState {
 
         // Metadata validation happened before model ownership moved into the
         // store, so stale-schema recovery reuses this single ONNX session.
-        let build_result: anyhow::Result<LanceStore> = async {
-            let store = LanceStore::open_or_create_with_owner(
-                &ground_dir,
-                &cfg.embeddings.model,
-                cfg.embeddings.quantized,
-                cfg.embeddings.enabled,
-                embedder,
-                store_lock_owner.clone(),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
-
-            if stale_version.is_some() {
-                let registry = HandlerRegistry::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
-                for corpus in cfg
-                    .effective_corpora()
-                    .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
-                {
-                    let missing = missing_roots(&corpus);
-                    if !missing.is_empty() {
-                        tracing::warn!(
-                            target: "hallouminate::daemon",
-                            corpus = %corpus.name,
-                            "rebuild: corpus root missing; skipped",
-                        );
-                        continue;
-                    }
-                    let stats = index_corpus(&corpus, &store, &registry)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
-                    tracing::info!(
-                        target: "hallouminate::daemon",
-                        corpus = %corpus.name,
-                        files = stats.files_upserted,
-                        chunks = stats.chunks_inserted,
-                        "rebuild: reindexed",
-                    );
-                }
-            }
-            Ok(store)
-        }
-        .await;
-        let store = match build_result {
-            Ok(store) => store,
-            Err(e) => {
-                if let Some(found) = stale_version
-                    && ground_dir.exists()
-                {
-                    let _ = tokio::fs::remove_dir_all(&ground_dir).await;
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        "rebuild failed; removed partial ground dir so next boot retries. \
-                         Backup preserved at {}.bak-v{found}",
-                        ground_dir.display(),
-                    );
-                }
-                return Err(e);
-            }
-        };
-        // Recoverable-until-pruned backups from a prior schema rebuild
-        // (see `move_stale_store` above) accumulate on disk forever
-        // otherwise. Tolerate failure — a stuck backup dir must never
-        // block startup; the next boot's prune retries.
-        if let Err(e) =
-            prune_stale_backups(&ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE).await
-        {
-            tracing::warn!(
-                target: "hallouminate::daemon",
-                error = %e,
-                "failed to prune stale ground store backups",
-            );
-        }
-        // Pre-warm the baseline crossencoder iff configured; tolerate
-        // failure so a misconfigured model name (or offline first run)
-        // doesn't brick the daemon. The cache stays empty for that model
-        // and a later `crossencoder()` call retries the load. Per-request
-        // repo-layer models are loaded lazily on first use, keyed by name.
-        let mut crossencoders: HashMap<String, FastembedCrossencoder> = HashMap::new();
-        if let Some(model) = cfg.search.crossencoder.as_deref() {
-            match canonical_crossencoder_model(model)
-                .map_err(anyhow::Error::from)
-                .and_then(|canonical| {
-                    FastembedCrossencoder::try_new(canonical, &cache_dir)
-                        .map(|c| (canonical, c))
-                        .map_err(anyhow::Error::from)
-                }) {
-                Ok((canonical, c)) => {
-                    crossencoders.insert(canonical.to_string(), c);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "hallouminate::daemon",
-                        model = %model,
-                        error = %e,
-                        "crossencoder unavailable at startup; ground will skip rerank until reload",
-                    );
-                }
-            }
-        }
+        // Boot rebuilds a stale store inline, before the watchdog arms.
+        let store = open_boot_store(
+            &cfg,
+            &ground_dir,
+            stale,
+            embedder,
+            &tokenizer,
+            store_lock_owner.clone(),
+        )
+        .await?;
+        prune_stale_backups_logged(&ground_dir).await;
+        // Keep model construction lazy. The rerank blocking-pool task owns
+        // construction and the per-model slot for the configured deadline.
+        let crossencoders = StdMutex::new(HashMap::new());
         let shutdown = CancellationToken::new();
-        let crossencoders_arc = Arc::new(Mutex::new(crossencoders));
         let last_activity = Arc::new(AtomicU64::new(monotonic_secs()));
         let store = Arc::new(store);
         let write_lane = Arc::new(Semaphore::new(1));
+        #[cfg(test)]
+        let coverage_probe = Arc::new(CoverageProbe::default());
+        let coverage_listing_gate = Semaphore::new(MAX_CONCURRENT_COVERAGE_CHECKS);
+        let scan_cache = crate::scan_cache::ScanCache::new(
+            crate::scan_cache::SCAN_BUDGET,
+            Arc::new(Semaphore::new(MAX_CONCURRENT_COVERAGE_CHECKS)),
+            crate::scan_cache::corpus_scanner(
+                #[cfg(test)]
+                Arc::clone(&coverage_probe),
+            ),
+        );
 
         // #161's idle eviction is deleted (ADR-001): dropping the ONNX session
         // released nothing (the CPU BFCArena retains its extents), so each
@@ -552,7 +666,7 @@ impl DaemonState {
         let ladder = super::ladder::Ladder {
             warn_at: 3,
             act_at: 5,
-            action: LadderAction::WatchdogTrip,
+            action: SupervisorAction::RestartCurrentTask,
         };
         let state = DaemonState {
             // `new_cyclic`: the escalation hook records trips into the very
@@ -578,15 +692,20 @@ impl DaemonState {
                     }
                 });
                 DaemonStateInner {
-                    baseline: cfg,
+                    baseline: Arc::new(cfg),
                     baseline_xdg_path: xdg_path,
                     baseline_resources,
                     resources: Mutex::new(resources_map),
                     resource_build_locks: KeyedLockMap::default(),
+                    ground_dir_locks: KeyedLockMap::default(),
                     corpus_locks: KeyedLockMap::default(),
                     store_lock_owner,
                     write_lane,
-                    crossencoders: crossencoders_arc,
+                    scan_cache,
+                    coverage_listing_gate,
+                    #[cfg(test)]
+                    coverage_probe,
+                    crossencoders,
                     last_activity_secs: last_activity,
                     active_connections: Arc::new(AtomicUsize::new(0)),
                     external_last_activity_secs: Arc::new(AtomicU64::new(monotonic_secs())),
@@ -605,6 +724,7 @@ impl DaemonState {
                     )),
                     heartbeat,
                     maintenance_task: Mutex::new(None),
+                    watch_registry: Arc::new(super::watch::WatchRegistry::new()),
                     shutdown,
                 }
             }),
@@ -670,6 +790,11 @@ impl DaemonState {
         &self.inner.heartbeat
     }
 
+    /// Live-registration ledger backing the watcher pump.
+    pub(crate) fn watch_registry(&self) -> &Arc<super::watch::WatchRegistry> {
+        &self.inner.watch_registry
+    }
+
     /// Source path of the baseline config the daemon booted from — the XDG
     /// path when no `--config PATH` was given, or the `--config PATH` value
     /// itself. `None` when the baseline was constructed without a known
@@ -690,6 +815,13 @@ impl DaemonState {
         &self.inner.baseline
     }
 
+    /// `baseline()` behind a cheap `Arc` clone, for call sites that need an
+    /// owned handle (e.g. as a fallback `Arc<Config>` in the watcher) without
+    /// deep-cloning the whole `Config` on every call.
+    pub(crate) fn baseline_arc(&self) -> Arc<Config> {
+        Arc::clone(&self.inner.baseline)
+    }
+
     pub fn store(&self) -> Arc<LanceStore> {
         self.inner.baseline_resources.store.clone()
     }
@@ -705,6 +837,18 @@ impl DaemonState {
         self.inner.baseline_resources.embeddings_enabled
     }
 
+    pub(crate) fn scan_cache(&self) -> &crate::scan_cache::ScanCache {
+        &self.inner.scan_cache
+    }
+
+    pub(crate) fn coverage_listing_gate(&self) -> &Semaphore {
+        &self.inner.coverage_listing_gate
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coverage_probe(&self) -> Arc<CoverageProbe> {
+        Arc::clone(&self.inner.coverage_probe)
+    }
     /// Per-request resource seam (B2+B3): resolve (or lazily build) the
     /// `RequestResources` for the effective config's `(ground_dir, model,
     /// quantized, enabled)` key. A repo-layer override of any of those
@@ -712,11 +856,10 @@ impl DaemonState {
     /// `[embeddings].enabled`) takes effect on the very next request — no
     /// daemon restart — while requests sharing a key share one
     /// `LanceStore`/embedder/tokenizer set so two `Arc<LanceStore>` handles
-    /// never open on the same ground dir. Deliberately no stale-schema-
-    /// rebuild handling here (that is boot-only, see `move_stale_store`); a
-    /// per-request `ground_dir` hitting `HallouminateError::StoreSchemaStale`
-    /// just surfaces as an `Err`, no worse than today's "can't point at a
-    /// different ground_dir at all".
+    /// never open on the same ground dir. A stale-schema store at a
+    /// per-request `ground_dir` moves aside on first use, and a fresh store
+    /// opens in its place. The request does not reindex. The watcher's
+    /// admitted catch-up refills the fresh store from source.
     pub async fn resources_for(&self, cfg: &Config) -> anyhow::Result<Arc<RequestResources>> {
         self.resources_for_with_initializer(cfg, |model, quantized, cache_dir| async move {
             init_embedder(&model, quantized, cache_dir).await
@@ -770,13 +913,8 @@ impl DaemonState {
         }
 
         let ground_dir = key.ground_dir.clone();
-        if let Some(parent) = ground_dir.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
-        }
+        let _ground = self.inner.ground_dir_locks.lock(ground_dir.as_path()).await;
+        let stale = check_ground_dir(cfg, &ground_dir).await?;
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
         let embedder = if cfg.embeddings.enabled {
             Some(
@@ -792,16 +930,27 @@ impl DaemonState {
         };
         let tokenizer = load_tokenizer(&cfg.embeddings.model)
             .map_err(|e| anyhow::anyhow!("load tokenizer for {}: {e}", cfg.embeddings.model))?;
-        let store = LanceStore::open_or_create_with_owner(
+        if let Some(StaleStore { found, expected }) = stale {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                ground_dir = %ground_dir.display(),
+                %found,
+                %expected,
+                "ground store schema v{found} < expected v{expected}; moving it aside for catch-up",
+            );
+            move_stale_store(&ground_dir, found).await?;
+        }
+        let store = open_ground_store(
+            cfg,
             &ground_dir,
-            &cfg.embeddings.model,
-            cfg.embeddings.quantized,
-            cfg.embeddings.enabled,
             embedder,
             self.inner.store_lock_owner.clone(),
         )
-        .await
-        .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))?;
+        .await?;
+        if stale.is_some() {
+            self.watch_registry().mark_reconcile_due_all();
+        }
+        prune_stale_backups_logged(&ground_dir).await;
         let resources = Arc::new(RequestResources {
             store: Arc::new(store),
             tokenizer,
@@ -816,49 +965,56 @@ impl DaemonState {
         Ok(resources)
     }
 
-    /// Borrow the crossencoder for the model named by the per-request
-    /// resolved config, loading it lazily on first use and caching it by
-    /// canonical model name. Pass `None` (no model configured for this
-    /// request) to skip reranking — returns `Ok(None)`. Returns `Err`
-    /// when a configured model name is unknown or fails to load; the
-    /// caller logs and falls back to fusion-only ranking. Resolving from
-    /// the per-request `cfg.search.crossencoder` (not the baseline) is
-    /// what lets repo-layer `[search].crossencoder` overrides take effect.
-    pub async fn crossencoder(
+    /// Admit the crossencoder named by the per-request resolved config. This
+    /// operation validates the canonical name without constructing native state.
+    /// Pass `None` to skip reranking and receive `Ok(None)`. Unknown model names
+    /// return `Err`; initialization failures return from the bounded rerank task.
+    /// The model is constructed lazily on the blocking pool and cached by name.
+    /// Resolving from per-request `cfg.search.crossencoder` lets repo-layer
+    /// `[search].crossencoder` overrides take effect without daemon restart.
+    pub fn crossencoder(
         &self,
         model_name: Option<&str>,
     ) -> anyhow::Result<Option<CrossencoderGuard>> {
         let Some(model_name) = model_name else {
             return Ok(None);
         };
-        // Canonicalize so config aliases (e.g. the corrected English
-        // spelling of a typo'd upstream id) share one cache entry.
         let canonical = canonical_crossencoder_model(model_name)?;
-        // Owned lock (not a borrowed `MutexGuard<'_, ...>`): #139's per-request
-        // rerank timeout boxes this guard as `dyn Crossencoder` and moves it
-        // into `spawn_blocking`, which requires 'static ownership.
-        let mut guard = Arc::clone(&self.inner.crossencoders).lock_owned().await;
-        if !guard.contains_key(canonical) {
-            let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
-            let model = FastembedCrossencoder::try_new(canonical, &cache_dir)
-                .map_err(|e| anyhow::anyhow!("init crossencoder ({canonical}): {e}"))?;
-            guard.insert(canonical.to_string(), model);
-        }
+        // The map holds no invariant a poisoned lock could corrupt, and the
+        // slot below already recovers from native panics. Keep the map alive.
+        let model = self
+            .inner
+            .crossencoders
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(canonical)
+            .or_insert_with(|| {
+                let cache_dir = expand_tilde(&self.inner.baseline.embeddings.cache_dir);
+                let initialize = crossencoder_initializer(canonical.to_owned(), cache_dir);
+                Arc::new(StdMutex::new(CrossencoderSlot {
+                    model: None,
+                    initialize,
+                }))
+            })
+            .clone();
         self.inner
             .last_activity_secs
             .store(monotonic_secs(), Ordering::Relaxed);
         Ok(Some(CrossencoderGuard {
-            guard,
-            key: canonical.to_string(),
+            model,
             last_use_secs: Arc::clone(&self.inner.last_activity_secs),
         }))
     }
 
-    /// Bump the activity clock to now — called at request completion so
-    /// idle-exit keys on real request throughput, not just embed use (ADR-003).
-    pub fn touch_activity(&self, class: WorkClass) {
+    /// Record a completed unit of work. The per-class clock always moves, so
+    /// maintenance-defer sees every external request. The aggregate idle-exit
+    /// clock moves only for `IdleClock::Restart` (ADR daemon-idle-exit-004).
+    pub fn touch_activity(&self, class: WorkClass, idle_clock: IdleClock) {
         let now = monotonic_secs();
-        self.inner.last_activity_secs.store(now, Ordering::Relaxed);
+        match idle_clock {
+            IdleClock::Restart => self.inner.last_activity_secs.store(now, Ordering::Relaxed),
+            IdleClock::Keep => {}
+        }
         match class {
             WorkClass::External => self
                 .inner
@@ -942,8 +1098,7 @@ impl DaemonState {
         )
     }
 
-    /// Record a ladder trip (curd 1's future ladder wiring calls this when
-    /// `Ladder::evaluate` returns `Action`). Overwrites any prior snapshot.
+    /// Records a ladder trip, overwriting any prior snapshot.
     pub(crate) fn record_ladder_trip(&self, action: LadderAction) {
         let at_secs = monotonic_secs();
         *self
@@ -951,6 +1106,27 @@ impl DaemonState {
             .last_ladder_trip
             .lock()
             .expect("ladder trip mutex poisoned") = Some(LadderTrip { action, at_secs });
+    }
+
+    /// Attempts to record a ladder trip without blocking the caller.
+    pub(crate) fn try_record_ladder_trip(&self, action: LadderAction) -> bool {
+        let Ok(mut trip) = self.inner.last_ladder_trip.try_lock() else {
+            return false;
+        };
+        *trip = Some(LadderTrip {
+            action,
+            at_secs: monotonic_secs(),
+        });
+        true
+    }
+
+    /// Holds the ladder-trip slot for contention tests.
+    #[cfg(test)]
+    pub(super) fn lock_ladder_trip(&self) -> std::sync::MutexGuard<'_, Option<LadderTrip>> {
+        self.inner
+            .last_ladder_trip
+            .lock()
+            .expect("ladder trip mutex poisoned")
     }
 
     /// The most recent ladder trip, if any (curd 9's status surface).
@@ -1011,10 +1187,11 @@ impl DaemonState {
     /// connections, activity clock quiet for at least `idle_secs`.
     /// `idle_secs == 0` disables idle-exit.
     ///
-    /// Reads the aggregate counter/clock, which every `WorkClass` stamps, so
-    /// idle-exit gates on BOTH classes (ADR daemon-rework-002 preserving ADR
-    /// daemon-idle-exit-003): housekeeping in flight defers teardown exactly
-    /// like an external request -- never drop the flock mid-write.
+    /// Reads the aggregate counter/clock. Every `WorkClass` holds the counter,
+    /// so work in flight always defers teardown -- never drop the flock
+    /// mid-write (ADR daemon-idle-exit-003). Only `IdleClock::Restart` work
+    /// stamps the clock, so cheap RPCs cannot starve idle-exit (ADR
+    /// daemon-idle-exit-004).
     pub(crate) fn should_idle_exit(&self, idle_secs: u64) -> bool {
         self.should_idle_exit_at(idle_secs, monotonic_secs())
     }
@@ -1083,20 +1260,32 @@ impl DaemonState {
         )
     }
 
-    /// Acquire the per-corpus async mutex. Call before any operation that
-    /// reads-modifies-writes that corpus's filesystem or LanceDB rows.
-    pub async fn lock_corpus(&self, corpus: &str) -> OwnedMutexGuard<()> {
-        self.inner.corpus_locks.lock(corpus).await
+    /// Acquire the per-`CorpusKey` async mutexes (name + canonical root).
+    /// Call before any operation that reads-modifies-writes the filesystem
+    /// or LanceDB rows under those roots. Worktrees of one repo share a
+    /// corpus name but not a root, so they lock distinct keys and run in
+    /// parallel. Keys are sorted and deduplicated before acquisition, so
+    /// every multi-key caller takes them in the same total order and cannot
+    /// deadlock against another. Never call while holding the write lane.
+    pub async fn lock_corpus(&self, keys: &[CorpusKey]) -> Vec<OwnedMutexGuard<()>> {
+        let mut sorted: Vec<&CorpusKey> = keys.iter().collect();
+        sorted.sort();
+        sorted.dedup();
+        let mut guards = Vec::with_capacity(sorted.len());
+        for key in sorted {
+            guards.push(self.inner.corpus_locks.lock(key).await);
+        }
+        guards
     }
 
     /// Acquire the global write-lane permit. ALWAYS call after
     /// `lock_corpus` for the same operation to maintain the documented
-    /// `corpus → write_lane` order and prevent deadlock.
+    /// `corpus keys → write_lane` order and prevent deadlock.
     pub fn write_lane(&self) -> Arc<Semaphore> {
         self.inner.write_lane.clone()
     }
 
-    /// Acquire the per-corpus mutex AND the global write-lane permit in the
+    /// Acquire the per-key corpus mutexes AND the global write-lane permit in the
     /// documented order. The returned `MutationGuard` releases both in the
     /// inverse order on drop. Replaces the open-coded
     /// `lock_corpus().await; write_lane().acquire_owned().await?` pattern
@@ -1104,9 +1293,195 @@ impl DaemonState {
     /// flipping the order by accident.
     pub async fn acquire_mutation_guard(
         &self,
-        corpus: &str,
+        keys: &[CorpusKey],
     ) -> Result<MutationGuard, &'static str> {
-        super::backpressure::acquire(self, corpus).await
+        super::backpressure::acquire(self, keys).await
+    }
+
+    /// Acquire only the global write-lane permit, without a corpus lock or
+    /// the debt gate. Callers must already hold `lock_corpus` for the
+    /// corpus being written and must have already cleared
+    /// `backpressure::await_debt_gate` *before* taking that lock (the
+    /// catch-up scan/plan/apply split calls this just before `apply`).
+    pub async fn acquire_write_lane(&self) -> Result<OwnedSemaphorePermit, &'static str> {
+        super::backpressure::acquire_lane(self).await
+    }
+}
+
+/// A ground store whose schema is older than this build.
+#[derive(Clone, Copy)]
+struct StaleStore {
+    found: u32,
+    expected: u32,
+}
+
+/// Create the ground dir's parent and validate any existing store metadata.
+/// Return the stale store's schema versions, or `None` for a current store.
+/// This step moves nothing, so a later model or tokenizer failure leaves
+/// the store in place.
+async fn check_ground_dir(cfg: &Config, ground_dir: &Path) -> anyhow::Result<Option<StaleStore>> {
+    if let Some(parent) = ground_dir.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
+    }
+    match LanceStore::validate_existing_metadata(
+        ground_dir,
+        &cfg.embeddings.model,
+        cfg.embeddings.quantized,
+        cfg.embeddings.enabled,
+    ) {
+        Ok(()) => Ok(None),
+        Err(HallouminateError::StoreSchemaStale {
+            found,
+            expected,
+            ground_dir: _,
+        }) => Ok(Some(StaleStore { found, expected })),
+        Err(e) => Err(anyhow::anyhow!(
+            "validate ground dir {}: {e}",
+            ground_dir.display()
+        )),
+    }
+}
+
+/// Open the ground store at `ground_dir`.
+async fn open_ground_store(
+    cfg: &Config,
+    ground_dir: &Path,
+    embedder: Option<Box<dyn EmbedBatch>>,
+    store_lock_owner: StoreLockOwner,
+) -> anyhow::Result<LanceStore> {
+    LanceStore::open_or_create_with_owner(
+        ground_dir,
+        &cfg.embeddings.model,
+        cfg.embeddings.quantized,
+        cfg.embeddings.enabled,
+        embedder,
+        store_lock_owner,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))
+}
+
+/// Open the boot ground store. A stale store moves aside, and every
+/// effective corpus of `cfg` reindexes into the fresh store before boot
+/// continues. A failed move leaves the stale store in place. A failed open
+/// or rebuild removes the partial store; the backup stays.
+async fn open_boot_store(
+    cfg: &Config,
+    ground_dir: &Path,
+    stale: Option<StaleStore>,
+    embedder: Option<Box<dyn EmbedBatch>>,
+    tokenizer: &Tokenizer,
+    store_lock_owner: StoreLockOwner,
+) -> anyhow::Result<LanceStore> {
+    let Some(StaleStore { found, expected }) = stale else {
+        return open_ground_store(cfg, ground_dir, embedder, store_lock_owner).await;
+    };
+    tracing::warn!(
+        target: "hallouminate::daemon",
+        ground_dir = %ground_dir.display(),
+        %found,
+        %expected,
+        "ground store schema v{found} < expected v{expected}; rebuilding from source",
+    );
+    move_stale_store(ground_dir, found).await?;
+    let result = match open_ground_store(cfg, ground_dir, embedder, store_lock_owner).await {
+        Ok(store) => reindex_effective_corpora(cfg, ground_dir, &store, tokenizer)
+            .await
+            .map(|()| store),
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(store) => Ok(store),
+        Err(error) => {
+            remove_partial_store(ground_dir, found, &error).await;
+            Err(error)
+        }
+    }
+}
+
+/// Reindex every effective corpus of `cfg` into `store`.
+async fn reindex_effective_corpora(
+    cfg: &Config,
+    ground_dir: &Path,
+    store: &LanceStore,
+    tokenizer: &Tokenizer,
+) -> anyhow::Result<()> {
+    let started = Instant::now();
+    let registry = HandlerRegistry::new(tokenizer.clone(), CHUNK_BUDGET_TOKENS);
+    for corpus in cfg
+        .effective_corpora()
+        .map_err(|e| anyhow::anyhow!("rebuild: list corpora: {e}"))?
+    {
+        let missing = missing_roots(&corpus);
+        if !missing.is_empty() {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                ground_dir = %ground_dir.display(),
+                corpus = %corpus.name,
+                roots = ?missing,
+                "rebuild: corpus root missing; skipped",
+            );
+            continue;
+        }
+        let stats = index_corpus(&corpus, store, &registry)
+            .await
+            .map_err(|e| anyhow::anyhow!("rebuild: index {}: {e}", corpus.name))?;
+        tracing::info!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            corpus = %corpus.name,
+            files = stats.files_upserted,
+            chunks = stats.chunks_inserted,
+            "rebuild: reindexed",
+        );
+    }
+    tracing::info!(
+        target: "hallouminate::daemon",
+        ground_dir = %ground_dir.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "rebuild: complete",
+    );
+    Ok(())
+}
+
+/// Remove the partial store that a failed boot rebuild left. The next open
+/// creates an empty store, and the watcher's catch-up refills it from source.
+async fn remove_partial_store(ground_dir: &Path, found: u32, error: &anyhow::Error) {
+    if !ground_dir.exists() {
+        return;
+    }
+    match tokio::fs::remove_dir_all(ground_dir).await {
+        Ok(()) => tracing::warn!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            error = %error,
+            "rebuild failed; removed partial ground dir. Backup preserved at {}.bak-v{found}",
+            ground_dir.display(),
+        ),
+        Err(remove_error) => tracing::error!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            error = %error,
+            remove_error = %remove_error,
+            "rebuild failed; could not remove partial ground dir",
+        ),
+    }
+}
+
+/// Prune old backups next to `ground_dir`. A stuck backup dir must never
+/// block an open, so this logs a failure and continues; the next open retries.
+async fn prune_stale_backups_logged(ground_dir: &Path) {
+    if let Err(e) = prune_stale_backups(ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE).await {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            error = %e,
+            "failed to prune stale ground store backups",
+        );
     }
 }
 
@@ -1145,8 +1520,8 @@ async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Resu
 /// Prune backup ground-store directories (`<ground>.bak-v{N}`) older than
 /// `max_age`, as measured from `now`. `now` is threaded in (rather than
 /// read internally) so tests can make ages deterministic without a
-/// filetime crate. Called once at daemon boot; failures are tolerated by
-/// the caller (a stuck backup dir must never block startup).
+/// filetime crate. Boot and each per-request store open call it through
+/// `prune_stale_backups_logged`, which tolerates failure.
 async fn prune_stale_backups(
     ground_dir: &Path,
     now: SystemTime,
@@ -1230,32 +1605,40 @@ async fn prune_stale_backups(
     Ok(())
 }
 
-/// Owned guard around the lazily-loaded crossencoder. Derefs to
-/// `FastembedCrossencoder` so callers can
-/// pass `&mut *guard` directly into anything that wants
-/// `&mut dyn Crossencoder`. Holds an `OwnedMutexGuard` (not a borrowed
-/// `MutexGuard<'a, ...>`) so it can be boxed as `Box<dyn Crossencoder>` and
-/// moved into `spawn_blocking` for the #139 per-request rerank timeout.
+/// Handle for a lazily loaded crossencoder keyed by canonical model name.
+/// Rerank acquires the per-model slot without waiting. Busy and initialization
+/// failures return domain errors, which let ground preserve fusion order. The
+/// handle moves into the ground blocking-pool task that enforces its deadline.
 pub struct CrossencoderGuard {
-    guard: OwnedMutexGuard<HashMap<String, FastembedCrossencoder>>,
-    /// Canonical model name; the key into `guard` that `crossencoder()`
-    /// inserted before handing the guard out.
-    key: String,
+    model: Arc<StdMutex<CrossencoderSlot>>,
     last_use_secs: Arc<AtomicU64>,
 }
 
-impl std::ops::Deref for CrossencoderGuard {
-    type Target = FastembedCrossencoder;
-    fn deref(&self) -> &FastembedCrossencoder {
-        // `crossencoder()` inserts `key` before constructing the guard,
-        // and the guard holds the lock, so the entry can't vanish.
-        self.guard.get(&self.key).expect("crossencoder loaded")
-    }
-}
-
-impl std::ops::DerefMut for CrossencoderGuard {
-    fn deref_mut(&mut self) -> &mut FastembedCrossencoder {
-        self.guard.get_mut(&self.key).expect("crossencoder loaded")
+impl Crossencoder for CrossencoderGuard {
+    fn rerank(
+        &mut self,
+        query: &str,
+        hits: &mut [SearchHit],
+    ) -> hallouminate_domain::common::Result<()> {
+        let mut slot = match self.model.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(HallouminateError::Embed("crossencoder busy".into()));
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                self.model.clear_poison();
+                let mut slot = poisoned.into_inner();
+                slot.model = None;
+                slot
+            }
+        };
+        if slot.model.is_none() {
+            slot.model = Some((slot.initialize)()?);
+        }
+        slot.model
+            .as_mut()
+            .expect("crossencoder initialized")
+            .rerank(query, hits)
     }
 }
 
@@ -1265,20 +1648,6 @@ impl Drop for CrossencoderGuard {
             .store(monotonic_secs(), Ordering::Relaxed);
     }
 }
-
-/// Lets a `CrossencoderGuard` be boxed as `Box<dyn Crossencoder>` and moved
-/// into `spawn_blocking` for the #139 per-request rerank timeout, instead of
-/// call sites unwrapping it to a borrowed `&mut dyn Crossencoder`.
-impl Crossencoder for CrossencoderGuard {
-    fn rerank(
-        &mut self,
-        query: &str,
-        hits: &mut [SearchHit],
-    ) -> hallouminate_domain::common::Result<()> {
-        (**self).rerank(query, hits)
-    }
-}
-
 impl std::fmt::Debug for DaemonState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DaemonState")
@@ -1292,7 +1661,13 @@ impl std::fmt::Debug for DaemonState {
 mod tests {
     use super::super::maintenance::{MaintenanceTick, jittered_sleep_secs};
     use super::*;
+    use async_trait::async_trait;
     use hallouminate_adapters::{EMBEDDING_DIM, EmbedRole, MaintenanceStats};
+    use hallouminate_domain::common::{CorpusConfig, CorpusKey};
+    use hallouminate_domain::ground::{GroundOpts, GroundResponse, ground};
+    use hallouminate_domain::indexer::SignalLists;
+    use hallouminate_domain::search::{ChunkRetrieval, NoopCrossencoder};
+    use std::sync::atomic::AtomicBool;
 
     use std::fmt;
     use tracing::Subscriber;
@@ -1556,10 +1931,35 @@ mod tests {
             state.should_idle_exit_at(300, 1000),
             "clock stale at 1 s; now=1000 is well past idle",
         );
-        state.touch_activity(WorkClass::Internal);
+        state.touch_activity(WorkClass::Internal, IdleClock::Restart);
         assert!(
             !state.should_idle_exit_at(300, state.last_activity_secs() + 1),
             "Internal activity must stamp the idle clock (both classes gate idle-exit)",
+        );
+    }
+
+    #[tokio::test]
+    async fn keep_touch_activity_does_not_restart_the_idle_window() {
+        // #222: a fleet of cheap RPCs must not starve idle-exit. A `Keep`
+        // completion moves the External clock (maintenance-defer still sees
+        // the request) but leaves the idle-exit clock stale.
+        let state = test_state().await;
+        // A sentinel far above any real monotonic reading: a stamp lowers it.
+        const STALE: u64 = u64::MAX / 2;
+        state.set_last_activity_secs_for_test(STALE);
+        state.touch_activity(WorkClass::External, IdleClock::Keep);
+        assert_eq!(state.last_activity_secs(), STALE);
+        assert!(
+            state.should_idle_exit_at(300, STALE + 1000),
+            "a Keep completion must leave the daemon eligible for idle-exit",
+        );
+        assert!(
+            state
+                .inner
+                .external_last_activity_secs
+                .load(Ordering::Relaxed)
+                < STALE,
+            "a Keep completion must still stamp the External clock",
         );
     }
 
@@ -1791,6 +2191,394 @@ mod tests {
         DaemonState::open(cfg, None).await.expect("open")
     }
 
+    fn key(name: &str, root: &str) -> CorpusKey {
+        CorpusKey {
+            name: name.to_string(),
+            canonical_root: PathBuf::from(root),
+        }
+    }
+
+    async fn lock_completes_promptly(state: &DaemonState, keys: Vec<CorpusKey>) -> bool {
+        let state = state.clone();
+        let task = tokio::spawn(async move {
+            let _guard = state.lock_corpus(&keys).await;
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let finished = task.is_finished();
+        if !finished {
+            task.abort();
+        }
+        finished
+    }
+
+    #[tokio::test]
+    async fn same_name_different_roots_lock_independently() {
+        let state = test_state().await;
+        let _main = state.lock_corpus(&[key("wiki", "/main")]).await;
+
+        assert!(
+            lock_completes_promptly(&state, vec![key("wiki", "/worktree")]).await,
+            "a worktree root must not wait on the main checkout's key",
+        );
+        assert!(
+            !lock_completes_promptly(&state, vec![key("wiki", "/main")]).await,
+            "the same key must still serialize",
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_root_lock_serializes_with_single_root_on_a_shared_key() {
+        let state = test_state().await;
+        let multi = state
+            .lock_corpus(&[key("wiki", "/b"), key("wiki", "/a")])
+            .await;
+
+        assert!(
+            !lock_completes_promptly(&state, vec![key("wiki", "/b")]).await,
+            "single-root op on a held key must wait",
+        );
+        assert!(
+            lock_completes_promptly(&state, vec![key("wiki", "/c")]).await,
+            "a key outside the multi-root set stays free",
+        );
+        drop(multi);
+        assert!(lock_completes_promptly(&state, vec![key("wiki", "/b")]).await);
+    }
+
+    #[tokio::test]
+    async fn multi_key_locks_in_opposite_order_do_not_deadlock() {
+        let state = test_state().await;
+        let mut tasks = Vec::new();
+        for index in 0..32 {
+            let state = state.clone();
+            let keys = if index % 2 == 0 {
+                vec![key("wiki", "/a"), key("wiki", "/b")]
+            } else {
+                vec![key("wiki", "/b"), key("wiki", "/a")]
+            };
+            tasks.push(tokio::spawn(async move {
+                let _guard = state.lock_corpus(&keys).await;
+                tokio::task::yield_now().await;
+            }));
+        }
+        let all = async {
+            for task in tasks {
+                task.await.expect("lock task");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), all)
+            .await
+            .expect("opposite-order multi-key locks must not deadlock");
+    }
+
+    #[tokio::test]
+    async fn catch_up_slow_scan_does_not_hold_write_lane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let _corpus_guard = state.lock_corpus(&super::corpus_lock_keys(&corpus)).await;
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(std::sync::Mutex::new(Some((reached_tx, release_rx))));
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+                let hook = hook.clone();
+                let lane_state = lane_state.clone();
+                async move {
+                    let first = hook.lock().unwrap().take();
+                    if let Some((reached_tx, release_rx)) = first {
+                        reached_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    }
+                    lane_state.acquire_write_lane().await
+                }
+            })
+            .await
+        });
+
+        reached_rx.await.expect("scan reached the lane hook");
+        {
+            let lane = state.write_lane();
+            let permit = lane
+                .try_acquire()
+                .expect("lane must be free while scan/plan is in flight");
+            drop(permit);
+        }
+        release_tx.send(()).unwrap();
+        let result = task.await.expect("task join");
+        assert!(matches!(result, Ok(Some(_))));
+    }
+
+    #[tokio::test]
+    async fn catch_up_scan_in_flight_blocks_same_corpus_guard() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let lock_keys = super::corpus_lock_keys(&corpus);
+
+        let _corpus_guard = state.lock_corpus(&super::corpus_lock_keys(&corpus)).await;
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(std::sync::Mutex::new(Some((reached_tx, release_rx))));
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+                let hook = hook.clone();
+                let lane_state = lane_state.clone();
+                async move {
+                    let first = hook.lock().unwrap().take();
+                    if let Some((reached_tx, release_rx)) = first {
+                        reached_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    }
+                    lane_state.acquire_write_lane().await
+                }
+            })
+            .await
+        });
+        reached_rx.await.expect("scan reached the lane hook");
+
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        let second_state = state.clone();
+        let second = tokio::spawn(async move {
+            let _guard = second_state.lock_corpus(&lock_keys).await;
+            second_tx.send(()).unwrap();
+        });
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            second_rx.try_recv().is_err(),
+            "second lock_corpus must not complete while the outer guard is held",
+        );
+
+        release_tx.send(()).unwrap();
+        task.await.expect("task join").expect("catch_up_corpus");
+        drop(_corpus_guard);
+        second.await.expect("second task join");
+    }
+
+    #[tokio::test]
+    async fn catch_up_apply_holds_lane_until_released() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        std::fs::write(root.join("a.md"), "# A\n\nbody\n").expect("write a.md");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let _corpus_guard = state.lock_corpus(&super::corpus_lock_keys(&corpus)).await;
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Arc::new(std::sync::Mutex::new(Some((reached_tx, release_rx))));
+        let lane_state = state.clone();
+        let task = tokio::spawn(async move {
+            super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+                let hook = hook.clone();
+                let lane_state = lane_state.clone();
+                async move {
+                    let permit = lane_state.acquire_write_lane().await?;
+                    let first = hook.lock().unwrap().take();
+                    if let Some((reached_tx, release_rx)) = first {
+                        reached_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                    }
+                    Ok(permit)
+                }
+            })
+            .await
+        });
+
+        reached_rx.await.expect("lane acquired before apply");
+        assert!(
+            state.write_lane().try_acquire().is_err(),
+            "lane must be held once acquired, before apply starts",
+        );
+        release_tx.send(()).unwrap();
+        let result = task.await.expect("task join");
+        assert!(matches!(result, Ok(Some(_))));
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be released once apply completes",
+        );
+    }
+
+    #[tokio::test]
+    async fn catch_up_no_work_never_acquires_the_lane() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("docs");
+        std::fs::create_dir_all(&root).expect("mkdir docs");
+        let state = test_state().await;
+        let corpus = CorpusConfig {
+            name: "docs".to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+
+        let res = state
+            .resources_for(state.baseline())
+            .await
+            .expect("resources");
+        let registry = state.make_registry();
+        let lane_touched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let touched = lane_touched.clone();
+        let result = super::super::dispatch::catch_up_corpus(&res, &registry, &corpus, move || {
+            let touched = touched.clone();
+            async move {
+                touched.store(true, Ordering::Relaxed);
+                panic!("no-work plan must never acquire the write lane");
+                #[allow(unreachable_code)]
+                Err("unreachable")
+            }
+        })
+        .await;
+
+        assert!(matches!(result, Ok(None)));
+        assert!(!lane_touched.load(Ordering::Relaxed));
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be untouched when the plan has no work",
+        );
+    }
+
+    #[tokio::test]
+    async fn write_lane_per_batch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let big_root = tmp.path().join("big");
+        let small_root = tmp.path().join("small");
+        std::fs::create_dir_all(&big_root).expect("mkdir big");
+        std::fs::create_dir_all(&small_root).expect("mkdir small");
+        for n in 0..20 {
+            std::fs::write(
+                big_root.join(format!("f{n}.md")),
+                format!("# F{n}\n\nbody\n"),
+            )
+            .expect("write big file");
+        }
+        std::fs::write(small_root.join("s.md"), "# S\n\nbody\n").expect("write small file");
+        let corpus = |name: &str, root: &std::path::Path| CorpusConfig {
+            name: name.to_string(),
+            paths: vec![root.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".to_string()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let big = corpus("big", &big_root);
+        let small = corpus("small", &small_root);
+        let state = test_state().await;
+        let res = Arc::new(
+            state
+                .resources_for(state.baseline())
+                .await
+                .expect("resources"),
+        );
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        let big_task = tokio::spawn({
+            let (state, res) = (state.clone(), res.clone());
+            let (calls, parked, resume) = (calls.clone(), parked.clone(), resume.clone());
+            async move {
+                super::super::dispatch::catch_up_corpus(
+                    &res,
+                    &state.make_registry(),
+                    &big,
+                    move || {
+                        let (state, calls) = (state.clone(), calls.clone());
+                        let (parked, resume) = (parked.clone(), resume.clone());
+                        async move {
+                            if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                                parked.notify_one();
+                                resume.notified().await;
+                            }
+                            state.acquire_write_lane().await
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), parked.notified())
+            .await
+            .expect("large catch-up reaches its second batch");
+        let small_stats = tokio::time::timeout(
+            Duration::from_secs(10),
+            super::super::dispatch::catch_up_corpus(
+                &res,
+                &state.make_registry(),
+                &small,
+                super::super::dispatch::state_write_lane(&state),
+            ),
+        )
+        .await
+        .expect("small catch-up must write while the large one waits between batches")
+        .expect("small catch-up");
+        assert!(small_stats.is_some());
+        assert!(
+            !big_task.is_finished(),
+            "large catch-up is still between batches when the small one finishes",
+        );
+
+        resume.notify_one();
+        let big_stats = big_task
+            .await
+            .expect("join")
+            .expect("large catch-up")
+            .expect("large catch-up had work");
+        assert_eq!(big_stats.files_upserted, 20);
+        assert!(
+            state.write_lane().try_acquire().is_ok(),
+            "lane must be free after both catch-ups",
+        );
+    }
+
     #[tokio::test]
     async fn touch_activity_advances_the_idle_clock() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1803,7 +2591,7 @@ mod tests {
             state.should_idle_exit_at(300, 1000),
             "clock stale at 1 s; now=1000 is well past idle",
         );
-        state.touch_activity(WorkClass::External);
+        state.touch_activity(WorkClass::External, IdleClock::Restart);
         assert!(
             !state.should_idle_exit_at(300, state.last_activity_secs() + 1),
             "touch_activity must reset the clock so a fresh now is not idle",
@@ -1846,7 +2634,7 @@ mod tests {
         );
         assert_eq!(state.inner.active_connections.load(Ordering::SeqCst), 2);
 
-        state.touch_activity(WorkClass::External);
+        state.touch_activity(WorkClass::External, IdleClock::Restart);
         assert!(
             state
                 .inner
@@ -1863,7 +2651,7 @@ mod tests {
             "External touch must not stamp the Internal clock",
         );
 
-        state.touch_activity(WorkClass::Internal);
+        state.touch_activity(WorkClass::Internal, IdleClock::Restart);
         assert!(
             state
                 .inner
@@ -2013,17 +2801,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn crossencoder_guard_updates_last_use_on_drop() {
-        let last_use_secs = Arc::new(AtomicU64::new(1));
+    async fn crossencoder_guard_recovers_after_native_panic() {
+        struct PanicCrossencoder;
+        impl Crossencoder for PanicCrossencoder {
+            fn rerank(
+                &mut self,
+                _query: &str,
+                _hits: &mut [SearchHit],
+            ) -> hallouminate_domain::common::Result<()> {
+                panic!("test crossencoder panic");
+            }
+        }
+
+        let state = test_state().await;
+        let initializations = Arc::new(AtomicUsize::new(0));
+        let initialize: CrossencoderInitializer = {
+            let initializations = Arc::clone(&initializations);
+            Box::new(move || {
+                if initializations.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(Box::new(PanicCrossencoder) as Box<dyn Crossencoder>)
+                } else {
+                    Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
+                }
+            })
+        };
+        install_test_crossencoder(&state, "bge-reranker-base", initialize);
+        let mut first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .expect("first")
+            .expect("configured");
+        let panic_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first.rerank("q", &mut [])));
+        assert!(panic_result.is_err());
+        drop(first);
+
+        let mut second = state
+            .crossencoder(Some("bge-reranker-base"))
+            .expect("second")
+            .expect("configured");
+        assert!(second.rerank("q", &mut []).is_ok());
+        assert_eq!(initializations.load(Ordering::SeqCst), 2);
+    }
+    #[test]
+    fn crossencoder_guard_updates_last_use_on_drop() {
+        let last_use_secs = Arc::new(AtomicU64::new(u64::MAX));
         let before_drop = monotonic_secs();
+        let initialize: CrossencoderInitializer =
+            Box::new(|| Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>));
+        let model = Arc::new(StdMutex::new(CrossencoderSlot {
+            model: None,
+            initialize,
+        }));
 
         drop(CrossencoderGuard {
-            guard: Arc::new(Mutex::new(HashMap::new())).lock_owned().await,
-            key: String::new(),
+            model,
             last_use_secs: Arc::clone(&last_use_secs),
         });
 
         let observed = last_use_secs.load(Ordering::Relaxed);
+        assert_ne!(observed, u64::MAX);
         assert!(
             observed >= before_drop,
             "drop should stamp crossencoder use at or after guard lifetime start: observed {observed}, before {before_drop}",
@@ -2250,6 +3086,429 @@ mod tests {
                  store was opened more than once for one ground dir",
             );
         }
+    }
+
+    /// #589 regression: a repo-level `[storage].ground_dir` override can hold
+    /// an older-schema store. The first request moves it aside and opens a
+    /// fresh store without a reindex. The admitted catch-up then refills it.
+    #[tokio::test]
+    async fn resources_for_moves_stale_override_store_and_catch_up_refills_it() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        let StaleSeed {
+            current,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let aged_backup = override_root.path().join("ground.bak-v0");
+        std::fs::create_dir(&aged_backup).expect("create aged backup");
+        let aged = SystemTime::now() - STALE_BACKUP_MAX_AGE - Duration::from_secs(86_400);
+        std::fs::File::open(&aged_backup)
+            .expect("open aged backup")
+            .set_modified(aged)
+            .expect("age the backup");
+
+        let resources = state
+            .resources_for(&cfg)
+            .await
+            .expect("a stale override store must open on the first request");
+
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+            "the stale store must move aside",
+        );
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read fresh meta"),
+            current,
+            "the fresh store must carry the current schema metadata",
+        );
+        assert!(
+            !aged_backup.exists(),
+            "the request must prune backups past the maximum age",
+        );
+        assert_eq!(
+            resources.store.count_rows().await.expect("count rows"),
+            0,
+            "the request must not reindex inline",
+        );
+
+        catch_up_override(&state, &resources, &cfg).await;
+        assert_ground_finds_arrakis(&resources, &cfg).await;
+    }
+
+    struct StaleSeed {
+        current: String,
+        stale: String,
+        backup_meta: PathBuf,
+    }
+
+    /// Seed an empty store at `ground_dir`, then rewrite its `meta.toml` to
+    /// the schema version before the current one.
+    async fn seed_stale_store(ground_dir: &Path, cfg: &Config) -> StaleSeed {
+        {
+            let _store = LanceStore::open_or_create(
+                ground_dir,
+                &cfg.embeddings.model,
+                cfg.embeddings.quantized,
+                cfg.embeddings.enabled,
+                None,
+            )
+            .await
+            .expect("seed override store");
+        }
+        let current_version = hallouminate_adapters::default_schema_version_pub();
+        let stale_version = current_version - 1;
+        let meta_path = ground_dir.join("meta.toml");
+        let current = std::fs::read_to_string(&meta_path).expect("read seeded meta");
+        let stale = current.replace(
+            &format!("schema_version = {current_version}"),
+            &format!("schema_version = {stale_version}"),
+        );
+        assert_ne!(
+            stale, current,
+            "seeded meta must carry the current schema version"
+        );
+        std::fs::write(&meta_path, &stale).expect("write stale meta");
+        let backup_meta = ground_dir
+            .with_file_name(format!("ground.bak-v{stale_version}"))
+            .join("meta.toml");
+        StaleSeed {
+            current,
+            stale,
+            backup_meta,
+        }
+    }
+
+    /// Lexical-only daemon plus an override config whose ground dir sits at
+    /// `<override_root>/ground` and whose one corpus holds one markdown file.
+    async fn override_fixture(
+        baseline_dir: &Path,
+        corpus_dir: &Path,
+        override_root: &Path,
+    ) -> (DaemonState, Config, PathBuf) {
+        let mut baseline = Config::default();
+        baseline.embeddings.enabled = false;
+        baseline.storage.ground_dir = baseline_dir.to_string_lossy().into_owned();
+        let state = DaemonState::open(baseline.clone(), None)
+            .await
+            .expect("open daemon state");
+        std::fs::write(
+            corpus_dir.join("arrakis.md"),
+            "# Arrakis\n\nThe spice must flow.\n",
+        )
+        .expect("write corpus file");
+        let ground_dir = override_root.join("ground");
+        let mut cfg = baseline;
+        cfg.storage.ground_dir = ground_dir.to_string_lossy().into_owned();
+        cfg.corpora = vec![CorpusConfig {
+            name: "docs".into(),
+            paths: vec![corpus_dir.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        }];
+        (state, cfg, ground_dir)
+    }
+
+    /// Run the watcher's admitted catch-up for the override corpus.
+    async fn catch_up_override(state: &DaemonState, resources: &RequestResources, cfg: &Config) {
+        super::super::dispatch::catch_up_corpus(
+            resources,
+            &state.make_registry(),
+            &cfg.corpora[0],
+            super::super::dispatch::state_write_lane(state),
+        )
+        .await
+        .expect("catch up the override corpus");
+    }
+
+    async fn assert_ground_finds_arrakis(resources: &RequestResources, cfg: &Config) {
+        let response = ground(
+            "spice",
+            &cfg.corpora[0],
+            resources.store.as_ref(),
+            None,
+            rerank_opts(),
+        )
+        .await
+        .expect("ground the override store");
+        let mut paths = Vec::new();
+        for path in response.docs.keys() {
+            paths.push(path.clone());
+        }
+        assert_eq!(paths.len(), 1, "one file must match: {paths:?}");
+        assert!(
+            paths[0].ends_with("arrakis.md"),
+            "hit must be arrakis.md: {paths:?}"
+        );
+    }
+
+    /// Press attack (#589): concurrent first requests to one stale override
+    /// must move the stale store aside once. A second mover renames the
+    /// fresh store over the stale backup.
+    #[tokio::test]
+    async fn concurrent_requests_move_stale_override_store_once() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        let StaleSeed {
+            current,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let state = state.clone();
+            let cfg = cfg.clone();
+            handles.push(tokio::spawn(async move {
+                state.resources_for(&cfg).await.expect("resources_for")
+            }));
+        }
+        let mut resolved = Vec::new();
+        for handle in handles {
+            resolved.push(handle.await.expect("join resources_for task"));
+        }
+
+        let first = &resolved[0];
+        for (i, res) in resolved.iter().enumerate() {
+            assert!(
+                Arc::ptr_eq(first, res),
+                "racer {i} resolved a different RequestResources Arc",
+            );
+        }
+        assert_one_store_and_one_backup(override_root.path(), &backup_meta);
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+            "the backup must hold the original stale store, not a fresh one",
+        );
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read fresh meta"),
+            current,
+        );
+    }
+
+    fn assert_one_store_and_one_backup(override_root: &Path, backup_meta: &Path) {
+        let backup_dir = backup_meta.parent().expect("backup dir");
+        let mut siblings = Vec::new();
+        for entry in std::fs::read_dir(override_root).expect("read override root") {
+            siblings.push(entry.expect("dir entry").file_name());
+        }
+        siblings.sort();
+        assert_eq!(
+            siblings,
+            vec![
+                std::ffi::OsString::from("ground"),
+                backup_dir.file_name().expect("backup name").to_os_string(),
+            ],
+            "exactly one store and one backup must exist",
+        );
+    }
+
+    /// Press attack (#589): two resource keys can name one stale dir. Only
+    /// the ground-dir lock stops the second key from moving the fresh store
+    /// over the stale backup.
+    #[tokio::test]
+    async fn two_keys_on_one_stale_override_dir_move_it_once() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        let StaleSeed {
+            current: _,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let mut quantized = cfg.clone();
+        quantized.embeddings.quantized = !cfg.embeddings.quantized;
+
+        let mut handles = Vec::new();
+        for request in [cfg, quantized] {
+            let state = state.clone();
+            handles.push(tokio::spawn(async move {
+                state.resources_for(&request).await.map(|_| ())
+            }));
+        }
+        let mut errors = Vec::new();
+        for handle in handles {
+            match handle.await.expect("join resources_for task") {
+                Ok(()) => {}
+                Err(error) => errors.push(format!("{error:#}")),
+            }
+        }
+
+        assert_eq!(errors.len(), 1, "exactly one key must lose: {errors:?}");
+        assert!(
+            errors[0].contains("embedding store mismatch"),
+            "the losing key must fail validation: {errors:?}",
+        );
+        assert_one_store_and_one_backup(override_root.path(), &backup_meta);
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+            "the backup must hold the original stale store",
+        );
+    }
+
+    /// Press attack (#589): an override store with a different embedding
+    /// model is not stale. The request must fail and leave the store in place.
+    #[tokio::test]
+    async fn override_store_with_other_model_fails_without_moving_it() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        {
+            let _store = LanceStore::open_or_create(
+                &ground_dir,
+                "intfloat/multilingual-e5-small",
+                cfg.embeddings.quantized,
+                cfg.embeddings.enabled,
+                None,
+            )
+            .await
+            .expect("seed store under another model");
+        }
+        let meta_path = ground_dir.join("meta.toml");
+        let before = std::fs::read_to_string(&meta_path).expect("read meta before");
+
+        let Err(err) = state.resources_for(&cfg).await else {
+            panic!("a model mismatch must refuse, not rebuild");
+        };
+
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("validate ground dir")
+                && chain.contains("intfloat/multilingual-e5-small"),
+            "error must come from metadata validation and name the stored model: {chain}",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&meta_path).expect("read meta after"),
+            before,
+            "a refused request must not touch the store",
+        );
+        let mut backups = Vec::new();
+        for entry in std::fs::read_dir(override_root.path()).expect("read override root") {
+            let name = entry.expect("dir entry").file_name();
+            if name.to_string_lossy().contains(".bak-v") {
+                backups.push(name);
+            }
+        }
+        assert!(backups.is_empty(), "no backup may exist: {backups:?}");
+    }
+
+    /// #589 enabled path: an embedder failure on the first request must leave
+    /// the stale store in place. The next request moves it, installs the
+    /// embedder, and catch-up refills the fresh store.
+    #[tokio::test]
+    async fn failed_embedder_init_leaves_stale_override_store_in_place() {
+        let baseline_dir = tempfile::tempdir().expect("baseline tempdir");
+        let corpus_dir = tempfile::tempdir().expect("corpus tempdir");
+        let override_root = tempfile::tempdir().expect("override tempdir");
+        let (state, mut cfg, ground_dir) =
+            override_fixture(baseline_dir.path(), corpus_dir.path(), override_root.path()).await;
+        cfg.embeddings.enabled = true;
+        let StaleSeed {
+            current: _,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let registered = super::super::watch::register_runtime_corpora(
+            &state,
+            Some(override_root.path()),
+            &cfg.corpora,
+            &cfg,
+        );
+        assert!(registered.is_ok(), "register the override corpus");
+        let Some(id) = state.watch_registry().begin_next_catch_up(1) else {
+            panic!("a new registration must queue its catch-up");
+        };
+        state
+            .watch_registry()
+            .finish_catch_up(&id, Err("stale store".into()));
+        assert!(
+            state.watch_registry().begin_next_catch_up(1).is_none(),
+            "a failed catch-up waits for the reconcile tick",
+        );
+
+        let failed = state
+            .resources_for_with_initializer(&cfg, |_, _, _| async {
+                Err(anyhow::anyhow!("model download failed"))
+            })
+            .await;
+        let Err(err) = failed else {
+            panic!("a failed embedder init must fail the request");
+        };
+        assert!(format!("{err:#}").contains("model download failed"));
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read meta"),
+            stale,
+            "a failed request must leave the stale store in place",
+        );
+        assert!(
+            !backup_meta.exists(),
+            "a failed request must not move the stale store",
+        );
+        assert!(
+            state.watch_registry().begin_next_catch_up(1).is_none(),
+            "a failed request must not queue a catch-up",
+        );
+
+        let resources = state
+            .resources_for_with_initializer(&cfg, |_, _, _| async {
+                Ok(Box::new(ZeroEmbedder) as Box<dyn EmbedBatch>)
+            })
+            .await
+            .expect("the next request opens the override store");
+        assert!(resources.store.embedder_available());
+        assert_eq!(
+            std::fs::read_to_string(&backup_meta).expect("read backup meta"),
+            stale,
+        );
+        assert!(
+            state.watch_registry().begin_next_catch_up(1).is_some(),
+            "a stale move must queue the catch-up again",
+        );
+        catch_up_override(&state, &resources, &cfg).await;
+        assert_ground_finds_arrakis(&resources, &cfg).await;
+    }
+
+    /// #589 boot path: when the stale store cannot move aside, boot fails and
+    /// leaves the stale store in place. A file at the backup path blocks the move.
+    #[tokio::test]
+    async fn boot_move_failure_leaves_stale_store_in_place() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ground_dir = root.path().join("ground");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = ground_dir.to_string_lossy().into_owned();
+        let StaleSeed {
+            current: _,
+            stale,
+            backup_meta,
+        } = seed_stale_store(&ground_dir, &cfg).await;
+        let backup_path = backup_meta.parent().expect("backup path");
+        std::fs::write(backup_path, "not a directory").expect("block the backup path");
+
+        let Err(err) = DaemonState::open(cfg, None).await else {
+            panic!("a failed move must fail boot");
+        };
+
+        assert_eq!(
+            std::fs::read_to_string(ground_dir.join("meta.toml")).expect("read stale meta"),
+            stale,
+            "a failed move must leave the stale store in place: {err:#}",
+        );
+        assert!(backup_path.is_file(), "the blocking file must stay");
     }
     struct ZeroEmbedder;
 
@@ -2686,5 +3945,380 @@ mod tests {
     #[test]
     fn jittered_sleep_secs_below_ten_adds_no_jitter() {
         assert_eq!(jittered_sleep_secs(5), 5);
+    }
+    struct BlockingCrossencoder {
+        started: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    }
+
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Crossencoder for BlockingCrossencoder {
+        fn rerank(
+            &mut self,
+            _query: &str,
+            hits: &mut [SearchHit],
+        ) -> hallouminate_domain::common::Result<()> {
+            self.started.store(true, Ordering::SeqCst);
+            spin_until(&self.release);
+            hits.reverse();
+            Ok(())
+        }
+    }
+
+    fn spin_until(flag: &AtomicBool) {
+        while !flag.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// Initializer that counts each entry in `entered` and blocks until `release`.
+    fn blocking_initializer(
+        entered: &Arc<AtomicUsize>,
+        release: &Arc<AtomicBool>,
+    ) -> CrossencoderInitializer {
+        let entered = Arc::clone(entered);
+        let release = Arc::clone(release);
+        Box::new(move || {
+            entered.fetch_add(1, Ordering::SeqCst);
+            spin_until(&release);
+            Ok(Box::new(NoopCrossencoder) as Box<dyn Crossencoder>)
+        })
+    }
+
+    /// Yield the runtime until `ready` holds; fail with `what` after one second.
+    async fn await_until(ready: impl Fn() -> bool, what: &str) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(what);
+    }
+
+    #[derive(Clone)]
+    struct TestChunkStore {
+        hits: Vec<SearchHit>,
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for TestChunkStore {
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> hallouminate_domain::common::Result<Vec<SearchHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn retrieve_signals(
+            &self,
+            corpus_key: &CorpusKey,
+            _query: &str,
+            limit: usize,
+        ) -> hallouminate_domain::common::Result<SignalLists> {
+            let mut hits = Vec::new();
+            for hit in &self.hits {
+                if hit.corpus_key != *corpus_key {
+                    continue;
+                }
+                if hits.len() >= limit {
+                    break;
+                }
+                hits.push(hit.clone());
+            }
+            let mut fts = Vec::with_capacity(hits.len());
+            let mut hit_map = HashMap::with_capacity(hits.len());
+            for hit in hits {
+                fts.push(hit.chunk_id.clone());
+                hit_map.insert(hit.chunk_id.clone(), hit);
+            }
+            Ok(SignalLists {
+                fts,
+                vector: Vec::new(),
+                fts_scores: HashMap::new(),
+                vector_distances: HashMap::new(),
+                hits: hit_map,
+            })
+        }
+    }
+
+    fn install_test_crossencoder(
+        state: &DaemonState,
+        model_name: &str,
+        initialize: CrossencoderInitializer,
+    ) {
+        let key = canonical_crossencoder_model(model_name).expect("test model name");
+        state
+            .inner
+            .crossencoders
+            .lock()
+            .expect("crossencoder map lock")
+            .insert(
+                key,
+                Arc::new(StdMutex::new(CrossencoderSlot {
+                    model: None,
+                    initialize,
+                })),
+            );
+    }
+
+    fn rerank_corpus() -> CorpusConfig {
+        CorpusConfig {
+            name: "rerank".into(),
+            paths: vec!["/tmp".into()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        }
+    }
+
+    fn rerank_hit(corpus: &CorpusConfig, file_ref: &str, score: f32) -> SearchHit {
+        SearchHit {
+            chunk_id: format!("{file_ref}#0"),
+            corpus_key: corpus
+                .corpus_keys()
+                .into_iter()
+                .next()
+                .expect("test corpus key"),
+            file_ref: file_ref.into(),
+            heading_path: Vec::new(),
+            line_start: 1,
+            line_end: 2,
+            text: "test hit".into(),
+            search_text: "test hit".into(),
+            summary: String::new(),
+            keywords: Vec::new(),
+            score,
+            mtime_ms: 0,
+            claim_marks: Vec::new(),
+            structure: None,
+            overlap_bytes: 0,
+            z_score: None,
+        }
+    }
+
+    fn rerank_store(corpus: &CorpusConfig) -> TestChunkStore {
+        TestChunkStore {
+            hits: vec![
+                rerank_hit(corpus, "/tmp/a.md", 0.5),
+                rerank_hit(corpus, "/tmp/b.md", 0.4),
+            ],
+        }
+    }
+
+    fn rerank_opts() -> GroundOpts {
+        GroundOpts {
+            top_files: 10,
+            chunks_per_file: 10,
+            limit: 10,
+            rerank_timeout: Duration::from_millis(10),
+            ..GroundOpts::default()
+        }
+    }
+
+    fn spawn_ground(
+        corpus: &CorpusConfig,
+        store: &TestChunkStore,
+        crossencoder: CrossencoderGuard,
+    ) -> JoinHandle<hallouminate_domain::common::Result<GroundResponse>> {
+        let corpus = corpus.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            ground(
+                "q",
+                &corpus,
+                &store,
+                Some(Box::new(crossencoder)),
+                rerank_opts(),
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn crossencoder_admission_deadline_falls_back_while_native_rerank_is_blocked() {
+        let state = test_state().await;
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_guard = ReleaseOnDrop(Arc::clone(&release));
+        let initialize: CrossencoderInitializer = {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            Box::new(move || {
+                Ok(Box::new(BlockingCrossencoder {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }) as Box<dyn Crossencoder>)
+            })
+        };
+        install_test_crossencoder(&state, "bge-reranker-base", initialize);
+
+        let corpus = rerank_corpus();
+        let store = rerank_store(&corpus);
+        let first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .expect("admit first crossencoder")
+            .expect("configured crossencoder");
+        let first_task = spawn_ground(&corpus, &store, first);
+        await_until(
+            || started.load(Ordering::SeqCst),
+            "first native rerank starts",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let mut second = state
+            .crossencoder(Some("bge-reranker-base"))
+            .expect("admit second crossencoder")
+            .expect("configured crossencoder");
+        assert!(second.rerank("q", &mut []).is_err());
+        let second_started = Instant::now();
+        let second = ground("q", &corpus, &store, Some(Box::new(second)), rerank_opts())
+            .await
+            .expect("second ground request");
+        assert!(
+            second_started.elapsed() < Duration::from_millis(100),
+            "busy admission must return fallback without waiting for the blocked native call",
+        );
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "crossencoder-unavailable"),
+            "second request must report unavailable fallback after bounded admission"
+        );
+        assert_eq!(second.docs.len(), 2);
+        let first_score = second
+            .docs
+            .get("/tmp/a.md")
+            .expect("first fallback doc")
+            .score;
+        let second_score = second
+            .docs
+            .get("/tmp/b.md")
+            .expect("second fallback doc")
+            .score;
+        assert!(
+            first_score > second_score,
+            "fusion order must remain unchanged on fallback"
+        );
+
+        drop(release_guard);
+        let first = first_task
+            .await
+            .expect("first ground task")
+            .expect("first ground request");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "rerank-timeout"),
+            "first request must use fusion fallback after its deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn crossencoder_concurrent_reranks_initialize_once() {
+        let state = test_state().await;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_guard = ReleaseOnDrop(Arc::clone(&release));
+        install_test_crossencoder(
+            &state,
+            "bge-reranker-base",
+            blocking_initializer(&entered, &release),
+        );
+        let corpus = rerank_corpus();
+        let store = rerank_store(&corpus);
+        let first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .expect("first")
+            .expect("configured");
+        let first_task = spawn_ground(&corpus, &store, first);
+        await_until(
+            || entered.load(Ordering::SeqCst) == 1,
+            "lazy constructor starts on the blocking pool",
+        )
+        .await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            tokio::time::sleep(Duration::from_millis(10)),
+        )
+        .await
+        .expect("the current-thread runtime stays responsive during construction");
+        let second = state
+            .crossencoder(Some("bge-reranker-base"))
+            .expect("second")
+            .expect("configured");
+        let second_started = Instant::now();
+        let second = ground("q", &corpus, &store, Some(Box::new(second)), rerank_opts())
+            .await
+            .expect("second ground request");
+        assert!(second_started.elapsed() < Duration::from_millis(100));
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "crossencoder-unavailable")
+        );
+        drop(release_guard);
+        let first = first_task
+            .await
+            .expect("first ground task")
+            .expect("first ground request");
+        assert!(
+            first
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "rerank-timeout")
+        );
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn crossencoder_different_models_initialize_independently() {
+        let state = test_state().await;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let release_guard = ReleaseOnDrop(Arc::clone(&release));
+        for model_name in ["bge-reranker-base", "bge-reranker-v2-m3"] {
+            install_test_crossencoder(&state, model_name, blocking_initializer(&entered, &release));
+        }
+        let mut first = state
+            .crossencoder(Some("bge-reranker-base"))
+            .expect("first")
+            .expect("configured");
+        let mut second = state
+            .crossencoder(Some("bge-reranker-v2-m3"))
+            .expect("second")
+            .expect("configured");
+        let first_task = tokio::task::spawn_blocking(move || first.rerank("q", &mut []));
+        let second_task = tokio::task::spawn_blocking(move || second.rerank("q", &mut []));
+        await_until(
+            || entered.load(Ordering::SeqCst) == 2,
+            "different models must initialize concurrently",
+        )
+        .await;
+        drop(release_guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            first_task
+                .await
+                .expect("first model")
+                .expect("first rerank");
+            second_task
+                .await
+                .expect("second model")
+                .expect("second rerank");
+        })
+        .await
+        .expect("different models must not share an execution lock");
     }
 }

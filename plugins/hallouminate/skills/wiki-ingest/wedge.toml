@@ -1,0 +1,5 @@
+name = "ingest-ledger"
+entry = "ingest_ledger:main"
+source = "ingest_ledger.py"
+project = "."
+repo = "paulnsorensen/hallouminate"

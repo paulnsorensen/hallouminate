@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
 
+use crate::embedder::{CPU_DEVICE_POLICY, DISABLE_KLEIDIAI, cpu_no_arena};
 use hallouminate_domain::common::{HallouminateError, Result};
 use hallouminate_domain::indexer::SearchHit;
 use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
@@ -9,7 +10,7 @@ use hallouminate_domain::search::{Crossencoder, canonical_crossencoder_model};
 fn resolve_model(canonical: &'static str) -> RerankerModel {
     match canonical {
         "jina-reranker-v1-turbo-en" => RerankerModel::JINARerankerV1TurboEn,
-        "jina-reranker-v2-base-multiligual" => RerankerModel::JINARerankerV2BaseMultiligual,
+        "jina-reranker-v2-base-multiligual" => RerankerModel::JINARerankerV2BaseMultilingual,
         "bge-reranker-base" => RerankerModel::BGERerankerBase,
         "bge-reranker-v2-m3" => RerankerModel::BGERerankerV2M3,
         _ => unreachable!("resolve_model takes a canonical name from canonical_crossencoder_model"),
@@ -27,7 +28,10 @@ impl FastembedCrossencoder {
         let model = resolve_model(canonical);
         let opts = RerankInitOptions::new(model)
             .with_cache_dir(PathBuf::from(cache_dir))
-            .with_show_download_progress(true);
+            .with_show_download_progress(true)
+            .with_execution_providers(cpu_no_arena())
+            .with_session_config(DISABLE_KLEIDIAI.0, DISABLE_KLEIDIAI.1)
+            .with_auto_device(CPU_DEVICE_POLICY);
         let inner = TextRerank::try_new(opts).map_err(|e| {
             HallouminateError::Embed(format!(
                 "init crossencoder {canonical}: {e}\n  \
@@ -145,8 +149,28 @@ mod tests {
             score,
             mtime_ms: 0,
             claim_marks: vec![],
+            structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
+    }
+
+    #[test]
+    fn cpu_no_arena_registers_exactly_one_cpu_provider() {
+        let eps = cpu_no_arena();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].name(), "CPUExecutionProvider");
+    }
+
+    #[test]
+    fn try_new_options_carry_disable_kleidiai_session_config() {
+        let opts = RerankInitOptions::new(RerankerModel::BGERerankerBase)
+            .with_execution_providers(cpu_no_arena())
+            .with_session_config(DISABLE_KLEIDIAI.0, DISABLE_KLEIDIAI.1);
+        assert_eq!(
+            opts.session_config,
+            vec![("mlas.disable_kleidiai".to_string(), "1".to_string())]
+        );
     }
 
     #[test]

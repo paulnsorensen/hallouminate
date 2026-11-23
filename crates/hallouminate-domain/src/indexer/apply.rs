@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::common::{CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result};
 use crate::corpus::blake3_file;
@@ -7,11 +9,24 @@ use crate::indexer::store::ChunkStore;
 
 use super::format::HandlerRegistry;
 use super::plan::{IndexPlan, MtimeCandidate};
-use super::writer::{WriteRequest, file_ref_string, prepare_file};
+use super::writer::{Prepared, SkipReason, WriteRequest, file_ref_string, prepare_file};
+
+/// Maximum number of files that [`ApplyStats::skipped_unreadable`] names.
+/// The `files_skipped_unreadable` count stays exact past this cap.
+pub const MAX_REPORTED_SKIPS: usize = 100;
+
+/// One present file that an [`apply`] run skipped without indexing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedFile {
+    /// The skipped file.
+    pub file: FileRef,
+    /// Why the indexer skipped it.
+    pub reason: SkipReason,
+}
 
 /// Tallies of the work an [`apply`] run performed, returned to the caller for
 /// reporting and assertions.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ApplyStats {
     /// Files written through the upsert/fallthrough path (content (re)indexed).
     pub files_upserted: usize,
@@ -33,10 +48,52 @@ pub struct ApplyStats {
     /// parse failure (atomic-save race, partial write, momentary corruption)
     /// must not silently drop a file from search.
     pub files_skipped_unreadable: usize,
+    /// The first [`MAX_REPORTED_SKIPS`] files counted in
+    /// `files_skipped_unreadable`, in processing order, with the reason.
+    pub skipped_unreadable: Vec<SkippedFile>,
     /// Total chunks written across all upserted files (both embedding modes).
     pub chunks_inserted: usize,
     /// Total embedding vectors written; zero when the embedder is `None`.
     pub embeddings_inserted: usize,
+}
+
+impl ApplyStats {
+    /// Counts one unreadable file, and names it while fewer than
+    /// [`MAX_REPORTED_SKIPS`] files are named.
+    pub fn record_unreadable(&mut self, skipped: SkippedFile) {
+        self.files_skipped_unreadable += 1;
+        if self.skipped_unreadable.len() < MAX_REPORTED_SKIPS {
+            self.skipped_unreadable.push(skipped);
+        }
+    }
+
+    /// Adds every tally in `other` to `self`. The named skips stay capped
+    /// at [`MAX_REPORTED_SKIPS`].
+    pub fn merge(&mut self, other: ApplyStats) {
+        let ApplyStats {
+            files_upserted,
+            files_touched,
+            files_deleted,
+            files_skipped_empty,
+            files_skipped_unreadable,
+            skipped_unreadable,
+            chunks_inserted,
+            embeddings_inserted,
+        } = other;
+        self.files_upserted += files_upserted;
+        self.files_touched += files_touched;
+        self.files_deleted += files_deleted;
+        self.files_skipped_empty += files_skipped_empty;
+        self.files_skipped_unreadable += files_skipped_unreadable;
+        for file in skipped_unreadable {
+            if self.skipped_unreadable.len() >= MAX_REPORTED_SKIPS {
+                break;
+            }
+            self.skipped_unreadable.push(file);
+        }
+        self.chunks_inserted += chunks_inserted;
+        self.embeddings_inserted += embeddings_inserted;
+    }
 }
 
 /// Whether `run_in_batches` should evict a truncated-to-empty file's stale
@@ -58,6 +115,7 @@ struct RunCtx<'a> {
     registry: &'a HandlerRegistry,
     indexed_at_ms: i64,
     batch_size: usize,
+    lane: Option<&'a LaneFn>,
 }
 
 /// Default number of files prepared and embedded per batch when the caller
@@ -112,7 +170,55 @@ pub async fn apply(
     registry: &HandlerRegistry,
     corpus: &CorpusConfig,
     batch_size: usize,
-    precomputed: Option<(&FileRef, &[u8])>,
+    precomputed: &[(&FileRef, &[u8])],
+) -> Result<ApplyStats> {
+    apply_with_lane(plan, store, registry, corpus, batch_size, precomputed, None).await
+}
+
+/// Opaque guard that a [`LaneFn`] returns. `apply_with_lane` holds it for the
+/// duration of one store write and then drops it.
+pub type LaneGuard = Box<dyn Send>;
+
+/// Why a caller could not hand out the write lane, such as a closed lane
+/// or a daemon that is shutting down. The pass that asked for the lane
+/// aborts with this reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct LaneError(pub &'static str);
+
+impl From<LaneError> for HallouminateError {
+    fn from(error: LaneError) -> Self {
+        HallouminateError::Indexer(error.0.to_string())
+    }
+}
+
+/// Future that resolves once the caller owns the write lane, or fails with
+/// the reason the lane is unavailable.
+pub type LaneFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<LaneGuard, LaneError>> + Send>>;
+
+/// Caller-supplied closure that acquires the write lane.
+pub type LaneFn = dyn Fn() -> LaneFuture + Send + Sync;
+
+async fn acquire_lane(lane: Option<&LaneFn>) -> Result<Option<LaneGuard>> {
+    match lane {
+        Some(acquire) => Ok(Some(acquire().await?)),
+        None => Ok(None),
+    }
+}
+
+/// Like [`apply`], but acquires the write lane through `lane` around each
+/// store write batch, not around the whole plan. File reads, hashing, and
+/// chunking run without the lane. With `lane` set to `None`, this function
+/// behaves as [`apply`].
+pub async fn apply_with_lane(
+    plan: IndexPlan,
+    store: &dyn ChunkStore,
+    registry: &HandlerRegistry,
+    corpus: &CorpusConfig,
+    batch_size: usize,
+    precomputed: &[(&FileRef, &[u8])],
+    lane: Option<&LaneFn>,
 ) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
     let batch_size = batch_size.max(1);
@@ -122,6 +228,7 @@ pub async fn apply(
         registry,
         indexed_at_ms,
         batch_size,
+        lane,
     };
 
     let mut upsert_reqs: Vec<WriteRequest<'_>> = Vec::with_capacity(plan.upserts.len());
@@ -152,6 +259,7 @@ pub async fn apply(
             None => blake3_file(candidate.file.as_path())?,
         };
         if new_hash == candidate.snap.content_hash {
+            let _lane = acquire_lane(lane).await?;
             store
                 .touch_mtime(
                     &candidate.snap.corpus_key,
@@ -184,6 +292,7 @@ pub async fn apply(
     let configured_keys = corpus.corpus_keys();
     for snapshot in plan.deletes {
         if configured_keys.contains(&snapshot.corpus_key) {
+            let _lane = acquire_lane(lane).await?;
             store
                 .delete_file(&snapshot.corpus_key, &snapshot.file_ref)
                 .await?;
@@ -212,7 +321,7 @@ async fn run_in_batches(
     run: &RunCtx<'_>,
     stats: &mut ApplyStats,
     empty_file_policy: EmptyFilePolicy,
-    precomputed: Option<(&FileRef, &[u8])>,
+    precomputed: &[(&FileRef, &[u8])],
 ) -> Result<()> {
     let mut by_key: BTreeMap<CorpusKey, Vec<WriteRequest<'_>>> = BTreeMap::new();
     for req in reqs {
@@ -222,12 +331,13 @@ async fn run_in_batches(
         for chunk_of_reqs in key_reqs.chunks(run.batch_size) {
             let mut prepared: Vec<PreparedFile> = Vec::with_capacity(chunk_of_reqs.len());
             for req in chunk_of_reqs {
-                let bytes_override =
-                    precomputed.and_then(
-                        |(file, bytes)| {
-                            if req.file == file { Some(bytes) } else { None }
-                        },
-                    );
+                let mut bytes_override: Option<&[u8]> = None;
+                for &(file, bytes) in precomputed {
+                    if req.file == file {
+                        bytes_override = Some(bytes);
+                        break;
+                    }
+                }
                 let prepared_file = prepare_file(
                     WriteRequest {
                         corpus_key: req.corpus_key.clone(),
@@ -238,9 +348,15 @@ async fn run_in_batches(
                     run.indexed_at_ms,
                     bytes_override,
                 )?;
-                let Some(prepared_file) = prepared_file else {
-                    stats.files_skipped_unreadable += 1;
-                    continue;
+                let prepared_file = match prepared_file {
+                    Prepared::File(prepared_file) => prepared_file,
+                    Prepared::Skipped(reason) => {
+                        stats.record_unreadable(SkippedFile {
+                            file: req.file.clone(),
+                            reason,
+                        });
+                        continue;
+                    }
                 };
                 if prepared_file.chunks.is_empty() {
                     tracing::warn!(
@@ -258,6 +374,7 @@ async fn run_in_batches(
                             file = %file_ref,
                             "evicting indexed file from search: re-index produced an empty file",
                         );
+                        let _lane = acquire_lane(run.lane).await?;
                         run.store.delete_file(&req.corpus_key, &file_ref).await?;
                         stats.files_deleted += 1;
                     }
@@ -269,7 +386,9 @@ async fn run_in_batches(
                 continue;
             }
             let file_count = prepared.len();
-            let write_stats = run.store.apply_batch(prepared).await?;
+            let prepared_batch = run.store.prepare_batch(&prepared).await?;
+            let _lane = acquire_lane(run.lane).await?;
+            let write_stats = run.store.commit_batch(prepared, prepared_batch).await?;
             stats.chunks_inserted += write_stats.chunks_written;
             stats.embeddings_inserted += write_stats.embeddings_written;
             stats.files_upserted += file_count;
@@ -281,7 +400,8 @@ async fn run_in_batches(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use text_splitter::Characters;
@@ -296,6 +416,16 @@ mod tests {
     struct RecordingStore {
         deleted: Mutex<Vec<(CorpusKey, String)>>,
         batches: Mutex<Vec<CorpusKey>>,
+        guards_live: Arc<AtomicUsize>,
+        guards_live_at_write: Mutex<Vec<usize>>,
+    }
+
+    struct CountedGuard(Arc<AtomicUsize>);
+
+    impl Drop for CountedGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -342,6 +472,10 @@ mod tests {
                 .lock()
                 .map_err(|_| HallouminateError::Indexer("batches mutex poisoned".into()))?
                 .push(first.corpus_key.clone());
+            self.guards_live_at_write
+                .lock()
+                .map_err(|_| HallouminateError::Indexer("guards mutex poisoned".into()))?
+                .push(self.guards_live.load(Ordering::SeqCst));
             Ok(BatchWriteStats {
                 chunks_written: files.iter().map(|file| file.chunks.len()).sum(),
                 embeddings_written: 0,
@@ -391,7 +525,7 @@ mod tests {
         let store = RecordingStore::default();
         let registry = HandlerRegistry::new(Characters, 384);
 
-        let stats = apply(plan, &store, &registry, &corpus, 16, None)
+        let stats = apply(plan, &store, &registry, &corpus, 16, &[])
             .await
             .expect("apply");
 
@@ -432,7 +566,7 @@ mod tests {
         let store = RecordingStore::default();
         let registry = HandlerRegistry::new(Characters, 384);
 
-        let stats = apply(plan, &store, &registry, &corpus, 16, None)
+        let stats = apply(plan, &store, &registry, &corpus, 16, &[])
             .await
             .expect("apply");
 
@@ -488,7 +622,7 @@ mod tests {
         let store = RecordingStore::default();
         let registry = HandlerRegistry::new(Characters, 384);
 
-        apply(plan, &store, &registry, &corpus, 16, None)
+        apply(plan, &store, &registry, &corpus, 16, &[])
             .await
             .expect("apply");
 
@@ -498,6 +632,75 @@ mod tests {
             *store.batches.lock().expect("batches mutex"),
             expected,
             "one deterministic write batch per corpus root"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_with_lane_acquires_the_lane_once_per_write_batch() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let key = CorpusKey::from_configured_root("docs", &root.path().to_string_lossy());
+        let mut upserts = Vec::new();
+        for name in ["a.md", "b.md", "c.md"] {
+            let file = root.path().join(name);
+            std::fs::write(&file, format!("# {name}\n\nbody of {name}\n")).expect("write file");
+            upserts.push(Upsert {
+                file: FileRef::new(file),
+                mtime: Mtime(1),
+                corpus_key: Some(key.clone()),
+            });
+        }
+        let plan = IndexPlan {
+            upserts,
+            mtime_touches: Vec::new(),
+            deletes: Vec::new(),
+        };
+        let corpus = CorpusConfig {
+            name: "docs".into(),
+            paths: vec![root.path().to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        };
+        let acquisitions = Arc::new(AtomicUsize::new(0));
+        let guards_live = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&acquisitions);
+        let live = Arc::clone(&guards_live);
+        let lane: Box<LaneFn> = Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            live.fetch_add(1, Ordering::SeqCst);
+            let guard = CountedGuard(Arc::clone(&live));
+            Box::pin(async move { Ok(Box::new(guard) as LaneGuard) })
+        });
+        let store = RecordingStore {
+            guards_live: Arc::clone(&guards_live),
+            ..RecordingStore::default()
+        };
+        let registry = HandlerRegistry::new(Characters, 384);
+
+        let stats = apply_with_lane(plan, &store, &registry, &corpus, 1, &[], Some(&*lane))
+            .await
+            .expect("apply_with_lane");
+
+        let batch_count = store.batches.lock().expect("batches mutex").len();
+        assert_eq!(stats.files_upserted, 3);
+        assert_eq!(
+            batch_count, 3,
+            "batch size 1 must split three files into three batches"
+        );
+        assert_eq!(
+            acquisitions.load(Ordering::SeqCst),
+            batch_count,
+            "the lane is acquired once per write batch"
+        );
+        assert_eq!(
+            *store.guards_live_at_write.lock().expect("guards mutex"),
+            vec![1, 1, 1],
+            "exactly one lane guard is held while each batch writes"
+        );
+        assert_eq!(
+            guards_live.load(Ordering::SeqCst),
+            0,
+            "every lane guard is released after its batch"
         );
     }
 
@@ -518,5 +721,62 @@ mod tests {
         // indexing timestamp -- a later rewrite necessarily bumps the mtime,
         // so equality gates already see it correctly.
         assert_eq!(smudge_racy_mtime(Mtime(999), 1_000), Mtime(999));
+    }
+
+    fn skipped(name: &str) -> SkippedFile {
+        SkippedFile {
+            file: FileRef::new(PathBuf::from(format!("/docs/{name}"))),
+            reason: SkipReason::UnsupportedFormat,
+        }
+    }
+
+    #[test]
+    fn record_unreadable_counts_every_skip_and_names_up_to_the_cap() {
+        let mut stats = ApplyStats::default();
+        for i in 0..MAX_REPORTED_SKIPS + 5 {
+            stats.record_unreadable(skipped(&format!("f{i}.bin")));
+        }
+        assert_eq!(stats.files_skipped_unreadable, MAX_REPORTED_SKIPS + 5);
+        assert_eq!(stats.skipped_unreadable.len(), MAX_REPORTED_SKIPS);
+        assert_eq!(stats.skipped_unreadable[0], skipped("f0.bin"));
+    }
+
+    #[test]
+    fn merge_sums_every_tally_and_keeps_the_name_cap() {
+        let mut into = ApplyStats {
+            files_upserted: 1,
+            files_touched: 2,
+            files_deleted: 3,
+            files_skipped_empty: 4,
+            chunks_inserted: 5,
+            embeddings_inserted: 6,
+            ..Default::default()
+        };
+        for i in 0..MAX_REPORTED_SKIPS - 1 {
+            into.record_unreadable(skipped(&format!("a{i}.bin")));
+        }
+        let mut extra = ApplyStats {
+            files_upserted: 10,
+            files_touched: 20,
+            files_deleted: 30,
+            files_skipped_empty: 40,
+            chunks_inserted: 50,
+            embeddings_inserted: 60,
+            ..Default::default()
+        };
+        extra.record_unreadable(skipped("b0.bin"));
+        extra.record_unreadable(skipped("b1.bin"));
+
+        into.merge(extra);
+
+        assert_eq!(into.files_upserted, 11);
+        assert_eq!(into.files_touched, 22);
+        assert_eq!(into.files_deleted, 33);
+        assert_eq!(into.files_skipped_empty, 44);
+        assert_eq!(into.chunks_inserted, 55);
+        assert_eq!(into.embeddings_inserted, 66);
+        assert_eq!(into.files_skipped_unreadable, MAX_REPORTED_SKIPS + 1);
+        assert_eq!(into.skipped_unreadable.len(), MAX_REPORTED_SKIPS);
+        assert_eq!(into.skipped_unreadable.last(), Some(&skipped("b0.bin")));
     }
 }

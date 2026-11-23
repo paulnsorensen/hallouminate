@@ -7,7 +7,7 @@ use std::time::Instant;
 use agent_bench::{Manifest, TokenUsage, repo_root};
 use anyhow::{Context, bail};
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Default agent CLI binary, overridable via `AGENT_BENCH_CLAUDE_BIN`.
@@ -269,16 +269,10 @@ fn load_manifest(path: &Path) -> anyhow::Result<Manifest> {
 }
 
 fn parse_usage(value: &Value) -> anyhow::Result<TokenUsage> {
-    let obj = value
-        .as_object()
-        .ok_or_else(|| anyhow::anyhow!("usage field was not a JSON object"))?;
-    let field = |name: &str| obj.get(name).and_then(Value::as_u64).unwrap_or(0);
-    Ok(TokenUsage {
-        input_tokens: field("input_tokens"),
-        output_tokens: field("output_tokens"),
-        cache_read_input_tokens: field("cache_read_input_tokens"),
-        cache_creation_input_tokens: field("cache_creation_input_tokens"),
-    })
+    if !value.is_object() {
+        bail!("usage field was not a JSON object");
+    }
+    TokenUsage::deserialize(value).map_err(Into::into)
 }
 
 /// A turn signals authoring completion when its JSON result reports

@@ -11,18 +11,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use futures_util::StreamExt;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::{JoinHandle, JoinSet};
+use tokio_util::codec::LinesCodecError;
 
 use hallouminate_config::{self, Config};
 
 use super::dispatch::dispatch;
+use super::framing::{MAX_IPC_LINE_BYTES, ipc_lines};
 use super::heartbeat::TaskName;
 use super::ipc::{DaemonRequest, DaemonResponse};
+use super::ladder::LadderAction;
 use super::socket::daemon_socket_path;
-use super::state::{DaemonState, WorkClass};
+use super::state::{DaemonState, IdleClock, WorkClass};
 use super::watchdog;
 
 #[derive(Debug, Default, Clone)]
@@ -32,16 +36,11 @@ pub struct DaemonArgs {
 
 /// How long `handle_connection` waits for a client to send its request
 /// line before giving up and closing the connection. Guards against a
-/// client that opens a connection and never writes (or writes a partial
-/// line with no trailing newline), which would otherwise pin a
-/// `BufReader::read_line` await forever and leak the per-connection task.
+/// client that opens a connection and never writes, which would otherwise
+/// pin the framed-line read forever and leak the per-connection task.
 pub const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Cap on the newline-delimited request line's `String` allocation. Without
-/// this, a client can stream an arbitrarily large line before
-/// `IDLE_READ_TIMEOUT` would otherwise catch it, growing the allocation
-/// without bound.
-const MAX_REQUEST_LINE_BYTES: u64 = 4 * 1024 * 1024;
+type WatchdogAbort = Box<dyn FnOnce() + Send>;
 
 /// Cap on concurrently active connection handlers. Bounds memory/CPU from a
 /// client (or many clients) opening unlimited connections; excess
@@ -57,6 +56,9 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Boot the daemon and serve until SIGINT/SIGTERM (or stdin close on the
 /// rare debug invocations). Returns `Err` if another daemon is already
 /// holding the single-instance lock on the configured socket directory.
+///
+/// The Tokio runtime must use the multi-thread scheduler because request
+/// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn run_daemon(cfg: Config, args: DaemonArgs) -> anyhow::Result<()> {
     // `cfg` is the startup config the caller already loaded (once, in
     // `lib::run`) to initialize logging before dispatch — loading it a
@@ -97,7 +99,7 @@ async fn serve_with_config(
         backoff_secs,
         recent_trips,
     } = watchdog::check_boot_backoff(
-        &socket_path.with_file_name("watchdog-trips"),
+        &watchdog::default_trip_state_path()?,
         cfg.daemon.boot_backoff_floor_secs,
         cfg.daemon.boot_backoff_cap_secs,
         now_unix,
@@ -116,11 +118,23 @@ async fn serve_with_config(
     let lock = acquire_single_instance(&lock_path)?;
     let state = DaemonState::open_with_socket(cfg, xdg_path, socket_path.to_path_buf()).await?;
     remove_stale_socket(socket_path).await;
-    // One-shot probe to learn whether the watcher is enabled (watchable
-    // roots exist and the backend initializes); the probe handle is dropped
-    // before the supervised factory creates the long-lived instance, so two
-    // debouncers never run at once.
-    let watcher_enabled = super::watch::spawn_corpus_watcher(&state).is_some();
+    // One-shot probe to learn whether the watcher backend is enabled. Stop and
+    // await the probe before the supervised factory creates the live instance.
+    let watcher_enabled = match super::watch::spawn_corpus_watcher_probe(&state) {
+        Some(handle) => {
+            if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.abort())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    "startup watcher probe teardown exceeded {SHUTDOWN_DRAIN_TIMEOUT:?}; continuing boot",
+                );
+            }
+            true
+        }
+        None => false,
+    };
     {
         let sup = state.supervisor().clone();
         let factory_state = state.clone();
@@ -128,11 +142,17 @@ async fn serve_with_config(
             let state = factory_state.clone();
             async move {
                 match super::watch::spawn_corpus_watcher(&state) {
-                    Some(handle) => handle.join().await,
+                    Some(handle) => {
+                        state.watch_registry().mark_pump_available();
+                        handle.join().await
+                    }
                     // Creation failed on this (re)start: park instead of
                     // hot-looping the factory; a restart only helps after
                     // conditions change, which needs a daemon restart anyway.
-                    None => std::future::pending::<()>().await,
+                    None => {
+                        state.watch_registry().mark_pump_unavailable();
+                        std::future::pending::<()>().await
+                    }
                 }
             }
         });
@@ -142,11 +162,18 @@ async fn serve_with_config(
     {
         let sup = state.supervisor().clone();
         let factory_state = state.clone();
+        state.watch_registry().mark_boot_catch_up_running();
         sup.spawn(TaskName::CatchUp, move || {
             super::dispatch::catch_up_index(factory_state.clone())
         });
     }
-    spawn_watchdog_when_armed(&state, watcher_enabled, socket_path);
+    let trip_path = watchdog::default_trip_state_path()?;
+    spawn_watchdog_when_armed(
+        &state,
+        watcher_enabled,
+        trip_path,
+        Box::new(|| std::process::abort()),
+    );
     let (result, shutdown_deadline): (anyhow::Result<()>, Instant) =
         match serve_on_listener(&state, socket_path, IDLE_READ_TIMEOUT).await {
             Ok(deadline) => (Ok(()), deadline),
@@ -275,7 +302,12 @@ async fn sleep_with_idle_heartbeat(state: &DaemonState, total: Duration) {
 /// sleep (`sleep_with_idle_heartbeat`, above) both bump their heartbeat well
 /// inside the default 300s stall window even on a fully-idle/active daemon,
 /// so neither false-trips once armed.
-fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool, socket_path: &Path) {
+fn spawn_watchdog_when_armed(
+    state: &DaemonState,
+    watcher_enabled: bool,
+    trip_path: PathBuf,
+    abort: WatchdogAbort,
+) {
     let daemon = &state.baseline().daemon;
     let stall_secs = daemon.watchdog_stall_secs;
     let mut candidates: Vec<TaskName> = Vec::new();
@@ -304,7 +336,6 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool, socket_
     let poll = Duration::from_secs((stall_secs / 4).clamp(1, 60));
     let stall = Duration::from_secs(stall_secs);
     let state = state.clone();
-    let trip_path = socket_path.with_file_name("watchdog-trips");
     tokio::spawn(async move {
         let shutdown = state.shutdown_token().clone();
         let heartbeat = state.heartbeat().clone();
@@ -318,13 +349,17 @@ fn spawn_watchdog_when_armed(state: &DaemonState, watcher_enabled: bool, socket_
                 _ = tokio::time::sleep(poll) => {}
             }
         }
+        let record_state = state.clone();
         let watchdog = watchdog::Watchdog::spawn(
             heartbeat,
             candidates,
             stall,
             poll,
             trip_path,
-            Box::new(|_| std::process::abort()),
+            Box::new(move |_| {
+                let _ = record_state.try_record_ladder_trip(LadderAction::WatchdogTrip);
+                abort();
+            }),
         );
         shutdown.cancelled().await;
         watchdog.stop();
@@ -430,6 +465,9 @@ async fn remove_stale_socket(socket_path: &Path) {
 /// `state.shutdown_token()` is cancelled — the IPC `Shutdown` request
 /// cancels that token. Before returning, the server drains connection handlers
 /// and periodic maintenance, then removes the socket and releases the flock.
+///
+/// The Tokio runtime must use the multi-thread scheduler because request
+/// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()> {
     serve_with_idle_timeout(state, socket_path, IDLE_READ_TIMEOUT).await
 }
@@ -438,6 +476,9 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
 /// timeout instead of the production [`IDLE_READ_TIMEOUT`] default. Public
 /// so integration tests can exercise the timeout behavior without waiting
 /// out the real 30s default.
+///
+/// The Tokio runtime must use the multi-thread scheduler because request
+/// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn serve_with_idle_timeout(
     state: &DaemonState,
     socket_path: &Path,
@@ -458,8 +499,19 @@ pub async fn serve_with_idle_timeout(
             Ok(deadline) => (Ok(()), deadline),
             Err(error) => (Err(error), Instant::now() + SHUTDOWN_DRAIN_TIMEOUT),
         };
-    drop(watcher);
     state.shutdown_token().cancel();
+    if let Some(watcher) = watcher {
+        let remaining = shutdown_deadline.saturating_duration_since(Instant::now());
+        if tokio::time::timeout(remaining, watcher.abort())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                "watcher teardown exceeded the shutdown drain budget; abandoning it",
+            );
+        }
+    }
     let maintenance = state.take_maintenance_task().await;
     finish_shutdown(maintenance, lock, socket_path, shutdown_deadline).await;
     result
@@ -600,13 +652,9 @@ async fn handle_connection(
     let peer_uid = peer_credential_uid(&stream);
     let effective_uid = rustix::process::geteuid().as_raw();
     let (read_half, mut write_half) = stream.into_split();
-    // Cap the newline-delimited request line's allocation — `.take()` bounds
-    // how many bytes `read_line` will pull before giving up, so an oversized
-    // line is rejected instead of growing the `String` without bound.
-    let mut reader = BufReader::new(read_half).take(MAX_REQUEST_LINE_BYTES);
-    let mut line = String::new();
-    let n = match tokio::time::timeout(idle_timeout, reader.read_line(&mut line)).await {
-        Ok(res) => res?,
+    let mut lines = ipc_lines(read_half);
+    let frame = match tokio::time::timeout(idle_timeout, lines.next()).await {
+        Ok(frame) => frame,
         Err(_) => {
             tracing::debug!(
                 target: "hallouminate::daemon",
@@ -616,32 +664,42 @@ async fn handle_connection(
             return Ok(());
         }
     };
-    if n == 0 {
+    let Some(frame) = frame else {
         return Ok(());
-    }
-    let response = if !line.ends_with('\n') {
-        tracing::warn!(
-            target: "hallouminate::daemon",
-            cap_bytes = MAX_REQUEST_LINE_BYTES,
-            "request line exceeded the size cap; returning structured error",
-        );
-        DaemonResponse::invalid_params(format!(
-            "request line exceeds {MAX_REQUEST_LINE_BYTES}-byte cap"
-        ))
-    } else {
-        match serde_json::from_str::<DaemonRequest>(line.trim_end()) {
+    };
+    let mut idle_clock = IdleClock::Keep;
+    let response = match frame {
+        Ok(line) => match serde_json::from_str::<DaemonRequest>(&line) {
             Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
                 Some(denied) => denied,
-                None => dispatch(&state, req).await,
+                None => {
+                    let candidate_idle_clock = idle_clock_for(&req.payload);
+                    let response = dispatch(&state, req).await;
+                    idle_clock = idle_clock_for_response(candidate_idle_clock, &response);
+                    response
+                }
             },
             Err(e) => DaemonResponse::invalid_params(format!("invalid request: {e}")),
+        },
+        Err(LinesCodecError::MaxLineLengthExceeded) => {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                cap_bytes = MAX_IPC_LINE_BYTES,
+                "request line exceeded the size cap; returning structured error",
+            );
+            DaemonResponse::invalid_params(format!(
+                "request line exceeds {MAX_IPC_LINE_BYTES}-byte cap"
+            ))
         }
+        Err(LinesCodecError::Io(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+            DaemonResponse::invalid_params(format!("invalid request: {error}"))
+        }
+        Err(LinesCodecError::Io(error)) => return Err(error.into()),
     };
-    // Request completed; stamp the activity clock so idle-exit keys on real
-    // request throughput, not just embed use (ADR-003).
-    state.touch_activity(WorkClass::External);
-    let mut text = serde_json::to_string(&response)?;
-    text.push('\n');
+    // Request completed. Every request stamps the External clock; only
+    // inference-bearing requests restart the idle-exit window (ADR-004).
+    state.touch_activity(WorkClass::External, idle_clock);
+    let text = response_frame(&response)?;
     let write_result = tokio::time::timeout(idle_timeout, async {
         write_half.write_all(text.as_bytes()).await?;
         write_half.flush().await
@@ -658,6 +716,56 @@ async fn handle_connection(
         }
     }
     Ok(())
+}
+
+/// Serializes one response line. A response that cannot fit one IPC frame
+/// becomes an `invalid_params` error that names the byte counts, because the
+/// client would otherwise fail on the frame limit without a reason.
+fn response_frame(response: &DaemonResponse) -> serde_json::Result<String> {
+    let mut text = serde_json::to_string(response)?;
+    text.push('\n');
+    if text.len() <= MAX_IPC_LINE_BYTES {
+        return Ok(text);
+    }
+    let oversize = text.len();
+    let mut error = serde_json::to_string(&DaemonResponse::invalid_params(format!(
+        "response is {oversize} bytes; the IPC limit is {MAX_IPC_LINE_BYTES} bytes. Narrow the request, for example with a smaller limit or corpus"
+    )))?;
+    error.push('\n');
+    Ok(error)
+}
+
+/// Classify a request for the idle-exit window (ADR daemon-idle-exit-004).
+/// Requests that embed or rerank restart it. Listings, reads, status, and
+/// row pruning keep it, so a fleet of cheap polls cannot starve idle-exit.
+fn idle_clock_for(payload: &super::ipc::DaemonRequestPayload) -> IdleClock {
+    use super::ipc::DaemonRequestPayload;
+    match payload {
+        DaemonRequestPayload::Ground(_)
+        | DaemonRequestPayload::Index(_)
+        | DaemonRequestPayload::AddMarkdown(_)
+        | DaemonRequestPayload::AddMarkdownBatch { .. } => IdleClock::Restart,
+        DaemonRequestPayload::Ping
+        | DaemonRequestPayload::ListCorpora
+        | DaemonRequestPayload::ListFiles(_)
+        | DaemonRequestPayload::ListTree(_)
+        | DaemonRequestPayload::ReadMarkdown(_)
+        | DaemonRequestPayload::DeleteMarkdown(_)
+        | DaemonRequestPayload::Backlinks(_)
+        | DaemonRequestPayload::CorpusStats { .. }
+        | DaemonRequestPayload::Status
+        | DaemonRequestPayload::Shutdown => IdleClock::Keep,
+    }
+}
+
+fn idle_clock_for_response(
+    candidate_idle_clock: IdleClock,
+    response: &DaemonResponse,
+) -> IdleClock {
+    match response {
+        DaemonResponse::Ok { .. } => candidate_idle_clock,
+        DaemonResponse::Err { .. } => IdleClock::Keep,
+    }
 }
 
 fn lock_path_for(socket_path: &Path) -> PathBuf {
@@ -724,13 +832,22 @@ fn authorize_peer(
 
 fn is_mutating_payload(payload: &super::ipc::DaemonRequestPayload) -> bool {
     use super::ipc::DaemonRequestPayload;
-    matches!(
-        payload,
+    match payload {
         DaemonRequestPayload::AddMarkdown(_)
-            | DaemonRequestPayload::DeleteMarkdown(_)
-            | DaemonRequestPayload::Index(_)
-            | DaemonRequestPayload::Shutdown
-    )
+        | DaemonRequestPayload::AddMarkdownBatch { .. }
+        | DaemonRequestPayload::DeleteMarkdown(_)
+        | DaemonRequestPayload::Index(_)
+        | DaemonRequestPayload::Shutdown => true,
+        DaemonRequestPayload::Ping
+        | DaemonRequestPayload::Ground(_)
+        | DaemonRequestPayload::ListCorpora
+        | DaemonRequestPayload::ListFiles(_)
+        | DaemonRequestPayload::ListTree(_)
+        | DaemonRequestPayload::ReadMarkdown(_)
+        | DaemonRequestPayload::Backlinks(_)
+        | DaemonRequestPayload::CorpusStats { .. }
+        | DaemonRequestPayload::Status => false,
+    }
 }
 
 /// Best-effort peer uid of a connected Unix-domain socket: `SO_PEERCRED` on
@@ -792,6 +909,160 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn ping_request_bytes() -> Vec<u8> {
+        serde_json::to_vec(&DaemonRequest {
+            cwd: PathBuf::from("."),
+            payload: super::super::ipc::DaemonRequestPayload::Ping,
+        })
+        .expect("serialize request")
+    }
+
+    fn request_bytes(total_bytes: usize) -> Vec<u8> {
+        let mut bytes = ping_request_bytes();
+        assert!(bytes.len() < total_bytes);
+        bytes.resize(total_bytes - 1, b' ');
+        bytes.push(b'\n');
+        bytes
+    }
+
+    async fn exchange_request(bytes: Vec<u8>) -> Option<DaemonResponse> {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open state");
+        let socket = tmp.path().join("request.sock");
+        let listener = UnixListener::bind(&socket).expect("bind request socket");
+        let client = tokio::spawn(async move {
+            let mut stream = UnixStream::connect(&socket).await.expect("connect request");
+            let _ = stream.write_all(&bytes).await;
+            let _ = stream.shutdown().await;
+            let mut lines = ipc_lines(stream);
+            let line = lines.next().await.transpose().expect("read response")?;
+            Some(serde_json::from_str(&line).expect("decode response"))
+        });
+        let (stream, _) = listener.accept().await.expect("accept request");
+        handle_connection(state, stream, Duration::from_secs(5))
+            .await
+            .expect("handle request");
+        client.await.expect("request client")
+    }
+
+    fn assert_ping_response(response: Option<DaemonResponse>) {
+        match response.expect("response") {
+            DaemonResponse::Ok { result } => assert!(result.is_object()),
+            DaemonResponse::Err { kind, message } => {
+                panic!("ping request failed with {kind:?}: {message}")
+            }
+        }
+    }
+
+    fn invalid_request_message(response: Option<DaemonResponse>) -> String {
+        match response.expect("response") {
+            DaemonResponse::Err { kind, message } => {
+                assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams);
+                message
+            }
+            DaemonResponse::Ok { result } => panic!("invalid request returned {result:?}"),
+        }
+    }
+
+    #[test]
+    fn oversize_response_becomes_an_invalid_params_error_naming_byte_counts() {
+        let oversize = DaemonResponse::ok(&"x".repeat(MAX_IPC_LINE_BYTES));
+        let frame = response_frame(&oversize).expect("frame");
+        assert!(frame.len() <= MAX_IPC_LINE_BYTES, "{}", frame.len());
+        let DaemonResponse::Err { kind, message } =
+            serde_json::from_str(frame.trim_end()).expect("parse frame")
+        else {
+            panic!("a response over the IPC limit must become an error");
+        };
+        assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams);
+        assert!(
+            message.contains(&format!("the IPC limit is {MAX_IPC_LINE_BYTES} bytes")),
+            "{message}"
+        );
+        assert!(message.contains("response is 4194"), "{message}");
+    }
+
+    #[test]
+    fn response_at_the_frame_cap_passes_through() {
+        let text = "x".repeat(MAX_IPC_LINE_BYTES - 64);
+        let frame = response_frame(&DaemonResponse::ok(&text)).expect("frame");
+        assert!(frame.len() <= MAX_IPC_LINE_BYTES);
+        let DaemonResponse::Ok { .. } = serde_json::from_str(frame.trim_end()).expect("parse")
+        else {
+            panic!("a response inside the limit must stay a success");
+        };
+    }
+
+    #[tokio::test]
+    async fn request_below_newline_inclusive_byte_cap_is_accepted() {
+        let response = exchange_request(request_bytes(MAX_IPC_LINE_BYTES - 1)).await;
+        assert_ping_response(response);
+    }
+
+    #[tokio::test]
+    async fn request_at_newline_inclusive_byte_cap_is_accepted() {
+        let response = exchange_request(request_bytes(MAX_IPC_LINE_BYTES)).await;
+        assert_ping_response(response);
+    }
+
+    #[tokio::test]
+    async fn request_above_newline_inclusive_byte_cap_gets_structured_error() {
+        let response = exchange_request(request_bytes(MAX_IPC_LINE_BYTES + 1)).await;
+        let message = invalid_request_message(response);
+        assert_eq!(
+            message,
+            format!("request line exceeds {MAX_IPC_LINE_BYTES}-byte cap")
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_request_gets_structured_error() {
+        let message = invalid_request_message(exchange_request(vec![0xff, b'\n']).await);
+        assert!(message.contains("Unable to decode input as UTF8"));
+    }
+
+    #[tokio::test]
+    async fn empty_request_closes_without_response() {
+        match exchange_request(Vec::new()).await {
+            None => {}
+            Some(response) => panic!("empty request returned {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_without_lf_is_decoded_at_eof() {
+        let response = exchange_request(ping_request_bytes()).await;
+        assert_ping_response(response);
+    }
+
+    #[tokio::test]
+    async fn truncated_request_at_eof_gets_structured_error() {
+        let message = invalid_request_message(exchange_request(br#"{"cwd":"#.to_vec()).await);
+        assert!(message.starts_with("invalid request:"));
+    }
+
+    #[tokio::test]
+    async fn idle_request_times_out_and_closes_without_response() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open state");
+        let socket = tmp.path().join("idle.sock");
+        let listener = UnixListener::bind(&socket).expect("bind idle socket");
+        let client = UnixStream::connect(&socket)
+            .await
+            .expect("connect idle client");
+        let (stream, _) = listener.accept().await.expect("accept idle request");
+        handle_connection(state, stream, Duration::from_millis(10))
+            .await
+            .expect("handle idle request");
+        let mut lines = ipc_lines(client);
+        assert_eq!(lines.next().await.transpose().expect("read idle EOF"), None);
+    }
     #[test]
     fn lock_path_appends_dot_lock_suffix() {
         let sock = PathBuf::from("/tmp/hallouminate/daemon.sock");
@@ -799,6 +1070,67 @@ mod tests {
             lock_path_for(&sock),
             PathBuf::from("/tmp/hallouminate/daemon.sock.lock"),
         );
+    }
+
+    async fn watchdog_state() -> (tempfile::TempDir, DaemonState) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = tmp.path().to_string_lossy().into_owned();
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.daemon.idle_exit_secs = 1;
+        cfg.daemon.watchdog_stall_secs = 1;
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        state.heartbeat().bump(TaskName::IdleExit);
+        (tmp, state)
+    }
+
+    #[tokio::test]
+    async fn watchdog_stall_records_watchdog_trip_before_the_abort_hook() {
+        let (tmp, state) = watchdog_state().await;
+        assert_eq!(state.last_ladder_trip(), None);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        spawn_watchdog_when_armed(
+            &state,
+            false,
+            tmp.path().join("watchdog-trips"),
+            Box::new(move || tx.send(()).expect("abort receiver dropped")),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("watchdog must trip within the timeout")
+            .expect("abort hook must fire");
+        assert_eq!(
+            state.last_ladder_trip().expect("trip recorded").action,
+            LadderAction::WatchdogTrip,
+        );
+        state.shutdown_token().cancel();
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_abort_hook_fires_when_the_ladder_trip_slot_is_contended() {
+        let (tmp, state) = watchdog_state().await;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        spawn_watchdog_when_armed(
+            &state,
+            false,
+            tmp.path().join("watchdog-trips"),
+            Box::new(move || tx.send(()).expect("abort receiver dropped")),
+        );
+        tokio::task::yield_now().await;
+
+        {
+            let trip = state.lock_ladder_trip();
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("watchdog must trip despite lock contention");
+            assert_eq!(*trip, None);
+        }
+        state.shutdown_token().cancel();
+        tokio::task::yield_now().await;
     }
 
     // A missing socket is the normal first-boot case: pre-bind cleanup must
@@ -868,6 +1200,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_inference_bearing_requests_restart_the_idle_window() {
+        use super::super::ipc::{
+            AddMarkdownRequest, DaemonRequestPayload, GroundRequest, IndexRequest,
+        };
+        let restarting = [
+            DaemonRequestPayload::Ground(GroundRequest {
+                query: "cheese".into(),
+                corpus: None,
+                top_files: None,
+                chunks_per_file: None,
+                limit: None,
+                snippet_chars: None,
+                footnote_mode: Default::default(),
+                match_mode: Default::default(),
+                group_by: Default::default(),
+                output: Default::default(),
+            }),
+            DaemonRequestPayload::Index(IndexRequest {
+                corpus: None,
+                paths_from: None,
+                strict: false,
+                background: false,
+            }),
+            DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default()),
+        ];
+        for payload in &restarting {
+            assert_eq!(idle_clock_for(payload), IdleClock::Restart, "{payload:?}");
+        }
+        let keeping = [
+            DaemonRequestPayload::Ping,
+            DaemonRequestPayload::ListCorpora,
+            DaemonRequestPayload::Status,
+            DaemonRequestPayload::CorpusStats { corpus: None },
+        ];
+        for payload in &keeping {
+            assert_eq!(idle_clock_for(payload), IdleClock::Keep, "{payload:?}");
+        }
+    }
+
+    #[test]
+    fn failed_inference_request_keeps_the_idle_window() {
+        use super::super::ipc::{DaemonRequestPayload, GroundRequest};
+        let payload = DaemonRequestPayload::Ground(GroundRequest {
+            query: "cheese".into(),
+            corpus: None,
+            top_files: None,
+            chunks_per_file: None,
+            limit: None,
+            snippet_chars: None,
+            footnote_mode: Default::default(),
+            match_mode: Default::default(),
+            group_by: Default::default(),
+            output: Default::default(),
+        });
+        let response = DaemonResponse::invalid_params("invalid corpus");
+        assert_eq!(
+            idle_clock_for_response(idle_clock_for(&payload), &response),
+            IdleClock::Keep,
+            "a failed inference-capable request must not reset idle-exit"
+        );
+    }
     #[test]
     fn authorize_peer_allows_different_uid_read_only_request() {
         use super::super::ipc::DaemonRequestPayload;
@@ -978,5 +1372,23 @@ mod tests {
         }
 
         sleep_task.await.expect("idle-exit sleep task");
+    }
+
+    #[test]
+    fn markdown_batch_requires_peer_authorization_and_restarts_idle_clock() {
+        let payload = super::super::ipc::DaemonRequestPayload::AddMarkdownBatch {
+            corpus: "wiki".into(),
+            items: Vec::new(),
+        };
+        assert_eq!(idle_clock_for(&payload), IdleClock::Restart);
+        assert!(authorize_peer(Some(501), 501, &payload).is_none());
+        for uid in [None, Some(999)] {
+            let response = authorize_peer(uid, 501, &payload).expect("unauthorized");
+            let DaemonResponse::Err { kind, message } = response else {
+                panic!("unauthorized batch succeeded");
+            };
+            assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams);
+            assert!(message.contains("mutating"), "{message}");
+        }
     }
 }
