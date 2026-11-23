@@ -528,6 +528,80 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_kappa() {
     );
 }
 
+#[test]
+fn calibration_accepts_exact_cutoff_and_rejects_higher_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions_path =
+        write_question_set(dir.path(), &[sample_question("q1", QuestionTag::Greppable)]);
+    let mut sessions = Vec::new();
+    let mut human_grades = Vec::new();
+    // 24 both pass, 9 both fail, 1 human only, 6 judge only: kappa = 420/700.
+    for (count, answer, human_score) in [
+        (24, "fixture judge-pass", 5),
+        (9, "fixture judge-fail", 0),
+        (1, "fixture judge-fail", 5),
+        (6, "fixture judge-pass", 0),
+    ] {
+        for _ in 0..count {
+            let run = u32::try_from(sessions.len()).unwrap();
+            sessions.push(sample_session("q1", Arm::Wiki, run, answer));
+            human_grades.push(
+                GradeRecord::grade("q1".into(), Arm::Wiki, run, human_score, 4, "human".into())
+                    .unwrap(),
+            );
+        }
+    }
+    let sessions_path = write_sessions(dir.path(), &sessions);
+    let human_path = write_grades(dir.path(), "human-grades.jsonl", &human_grades);
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        r#"case "$(cat)" in
+    *"fixture judge-pass"*) score=5 ;;
+    *"fixture judge-fail"*) score=0 ;;
+    *) exit 99 ;;
+esac
+printf '{"result":"SCORE: %s\\nRATIONALE: fixture"}\n' "$score""#,
+    );
+    let run = || {
+        let mut command = Command::new(bin_path());
+        command
+            .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .arg("--sessions")
+            .arg(&sessions_path)
+            .arg("--questions")
+            .arg(&questions_path)
+            .arg("--out")
+            .arg(dir.path().join("grades.jsonl"))
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--calibrate")
+            .arg(&human_path);
+        command
+    };
+
+    let at_cutoff = run().output().unwrap();
+    assert!(
+        at_cutoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&at_cutoff.stderr)
+    );
+    assert!(String::from_utf8_lossy(&at_cutoff.stdout).contains("kappa: 0.6000"));
+
+    let below_cutoff = run()
+        .arg("--min-kappa=0.6000000000000001")
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&below_cutoff.stderr);
+    assert!(
+        !below_cutoff.status.success() && error.contains("is below --min-kappa"),
+        "{error}"
+    );
+}
+
 /// The regime the raw-agreement gate certified wrongly: every labelled item
 /// passes under both raters, so a judge indistinguishable from a constant
 /// "pass" scored 1.00 raw agreement. Chance-corrected agreement is undefined

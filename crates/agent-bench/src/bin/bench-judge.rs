@@ -343,20 +343,17 @@ fn calibrate(
     }
 
     let po = pass_agree_count as f64 / n;
-    let p_judge_yes = judge_pass_count as f64 / n;
-    let p_human_yes = human_pass_count as f64 / n;
-    let pe = p_judge_yes * p_human_yes + (1.0 - p_judge_yes) * (1.0 - p_human_yes);
-    // pe = 1 means both raters' pass rates are 0% or 100% together, so
-    // every item resolves the same way under both raters and there is no
-    // variance to compute a chance-corrected statistic against. This is the
-    // regime where a raw-agreement number is most misleading (it can read
-    // as high as the pass rate itself while conveying nothing about
-    // discriminative agreement), so it is refused rather than reported as
-    // the most flattering possible value.
-    let kappa = if (1.0 - pe).abs() < f64::EPSILON {
+    // Scale expected agreement by the square of the trial count.
+    let trials = pairs.len() as i128;
+    let judge_pass = judge_pass_count as i128;
+    let human_pass = human_pass_count as i128;
+    let expected = judge_pass * human_pass + (trials - judge_pass) * (trials - human_pass);
+    let denominator = trials * trials - expected;
+    let kappa = if denominator == 0 {
         None
     } else {
-        Some((po - pe) / (1.0 - pe))
+        let numerator = pass_agree_count as i128 * trials - expected;
+        Some(numerator as f64 / denominator as f64)
     };
 
     Ok(CalibrationReport {
@@ -429,6 +426,14 @@ mod tests {
     }
 
     #[test]
+    fn calibrate_preserves_negative_kappa() {
+        let judge_grades = vec![grade("q1", 5), grade("q2", 0)];
+        let human_grades = vec![grade("q1", 0), grade("q2", 5)];
+        let report = calibrate(&judge_grades, &human_grades, 4).unwrap();
+        assert_eq!(report.kappa, Some(-1.0));
+    }
+
+    #[test]
     fn calibrate_rejects_empty_labelled_subset() {
         let judge_grades = vec![grade("q1", 5)];
         let human_grades = vec![grade("q-not-graded", 5)];
@@ -438,9 +443,10 @@ mod tests {
 
     #[test]
     fn calibrate_returns_none_for_degenerate_labelled_subset() {
-        let judge_grades = vec![grade("q1", 5), grade("q2", 5)];
-        let human_grades = vec![grade("q1", 5), grade("q2", 5)];
-        let report = calibrate(&judge_grades, &human_grades, 4).unwrap();
-        assert_eq!(report.kappa, None);
+        for score in [0, 5] {
+            let judge_grades = vec![grade("q1", score), grade("q2", score)];
+            let report = calibrate(&judge_grades, &judge_grades, 4).unwrap();
+            assert_eq!(report.kappa, None);
+        }
     }
 }
