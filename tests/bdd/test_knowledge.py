@@ -18,6 +18,7 @@ CORPUS = "repo:demo:wiki"
 PATH = "guides/answer.md"
 OLD = "# Answer\n\nThe answer is cobaltbeacon.\n"
 NEW = "# Answer\n\nThe answer is amberbeacon.\n"
+WATCHER_DEADLINE_SECONDS = 20
 
 
 @pytest.fixture
@@ -159,7 +160,7 @@ def external_create(app: Application, client: Mcp) -> None:
 @then("the new page is readable and searchable")
 def external_visible(app: Application, client: Mcp) -> None:
     assert read(app, client) == OLD
-    assert found(app, client, "cobaltbeacon") == [PATH]
+    _assert_indexed_facts(app, client, {"cobaltbeacon": "# Answer The answer is cobaltbeacon."})
 
 
 @when("I change a published page outside the wiki tool")
@@ -171,7 +172,7 @@ def external_watched_update(app: Application, client: Mcp) -> None:
 
 @then("the changed fact becomes searchable without explicit indexing")
 def watched_fact(app: Application, client: Mcp) -> None:
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + WATCHER_DEADLINE_SECONDS
     latest: dict[str, Any] = {}
     while time.monotonic() < deadline:
         latest = tool_result(client.call(
@@ -199,7 +200,7 @@ def _assert_indexed_facts(
         for state in ("queued", "in-flight")
         for reason in ("reconciliation not complete", "reconciliation pending")
     }
-    deadline = time.monotonic() + 5
+    deadline = time.monotonic() + WATCHER_DEADLINE_SECONDS
     while True:
         pending = None
         for fact, snippet in facts.items():

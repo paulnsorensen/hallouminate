@@ -99,3 +99,6 @@
 - 2026-11-01 · 898a746602dd9471 · merged · index.md · two facts-layer evidence entries added to the curated topic list.
 - All 11 frozen retrieval probes pass on the first write: 3 exact probes at rank 1, 8 natural or central-claim probes within the top 3.
 
+
+- 2026-11-22 · wiki-harvest · merged · multi-format-ingestion.md · added the shipped `Json` and `Jsonl` formats (#543).
+- 2026-11-22 · wiki-harvest · merged · index.md · listed daemon-version-skew; corrected the PDF and multi-format glosses.
