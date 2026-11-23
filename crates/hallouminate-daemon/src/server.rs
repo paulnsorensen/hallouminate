@@ -1095,6 +1095,43 @@ mod tests {
         let mut lines = ipc_lines(client);
         assert_eq!(lines.next().await.transpose().expect("read idle EOF"), None);
     }
+
+    // A named-pipe client cannot half-close, so the Unix EOF tests above cannot
+    // read the reply. Dropping the client still delivers EOF to the server, and
+    // the connection must end at that EOF rather than at the idle timeout.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn client_disconnect_mid_request_ends_connection_before_idle_timeout() {
+        let partial_requests = [ping_request_bytes(), br#"{"cwd":"#.to_vec()];
+        for bytes in partial_requests {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut cfg = Config::default();
+            cfg.embeddings.enabled = false;
+            cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+            let state = DaemonState::open(cfg, None).await.expect("open state");
+            let socket = tmp.path().join("eof.sock");
+            let listener = LocalListener::bind(&socket).expect("bind eof socket");
+            let mut client = LocalStream::connect(&socket)
+                .await
+                .expect("connect eof client");
+            client
+                .write_all(&bytes)
+                .await
+                .expect("write partial request");
+            drop(client);
+            let (stream, _) = listener.accept().await.expect("accept eof request");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle_connection(state, stream, Duration::from_secs(60)),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "connection must end at client EOF, not at the idle timeout"
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread")]
     async fn stop_waits_for_windows_daemon_to_drain() -> anyhow::Result<()> {
