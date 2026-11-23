@@ -21,6 +21,8 @@
 //! `handle_add_markdown` take, so a watch-triggered reindex never races the
 //! daemon's own writes.
 
+#[cfg(target_os = "linux")]
+mod native;
 pub(crate) mod registry;
 
 pub(crate) use registry::{ConfigSource, WatchRegistry};
@@ -46,6 +48,13 @@ use super::ladder::LadderOutcome;
 use super::state::{DaemonState, IdleClock, WorkClass, corpus_lock_keys, path_lock_keys};
 use registry::RegistrationId;
 use tokio_util::task::TaskTracker;
+
+#[cfg(target_os = "linux")]
+use native::NativeWatcher;
+#[cfg(not(target_os = "linux"))]
+type NativeWatcher = notify::RecommendedWatcher;
+
+type NativeDebouncer = notify_debouncer_full::Debouncer<NativeWatcher, NoCache>;
 
 /// One watched location: the directory handed to `notify`, the corpus that
 /// owns it, and — for a **file-path** corpus root — the exact declared file.
@@ -457,20 +466,19 @@ fn spawn_retired_cleanup(
 /// failed, so the caller can retry it, or `None` when nothing remains.
 /// A root that reappeared is dropped, not deleted.
 ///
-/// Lock order matches catch-up: the corpus lock first, then the write
-/// lane. The absence recheck runs under both, so a recreated root cannot
-/// race a catch-up that is indexing it.
+/// Clear the debt gate before taking the corpus lock and write lane.
+/// Recheck absence under both locks so cleanup cannot race catch-up.
 async fn cleanup_retired_registration(
     state: &DaemonState,
     registration: registry::RetiredRegistration,
 ) -> Option<registry::RetiredRegistration> {
-    let _corpus_guard = state.lock_corpus(&registration.lock_keys).await;
     let shutdown = state.shutdown_token().clone();
-    let _lane = tokio::select! {
+    let _guard = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Some(registration),
-        permit = state.acquire_write_lane() => match permit {
-            Ok(permit) => permit,
+        guard = state.acquire_mutation_guard(&registration.lock_keys) => match guard {
+            Ok(guard) => guard,
+            Err(crate::backpressure::RETRYABLE_HARD_DEBT) => return Some(registration),
             Err(error) => {
                 tracing::warn!(target: "hallouminate::daemon", corpus = %registration.corpus, error = %error, "watcher: retired-root cleanup could not take the write lane; will retry on next reconcile");
                 return Some(registration);
@@ -644,7 +652,7 @@ struct NativeWatchHook {
 /// `UpdatePathsError` for a configured path or a stream-restart failure.
 #[cfg(test)]
 fn native_update_paths(
-    debouncer: &mut notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
+    debouncer: &mut NativeDebouncer,
     ops: Vec<PathOp>,
     hook: &mut Option<std::sync::Arc<std::sync::Mutex<NativeWatchHook>>>,
 ) -> Result<(), Box<UpdatePathsError>> {
@@ -722,7 +730,7 @@ fn native_update_paths(
 /// debouncer, the set of paths currently `debouncer.watch()`'d, and the
 /// flattened current root list used by `process_change_batch`.
 struct PumpState {
-    debouncer: Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>>,
+    debouncer: Option<NativeDebouncer>,
     installed: HashMap<PathBuf, RecursiveMode>,
     roots: Vec<WatchRoot>,
     /// Registrations already marked `Degraded` because the native backend
@@ -1239,7 +1247,7 @@ fn build_debouncer(
     wake: std::sync::Arc<tokio::sync::Notify>,
     pending: std::sync::Arc<std::sync::Mutex<PendingPaths>>,
     quiet: bool,
-) -> Option<notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>> {
+) -> Option<NativeDebouncer> {
     let debounce = Duration::from_millis(cfg.watch.debounce_ms);
     // unbounded channel: a write burst that outpaces the serial async
     // consumer used to retain every debounced batch in daemon memory
@@ -1443,9 +1451,7 @@ fn spawn_corpus_watcher_with(
         std::sync::Arc<tokio::sync::Notify>,
         std::sync::Arc<std::sync::Mutex<PendingPaths>>,
         bool,
-    ) -> Option<
-        notify_debouncer_full::Debouncer<notify::RecommendedWatcher, NoCache>,
-    >,
+    ) -> Option<NativeDebouncer>,
 ) -> Option<WatcherHandle> {
     let cfg = state.baseline();
     let failure_reminder = Duration::from_secs(cfg.watch.failure_reminder_secs);
@@ -5682,6 +5688,86 @@ body
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retired_root_clears_native_retry_after_kernel_unwatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (state, repo, root) = repo_layer_fixture(tmp.path()).await;
+        let mut pump = PumpState::test_default();
+        pump.debouncer = Some(
+            build_debouncer(
+                state.baseline(),
+                &state,
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+                std::sync::Arc::new(std::sync::Mutex::new(PendingPaths::default())),
+                false,
+            )
+            .expect("open inotify"),
+        );
+        let tracker = TaskTracker::new();
+        pump.reconcile(&state, &tracker, WatchRetry::ReconcileTick);
+        assert!(
+            pump.installed.contains_key(&root),
+            "install the native watch"
+        );
+        std::fs::remove_dir_all(&repo).expect("delete repo");
+
+        let debouncer = pump.debouncer.as_ref().expect("debouncer");
+        crate::test_support::wait_until(Duration::from_secs(5), "inotify root removal", || async {
+            debouncer
+                .watched_paths()
+                .expect("read native watches")
+                .iter()
+                .all(|(path, _mode)| path != &root)
+        })
+        .await;
+
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS - 1,
+        );
+        let sibling = repo.parent().expect("repo parent").join("sibling");
+        std::fs::create_dir(&sibling).expect("create sibling");
+        register_runtime_corpora(
+            &state,
+            None,
+            &[corpus(
+                "sibling",
+                sibling.to_str().expect("utf8"),
+                &["**/*.md"],
+            )],
+            state.baseline(),
+        )
+        .expect("register sibling");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+
+        let native_paths = pump
+            .debouncer
+            .as_ref()
+            .expect("debouncer")
+            .watched_paths()
+            .expect("read native watches");
+        assert!(
+            native_paths.iter().any(|(path, _mode)| path == &sibling),
+            "install the watch that follows the removed root in the reconcile batch"
+        );
+        assert!(!registered(&state, "cheese"), "retire the missing root");
+        assert!(
+            !pump.installed.contains_key(&root),
+            "forget the removed watch"
+        );
+        assert!(
+            !pump.unwatch_retries.contains_key(&root),
+            "clear the obsolete retry"
+        );
+    }
+
     #[tokio::test]
     async fn deleted_repo_layer_root_retires_after_consecutive_missing_ticks() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -5893,6 +5979,77 @@ body
     }
 
     #[tokio::test]
+    async fn retired_root_cleanup_waits_for_mutation_admission() {
+        use crate::debt::{DebtLevel, OBSERVED, OBSERVED_HARD_COORD};
+
+        let _coord = OBSERVED_HARD_COORD.write().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().canonicalize().expect("canonicalize tempdir");
+        let root = path.join("gone");
+        let key = CorpusKey::from_configured_root("gone", root.to_str().expect("utf8"));
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = path.join("ground").to_string_lossy().into_owned();
+        cfg.daemon.maintenance_interval_secs = 3600;
+        cfg.daemon.debt_hard_fragments = 1;
+        cfg.daemon.debt_cache_ttl_secs = 0;
+        cfg.daemon.hard_block_wait_secs = 0;
+
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let resources = state.resources_for(&cfg).await.expect("resources");
+        seed_retired_root_rows(&resources.store, &key).await;
+        let retired = registry::RetiredRegistration {
+            corpus: "gone".into(),
+            root: root.clone(),
+            roots: vec![root.clone()],
+            lock_keys: vec![key.clone()],
+            cfg: std::sync::Arc::new(cfg),
+            failed_attempts: 0,
+        };
+
+        let pending = cleanup_retired_registration(&state, retired).await;
+        OBSERVED.record(DebtLevel::Ok);
+        let stats = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            stats.total_chunks, 1,
+            "Hard debt must preserve the indexed row"
+        );
+        let pending = pending.expect("Hard debt must defer cleanup");
+        assert_eq!(pending.roots, vec![root]);
+    }
+
+    async fn seed_retired_root_rows(store: &LanceStore, key: &CorpusKey) {
+        store
+            .apply_batch(vec![hallouminate_domain::indexer::PreparedFile {
+                file_ref: "/tmp/gone.md".into(),
+                corpus_key: key.clone(),
+                mtime_ms: 1,
+                content_hash: "deadbeef".into(),
+                summary: "summary".into(),
+                keywords: vec![],
+                frontmatter: None,
+                indexed_at_ms: 1,
+                chunks: vec![hallouminate_domain::indexer::PreparedChunk {
+                    ord: 0,
+                    heading_path: vec!["H".into()],
+                    line_start: 1,
+                    line_end: 2,
+                    text: "body".into(),
+                    search_text: "body".into(),
+                    claim_marks: None,
+                    structure: None,
+                    overlap_bytes: 0,
+                }],
+            }])
+            .await
+            .expect("seed retired root rows");
+    }
+
+    #[tokio::test]
     async fn failed_retired_cleanup_is_retried_on_the_next_reconcile_tick() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
@@ -5923,31 +6080,7 @@ body
             tmp.path().join("gone").to_str().expect("utf8"),
         );
         let resources = state.resources_for(&broken).await.expect("resources");
-        resources
-            .store
-            .apply_batch(vec![hallouminate_domain::indexer::PreparedFile {
-                file_ref: "/tmp/gone.md".into(),
-                corpus_key: key.clone(),
-                mtime_ms: 1,
-                content_hash: "deadbeef".into(),
-                summary: "summary".into(),
-                keywords: vec![],
-                frontmatter: None,
-                indexed_at_ms: 1,
-                chunks: vec![hallouminate_domain::indexer::PreparedChunk {
-                    ord: 0,
-                    heading_path: vec!["H".into()],
-                    line_start: 1,
-                    line_end: 2,
-                    text: "body".into(),
-                    search_text: "body".into(),
-                    claim_marks: None,
-                    structure: None,
-                    overlap_bytes: 0,
-                }],
-            }])
-            .await
-            .expect("seed retired root rows");
+        seed_retired_root_rows(&resources.store, &key).await;
         let seeded = resources
             .store
             .corpus_chunk_stats(&key)
