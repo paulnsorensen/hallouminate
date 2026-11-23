@@ -1,8 +1,8 @@
 {
-  "asset": "ingest-ledger-9322c9e94e3d.pyz",
-  "content_sha256": "9322c9e94e3de7fcbd47b4d775334f043a473a52c3f8a7156ea6abbeb4be4d28",
-  "format": 8,
-  "key": "fd5b467893108b08647632f2b52981d8669ba71c91d8a1f4e33ba402dc24ee7d",
+  "asset": "ingest-ledger-e47acd5b56de.pyz",
+  "content_sha256": "e47acd5b56de2027727da2b71be71ba8066ab613394424fee9de6a8947b21637",
+  "format": 10,
+  "key": "b84222bc573eab417bbe696b80a0ff528a1b7a13b93e7d8d10842f7ad46958c3",
   "name": "ingest-ledger",
   "release": "wedge",
   "repo": "paulnsorensen/hallouminate"
