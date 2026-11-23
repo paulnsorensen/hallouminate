@@ -192,7 +192,8 @@ test("AC-13 package version and release runners", () => {
 });
 
 test("AC-20 Windows CI runners and timeout", () => {
-  const ci = fs.readFileSync(path.join(__dirname, "../../.github/workflows/ci.yml"), "utf8");
+  // Windows checkouts may convert ci.yml to CRLF; the job regex expects LF.
+  const ci = fs.readFileSync(path.join(__dirname, "../../.github/workflows/ci.yml"), "utf8").replace(/\r\n/g, "\n");
   const jobBody = (name) => ci.match(new RegExp(`^  ${name}:\\n((?:    .*\\n|\\n)+)`, "m"))[1];
   const windowsJob = jobBody("windows");
   assert.match(windowsJob, /^    runs-on: windows-2022$/m);
