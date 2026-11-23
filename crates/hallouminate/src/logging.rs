@@ -611,7 +611,14 @@ impl Write for LogSink {
             }
             Slot::Closed => return Err(io::Error::other("log file is closed")),
         };
-        active.write_record(&self.dir, &self.config, buf)?;
+        let record = active.write_record(&self.dir, &self.config, buf);
+        if let Err(error) = record {
+            report_once("write log file", &error);
+            *slot = Slot::Failed {
+                retry_at: Instant::now() + OPEN_RETRY_DELAY,
+            };
+            return write_stderr(buf);
+        }
         Ok(buf.len())
     }
 
@@ -694,8 +701,9 @@ impl ActiveLog {
             self.try_promote(dir);
         }
         let rotated = self.is_full(incoming, config);
-        if rotated {
-            self.rotate(dir);
+        if rotated && let Err(error) = self.rotate(dir) {
+            report_once("reopen log file", &error);
+            return Err(error);
         }
         self.file.write_all(buf)?;
         self.len = self.len.saturating_add(incoming);
@@ -730,19 +738,24 @@ impl ActiveLog {
         self._lock = lock;
     }
 
-    fn rotate(&mut self, dir: &Path) {
+    fn rotate(&mut self, dir: &Path) -> io::Result<()> {
         let active = self.family.active_path(dir);
         let archive = self.family.archive_path(dir, self.next_archive);
         match std::fs::rename(&active, &archive) {
-            Ok(()) => self.next_archive = self.next_archive.saturating_add(1),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => report_once("rotate log file", &error),
-        }
-        match open_append(&active) {
-            Ok(file) => self.file = file,
-            Err(error) => report_once("reopen log file", &error),
+            Ok(()) => {
+                self.next_archive = self.next_archive.saturating_add(1);
+                self.file = open_append(&active)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.file = open_append(&active)?;
+            }
+            Err(error) => {
+                report_once("rotate log file", &error);
+                self.file.set_len(0)?;
+            }
         }
         self.len = 0;
+        Ok(())
     }
 }
 
@@ -853,6 +866,28 @@ mod tests {
             }
         }
         Ok((paths.len(), lines))
+    }
+
+    #[test]
+    fn rotate_keeps_cap_when_archive_rename_fails() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut active = ActiveLog::open(dir.path(), LogRole::Cli, 1)?;
+        std::fs::create_dir(active.family.archive_path(dir.path(), active.next_archive))?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 1 << 20,
+        };
+        let record = [b'x'; 40];
+        for _ in 0..10 {
+            active.write_record(dir.path(), &config, &record)?;
+        }
+        let len = std::fs::metadata(active.family.active_path(dir.path()))?.len();
+        assert!(
+            len <= config.max_file_bytes,
+            "active file grew to {len} bytes past the {} byte cap",
+            config.max_file_bytes
+        );
+        Ok(())
     }
 
     #[test]
