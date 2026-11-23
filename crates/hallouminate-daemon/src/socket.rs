@@ -28,7 +28,7 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        Ok(windows_socket_path(crate::windows_security::account_home()?))
+        default_windows_socket_path()
     }
 }
 
@@ -62,6 +62,12 @@ fn canonical_socket_path(account_home: PathBuf) -> PathBuf {
         .join(".cache")
         .join("hallouminate")
         .join(SOCKET_NAME)
+}
+
+/// Resolves the account-home socket path and ignores `HALLOUMINATE_SOCKET`.
+#[cfg(windows)]
+pub(crate) fn default_windows_socket_path() -> io::Result<PathBuf> {
+    Ok(windows_socket_path(crate::windows_security::account_home()?))
 }
 
 #[cfg(windows)]

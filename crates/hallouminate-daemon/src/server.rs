@@ -234,12 +234,39 @@ pub fn spawn_signal_handlers(state: &DaemonState) {
     state.supervisor().spawn(TaskName::Signal, move || {
         let token = token.clone();
         async move {
-            match tokio::signal::ctrl_c().await {
-                Ok(()) => token.cancel(),
-                Err(error) => tracing::warn!(%error, "failed to wait for console shutdown"),
+            match console_shutdown_event().await {
+                Ok(event) => {
+                    tracing::info!(
+                        target: "hallouminate::daemon",
+                        event,
+                        "received console event; shutting down",
+                    );
+                    token.cancel();
+                }
+                Err(error) => tracing::warn!(
+                    target: "hallouminate::daemon",
+                    %error,
+                    "failed to wait for console shutdown",
+                ),
             }
         }
     });
+}
+
+/// Waits for Ctrl-C, console close, logoff, or system shutdown.
+#[cfg(windows)]
+async fn console_shutdown_event() -> std::io::Result<&'static str> {
+    use tokio::signal::windows;
+
+    let mut close = windows::ctrl_close()?;
+    let mut shutdown = windows::ctrl_shutdown()?;
+    let mut logoff = windows::ctrl_logoff()?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result.map(|()| "Ctrl-C"),
+        _ = close.recv() => Ok("console close"),
+        _ = shutdown.recv() => Ok("system shutdown"),
+        _ = logoff.recv() => Ok("logoff"),
+    }
 }
 
 /// Spawn the process-level idle-exit watcher (ADR-001/003). When the activity
@@ -417,8 +444,8 @@ async fn finish_shutdown(
     cleanup(lock, socket_path).await;
 }
 
-/// Remove the socket file, then release the single-instance flock (dropping
-/// the `File` releases the advisory lock, POSIX). This order matters: if the
+/// Remove the socket file, then release the single-instance lock (dropping
+/// the `File` releases it). This order matters: if the
 /// flock were released first, a respawning daemon could win it, remove the
 /// stale socket, and bind a fresh one — which this process's trailing
 /// `remove_file` would then delete, leaving the new daemon bound but
@@ -434,6 +461,8 @@ async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = socket_path.parent()
         && !parent.as_os_str().is_empty()
     {
+        #[cfg(windows)]
+        let parent_existed = tokio::fs::try_exists(parent).await.unwrap_or(true);
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| anyhow::anyhow!("create socket parent dir {}: {e}", parent.display()))?;
@@ -455,8 +484,22 @@ async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
                     )
                 })?;
         }
+        // Rewrite the DACL only for a directory that the daemon created or
+        // that holds the default socket path. Any other existing directory
+        // belongs to the caller; the endpoint marker and pipe carry their
+        // own owner-only DACLs.
         #[cfg(windows)]
-        crate::windows_security::restrict_path(parent)?;
+        if !parent_existed
+            || super::socket::default_windows_socket_path()
+                .is_ok_and(|default_path| default_path == socket_path)
+        {
+            crate::windows_security::restrict_path(parent).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to set owner-only DACL on socket parent dir {}: {e}",
+                    parent.display(),
+                )
+            })?;
+        }
     }
     Ok(())
 }
@@ -670,17 +713,18 @@ async fn handle_connection(
     stream: LocalStream,
     idle_timeout: Duration,
 ) -> anyhow::Result<()> {
-    // Best-effort peer uid, checked below against the mutating-request
+    // Best-effort peer identity, checked below against the mutating-request
     // allowlist (B6 defense-in-depth). Captured before `into_split` since the
-    // whole `LocalStream` (not either half) implements `AsRawFd`.
+    // whole `LocalStream` (not either half) exposes the peer: `AsRawFd` on
+    // Unix, the pipe handle on Windows.
     #[cfg(unix)]
-    let peer_uid = peer_credential_uid(&stream);
+    let peer_identity = peer_credential_uid(&stream);
     #[cfg(unix)]
-    let effective_uid = rustix::process::geteuid().as_raw();
+    let daemon_identity = rustix::process::geteuid().as_raw();
     #[cfg(windows)]
-    let peer_uid = stream.peer_user().ok();
+    let peer_identity = stream.peer_user().ok();
     #[cfg(windows)]
-    let effective_uid = crate::windows_security::current_user_sid()?;
+    let daemon_identity = crate::windows_security::current_user_sid()?.clone();
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = ipc_lines(read_half);
     let frame = match tokio::time::timeout(idle_timeout, lines.next()).await {
@@ -700,7 +744,7 @@ async fn handle_connection(
     let mut idle_clock = IdleClock::Keep;
     let response = match frame {
         Ok(line) => match serde_json::from_str::<DaemonRequest>(&line) {
-            Ok(req) => match authorize_peer(peer_uid, effective_uid, &req.payload) {
+            Ok(req) => match authorize_peer(peer_identity, daemon_identity, &req.payload) {
                 Some(denied) => denied,
                 None => {
                     let candidate_idle_clock = idle_clock_for(&req.payload);
@@ -804,10 +848,10 @@ pub(super) fn lock_path_for(socket_path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Take a non-blocking advisory lock on the lockfile next to the socket.
-/// Returns the open file; closing the fd releases the advisory lock
-/// (POSIX). A second daemon on the same socket bounces with `EWOULDBLOCK`
-/// and surfaces a clear "daemon already running" error.
+/// Take a non-blocking exclusive lock on the lockfile next to the socket.
+/// Returns the open file; closing it releases the lock. A second daemon on
+/// the same socket fails `File::try_lock` and surfaces a clear "daemon
+/// already running" error.
 fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
@@ -829,26 +873,27 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
 }
 
 /// Reject mutating requests (`AddMarkdown`/`DeleteMarkdown`/`Index`/
-/// `Shutdown`) from a peer whose uid doesn't match the daemon's effective
-/// uid (B6 defense-in-depth). The socket + parent dir are already
-/// owner-only (0o600 / 0o700 in [`serve_on_listener`]/[`prepare_socket_dir`]),
+/// `Shutdown`) from a peer whose identity (uid on Unix, SID on Windows)
+/// doesn't match the daemon's (B6 defense-in-depth). The endpoint is already
+/// owner-only (0o600 / 0o700 on Unix, owner-only DACLs on Windows, set in
+/// [`serve_on_listener`]/[`prepare_socket_dir`]),
 /// so this only matters if those perms are loosened after boot on a shared
 /// machine. Read-only requests (Ping/Ground/List*/Backlinks/ReadMarkdown/
-/// CorpusStats) are unrestricted. `peer_uid: None` (credential lookup
+/// CorpusStats) are unrestricted. `peer_identity: None` (credential lookup
 /// unsupported or failed) fails closed for mutating requests rather than
 /// silently allowing them.
 fn authorize_peer<T: std::fmt::Display + PartialEq>(
-    peer_uid: Option<T>,
-    effective_uid: T,
+    peer_identity: Option<T>,
+    daemon_identity: T,
     payload: &super::ipc::DaemonRequestPayload,
 ) -> Option<DaemonResponse> {
     if !is_mutating_payload(payload) {
         return None;
     }
-    match peer_uid {
-        Some(uid) if uid == effective_uid => None,
-        Some(uid) => Some(DaemonResponse::invalid_params(format!(
-            "peer uid {uid} is not authorized for mutating requests (daemon uid {effective_uid})"
+    match peer_identity {
+        Some(identity) if identity == daemon_identity => None,
+        Some(identity) => Some(DaemonResponse::invalid_params(format!(
+            "peer identity {identity} is not authorized for mutating requests (daemon identity {daemon_identity})"
         ))),
         None => Some(DaemonResponse::invalid_params(
             "peer credentials unavailable; refusing mutating request",
@@ -1054,6 +1099,7 @@ mod tests {
         assert!(message.contains("Unable to decode input as UTF8"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn empty_request_closes_without_response() {
         match exchange_request(Vec::new()).await {
@@ -1095,6 +1141,43 @@ mod tests {
         let mut lines = ipc_lines(client);
         assert_eq!(lines.next().await.transpose().expect("read idle EOF"), None);
     }
+
+    // A named-pipe client cannot half-close, so the Unix EOF tests above cannot
+    // read the reply. Dropping the client still delivers EOF to the server, and
+    // the connection must end at that EOF rather than at the idle timeout.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn client_disconnect_mid_request_ends_connection_before_idle_timeout() {
+        let partial_requests = [ping_request_bytes(), br#"{"cwd":"#.to_vec()];
+        for bytes in partial_requests {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let mut cfg = Config::default();
+            cfg.embeddings.enabled = false;
+            cfg.storage.ground_dir = tmp.path().join("ground").to_string_lossy().into_owned();
+            let state = DaemonState::open(cfg, None).await.expect("open state");
+            let socket = tmp.path().join("eof.sock");
+            let listener = LocalListener::bind(&socket).expect("bind eof socket");
+            let mut client = LocalStream::connect(&socket)
+                .await
+                .expect("connect eof client");
+            client
+                .write_all(&bytes)
+                .await
+                .expect("write partial request");
+            drop(client);
+            let (stream, _) = listener.accept().await.expect("accept eof request");
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(5),
+                handle_connection(state, stream, Duration::from_secs(60)),
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "connection must end at client EOF, not at the idle timeout"
+            );
+        }
+    }
+
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread")]
     async fn stop_waits_for_windows_daemon_to_drain() -> anyhow::Result<()> {
