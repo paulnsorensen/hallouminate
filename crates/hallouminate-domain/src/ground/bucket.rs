@@ -1,20 +1,75 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::common::Result;
 use crate::corpus::make_snippet;
-use crate::indexer::SearchHit;
+use crate::footnotes::{FootnoteMode, apply_footnote_mode};
+use crate::indexer::{Format, PAGE_BREADCRUMB_PREFIX, SearchHit, format_from_extension};
 
-use super::types::{ChunkProvenance, DocChunk, DocFile};
+use super::types::{
+    ChunkProvenance, DocChunk, DocFile, FileCoverage, GroundGroupBy, GroundMatch, GroundOutput,
+};
 
-/// Bucket `hits` by `file_ref`, sort by max-score descending (file_ref tiebreak),
-/// truncate to `top_files`, then take the top `chunks_per_file` chunks per
-/// bucket by score. Pure CPU — LanceDB hits already carry every field needed
-/// to render a `DocFile`, including `mtime_ms` which is formatted as RFC3339
-/// at bucket-emit time.
+/// How [`roll_up`] shapes the hits of each matched file.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Rollup {
+    pub(super) chunks_per_file: usize,
+    pub(super) footnote_mode: FootnoteMode,
+    pub(super) match_mode: GroundMatch,
+    pub(super) group_by: GroundGroupBy,
+    pub(super) output: GroundOutput,
+}
+
+#[cfg(test)]
 pub(super) fn build_docs(
     hits: &[SearchHit],
     top_files: usize,
     chunks_per_file: usize,
+    footnote_mode: FootnoteMode,
+) -> Result<BTreeMap<String, DocFile>> {
+    roll_up(
+        hits,
+        top_files,
+        Rollup {
+            chunks_per_file,
+            footnote_mode,
+            match_mode: GroundMatch::Ranked,
+            group_by: GroundGroupBy::Chunk,
+            output: GroundOutput::Hits,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(super) fn build_phrase_docs(
+    hits: &[SearchHit],
+    top_files: usize,
+    chunks_per_file: usize,
+    footnote_mode: FootnoteMode,
+) -> Result<BTreeMap<String, DocFile>> {
+    roll_up(
+        hits,
+        top_files,
+        Rollup {
+            chunks_per_file,
+            footnote_mode,
+            match_mode: GroundMatch::Phrase,
+            group_by: GroundGroupBy::Chunk,
+            output: GroundOutput::Hits,
+        },
+    )
+}
+
+/// Bucket `hits` by `file_ref`, sort by max-score descending (file_ref tiebreak),
+/// truncate to `top_files`, then take the top `chunks_per_file` entries per
+/// bucket by score. With [`GroundGroupBy::Page`], an entry is a page; with
+/// [`GroundOutput::Counts`], each file carries counts and no entries. Pure
+/// CPU — LanceDB hits already carry every field needed to render a
+/// `DocFile`, including `mtime_ms` which is formatted as RFC3339 at
+/// bucket-emit time.
+pub(super) fn roll_up(
+    hits: &[SearchHit],
+    top_files: usize,
+    rollup: Rollup,
 ) -> Result<BTreeMap<String, DocFile>> {
     let mut buckets: HashMap<String, FileBucket> = HashMap::new();
     for hit in hits {
@@ -33,10 +88,76 @@ pub(super) fn build_docs(
     files.truncate(top_files);
     let mut out = BTreeMap::new();
     for f in files {
-        let (key, doc) = f.into_doc(chunks_per_file);
+        let (key, doc) = f.into_doc(rollup);
         out.insert(key, doc);
     }
     Ok(out)
+}
+
+/// The `page:N` breadcrumb of a PDF chunk, or `None` for any other chunk.
+///
+/// The file must have a `.pdf` extension, or no extension at all because
+/// `detect_format` sniffs an extensionless PDF. Sniffed text has no
+/// headings, so a `page:N` breadcrumb on an extensionless file comes only
+/// from the PDF handler. `N` must be a positive integer, so an authored
+/// `# page:x` heading in another format is not a page.
+fn page_label(hit: &SearchHit) -> Option<&str> {
+    let [label] = hit.heading_path.as_slice() else {
+        return None;
+    };
+    let (Some(Some(Format::Pdf)) | None) =
+        format_from_extension(std::path::Path::new(&hit.file_ref))
+    else {
+        return None;
+    };
+    let number = label.strip_prefix(PAGE_BREADCRUMB_PREFIX)?;
+    match number.parse::<usize>() {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(label),
+    }
+}
+
+/// Collapses best-first `hits` to one entry per page, keeping the first (best)
+/// chunk of each page with the number of chunks it stands for. A chunk without
+/// a page breadcrumb stays a single entry.
+fn group_by_page(hits: Vec<SearchHit>) -> Vec<(SearchHit, Option<usize>)> {
+    let mut entries: Vec<(SearchHit, Option<usize>)> = Vec::with_capacity(hits.len());
+    let mut page_slots: HashMap<String, usize> = HashMap::new();
+    for hit in hits {
+        let Some(page) = page_label(&hit) else {
+            entries.push((hit, Some(1)));
+            continue;
+        };
+        let existing = page_slots.get(page).copied();
+        match existing {
+            Some(slot) => {
+                let (_, count) = &mut entries[slot];
+                *count = count.map(|stood_for| stood_for + 1);
+            }
+            None => {
+                page_slots.insert(page.to_string(), entries.len());
+                entries.push((hit, Some(1)));
+            }
+        }
+    }
+    entries
+}
+
+fn coverage_of(hits: &[SearchHit]) -> FileCoverage {
+    let mut pages: HashSet<&str> = HashSet::new();
+    for hit in hits {
+        if let Some(page) = page_label(hit) {
+            pages.insert(page);
+        }
+    }
+    FileCoverage {
+        chunks: hits.len(),
+        pages: if pages.is_empty() {
+            None
+        } else {
+            Some(pages.len())
+        },
+    }
 }
 
 struct FileBucket {
@@ -70,34 +191,62 @@ impl FileBucket {
         self.chunks.push(hit);
     }
 
-    fn into_doc(mut self, chunks_per_file: usize) -> (String, DocFile) {
+    fn into_doc(mut self, rollup: Rollup) -> (String, DocFile) {
+        let Rollup {
+            chunks_per_file,
+            footnote_mode,
+            match_mode,
+            group_by,
+            output,
+        } = rollup;
         self.chunks.sort_by(|a, b| {
-            (b.score)
+            let order = b
+                .score
                 .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.chunk_id.cmp(&b.chunk_id))
+                .unwrap_or(std::cmp::Ordering::Equal);
+            match match_mode {
+                GroundMatch::Ranked => order.then_with(|| a.chunk_id.cmp(&b.chunk_id)),
+                GroundMatch::Phrase => order
+                    .then_with(|| a.line_start.cmp(&b.line_start))
+                    .then_with(|| a.chunk_id.cmp(&b.chunk_id)),
+            }
         });
-        self.chunks.truncate(chunks_per_file);
-        let chunks = self
-            .chunks
-            .iter()
-            .map(|h| DocChunk {
-                chunk_id: h.chunk_id.clone(),
-                heading_path: h.heading_path.clone(),
+        let coverage = match output {
+            GroundOutput::Hits => None,
+            GroundOutput::Counts => Some(coverage_of(&self.chunks)),
+        };
+        let mut entries = match (output, group_by) {
+            (GroundOutput::Counts, GroundGroupBy::Chunk | GroundGroupBy::Page) => Vec::new(),
+            (GroundOutput::Hits, GroundGroupBy::Chunk) => {
+                let mut entries = Vec::with_capacity(self.chunks.len());
+                for hit in self.chunks {
+                    entries.push((hit, None));
+                }
+                entries
+            }
+            (GroundOutput::Hits, GroundGroupBy::Page) => group_by_page(self.chunks),
+        };
+        entries.truncate(chunks_per_file);
+        let mut chunks = Vec::with_capacity(entries.len());
+        for (h, chunk_count) in entries {
+            chunks.push(DocChunk {
+                snippet: make_snippet(&apply_footnote_mode(&h.text, footnote_mode)),
+                chunk_id: h.chunk_id,
+                heading_path: h.heading_path,
                 line_range: [h.line_start as u32, h.line_end as u32],
                 score: h.score as f64,
                 z_score: h.z_score,
-                snippet: make_snippet(&h.text),
                 // `corpus` is stamped by the orchestrator from its corpus arg
                 // (the LanceDB row implies corpus by query scope and doesn't
                 // carry it per-row); `claim_marks` is per-row, so it flows from
                 // the decoded hit here.
                 provenance: ChunkProvenance {
-                    claim_marks: h.claim_marks.clone(),
+                    claim_marks: h.claim_marks,
                     ..ChunkProvenance::default()
                 },
-            })
-            .collect();
+                chunk_count,
+            });
+        }
         // mtime is sourced from SearchHit.mtime_ms (decoded from the
         // LanceDB `mtime_ms` column) and formatted RFC3339 in UTC with
         // second precision so the response shape matches `2026-04-30T10:11:23Z`.
@@ -109,11 +258,15 @@ impl FileBucket {
         let mtime = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(self.mtime_ms)
             .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
             .unwrap_or_default();
+        let (summary, keywords) = match output {
+            GroundOutput::Hits => (self.summary, self.keywords),
+            GroundOutput::Counts => (None, Vec::new()),
+        };
         (
             self.file_ref,
             DocFile {
-                summary: self.summary,
-                keywords: self.keywords,
+                summary,
+                keywords,
                 score: self.score,
                 z_score: self.z_score,
                 mtime,
@@ -121,6 +274,7 @@ impl FileBucket {
                 path: None,
                 stale: false,
                 chunks,
+                coverage,
             },
         )
     }
@@ -180,6 +334,8 @@ mod tests {
             score,
             mtime_ms: FIXTURE_MTIME_MS,
             claim_marks: vec![],
+            structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
     }
@@ -191,7 +347,7 @@ mod tests {
             hit("/a.md", 1, 0.5),
             hit("/b.md", 0, 0.7),
         ];
-        let docs = build_docs(&hits, 10, 10).expect("build");
+        let docs = build_docs(&hits, 10, 10, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 2);
         let a = docs.get("/a.md").expect("a present");
         assert!((a.score - 0.9_f64).abs() < 1e-6, "{} != 0.9", a.score);
@@ -202,15 +358,221 @@ mod tests {
         assert_eq!(a.keywords, vec!["docs".to_string(), "test".into()]);
     }
 
+    fn page_hit(file_ref: &str, ord: usize, page: usize, score: f32) -> SearchHit {
+        let mut hit = hit(file_ref, ord, score);
+        hit.heading_path = vec![format!("{PAGE_BREADCRUMB_PREFIX}{page}")];
+        hit
+    }
+
+    fn page_rollup(
+        group_by: GroundGroupBy,
+        output: GroundOutput,
+        chunks_per_file: usize,
+    ) -> Rollup {
+        Rollup {
+            chunks_per_file,
+            footnote_mode: FootnoteMode::Include,
+            match_mode: GroundMatch::Phrase,
+            group_by,
+            output,
+        }
+    }
+
+    fn pdf_hits() -> Vec<SearchHit> {
+        vec![
+            page_hit("/a.pdf", 0, 1, 1.0),
+            page_hit("/a.pdf", 1, 1, 3.0),
+            page_hit("/a.pdf", 2, 1, 2.0),
+            page_hit("/a.pdf", 3, 2, 5.0),
+            page_hit("/a.pdf", 4, 2, 1.0),
+            hit("/a.pdf", 5, 0.5),
+        ]
+    }
+
+    #[test]
+    fn page_grouping_returns_the_best_chunk_and_chunk_count_for_each_page() {
+        let rollup = page_rollup(GroundGroupBy::Page, GroundOutput::Hits, 10);
+        let docs = roll_up(&pdf_hits(), 10, rollup).expect("build");
+        let doc = docs.get("/a.pdf").expect("pdf present");
+        let mut entries = Vec::new();
+        for chunk in &doc.chunks {
+            entries.push((
+                chunk.heading_path.join(" > "),
+                chunk.chunk_id.clone(),
+                chunk.chunk_count,
+            ));
+        }
+        assert_eq!(
+            entries,
+            vec![
+                ("page:2".to_string(), "/a.pdf#3".to_string(), Some(2)),
+                ("page:1".to_string(), "/a.pdf#1".to_string(), Some(3)),
+                ("section".to_string(), "/a.pdf#5".to_string(), Some(1)),
+            ]
+        );
+        assert!(doc.coverage.is_none(), "hits output carries no coverage");
+
+        let chunked = roll_up(
+            &pdf_hits(),
+            10,
+            page_rollup(GroundGroupBy::Chunk, GroundOutput::Hits, 10),
+        )
+        .expect("build");
+        let chunked = chunked.get("/a.pdf").expect("pdf present");
+        assert_eq!(chunked.chunks.len(), 6);
+        for chunk in &chunked.chunks {
+            assert_eq!(chunk.chunk_count, None, "chunk grouping sets no count");
+        }
+    }
+
+    #[test]
+    fn page_grouping_applies_chunks_per_file_to_pages() {
+        let rollup = page_rollup(GroundGroupBy::Page, GroundOutput::Hits, 1);
+        let docs = roll_up(&pdf_hits(), 10, rollup).expect("build");
+        let doc = docs.get("/a.pdf").expect("pdf present");
+        assert_eq!(doc.chunks.len(), 1);
+        assert_eq!(doc.chunks[0].heading_path, vec!["page:2".to_string()]);
+        assert_eq!(doc.chunks[0].chunk_count, Some(2));
+    }
+
+    #[test]
+    fn authored_page_heading_in_markdown_is_not_a_pdf_page() {
+        let mut hits = Vec::new();
+        for (ord, label) in ["page:1", "page:x"].into_iter().enumerate() {
+            let mut authored = hit("/notes.md", ord, 1.0);
+            authored.heading_path = vec![label.into()];
+            hits.push(authored);
+        }
+        let mut zero = hit("/b.pdf", 0, 1.0);
+        zero.heading_path = vec!["page:0".into()];
+        hits.push(zero);
+        let mut word = hit("/b.pdf", 1, 1.0);
+        word.heading_path = vec!["page:x".into()];
+        hits.push(word);
+        for group_by in [GroundGroupBy::Chunk, GroundGroupBy::Page] {
+            let rollup = page_rollup(group_by, GroundOutput::Counts, 1);
+            let docs = roll_up(&hits, usize::MAX, rollup).expect("build");
+            for path in ["/notes.md", "/b.pdf"] {
+                let doc = docs.get(path).expect("file present");
+                assert_eq!(
+                    doc.coverage.as_ref().map(|coverage| coverage.pages),
+                    Some(None),
+                    "{path} must report no pages"
+                );
+            }
+        }
+        let rollup = page_rollup(GroundGroupBy::Page, GroundOutput::Hits, 10);
+        let docs = roll_up(&hits, usize::MAX, rollup).expect("build");
+        let notes = docs.get("/notes.md").expect("markdown present");
+        assert_eq!(
+            notes.chunks.len(),
+            2,
+            "authored headings stay separate entries"
+        );
+    }
+
+    #[test]
+    fn counts_output_reports_chunks_and_distinct_pages_without_snippets() {
+        let mut hits = pdf_hits();
+        hits.push(hit("/b.md", 0, 1.0));
+        hits.push(hit("/b.md", 1, 1.0));
+        for group_by in [GroundGroupBy::Chunk, GroundGroupBy::Page] {
+            let rollup = page_rollup(group_by, GroundOutput::Counts, 1);
+            let docs = roll_up(&hits, usize::MAX, rollup).expect("build");
+            let pdf = docs.get("/a.pdf").expect("pdf present");
+            assert_eq!(
+                pdf.coverage,
+                Some(FileCoverage {
+                    chunks: 6,
+                    pages: Some(2)
+                })
+            );
+            assert!(pdf.chunks.is_empty(), "counts output carries no chunks");
+            assert_eq!(pdf.summary, None, "counts output is compact");
+            assert!(pdf.keywords.is_empty(), "counts output is compact");
+            let markdown = docs.get("/b.md").expect("markdown present");
+            assert_eq!(
+                markdown.coverage,
+                Some(FileCoverage {
+                    chunks: 2,
+                    pages: None
+                })
+            );
+            assert!(markdown.chunks.is_empty());
+        }
+    }
+
+    #[test]
+    fn page_label_accepts_only_a_single_page_breadcrumb() {
+        let labelled = |file_ref: &str, path: &[&str]| {
+            let mut hit = hit(file_ref, 0, 1.0);
+            let mut heading_path = Vec::new();
+            for label in path {
+                heading_path.push((*label).to_string());
+            }
+            hit.heading_path = heading_path;
+            hit
+        };
+        assert_eq!(page_label(&labelled("/a.pdf", &["page:7"])), Some("page:7"));
+        assert_eq!(page_label(&labelled("/A.PDF", &["page:7"])), Some("page:7"));
+        assert_eq!(page_label(&labelled("/a.pdf", &["section"])), None);
+        assert_eq!(page_label(&labelled("/a.pdf", &[])), None);
+        assert_eq!(page_label(&labelled("/a.pdf", &["page:1", "page:2"])), None);
+        assert_eq!(page_label(&labelled("/a.md", &["page:7"])), None);
+        assert_eq!(page_label(&labelled("/scan", &["page:7"])), Some("page:7"));
+        assert_eq!(page_label(&labelled("/scan.docx", &["page:7"])), None);
+    }
+
+    #[test]
+    fn phrase_rollup_keeps_line_order_when_chunk_ids_disagree() {
+        let mut earlier = hit("/a.md", 0, 1.0);
+        earlier.chunk_id = "z".into();
+        earlier.line_start = 2;
+        let mut later = hit("/a.md", 1, 1.0);
+        later.chunk_id = "a".into();
+        later.line_start = 20;
+        let docs = build_phrase_docs(&[later, earlier], usize::MAX, 1, FootnoteMode::Include)
+            .expect("build phrase docs");
+        let doc = docs.get("/a.md").expect("one file");
+        assert_eq!(doc.chunks[0].chunk_id, "z");
+    }
+
     #[test]
     fn snippets_preserve_display_text_instead_of_retrieval_text() {
         let mut poisoned = hit("/display.md", 0, 0.9);
         poisoned.text = "display evidence".into();
         poisoned.search_text = "retrieval poison".into();
 
-        let docs = build_docs(&[poisoned], 1, 1).expect("build docs");
+        let docs = build_docs(&[poisoned], 1, 1, FootnoteMode::Include).expect("build docs");
         let chunk = &docs.get("/display.md").expect("display doc").chunks[0];
         assert_eq!(chunk.snippet, "display evidence");
+    }
+
+    #[test]
+    fn footnote_mode_filters_the_snippet_before_it_leaves_the_domain() {
+        // WHY: `footnote_mode` rides the IPC request; if filtering lived only in
+        // the MCP adapter, CLI and any other IPC client would get unfiltered
+        // snippets. Filtering in `build_docs` is the single enforcement point.
+        let mut h = hit("/notes.md", 0, 0.9);
+        h.text = "claim with a marker[^a]\n\n[^a]: the footnote body".into();
+
+        let excluded = build_docs(&[h.clone()], 1, 1, FootnoteMode::Exclude).expect("build");
+        let snippet = &excluded.get("/notes.md").expect("doc").chunks[0].snippet;
+        assert!(
+            !snippet.contains("[^a]") && !snippet.contains("the footnote body"),
+            "Exclude must drop marker and definition, got {snippet:?}"
+        );
+        assert!(
+            snippet.contains("claim with a marker"),
+            "Exclude must keep body prose, got {snippet:?}"
+        );
+
+        let only = build_docs(&[h], 1, 1, FootnoteMode::Only).expect("build");
+        let snippet = &only.get("/notes.md").expect("doc").chunks[0].snippet;
+        assert!(
+            snippet.contains("the footnote body") && !snippet.contains("claim with a marker"),
+            "Only must keep just the definition, got {snippet:?}"
+        );
     }
 
     #[test]
@@ -223,7 +585,7 @@ mod tests {
             reference: Some("old.md".into()),
             note: None,
         }];
-        let docs = build_docs(&[h], 5, 5).expect("build");
+        let docs = build_docs(&[h], 5, 5, FootnoteMode::Include).expect("build");
         let chunk = &docs.get("/a.md").expect("a present").chunks[0];
         assert_eq!(
             chunk.provenance.claim_marks,
@@ -244,7 +606,7 @@ mod tests {
             hit("/a.md", 0, 0.5), // tied, lex smaller wins tie
             hit("/b.md", 0, 0.9),
         ];
-        let docs = build_docs(&hits, 2, 5).expect("build");
+        let docs = build_docs(&hits, 2, 5, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 2);
         assert!(docs.contains_key("/b.md"));
         assert!(
@@ -262,7 +624,7 @@ mod tests {
             hit("/x.md", 1, 0.5),
             hit("/x.md", 2, 0.7),
         ];
-        let docs = build_docs(&hits, 5, 2).expect("build");
+        let docs = build_docs(&hits, 5, 2, FootnoteMode::Include).expect("build");
         let x = docs.get("/x.md").expect("x present");
         assert_eq!(x.chunks.len(), 2);
         assert!(
@@ -279,14 +641,14 @@ mod tests {
 
     #[test]
     fn empty_hits_yield_empty_docs() {
-        let docs = build_docs(&[], 10, 10).expect("build");
+        let docs = build_docs(&[], 10, 10, FootnoteMode::Include).expect("build");
         assert!(docs.is_empty());
     }
 
     #[test]
     fn top_files_zero_yields_empty_docs_even_when_hits_present() {
         let hits = vec![hit("/a.md", 0, 0.9), hit("/b.md", 0, 0.5)];
-        let docs = build_docs(&hits, 0, 5).expect("build");
+        let docs = build_docs(&hits, 0, 5, FootnoteMode::Include).expect("build");
         assert!(
             docs.is_empty(),
             "top_files=0 must drop every bucket; got {:?}",
@@ -297,7 +659,7 @@ mod tests {
     #[test]
     fn chunks_per_file_zero_keeps_files_but_drops_all_chunks() {
         let hits = vec![hit("/a.md", 0, 0.9), hit("/a.md", 1, 0.5)];
-        let docs = build_docs(&hits, 5, 0).expect("build");
+        let docs = build_docs(&hits, 5, 0, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 1, "file bucket survives top-files cut");
         let a = docs.get("/a.md").expect("a present");
         assert!(a.chunks.is_empty(), "chunks_per_file=0 drops all chunks");
@@ -313,7 +675,7 @@ mod tests {
         // DocFile.summary so JSON consumers see `null`, not `""`.
         let mut h = hit("/a.md", 0, 0.5);
         h.summary = String::new();
-        let docs = build_docs(&[h], 5, 5).expect("build");
+        let docs = build_docs(&[h], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert_eq!(
             a.summary, None,
@@ -326,7 +688,7 @@ mod tests {
         // Regression for PR #7 Copilot review: DocFile.mtime must reflect
         // the file's stored mtime_ms, not an empty string. Use the fixture
         // hit's mtime_ms (2024-01-01T00:00:00Z) so the round-trip is exact.
-        let docs = build_docs(&[hit("/a.md", 0, 0.5)], 5, 5).expect("build");
+        let docs = build_docs(&[hit("/a.md", 0, 0.5)], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert_eq!(
             a.mtime, "2024-01-01T00:00:00Z",
@@ -341,7 +703,7 @@ mod tests {
         // None and the formatter returns Default (empty string).
         let mut h = hit("/a.md", 0, 0.5);
         h.mtime_ms = i64::MAX;
-        let docs = build_docs(&[h], 5, 5).expect("build");
+        let docs = build_docs(&[h], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert!(
             a.mtime.is_empty(),
@@ -359,7 +721,7 @@ mod tests {
             hit("/x.md", 0, 0.5), // chunk_id "/x.md#0"
             hit("/x.md", 1, 0.5), // chunk_id "/x.md#1"
         ];
-        let docs = build_docs(&hits, 5, 5).expect("build");
+        let docs = build_docs(&hits, 5, 5, FootnoteMode::Include).expect("build");
         let x = docs.get("/x.md").expect("x present");
         let ids: Vec<&str> = x.chunks.iter().map(|c| c.chunk_id.as_str()).collect();
         assert_eq!(
@@ -385,6 +747,8 @@ mod tests {
             score,
             mtime_ms: FIXTURE_MTIME_MS,
             claim_marks: vec![],
+            structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
     }
@@ -468,7 +832,7 @@ mod tests {
         ];
         // No z stamping — simulates the RRF/OFF path (crossencoder: None, so the
         // `if let Some(rerank)` gate in the orchestrator never fires).
-        let docs = build_docs(&hits, 10, 10).expect("build");
+        let docs = build_docs(&hits, 10, 10, FootnoteMode::Include).expect("build");
         for (path, doc) in &docs {
             assert!(
                 doc.z_score.is_none(),
@@ -512,7 +876,7 @@ mod tests {
         let expected_top_z = (0.9_f32 as f64 - mu) / sigma;
         let expected_second_z = (0.8_f32 as f64 - mu) / sigma;
         // Now build docs with top_files=2 — only top-2 survive.
-        let docs = build_docs(&hits, 2, 5).expect("build");
+        let docs = build_docs(&hits, 2, 5, FootnoteMode::Include).expect("build");
         assert_eq!(docs.len(), 2);
         let top = docs.get("/f0.md").expect("/f0.md present");
         assert!(
@@ -574,6 +938,7 @@ mod tests {
             path: None,
             stale: false,
             chunks: vec![],
+            coverage: None,
         };
         let v = serde_json::to_value(&file).expect("serialize");
         assert_eq!(
@@ -623,7 +988,7 @@ mod tests {
         let mut high = hit("/a.md", 1, 0.9);
         high.z_score = Some(1.5); // z for the higher-score chunk
         // Push low first, then high — FileBucket.push should adopt high's z.
-        let docs = build_docs(&[low, high], 5, 5).expect("build");
+        let docs = build_docs(&[low, high], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         assert!(
             (a.z_score.expect("file z must be Some") - 1.5).abs() < 1e-9,
@@ -641,7 +1006,7 @@ mod tests {
         h0.z_score = Some(1.2);
         let mut h1 = hit("/a.md", 1, 0.5);
         h1.z_score = Some(-0.3);
-        let docs = build_docs(&[h0, h1], 5, 5).expect("build");
+        let docs = build_docs(&[h0, h1], 5, 5, FootnoteMode::Include).expect("build");
         let a = docs.get("/a.md").expect("a present");
         // Chunks are sorted by score desc: h0 (0.9) first, h1 (0.5) second.
         assert_eq!(a.chunks.len(), 2);

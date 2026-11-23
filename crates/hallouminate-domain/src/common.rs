@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 mod paths;
 
-pub use paths::{RetiredRoot, canonicalize_or_passthrough, expand_tilde, retired_roots};
+pub use paths::{
+    RetiredRoot, best_effort_canonical, canonical_following_leaf, canonicalize_or_passthrough,
+    expand_tilde, retired_roots,
+};
 
 /// A reference to a file on disk, identified by its path.
 ///
@@ -38,6 +42,21 @@ impl From<PathBuf> for FileRef {
     fn from(path: PathBuf) -> Self {
         Self(path)
     }
+}
+
+/// The last path component of `file_ref`, or an empty string when it has none.
+pub(crate) fn file_name(file_ref: &str) -> String {
+    Path::new(file_ref)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// Milliseconds since the Unix epoch, or `None` for a pre-epoch or
+/// out-of-range time. Callers choose whether `None` is an error.
+pub(crate) fn epoch_millis(time: SystemTime) -> Option<i64> {
+    let elapsed = time.duration_since(UNIX_EPOCH).ok()?;
+    i64::try_from(elapsed.as_millis()).ok()
 }
 
 /// Identifies one configured corpus root after filesystem canonicalization.
@@ -76,7 +95,7 @@ impl CorpusKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Mtime(pub i64);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CorpusConfig {
     pub name: String,
     #[serde(default)]
@@ -140,11 +159,22 @@ impl CorpusConfig {
     /// root selection. A caller that resolves ancestors but deliberately
     /// leaves a symlinked final component alone uses this, so an escaping
     /// symlink still reaches the guard that owns it.
+    ///
+    /// Ownership is tested against each root's [`best_effort_canonical`]
+    /// form, so a configured root that does not exist yet — or is reached
+    /// through a symlinked ancestor — still matches paths the caller
+    /// resolved the same way. The returned key keeps its own
+    /// `canonical_root` unchanged, so corpus identity is unaffected.
     pub fn corpus_key_for_resolved_path(&self, path: &Path) -> Option<CorpusKey> {
         self.corpus_keys()
             .into_iter()
-            .filter(|key| path.starts_with(&key.canonical_root))
-            .max_by_key(|key| key.canonical_root.components().count())
+            .filter_map(|key| {
+                let owning_root = best_effort_canonical(&key.canonical_root);
+                path.starts_with(&owning_root)
+                    .then(|| (owning_root.components().count(), key))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, key)| key)
     }
 }
 

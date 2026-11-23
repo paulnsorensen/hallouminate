@@ -12,23 +12,60 @@ default:
 
 # Canonical local gate. No args runs fmt, clippy, build, and tests; targeted
 # Cargo commands use the same cross-worktree verification lease.
+[unix]
+[script("python3")]
+[positional-arguments]
 verify *args:
-    python3 scripts/verify.py {{quote(args)}}
+    import runpy
+    runpy.run_path("scripts/verify.py", run_name="__main__")
+
+[windows]
+[script("python")]
+[positional-arguments]
+verify *args:
+    import runpy
+    runpy.run_path("scripts/verify.py", run_name="__main__")
 
 # Compatibility routes retained for contributors and release automation.
-ci:
-    just verify
+ci: verify
 
-llm:
-    just verify --fix
+llm: (verify "--fix")
+
+# Build once before workers start. Keep compiler work inside the existing lease.
+bdd *args:
+    uv sync --locked
+    just verify cargo build --locked -p hallouminate --bin hallouminate
+    just verify cargo run --locked -p hallouminate -- config download --config tests/bdd/tokenizer.toml
+    just bdd-check {{quote(args)}}
+
+# CI reuses its built binary and warmed tokenizer cache.
+bdd-check *args:
+    uv run --locked pytest tests/bdd --collect-only -q
+    uv run --locked pytest tests/bdd -n 0 {{quote(args)}}
+    uv run --locked pytest tests/bdd -n 2 {{quote(args)}}
 
 # Measure the production fusion baseline against the Jina-v1 diagnostic arm.
 eval-measure:
     HALLOUMINATE_EVAL_OUTPUT=.context/issue-288-eval-results.json just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_measure -- --ignored --nocapture --exact
 
+# Measure only the production fusion baseline, without comparison. CI uses this
+# for baseline updates; the output has the shape of eval/baseline.json.
+eval-measure-baseline:
+    HALLOUMINATE_EVAL_OUTPUT=.context/eval-baseline-measurement.json just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_measure_baseline -- --ignored --nocapture --exact
+
 # Enforce the committed production fusion baseline without a crossencoder.
 eval:
     just verify cargo test -p hallouminate --test eval_ground_recall eval_ground_recall_enforce -- --ignored --nocapture --exact
+
+# Build every fuzz target on the nightly pinned in fuzz/rust-toolchain.toml.
+fuzz-build:
+    cp Cargo.lock fuzz/Cargo.lock
+    RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' fuzz/rust-toolchain.toml)" just verify cargo fuzz build --fuzz-dir fuzz --debug-assertions
+
+# Fuzz one target, e.g. `just fuzz claim_marks 300`. Crash inputs land in fuzz/artifacts/.
+fuzz target seconds="60": fuzz-build
+    mkdir -p fuzz/corpus/{{target}}
+    cd fuzz && RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" cargo fuzz run --debug-assertions {{target}} corpus/{{target}} seeds ../.hallouminate/wiki -- -dict=markdown.dict -max_total_time={{seconds}}
 
 # Prepare a new release bump PR: crate version, lockfile, and plugin manifests.
 prepare-release version:

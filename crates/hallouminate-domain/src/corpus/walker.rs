@@ -1,12 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use ignore::gitignore::GitignoreBuilder;
 
 use crate::common::{
-    CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result, expand_tilde,
+    CorpusConfig, CorpusKey, FileRef, HallouminateError, Mtime, Result, epoch_millis, expand_tilde,
 };
 
 /// One scanned file paired with the canonical corpus root that owns it.
@@ -73,6 +72,11 @@ pub fn scan(corpus: &CorpusConfig) -> Result<Vec<ScannedFile>> {
     let roots = configured_roots(corpus);
     let mut out = Vec::new();
     for root in &roots {
+        // A gitignored root such as `.cheese` is absent from a fresh
+        // worktree. It holds no files, so it contributes none.
+        if let Ok(false) = root.configured_path.try_exists() {
+            continue;
+        }
         // "Auto-skip gitignored, unless explicitly included": if the corpus
         // root itself is gitignored by some ancestor `.gitignore`, the user
         // pointed at it on purpose — treat that as explicit opt-in and walk
@@ -94,10 +98,9 @@ pub fn scan(corpus: &CorpusConfig) -> Result<Vec<ScannedFile>> {
 
 /// Corpus `paths` entries whose expanded root is confirmed absent on disk.
 ///
-/// A nonexistent root makes [`scan`] fail fatally (the underlying directory
-/// walk yields an IO error on the first iteration). Callers that want to skip
-/// a missing corpus rather than abort the whole run check this first; an empty
-/// result means every root is present and `scan` is safe to call.
+/// [`scan`] treats a nonexistent root as empty. Callers that report or refuse
+/// a missing corpus check this first; an empty result means every root is
+/// present.
 ///
 /// Only `try_exists() == Ok(false)` counts as missing. A root that errors on
 /// the existence probe (e.g. permission denied on a parent component) is *not*
@@ -425,10 +428,12 @@ fn entry_mtime_ms(entry: &ignore::DirEntry) -> Result<i64> {
         .metadata()
         .map_err(|e| HallouminateError::Indexer(format!("metadata: {e}")))?;
     let mtime = meta.modified()?;
-    let dur = mtime.duration_since(UNIX_EPOCH).map_err(|_| {
-        HallouminateError::Indexer(format!("pre-epoch mtime on {}", entry.path().display()))
-    })?;
-    Ok(dur.as_millis() as i64)
+    epoch_millis(mtime).ok_or_else(|| {
+        HallouminateError::Indexer(format!(
+            "unrepresentable mtime on {}",
+            entry.path().display()
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -959,6 +964,27 @@ mod tests {
             warnings.is_empty(),
             "a missing root must not produce an invented zero-match count: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn scan_treats_a_missing_root_as_empty_and_keeps_present_roots() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let present = tmp.path().join("wiki");
+        fs::create_dir_all(&present).unwrap();
+        fs::write(present.join("page.md"), "kept").unwrap();
+        let missing = tmp.path().join(".cheese");
+        let corpus = CorpusConfig {
+            name: "mixed".into(),
+            paths: vec![
+                missing.to_string_lossy().into_owned(),
+                present.to_string_lossy().into_owned(),
+            ],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        };
+        let scanned = scan(&corpus).expect("a missing root must not fail the scan");
+        assert_eq!(file_names(&scanned), vec!["page.md".to_string()]);
     }
 
     #[test]

@@ -18,7 +18,7 @@ use hallouminate_daemon::{
 };
 use hallouminate_domain::common::{CorpusConfig, expand_tilde};
 use hallouminate_domain::corpus::{blake3_bytes, load_tokenizer, scan};
-use hallouminate_domain::ground::{DocFile, GroundResponse, Warning};
+use hallouminate_domain::ground::{DocFile, GroundResponse, Warning, warning_codes};
 use hallouminate_domain::indexer::{Format, HandlerRegistry, PrepareCtx};
 use serde::{Deserialize, Serialize};
 use text_splitter::{Characters, ChunkSizer};
@@ -37,6 +37,7 @@ const CHUNK_BUDGET_TOKENS: usize = 384;
 const MIN_LABELLED_QUERIES: usize = 40;
 const GROUND_RPC_GRACE_MS: u64 = 60_000;
 const EVALUATION_RERANK_TIMEOUT_MS: u64 = 5_000;
+const EVALUATION_RERANK_TIMEOUT_ENV: &str = "HALLOUMINATE_EVAL_RERANK_TIMEOUT_MS";
 const FOOTNOTE_INVERSION_ID: &str = "footnote-inversion";
 const MODEL_LOAD_MARKER: &str = "cold model load failed";
 const RERANK_TIMEOUT_MARKER: &str = "rerank timeout";
@@ -464,9 +465,28 @@ fn validate_fixture_labels_with_production_tokenizer(queries: &[LabelledQuery]) 
 
 fn rerank_timeout_ms(arm: ArmSpec<'_>) -> u64 {
     match arm.model {
-        Some(_) => EVALUATION_RERANK_TIMEOUT_MS,
+        Some(_) => {
+            let raw = env::var(EVALUATION_RERANK_TIMEOUT_ENV).ok();
+            parse_evaluation_rerank_timeout_ms(raw.as_deref())
+                .unwrap_or_else(|error| panic!("{error:#}"))
+        }
         None => SearchConfig::default().rerank_timeout_ms,
     }
+}
+
+/// Lets local diagnostic runs give slow reranker hosts a longer deadline.
+fn parse_evaluation_rerank_timeout_ms(raw: Option<&str>) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(EVALUATION_RERANK_TIMEOUT_MS);
+    };
+    let timeout_ms: u64 = raw.trim().parse().with_context(|| {
+        format!("{EVALUATION_RERANK_TIMEOUT_ENV}={raw:?} must be a millisecond count")
+    })?;
+    ensure!(
+        timeout_ms > 0,
+        "{EVALUATION_RERANK_TIMEOUT_ENV} must be greater than zero"
+    );
+    Ok(timeout_ms)
 }
 
 fn build_config(arm: ArmSpec<'_>, ground_dir: &Path) -> Config {
@@ -546,19 +566,20 @@ async fn index_fixture(
     client: &hallouminate_daemon::DaemonClient,
     cwd: &Path,
     arm: ArmSpec<'_>,
-) -> Result<()> {
-    let _: IndexReport = client
+) -> Result<IndexReport> {
+    let report: IndexReport = client
         .call(DaemonRequest {
             cwd: cwd.to_path_buf(),
             payload: DaemonRequestPayload::Index(IndexRequest {
                 corpus: Some(CORPUS_NAME.into()),
                 paths_from: None,
                 strict: true,
+                background: false,
             }),
         })
         .await
         .with_context(|| format!("index fixture for {}", arm.id))?;
-    Ok(())
+    Ok(report)
 }
 
 fn ground_rpc_timeout(arm: ArmSpec<'_>) -> Duration {
@@ -582,6 +603,10 @@ async fn ground_query(
                     chunks_per_file: Some(1),
                     limit: Some(50),
                     snippet_chars: None,
+                    footnote_mode: Default::default(),
+                    match_mode: Default::default(),
+                    group_by: Default::default(),
+                    output: Default::default(),
                 }),
             },
             ground_rpc_timeout(arm),
@@ -615,8 +640,8 @@ fn top_rerank_signal(ranked: &[(&String, &DocFile)]) -> Option<f64> {
     None
 }
 
-const RERANK_TIMEOUT_CODE: &str = "rerank-timeout";
-const CROSSENCODER_UNAVAILABLE_CODE: &str = "crossencoder-unavailable";
+const RERANK_TIMEOUT_CODE: &str = warning_codes::RERANK_TIMEOUT;
+const CROSSENCODER_UNAVAILABLE_CODE: &str = warning_codes::CROSSENCODER_UNAVAILABLE;
 
 /// A fused retrieval signal broke mid-run — a ripgrep pass that failed, timed
 /// out, resolved to nothing, or emitted unparseable events silently changes
@@ -624,10 +649,10 @@ const CROSSENCODER_UNAVAILABLE_CODE: &str = "crossencoder-unavailable";
 /// bake it into the committed baseline. These codes, and only these, fail the
 /// eval.
 const DEGRADED_SIGNAL_CODES: [&str; 4] = [
-    "ripgrep-unresolved",
-    "ripgrep-unparseable",
-    "ripgrep-failed",
-    "ripgrep-timeout",
+    warning_codes::RIPGREP_UNRESOLVED,
+    warning_codes::RIPGREP_UNPARSEABLE,
+    warning_codes::RIPGREP_FAILED,
+    warning_codes::RIPGREP_TIMEOUT,
 ];
 
 /// Rerank fell back to plain fusion. `rerank_completion` owns and judges these
@@ -636,28 +661,18 @@ const RERANK_FALLBACK_CODES: [&str; 2] = [RERANK_TIMEOUT_CODE, CROSSENCODER_UNAV
 
 /// Informational only — they describe what the query covered, not a broken
 /// signal, so they must never fail the eval.
-const ADVISORY_WARNING_CODES: [&str; 3] =
-    ["code-repos-empty", "cross-repo-union", "index-coverage"];
-
-/// Every `Warning.code` the domain and daemon crates emit. Re-derive with:
-///
-/// ```text
-/// rg -n 'code:\s*"' --glob '*.rs' crates/
-/// ```
-///
-/// `producer_warning_codes_are_classified_exactly_once` pins this against the
-/// three sets above, so a new producer-side warning breaks a test at its source
-/// instead of silently reaching the eval gate unclassified.
-const PRODUCER_WARNING_CODES: [&str; 9] = [
-    "ripgrep-unresolved",
-    "ripgrep-unparseable",
-    "ripgrep-failed",
-    "ripgrep-timeout",
-    RERANK_TIMEOUT_CODE,
-    CROSSENCODER_UNAVAILABLE_CODE,
-    "code-repos-empty",
-    "cross-repo-union",
-    "index-coverage",
+const ADVISORY_WARNING_CODES: [&str; 11] = [
+    warning_codes::LEXICAL_FALLBACK,
+    warning_codes::LEXICAL_FALLBACK_TRUNCATED,
+    warning_codes::LEXICAL_FALLBACK_FAILED,
+    warning_codes::LEXICAL_FALLBACK_TIMEOUT,
+    warning_codes::LEXICAL_FALLBACK_SCAN_TIMEOUT,
+    warning_codes::CROSS_REPO_UNION,
+    warning_codes::CONFIG_PATH_OUTSIDE_REPO,
+    warning_codes::INDEX_COVERAGE,
+    warning_codes::INDEX_RECONCILIATION,
+    warning_codes::PHRASE_TRUNCATED,
+    warning_codes::COUNTS_TRUNCATED,
 ];
 
 /// Which of `run_arm`'s two sweeps a response came from. Only the measured
@@ -1222,6 +1237,26 @@ fn compare_against_baseline(committed: &EvalArtifact, current: &EvalArtifact) ->
     Ok(())
 }
 
+fn persist_current_measurement_and_compare(
+    baseline: &EvalArtifact,
+    current: &EvalArtifact,
+    output: Option<&Path>,
+    baseline_path: &Path,
+    baseline_bytes: &[u8],
+) -> Result<()> {
+    if let Some(output) = output {
+        write_measurement_artifact(output, baseline_path, current)
+            .context("persist current measurement before baseline comparison")?;
+        let baseline_after = fs::read(baseline_path).context("re-read eval/baseline.json")?;
+        ensure!(
+            baseline_bytes == baseline_after,
+            "measurement modified eval/baseline.json"
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(current)?);
+    compare_against_baseline(baseline, current)
+}
+
 fn normalize_path_for_comparison(path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -1311,6 +1346,267 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct Issue573Query {
+    id: String,
+    query: String,
+    expected_file: String,
+    max_rank: usize,
+    ahead_of_file: Option<String>,
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_ranked_heading_regressions() -> Result<()> {
+    let fixture = fs::canonicalize(repo_root().join("eval/fixtures/ranked-heading-relevance-573"))?;
+    let bytes = fs::read(repo_root().join("eval/ranked-heading-relevance-573.json"))?;
+    let queries: Vec<Issue573Query> = serde_json::from_slice(&bytes)?;
+    let tmp = tempfile::tempdir()?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    let started = Instant::now();
+    let report = index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let elapsed = started.elapsed();
+    let [corpus] = report.corpora.as_slice() else {
+        return Err(anyhow::anyhow!(
+            "expected one indexed issue corpus: {report:?}"
+        ));
+    };
+    println!(
+        "issue573 rebuild estimate: {elapsed:?} for {} files, {} chunks, {} embeddings",
+        corpus.files_upserted, corpus.chunks_inserted, corpus.embeddings_inserted
+    );
+    assert!(corpus.embeddings_inserted > 0);
+    let mut failures = Vec::new();
+    for query in queries {
+        let labelled = LabelledQuery {
+            id: query.id.clone(),
+            query: query.query,
+            expected_chunk: ChunkIdentity {
+                file: query.expected_file.clone(),
+                heading_path: Vec::new(),
+                line_start: 0,
+            },
+        };
+        let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &labelled).await?;
+        let ranked = ranked_docs(&response.docs);
+        let rank = rank_of_expected(&ranked, &query.expected_file);
+        println!(
+            "issue573 {} rank {:?}, top {:?}",
+            query.id,
+            rank,
+            top_identity(&ranked)
+        );
+        if !rank.is_some_and(|rank| rank <= query.max_rank) {
+            failures.push(format!(
+                "{} expected {} by rank {}, got {:?}",
+                query.id, query.expected_file, query.max_rank, rank
+            ));
+        }
+        if let Some(other_file) = &query.ahead_of_file {
+            let other_rank = rank_of_expected(&ranked, other_file);
+            let precedes = match (rank, other_rank) {
+                (Some(target), Some(other)) => target < other,
+                (None, Some(_)) | (Some(_), None) | (None, None) => false,
+            };
+            if !precedes {
+                failures.push(format!(
+                    "{} expected {} ahead of {}, got {:?} versus {:?}",
+                    query.id, query.expected_file, other_file, rank, other_rank
+                ));
+            }
+        }
+    }
+    drop(client);
+    harness.shutdown().await?;
+    ensure!(
+        failures.is_empty(),
+        "issue573 failures: {}",
+        failures.join("; ")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_equal_evidence_heading_order_in_real_store() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir(&fixture)?;
+    let body = "The restart sequence uses the same guarded steps in this guide.\n";
+    fs::write(
+        fixture.join("h1.md"),
+        format!("# Zephyr spindle calibration\n\n{body}"),
+    )?;
+    fs::write(
+        fixture.join("h2.md"),
+        format!("# Reference\n\n## Zephyr spindle calibration\n\n{body}"),
+    )?;
+    fs::write(
+        fixture.join("body.md"),
+        format!("# Reference\n\nZephyr spindle calibration. {body}"),
+    )?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let query = LabelledQuery {
+        id: "equal-heading-evidence".into(),
+        query: "zephyr spindle calibration".into(),
+        expected_chunk: ChunkIdentity {
+            file: "h1.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &query).await?;
+    let ranked = ranked_docs(&response.docs);
+    let h1 = rank_of_expected(&ranked, "h1.md");
+    let h2 = rank_of_expected(&ranked, "h2.md");
+    let body = rank_of_expected(&ranked, "body.md");
+    println!("issue573 equal evidence: H1 {h1:?}, H2 {h2:?}, body {body:?}");
+    assert!(
+        h1.is_some() && h2.is_some() && body.is_some() && h1 < h2 && h2 < body,
+        "expected H1 > H2 > body: {h1:?}, {h2:?}, {body:?}"
+    );
+    drop(client);
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_mixed_index_keeps_authored_prose_in_real_store() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir(&fixture)?;
+    fs::write(
+        fixture.join("answer.md"),
+        "# Ceramic brake isolation register\n\nThe ceramic brake isolates the spindle from drive current during recovery.\n",
+    )?;
+    fs::write(
+        fixture.join("index.md"),
+        "# Field notes\n\nThe ceramic brake isolation register records the recovery current.\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Ceramic brake isolation register](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n",
+    )?;
+    fs::write(
+        fixture.join("nav.md"),
+        "# Navigation\n\n<!-- HALLOUMINATE:INDEX-START -->\n- [Ceramic brake isolation register](./answer.md)\n<!-- HALLOUMINATE:INDEX-END -->\n",
+    )?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+    let query = LabelledQuery {
+        id: "mixed-index-authored-prose".into(),
+        query: "ceramic brake isolation register recovery current".into(),
+        expected_chunk: ChunkIdentity {
+            file: "index.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &query).await?;
+    let ranked = ranked_docs(&response.docs);
+    let authored = rank_of_expected(&ranked, "index.md");
+    let navigation = rank_of_expected(&ranked, "nav.md");
+    println!("issue573 mixed index: authored {authored:?}, navigation {navigation:?}");
+    assert!(
+        authored.is_some() && navigation.is_some() && authored < navigation,
+        "authored index prose must outrank generated-only navigation: {authored:?}, {navigation:?}"
+    );
+    drop(client);
+    harness.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires production embeddings"]
+async fn issue573_generated_only_index_cannot_escape_file_rollup() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let fixture = tmp.path().join("fixture");
+    fs::create_dir(&fixture)?;
+    fs::write(
+        fixture.join("answer.md"),
+        "# Cache recovery procedure\n\nAfter an interrupted snapshot, cache recovery restores the archive from the last durable checkpoint. Verify the archive checksum before reopening writes.\n",
+    )?;
+    let mut index =
+        String::from("# Cache recovery\n\n## Files\n\n<!-- HALLOUMINATE:INDEX-START -->\n");
+    for number in 0..80 {
+        index.push_str(&format!(
+            "- [After an interrupted snapshot, cache recovery restores the archive from the last durable checkpoint {number}](./answer.md)\n"
+        ));
+    }
+    index.push_str("<!-- HALLOUMINATE:INDEX-END -->\n");
+    fs::write(fixture.join("index.md"), index)?;
+    let mut config = build_config(BASELINE_ARM, &tmp.path().join("ground"));
+    config.corpora = vec![CorpusConfig {
+        name: CORPUS_NAME.into(),
+        paths: vec![fixture.to_string_lossy().into_owned()],
+        globs: vec!["**/*.md".into()],
+        ..Default::default()
+    }];
+    let harness = DaemonHarness::spawn(config).await;
+    let client = connect_at(harness.socket()).await?;
+    index_fixture(&client, harness.cwd(), BASELINE_ARM).await?;
+
+    let answer_query = LabelledQuery {
+        id: "generated-only-rollup-answer".into(),
+        query: "after interrupted snapshot cache recovery restores archive last durable checkpoint verify checksum".into(),
+        expected_chunk: ChunkIdentity {
+            file: "answer.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &answer_query).await?;
+    let ranked = ranked_docs(&response.docs);
+    let answer = rank_of_expected(&ranked, "answer.md").expect("answer must be retrieved");
+    let index = rank_of_expected(&ranked, "index.md").expect("index must be retrieved");
+    println!("issue573 generated-only rollup: answer {answer}, index {index}");
+    assert!(
+        answer < index,
+        "substantive answer must outrank generated-only index after file rollup: {answer}, {index}"
+    );
+
+    let nav_query = LabelledQuery {
+        id: "generated-only-direct-navigation".into(),
+        query: "Cache recovery Files".into(),
+        expected_chunk: ChunkIdentity {
+            file: "index.md".into(),
+            heading_path: Vec::new(),
+            line_start: 0,
+        },
+    };
+    let response = ground_query(&client, harness.cwd(), BASELINE_ARM, &nav_query).await?;
+    let ranked = ranked_docs(&response.docs);
+    assert!(
+        rank_of_expected(&ranked, "index.md").is_some(),
+        "direct navigation must retrieve the index: {ranked:?}"
+    );
+    drop(client);
+    harness.shutdown().await?;
+    Ok(())
 }
 
 #[test]
@@ -1412,20 +1708,40 @@ fn evaluation_arms_derive_from_production_defaults() {
     assert_eq!(baseline.search, SearchConfig::default());
 
     let candidate = build_config(JINA_ARM, temp.path());
+    let override_ms = env::var(EVALUATION_RERANK_TIMEOUT_ENV).ok();
     let expected_search = SearchConfig {
         crossencoder: Some(JINA_MODEL.to_string()),
-        rerank_timeout_ms: EVALUATION_RERANK_TIMEOUT_MS,
+        rerank_timeout_ms: parse_evaluation_rerank_timeout_ms(override_ms.as_deref())
+            .expect("valid rerank timeout override"),
         ..Default::default()
     };
     assert_eq!(candidate.embeddings, embeddings);
     assert_eq!(candidate.search, expected_search);
     assert!(
-        candidate.search.rerank_timeout_ms > SearchConfig::default().rerank_timeout_ms,
+        EVALUATION_RERANK_TIMEOUT_MS > SearchConfig::default().rerank_timeout_ms,
         "the Jina measurement needs its own bounded timeout so a slow valid inference does not become a fallback"
     );
 
     assert_eq!(baseline_arms(), [BASELINE_ARM]);
     assert_eq!(diagnostic_arms(), [BASELINE_ARM, JINA_ARM]);
+}
+
+#[test]
+fn evaluation_rerank_timeout_override_parses_milliseconds() {
+    assert_eq!(
+        parse_evaluation_rerank_timeout_ms(None).expect("default"),
+        EVALUATION_RERANK_TIMEOUT_MS
+    );
+    assert_eq!(
+        parse_evaluation_rerank_timeout_ms(Some("60000")).expect("override"),
+        60_000
+    );
+    for invalid in ["0", "", "60s", "-1"] {
+        assert!(
+            parse_evaluation_rerank_timeout_ms(Some(invalid)).is_err(),
+            "{invalid:?} must be rejected"
+        );
+    }
 }
 
 #[test]
@@ -1843,6 +2159,44 @@ fn comparator_rejects_metric_and_top_chunk_regressions() {
 }
 
 #[test]
+fn failed_comparison_preserves_current_measurement_artifact() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let baseline_path = temp.path().join("eval/baseline.json");
+    let output = temp.path().join(".context/current.json");
+    fs::create_dir_all(baseline_path.parent().expect("baseline parent")).expect("mkdir eval");
+    let baseline_bytes =
+        serde_json::to_vec(&synthetic_baseline_artifact()).expect("serialize baseline");
+    fs::write(&baseline_path, &baseline_bytes).expect("write baseline");
+    let current = {
+        let mut artifact = synthetic_baseline_artifact();
+        artifact.measurements[0].queries[0].actual_top = None;
+        artifact.measurements[0].queries[0].top_chunk_pass = false;
+        artifact
+    };
+
+    let error = persist_current_measurement_and_compare(
+        &synthetic_baseline_artifact(),
+        &current,
+        Some(&output),
+        &baseline_path,
+        &baseline_bytes,
+    )
+    .expect_err("comparison must fail for the regressed top chunk");
+
+    assert!(error.to_string().contains("top-chunk pass to fail"));
+    let mut expected_output = serde_json::to_vec_pretty(&current).expect("serialize current");
+    expected_output.push(b'\n');
+    assert_eq!(
+        fs::read(&output).expect("read current artifact"),
+        expected_output
+    );
+    assert_eq!(
+        fs::read(&baseline_path).expect("read baseline"),
+        baseline_bytes
+    );
+}
+
+#[test]
 fn artifact_write_isolated_to_requested_output() {
     let temp = tempfile::tempdir().expect("tempdir");
     let baseline = temp.path().join("eval/baseline.json");
@@ -1931,6 +2285,30 @@ async fn eval_ground_recall_measure() -> Result<()> {
     Ok(())
 }
 
+/// Measures only the production fusion arm and writes a baseline-shaped
+/// artifact without comparing it. CI uses this for baseline updates, because
+/// the Jina arm exceeds its rerank deadline on hosted runners.
+#[tokio::test]
+#[ignore = "loads production embeddings and measures the baseline arm"]
+async fn eval_ground_recall_measure_baseline() -> Result<()> {
+    let output = env::var_os("HALLOUMINATE_EVAL_OUTPUT")
+        .context("HALLOUMINATE_EVAL_OUTPUT must name the baseline measurement artifact")?;
+    let output = measurement_output_path(Path::new(&output));
+    let baseline = baseline_path();
+    ensure_measurement_output_is_not_baseline(&output, &baseline)?;
+    let baseline_before = read_optional(&baseline)?;
+    let (queries, query_set_digest) = load_queries()?;
+    let artifact = measure_baseline(&queries, query_set_digest).await?;
+    write_measurement_artifact(&output, &baseline, &artifact)?;
+    let baseline_after = read_optional(&baseline)?;
+    ensure!(
+        baseline_before == baseline_after,
+        "measurement modified eval/baseline.json"
+    );
+    println!("{}", serde_json::to_string_pretty(&artifact)?);
+    Ok(())
+}
+
 /// `EvalArtifact` gains required fields as the schema moves, so decoding the
 /// full artifact first turns a stale baseline into a serde "missing field"
 /// error. Probe the version separately so the mismatch is reported by the
@@ -1954,7 +2332,13 @@ fn ensure_baseline_schema_current(bytes: &[u8]) -> Result<()> {
 #[tokio::test]
 #[ignore = "loads production embeddings and enforces the committed baseline"]
 async fn eval_ground_recall_enforce() -> Result<()> {
-    let baseline_bytes = fs::read(baseline_path()).context("read eval/baseline.json")?;
+    let output = env::var_os("HALLOUMINATE_EVAL_OUTPUT")
+        .map(|output| measurement_output_path(Path::new(&output)));
+    let baseline_path = baseline_path();
+    if let Some(output) = output.as_deref() {
+        ensure_measurement_output_is_not_baseline(output, &baseline_path)?;
+    }
+    let baseline_bytes = fs::read(&baseline_path).context("read eval/baseline.json")?;
     ensure_baseline_schema_current(&baseline_bytes)?;
     let baseline: EvalArtifact =
         serde_json::from_slice(&baseline_bytes).context("parse eval/baseline.json")?;
@@ -1966,8 +2350,13 @@ async fn eval_ground_recall_enforce() -> Result<()> {
         "query-set digest disagrees with eval/baseline.json"
     );
     let current = measure_baseline(&queries, query_set_digest).await?;
-    compare_against_baseline(&baseline, &current)?;
-    println!("{}", serde_json::to_string_pretty(&current)?);
+    persist_current_measurement_and_compare(
+        &baseline,
+        &current,
+        output.as_deref(),
+        &baseline_path,
+        &baseline_bytes,
+    )?;
     Ok(())
 }
 
@@ -2015,77 +2404,11 @@ fn advisory_warnings_do_not_fail_the_eval() {
     }
 }
 
-/// Collects every `code: "<literal>"` a Rust source constructs.
-fn collect_warning_code_literals(text: &str, found: &mut BTreeSet<String>) {
-    const MARKER: &str = "code: \"";
-    let mut rest = text;
-    while let Some(start) = rest.find(MARKER) {
-        let after = &rest[start + MARKER.len()..];
-        let Some(end) = after.find('"') else { break };
-        found.insert(after[..end].to_string());
-        rest = &after[end..];
-    }
-}
-
-/// Every `Warning.code` the workspace's own sources construct, read from disk.
-///
-/// This is what makes `PRODUCER_WARNING_CODES` a pin rather than a wish: the
-/// list is checked against the producers instead of against itself, so adding a
-/// warning code anywhere under `crates/*/src` fails a test here until it is
-/// classified.
-fn scan_producer_warning_codes() -> BTreeSet<String> {
-    fn visit(dir: &Path, found: &mut BTreeSet<String>) {
-        let entries =
-            fs::read_dir(dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()));
-        for entry in entries {
-            let path = entry.expect("read dir entry").path();
-            if path.is_dir() {
-                visit(&path, found);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                let text = fs::read_to_string(&path)
-                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-                collect_warning_code_literals(&text, found);
-            }
-        }
-    }
-
-    let crates = repo_root().join("crates");
-    let mut found = BTreeSet::new();
-    let entries =
-        fs::read_dir(&crates).unwrap_or_else(|error| panic!("read {}: {error}", crates.display()));
-    for entry in entries {
-        let src = entry.expect("read crate dir entry").path().join("src");
-        if src.is_dir() {
-            visit(&src, &mut found);
-        }
-    }
-    assert!(
-        !found.is_empty(),
-        "scanned {} and found no warning codes at all — the scan is broken, not the sources",
-        crates.display()
-    );
-    found
-}
-
-#[test]
-fn producer_warning_codes_match_the_workspace_sources() {
-    let declared: BTreeSet<String> = PRODUCER_WARNING_CODES
-        .iter()
-        .map(|code| (*code).to_string())
-        .collect();
-    assert_eq!(
-        scan_producer_warning_codes(),
-        declared,
-        "PRODUCER_WARNING_CODES is out of date with crates/*/src. Every warning \
-         code a producer emits must be classified into DEGRADED_SIGNAL_CODES, \
-         RERANK_FALLBACK_CODES, or ADVISORY_WARNING_CODES — an unclassified code \
-         reaches the eval gate and is silently tolerated as a valid measurement."
-    );
-}
-
+/// `warning_codes::ALL` is the one list of producer codes, so a new code fails
+/// here until it is classified into exactly one eval class.
 #[test]
 fn producer_warning_codes_are_classified_exactly_once() {
-    for code in PRODUCER_WARNING_CODES {
+    for &code in warning_codes::ALL {
         let mut classes = Vec::new();
         if DEGRADED_SIGNAL_CODES.contains(&code) {
             classes.push("degraded");

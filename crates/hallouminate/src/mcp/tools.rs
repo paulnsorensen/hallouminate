@@ -1,7 +1,6 @@
-//! Tool registrations for the hallouminate MCP server. Every stateful tool
-//! is a proxy to the local daemon: opening a `DaemonClient` and dispatching
-//! one RPC per call. Keeps the daemon as the canonical owner of the LanceDB
-//! ground directory and per-corpus mutation locks per the spec's Approach.
+//! Proxies stateful MCP tools through the local daemon.
+//! Read batches use one RPC per item; write batches use one ordered daemon RPC.
+//! The daemon owns the LanceDB ground directory and per-corpus mutation locks.
 //!
 //! When the daemon is unreachable (e.g. no `hallouminate daemon` running),
 //! tool calls return JSON-RPC `-32603 internal_error` with the documented
@@ -9,10 +8,12 @@
 //! handle — that fallback is exactly the multi-process race the daemon is
 //! built to remove.
 
+use rmcp::handler::server::common::FromContextPart;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, ErrorCode, ErrorData, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, ErrorCode, ErrorData, ServerCapabilities, ServerConfig,
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use schemars::JsonSchema;
@@ -20,15 +21,16 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use hallouminate_daemon::{
-    AddMarkdownRequest, AddMarkdownResult, BacklinksRequest, BacklinksResult, CorpusStatsResult,
-    DaemonClient, DaemonRequest, DaemonRequestPayload, DaemonRpcError, DeleteMarkdownRequest,
+    AddMarkdownBatchResult, AddMarkdownItem, AddMarkdownRequest, AddMarkdownResult,
+    BacklinksRequest, BacklinksResult, CorpusStatsResult, DaemonClient, DaemonRequest,
+    DaemonRequestPayload, DaemonResponse, DaemonRpcError, DeleteMarkdownRequest,
     DeleteMarkdownResult, ErrorKind, GroundRequest, GroundResult, IndexRequest, LineRange,
     ListCorporaResult, ListFilesRequest, ListFilesResult, ListTreeRequest, ListTreeResult,
     Position, ReadMarkdownRequest, ReadMarkdownResult, client_for,
 };
 
 use hallouminate_domain::footnotes::{FootnoteMode, apply_footnote_mode};
-use hallouminate_domain::ground::{Format, RenderOpts, render};
+use hallouminate_domain::ground::{GroundGroupBy, GroundMatch, GroundOutput};
 
 const SERVER_INSTRUCTIONS: &str = "\
 Hallouminate stores per-repository markdown wikis on disk and exposes them \
@@ -50,13 +52,18 @@ fresh from `cwd` on every request. There is no default, no MCP-roots-derived \
 value, and no server-startup fallback — a missing, relative, or nonexistent \
 `cwd` fails the call before any corpus operation.
 
-Default corpus: READ tools (`ground`, `read_markdown`, `list_files`, \
-`list_tree`, `corpus_stats`, `backlinks`) that omit `corpus` \
-default to the wiki for the repository containing `cwd`. WRITE tools \
-(`add_markdown`, `delete_markdown`) require `corpus` explicitly. Pass \
-`corpus` explicitly to target another wiki, the repo's source corpus \
-(`repo:{name}:corpus`), or a user-declared `[[corpus]]` entry; \
-`list_corpora` enumerates everything available.
+Corpus scoping: `ground` with no `corpus` searches EVERY effective corpus \
+and fuses the results into one ranked set; the wiki for the repository \
+containing `cwd` is the priority corpus, so its pages win score ties and \
+keep reserved slots in the `top_files` cut, and each hit names its own \
+source corpus. The other READ \
+tools (`read_markdown`, `list_files`, `list_tree`, `corpus_stats`, \
+`backlinks`) that omit `corpus` default to the wiki for the repository \
+containing `cwd`. WRITE tools (`add_markdown`, `delete_markdown`) require \
+`corpus` explicitly. Pass `corpus` explicitly to pin `ground` to one corpus, \
+or to target another wiki, the repo's source corpus (`repo:{name}:corpus`), \
+or a user-declared `[[corpus]]` entry; `list_corpora` enumerates everything \
+available.
 
 Tools:
 - `list_corpora` — every configured corpus name.
@@ -210,6 +217,52 @@ fn tool_ok(text: String, structured: serde_json::Value) -> CallToolResult {
     result
 }
 
+/// Render an `IndexReport` as one summary line per corpus. Each skipped
+/// unreadable file follows its corpus line, so the caller does not have to
+/// find skipped files by elimination.
+fn index_summary(report: &hallouminate_daemon::IndexReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut summary = String::new();
+    for hallouminate_daemon::CorpusReport {
+        name,
+        files_upserted,
+        files_touched,
+        files_deleted,
+        files_skipped_empty: _,
+        files_skipped_unreadable,
+        skipped_unreadable,
+        chunks_inserted,
+        embeddings_inserted: _,
+    } in &report.corpora
+    {
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        let _ = write!(
+            summary,
+            "{name}: upserted={files_upserted} touched={files_touched} deleted={files_deleted} unreadable={files_skipped_unreadable} chunks+={chunks_inserted}"
+        );
+        for hallouminate_daemon::SkippedFileReport { path, reason } in skipped_unreadable {
+            let _ = write!(summary, "\n  skipped {path}: ");
+            match reason {
+                hallouminate_daemon::SkippedFileReason::UnsupportedFormat => {
+                    summary.push_str("unsupported format");
+                }
+                hallouminate_daemon::SkippedFileReason::ExtractionFailed { error } => {
+                    let error = hallouminate_domain::search::collapse_whitespace(error);
+                    let _ = write!(summary, "extraction failed: {error}");
+                }
+            }
+        }
+        let unnamed = files_skipped_unreadable.saturating_sub(skipped_unreadable.len());
+        if unnamed > 0 {
+            let _ = write!(summary, "\n  and {unnamed} more unreadable files");
+        }
+    }
+    summary
+}
+
 /// Render a `TreeNode` as an indented ASCII outline — subdirs first, then
 /// files, with one entry per line and two-space indents per depth level.
 /// Mirrors the structured tree for clients that only want the text block.
@@ -272,6 +325,59 @@ fn render_corpus_stats_text(result: &CorpusStatsResult) -> String {
         }
     }
     text
+}
+
+fn render_add_markdown(response: &AddMarkdownResult) -> String {
+    let mut text = format!(
+        "wrote {} and refreshed corpus {}",
+        response.path, response.corpus
+    );
+    if !response.warnings.is_empty() {
+        text.push_str("\n\nlint warnings (advisory, file was written as-is):");
+        for warning in &response.warnings {
+            text.push_str(&format!("\n- {warning}"));
+        }
+    }
+    text
+}
+
+fn batch_item(
+    index: usize,
+    path: &str,
+    outcome: Result<(String, serde_json::Value), ErrorData>,
+) -> (String, serde_json::Value) {
+    match outcome {
+        Ok((text, result)) => (
+            format!("[{index}] {path}\n{text}"),
+            serde_json::json!({ "index": index, "path": path, "result": result }),
+        ),
+        Err(error) => (
+            format!(
+                "[{index}] {path}\nerror {}: {}",
+                error.code.0, error.message
+            ),
+            serde_json::json!({ "index": index, "path": path, "error": error }),
+        ),
+    }
+}
+
+fn validate_batch_count(count: usize) -> Result<(), ErrorData> {
+    if !(1..=20).contains(&count) {
+        return Err(invalid_params("items must contain 1–20 entries"));
+    }
+    Ok(())
+}
+
+fn map_batch_write_error(error: anyhow::Error) -> ErrorData {
+    if error.downcast_ref::<DaemonRpcError>().is_some() {
+        return map_daemon_err(error);
+    }
+    let mut error = map_daemon_err(error);
+    error.message = format!(
+        "Batch completion is uncertain; inspect files before retrying. No automatic retry or rollback occurred. {}",
+        error.message,
+    ).into();
+    error
 }
 
 fn internal_error(msg: impl Into<String>) -> ErrorData {
@@ -341,9 +447,33 @@ fn map_daemon_err(err: anyhow::Error) -> ErrorData {
     internal_error(format!("{err:#}"))
 }
 
+const MISSING_CWD_MESSAGE: &str = "cwd is required: pass the absolute path of your active checkout (the worktree or workspace directory you are working in), for example {\"cwd\": \"/abs/path/to/repo\", ...}";
+
+/// Tool-call extractor that rejects a missing `cwd` before parameter
+/// deserialization, so the caller sees [`MISSING_CWD_MESSAGE`] instead of
+/// serde's first missing-field error. It only peeks at the arguments; each
+/// tool still deserializes its own `Parameters`, whose schema keeps `cwd`
+/// required.
+struct RequireCwd;
+
+impl<S> FromContextPart<ToolCallContext<'_, S>> for RequireCwd {
+    fn from_context_part(context: &mut ToolCallContext<S>) -> Result<Self, ErrorData> {
+        let has_cwd = context
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("cwd"))
+            .is_some_and(|cwd| !cwd.is_null());
+        if has_cwd {
+            Ok(Self)
+        } else {
+            Err(invalid_params(MISSING_CWD_MESSAGE))
+        }
+    }
+}
+
 /// Validate and canonicalize a tool call's required `cwd` argument.
 ///
-/// Rejects missing (enforced by the schema's `required`), empty, relative,
+/// Rejects missing (see [`RequireCwd`]), empty, relative,
 /// nonexistent, non-directory, and inaccessible values with an
 /// invalid-parameter error. Runs before any config lookup or daemon
 /// dispatch — there is no fallback (no MCP roots, no server-startup cwd, no
@@ -373,7 +503,8 @@ fn validate_cwd(cwd: &str) -> Result<PathBuf, ErrorData> {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GroundParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Free-text query to embed and search against the index.
     pub query: String,
@@ -398,11 +529,41 @@ pub struct GroundParams {
     /// inline `[^label]` markers; `only` returns just the definition lines.
     #[serde(default)]
     pub footnotes: FootnoteMode,
+    /// Retrieval mode. `ranked` (default) is hybrid BM25, vector, and
+    /// literal retrieval. `phrase` returns every chunk whose body text
+    /// contains the whole query as a case-insensitive literal substring.
+    /// In `phrase` mode, stopwords, punctuation, `%`, `_`, and quotes count
+    /// literally. Each run of whitespace (line breaks, tabs, repeated or
+    /// non-breaking spaces) counts as one space on both sides, so a phrase
+    /// that wraps across a hard line break matches. The match ignores the
+    /// heading breadcrumb and the file summary, so inline markup in a
+    /// heading, such as `## Tax **Abatement**`, does not match. The query
+    /// must hold 1 to 512 characters and must not be only whitespace. Hits
+    /// rank by occurrence count; a `phrase-truncated` warning means more
+    /// chunks matched than the response holds.
+    #[serde(default)]
+    pub r#match: GroundMatch,
+    /// Unit returned within each file. `chunk` (default) returns one entry
+    /// per matched chunk. `page` returns one entry per PDF page (`page:N`
+    /// breadcrumb): the best chunk of the page plus `chunk_count`, the
+    /// number of matched chunks on that page. `chunks_per_file` then caps
+    /// pages. Chunks without a page breadcrumb stay single entries.
+    #[serde(default)]
+    pub group_by: GroundGroupBy,
+    /// Response shape. `hits` (default) returns ranked chunks with snippets.
+    /// `counts` requires `match: "phrase"` and returns each matched file
+    /// with `coverage: {chunks, pages}` and no chunks, snippets, summary, or
+    /// keywords; it ignores `top_files`, `chunks_per_file`, and `limit`. It
+    /// lists at most 2,000 files and adds a `counts-truncated` warning when
+    /// more match.
+    #[serde(default)]
+    pub output: GroundOutput,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct IndexParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Optional corpus name; omit to index every configured corpus.
     #[serde(default)]
@@ -411,7 +572,8 @@ pub struct IndexParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CorpusStatsParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus name; defaults to the wiki for the repo containing `cwd`.
     /// Required only when no default applies and multiple corpora are
@@ -422,13 +584,15 @@ pub struct CorpusStatsParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListCorporaParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListFilesParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus name; defaults to the wiki for the repo containing `cwd`.
     /// Required only when no default applies and multiple corpora are
@@ -439,7 +603,8 @@ pub struct ListFilesParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListTreeParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus name; defaults to the wiki for the repo containing `cwd`.
     /// Required only when no default applies and multiple corpora are
@@ -448,9 +613,137 @@ pub struct ListTreeParams {
     pub corpus: Option<String>,
 }
 
+/// Selects a single markdown write or an ordered batch.
+#[derive(Debug, JsonSchema)]
+#[schemars(untagged, extend("type" = "object", "required" = ["cwd", "corpus"]))]
+pub enum AddMarkdownParams {
+    /// Carries one markdown write.
+    #[schemars(extend("not" = {"required": ["items"]}))]
+    Single(AddMarkdownSingleParams),
+    /// Carries ordered writes in one corpus.
+    Batch(AddMarkdownBatchParams),
+}
+
+impl<'de> Deserialize<'de> for AddMarkdownParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("items").is_some() {
+            reject_unknown_batch_fields(&value, &["cwd", "corpus", "items"])?;
+            serde_json::from_value(value)
+                .map(Self::Batch)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Single)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Rejects single-file fields in a batch envelope before the items are parsed.
+///
+/// The check does not depend on key order, so a mixed envelope always reports
+/// `unknown field`, even when serde_json keeps the client's key order.
+fn reject_unknown_batch_fields<E: serde::de::Error>(
+    value: &serde_json::Value,
+    allowed: &'static [&'static str],
+) -> Result<(), E> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(E::unknown_field(key, allowed));
+        }
+    }
+    Ok(())
+}
+
+/// Carries one to twenty ordered markdown writes in one corpus.
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct AddMarkdownParams {
-    /// Absolute path of the directory this request applies to.
+#[serde(deny_unknown_fields)]
+pub struct AddMarkdownBatchParams {
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
+    cwd: String,
+    corpus: String,
+    /// One to twenty writes, in order. Earlier successful writes remain after item errors.
+    #[schemars(length(min = 1, max = 20))]
+    items: Vec<AddMarkdownItemParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddMarkdownItemParams {
+    path: String,
+    content: String,
+    #[serde(default)]
+    overwrite: bool,
+    #[serde(default)]
+    under_heading: Option<String>,
+    #[serde(default)]
+    position: Position,
+    #[serde(default)]
+    replace_lines: Option<LineRange>,
+    #[serde(default)]
+    replace_match: Option<String>,
+}
+
+/// Selects a single markdown read or an ordered batch.
+#[derive(Debug, JsonSchema)]
+#[schemars(untagged, extend("type" = "object", "required" = ["cwd"]))]
+pub enum ReadMarkdownParams {
+    /// Carries one markdown read.
+    #[schemars(extend("not" = {"required": ["items"]}))]
+    Single(ReadMarkdownSingleParams),
+    /// Carries reads with independent display settings.
+    Batch(ReadMarkdownBatchParams),
+}
+
+impl<'de> Deserialize<'de> for ReadMarkdownParams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("items").is_some() {
+            reject_unknown_batch_fields(&value, &["cwd", "corpus", "items"])?;
+            serde_json::from_value(value)
+                .map(Self::Batch)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_json::from_value(value)
+                .map(Self::Single)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// Carries one to twenty markdown reads with shared corpus selection.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReadMarkdownBatchParams {
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
+    cwd: String,
+    #[serde(default)]
+    corpus: Option<String>,
+    /// One to twenty reads with independent display settings.
+    #[schemars(length(min = 1, max = 20))]
+    items: Vec<ReadMarkdownItemParams>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadMarkdownItemParams {
+    path: String,
+    #[serde(default)]
+    line_numbers: bool,
+    #[serde(default)]
+    footnotes: FootnoteMode,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AddMarkdownSingleParams {
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the markdown file.
     pub corpus: String,
@@ -495,8 +788,9 @@ pub struct AddMarkdownParams {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
-pub struct ReadMarkdownParams {
-    /// Absolute path of the directory this request applies to.
+pub struct ReadMarkdownSingleParams {
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the markdown file. Defaults to the wiki for the repo
     /// containing `cwd` when omitted.
@@ -523,7 +817,8 @@ pub struct ReadMarkdownParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteMarkdownParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the markdown file.
     pub corpus: String,
@@ -535,7 +830,8 @@ pub struct DeleteMarkdownParams {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BacklinksParams {
-    /// Absolute path of the directory this request applies to.
+    /// Absolute path of your active checkout (the worktree or workspace you
+    /// work in), not the directory where the harness started.
     pub cwd: String,
     /// Corpus that owns the page. Defaults to the wiki for the repo
     /// containing `cwd`, same as `ground`.
@@ -577,8 +873,11 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), repo-local pages ranked first; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set.",
+        description = "Semantic search over a markdown corpus. `content` is a ripgrep-style outline (path, summary, line_range, score, snippet). `structuredContent.docs` maps absolute_path → { corpus, score, summary, keywords, mtime, path, stale, chunks: [{chunk_id, heading_path, line_range, score, snippet, provenance: {corpus}}] }, where `path` is the corpus-relative path accepted directly by `read_markdown`/`add_markdown` (null when no corpus root matches), `stale: true` means the file was modified on disk since it was last indexed (index may be stale), and each chunk's `provenance.corpus` names its source wiki. Score note: the default `score` is rank-fusion RRF (rank-derived, not a similarity value; top hits cluster ~0.02–0.07; not comparable across queries — do not threshold on it for dedup or routing). To get a calibrated semantic score, enable the opt-in cross-encoder reranker via `search.crossencoder` in config. With no `corpus`, the search unions every effective corpus (the repo's own wiki plus every config-declared corpus — user `[[corpus]]` entries, `[[repository]]` wikis, and `repo:<name>:corpus` source corpora when configured), fused as one ranking so that a corpus's best page outranks another corpus's pages only on its evidence; repo-local pages win score ties and keep reserved `top_files` slots; each hit carries its source corpus. Passing an explicit `corpus` still pins the search to that one corpus. A cold or never-indexed corpus makes the first `ground` wait for the first reconciliation, up to `search.cold_wait_ms` (default 10000 ms, maximum 60000 ms; first reconciliation only). Every ranked `ground` (not `match: \"phrase\"`) also runs a lexical line-window scan of the files that the indexer selects but that have no indexed rows, whether the wait ended before the index was ready or the index lacks those files. A fallback hit has a `chunk_id` that starts with `lexical-fallback:`, an empty `heading_path`, and `score` 0; its `stale` flag does not report index freshness because the hit reads the live file. Fallback warning codes: `lexical-fallback` (fallback results returned), `lexical-fallback-truncated` (more than 1000 unindexed files; some were not searched), `lexical-fallback-timeout` and `lexical-fallback-scan-timeout` (scan ran out of time), `lexical-fallback-failed` (scan failed). Other warning codes: `config-path-outside-repo` (a configured path outside the repository root was skipped), `index-coverage` (fewer files are indexed than the corpus selects), `index-reconciliation` (reconciliation is pending, failed, degraded, or not watched), `cross-repo-union` (a union search resolved a name collision between repositories), `crossencoder-unavailable` and `rerank-timeout` (the reranker was unavailable or timed out; ranking fell back to fusion order), `ripgrep-failed` and `ripgrep-timeout` (the ripgrep pass failed or timed out; ranking continued without its signal), `ripgrep-unresolved` (ripgrep hits resolved to no indexed chunk), and `ripgrep-unparseable` (ripgrep output could not be parsed). Inspect `index-coverage`, `index-reconciliation`, and every `lexical-fallback*` warning for the selected corpus before treating zero or fallback hits as absence. Incomplete retrieval does not establish missing knowledge; foreign-corpus hits do not establish selected-corpus coverage. Complete file coverage does not prove freshness or reconciliation completion. Keep the original `cwd` and selected `corpus` fixed during recovery. Defaults from config: top_files=10, chunks_per_file=3, limit=50. Snippets are full chunk text unless `snippet_chars` is set. Set `match: \"phrase\"` to return every chunk whose body text contains the whole query as a case-insensitive literal substring, ranked by occurrence count; a `phrase-truncated` warning means that more chunks matched than the response holds. Set `group_by: \"page\"` to return one entry per PDF page with its `chunk_count`. Set `output: \"counts\"` with `match: \"phrase\"` to get each matched file's `coverage: {chunks, pages}` without snippets, summaries, or the file cap of `top_files`; at most 2000 files are listed, and a `counts-truncated` warning means more files matched.",
         annotations(
+            // A queued catch-up refreshes only the server's own index, so the
+            // tool stays read-only for hosts (Codex skips its approval prompt
+            // only for read-only tools).
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -587,6 +886,7 @@ impl HallouminateTools {
     )]
     pub async fn ground(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<GroundParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -599,23 +899,22 @@ impl HallouminateTools {
                 chunks_per_file: params.chunks_per_file,
                 limit: params.limit,
                 snippet_chars: params.snippet_chars,
+                footnote_mode: params.footnotes,
+                match_mode: params.r#match,
+                group_by: params.group_by,
+                output: params.output,
             }),
         };
-        let mut result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
-        if params.footnotes != FootnoteMode::Include {
-            for doc in result.response.docs.values_mut() {
-                for chunk in &mut doc.chunks {
-                    chunk.snippet = apply_footnote_mode(&chunk.snippet, params.footnotes);
-                }
-            }
-            result.outline = render(&result.response, Format::Outline, &RenderOpts::default());
-        }
+        // `footnote_mode` rides the IPC request and the daemon filters each
+        // chunk snippet in `roll_up`, so the response is already filtered,
+        // trimmed, and rendered for every transport.
+        let result: GroundResult = client.call(req).await.map_err(map_daemon_err)?;
         let structured = to_structured(&result.response)?;
         Ok(tool_ok(result.outline, structured))
     }
 
     #[tool(
-        description = "Build or refresh the LanceDB index for one or all configured corpora. Returns a one-line summary in `content` and the per-corpus IndexReport in `structuredContent`.",
+        description = "Build or refresh the LanceDB index for one or all configured corpora. Returns a one-line summary per corpus in `content`, followed by one line per skipped unreadable file, and the per-corpus IndexReport in `structuredContent`. `skipped_unreadable` names at most 100 skipped files, each with a `reason` of `unsupported_format` or `extraction_failed`; `files_skipped_unreadable` is the exact count.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -625,6 +924,7 @@ impl HallouminateTools {
     )]
     pub async fn index(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<IndexParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -634,28 +934,22 @@ impl HallouminateTools {
                 corpus: params.corpus,
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         };
         let report: hallouminate_daemon::IndexReport =
             client.call(req).await.map_err(map_daemon_err)?;
-        let summary = report
-            .corpora
-            .iter()
-            .map(|c| {
-                format!(
-                    "{}: upserted={} touched={} deleted={} chunks+={}",
-                    c.name, c.files_upserted, c.files_touched, c.files_deleted, c.chunks_inserted
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let summary = index_summary(&report);
         let structured = to_structured(&report)?;
         Ok(tool_ok(summary, structured))
     }
 
     #[tool(
-        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing `cwd` when `corpus` is omitted.",
+        description = "List the corpus' files as a directory tree. `content` is an indented ASCII outline (subdirs first). `structuredContent` is { corpus, root: {path, absolute_path, files: [...], subdirs: [...]} } — recursive so an LLM can navigate progressively-disclosed wikis without reading every index.md. Defaults to the wiki for the repo containing `cwd` when `corpus` is omitted. `structuredContent.warnings` (omitted when empty) lists non-fatal notes such as `index-registration-conflict`; `content` repeats each one as a trailing `warning:` line. The call never changes user data. It can queue background indexing for an unregistered checkout, which refreshes only the server's own index, so `read_only_hint` is true and `idempotent_hint` is true.",
         annotations(
+            // A queued catch-up refreshes only the server's own index, so the
+            // tool stays read-only for hosts (Codex skips its approval prompt
+            // only for read-only tools).
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -664,6 +958,7 @@ impl HallouminateTools {
     )]
     pub async fn list_tree(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ListTreeParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -676,6 +971,9 @@ impl HallouminateTools {
         let result: ListTreeResult = client.call(req).await.map_err(map_daemon_err)?;
         let mut outline = String::new();
         render_tree_outline(&result.root, 0, &mut outline);
+        for warning in &result.warnings {
+            outline.push_str(&format!("warning: {warning}\n"));
+        }
         let structured = to_structured(&result)?;
         Ok(tool_ok(outline, structured))
     }
@@ -691,6 +989,7 @@ impl HallouminateTools {
     )]
     pub async fn list_files(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ListFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -713,7 +1012,7 @@ impl HallouminateTools {
     }
 
     #[tool(
-        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams.",
+        description = "Write a markdown file under the corpus' single configured root, creating parent directories as needed, then refresh just that file's LanceDB rows. Alternatively pass items (1–20), sharing cwd and corpus, with each item's path, content, overwrite and edit fields. Never mix items with single-file fields. Batch results are ordered {results:[{index,path,result}|{index,path,error:{code,message,data?}}]}. Writes run sequentially; item errors do not undo successes or stop later items. Duplicate paths observe earlier writes. Other clients can interleave. Transport failures leave completion uncertain: inspect files before retrying; no automatic retry or rollback. Serialized batches must fit the 4 MiB IPC frame. Requires a single-root corpus — multi-root corpora are read- and search-only and reject writes. Atomic write, no-symlink-follow. Stores content verbatim — no markdown schema imposed. Returns advisory lint `warnings` (empty-destination links, empty mermaid blocks, heading-level jumps) without blocking or altering the write. For updates, call `read_markdown` first, then re-call with `overwrite=true`. For a targeted edit instead of a whole-file write, set exactly ONE of: `under_heading` (splice `content` into an existing heading's section; `position` = `append` (default, before the next same-or-higher heading) or `prepend` (right after the heading line)); `replace_lines` ({start, end}, 1-based inclusive, replace that line range with `content`); or `replace_match` (replace the unique literal occurrence of the given substring with `content`). All three require the file to already exist and ignore `overwrite`. Setting more than one is rejected. A missing/duplicate heading, an out-of-range line range, or a substring with zero or multiple matches is rejected with InvalidParams.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -723,8 +1022,13 @@ impl HallouminateTools {
     )]
     pub async fn add_markdown(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<AddMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let params = match params {
+            AddMarkdownParams::Single(params) => params,
+            AddMarkdownParams::Batch(params) => return self.add_markdown_batch(params).await,
+        };
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
@@ -740,22 +1044,13 @@ impl HallouminateTools {
             }),
         };
         let response: AddMarkdownResult = client.call(req).await.map_err(map_daemon_err)?;
-        let mut text = format!(
-            "wrote {} and refreshed corpus {}",
-            response.path, response.corpus
-        );
-        if !response.warnings.is_empty() {
-            text.push_str("\n\nlint warnings (advisory, file was written as-is):");
-            for warning in &response.warnings {
-                text.push_str(&format!("\n- {warning}"));
-            }
-        }
+        let text = render_add_markdown(&response);
         let structured = to_structured(&response)?;
         Ok(tool_ok(text, structured))
     }
 
     #[tool(
-        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim.",
+        description = "Read verbatim UTF-8 contents of a markdown file in a corpus. Alternatively pass items (1–20), sharing cwd and optional corpus, with each item's path, line_numbers and footnotes. Never mix items with single-file fields. Batch results are ordered {results:[{index,path,result}|{index,path,error:{code,message,data?}}]}, with labeled text per item. Item errors do not stop later reads. `content` is the full file text; `structuredContent` is { corpus, path, absolute_path, content, bytes }. Symlinks are rejected. Returns the on-disk text, not the indexed/chunked view — call `ground` for semantic search. `path` is a corpus-relative filename without citation suffixes such as `:12` or `:12-30`. `line_numbers` only affects display; it does not select a line range. Set `line_numbers: true` to render the text block with `cat -n`-style line-number gutters for citing `path:line`; the structured `content` stays verbatim.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -765,8 +1060,13 @@ impl HallouminateTools {
     )]
     pub async fn read_markdown(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ReadMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
+        let params = match params {
+            ReadMarkdownParams::Single(params) => params,
+            ReadMarkdownParams::Batch(params) => return self.read_markdown_batch(params).await,
+        };
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
         let req = DaemonRequest {
             cwd,
@@ -797,6 +1097,7 @@ impl HallouminateTools {
     )]
     pub async fn delete_markdown(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<DeleteMarkdownParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -818,10 +1119,17 @@ impl HallouminateTools {
                       total chunk row count, the newest index timestamp (ms since epoch, null when \
                       the corpus has never been indexed), and how many on-disk files matching the \
                       corpus globs have not yet been indexed. It also reports advisory warnings for \
-                      zero-match include and exclude patterns. Corpus selection follows the same \
-                      default resolution as `list_files`. `structuredContent` is \
+                      zero-match include and exclude patterns and for registration conflicts \
+                      such as `index-registration-conflict`. Corpus selection follows the same \
+                      default resolution as `list_files`. It never waits for the cold-start \
+                      reconciliation. The call never changes user data. It can queue background \
+                      indexing for an unregistered checkout, which refreshes only the server's own index, so `read_only_hint` is true and \
+                      `idempotent_hint` is true. `structuredContent` is \
                       { corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files, warnings }.",
         annotations(
+            // A queued catch-up refreshes only the server's own index, so the
+            // tool stays read-only for hosts (Codex skips its approval prompt
+            // only for read-only tools).
             read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
@@ -830,6 +1138,7 @@ impl HallouminateTools {
     )]
     pub async fn corpus_stats(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<CorpusStatsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -858,6 +1167,7 @@ impl HallouminateTools {
     )]
     pub async fn list_corpora(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<ListCorporaParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -888,6 +1198,7 @@ impl HallouminateTools {
     )]
     pub async fn backlinks(
         &self,
+        _cwd: RequireCwd,
         Parameters(params): Parameters<BacklinksParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (client, cwd) = self.tool_setup(&params.cwd).await?;
@@ -909,6 +1220,135 @@ impl HallouminateTools {
     }
 }
 
+impl HallouminateTools {
+    async fn read_markdown_batch(
+        &self,
+        params: ReadMarkdownBatchParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let ReadMarkdownBatchParams { cwd, corpus, items } = params;
+        validate_batch_count(items.len())?;
+        let (client, cwd) = self.tool_setup(&cwd).await?;
+        let mut results = Vec::with_capacity(items.len());
+        let mut texts = Vec::with_capacity(items.len());
+        for (
+            index,
+            ReadMarkdownItemParams {
+                path,
+                line_numbers,
+                footnotes,
+            },
+        ) in items.into_iter().enumerate()
+        {
+            let response = client
+                .call::<ReadMarkdownResult>(DaemonRequest {
+                    cwd: cwd.clone(),
+                    payload: DaemonRequestPayload::ReadMarkdown(ReadMarkdownRequest {
+                        corpus: corpus.clone(),
+                        path: path.clone(),
+                    }),
+                })
+                .await
+                .map_err(map_daemon_err);
+            let outcome = response.and_then(|response| {
+                let structured = to_structured(&response)?;
+                let body = apply_footnote_mode(&response.content, footnotes);
+                let text = if line_numbers {
+                    number_lines(&body)
+                } else {
+                    body
+                };
+                Ok((text, structured))
+            });
+            let (text, result) = batch_item(index, &path, outcome);
+            texts.push(text);
+            results.push(result);
+        }
+        Ok(tool_ok(
+            texts.join("\n\n"),
+            serde_json::json!({ "results": results }),
+        ))
+    }
+
+    async fn add_markdown_batch(
+        &self,
+        params: AddMarkdownBatchParams,
+    ) -> Result<CallToolResult, ErrorData> {
+        let AddMarkdownBatchParams { cwd, corpus, items } = params;
+        validate_batch_count(items.len())?;
+        let mut paths = Vec::with_capacity(items.len());
+        let mut requests = Vec::with_capacity(items.len());
+        for AddMarkdownItemParams {
+            path,
+            content,
+            overwrite,
+            under_heading,
+            position,
+            replace_lines,
+            replace_match,
+        } in items
+        {
+            let selectors = usize::from(under_heading.is_some())
+                + usize::from(replace_lines.is_some())
+                + usize::from(replace_match.is_some());
+            if selectors > 1 {
+                return Err(invalid_params(
+                    "set at most one of under_heading / replace_lines / replace_match",
+                ));
+            }
+            paths.push(path.clone());
+            requests.push(AddMarkdownItem {
+                path,
+                content,
+                overwrite,
+                under_heading,
+                position,
+                replace_lines,
+                replace_match,
+            });
+        }
+        let (client, cwd) = self.tool_setup(&cwd).await?;
+        let response: AddMarkdownBatchResult = client
+            .call(DaemonRequest {
+                cwd,
+                payload: DaemonRequestPayload::AddMarkdownBatch {
+                    corpus,
+                    items: requests,
+                },
+            })
+            .await
+            .map_err(map_batch_write_error)?;
+        if response.results.len() != paths.len() {
+            return Err(internal_error(
+                "Batch completion is uncertain: daemon returned an incorrect result count; inspect files before retrying.",
+            ));
+        }
+        let mut results = Vec::with_capacity(paths.len());
+        let mut texts = Vec::with_capacity(paths.len());
+        for (index, (path, response)) in paths.into_iter().zip(response.results).enumerate() {
+            let outcome = match response {
+                DaemonResponse::Ok { result } => {
+                    match serde_json::from_value::<AddMarkdownResult>(result.clone()) {
+                        Ok(response) => Ok((render_add_markdown(&response), result)),
+                        Err(error) => Err(internal_error(format!(
+                            "Item completion is uncertain: invalid item response: {error}; inspect the file before retrying."
+                        ))),
+                    }
+                }
+                DaemonResponse::Err { kind, message } => {
+                    Err(map_daemon_err(DaemonRpcError { kind, message }.into()))
+                }
+            };
+            let (text, result) = batch_item(index, &path, outcome);
+            texts.push(text);
+            results.push(result);
+        }
+        Ok(tool_ok(
+            texts.join("\n\n"),
+            serde_json::json!({ "results": results }),
+        ))
+    }
+}
+
 impl Default for HallouminateTools {
     /// `#[derive(Default)]` would construct `ToolRouter::default()` (an empty
     /// router) and skip the `#[tool_router]`-generated registration. Manual
@@ -921,11 +1361,11 @@ impl Default for HallouminateTools {
 
 #[tool_handler]
 impl ServerHandler for HallouminateTools {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` and `Implementation` are both `#[non_exhaustive]` in
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` and `Implementation` are both `#[non_exhaustive]` in
         // `rmcp`; construct via `Default::default()` and mutate the fields
         // we care about so we don't fight the crate's evolution constraints.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.server_info.name = env!("CARGO_PKG_NAME").into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.instructions = Some(SERVER_INSTRUCTIONS.to_string());
@@ -943,6 +1383,10 @@ mod tests {
     //! Daemon RPC error mapping has its own contract — pin the JSON-RPC
     //! code each error variant maps to so a future refactor of the
     //! daemon's `ErrorKind` would have to deliberately update the test.
+
+    use std::collections::BTreeSet;
+
+    use hallouminate_domain::ground::warning_codes;
 
     use super::*;
 
@@ -1101,5 +1545,127 @@ mod tests {
         let dir = std::env::temp_dir();
         let resolved = validate_cwd(dir.to_str().expect("utf8 path")).expect("valid dir accepted");
         assert_eq!(resolved, dir.canonicalize().expect("canonicalize temp dir"));
+    }
+
+    #[test]
+    fn index_summary_names_each_skipped_file_and_the_unnamed_rest() {
+        let report = hallouminate_daemon::IndexReport {
+            corpora: vec![hallouminate_daemon::CorpusReport {
+                name: "docs".into(),
+                files_upserted: 2,
+                files_touched: 0,
+                files_deleted: 0,
+                files_skipped_empty: 0,
+                files_skipped_unreadable: 3,
+                skipped_unreadable: vec![
+                    hallouminate_daemon::SkippedFileReport {
+                        path: "/r/brief.html".into(),
+                        reason: hallouminate_daemon::SkippedFileReason::UnsupportedFormat,
+                    },
+                    hallouminate_daemon::SkippedFileReport {
+                        path: "/r/scan.pdf".into(),
+                        reason: hallouminate_daemon::SkippedFileReason::ExtractionFailed {
+                            error: "no text layer".into(),
+                        },
+                    },
+                ],
+                chunks_inserted: 7,
+                embeddings_inserted: 7,
+            }],
+            warnings: Vec::new(),
+        };
+        assert_eq!(
+            index_summary(&report),
+            "docs: upserted=2 touched=0 deleted=0 unreadable=3 chunks+=7\n  skipped /r/brief.html: unsupported format\n  skipped /r/scan.pdf: extraction failed: no text layer\n  and 1 more unreadable files"
+        );
+    }
+
+    #[test]
+    fn index_summary_folds_a_multi_line_error_onto_one_line() {
+        let report = hallouminate_daemon::IndexReport {
+            corpora: vec![hallouminate_daemon::CorpusReport {
+                name: "docs".into(),
+                files_upserted: 0,
+                files_touched: 0,
+                files_deleted: 0,
+                files_skipped_empty: 0,
+                files_skipped_unreadable: 1,
+                skipped_unreadable: vec![hallouminate_daemon::SkippedFileReport {
+                    path: "/r/scan.pdf".into(),
+                    reason: hallouminate_daemon::SkippedFileReason::ExtractionFailed {
+                        error: "bad xref\n  at offset 12\r\n\tgave up".into(),
+                    },
+                }],
+                chunks_inserted: 0,
+                embeddings_inserted: 0,
+            }],
+            warnings: Vec::new(),
+        };
+        let summary = index_summary(&report);
+        assert_eq!(summary.lines().count(), 2, "{summary}");
+        assert!(
+            summary
+                .ends_with("skipped /r/scan.pdf: extraction failed: bad xref at offset 12 gave up"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn index_tool_description_states_the_skip_cap() {
+        let cap = hallouminate_domain::indexer::MAX_REPORTED_SKIPS.to_string();
+        let description = HallouminateTools::index_tool_attr()
+            .description
+            .expect("index tool has a description");
+        assert!(description.contains(&cap), "{description}");
+    }
+
+    /// Backticked kebab-case tokens (`two-or-more-words`) in `text`.
+    fn backticked_kebab_tokens(text: &str) -> BTreeSet<String> {
+        let mut found = BTreeSet::new();
+        for (index, span) in text.split('`').enumerate() {
+            let is_code_span = index % 2 == 1;
+            let is_kebab = span.contains('-')
+                && span
+                    .split('-')
+                    .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_lowercase()));
+            if is_code_span && is_kebab {
+                found.insert(span.to_string());
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn ground_description_documents_every_warning_code() {
+        let description = HallouminateTools::ground_tool_attr()
+            .description
+            .expect("ground tool has a description");
+        let documented = backticked_kebab_tokens(&description);
+        let known: BTreeSet<String> = warning_codes::ALL
+            .iter()
+            .map(|code| (*code).to_string())
+            .collect();
+        assert_eq!(
+            documented, known,
+            "ground description drifted from warning_codes::ALL"
+        );
+    }
+
+    #[test]
+    fn wiki_query_skill_lists_only_known_warning_codes() {
+        let skill = include_str!("../../../../plugins/hallouminate/skills/wiki-query/SKILL.md");
+        let warning_lines = skill
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("warning"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let named = backticked_kebab_tokens(&warning_lines);
+        assert!(!named.is_empty(), "SKILL.md names no warning codes");
+        for code in &named {
+            assert!(
+                warning_codes::ALL.contains(&code.as_str()),
+                "SKILL.md names unknown warning code `{code}`"
+            );
+        }
     }
 }

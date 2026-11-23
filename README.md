@@ -218,8 +218,8 @@ passed as `cwd`:
   the _union_ of that repo's own `repo:<name>:wiki` with every other
   config-declared corpus — baseline-registered `[[repository]]` wikis,
   user-declared `[[corpus]]` entries, and each repository's
-  `repo:<name>:corpus` source corpus when configured — with the repo's own
-  pages ranked first.
+  `repo:<name>:corpus` source corpus when configured — fused as one ranking.
+  The repo's own pages win score ties and keep reserved `top_files` slots.
 - **Above all repos** (e.g. `cwd: ~/Dev`) — a `ground` call with **no explicit
   `corpus`** searches the _union_ of every effective corpus: discovered sub-repo
   wikis + baseline-registered `[[repository]]` wikis, plus user-declared
@@ -250,8 +250,9 @@ thin clients that talk to it over a Unix domain socket.
   start by hand.
 - **Socket resolution order** — `HALLOUMINATE_SOCKET` (explicit full-path
   override; setting it also disables auto-spawn — the caller owns the daemon
-  lifecycle), else `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, else
-  `~/.cache/hallouminate/daemon.sock`.
+  lifecycle), else `<account-home>/.cache/hallouminate/daemon.sock`. The
+  account home comes from the OS user record, not `$HOME` or
+  `$XDG_RUNTIME_DIR`.
 - **Lifecycle** — `hallouminate daemon status` / `stop` / `restart`; bare
   `hallouminate daemon` runs it in the foreground. Only one instance per
   socket can run (`flock`-guarded).

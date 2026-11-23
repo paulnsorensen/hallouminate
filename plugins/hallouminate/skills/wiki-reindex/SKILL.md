@@ -44,13 +44,17 @@ If the daemon comes up cleanly, the store is healthy — stop here.
 
 ### Auto-heal (stale store) — verify, don't delete
 
-On a stale store the daemon renames it to `<ground-dir>.bak-v<found>` and
-reindexes every configured corpus during startup — no manual step. Verify
-with `hallouminate daemon status` (expect `running`) and a test
-`hallouminate ground "<query>"`. The backup is kept for recovery and pruned
-automatically after ~30 days (`STALE_BACKUP_MAX_AGE`). If the rebuild itself
-fails, the daemon removes the partial store so the next boot retries, and the
-backup survives.
+On a stale store the daemon renames it to `<ground-dir>.bak-v<found>` — no
+manual step. The daemon reindexes every baseline corpus before it serves
+requests. A corpus declared only in a repo config is indexed when a request
+first registers it. `[storage] ground_dir` is baseline-only, so every repo
+shares this one store. Until a corpus finishes its catch-up, `ground` can return partial
+results with an `index-coverage` warning. Verify with `hallouminate daemon
+status` (expect `running`) and a test `hallouminate ground "<query>"`. The
+daemon keeps the backup for
+recovery and prunes it after about 30 days (`STALE_BACKUP_MAX_AGE`). If the startup
+rebuild fails, the daemon removes the partial store, keeps the backup, and
+exits. The next start opens a fresh store, and the catch-up refills it.
 
 ## Manual sequence
 
@@ -67,7 +71,8 @@ error output, the default store lives at:
 ```
 
 This path is overridable via `[storage] ground_dir` in your
-`~/.config/hallouminate/config.toml`. Verify:
+`~/.config/hallouminate/config.toml` only. A repo `.hallouminate/config.toml`
+cannot set it. Verify:
 
 ```bash
 hallouminate config show | grep ground_dir
@@ -161,5 +166,4 @@ or run `hallouminate daemon` (foreground) to see startup errors.
 - If `hallouminate daemon stop` times out (> 10 s), kill the process directly
   (`kill $(lsof -t -- <socket-path>)`) and then delete the socket file before
   proceeding. The socket path is `$HALLOUMINATE_SOCKET` when set, otherwise
-  `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, otherwise
-  `~/.cache/hallouminate/daemon.sock`.
+  `<account-home>/.cache/hallouminate/daemon.sock`.

@@ -9,14 +9,24 @@ owner of the LanceDB ground directory, per-corpus mutation locks, and
 the repository registry. Every other caller — CLI subcommand, MCP
 tool, future agent — dials the daemon over a Unix domain socket.
 
+
+
+The daemon keeps client-triggered startup and idle exit. It installs no OS service.[^service-policy]
+An OS manager restarts a process, not an individual Tokio task. It does not replace task recovery, socket ownership, or cleanup order.
+`service-manager` also leaves application policy in place. Its generic API differs from backend-specific capabilities, including systemd restart limits and raw launchd crash policy.
+The rejection covers the current lifecycle. A future persistent-service requirement needs a new decision.
+The spike does not run live launchd or systemd service tests.[^service-policy]
+
+[^service-policy]: `docs/adr/infrastructure-ownership-002.md:5-17`.
+
 ## Socket location
 
 Resolved in this order (`crates/hallouminate-daemon/src/socket.rs`):
 
 1. `HALLOUMINATE_SOCKET` env var — per-process override.
-2. `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` — the default when a
-   runtime dir exists.
-3. `${XDG_CACHE_HOME:-~/.cache}/hallouminate/daemon.sock` — fallback.
+2. `<account-home>/.cache/hallouminate/daemon.sock` — the default. The
+   account home comes from the OS user record; `HOME`, `XDG_RUNTIME_DIR`,
+   and `XDG_CACHE_HOME` do not change it.
 
 `--socket PATH` on `index`, `ground`, etc. overrides per-invocation.
 
@@ -24,22 +34,21 @@ The daemon takes a flock on `<socket>.lock` to enforce single-instance
 ownership. A second `hallouminate daemon` against the same socket
 errors out with "another hallouminate daemon already holds …".
 
-**Sibling adoption (#218, #318).** Single-instance ownership remains per
-socket path, but default-socket clients probe both canonical candidates
-before spawning: the resolved primary and the opposite runtime/cache
-path. `serve` bootstrap, ordinary clients, `daemon status`, and `daemon
-stop` all adopt the reachable candidate, so disagreement about
-`XDG_RUNTIME_DIR` no longer wedges startup or hides the running daemon.
-An explicit `HALLOUMINATE_SOCKET` or per-command socket path is honored
-exactly and never triggers sibling probing.[^1]
+**One socket per account (#218, #318, #323).** Single-instance ownership
+is per socket path, and the default path no longer depends on the
+environment. `serve` bootstrap, ordinary clients, `daemon status`, and
+`daemon stop` all dial that one path. A daemon that listens only at the
+old `$XDG_RUNTIME_DIR/hallouminate/daemon.sock` path is not adopted. An
+explicit `HALLOUMINATE_SOCKET` or per-command socket path is honored
+exactly.[^1]
 
-**Cold start (#220).** When neither candidate is reachable, bootstrap
-spawns a daemon candidate and polls the primary socket for one 90-second
+**Cold start (#220).** When the socket is unreachable, bootstrap
+spawns a daemon candidate and polls the socket for one 90-second
 total budget, using exponential backoff capped at one second. A flock
 loser exits before opening daemon state, so concurrent candidates do not
 load duplicate models.[^2]
 
-[^1]: `crates/hallouminate-daemon/src/socket.rs:43-92`; `crates/hallouminate-daemon/src/client.rs:43-108`; `crates/hallouminate-daemon/src/bootstrap.rs:43-115`; `crates/hallouminate-daemon/src/lifecycle.rs:38-111`
+[^1]: `crates/hallouminate-daemon/src/socket.rs:11-49`; `crates/hallouminate-daemon/src/client.rs:30-84`; `crates/hallouminate-daemon/src/bootstrap.rs:43-115`; `crates/hallouminate-daemon/src/lifecycle.rs:38-107`
 [^2]: `crates/hallouminate-daemon/src/bootstrap.rs:24-26,94-153`; `crates/hallouminate-daemon/src/server.rs:114-117,672-694`
 
 ## Wire protocol
@@ -74,6 +83,34 @@ walks it on every request to discover the active repo-layer config
 (`.hallouminate/config.toml`) and merges it with the boot baseline.
 That's how a single daemon can serve many repos with different configs.
 
+## Reply-size guard
+
+Every daemon reply passes one reply-size guard before it goes on the socket.
+`response_frame` in `crates/hallouminate-daemon/src/server.rs` serializes the
+reply and its newline. It then compares the length to `MAX_IPC_LINE_BYTES`
+(4 MiB, `framing.rs`).[^reply-size]
+
+- A reply that fits goes out unchanged.
+- A reply that does not fit becomes an `invalid_params` error. The message
+  names the reply size and the limit, for example `response is N bytes; the
+  IPC limit is 4194304 bytes`. It tells the caller to narrow the request with
+  a smaller `limit` or `corpus`.[^reply-size]
+
+The guard covers every operation: `ground`, `read_markdown`, `list_files`,
+`list_tree`, and the others. It replaced a `ground`-only `ground_reply`
+check and that check's headroom constant.[^reply-size]
+
+Why: the client reads replies through the same 4 MiB line codec. Before the
+guard, an oversized `read_markdown` or `list_files` reply failed on the client
+as `max line length exceeded`, with no size and no reason. Now the daemon
+sends a small error that the client can read. The request side has a
+matching check: `DaemonClient::call_raw` refuses a markdown write batch over
+the frame limit before it connects.[^reply-size]
+
+[^reply-size]: `crates/hallouminate-daemon/src/server.rs::response_frame` and its tests; `crates/hallouminate-daemon/src/framing.rs::MAX_IPC_LINE_BYTES`; `crates/hallouminate-daemon/src/client.rs::DaemonClient::call_raw`; PR #586.
+
+_Source: PR #586 · Updated: 2026-10-16 · Supersedes: the `ground`-only `ground_reply` size check_
+
 ## Wire compatibility
 
 v1 ships from a single binary — CLI, MCP, and daemon are all the same
@@ -91,7 +128,7 @@ negotiation handshake.
 | `hallouminate index [--corpus NAME]` | bulk index one or all corpora |
 | `hallouminate ground "<query>" [...]` | semantic search; `--format outline\|json\|json-pretty`, `--full`, `--top-files N`, `--chunks-per-file N`, `--limit N`, `--snippet-chars N` |
 | `hallouminate serve` | stdio MCP server (auto-spawns daemon if down) |
-| `hallouminate daemon [--config PATH]` | run the daemon in the foreground; `daemon status` renders per-task `restarts=N` — see [supervisor-restart-ladder](supervisor-restart-ladder.md) |
+| `hallouminate daemon [--config PATH]` | run the daemon in the foreground; `daemon status` renders per-task `restarts=N` — see [supervisor-restart-ladder](supervisor-restart-ladder.md) — and one `watcher: N registration(s) degraded` line when `StatusReport.degraded_watch_roots > 0`, which means the native watcher never started and those roots reindex on the periodic reconcile tick only |
 | `hallouminate config init\|show\|validate\|download` | config inspection / scaffolding |
 | `hallouminate hook install\|uninstall [--repo PATH]` | per-repo discovery hook install |
 
@@ -121,3 +158,32 @@ Verified request-concurrency model (2026-07-13 audit):
   (`crates/hallouminate-daemon/src/client.rs:183-254`).
 
 _Source: multi-instance concurrency audit, `.cheese/concurrency-audit/notes.md` (branch `claude/fix-concurrency`) · Updated: 2026-07-30 · Supersedes: —_
+
+
+Catch-up split (2026-09-09): `dispatch::catch_up_corpus` holds only the per-corpus lock while it scans the filesystem, lists stored files, and plans.
+It acquires the global write lane through a caller-supplied closure (`DaemonState::acquire_write_lane` → `backpressure::acquire_lane`) only when the plan is non-empty, immediately before `apply`.
+A no-work scan never touches the lane, so a slow scan of one corpus no longer blocks writes to other corpora.
+The per-corpus lock held across scan and apply keeps the plan valid; every corpus writer (`handle_index`, `handle_add_markdown`, `dispatch::catch_up_corpus` invoked from `watch::spawn_registration_catch_up`, boot `catch_up_index`) still takes the corpus guard first and the global write lane only when the plan mutates ([performance-catch-up-write-lane-001](../../docs/adr/performance-catch-up-write-lane-001.md)).
+`handle_index` is not split: it calls the domain `index_corpus` directly and does not have the scan/plan/apply shape.
+Tests: `catch_up_slow_scan_does_not_hold_write_lane`, `catch_up_scan_in_flight_blocks_same_corpus_guard`, `catch_up_apply_holds_lane_until_released`, `catch_up_no_work_never_acquires_the_lane` in `state.rs`.
+
+Watcher-pump wake contract (2026-09-09): `WatchRegistry` signals the pump with `notify_one()` (`signal_changed`), not `notify_waiters()`.
+The pump is the single consumer, and the permit survives a signal that fires while the pump is not parked in its `select!` (spawned but not yet polled, or busy in `reconcile`/a change batch).
+With `notify_waiters` a runtime-discovered corpus could wait a full `reconcile_interval_secs` (3600 s in tests) for its watch install and catch-up. Regression: `registry_signal_wakes_pump_before_it_is_first_polled`.
+
+
+## Inference idle policy
+
+The idle-exit clock ignores cheap polling traffic. Successful `ground`, `index`, and `add_markdown` RPCs restart its window.[^idle-policy]
+Dispatch errors keep the window. Watcher and boot catch-up restart it only when `ApplyStats::embeddings_inserted > 0`.
+No-op, delete-only, cleanup, and failed passes keep the window. Every external request still updates its work-class clock for maintenance deferral.
+Connection guards protect in-flight work from idle exit. Crossencoder acquisition and guard drop independently stamp the idle clock.
+A timed-out rerank can stamp the clock when its blocking task finishes. No embedder guard stamps the daemon clock.[^idle-policy]
+
+This policy permits memory reclamation under a polling fleet. It does not impose a memory limit during continuous inference.
+The next request after exit still pays eager baseline-model startup. Lazy startup is a separate change.[^idle-policy]
+
+[^idle-policy]: `docs/adr/daemon-idle-exit-004.md:5-9`; `crates/hallouminate-daemon/src/server.rs::idle_clock_for_response`; `crates/hallouminate-daemon/src/watch/mod.rs::process_change_batch`.
+
+_Source: landed PRs #525 and #527 · Updated: 2026-09-23 · Supersedes: every completed request restarts the idle window._
+

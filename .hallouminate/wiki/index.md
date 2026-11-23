@@ -16,23 +16,34 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [corpus-walker](corpus-walker.md) — gitignore-aware corpus walking and the explicit-root opt-in escape hatch.
 - [daemon-and-cli](daemon-and-cli.md) — why there's a daemon, the JSON-line socket protocol, the CLI subcommand surface.
 - [daemon-canonical-identity-001](daemon-canonical-identity-001.md) — why the default daemon socket is resolved from the OS account record instead of `XDG_RUNTIME_DIR` (#320).
-- [daemon-canonical-identity-002](daemon-canonical-identity-002.md) — the one ordered canonical→legacy discovery seam every client and lifecycle command shares, and the bounded migration window (#323 retires it).
+- [daemon-canonical-identity-002](daemon-canonical-identity-002.md) — the one discovery seam every client and lifecycle command shares, and the retired legacy XDG probe (#323).
+- [operation-outcome-record-001](operation-outcome-record-001.md) — why operation outcomes and stage timing go to a dedicated local log, not to OpenTelemetry or the tracing log (#454, #456; accepted, not implemented).
+- [operation-outcome-record-002](operation-outcome-record-002.md) — why one call writes a daemon row and a client row joined by `request_id`.
+- [operation-outcome-record-003](operation-outcome-record-003.md) — why every MCP tool response carries the `request_id` and no timing block.
 - [daemon-canonical-identity-003](daemon-canonical-identity-003.md) — store-lock owner diagnostics: what the `store.lock` metadata names, and why a second advisory guard proves it is current.
 - [debt-observed-test-isolation](debt-observed-test-isolation.md) — why the process-wide `debt::OBSERVED` static makes any Hard-recording test break concurrent maintenance-defer tests.
 - [design-rationale](design-rationale.md) — what hallouminate deliberately *is* and *isn't*, and why — the "why this design not that one" page.
-- [domain-model](domain-model.md) — the `search_text`, root-aware `CorpusKey`, and schema-v4 model that shipped in #290 (issue #288's design), plus the shipped `Provisioner`/donor vocabulary from #430.
+- [domain-model](domain-model.md) — the `search_text`, root-aware `CorpusKey`, and schema-v4 model that shipped in #290 (issue #288's design).
 - [eval-baseline-rg-provenance-adrs](eval-baseline-rg-provenance-adrs.md) — why the eval was re-baselined with the divergence unexplained, and why ripgrep's version is recorded but never enforced.
 - [eval-harness-gotchas](eval-harness-gotchas.md) — operational traps running the ground-retrieval eval: ripgrep as an uninstalled hard dependency, the warning-code taxonomy three crates own, the discarded warmup sweep, and ETXTBSY in parallel tests.
+- [facts-layer-extraction-evidence](facts-layer-extraction-evidence.md) — research evidence for fork Q1: closed-schema extraction accuracy on 2026 models, open-extraction relation sprawl, and the canonicalization trade-off.
+- [facts-layer-landscape](facts-layer-landscape.md) — research evidence: no end-to-end standard for an LLM-wiki facts layer; the four layers (workflow, markdown fact syntax, formal fact models, construction methods) and a 2026-10-05 tooling snapshot.
+- [facts-layer-open-forks](facts-layer-open-forks.md) — the four open (undecided) facts-layer design forks: extraction method, where facts live, statement model, and time model.
+- [facts-layer-store-evidence](facts-layer-store-evidence.md) — research evidence on whether an RDF or graph store helps modern LLMs more than inline fact demarcation; structure helps, the store technology does not carry the gain.
+- [facts-layer-supersession-evidence](facts-layer-supersession-evidence.md) — research evidence for forks Q3 and Q4: how statement models mark a changed fact, and STALE results for outdated memories on 2026 models.
 - [ground-search-evaluation](ground-search-evaluation.md) — discriminative file/chunk relevance metrics, latency thresholds, small-reranker comparison, and scheduled regression gate.
 - [ground-search-quality](ground-search-quality.md) — issue #288's spec, shipped in #290: indexed-text cleanup, worktree isolation, eval-gated reranking (default stayed opt-in), and authoring context.
 - [ground-search-quality-adrs](ground-search-quality-adrs.md) — five decisions and their research basis for issue #288; ADR-001/002/003/005 shipped in #290, ADR-004's reranker default stayed opt-in.
 - [ground-signal-fusion-adrs](ground-signal-fusion-adrs.md) — the post-#290 ranking audit: why weighted RRF over four peer signals moved into the domain layer, why the shipped 0.5/0.5 literal weights were kept, and why the literal signals only reorder the FTS/vector pool.
 - [log](log.md) — append-only ingest log: what each wiki-ingest run wrote, merged, skipped as a near-duplicate, or flagged as conflicting, and why.
-- [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis: every call requires an absolute `cwd` (#453), `ground`'s default corpus unions every configured corpus with a repo-local ranking guard (#425/#426), plus `add_markdown`'s surgical edit modes and the multi-root read/write asymmetry.
+- [lancedb-adapter-notes](lancedb-adapter-notes.md) — how `lance.rs` uses the `lancedb` crate, why 0.38 to 0.40 failed to compile with default features before the 0.41 bump merged, the exhaustive `IndexType` match, the unverified first-create crash-recovery risk (#682), and the ranked backlog of unused lancedb features (scalar indexes, scan projection, explicit distance type).
+- [maintenance-compaction-index-deltas](maintenance-compaction-index-deltas.md) — why `maintain` merges index deltas before compaction: per-batch ANN deltas split every compaction bin, so Hard debt never drained (issue #463).
+- [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis, including `add_markdown`'s surgical edit modes and the multi-root read/write asymmetry.
 - [multi-format-ingestion](multi-format-ingestion.md) — the shipped Phase 1 per-format dispatch (markdown/text/RST/spreadsheet), why the wiki corpus stays markdown-only, and what (PDF/office/code) is still deferred.
 - [not-found-suggestions](not-found-suggestions.md) — how an unknown-corpus error and a `read_markdown` path miss self-enrich with `strsim` closest-match hints so a caller recovers in zero extra round trips.
 - [office-prose-extraction](office-prose-extraction.md) — deferred/future-phase plan for .docx/.pptx/.odt prose extraction (not shipped today).
 - [ort-arena-retention](ort-arena-retention.md) — why session eviction never reclaimed embedder memory: upstream ONNX Runtime BFCArena retention; superseded by daemon idle-exit.
+- [ort-coreml-device-policy](ort-coreml-device-policy.md) — why every ONNX session sets `PreferCPU`: `ort` rc.15's default policy runs the embedder on CoreML on macOS (~21 GB); the placement test and the Renovate hold that guard it.
 - [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — deferred/future-phase plan for PDF and OCR ingestion (not shipped today).
 - [racy-mtime-smudge](racy-mtime-smudge.md) — why stored file mtimes are deliberately smudged by one millisecond at the write seam rather than fixing the equality gates.
 - [release-ceremony](release-ceremony.md) — release-flow gotchas the scripts don't tell you, learned cutting real releases.
@@ -41,10 +52,11 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [search-reliability-loop-003](search-reliability-loop-003.md) — ADR-003: rerank the indexed `search_text` while `SearchHit.text` stays the display/evidence contract.
 - [sources/](sources/index.md) — corpus-local source pages for durable external research, each with a fixed indexed identity spine (title, URL, attribution, limitations).
 - [supervisor-restart-ladder](supervisor-restart-ladder.md) — ADR for the generic ladder evaluator, the supervisor crash-loop thresholds, the separate watchdog path, and the decision not to change heartbeats on restart.
+- [watcher-batched-reconcile-adr](watcher-batched-reconcile-adr.md) — why watcher reconciliation batches native path changes and retains registrations after stream failure.
 - [wiki-conventions](wiki-conventions.md) — how to author entries in *this* wiki without contradicting the indexer's expectations.
 - [worktree-corpus-identity](worktree-corpus-identity.md) — #215's root-scoped delete fix, the #290 root-aware identity that closed the sibling-worktree search leak, and #304's retired-root garbage collection.
 - [worktree-dev-gotchas](worktree-dev-gotchas.md) — environment traps for agents in isolated worktrees: tilth edits leaking to the parent repo, and `/tmp` scratch builds (disk quota, cargo wrapper exit 134).
-- [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md) — ADRs for the shipped #427/#430 work: a dedicated Provisioner task catches up new worktree roots on discovery, file-level vector donor reuse keyed by `content_hash`, and why root GC (#427 part 4) was dropped as already shipped in #304.
+- [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md) — four decisions for index-on-discovery: the retired provisioner task, file-level vector reuse by `content_hash`, the root-GC non-goal, and the durable `WatchRegistry` with bounded reconciliation (#427, #461).
 
 ## How to use this index
 

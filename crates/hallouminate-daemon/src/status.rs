@@ -23,7 +23,6 @@ pub(super) fn report(state: &DaemonState) -> ipc::StatusReport {
         heartbeat::TaskName::WatcherPump,
         heartbeat::TaskName::IdleExit,
         heartbeat::TaskName::Signal,
-        heartbeat::TaskName::Provision,
     ] {
         per_task.push(ipc::TaskStatus {
             task: wire_task(task),
@@ -47,6 +46,7 @@ pub(super) fn report(state: &DaemonState) -> ipc::StatusReport {
                 at_secs: trip.at_secs,
             },
         },
+        degraded_watch_roots: state.watch_registry().degraded_count(),
     }
 }
 
@@ -73,7 +73,6 @@ fn wire_task(task: heartbeat::TaskName) -> ipc::TaskName {
         heartbeat::TaskName::WatcherPump => ipc::TaskName::WatcherPump,
         heartbeat::TaskName::IdleExit => ipc::TaskName::IdleExit,
         heartbeat::TaskName::Signal => ipc::TaskName::Signal,
-        heartbeat::TaskName::Provision => ipc::TaskName::Provision,
     }
 }
 
@@ -103,7 +102,7 @@ mod tests {
         // zero/none shape, not an invented value.
         let state = test_state().await;
         let report = report(&state);
-        assert_eq!(report.per_task.len(), 6);
+        assert_eq!(report.per_task.len(), 5);
         assert!(
             report
                 .per_task
@@ -128,6 +127,7 @@ mod tests {
             ipc::TripState::None => {}
             other => panic!("fresh state has no recorded ladder trip, got: {other:?}"),
         }
+        assert_eq!(report.degraded_watch_roots, 0);
     }
 
     #[tokio::test]

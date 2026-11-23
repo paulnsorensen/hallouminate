@@ -7,7 +7,115 @@ GitHub release notes for this project ship only install/download links, not
 change descriptions, so entries below are condensed from merged PR titles
 for each release window.
 
-## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.10.0...HEAD)
+## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.12.2...HEAD)
+
+### Changed
+
+- Dependencies: zip 9.6.0
+
+### Security
+
+- Dependencies: bump url to 2.5.9 and form_urlencoded to 1.2.3 for RUSTSEC-2026-0592 to stop a stack overflow in `Url::origin()` on nested `blob:` URLs
+
+## [0.12.2](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.2) - 2026-11-21
+
+### Fixed
+
+- Release: link the Xcode clang runtime into the macOS dist build. The dist profile's thin LTO drops the `___isPlatformVersionAtLeast` symbol that the prebuilt onnxruntime needs (rust-lang/rust#164915), so the v0.12.1 macOS build failed to link. v0.12.1 published only to crates.io and the skill pack, with no GitHub release, binaries, or npm package
+
+## [0.12.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.1) - 2026-11-21
+
+### Fixed
+
+- Release: build `aarch64-apple-darwin` on `macos-latest`. dist's default `macos-14` runner is no longer supported, so v0.12.0 published only to crates.io and the skill pack, with no GitHub release, binaries, or npm package
+
+### Changed
+
+- Dependencies: pnpm 12.20.0
+
+## [0.12.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.0) - 2026-11-21
+
+### Added
+
+- Ground: exact phrase match mode
+- Ground: chunk overlap, page rollup, and phrase counts in results
+- Ground: useful results on the first call in a fresh worktree
+- Indexer: index JSON and JSONL source files
+- MCP: batch markdown operations and clearer retrieval recovery messages
+- Adapters: scalar indexes on `corpus`, `root`, and `content_hash`
+- Skills: `wiki-ingest` bundles the `ingest-ledger` CLI
+- Fuzz: `cargo-fuzz` targets and a Fuzz workflow for domain parsers and indexer format handlers
+- Build: Windows verification leases
+- Site: illuminated halloumi favicon
+
+### Changed
+
+- Lance: defer FTS and FM index rebuilds from `apply_batch` to maintenance, and project only hit columns in `fts_scan` and `vector_scan`
+- Daemon: batch the ancestor reindex for `add_markdown` and add timing spans
+- Build: sccache locally and in CI; Rust nightly pin moves to nightly-2026-11-12; MSRV rises to 1.94 for lancedb 0.41
+- CI: daily security re-check for advisories and stale dependency reviews; auto-merge for bot patch and minor bumps
+- Docs: document body-only phrase matching and the daemon reply-size guard
+- Dependencies: lancedb 0.41, rmcp 3.10.0, ort pinned to 2.0.0-rc.15, zip 9.x (via calamine 0.38), notify 9.0.0-rc.8, notify-debouncer-full 0.8.0-rc.3, fastembed 7.7, rust_xlsxwriter 0.102.0, text-splitter 0.33.2, TypeScript 7, Node 26, pnpm 12.19.0, Astro 7.4.8, Starlight 0.42.10
+
+### Fixed
+
+- Search: match wrapped phrases and name skipped index files
+- Search: prioritize headings and lower the ranking of generated index pages
+- Search: match the FM literal signal case-insensitively
+- Ground: rank corpora together and skip missing corpus roots
+- Daemon: recover stale `ground_dir` override stores per request
+- Daemon: report a per-build identity in Ping so a new build restarts stale nightlies
+- Daemon: remove legacy XDG socket probing from default discovery
+- Adapters: recover table directories left without a manifest
+- Adapters: keep ONNX sessions on CPU with fastembed 7.7 `PreferCPU` to stop CoreML auto-selection on macOS
+- MCP: return an actionable `InvalidParams` error when `cwd` is missing
+- Config: explain baseline-only conflicts and stop reporting a found repo config as missing
+- Claim marks: strip claim comments until none remain
+- Eval: measure only the baseline arm in CI measure mode
+- Security: bump rmcp to 3.9.0 for RUSTSEC-2026-0462, and pulldown-cmark to 0.13.5 to stop an offset-iterator panic
+
+## [0.11.1](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.11.1) - 2026-09-23
+
+### Changed
+
+- Daemon: batch each watcher reconcile into one `update_paths` call, so a macOS reconcile rebuilds the FSEvents stream once instead of once per root; pins `notify` 9.0.0-rc.5 and `notify-debouncer-full` 0.8.0-rc.2
+- Dependencies: fastembed 7.1.0, rmcp 3.4.1, thiserror 2.0.21, stop-words 0.10.1, pnpm 12.6.0, Astro 7.3.4, Starlight 0.42.3; CI runners move to Ubuntu 26
+
+### Fixed
+
+- Daemon: skip missing watch roots and retry failed installs on reconcile ticks
+- Daemon: restart the idle-exit window only for inference work
+- Config: `config validate` accepts all `watch`, `daemon`, and `search` keys
+
+## [0.11.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.11.0) - 2026-09-19
+
+### Added
+
+- CLI: `wiki status` lists uncommitted wiki and corpus files
+- Config: `inherit_global_corpora` repo-level opt-out for inherited global corpora
+- Daemon: watch discovered corpus roots and reconcile external changes at runtime
+- Daemon: `daemon status` reports `degraded_watch_roots`, the count of watch registrations that run on periodic reconciliation only, on the wire and in the CLI render
+
+### Changed
+
+- **Breaking**: MCP tools enforce explicit workspace path contracts; a missing, relative, or nonexistent path now fails the call instead of falling back to an implicit working directory
+- Dependencies: rmcp 3.4.0, fastembed 6.1.0, tokenizers 0.23.2, clap 4.6.7, pdf-extract 0.12.1, rust_xlsxwriter 0.99.1, toml 1.1.6, pnpm 12, Astro 7.3.3
+
+### Fixed
+
+- Adapters: stop ONNX Runtime from retaining gigabytes of memory after embedding
+- Adapters: merge index deltas before compaction so hard debt drains
+- Daemon: harden watcher, backpressure, and lexical ranking for release
+- Daemon: keep runtime discovery and periodic reconciliation active when the native watcher cannot start
+- Daemon: bound lazy reranker admission per model
+- Daemon: bound coverage scans across concurrent requests
+- Daemon: disable recursive watcher file-ID cache
+- Index: validate donor input and bound retained candidates
+- Ground: preserve fusion results and report `crossencoder-unavailable` when the reranker worker fails
+
+### Removed
+
+- **Breaking**: `TaskName::Provision` and the separate Provisioner loop; `daemon status` `per_task` drops from six rows to five; the watcher registry owns runtime catch-up
 
 ## [0.10.0](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.10.0) - 2026-09-01
 

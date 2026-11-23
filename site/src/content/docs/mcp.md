@@ -3,30 +3,40 @@ title: "MCP surface"
 ---
 
 `hallouminate serve` starts a stdio MCP server. It is stateless beyond its
-tool router and a startup-captured working directory; every tool call dials
-the local daemon over a Unix domain socket, and `serve` auto-spawns the daemon
-if none is up.
+tool router; every tool call dials the local daemon over a Unix domain socket,
+and `serve` auto-spawns the daemon if none is up.
 
-## Default corpus
+Every tool call requires an absolute `cwd` for the active checkout. The server
+validates and canonicalizes `cwd` before it loads configuration or contacts the
+daemon. It does not use the server startup directory, MCP roots, or a session
+working directory as a fallback.
 
-Read-side tools (`ground`, `list_files`, `list_tree`, `backlinks`,
-`corpus_stats`) that omit `corpus`
-default to the wiki for the repository containing the daemon's working
-directory — `repo:<NAME>:wiki` for the deepest `[[repository]]` whose `path`
-is an ancestor of the cwd. When the cwd sits under no configured repo, the
-caller must name a corpus explicitly.
+## Corpus scoping
 
-The mutating tools (`add_markdown`, `delete_markdown`) and `read_markdown`
-**always** require an explicit `corpus`, to avoid accidental writes to the
-wrong wiki or ambiguous reads.
+`ground` with no `corpus` searches **every** effective corpus and fuses the
+results into a single ranked set. Every signal ranks the chunks of all corpora
+together, so a page that leads its own corpus does not outrank stronger pages
+of another corpus. The wiki for the repository containing the request's `cwd`
+is the priority corpus: its pages win score ties and keep reserved slots in the
+`top_files` cut. Every hit carries its own source corpus, and passing `corpus`
+explicitly pins the search to that one corpus.
+
+The other read-side tools (`read_markdown`, `list_files`, `list_tree`,
+`backlinks`, `corpus_stats`) that omit `corpus` default to the wiki for the
+repository containing `cwd` — `repo:<NAME>:wiki` for the deepest
+`[[repository]]` whose `path` is an ancestor of `cwd`. When `cwd` sits under no
+configured repo, the caller must name a corpus explicitly.
+
+The mutating tools (`add_markdown`, `delete_markdown`) **always** require an
+explicit `corpus`, to avoid accidental writes to the wrong wiki.
 
 ## The ten tools
 
 ### `list_corpora`
 
 Every corpus the daemon knows about — explicit `[[corpus]]` entries plus
-derived `repo:NAME:wiki` and `repo:NAME:corpus` corpora. No params. Call this
-first to learn what's available.
+derived `repo:NAME:wiki` and `repo:NAME:corpus` corpora. Param: `cwd` (required
+absolute path). Call this first to learn what's available.
 
 ### `list_files`
 
@@ -46,9 +56,43 @@ first. Param: `corpus` (defaults to wiki-for-cwd).
 Semantic search. Embeds the query with the configured embedding model
 (default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from
 LanceDB, and rolls up per-file with breadcrumb context. Params: `query`
-(required), `corpus`, `top_files`, `chunks_per_file`, `limit`, `snippet_chars`.
+(required), `corpus`, `top_files`, `chunks_per_file`, `limit`, `snippet_chars`,
+`footnotes`, `match`, `group_by`, `output`.
 Returns a ripgrep-style outline in `content` and the full structured response
 in `structuredContent.docs`.
+
+Set `match: "phrase"` for an exact lookup, such as a canonical URL or a
+source title. Phrase mode uses bounded case-insensitive literal matching of
+the whole query against chunk body text. The match ignores the heading
+breadcrumb and the file summary, so inline markup in a heading, such as
+`## Tax **Abatement**`, does not match as a phrase. It does not use BM25,
+vector search, or the reranker. Stopwords, punctuation, quotes, `%`, and `_`
+match literally. Each run of whitespace, such as a line break, a tab, repeated
+spaces, or a non-breaking space, counts as one space in the query and in the
+chunk text. A phrase that wraps across a hard line break therefore matches.
+Hits rank by occurrence count, and `score` is that count.
+The query must hold 1 to 512 characters and must not be only whitespace.
+The `limit`, `chunks_per_file`, `top_files`, and 10,000-match scan cap can
+restrict results. A `phrase-truncated` warning reports these limits. Do not
+conclude absence or uniqueness from a truncated result.
+
+Plain-text, JSON, and PDF chunks repeat about 12 percent of the chunk budget from the
+previous chunk. A short phrase across a split point is then whole in one
+chunk. Phrase mode counts each occurrence once, in the first chunk that holds
+it.
+
+Set `group_by: "page"` to return one entry for each PDF page (`page:N`
+breadcrumb). The entry is the best chunk of the page, and `chunk_count` gives
+the number of matched chunks on that page. `chunks_per_file` then caps pages.
+Chunks without a page breadcrumb stay single entries.
+
+Set `output: "counts"` with `match: "phrase"` to get coverage counts.
+Each matched file carries `coverage: {chunks, pages}` and no chunks, snippets,
+summary, or keywords. `pages` is `null` for a file without page breadcrumbs.
+Counts ignore `top_files`, `chunks_per_file`, and `limit`. The 10,000-match scan
+cap applies. A counts response lists at most 2,000 files and adds a
+`counts-truncated` warning when more files match. A response over the IPC frame
+limit returns an error. `output: "counts"` with `match: "ranked"` is rejected.
 
 ### `add_markdown`
 
@@ -97,6 +141,26 @@ Corpus-relative paths of every page that links to the given page via a
 path, backlinks }`; `content` is a newline-joined list of backlink paths, or a
 message noting there are none. Use this to find which pages reference a page
 before renaming or deleting it.
+
+## Migrating from the startup-cwd contract
+
+Pass the active checkout as `cwd` on every request, including `list_corpora`:
+
+```json
+{"name":"list_corpora","arguments":{"cwd":"/workspaces/project"}}
+{"name":"ground","arguments":{"cwd":"/workspaces/project","query":"release process"}}
+```
+
+Use corpus-relative document paths. Resolve each `globs` pattern from every
+configured corpus root, not from the daemon startup directory or the filesystem
+root:
+
+```toml
+[[corpus]]
+name = "docs"
+paths = ["/workspaces/project/docs"]
+globs = ["guides/**/*.md"]
+```
 
 ## Conventions for LLM authors
 

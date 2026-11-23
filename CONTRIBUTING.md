@@ -24,6 +24,26 @@ cd hallouminate
 just verify cargo build --locked --all-targets
 ```
 
+## Optional local compiler caching
+
+Install `sccache` if you want local compiler caching:
+
+```sh
+brew install sccache
+```
+
+`just verify` detects `sccache` on `PATH` and uses its absolute path for
+leased Cargo commands. It sets `CARGO_INCREMENTAL=0` only when it enables this
+automatic cache. Run `sccache --show-stats` to inspect cache activity.
+
+Set `RUSTC_WRAPPER=` to opt out. Any explicit Rust wrapper variable or
+`CARGO_INCREMENTAL=1` also disables automatic setup. Direct `cargo` commands
+remain unchanged. Wrappers configured only in Cargo config are not visible to
+this check; export the wrapper variable to preserve one, or opt out explicitly.
+By default, `just verify` uses the toolchain selected by
+`rust-toolchain.toml`. PATH or `RUSTUP_TOOLCHAIN` overrides can select another
+toolchain and change cache keys.
+
 ## Running tests
 
 Run the full local gate before opening a PR:
@@ -43,6 +63,28 @@ The lease prevents duplicate heavy work for this repository only; host-wide
 admission and resource isolation belong to the execution environment. See
 [Development verification](./site/src/content/docs/development-verification.md) for the
 lease, evidence log, compatibility routes, and fix mode.
+
+### Python behavior tests
+
+Install Python 3.12 or newer and uv 0.13.0 for the BDD suite.
+
+```sh
+just bdd
+```
+
+This command builds the CLI once under the verification lease.
+It downloads the tokenizer before workers start.
+It then collects scenarios and runs them serially and with two workers.
+
+Use `just bdd -k publish` to select scenarios.
+Use `just bdd-check` when the binary and tokenizer are already available.
+CI runs `just bdd-check` after its existing build and tokenizer warm-up.
+
+Each scenario uses isolated configuration, storage, files, and a Unix socket.
+Workers use the shared tokenizer cache offline.
+Fixtures never build the application or use the developer's daemon.
+
+See [BDD coverage and fixture rules](./tests/bdd/README.md).
 
 ## Submitting a pull request
 

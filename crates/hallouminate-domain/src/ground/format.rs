@@ -4,7 +4,7 @@
 
 use std::fmt::Write as _;
 
-use crate::ground::types::{DocFile, GroundResponse};
+use crate::ground::types::{DocFile, FileCoverage, GroundResponse};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Format {
@@ -94,6 +94,9 @@ fn render_outline(response: &GroundResponse, strip_prefix: Option<&str>) -> Stri
     }
 
     writeln!(buf).expect("blank");
+    for warning in &response.warnings {
+        writeln!(buf, "warning [{}]: {}", warning.code, warning.message).expect("warning");
+    }
     // Render in relevance order (score desc, path asc tiebreak) — `docs` is a
     // `BTreeMap` keyed by path for O(log n) lookup, so its iteration order is
     // alphabetical and must not be used directly for display.
@@ -109,10 +112,6 @@ fn render_outline(response: &GroundResponse, strip_prefix: Option<&str>) -> Stri
         write_doc_block(&mut buf, path, doc, strip_prefix);
     }
 
-    for warning in &response.warnings {
-        writeln!(buf, "warning [{}]: {}", warning.code, warning.message).expect("warning");
-    }
-
     buf
 }
 
@@ -121,6 +120,20 @@ fn write_doc_block(buf: &mut String, path: &str, doc: &DocFile, strip_prefix: Op
         Some(p) if path.starts_with(p) => path.trim_start_matches(p).to_string(),
         _ => path.to_string(),
     };
+    if let Some(FileCoverage { chunks, pages }) = doc.coverage {
+        write!(
+            buf,
+            "{display_path}  ({score:.3})  {chunks} matched chunks",
+            score = doc.score,
+        )
+        .expect("counts line");
+        match pages {
+            Some(pages) => writeln!(buf, " on {pages} pages"),
+            None => writeln!(buf),
+        }
+        .expect("counts line end");
+        return;
+    }
     writeln!(buf, "{display_path}  ({score:.3})", score = doc.score,).expect("doc header");
     if let Some(z) = doc.z_score {
         writeln!(buf, "  z={z:.3}").expect("doc z_score");
@@ -134,9 +147,13 @@ fn write_doc_block(buf: &mut String, path: &str, doc: &DocFile, strip_prefix: Op
             Some(z) => format!("  z={z:.3}"),
             None => String::new(),
         };
+        let count_suffix = match chunk.chunk_count {
+            Some(count) => format!("  chunks={count}"),
+            None => String::new(),
+        };
         writeln!(
             buf,
-            "  L{start}-{end}  {heading}  ({score:.3}){z_suffix}",
+            "  L{start}-{end}  {heading}  ({score:.3}){z_suffix}{count_suffix}",
             start = chunk.line_range[0],
             end = chunk.line_range[1],
             score = chunk.score,
@@ -179,6 +196,7 @@ mod tests {
                             corpus: "cheese".into(),
                             ..Default::default()
                         },
+                        chunk_count: None,
                     },
                     DocChunk {
                         chunk_id: "def456".into(),
@@ -191,8 +209,10 @@ mod tests {
                             corpus: "cheese".into(),
                             ..Default::default()
                         },
+                        chunk_count: None,
                     },
                 ],
+                coverage: None,
             },
         );
         GroundResponse {
@@ -209,27 +229,17 @@ mod tests {
     fn outline_format_renders_header_path_and_chunks() {
         let response = fixture();
         let out = render(&response, Format::Outline, &RenderOpts::default());
-
-        assert!(out.starts_with("planner cognition  48ms  50 hits\n"));
-        assert!(
-            out.contains("/home/u/.cheese/research/cheese-flow/INDEX.md  (0.873)"),
-            "full path with score: {out}"
-        );
-        assert!(
-            out.contains("  Planner Cognition Research\n"),
-            "summary indented two spaces: {out}"
-        );
-        assert!(
-            out.contains("  L26-28  Planner Cognition Research  (0.910)"),
-            "chunk heading line: {out}"
-        );
-        assert!(
-            out.contains("    Three research rounds on planning LLMs handling code."),
-            "snippet indented four spaces: {out}"
-        );
-        assert!(
-            out.contains("  L44-52  Planner Cognition Research > Open Gaps  (0.840)"),
-            "joined heading path: {out}"
+        assert_eq!(
+            out,
+            concat!(
+                "planner cognition  48ms  50 hits\n\n",
+                "/home/u/.cheese/research/cheese-flow/INDEX.md  (0.873)\n",
+                "  Planner Cognition Research\n",
+                "  L26-28  Planner Cognition Research  (0.910)\n",
+                "    Three research rounds on planning LLMs handling code.\n",
+                "  L44-52  Planner Cognition Research > Open Gaps  (0.840)\n",
+                "    Signature-graph planning is unexplored in detail.\n\n",
+            )
         );
     }
 
@@ -328,17 +338,89 @@ mod tests {
     }
 
     #[test]
-    fn outline_renders_warnings_after_doc_blocks() {
+    fn outline_renders_warnings_before_doc_blocks() {
+        let mut response = fixture();
+        response.warnings = vec![
+            Warning {
+                code: "code-repos-empty".into(),
+                message: "no [[code_repo]] configured".into(),
+            },
+            Warning {
+                code: "index-coverage".into(),
+                message: "/home/u/.cheese/research/wiki has no indexed files".into(),
+            },
+        ];
+        for doc in response.docs.values_mut() {
+            for chunk in &mut doc.chunks {
+                chunk.snippet = "Long document snippet. ".repeat(100);
+            }
+        }
+        let doc = response
+            .docs
+            .values()
+            .next()
+            .expect("fixture document")
+            .clone();
+        response
+            .docs
+            .insert("/home/u/.cheese/research/second.md".into(), doc);
+        let expected = concat!(
+            "planner cognition  48ms  50 hits\n\n",
+            "warning [code-repos-empty]: no [[code_repo]] configured\n",
+            "warning [index-coverage]: /home/u/.cheese/research/wiki has no indexed files\n",
+        );
+        for snippet_chars in [None, Some(0), Some(20)] {
+            for path_prefix_strip in [None, Some("/home/u/.cheese/research/".into())] {
+                let opts = RenderOpts {
+                    snippet_chars,
+                    path_prefix_strip,
+                };
+                let out = render(&response, Format::Outline, &opts);
+                assert!(out.starts_with(expected), "warnings follow header: {out}");
+                for warning in &response.warnings {
+                    let line = format!("warning [{}]: {}\n", warning.code, warning.message);
+                    assert_eq!(out.matches(&line).count(), 1, "one warning line");
+                    let warning_position = out.find(&line).expect("warning line");
+                    for path in response.docs.keys() {
+                        let path = match &opts.path_prefix_strip {
+                            Some(prefix) => path.strip_prefix(prefix).expect("fixture prefix"),
+                            None => path.as_str(),
+                        };
+                        let document_position =
+                            out.find(&format!("{path}  (")).expect("document header");
+                        assert!(
+                            warning_position < document_position,
+                            "warning precedes document"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn outline_rendering_preserves_structured_response_and_json() {
         let mut response = fixture();
         response.warnings.push(Warning {
             code: "code-repos-empty".into(),
             message: "no [[code_repo]] configured".into(),
         });
-        let out = render(&response, Format::Outline, &RenderOpts::default());
-        assert!(
-            out.contains("warning [code-repos-empty]: no [[code_repo]] configured"),
-            "warning line: {out}"
+        let expected = serde_json::to_value(&response).expect("response value");
+        let opts = RenderOpts {
+            path_prefix_strip: Some("/home/u/.cheese/research/".into()),
+            ..Default::default()
+        };
+        let outline = render(&response, Format::Outline, &opts);
+        assert!(outline.contains("warning [code-repos-empty]: no [[code_repo]] configured"));
+        assert_eq!(
+            serde_json::to_value(&response).expect("response value"),
+            expected
         );
+        for format in [Format::Json, Format::JsonPretty] {
+            let out = render(&response, format, &opts);
+            let actual: serde_json::Value = serde_json::from_str(&out).expect("parse json");
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -370,9 +452,9 @@ mod tests {
             }],
         };
         let out = render(&response, Format::Outline, &RenderOpts::default());
-        assert!(
-            out.contains("warning [code-repos-empty]: no [[code_repo]] configured"),
-            "warnings must render even when docs is empty: {out:?}"
+        assert_eq!(
+            out,
+            "no hits  5ms  0 hits\n\nwarning [code-repos-empty]: no [[code_repo]] configured\n"
         );
     }
 
@@ -438,6 +520,44 @@ mod tests {
     }
 
     #[test]
+    fn outline_renders_coverage_and_page_chunk_counts_only_when_set() {
+        let plain = render(&fixture(), Format::Outline, &RenderOpts::default());
+        assert!(!plain.contains("matched chunks"), "{plain}");
+        assert!(!plain.contains("chunks="), "{plain}");
+
+        let mut paged = fixture();
+        for doc in paged.docs.values_mut() {
+            doc.chunks[0].chunk_count = Some(4);
+        }
+        let out = render(&paged, Format::Outline, &RenderOpts::default());
+        assert!(out.contains("(0.910)  chunks=4"), "{out}");
+
+        let mut counted = fixture();
+        for doc in counted.docs.values_mut() {
+            doc.chunks.clear();
+            doc.coverage = Some(crate::ground::types::FileCoverage {
+                chunks: 48,
+                pages: Some(20),
+            });
+        }
+        let out = render(&counted, Format::Outline, &RenderOpts::default());
+        assert!(out.contains("  48 matched chunks on 20 pages"), "{out}");
+
+        for doc in counted.docs.values_mut() {
+            doc.coverage = Some(crate::ground::types::FileCoverage {
+                chunks: 2,
+                pages: None,
+            });
+        }
+        let out = render(&counted, Format::Outline, &RenderOpts::default());
+        assert!(out.contains("  2 matched chunks\n"), "{out}");
+        assert!(
+            !out.contains("Planner Cognition Research"),
+            "a counts doc is one line without the summary: {out}"
+        );
+    }
+
+    #[test]
     fn outline_orders_docs_by_score_not_path() {
         // Regression: `docs` is a `BTreeMap` keyed by absolute path, so
         // iterating it directly yields alphabetical order. A higher-scored
@@ -456,6 +576,7 @@ mod tests {
                 path: None,
                 stale: false,
                 chunks: vec![],
+                coverage: None,
             },
         );
         docs.insert(
@@ -470,6 +591,7 @@ mod tests {
                 path: None,
                 stale: false,
                 chunks: vec![],
+                coverage: None,
             },
         );
         let response = GroundResponse {

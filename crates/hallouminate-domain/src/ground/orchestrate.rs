@@ -1,36 +1,48 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
 use futures_util::{StreamExt, TryStreamExt};
 
 use crate::common::{CorpusConfig, CorpusKey, HallouminateError, Result};
+use crate::corpus::{ScannedFile, scan};
+use crate::footnotes::FootnoteMode;
 use crate::indexer::SearchHit;
-use crate::search::{ChunkRetrieval, Crossencoder, FusedSearch, search_fused};
+use crate::search::RootIndex;
+use crate::search::phrase::search_phrase_in;
+use crate::search::{
+    ChunkRetrieval, Crossencoder, FusedSearch, MAX_PHRASE_SCAN_ROWS, RootSignals, fuse_roots,
+    gather_signals, lexical_fallback_search, rank_after,
+};
 
-use super::bucket::{build_docs, normalize_scores};
-use super::types::{DocFile, GroundResponse, Stats, Warning};
+use super::bucket::{Rollup, normalize_scores, roll_up};
+use super::inventory::{
+    IndexedFiles, Inventory, RootInventory, assemble_inventory, list_root_indexes,
+};
+use super::types::{
+    DocFile, GroundGroupBy, GroundMatch, GroundOutput, GroundResponse, Stats, Warning,
+};
+use super::warning_codes;
 
-/// Run `crossencoder.rerank(query, &mut hits)` on a blocking-pool thread and
-/// bound it with `timeout`. `Crossencoder::rerank` is synchronous CPU-bound
-/// work with no `.await`, so wrapping `tokio::time::timeout` directly around
-/// it cannot preempt a stalled call (#139) — only a real OS-thread boundary
-/// can. `spawn_blocking` gives us that boundary; on timeout the spawned
-/// thread is abandoned (left to finish or die on its own, never joined) and
-/// `hits` (cloned up front) is returned unchanged so the caller falls back
-/// to fusion order. Returns `(hits, applied)`; `applied` is `false` on
-/// timeout so callers gate z-score normalization on it, preserving the
-/// "z-score only when the cross-encoder ran" invariant on the fallback path.
-/// The abandoned thread still owns the boxed crossencoder (on the daemon
-/// path, a `CrossencoderGuard` holding the shared crossencoder mutex), so
-/// that mutex stays locked until the stalled call drains — concurrent rerank
-/// requests serialize behind it, exactly as they did before the timeout
-/// existed (#139 accepted tradeoff).
+/// Maximum number of files a counts response lists. Counts output has no
+/// `top_files` cap, so this bound keeps the response inside the IPC frame.
+pub const MAX_COUNTS_FILES: usize = 2_000;
+
+/// Why one bounded crossencoder attempt kept fusion order.
+#[derive(Debug, PartialEq, Eq)]
+enum RerankFallback {
+    Timeout,
+    Unavailable,
+}
+
+/// Run reranking on a blocking-pool thread within `timeout`.
+/// Construction, admission, and native execution share this deadline.
+/// Returns the hits plus `Some(reason)` when fusion order was kept.
 async fn rerank_with_timeout(
     mut crossencoder: Box<dyn Crossencoder>,
     query: String,
     hits: Vec<SearchHit>,
     timeout: Duration,
-) -> Result<(Vec<SearchHit>, bool)> {
+) -> (Vec<SearchHit>, Option<RerankFallback>) {
     let fallback = hits.clone();
     let query_len = query.len();
     let handle = tokio::task::spawn_blocking(move || {
@@ -38,19 +50,27 @@ async fn rerank_with_timeout(
         crossencoder.rerank(&query, &mut hits)?;
         Ok::<Vec<SearchHit>, HallouminateError>(hits)
     });
-    match tokio::time::timeout(timeout, handle).await {
-        Ok(Ok(Ok(reranked))) => Ok((reranked, true)),
-        Ok(Ok(Err(e))) => Err(e),
+    let reason = match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(Ok(reranked))) => return (reranked, None),
+        Ok(Ok(Err(error))) => {
+            tracing::warn!(
+                error = %error,
+                "crossencoder rerank unavailable; falling back to fusion order",
+            );
+            RerankFallback::Unavailable
+        }
         Ok(Err(join_err)) => {
             let cause = if join_err.is_panic() {
                 "panicked"
             } else {
                 "was cancelled"
             };
-            tracing::error!(error = %join_err, cause, "crossencoder task failed");
-            Err(HallouminateError::Embed(format!(
-                "crossencoder task {cause}: {join_err}"
-            )))
+            tracing::warn!(
+                error = %join_err,
+                cause,
+                "crossencoder task failed; falling back to fusion order",
+            );
+            RerankFallback::Unavailable
         }
         Err(_elapsed) => {
             tracing::warn!(
@@ -58,9 +78,10 @@ async fn rerank_with_timeout(
                 query_len,
                 "crossencoder rerank timed out; falling back to fusion order"
             );
-            Ok((fallback, false))
+            RerankFallback::Timeout
         }
-    }
+    };
+    (fallback, Some(reason))
 }
 /// Strip the first matching corpus root prefix from `abs_path`, returning
 /// a corpus-relative path string accepted by `safe_relative_path`.
@@ -95,6 +116,17 @@ pub struct GroundOpts {
     /// real OS-thread boundary (not a bare `tokio::time::timeout`) is
     /// required to preempt the synchronous crossencoder.
     pub rerank_timeout: Duration,
+    pub footnote_mode: FootnoteMode,
+    /// Retrieval mode. [`GroundMatch::Phrase`] skips fusion and reranking.
+    pub match_mode: GroundMatch,
+    /// Unit returned within each file. [`GroundGroupBy::Page`] returns one
+    /// entry per PDF page, and `chunks_per_file` then caps pages.
+    pub group_by: GroundGroupBy,
+    /// Response shape. [`GroundOutput::Counts`] ignores `top_files`,
+    /// `chunks_per_file`, and `limit`, lists at most [`MAX_COUNTS_FILES`]
+    /// files with a `counts-truncated` warning, and needs
+    /// [`GroundMatch::Phrase`].
+    pub output: GroundOutput,
 }
 
 impl Default for GroundOpts {
@@ -104,7 +136,57 @@ impl Default for GroundOpts {
             chunks_per_file: 3,
             limit: 50,
             rerank_timeout: Duration::from_secs(2),
+            footnote_mode: FootnoteMode::Include,
+            match_mode: GroundMatch::Ranked,
+            group_by: GroundGroupBy::Chunk,
+            output: GroundOutput::Hits,
         }
+    }
+}
+
+/// Reason a `ground` request shape is rejected before retrieval.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::{GroundMatch, GroundOutput, GroundShapeError, validate_shape};
+/// let error = validate_shape(GroundMatch::Ranked, GroundOutput::Counts).unwrap_err();
+/// assert_eq!(error, GroundShapeError::CountsNeedPhrase);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GroundShapeError {
+    /// Counts need every match, and only phrase mode retrieves every match.
+    #[error(
+        "output \"counts\" requires match \"phrase\"; ranked retrieval returns a bounded candidate pool, so its counts are not complete"
+    )]
+    CountsNeedPhrase,
+}
+
+/// Checks that `output` is valid for `match_mode`.
+///
+/// # Examples
+///
+/// ```
+/// use hallouminate_domain::ground::{GroundMatch, GroundOutput, GroundShapeError, validate_shape};
+/// assert_eq!(validate_shape(GroundMatch::Phrase, GroundOutput::Counts), Ok(()));
+/// assert_eq!(
+///     validate_shape(GroundMatch::Ranked, GroundOutput::Counts),
+///     Err(GroundShapeError::CountsNeedPhrase)
+/// );
+/// ```
+///
+/// # Errors
+///
+/// Returns [`GroundShapeError::CountsNeedPhrase`] for counts output in
+/// ranked mode.
+pub fn validate_shape(
+    match_mode: GroundMatch,
+    output: GroundOutput,
+) -> std::result::Result<(), GroundShapeError> {
+    match (match_mode, output) {
+        (GroundMatch::Ranked, GroundOutput::Counts) => Err(GroundShapeError::CountsNeedPhrase),
+        (GroundMatch::Ranked | GroundMatch::Phrase, GroundOutput::Hits)
+        | (GroundMatch::Phrase, GroundOutput::Counts) => Ok(()),
     }
 }
 
@@ -126,16 +208,133 @@ pub async fn ground(
     .await
 }
 
-/// Searches one root-aware corpus identity, returning its un-reranked hits
-/// plus any warnings raised while assembling them.
-async fn search_corpus(
+/// One corpus root's search result: the unfused signal lists plus the
+/// lexical fallback hits, which stay out of the rerank pool and rank after
+/// every fused hit.
+struct CorpusSearch {
+    signals: RootSignals,
+    fallback: Vec<SearchHit>,
+}
+
+/// Lists each root's indexed files once, then scans each corpus once.
+///
+/// The scan applies the include, exclude, gitignore, and nested-root rules,
+/// so the fallback admits only files the indexer would index. A corpus that
+/// cannot be scanned adds no eligible files. A corpus whose store cannot
+/// list its indexed files is not scanned, because it gets no fallback.
+async fn scan_inventory(corpora: &[CorpusConfig], store: &dyn ChunkRetrieval) -> Inventory {
+    let mut listed: Vec<(&CorpusConfig, Vec<(CorpusKey, IndexedFiles)>)> =
+        Vec::with_capacity(corpora.len());
+    for corpus in corpora {
+        listed.push((corpus, list_root_indexes(corpus, store).await));
+    }
+    let mut scans = Vec::new();
+    for (corpus, roots) in &listed {
+        let mut has_known_root = false;
+        for (_, indexed) in roots {
+            match indexed {
+                IndexedFiles::Known(_) => has_known_root = true,
+                IndexedFiles::Unknown | IndexedFiles::ListingFailed(_) => {}
+            }
+        }
+        if !has_known_root {
+            continue;
+        }
+        let corpus = (*corpus).clone();
+        scans.push(async move {
+            let scanned = tokio::task::spawn_blocking(move || scan(&corpus)).await;
+            match scanned {
+                Ok(Ok(files)) => files,
+                Ok(Err(error)) => {
+                    tracing::debug!(err = %error, "lexical fallback skipped: corpus scan failed");
+                    Vec::new()
+                }
+                Err(error) => {
+                    tracing::warn!(err = %error, "lexical fallback skipped: corpus scan task failed");
+                    Vec::new()
+                }
+            }
+        });
+    }
+    let scanned: Vec<Vec<ScannedFile>> = futures_util::stream::iter(scans)
+        .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+        .collect()
+        .await;
+    let mut files = Vec::new();
+    for corpus_files in scanned {
+        files.extend(corpus_files);
+    }
+    let mut roots = Vec::new();
+    for (_, corpus_roots) in listed {
+        roots.extend(corpus_roots);
+    }
+    let mut inventory = Inventory::new();
+    inventory.extend(assemble_inventory(roots, &files));
+    inventory
+}
+
+/// Searches one root: the signal lists, then the lexical fallback over the
+/// root's unindexed files. A failed indexed-file listing degrades to no
+/// fallback plus a `lexical-fallback-failed` warning.
+async fn search_root_ranked(
     query: &str,
+    corpus: &CorpusConfig,
     corpus_key: &CorpusKey,
     store: &dyn ChunkRetrieval,
-    globs: &[String],
     limit: usize,
-) -> Result<FusedSearch> {
-    search_fused(store, corpus_key, query, globs, limit).await
+    root: RootInventory,
+) -> Result<CorpusSearch> {
+    let RootInventory { eligible, indexed } = root;
+    let mut listing_warning = None;
+    let (indexed, handle) = match &indexed {
+        IndexedFiles::Known(RootIndex { files, handle }) => (Some(files.as_ref()), handle.as_ref()),
+        IndexedFiles::Unknown => (None, None),
+        IndexedFiles::ListingFailed(reason) => {
+            tracing::warn!(err = %reason, "lexical fallback skipped: indexed file listing failed");
+            listing_warning = Some(Warning {
+                code: warning_codes::LEXICAL_FALLBACK_FAILED.to_string(),
+                message: format!(
+                    "could not list indexed files in corpus root {} ({reason}); skipping the lexical fallback",
+                    corpus_key.canonical_root.display()
+                ),
+            });
+            (None, None)
+        }
+    };
+    let mut signals = gather_signals(
+        store,
+        corpus_key,
+        query,
+        &corpus.globs,
+        limit,
+        indexed,
+        handle,
+    )
+    .await?;
+    signals.warnings.extend(listing_warning);
+    let lexical = lexical_fallback_search(corpus_key, query, &eligible, indexed, limit).await;
+    if let Some(unpooled) = &signals.unpooled_files {
+        let mut covered = HashSet::new();
+        for hit in &lexical.hits {
+            covered.insert(hit.file_ref.as_str());
+        }
+        let mut resolved = true;
+        for file in unpooled {
+            if !covered.contains(file.as_str()) {
+                resolved = false;
+            }
+        }
+        if resolved {
+            signals
+                .warnings
+                .retain(|warning| warning.code != "ripgrep-unresolved");
+        }
+    }
+    signals.warnings.extend(lexical.warnings);
+    Ok(CorpusSearch {
+        signals,
+        fallback: lexical.hits,
+    })
 }
 
 /// Cap on concurrent per-root searches fanned out by `ground_union`. Each
@@ -165,14 +364,22 @@ fn rollup_order(
         .then_with(|| a.0.cmp(&b.0))
 }
 
-/// Fans one query across every effective corpus root and globally reranks it.
+/// Fans one query across every effective corpus root and ranks the roots'
+/// signals as one fusion, so a root's best chunk outranks another root's
+/// chunks only on the evidence.
 ///
 /// `priority_corpus`, when `Some`, names the corpus whose docs get ranking
 /// priority in the final `top_files` rollup (#425): equal-score ties favor
 /// it, and up to `RESERVED_LOCAL_SLOTS` of its docs survive the cut even when
-/// their global score falls outside it. `None` (the single-corpus `ground`
-/// wrapper, and an above-all-repos union ground) leaves ranking exactly as
-/// before — pure global score order.
+/// their global score falls outside it. Counts output applies the same
+/// reserve to its `MAX_COUNTS_FILES` cut and ranks files by matched chunks.
+/// `None` (the single-corpus `ground` wrapper, and an above-all-repos union
+/// ground) leaves ranking exactly as before.
+///
+/// # Errors
+///
+/// Returns an error when the request shape is invalid (see
+/// [`validate_shape`]) or when retrieval or rollup fails.
 pub async fn ground_union(
     query: &str,
     corpora: &[CorpusConfig],
@@ -181,70 +388,159 @@ pub async fn ground_union(
     opts: GroundOpts,
     priority_corpus: Option<&str>,
 ) -> Result<GroundResponse> {
-    let started = Instant::now();
-    let corpus_keys: Vec<(CorpusKey, &[String])> = corpora
-        .iter()
-        .flat_map(|c| {
-            c.corpus_keys()
-                .into_iter()
-                .map(move |k| (k, c.globs.as_slice()))
-        })
-        .collect();
-    // Collected eagerly: a lazy `Map` iterator would bake the closure into
-    // the stream's type, and that closure is not general enough over the
-    // borrow's lifetime once this future is spawned (the daemon spawns it),
-    // so inference fails at the far-away spawn site. Futures are inert until
-    // polled, so building them up front costs nothing and `buffered` still
-    // polls at most MAX_CONCURRENT_CORPUS_SEARCHES of them at a time.
-    let searches: Vec<_> = corpus_keys
-        .iter()
-        .map(|(corpus_key, globs)| search_corpus(query, corpus_key, store, globs, opts.limit))
-        .collect();
-    // `buffered` (not `buffer_unordered`) preserves per-root result order,
-    // which callers rely on for warning ordering; it still propagates the
-    // first `Err` like `try_join_all` did.
-    let search_results: Vec<FusedSearch> = futures_util::stream::iter(searches)
-        .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
-        .try_collect()
-        .await?;
-    let mut hits: Vec<SearchHit> = Vec::new();
-    let mut warnings = Vec::new();
-    for result in search_results {
-        hits.extend(result.hits);
-        warnings.extend(result.warnings);
-    }
-    let stats = Stats { hits: hits.len() };
+    let inventory = match opts.match_mode {
+        GroundMatch::Ranked => scan_inventory(corpora, store).await,
+        GroundMatch::Phrase => Inventory::new(),
+    };
+    ground_union_inventoried(
+        query,
+        corpora,
+        store,
+        crossencoder,
+        opts,
+        priority_corpus,
+        &inventory,
+    )
+    .await
+}
 
+/// [`ground_union`] with each root's eligible and indexed file sets supplied
+/// by the caller, so the caller walks and lists each root once per request.
+///
+/// A root missing from `inventory` gets no lexical fallback.
+///
+/// # Errors
+///
+/// Returns an error when the request shape is invalid (see
+/// [`validate_shape`]) or when retrieval or rollup fails.
+pub async fn ground_union_inventoried(
+    query: &str,
+    corpora: &[CorpusConfig],
+    store: &dyn ChunkRetrieval,
+    crossencoder: Option<Box<dyn Crossencoder>>,
+    opts: GroundOpts,
+    priority_corpus: Option<&str>,
+    inventory: &Inventory,
+) -> Result<GroundResponse> {
+    validate_shape(opts.match_mode, opts.output)
+        .map_err(|error| HallouminateError::Search(error.to_string()))?;
+    let started = Instant::now();
+    let limit = match opts.output {
+        GroundOutput::Hits => opts.limit,
+        GroundOutput::Counts => MAX_PHRASE_SCAN_ROWS,
+    };
+    let mut corpus_keys: Vec<(CorpusKey, &CorpusConfig)> = Vec::new();
+    for corpus in corpora {
+        for corpus_key in corpus.corpus_keys() {
+            corpus_keys.push((corpus_key, corpus));
+        }
+    }
+    let mut warnings = Vec::new();
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut fallback_hits: Vec<SearchHit> = Vec::new();
+    let mut fallback_files: BTreeSet<(CorpusKey, String)> = BTreeSet::new();
+    // The futures are collected eagerly because a lazy `Map` stream infers a
+    // closure type that is not general enough once the daemon spawns this
+    // future. `buffered` keeps per-root order, which warning order relies on.
+    match opts.match_mode {
+        GroundMatch::Ranked => {
+            let mut searches = Vec::with_capacity(corpus_keys.len());
+            for (corpus_key, corpus) in &corpus_keys {
+                let root = inventory.get(corpus_key).cloned().unwrap_or_default();
+                searches.push(search_root_ranked(
+                    query, corpus, corpus_key, store, limit, root,
+                ));
+            }
+            let searched: Vec<CorpusSearch> = futures_util::stream::iter(searches)
+                .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+                .try_collect()
+                .await?;
+            let mut roots = Vec::with_capacity(searched.len());
+            for CorpusSearch {
+                mut signals,
+                fallback,
+            } in searched
+            {
+                warnings.append(&mut signals.warnings);
+                for hit in &fallback {
+                    fallback_files.insert((hit.corpus_key.clone(), hit.file_ref.clone()));
+                }
+                fallback_hits.extend(fallback);
+                roots.push(signals);
+            }
+            hits = fuse_roots(roots, query, priority_corpus);
+        }
+        GroundMatch::Phrase => {
+            let mut searches = Vec::with_capacity(corpus_keys.len());
+            for (corpus_key, _) in &corpus_keys {
+                let handle = inventory.get(corpus_key).and_then(RootInventory::handle);
+                searches.push(search_phrase_in(store, corpus_key, query, limit, handle));
+            }
+            let phrased: Vec<FusedSearch> = futures_util::stream::iter(searches)
+                .buffered(MAX_CONCURRENT_CORPUS_SEARCHES)
+                .try_collect()
+                .await?;
+            for fused in phrased {
+                hits.extend(fused.hits);
+                warnings.extend(fused.warnings);
+            }
+        }
+    }
+    let stats = Stats {
+        hits: hits.len() + fallback_hits.len(),
+    };
+
+    let crossencoder = match opts.match_mode {
+        GroundMatch::Ranked => crossencoder,
+        GroundMatch::Phrase => None,
+    };
     if let Some(rerank) = crossencoder
         && !hits.is_empty()
     {
-        let (reranked, applied) =
-            rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await?;
+        let (reranked, fallback) =
+            rerank_with_timeout(rerank, query.to_string(), hits, opts.rerank_timeout).await;
         hits = reranked;
-        if applied {
-            let z_scores = normalize_scores(&hits);
-            for (hit, z_score) in hits.iter_mut().zip(z_scores) {
-                hit.z_score = z_score;
+        match fallback {
+            None => {
+                let z_scores = normalize_scores(&hits);
+                for (hit, z_score) in hits.iter_mut().zip(z_scores) {
+                    hit.z_score = z_score;
+                }
             }
-        } else {
-            warnings.push(Warning {
-                code: "rerank-timeout".to_string(),
+            Some(RerankFallback::Timeout) => warnings.push(Warning {
+                code: warning_codes::RERANK_TIMEOUT.to_string(),
                 message: format!(
                     "crossencoder rerank timed out after {} ms; falling back to fusion order",
                     opts.rerank_timeout.as_millis()
                 ),
-            });
+            }),
+            Some(RerankFallback::Unavailable) => warnings.push(Warning {
+                code: warning_codes::CROSSENCODER_UNAVAILABLE.to_string(),
+                message: "crossencoder rerank unavailable; falling back to fusion order"
+                    .to_string(),
+            }),
         }
     }
+
+    rank_after(&mut fallback_hits, &hits);
+    hits.extend(fallback_hits);
 
     let mut by_key: BTreeMap<CorpusKey, Vec<SearchHit>> = BTreeMap::new();
     for hit in hits {
         by_key.entry(hit.corpus_key.clone()).or_default().push(hit);
     }
 
+    let rollup = Rollup {
+        chunks_per_file: opts.chunks_per_file,
+        footnote_mode: opts.footnote_mode,
+        match_mode: opts.match_mode,
+        group_by: opts.group_by,
+        output: opts.output,
+    };
     let mut docs: BTreeMap<String, DocFile> = BTreeMap::new();
+    let mut fallback_docs: HashSet<String> = HashSet::new();
     for (corpus_key, corpus_hits) in by_key {
-        let mut built = build_docs(&corpus_hits, usize::MAX, opts.chunks_per_file)?;
+        let mut built = roll_up(&corpus_hits, usize::MAX, rollup)?;
         let root = corpus_key.canonical_root.to_string_lossy().into_owned();
         for (absolute_path, doc) in built.iter_mut() {
             doc.corpus = corpus_key.name.clone();
@@ -254,59 +550,71 @@ pub async fn ground_union(
             }
         }
         for (path, doc) in built {
+            let is_fallback = fallback_files.contains(&(corpus_key.clone(), path.clone()));
             let doc_key = if docs.contains_key(&path) {
                 format!("{path} [{}]", corpus_key.name)
             } else {
                 path
             };
+            if is_fallback {
+                fallback_docs.insert(doc_key.clone());
+            }
             docs.insert(doc_key, doc);
         }
     }
 
-    // Repo-local docs (matching `priority_corpus`) get a guaranteed foothold
-    // in the final `top_files` cut even when their global score falls
-    // outside it, so a few high-scoring neighbor-corpus hits can't fully
-    // crowd out the searcher's own repo (#425).
-    const RESERVED_LOCAL_SLOTS: usize = 2;
-
-    if docs.len() > opts.top_files {
-        let mut ranked: Vec<(String, DocFile)> = docs.into_iter().collect();
-        ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
-
-        let mut swapped = false;
-        if let Some(priority) = priority_corpus {
-            let kept_locals = ranked[..opts.top_files]
-                .iter()
-                .filter(|(_, d)| d.corpus == priority)
-                .count();
-            let missing = RESERVED_LOCAL_SLOTS.saturating_sub(kept_locals);
-            if missing > 0 {
-                let promote: Vec<usize> = (opts.top_files..ranked.len())
-                    .filter(|&i| ranked[i].1.corpus == priority)
-                    .take(missing)
-                    .collect();
-                // Evict the lowest-ranked non-priority docs in the kept
-                // window; the zip truncates to however many of those exist,
-                // so promotion can never over-fill the window.
-                let evict: Vec<usize> = (0..opts.top_files)
-                    .rev()
-                    .filter(|&i| ranked[i].1.corpus != priority)
-                    .take(promote.len())
-                    .collect();
-                for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
-                    ranked.swap(evict_idx, promote_idx);
-                    swapped = true;
-                }
+    match opts.output {
+        GroundOutput::Hits => {
+            if docs.len() > opts.top_files {
+                docs = cut_with_local_reserve(
+                    docs,
+                    opts.top_files,
+                    priority_corpus,
+                    &fallback_docs,
+                    |a, b| rollup_order(priority_corpus, a, b),
+                );
             }
         }
-
-        ranked.truncate(opts.top_files);
-        // Truncating a sorted vec leaves it sorted; only actual promotion
-        // swaps disturb the order and need the re-sort.
-        if swapped {
-            ranked.sort_by(|a, b| rollup_order(priority_corpus, a, b));
+        GroundOutput::Counts => {
+            if docs.len() > MAX_COUNTS_FILES {
+                let matched_files = docs.len();
+                docs = cut_with_local_reserve(
+                    docs,
+                    MAX_COUNTS_FILES,
+                    priority_corpus,
+                    &fallback_docs,
+                    |a, b| counts_order(priority_corpus, a, b),
+                );
+                warnings.push(Warning {
+                    code: warning_codes::COUNTS_TRUNCATED.to_string(),
+                    message: format!(
+                        "counts output lists the first {MAX_COUNTS_FILES} of {matched_files} matched files; narrow the phrase or the corpus to see the rest"
+                    ),
+                });
+            }
         }
-        docs = ranked.into_iter().collect();
+    }
+
+    match (opts.match_mode, opts.output) {
+        (GroundMatch::Phrase, GroundOutput::Hits) => {
+            let mut retained = 0;
+            for doc in docs.values() {
+                for chunk in &doc.chunks {
+                    retained += chunk.chunk_count.unwrap_or(1);
+                }
+            }
+            if retained < stats.hits {
+                warnings.push(Warning {
+                    code: warning_codes::PHRASE_TRUNCATED.to_string(),
+                    message: format!(
+                        "phrase rollup retained {retained} of {} matched chunks after chunks_per_file and top_files caps",
+                        stats.hits
+                    ),
+                });
+            }
+        }
+        (GroundMatch::Phrase, GroundOutput::Counts)
+        | (GroundMatch::Ranked, GroundOutput::Hits | GroundOutput::Counts) => {}
     }
 
     Ok(GroundResponse {
@@ -319,11 +627,100 @@ pub async fn ground_union(
     })
 }
 
+/// Keeps up to `RESERVED_LOCAL_SLOTS` docs of `priority_corpus` in the final
+/// cut even when `order` ranks them outside it, so a few high-ranked
+/// neighbor-corpus docs cannot fully crowd out the searcher's own repo (#425).
+///
+/// Docs named in `fallback_docs` never take part in the reserve and never
+/// displace a fused doc. They fill only the slots the fused docs leave.
+fn cut_with_local_reserve(
+    docs: BTreeMap<String, DocFile>,
+    cap: usize,
+    priority_corpus: Option<&str>,
+    fallback_docs: &HashSet<String>,
+    order: impl Fn(&(String, DocFile), &(String, DocFile)) -> std::cmp::Ordering,
+) -> BTreeMap<String, DocFile> {
+    let mut ranked: Vec<(String, DocFile)> = Vec::new();
+    let mut fallback: Vec<(String, DocFile)> = Vec::new();
+    for entry in docs {
+        if fallback_docs.contains(&entry.0) {
+            fallback.push(entry);
+        } else {
+            ranked.push(entry);
+        }
+    }
+    ranked.sort_by(&order);
+
+    if ranked.len() <= cap {
+        fallback.sort_by(&order);
+        fallback.truncate(cap - ranked.len());
+        ranked.extend(fallback);
+        return ranked.into_iter().collect();
+    }
+
+    let mut swapped = false;
+    if let Some(priority) = priority_corpus {
+        let kept_locals = ranked[..cap]
+            .iter()
+            .filter(|(_, d)| d.corpus == priority)
+            .count();
+        let missing = RESERVED_LOCAL_SLOTS.saturating_sub(kept_locals);
+        if missing > 0 {
+            let promote: Vec<usize> = (cap..ranked.len())
+                .filter(|&i| ranked[i].1.corpus == priority)
+                .take(missing)
+                .collect();
+            // Evict the lowest-ranked non-priority docs in the kept
+            // window; the zip truncates to however many of those exist,
+            // so promotion can never over-fill the window.
+            let evict: Vec<usize> = (0..cap)
+                .rev()
+                .filter(|&i| ranked[i].1.corpus != priority)
+                .take(promote.len())
+                .collect();
+            for (&promote_idx, &evict_idx) in promote.iter().zip(&evict) {
+                ranked.swap(evict_idx, promote_idx);
+                swapped = true;
+            }
+        }
+    }
+
+    ranked.truncate(cap);
+    // Truncating a sorted vec leaves it sorted; only actual promotion
+    // swaps disturb the order and need the re-sort.
+    if swapped {
+        ranked.sort_by(&order);
+    }
+    ranked.into_iter().collect()
+}
+
+const RESERVED_LOCAL_SLOTS: usize = 2;
+
+/// Ranks counts-mode files by matched chunks, most first. Occurrence count of
+/// the best chunk does not measure coverage.
+fn counts_order(
+    priority_corpus: Option<&str>,
+    a: &(String, DocFile),
+    b: &(String, DocFile),
+) -> std::cmp::Ordering {
+    let chunks_of = |doc: &DocFile| doc.coverage.as_ref().map_or(0, |coverage| coverage.chunks);
+    chunks_of(&b.1)
+        .cmp(&chunks_of(&a.1))
+        .then_with(|| match priority_corpus {
+            Some(p) => (b.1.corpus == p).cmp(&(a.1.corpus == p)),
+            None => std::cmp::Ordering::Equal,
+        })
+        .then_with(|| a.0.cmp(&b.0))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use async_trait::async_trait;
 
     use super::*;
+    use crate::common::FileRef;
     use crate::indexer::SignalLists;
 
     /// `retrieve_signals` returns a canned, pre-seeded hit list; writes are
@@ -352,8 +749,33 @@ mod tests {
             Ok(SignalLists {
                 fts: hits.iter().map(|h| h.chunk_id.clone()).collect(),
                 vector: Vec::new(),
+                fts_scores: std::collections::HashMap::new(),
+                vector_distances: std::collections::HashMap::new(),
                 hits: hits.into_iter().map(|h| (h.chunk_id.clone(), h)).collect(),
             })
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            let needle = phrase.to_lowercase();
+            let mut hits = Vec::new();
+            for hit in &self.hits {
+                if hit.corpus_key != *corpus_key
+                    || !crate::search::collapse_whitespace(&hit.search_text.to_lowercase())
+                        .contains(&needle)
+                {
+                    continue;
+                }
+                if hits.len() == limit {
+                    break;
+                }
+                hits.push(hit.clone());
+            }
+            Ok(hits)
         }
     }
 
@@ -365,9 +787,14 @@ mod tests {
     /// makes these tests crawl the entire filesystem — fast only while the
     /// literal pass happens to match nothing.
     fn fixture_root() -> &'static std::path::Path {
-        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| tempfile::tempdir().expect("fixture corpus root"))
-            .path()
+        static ROOT: std::sync::OnceLock<(tempfile::TempDir, std::path::PathBuf)> =
+            std::sync::OnceLock::new();
+        let (_dir, canonical) = ROOT.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("fixture corpus root");
+            let canonical = dir.path().canonicalize().expect("canonical fixture root");
+            (dir, canonical)
+        });
+        canonical
     }
 
     fn fixture_corpus() -> CorpusConfig {
@@ -402,18 +829,15 @@ mod tests {
 
     // --- efficiency: ground_union fans roots out concurrently ---
 
-    /// A `ChunkStore` double whose `retrieve_signals` sleeps a fixed delay
-    /// per call before returning an empty (no-hit) result. Used to prove
-    /// `ground_union` awaits per-root searches concurrently: if the roots
-    /// were still awaited sequentially, N roots would take >= N * delay;
-    /// concurrent awaits take roughly one delay regardless of N.
-    struct SleepyChunkStore {
-        delay: Duration,
+    /// A `ChunkStore` double that waits until every root starts retrieval.
+    /// Used to prove `ground_union` admits all corpus roots concurrently.
+    struct BarrierChunkStore {
+        barrier: std::sync::Arc<tokio::sync::Barrier>,
         calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
-    impl ChunkRetrieval for SleepyChunkStore {
+    impl ChunkRetrieval for BarrierChunkStore {
         async fn retrieve_signals(
             &self,
             _corpus_key: &CorpusKey,
@@ -421,15 +845,23 @@ mod tests {
             _limit: usize,
         ) -> Result<SignalLists> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
+            self.barrier.wait().await;
             Ok(SignalLists::default())
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
         }
     }
 
     #[tokio::test]
     async fn ground_union_searches_corpus_roots_concurrently() {
         const ROOTS: usize = 5;
-        const DELAY: Duration = Duration::from_millis(80);
 
         let root_dirs: Vec<tempfile::TempDir> = (0..ROOTS)
             .map(|_| tempfile::tempdir().expect("root dir"))
@@ -444,23 +876,25 @@ mod tests {
             exclude: Vec::new(),
             global: false,
         };
-        let store = SleepyChunkStore {
-            delay: DELAY,
+        let store = BarrierChunkStore {
+            barrier: std::sync::Arc::new(tokio::sync::Barrier::new(ROOTS)),
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
 
-        let started = Instant::now();
-        let resp = ground_union(
-            "spice",
-            &[corpus],
-            &store,
-            None,
-            GroundOpts::default(),
-            None,
+        let resp = tokio::time::timeout(
+            Duration::from_secs(1),
+            ground_union(
+                "spice",
+                &[corpus],
+                &store,
+                None,
+                GroundOpts::default(),
+                None,
+            ),
         )
         .await
+        .expect("all roots must be admitted concurrently")
         .expect("concurrent ground_union must succeed");
-        let elapsed = started.elapsed();
 
         assert_eq!(
             store.calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -468,15 +902,6 @@ mod tests {
             "every corpus root must be searched exactly once"
         );
         assert!(resp.docs.is_empty(), "no-hit store yields no docs");
-        assert!(
-            elapsed < DELAY * 2,
-            "expected {ROOTS} roots x {DELAY:?} delay each to run concurrently and finish \
-             in roughly one delay; took {elapsed:?}. A sequential loop would take >= \
-             {:?} (the sum over roots) — this margin (2x one delay) is generous enough \
-             that it cannot pass by accident on a loaded machine, yet fails if the \
-             per-root loop reverts to sequential awaits.",
-            DELAY * ROOTS as u32
-        );
     }
 
     // --- #137: relative_path_for ---
@@ -553,8 +978,38 @@ mod tests {
             score,
             mtime_ms: 0,
             claim_marks: vec![],
+            structure: None,
+            overlap_bytes: 0,
             z_score: None,
         }
+    }
+
+    #[tokio::test]
+    async fn rerank_with_timeout_keeps_crossencoder_scores_on_success() {
+        struct ReorderingCrossencoder;
+        impl Crossencoder for ReorderingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                hits.reverse();
+                hits[0].score = 0.9;
+                hits[1].score = 0.1;
+                Ok(())
+            }
+        }
+        let hits = vec![
+            hit_for_timeout_test("/first.md", 0.04),
+            hit_for_timeout_test("/second.md", 0.03),
+        ];
+        let (ranked, fallback) = rerank_with_timeout(
+            Box::new(ReorderingCrossencoder),
+            "query".into(),
+            hits,
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(fallback, None);
+        assert_eq!(ranked[0].file_ref, "/second.md");
+        assert_eq!(ranked[0].score, 0.9);
+        assert_eq!(ranked[1].score, 0.1);
     }
 
     #[tokio::test]
@@ -574,19 +1029,14 @@ mod tests {
         ];
         let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
 
-        let (result, applied) = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(SleepingCrossencoder),
             "q".to_string(),
             hits,
             Duration::from_millis(20),
         )
-        .await
-        .expect("timeout path must not error");
-
-        assert!(
-            !applied,
-            "a stalled crossencoder must report applied == false"
-        );
+        .await;
+        assert_eq!(reason, Some(RerankFallback::Timeout));
         let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
         assert_eq!(
             observed, fusion_order,
@@ -609,22 +1059,62 @@ mod tests {
             hit_for_timeout_test("/b.md", 0.9),
         ];
 
-        let (result, applied) = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(ReversingCrossencoderStub),
             "q".to_string(),
             hits,
             Duration::from_secs(2),
         )
-        .await
-        .expect("fast path must not error");
-
-        assert!(applied, "a fast crossencoder must report applied == true");
+        .await;
+        assert_eq!(reason, None, "fast path must apply reranking");
         let observed: Vec<&str> = result.iter().map(|h| h.file_ref.as_str()).collect();
         assert_eq!(
             observed,
             vec!["/b.md", "/a.md"],
-            "fast path must apply the crossencoder's reordering"
+            "fast path must apply the crossencoder ordering"
         );
+    }
+
+    #[tokio::test]
+    async fn ground_preserves_fusion_results_when_crossencoder_panics() {
+        struct PanickingCrossencoder;
+        impl Crossencoder for PanickingCrossencoder {
+            fn rerank(&mut self, _query: &str, hits: &mut [SearchHit]) -> Result<()> {
+                hits.reverse();
+                for hit in hits {
+                    hit.score = 999.0;
+                }
+                panic!("native reranker failed after modifying hits");
+            }
+        }
+
+        let store = FakeChunkStore {
+            hits: fixture_hits(),
+        };
+        let corpus = fixture_corpus();
+        let baseline = ground("spice", &corpus, &store, None, GroundOpts::default())
+            .await
+            .expect("fusion search succeeds");
+        let response = ground(
+            "spice",
+            &corpus,
+            &store,
+            Some(Box::new(PanickingCrossencoder)),
+            GroundOpts::default(),
+        )
+        .await
+        .expect("a reranker panic must preserve the search response");
+
+        assert_eq!(response.stats.hits, 5);
+        assert_eq!(
+            serde_json::to_value(&response.docs).unwrap(),
+            serde_json::to_value(&baseline.docs).unwrap()
+        );
+        let mut warnings = Vec::new();
+        for warning in &response.warnings {
+            warnings.push(warning.code.as_str());
+        }
+        assert_eq!(warnings, vec!["crossencoder-unavailable"]);
     }
 
     // --- #139: GroundOpts.rerank_timeout wiring ---
@@ -709,6 +1199,220 @@ mod tests {
             "a completed rerank over >=5 spread-score hits must produce Some z_score; \
              all-None means the assertion channel the timeout tests rely on is dead"
         );
+    }
+
+    #[tokio::test]
+    async fn phrase_mode_ranks_by_occurrence_count_truncates_and_skips_the_crossencoder() {
+        let texts = [
+            "Exact Phrase, then exact phrase again",
+            "one exact phrase",
+            "another exact phrase",
+            "exact words, no phrase",
+        ];
+        let mut hits = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            let file_ref = fixture_root().join(format!("phrase{i}.md"));
+            let mut hit = hit_for_timeout_test(&file_ref.to_string_lossy(), 0.0);
+            hit.text = (*text).to_string();
+            hit.search_text = (*text).to_string();
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            limit: 2,
+            rerank_timeout: Duration::from_secs(5),
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+
+        let resp = ground_union(
+            "exact phrase",
+            &[fixture_corpus()],
+            &store,
+            Some(Box::new(ScoringCrossencoder)),
+            opts,
+            None,
+        )
+        .await
+        .expect("phrase mode must succeed");
+
+        assert_eq!(resp.stats.hits, 2);
+        let mut scored = Vec::new();
+        for doc in resp.docs.values() {
+            assert_eq!(doc.z_score, None, "phrase mode must not rerank");
+            scored.push((doc.path.clone(), doc.score));
+        }
+        assert_eq!(
+            scored,
+            vec![
+                (Some("phrase0.md".to_string()), 2.0),
+                (Some("phrase1.md".to_string()), 1.0),
+            ]
+        );
+        let mut codes = Vec::new();
+        for warning in &resp.warnings {
+            codes.push(warning.code.as_str());
+        }
+        assert_eq!(codes, vec!["phrase-truncated"]);
+        assert!(
+            resp.warnings[0].message.contains("matched 3 chunks"),
+            "{}",
+            resp.warnings[0].message
+        );
+    }
+
+    #[tokio::test]
+    async fn phrase_mode_ignores_a_phrase_that_only_the_file_summary_holds() {
+        let path = fixture_root().join("phrase-summary.md");
+        let path = path.to_string_lossy();
+        let mut summary_only = hit_for_timeout_test(&path, 0.0);
+        summary_only.chunk_id = "summary-only".into();
+        summary_only.text = "plain body".into();
+        summary_only.search_text = "crumb\nexact phrase in summary\nplain body".into();
+        let mut in_body = summary_only.clone();
+        in_body.chunk_id = "in-body".into();
+        in_body.line_start = 20;
+        in_body.text = "the exact phrase".into();
+        in_body.search_text = "crumb\nexact phrase in summary\nthe exact phrase".into();
+        let store = FakeChunkStore {
+            hits: vec![summary_only, in_body],
+        };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("phrase ground");
+        assert_eq!(resp.stats.hits, 1);
+        let doc = resp.docs.values().next().expect("one file");
+        assert_eq!(doc.chunks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn counts_output_caps_the_file_count_and_warns() {
+        let mut hits = Vec::new();
+        for index in 0..=MAX_COUNTS_FILES {
+            let path = fixture_root().join(format!("counts-{index:05}.md"));
+            let mut hit = hit_for_timeout_test(&path.to_string_lossy(), 0.0);
+            hit.text = "exact phrase".into();
+            hit.search_text = "exact phrase".into();
+            hit.summary = "file summary".into();
+            hit.keywords = vec!["keyword".into()];
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("counts ground");
+        assert_eq!(resp.docs.len(), MAX_COUNTS_FILES);
+        assert_eq!(resp.stats.hits, MAX_COUNTS_FILES + 1);
+        let mut codes = Vec::new();
+        for warning in &resp.warnings {
+            codes.push(warning.code.as_str());
+        }
+        assert_eq!(codes, vec!["counts-truncated"]);
+        assert!(
+            resp.warnings[0]
+                .message
+                .contains("2000 of 2001 matched files"),
+            "{}",
+            resp.warnings[0].message
+        );
+        for doc in resp.docs.values() {
+            assert_eq!(doc.summary, None);
+            assert!(doc.keywords.is_empty());
+            assert!(doc.chunks.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn phrase_rollup_warns_when_chunks_per_file_drops_a_match() {
+        let path = fixture_root().join("phrase-chunks.md");
+        let path = path.to_string_lossy();
+        let mut first = hit_for_timeout_test(&path, 0.0);
+        first.chunk_id = "first".into();
+        first.line_start = 1;
+        first.text = "exact phrase".into();
+        first.search_text = "exact phrase".into();
+        let mut second = first.clone();
+        second.chunk_id = "second".into();
+        second.line_start = 20;
+        let store = FakeChunkStore {
+            hits: vec![first, second],
+        };
+        let opts = GroundOpts {
+            chunks_per_file: 1,
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("phrase ground");
+        assert_eq!(resp.stats.hits, 2);
+        assert_eq!(resp.docs.values().next().expect("one file").chunks.len(), 1);
+        assert_eq!(resp.warnings.len(), 1);
+        assert_eq!(resp.warnings[0].code, "phrase-truncated");
+    }
+
+    #[tokio::test]
+    async fn phrase_rollup_warns_when_top_files_drops_a_match() {
+        let mut hits = Vec::new();
+        for name in ["phrase-top-a.md", "phrase-top-b.md"] {
+            let path = fixture_root().join(name);
+            let mut hit = hit_for_timeout_test(&path.to_string_lossy(), 0.0);
+            hit.text = "exact phrase".into();
+            hit.search_text = "exact phrase".into();
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            top_files: 1,
+            match_mode: GroundMatch::Phrase,
+            ..GroundOpts::default()
+        };
+        let resp = ground("exact phrase", &fixture_corpus(), &store, None, opts)
+            .await
+            .expect("phrase ground");
+        assert_eq!(resp.stats.hits, 2);
+        assert_eq!(resp.docs.len(), 1);
+        assert_eq!(resp.warnings.len(), 1);
+        assert_eq!(resp.warnings[0].code, "phrase-truncated");
+    }
+
+    #[tokio::test]
+    async fn phrase_search_rejects_invalid_queries_before_store_access() {
+        struct PanicStore;
+        #[async_trait]
+        impl ChunkRetrieval for PanicStore {
+            async fn retrieve_signals(
+                &self,
+                _: &CorpusKey,
+                _: &str,
+                _: usize,
+            ) -> Result<SignalLists> {
+                panic!("store accessed")
+            }
+            async fn retrieve_phrase(
+                &self,
+                _: &CorpusKey,
+                _: &str,
+                _: usize,
+            ) -> Result<Vec<SearchHit>> {
+                panic!("store accessed")
+            }
+        }
+        let root = fixture_root().to_string_lossy();
+        let key = CorpusKey::from_configured_root("fixtures", &root);
+        for phrase in [" ", &"x".repeat(513)] {
+            let result = search_phrase_in(&PanicStore, &key, phrase, 1, None).await;
+            assert!(result.is_err(), "{phrase:?} must fail before store access");
+        }
     }
 
     #[tokio::test]
@@ -868,18 +1572,17 @@ mod tests {
         ];
         let fusion_order: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
 
-        let (result, applied) = rerank_with_timeout(
+        let (result, reason) = rerank_with_timeout(
             Box::new(SleepingCrossencoder),
             "q".to_string(),
             hits,
             Duration::from_millis(0),
         )
-        .await
-        .expect("zero timeout must not error, only fall back to fusion order");
-
-        assert!(
-            !applied,
-            "a zero-duration timeout must report applied == false"
+        .await;
+        assert_eq!(
+            reason,
+            Some(RerankFallback::Timeout),
+            "zero timeout must fall back to fusion order"
         );
         let observed: Vec<String> = result.iter().map(|h| h.chunk_id.clone()).collect();
         assert_eq!(
@@ -892,13 +1595,17 @@ mod tests {
 
     #[tokio::test]
     async fn ground_union_collects_ripgrep_warnings_from_every_root() {
-        // Two nonexistent roots: `search_fused`'s ripgrep pass errors on
-        // each (no such directory), so both must surface a distinct
+        // Two roots whose ripgrep pass errors (an unclosed glob class makes
+        // rg exit 2), so both must surface a distinct
         // "ripgrep-failed" warning in GroundResponse.warnings. If the
         // fan-out's warnings.extend ever regresses to overwrite-with-last
         // or keep-only-first, this collapses to one warning and fails.
-        let root_a = "/nonexistent/hallouminate-orchestrate-test-root-a";
-        let root_b = "/nonexistent/hallouminate-orchestrate-test-root-b";
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let root_a = dir_a.path().canonicalize().expect("canonical root a");
+        let root_b = dir_b.path().canonicalize().expect("canonical root b");
+        let root_a = root_a.to_str().expect("utf-8 root a");
+        let root_b = root_b.to_str().expect("utf-8 root b");
         let key_a = CorpusKey::from_configured_root("warnings", root_a);
         let key_b = CorpusKey::from_configured_root("warnings", root_b);
 
@@ -913,7 +1620,7 @@ mod tests {
         let corpus = CorpusConfig {
             name: "warnings".into(),
             paths: vec![root_a.into(), root_b.into()],
-            globs: vec!["**/*.md".into()],
+            globs: vec!["[".into()],
             exclude: Vec::new(),
             global: false,
         };
@@ -1100,6 +1807,69 @@ mod tests {
         );
     }
 
+    /// Counts output ranks by matched chunks and keeps the reserved local
+    /// slots, so a flood of neighbor files cannot drop every local file.
+    #[tokio::test]
+    async fn counts_cut_keeps_reserved_local_files_below_the_cap() {
+        let local_root = tempfile::tempdir().expect("local root");
+        let neighbor_root = tempfile::tempdir().expect("neighbor root");
+        let local = priority_corpus_config(local_root.path(), "repo:local:wiki");
+        let neighbor = priority_corpus_config(neighbor_root.path(), "neighbor");
+
+        let mut hits = Vec::new();
+        for index in 0..MAX_COUNTS_FILES {
+            for chunk in 0..2 {
+                let mut hit = priority_hit(
+                    neighbor_root.path(),
+                    "neighbor",
+                    &format!("n{index:05}.md"),
+                    0.0,
+                );
+                hit.chunk_id = format!("n{index:05}-{chunk}");
+                hit.text = "exact phrase".into();
+                hit.search_text = "exact phrase".into();
+                hits.push(hit);
+            }
+        }
+        for index in 0..2 {
+            let mut hit = priority_hit(
+                local_root.path(),
+                "repo:local:wiki",
+                &format!("l{index}.md"),
+                0.0,
+            );
+            hit.chunk_id = format!("l{index}-0");
+            hit.text = "exact phrase".into();
+            hit.search_text = "exact phrase".into();
+            hits.push(hit);
+        }
+        let store = FakeChunkStore { hits };
+        let opts = GroundOpts {
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        };
+        let resp = ground_union(
+            "exact phrase",
+            &[local, neighbor],
+            &store,
+            None,
+            opts,
+            Some("repo:local:wiki"),
+        )
+        .await
+        .expect("counts ground_union");
+
+        assert_eq!(resp.docs.len(), MAX_COUNTS_FILES);
+        let mut local_kept = 0;
+        for doc in resp.docs.values() {
+            if doc.corpus == "repo:local:wiki" {
+                local_kept += 1;
+            }
+        }
+        assert_eq!(local_kept, 2, "reserved local slots must survive the cut");
+    }
+
     /// AC3/no-op: `priority_corpus = None` must reproduce today's pure-score
     /// ordering — at an equal score, the tie falls back to the path-key
     /// comparator, with no favoritism toward either corpus.
@@ -1133,5 +1903,394 @@ mod tests {
             "with no priority_corpus, the tie must fall back to the unchanged path-key \
              tie-break (\"a_tied_neighbor.md\" < \"z_tied_local.md\"), not favor either corpus"
         );
+    }
+
+    /// Store double with no indexed rows. `indexed` is what the membership
+    /// read returns; `fail_listing` makes that read fail.
+    struct ColdStore {
+        indexed: Option<HashSet<FileRef>>,
+        fail_listing: bool,
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for ColdStore {
+        async fn retrieve_signals(
+            &self,
+            _corpus_key: &CorpusKey,
+            _query: &str,
+            _limit: usize,
+        ) -> Result<SignalLists> {
+            Ok(SignalLists::default())
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            _corpus_key: &CorpusKey,
+            _phrase: &str,
+            _limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            Ok(Vec::new())
+        }
+
+        async fn indexed_file_refs(
+            &self,
+            _corpus_key: &CorpusKey,
+        ) -> Result<Option<HashSet<FileRef>>> {
+            if self.fail_listing {
+                return Err(HallouminateError::Search("membership read failed".into()));
+            }
+            Ok(self.indexed.clone())
+        }
+    }
+
+    fn md_corpus(name: &str, dir: &std::path::Path) -> CorpusConfig {
+        CorpusConfig {
+            name: name.into(),
+            paths: vec![dir.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: Vec::new(),
+            global: false,
+        }
+    }
+
+    fn warning_codes(resp: &GroundResponse) -> Vec<&str> {
+        resp.warnings.iter().map(|w| w.code.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_failed_membership_read_degrades_to_no_fallback_with_a_warning() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("cold.md"), "the quokkaherd is cold\n").expect("cold");
+        let store = ColdStore {
+            indexed: Some(HashSet::new()),
+            fail_listing: true,
+        };
+
+        let resp = ground_union(
+            "quokkaherd",
+            &[md_corpus("docs", dir.path())],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+        )
+        .await
+        .expect("a membership failure must not fail ground");
+
+        assert!(resp.docs.is_empty());
+        assert_eq!(warning_codes(&resp), vec!["lexical-fallback-failed"]);
+    }
+
+    fn doc_in(corpus: &str, score: f64) -> DocFile {
+        DocFile {
+            summary: None,
+            keywords: Vec::new(),
+            score,
+            z_score: None,
+            mtime: String::new(),
+            corpus: corpus.into(),
+            path: None,
+            stale: false,
+            chunks: Vec::new(),
+            coverage: None,
+        }
+    }
+
+    fn kept_keys(docs: &BTreeMap<String, DocFile>) -> Vec<&str> {
+        docs.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn local_reserve_never_promotes_a_fallback_doc_over_fused_docs() {
+        let docs: BTreeMap<String, DocFile> = BTreeMap::from([
+            ("a-fused".to_string(), doc_in("other", 0.9)),
+            ("b-fused".to_string(), doc_in("other", 0.8)),
+            ("c-fallback".to_string(), doc_in("local", 0.001)),
+        ]);
+        let fallback = HashSet::from(["c-fallback".to_string()]);
+
+        let kept = cut_with_local_reserve(docs, 2, Some("local"), &fallback, |a, b| {
+            rollup_order(Some("local"), a, b)
+        });
+
+        assert_eq!(kept_keys(&kept), vec!["a-fused", "b-fused"]);
+    }
+
+    #[test]
+    fn fallback_docs_fill_only_the_slots_fused_docs_leave() {
+        let docs: BTreeMap<String, DocFile> = BTreeMap::from([
+            ("a-fused".to_string(), doc_in("other", 0.9)),
+            ("b-fallback".to_string(), doc_in("local", 0.002)),
+            ("c-fallback".to_string(), doc_in("local", 0.001)),
+        ]);
+        let fallback = HashSet::from(["b-fallback".to_string(), "c-fallback".to_string()]);
+
+        let kept = cut_with_local_reserve(docs, 2, Some("local"), &fallback, |a, b| {
+            rollup_order(Some("local"), a, b)
+        });
+
+        assert_eq!(kept_keys(&kept), vec!["a-fused", "b-fallback"]);
+    }
+
+    /// Fused hits for the warm corpus; every root reports its own indexed
+    /// files, so only the warm corpus counts the shared file as indexed.
+    struct WarmColdStore {
+        warm_hits: FakeChunkStore,
+        warm_file: String,
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for WarmColdStore {
+        async fn retrieve_signals(
+            &self,
+            corpus_key: &CorpusKey,
+            query: &str,
+            limit: usize,
+        ) -> Result<SignalLists> {
+            self.warm_hits
+                .retrieve_signals(corpus_key, query, limit)
+                .await
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            self.warm_hits
+                .retrieve_phrase(corpus_key, phrase, limit)
+                .await
+        }
+
+        async fn indexed_file_refs(
+            &self,
+            corpus_key: &CorpusKey,
+        ) -> Result<Option<HashSet<FileRef>>> {
+            let mut indexed = HashSet::new();
+            if corpus_key.name == "a-warm" {
+                indexed.insert(FileRef::new(std::path::PathBuf::from(&self.warm_file)));
+            }
+            Ok(Some(indexed))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_warm_fused_doc_keeps_its_slot_when_a_cold_corpus_falls_back_on_the_same_file() {
+        let dir = tempfile::tempdir().expect("shared root");
+        std::fs::write(dir.path().join("shared.md"), "the quokkaherd is shared\n").expect("file");
+        let warm_hit = priority_hit(dir.path(), "a-warm", "shared.md", 0.5);
+        let store = WarmColdStore {
+            warm_file: warm_hit.file_ref.clone(),
+            warm_hits: FakeChunkStore {
+                hits: vec![warm_hit],
+            },
+        };
+        let corpora = [
+            priority_corpus_config(dir.path(), "a-warm"),
+            priority_corpus_config(dir.path(), "z-cold"),
+        ];
+        let opts = GroundOpts {
+            top_files: 1,
+            ..GroundOpts::default()
+        };
+
+        let resp = ground_union("quokkaherd", &corpora, &store, None, opts, Some("z-cold"))
+            .await
+            .expect("ground_union");
+
+        let kept: Vec<&str> = resp.docs.values().map(|doc| doc.corpus.as_str()).collect();
+        assert_eq!(kept, vec!["a-warm"]);
+    }
+
+    fn file_ref_in(dir: &std::path::Path, name: &str) -> FileRef {
+        FileRef::new(dir.canonicalize().expect("canonical dir").join(name))
+    }
+
+    fn key_of(corpus: &CorpusConfig) -> CorpusKey {
+        corpus.corpus_keys().remove(0)
+    }
+
+    /// A supplied inventory replaces the walk and the membership read: the
+    /// store would fail the listing and the disk holds an extra matching
+    /// file, yet only the inventory's eligible file is searched.
+    #[tokio::test]
+    async fn a_supplied_inventory_replaces_the_walk_and_the_membership_read() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("cold.md"), "the quokkaherd is cold\n").expect("cold");
+        std::fs::write(dir.path().join("other.md"), "the quokkaherd is other\n").expect("other");
+        let corpus = md_corpus("docs", dir.path());
+        let store = ColdStore {
+            indexed: None,
+            fail_listing: true,
+        };
+        let inventory = Inventory::from([(
+            key_of(&corpus),
+            RootInventory {
+                eligible: Arc::new(HashSet::from([file_ref_in(dir.path(), "cold.md")])),
+                indexed: IndexedFiles::Known(RootIndex {
+                    files: Arc::new(HashSet::new()),
+                    handle: None,
+                }),
+            },
+        )]);
+
+        let resp = ground_union_inventoried(
+            "quokkaherd",
+            &[corpus],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+            &inventory,
+        )
+        .await
+        .expect("ground_union_inventoried");
+
+        let paths: Vec<Option<&str>> = resp.docs.values().map(|doc| doc.path.as_deref()).collect();
+        assert_eq!(paths, vec![Some("cold.md")]);
+        assert_eq!(warning_codes(&resp), vec!["lexical-fallback"]);
+    }
+
+    /// A root whose eligible files all have indexed rows searches no
+    /// unindexed file.
+    #[tokio::test]
+    async fn a_fully_indexed_root_adds_no_fallback_hits() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(dir.path().join("cold.md"), "the quokkaherd is cold\n").expect("cold");
+        let corpus = md_corpus("docs", dir.path());
+        let store = ColdStore {
+            indexed: None,
+            fail_listing: false,
+        };
+        let covered = Arc::new(HashSet::from([file_ref_in(dir.path(), "cold.md")]));
+        let inventory = Inventory::from([(
+            key_of(&corpus),
+            RootInventory {
+                eligible: Arc::clone(&covered),
+                indexed: IndexedFiles::Known(RootIndex {
+                    files: covered,
+                    handle: None,
+                }),
+            },
+        )]);
+
+        let resp = ground_union_inventoried(
+            "quokkaherd",
+            &[corpus],
+            &store,
+            None,
+            GroundOpts::default(),
+            None,
+            &inventory,
+        )
+        .await
+        .expect("ground_union_inventoried");
+
+        assert!(resp.docs.is_empty());
+        assert!(resp.warnings.is_empty(), "{:?}", warning_codes(&resp));
+    }
+
+    /// Counts retrievals that receive the handle from the one root read.
+    #[derive(Default)]
+    struct HandleStore {
+        inner: FakeChunkStore,
+        with_handle: std::sync::atomic::AtomicUsize,
+        without_handle: std::sync::atomic::AtomicUsize,
+    }
+
+    impl HandleStore {
+        fn note(&self, handle: Option<&crate::search::RootHandle>) {
+            let counter = match handle {
+                Some(_) => &self.with_handle,
+                None => &self.without_handle,
+            };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl ChunkRetrieval for HandleStore {
+        async fn retrieve_signals(
+            &self,
+            corpus_key: &CorpusKey,
+            query: &str,
+            limit: usize,
+        ) -> Result<SignalLists> {
+            self.inner.retrieve_signals(corpus_key, query, limit).await
+        }
+
+        async fn retrieve_phrase(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+        ) -> Result<Vec<SearchHit>> {
+            self.inner.retrieve_phrase(corpus_key, phrase, limit).await
+        }
+
+        async fn load_root_index(&self, _corpus_key: &CorpusKey) -> Result<Option<RootIndex>> {
+            Ok(Some(RootIndex {
+                files: Arc::new(HashSet::new()),
+                handle: Some(crate::search::RootHandle::new(7_u8)),
+            }))
+        }
+
+        async fn retrieve_signals_in(
+            &self,
+            corpus_key: &CorpusKey,
+            query: &str,
+            limit: usize,
+            handle: Option<&crate::search::RootHandle>,
+        ) -> Result<SignalLists> {
+            self.note(handle);
+            self.inner.retrieve_signals(corpus_key, query, limit).await
+        }
+
+        async fn retrieve_phrase_in(
+            &self,
+            corpus_key: &CorpusKey,
+            phrase: &str,
+            limit: usize,
+            handle: Option<&crate::search::RootHandle>,
+        ) -> Result<Vec<SearchHit>> {
+            self.note(handle);
+            self.inner.retrieve_phrase(corpus_key, phrase, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn ground_hands_the_one_root_read_to_ranked_and_phrase_retrieval() {
+        let dir = tempfile::tempdir().expect("dir");
+        let corpus = md_corpus("docs", dir.path());
+        for match_mode in [GroundMatch::Ranked, GroundMatch::Phrase] {
+            let store = HandleStore::default();
+            let opts = GroundOpts {
+                match_mode,
+                ..GroundOpts::default()
+            };
+
+            let listed = list_root_indexes(&corpus, &store).await;
+            let mut inventory = Inventory::new();
+            inventory.extend(assemble_inventory(listed, &[]));
+
+            ground_union_inventoried(
+                "quokkaherd",
+                std::slice::from_ref(&corpus),
+                &store,
+                None,
+                opts,
+                None,
+                &inventory,
+            )
+            .await
+            .expect("ground_union_inventoried");
+
+            let with = store.with_handle.load(std::sync::atomic::Ordering::SeqCst);
+            let without = store
+                .without_handle
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!((with, without), (1, 0), "{match_mode:?} reuses the handle");
+        }
     }
 }
