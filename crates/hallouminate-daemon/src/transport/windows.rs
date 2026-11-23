@@ -1,5 +1,5 @@
 use std::io;
-use std::os::windows::ffi::OsStrExt;
+use std::io::Write as _;
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::pin::Pin;
@@ -15,19 +15,40 @@ use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 
-use crate::windows_security::{OwnerSecurity, UserSid, current_user_sid, process_user_sid};
+use crate::windows_security::{
+    OwnerSecurity, UserSid, create_owner_only_file, current_user_sid, process_user_sid,
+    random_nonce,
+};
 
+/// Longest wait for a busy pipe when the caller sets no deadline.
+const BUSY_RETRY_BUDGET: Duration = Duration::from_secs(5);
+const BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+/// Pause before `accept` reports a failed pipe-instance creation again.
+const INSTANCE_RETRY_DELAY: Duration = Duration::from_millis(50);
+const NONCE_HEX_LEN: usize = 64;
+
+fn pipe_name_for_nonce(nonce: &str) -> String {
+    format!(r"\\.\pipe\hallouminate-{nonce}")
+}
+
+/// Reads the pipe name that the daemon recorded in the owner-only marker file.
+///
+/// The name carries a random nonce, so another account cannot compute it or
+/// create the pipe first. A missing or incomplete marker reports `NotFound`.
 pub(crate) fn pipe_name(path: &Path) -> io::Result<String> {
-    let path = hallouminate_domain::common::best_effort_canonical(path);
-    let mut hash = blake3::Hasher::new();
-    for unit in path.as_os_str().encode_wide() {
-        hash.update(&unit.to_le_bytes());
+    let nonce = std::fs::read_to_string(path)?;
+    if nonce.len() != NONCE_HEX_LEN || !nonce.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "daemon endpoint marker is not ready",
+        ));
     }
-    hash.update(current_user_sid()?.to_string().as_bytes());
-    Ok(format!(
-        r"\\.\pipe\hallouminate-{}",
-        hash.finalize().to_hex()
-    ))
+    Ok(pipe_name_for_nonce(&nonce))
+}
+
+/// Reports whether `error` means that every pipe instance is in use.
+pub(crate) fn is_pipe_busy(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
 }
 
 enum Instance {
@@ -52,6 +73,7 @@ fn create_server(name: &str, instance: Instance) -> io::Result<NamedPipeServer> 
             options.first_pipe_instance(false);
         }
     }
+    // SAFETY: `attributes` and the descriptor behind it outlive the call.
     unsafe {
         options.create_with_security_attributes_raw(
             name,
@@ -62,45 +84,94 @@ fn create_server(name: &str, instance: Instance) -> io::Result<NamedPipeServer> 
 
 pub(crate) struct LocalListener {
     name: String,
-    pending: Mutex<NamedPipeServer>,
+    /// The instance that waits for the next client. `None` after a failed
+    /// replacement, until the next `accept` creates it again.
+    pending: Mutex<Option<NamedPipeServer>>,
 }
 
 impl LocalListener {
+    /// Creates the pipe and records its random name in an owner-only marker file at `path`.
+    ///
+    /// Fails when `path` exists, like a Unix socket bind.
     pub(crate) fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
-        let name = pipe_name(path)?;
-        let pending = create_server(&name, Instance::First)?;
-        std::fs::File::create(path)?;
-        crate::windows_security::restrict_path(path)?;
-        Ok(Self {
-            name,
-            pending: Mutex::new(pending),
-        })
+        let nonce = random_nonce()?;
+        let name = pipe_name_for_nonce(&nonce);
+        let mut marker = create_owner_only_file(path)?;
+        let pending = create_server(&name, Instance::First).and_then(|pending| {
+            marker.write_all(nonce.as_bytes())?;
+            Ok(pending)
+        });
+        drop(marker);
+        match pending {
+            Ok(pending) => Ok(Self {
+                name,
+                pending: Mutex::new(Some(pending)),
+            }),
+            Err(error) => {
+                let _ = std::fs::remove_file(path);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn accept(&self) -> io::Result<(LocalStream, ())> {
-        let mut pending = self.pending.lock().await;
+        let mut slot = self.pending.lock().await;
+        if slot.is_none() {
+            match create_server(&self.name, Instance::Additional) {
+                Ok(server) => *slot = Some(server),
+                Err(error) => {
+                    tokio::time::sleep(INSTANCE_RETRY_DELAY).await;
+                    return Err(error);
+                }
+            }
+        }
+        let Some(pending) = slot.as_mut() else {
+            return Err(io::Error::other("pipe instance missing after creation"));
+        };
         pending.connect().await?;
-        let next = create_server(&self.name, Instance::Additional)?;
-        let connected = std::mem::replace(&mut *pending, next);
+        let Some(connected) = slot.take() else {
+            return Err(io::Error::other("pipe instance missing after connect"));
+        };
+        *slot = create_server(&self.name, Instance::Additional)
+            .inspect_err(|error| {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    error = %error,
+                    "failed to create the next pipe instance; retrying on the next accept",
+                );
+            })
+            .ok();
         Ok((LocalStream::Server(connected), ()))
     }
 }
 
+/// A connected named-pipe endpoint.
+///
+/// Named pipes have no half-close, so `shutdown` does not send end-of-file.
+/// A request must end with a line feed.
 pub(crate) enum LocalStream {
     Client(NamedPipeClient),
     Server(NamedPipeServer),
 }
 
 impl LocalStream {
+    /// Connects to the daemon, waiting a bounded time while every pipe instance is busy.
     pub(crate) async fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::connect_until(path, tokio::time::Instant::now() + BUSY_RETRY_BUDGET).await
+    }
+
+    /// Connects to the daemon, retrying a busy pipe until `deadline`.
+    pub(crate) async fn connect_until(
+        path: impl AsRef<Path>,
+        deadline: tokio::time::Instant,
+    ) -> io::Result<Self> {
         let name = pipe_name(path.as_ref())?;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             match ClientOptions::new().open(&name) {
                 Ok(client) => {
                     let stream = Self::Client(client);
-                    if stream.peer_user()? != current_user_sid()? {
+                    if stream.peer_user()? != *current_user_sid()? {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             "daemon belongs to another Windows account",
@@ -108,11 +179,8 @@ impl LocalStream {
                     }
                     return Ok(stream);
                 }
-                Err(error)
-                    if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
-                        && tokio::time::Instant::now() < deadline =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                Err(error) if is_pipe_busy(&error) && tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(BUSY_RETRY_INTERVAL).await;
                 }
                 Err(error) => return Err(error),
             }
@@ -121,6 +189,8 @@ impl LocalStream {
 
     pub(crate) fn peer_user(&self) -> io::Result<UserSid> {
         let mut pid = 0;
+        // SAFETY: each handle comes from a live pipe that `self` owns, and
+        // `pid` is a valid out pointer.
         let success = match self {
             Self::Client(client) => unsafe {
                 GetNamedPipeServerProcessId(client.as_raw_handle(), &mut pid)
@@ -195,7 +265,7 @@ mod tests {
                 let (mut stream, ()) = listener.accept().await.expect("accept client");
                 assert_eq!(
                     stream.peer_user().expect("client SID"),
-                    current_user_sid().expect("SID")
+                    *current_user_sid().expect("SID")
                 );
                 assert_eq!(stream.read_u8().await.expect("request"), expected);
                 stream.write_u8(expected + 1).await.expect("response");
@@ -208,6 +278,23 @@ mod tests {
         }
         server.await.expect("server task");
         assert!(LocalStream::connect(&endpoint).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn pipe_name_comes_from_a_random_marker_nonce() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let first = directory.path().join("first.sock");
+        let second = directory.path().join("second.sock");
+        let _first = LocalListener::bind(&first).expect("bind first pipe");
+        let _second = LocalListener::bind(&second).expect("bind second pipe");
+        assert_ne!(
+            pipe_name(&first).expect("first name"),
+            pipe_name(&second).expect("second name")
+        );
+        std::fs::remove_file(&second).expect("remove marker");
+        std::fs::write(&second, b"").expect("write empty marker");
+        let error = pipe_name(&second).expect_err("an empty marker has no pipe name");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
     #[tokio::test]

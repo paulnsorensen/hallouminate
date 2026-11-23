@@ -106,7 +106,15 @@ pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
         #[cfg(unix)]
         let stopped = !socket.exists() || LocalStream::connect(socket).await.is_err();
         #[cfg(windows)]
-        let stopped = daemon_lock_released(socket)?;
+        let stopped = {
+            use anyhow::Context as _;
+            daemon_lock_released(socket).with_context(|| {
+                format!(
+                    "check daemon lock {}",
+                    super::server::lock_path_for(socket).display()
+                )
+            })?
+        };
         if stopped {
             return Ok(());
         }
@@ -121,7 +129,7 @@ pub(super) async fn stop_at(socket: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Connects for `stop`, retrying a busy pipe until `deadline`.
+/// Connects for `stop`, waiting out a busy pipe until `deadline`.
 ///
 /// `Ok(None)` means the endpoint is gone. Access and account errors fail at once.
 #[cfg(windows)]
@@ -129,31 +137,30 @@ async fn connect_for_stop(
     socket: &Path,
     deadline: std::time::Instant,
 ) -> anyhow::Result<Option<super::client::DaemonClient>> {
-    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
-
-    loop {
-        let error = match connect_at(socket).await {
-            Ok(client) => return Ok(Some(client)),
-            Err(error) => error,
-        };
-        let Some(cause) = error.downcast_ref::<std::io::Error>() else {
-            return Err(error);
-        };
-        if cause.kind() == std::io::ErrorKind::NotFound {
-            return Ok(None);
-        }
-        if cause.raw_os_error() != Some(ERROR_PIPE_BUSY as i32) {
-            return Err(error);
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "daemon did not stop within {}s (endpoint {})",
-                STOP_TIMEOUT.as_secs(),
-                socket.display(),
-            );
-        }
-        tokio::time::sleep(STOP_POLL).await;
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let error = match super::client::connect_at_until(
+        socket,
+        tokio::time::Instant::now() + remaining,
+    )
+    .await
+    {
+        Ok(client) => return Ok(Some(client)),
+        Err(error) => error,
+    };
+    let Some(cause) = error.downcast_ref::<std::io::Error>() else {
+        return Err(error);
+    };
+    if cause.kind() == std::io::ErrorKind::NotFound {
+        return Ok(None);
     }
+    if super::transport::is_pipe_busy(cause) {
+        anyhow::bail!(
+            "daemon did not stop within {}s (endpoint {})",
+            STOP_TIMEOUT.as_secs(),
+            socket.display(),
+        );
+    }
+    Err(error)
 }
 
 #[cfg(windows)]
@@ -298,6 +305,7 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, "ab".repeat(32)).expect("write endpoint marker");
         let name = crate::transport::pipe_name(&socket).expect("pipe name");
         let server = ServerOptions::new()
             .first_pipe_instance(true)

@@ -8,4 +8,4 @@ mod windows;
 #[cfg(all(windows, test))]
 pub(crate) use windows::pipe_name;
 #[cfg(windows)]
-pub(crate) use windows::{LocalListener, LocalStream};
+pub(crate) use windows::{LocalListener, LocalStream, is_pipe_busy};
