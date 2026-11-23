@@ -1,5 +1,7 @@
 //! One tracing event per error response that the daemon sends to a client.
 
+use std::borrow::Cow;
+
 use super::ipc::{DaemonResponse, ErrorKind};
 
 /// Writes one tracing event for an error response that the daemon sends to a
@@ -18,7 +20,7 @@ pub(crate) fn log_error_response(op: Option<&'static str>, response: &DaemonResp
         DaemonResponse::Ok { .. } => return,
         DaemonResponse::Err { kind, message } => (kind, message),
     };
-    let message = message.escape_debug();
+    let message = escape_controls(message);
     match kind {
         ErrorKind::Internal => tracing::error!(
             target: "hallouminate::daemon",
@@ -39,4 +41,21 @@ pub(crate) fn log_error_response(op: Option<&'static str>, response: &DaemonResp
             "request failed: {message}",
         ),
     }
+}
+
+fn escape_controls(message: &str) -> Cow<'_, str> {
+    let Some(first_control) = message.find(char::is_control) else {
+        return Cow::Borrowed(message);
+    };
+    let (prefix, suffix) = message.split_at(first_control);
+    let mut escaped = String::with_capacity(message.len());
+    escaped.push_str(prefix);
+    for character in suffix.chars() {
+        if character.is_control() {
+            escaped.extend(character.escape_debug());
+        } else {
+            escaped.push(character);
+        }
+    }
+    Cow::Owned(escaped)
 }
