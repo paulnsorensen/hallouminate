@@ -18,8 +18,9 @@ operations-2026-11-16.jsonl
 Each segment is named `operations-YYYY-MM-DD.jsonl` by UTC date. No file named
 `operations.jsonl` exists. Read the log with the glob `operations-*.jsonl`.
 Each line is one complete JSON object.
-The `operations.lock` file coordinates appends and retention. Do not remove it
-while a Hallouminate process uses this state directory.
+The `operations.lock` file coordinates appends and retention. On Unix, a new
+lock file has mode `0600`. New segments still respect the process umask.
+Do not remove the lock file while a Hallouminate process uses this state directory.
 
 Two keys in the baseline config control the log:
 

@@ -164,21 +164,42 @@ impl OpLog {
 
     fn lock_directory(&self, path: &Path) -> io::Result<File> {
         std::fs::create_dir_all(&self.dir)?;
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = match options.open(path) {
+        let lock = match Self::open_existing_lock(path) {
             Ok(lock) => lock,
-            // A restrictive umask can leave the lock file read-only.
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => File::open(path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => self.create_lock(path)?,
             Err(error) => return Err(error),
         };
         lock.lock()?;
         Ok(lock)
+    }
+
+    fn open_existing_lock(path: &Path) -> io::Result<File> {
+        match OpenOptions::new().write(true).open(path) {
+            Ok(lock) => Ok(lock),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => File::open(path),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn create_lock(&self, path: &Path) -> io::Result<File> {
+        let pending = tempfile::Builder::new()
+            .prefix(".operations-lock-")
+            .tempfile_in(&self.dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            pending
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        // Publish only after initialization so no peer sees a mode-000 lock.
+        match pending.persist_noclobber(path) {
+            Ok(lock) => Ok(lock),
+            Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+                Self::open_existing_lock(path)
+            }
+            Err(error) => Err(error.error),
+        }
     }
 
     fn report_append_failure(&self, path: &Path, error: &io::Error) {

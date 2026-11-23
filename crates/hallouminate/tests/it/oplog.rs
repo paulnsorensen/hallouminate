@@ -1,7 +1,8 @@
 //! Operations log: the writer (segment naming, cross-process appends, the
 //! daemon-only size cap) and the `daemon_op` rows of a served daemon.
 
-use std::os::unix::fs::PermissionsExt;
+use std::fs::File;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -156,10 +157,140 @@ fn new_operation_log_mode_respects_umask() {
             "umask {mask}: got {actual_mode:04o}, expected {expected_mode:04o}"
         );
         let rows = read_rows(&segment);
-        assert_eq!(mode(&dir.join("operations.lock")), expected_mode);
+        assert_eq!(mode(&dir.join("operations.lock")), 0o600);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].op, "status");
         assert_eq!(mode(&dir), 0o755);
+    }
+}
+
+fn seed_writable_segments(dir: &Path) -> [PathBuf; 2] {
+    let today = Utc::now().date_naive();
+    let tomorrow = today.succ_opt().expect("next date");
+    let segments = [
+        dir.join(segment_name(today)),
+        dir.join(segment_name(tomorrow)),
+    ];
+    for path in &segments {
+        File::create(path)
+            .expect("create writable segment")
+            .set_permissions(PermissionsExt::from_mode(0o640))
+            .expect("set segment mode");
+    }
+    segments
+}
+
+#[test]
+fn operation_lock_reopens_after_restrictive_umask() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = traversable_log_dir(root.path());
+    let segments = seed_writable_segments(&dir);
+    let lock = dir.join("operations.lock");
+    let sentinel = dir.join("sentinel");
+    std::fs::write(&sentinel, b"sentinel").expect("write sentinel");
+    std::fs::set_permissions(&sentinel, PermissionsExt::from_mode(0o644))
+        .expect("set sentinel mode");
+
+    log_cli_status(root.path(), "666");
+    let initial = std::fs::metadata(&lock).expect("lock after first process");
+    log_cli_status(root.path(), "022");
+
+    let rows = read_segment_rows(&dir);
+    assert_eq!(rows.len(), 2, "both CLI processes must append");
+    assert_eq!(rows[0].op, "status");
+    assert_eq!(rows[1].op, "status");
+    assert_ne!(rows[0].request_id, rows[1].request_id);
+    assert_eq!(initial.mode() & 0o777, 0o600);
+    assert_eq!(
+        initial.ino(),
+        std::fs::metadata(&lock).expect("reopened lock").ino()
+    );
+    assert_eq!(mode(&lock), 0o600);
+    assert_eq!(std::fs::read(&lock).expect("read coordination file"), b"");
+    for path in &segments {
+        assert_eq!(mode(path), 0o640);
+    }
+    assert_eq!(mode(&sentinel), 0o644);
+    assert_eq!(
+        std::fs::read(&sentinel).expect("read sentinel"),
+        b"sentinel"
+    );
+    assert_eq!(mode(&dir), 0o755);
+}
+
+#[test]
+fn operation_lock_preserves_existing_inode_and_mode() {
+    for permissions in [0o400, 0o000] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = traversable_log_dir(root.path());
+        seed_writable_segments(&dir);
+        let lock = dir.join("operations.lock");
+        std::fs::write(&lock, b"existing lock").expect("write lock sentinel");
+        let original = File::open(&lock).expect("hold the original inode");
+        original
+            .set_permissions(PermissionsExt::from_mode(permissions))
+            .expect("set existing lock mode");
+        let expected_rows = match File::open(&lock) {
+            Ok(_lock) => 1,
+            Err(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                0
+            }
+        };
+
+        log_cli_status(root.path(), "022");
+
+        let rows = read_segment_rows(&dir);
+        assert_eq!(
+            rows.len(),
+            expected_rows,
+            "preserve access to the existing lock"
+        );
+        for row in rows {
+            assert_eq!(row.op, "status");
+        }
+        let current = std::fs::metadata(&lock).expect("original lock still exists");
+        assert_eq!(
+            current.ino(),
+            original.metadata().expect("original lock metadata").ino()
+        );
+        assert_eq!(mode(&lock), permissions);
+        assert_eq!(
+            std::io::read_to_string(&original).expect("read original lock"),
+            "existing lock"
+        );
+    }
+}
+
+#[test]
+fn operation_lock_allows_concurrent_first_users_under_restrictive_umask() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = traversable_log_dir(root.path());
+    seed_writable_segments(&dir);
+    let barrier = std::sync::Barrier::new(CHILDREN);
+    std::thread::scope(|scope| {
+        for _ in 0..CHILDREN {
+            let root = root.path();
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                log_cli_status(root, "666");
+            });
+        }
+    });
+
+    let rows = read_segment_rows(&dir);
+    assert_eq!(rows.len(), CHILDREN, "all first users must append");
+    for row in rows {
+        assert_eq!(row.op, "status");
+    }
+    assert_eq!(mode(&dir.join("operations.lock")), 0o600);
+    for entry in std::fs::read_dir(&dir).expect("list state") {
+        let name = entry.expect("state entry").file_name();
+        assert!(
+            !name.to_string_lossy().starts_with(".operations-lock-"),
+            "unpublished lock remains: {name:?}"
+        );
     }
 }
 
