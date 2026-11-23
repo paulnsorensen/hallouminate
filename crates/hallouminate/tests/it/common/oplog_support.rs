@@ -22,6 +22,11 @@ pub struct Fixture {
     pub harness: DaemonHarness,
 }
 
+/// Encodes a fixture path as a TOML string.
+pub fn toml_path(path: &Path) -> toml::Value {
+    toml::Value::String(path.to_str().expect("UTF-8 fixture path").to_owned())
+}
+
 pub fn docs_config(tmp: &Path, extra: &str) -> (Config, PathBuf) {
     let corpus_root = tmp.join("corpus");
     std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
@@ -29,25 +34,29 @@ pub fn docs_config(tmp: &Path, extra: &str) -> (Config, PathBuf) {
         r#"
 [[corpus]]
 name = "docs"
-paths = ["{c}"]
+paths = [{c}]
 globs = ["**/*.md"]
 
 [storage]
-ground_dir = "{g}"
+ground_dir = {g}
 
 [embeddings]
 enabled = false
 {extra}
 "#,
-        c = corpus_root.display(),
-        g = tmp.join("ground").display(),
+        c = toml_path(&corpus_root),
+        g = toml_path(&tmp.join("ground")),
     );
     let cfg: Config = toml::from_str(&toml).expect("parse cfg");
     (cfg, corpus_root)
 }
 
 pub async fn fixture_with(extra: &str) -> Fixture {
-    let tmp = tempfile::tempdir().expect("tempdir");
+    fixture_for(tempfile::tempdir().expect("tempdir"), extra).await
+}
+
+/// Starts the fixture with the supplied temporary directory for corpus and storage paths.
+pub async fn fixture_for(tmp: tempfile::TempDir, extra: &str) -> Fixture {
     let (cfg, corpus_root) = docs_config(tmp.path(), extra);
     let logging = cfg.logging;
     let harness = DaemonHarness::spawn_with_oplog(cfg, logging).await;

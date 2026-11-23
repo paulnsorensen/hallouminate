@@ -251,9 +251,8 @@ impl DaemonHarness {
     }
 }
 
-/// Every row in the `operations-*.jsonl` segments of `dir`, oldest segment
-/// first. A missing `dir` has no rows.
-pub fn read_segment_rows(dir: &Path) -> Vec<OperationRecord> {
+/// Returns the operations-log segment paths in name order.
+pub fn segment_paths(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -268,8 +267,13 @@ pub fn read_segment_rows(dir: &Path) -> Vec<OperationRecord> {
         }
     }
     segments.sort();
+    segments
+}
+
+/// Returns the operations-log rows in segment order, oldest segment first.
+pub fn read_segment_rows(dir: &Path) -> Vec<OperationRecord> {
     let mut rows = Vec::new();
-    for segment in segments {
+    for segment in segment_paths(dir) {
         let text = std::fs::read_to_string(&segment).expect("read segment");
         for line in text.lines() {
             let row: OperationRecord = serde_json::from_str(line)

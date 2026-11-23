@@ -12,11 +12,17 @@ use super::OperationRecord;
 const SEGMENT_PREFIX: &str = "operations-";
 const SEGMENT_SUFFIX: &str = ".jsonl";
 const SEGMENT_DATE_FORMAT: &str = "%Y-%m-%d";
+const LOCK_NAME: &str = "operations.lock";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Switch {
     Enabled,
     Disabled,
+}
+
+enum Retention {
+    AppendOnly,
+    EnforceCap,
 }
 
 /// Writer for the operations log segments in one directory.
@@ -114,7 +120,7 @@ impl OpLog {
     ///
     /// Does nothing when the log is disabled. Never deletes a segment.
     pub fn append(&self, record: &OperationRecord) {
-        self.append_row(record);
+        self.append_at(record, Retention::AppendOnly, || Utc::now().date_naive());
     }
 
     /// Appends `record` like [`OpLog::append`], then deletes the oldest
@@ -124,37 +130,71 @@ impl OpLog {
     /// never deleted. The directory is scanned only on the first call, after
     /// the UTC date changes, or when the total passes the cap.
     pub fn append_and_enforce_cap(&self, record: &OperationRecord) {
-        let Some(current) = self.append_row(record) else {
-            return;
-        };
-        self.enforce_cap(current);
+        self.append_at(record, Retention::EnforceCap, || Utc::now().date_naive());
     }
 
-    fn append_row(&self, record: &OperationRecord) -> Option<NaiveDate> {
+    fn append_at(
+        &self,
+        record: &OperationRecord,
+        retention: Retention,
+        date: impl FnOnce() -> NaiveDate,
+    ) {
         match self.switch {
             Switch::Enabled => {}
-            Switch::Disabled => return None,
+            Switch::Disabled => return,
         }
-        let date = Utc::now().date_naive();
-        let path = self.segment_path(date);
-        match self.write_line(&path, record) {
+        let lock_path = self.dir.join(LOCK_NAME);
+        let _lock = match self.lock_directory(&lock_path) {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.report_append_failure(&lock_path, &error);
+                return;
+            }
+        };
+        let date = date();
+        match self.write_line(date, record) {
             Ok(()) => self.shared.append_failure.reset(),
-            Err(error) => match self.shared.append_failure.trip() {
-                Failure::First => {
-                    tracing::warn!(path = %path.display(), %error, "operations log append failed");
-                }
-                Failure::Repeat => {
-                    tracing::debug!(path = %path.display(), %error, "operations log append failed again");
-                }
-            },
+            Err(error) => self.report_append_failure(&self.segment_path(date), &error),
         }
-        Some(date)
+        match retention {
+            Retention::AppendOnly => {}
+            Retention::EnforceCap => self.enforce_cap(date),
+        }
     }
 
-    fn write_line(&self, path: &Path, record: &OperationRecord) -> io::Result<()> {
+    fn lock_directory(&self, path: &Path) -> io::Result<File> {
+        std::fs::create_dir_all(&self.dir)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = match options.open(path) {
+            Ok(lock) => lock,
+            // A restrictive umask can leave the lock file read-only.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => File::open(path)?,
+            Err(error) => return Err(error),
+        };
+        lock.lock()?;
+        Ok(lock)
+    }
+
+    fn report_append_failure(&self, path: &Path, error: &io::Error) {
+        match self.shared.append_failure.trip() {
+            Failure::First => {
+                tracing::warn!(path = %path.display(), %error, "operations log append failed");
+            }
+            Failure::Repeat => {
+                tracing::debug!(path = %path.display(), %error, "operations log append failed again");
+            }
+        }
+    }
+
+    fn write_line(&self, date: NaiveDate, record: &OperationRecord) -> io::Result<()> {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
-        std::fs::create_dir_all(&self.dir)?;
         let mut options = OpenOptions::new();
         options.read(true).append(true).create(true);
         #[cfg(unix)]
@@ -162,7 +202,7 @@ impl OpLog {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(path)?;
+        let mut file = options.open(self.segment_path(date))?;
         file.lock()?;
         recover_unterminated_row(&mut file)?;
         file.write_all(&line)
@@ -388,6 +428,233 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    mod rollover {
+        use super::*;
+        use std::fs::TryLockError;
+        use std::process::{Child, Command};
+        use std::time::{Duration, Instant};
+
+        const CHILD_DIR: &str = "HALLOUMINATE_TEST_OPLOG_ROLLOVER_DIR";
+        const CHILD_OP: &str = "HALLOUMINATE_TEST_OPLOG_ROLLOVER_OP";
+        const READY: &str = "peer-ready";
+        const NEXT_DAY: &str = "next-day";
+
+        struct Peer(Child);
+
+        impl Drop for Peer {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn wait_for(mut condition: impl FnMut() -> bool, reason: &str) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !condition() {
+                assert!(Instant::now() < deadline, "{reason}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn start_peer(dir: &Path, op: &str) -> Peer {
+            let mut peer = Peer(
+                Command::new(std::env::current_exe().expect("test binary"))
+                    .args([
+                        "oplog::writer::tests::rollover::rollover_peer",
+                        "--exact",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_DIR, dir)
+                    .env(CHILD_OP, op)
+                    .spawn()
+                    .expect("spawn rollover peer"),
+            );
+            wait_for(
+                || {
+                    if dir.join(READY).exists() {
+                        return true;
+                    }
+                    assert_eq!(peer.0.try_wait().expect("poll rollover peer"), None);
+                    false
+                },
+                "peer did not reach the rollover barrier",
+            );
+            peer
+        }
+
+        fn finish_peer(mut peer: Peer) {
+            wait_for(
+                || {
+                    let Some(status) = peer.0.try_wait().expect("poll rollover peer") else {
+                        return false;
+                    };
+                    assert!(status.success(), "rollover peer failed: {status}");
+                    true
+                },
+                "peer did not finish after the lock holder returned",
+            );
+        }
+
+        fn row(op: &str) -> OperationRecord {
+            OperationRecord {
+                op: op.to_owned(),
+                ..record()
+            }
+        }
+
+        fn ops(contents: &str) -> Vec<String> {
+            let mut ops = Vec::new();
+            for line in contents.lines() {
+                let OperationRecord { op, .. } =
+                    serde_json::from_str(line).expect("complete operation row");
+                ops.push(op);
+            }
+            ops
+        }
+
+        #[test]
+        #[ignore = "child process of rollover tests"]
+        fn rollover_peer() {
+            let Some(dir) = std::env::var_os(CHILD_DIR) else {
+                return;
+            };
+            let dir = Path::new(&dir);
+            let op = std::env::var(CHILD_OP).expect("peer operation");
+            let lock = File::open(dir.join(LOCK_NAME)).expect("open rollover lock");
+            let blocked = match lock.try_lock() {
+                Ok(()) => false,
+                Err(TryLockError::WouldBlock) => true,
+                Err(TryLockError::Error(error)) => panic!("probe rollover lock: {error}"),
+            };
+            drop(lock);
+            if blocked {
+                std::fs::write(dir.join(READY), []).expect("signal peer is blocked");
+            }
+
+            let log = capped_log(dir, 1);
+            if op == "retention" {
+                log.append_at(&row(&op), Retention::EnforceCap, || {
+                    if blocked {
+                        let contents = std::fs::read_to_string(log.segment_path(date(15)))
+                            .expect("read yesterday before retention");
+                        assert_eq!(ops(&contents), ["seed", "writer"]);
+                    }
+                    date(16)
+                });
+            } else {
+                assert_eq!(op, "writer");
+                log.append_at(&row(&op), Retention::AppendOnly, || {
+                    if dir.join(NEXT_DAY).exists() {
+                        date(16)
+                    } else {
+                        date(15)
+                    }
+                });
+            }
+            if !blocked {
+                std::fs::write(dir.join(READY), []).expect("signal peer completed without waiting");
+            }
+        }
+
+        #[test]
+        fn rollover_writer_finishes_before_retention_unlinks_the_segment() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log = capped_log(dir.path(), 1);
+            File::create_new(dir.path().join(LOCK_NAME)).expect("seed coordination file");
+            log.append_at(&row("seed"), Retention::AppendOnly, || date(15));
+            let yesterday = log.segment_path(date(15));
+            let mut inode = File::open(&yesterday).expect("keep the original inode open");
+            let mut peer = None;
+            log.append_at(&row("writer"), Retention::AppendOnly, || {
+                let current = date(15);
+                peer = Some(start_peer(dir.path(), "retention"));
+                current
+            });
+            finish_peer(peer.expect("retention peer"));
+
+            let mut contents = String::new();
+            inode
+                .read_to_string(&mut contents)
+                .expect("read unlinked inode");
+            assert_eq!(ops(&contents), ["seed", "writer"]);
+            assert!(
+                !yesterday.exists(),
+                "retention must remove the completed segment"
+            );
+            let today = std::fs::read_to_string(log.segment_path(date(16))).expect("read today");
+            assert_eq!(ops(&today), ["retention"]);
+        }
+
+        #[test]
+        fn rollover_retention_finishes_before_the_waiting_writer_selects_its_date() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let log = capped_log(dir.path(), 1);
+            File::create_new(dir.path().join(LOCK_NAME)).expect("seed coordination file");
+            log.append_at(&row("seed"), Retention::AppendOnly, || date(15));
+            let mut peer = None;
+            log.append_at(&row("retention"), Retention::EnforceCap, || {
+                peer = Some(start_peer(dir.path(), "writer"));
+                std::fs::write(dir.path().join(NEXT_DAY), []).expect("advance UTC date");
+                date(16)
+            });
+            finish_peer(peer.expect("writer peer"));
+
+            let today = std::fs::read_to_string(log.segment_path(date(16))).expect("read today");
+            assert_eq!(ops(&today), ["retention", "writer"]);
+            assert!(
+                !log.segment_path(date(15)).exists(),
+                "retention must remove yesterday"
+            );
+        }
+    }
+
+    #[test]
+    fn size_cap_deletes_oldest_segments_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = record();
+        let row_bytes = u64::try_from(serde_json::to_vec(&first).expect("serialize").len() + 1)
+            .expect("row length");
+        let log = capped_log(dir.path(), 2000 + row_bytes);
+        let oldest = write_segment(&log, 13, 1000);
+        let middle = write_segment(&log, 14, 1000);
+        let newest = write_segment(&log, 15, 1000);
+        let unrelated = dir.path().join("hallouminate.log");
+        std::fs::write(&unrelated, vec![b'l'; 10_000]).expect("write unrelated log");
+
+        log.append_at(&first, Retention::EnforceCap, || date(16));
+        assert!(!oldest.exists(), "oldest segment must go first");
+        assert!(middle.exists(), "cap reached: middle segment must stay");
+        assert!(newest.exists(), "cap reached: newest old segment must stay");
+        let current = log.segment_path(date(16));
+        let first_line = serde_json::to_string(&first).expect("serialize first row");
+        assert_eq!(
+            std::fs::read_to_string(&current).expect("read current segment"),
+            format!("{first_line}\n")
+        );
+
+        let log = capped_log(dir.path(), 1);
+        let second = record();
+        log.append_at(&second, Retention::EnforceCap, || date(16));
+        assert!(!middle.exists(), "over the cap: older segments go");
+        assert!(!newest.exists(), "over the cap: older segments go");
+        assert!(unrelated.exists(), "non-segment files are outside the cap");
+        assert!(
+            dir.path().join(LOCK_NAME).exists(),
+            "the directory lock stays"
+        );
+
+        let third = record();
+        log.append_at(&third, Retention::AppendOnly, || date(16));
+        let second_line = serde_json::to_string(&second).expect("serialize second row");
+        let third_line = serde_json::to_string(&third).expect("serialize third row");
+        assert_eq!(
+            std::fs::read_to_string(&current).expect("read current segment"),
+            format!("{first_line}\n{second_line}\n{third_line}\n")
+        );
+    }
+
     #[test]
     fn append_recovers_a_partial_row_without_losing_complete_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -395,7 +662,9 @@ mod tests {
         let after = [record(), record()];
         let writer = capped_log(dir.path(), u64::MAX);
         let path = writer.segment_path(date(16));
-        writer.write_line(&path, &before).expect("write first row");
+        writer
+            .write_line(date(16), &before)
+            .expect("write first row");
         let interrupted = OperationRecord {
             corpus: Some("é".repeat(8192)),
             ..record()
@@ -416,7 +685,9 @@ mod tests {
                 scope.spawn(move || {
                     let dir = path.parent().expect("segment parent");
                     let reopened = capped_log(dir, u64::MAX);
-                    reopened.write_line(path, row).expect("write recovery row");
+                    reopened
+                        .write_line(date(16), row)
+                        .expect("write recovery row");
                 });
             }
         });
@@ -446,7 +717,7 @@ mod tests {
         let before = serde_json::to_string(&record()).expect("serialize first row");
         std::fs::write(&path, &before).expect("write first row without newline");
         let row = record();
-        writer.write_line(&path, &row).expect("write second row");
+        writer.write_line(date(16), &row).expect("write second row");
         let after = serde_json::to_string(&row).expect("serialize second row");
         let contents = std::fs::read_to_string(&path).expect("read recovered segment");
         assert_eq!(contents, format!("{before}\n{after}\n"));

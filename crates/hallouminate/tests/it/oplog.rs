@@ -16,11 +16,11 @@ use hallouminate_daemon::{
     AddMarkdownRequest, DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind,
     GroundRequest, connect_at,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
-use crate::common::daemon::DaemonHarness;
-use crate::common::oplog_support::{Fixture, docs_config, fixture_with};
+use crate::common::daemon::{DaemonHarness, read_segment_rows, segment_paths};
+use crate::common::oplog_support::{Fixture, docs_config, fixture_for, fixture_with, toml_path};
 
 const CHILD_DIR_ENV: &str = "HALLOUMINATE_OPLOG_TEST_DIR";
 const CHILD_ID_ENV: &str = "HALLOUMINATE_OPLOG_TEST_CHILD";
@@ -32,7 +32,6 @@ const OLD_SEGMENT_BYTES: usize = 1000;
 const IPC_LINE_CAP_BYTES: usize = 4 * 1024 * 1024;
 const IN_FLIGHT_WAIT: Duration = Duration::from_secs(5);
 const IN_FLIGHT_POLL: Duration = Duration::from_millis(10);
-const CLOSE_SETTLE: Duration = Duration::from_millis(300);
 
 fn record(tool: String, corpus: Option<String>) -> OperationRecord {
     OperationRecord {
@@ -69,16 +68,6 @@ fn write_old_segment(dir: &Path, date: &str) -> PathBuf {
     let path = dir.join(format!("operations-{date}.jsonl"));
     std::fs::write(&path, vec![b'x'; OLD_SEGMENT_BYTES]).expect("write old segment");
     path
-}
-
-fn file_names(dir: &Path) -> Vec<String> {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir).expect("read dir") {
-        let entry = entry.expect("dir entry");
-        names.push(entry.file_name().to_string_lossy().into_owned());
-    }
-    names.sort();
-    names
 }
 
 fn read_rows(path: &Path) -> Vec<OperationRecord> {
@@ -167,6 +156,7 @@ fn new_operation_log_mode_respects_umask() {
             "umask {mask}: got {actual_mode:04o}, expected {expected_mode:04o}"
         );
         let rows = read_rows(&segment);
+        assert_eq!(mode(&dir.join("operations.lock")), expected_mode);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].op, "status");
         assert_eq!(mode(&dir), 0o755);
@@ -247,8 +237,8 @@ fn concurrent_process_appends_keep_whole_lines() {
 
     let mut per_child = vec![0usize; CHILDREN];
     let mut total = 0;
-    for name in file_names(dir.path()) {
-        for row in read_rows(&dir.path().join(name)) {
+    for path in segment_paths(dir.path()) {
+        for row in read_rows(&path) {
             let OperationRecord { corpus, kind, .. } = row;
             let child: usize = corpus.expect("child id").parse().expect("numeric child id");
             let RecordKind::ClientCall(ClientCallFields { tool, .. }) = kind else {
@@ -261,50 +251,6 @@ fn concurrent_process_appends_keep_whole_lines() {
     }
     assert_eq!(total, CHILDREN * ROWS_PER_CHILD);
     assert_eq!(per_child, vec![ROWS_PER_CHILD; CHILDREN]);
-}
-
-#[test]
-fn size_cap_deletes_oldest_segments_only() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let oldest = write_old_segment(dir.path(), "2020-01-01");
-    let middle = write_old_segment(dir.path(), "2020-01-02");
-    let newest = write_old_segment(dir.path(), "2020-01-03");
-    let unrelated = dir.path().join("hallouminate.log");
-    std::fs::write(&unrelated, vec![b'l'; 10 * OLD_SEGMENT_BYTES]).expect("write log");
-
-    let row = record("ground".to_owned(), None);
-    let row_bytes =
-        u64::try_from(serde_json::to_vec(&row).expect("serialize").len() + 1).expect("row length");
-    let two_old = u64::try_from(2 * OLD_SEGMENT_BYTES).expect("bytes");
-    let daemon = OpLog::in_dir(dir.path(), &config(two_old + row_bytes));
-    let before = Utc::now().date_naive();
-    daemon.append_and_enforce_cap(&row);
-    let after = Utc::now().date_naive();
-    let current = current_segment(dir.path(), before, after);
-
-    assert!(!oldest.exists(), "oldest segment must go first");
-    assert!(middle.exists(), "cap reached: middle segment must stay");
-    assert!(newest.exists(), "cap reached: newest old segment must stay");
-    assert!(unrelated.exists(), "non-segment files are outside the cap");
-    assert_eq!(read_rows(&current), vec![row]);
-
-    let daemon = OpLog::in_dir(dir.path(), &config(1));
-    let second = record("ground".to_owned(), None);
-    daemon.append_and_enforce_cap(&second);
-    assert!(!middle.exists(), "over the cap: older segments go");
-    assert!(!newest.exists(), "over the cap: older segments go");
-    assert!(current.exists(), "the current segment is never deleted");
-
-    let client = OpLog::in_dir(dir.path(), &config(1));
-    let third = record("status".to_owned(), None);
-    client.append(&third);
-    let current = current_segment(dir.path(), before, Utc::now().date_naive());
-    let rows = read_rows(&current);
-    assert_eq!(
-        rows.last(),
-        Some(&third),
-        "rows keep landing in the current segment"
-    );
 }
 
 #[test]
@@ -332,7 +278,7 @@ fn segment_name_is_utc_date_and_clients_delete_none() {
     assert_eq!(read_rows(&current), vec![row]);
     assert!(old.exists(), "a client append must delete no segment");
     assert!(older.exists(), "a client append must delete no segment");
-    assert_eq!(file_names(dir.path()).len(), 3);
+    assert_eq!(segment_paths(dir.path()).len(), 3);
 }
 
 #[test]
@@ -417,14 +363,8 @@ fn segment_values(dir: &Path) -> Vec<serde_json::Value> {
 }
 
 fn segment_text(dir: &Path) -> String {
-    let mut names = Vec::new();
-    for entry in std::fs::read_dir(dir).expect("state dir") {
-        let path = entry.expect("dir entry").path();
-        names.push(path);
-    }
-    names.sort();
     let mut text = String::new();
-    for path in names {
+    for path in segment_paths(dir) {
         text.push_str(&std::fs::read_to_string(path).expect("read segment"));
     }
     text
@@ -742,11 +682,15 @@ async fn row_values_are_well_formed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warnings_are_counted_and_coded() {
+    let tmp = tempfile::Builder::new()
+        .prefix("oplog-\"quoted\"-")
+        .tempdir()
+        .expect("quoted tempdir");
     let Fixture {
         _tmp,
         harness,
         corpus_root: outside_root,
-    } = fixture().await;
+    } = fixture_for(tmp, "").await;
     let lint = RequestId::generate();
     let body = "# Notes\n\nSee [the spec]() for details.\n\n```mermaid\n```\n";
     let response = send(
@@ -773,9 +717,9 @@ async fn warnings_are_counted_and_coded() {
     std::fs::write(
         harness.cwd().join(".hallouminate/config.toml"),
         format!(
-            "[[corpus]]\nname = \"mixed\"\npaths = [\"{}\", \"{}\"]\nglobs = [\"**/*.md\"]\n",
-            inside_root.display(),
-            outside_root.display()
+            "[[corpus]]\nname = \"mixed\"\npaths = [{}, {}]\nglobs = [\"**/*.md\"]\n",
+            toml_path(&inside_root),
+            toml_path(&outside_root)
         ),
     )
     .expect("write repo layer");
@@ -1032,22 +976,27 @@ async fn client_disconnect_keeps_operation_outcome() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_without_request_writes_no_row() {
-    let Fixture { harness, .. } = fixture().await;
-    let stream = UnixStream::connect(harness.socket())
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (cfg, _corpus_root) = docs_config(tmp.path(), "");
+    let state = tmp.path().join("state");
+    let log = OpLog::in_dir(&state, &cfg.logging);
+    let harness = DaemonHarness::spawn_with_oplog_writer(cfg, log).await;
+    let mut stream = UnixStream::connect(harness.socket())
         .await
         .expect("connect");
-    drop(stream);
-    tokio::time::sleep(CLOSE_SETTLE).await;
+    stream.shutdown().await.expect("send EOF");
 
-    let barrier = RequestId::generate();
-    send(
-        &harness,
-        DaemonRequest::new(harness.cwd().to_path_buf(), DaemonRequestPayload::Ping)
-            .with_request_id(barrier.clone()),
-    )
-    .await;
-    harness.row_for(barrier.as_str()).await;
-    for row in harness.rows() {
-        assert_eq!(row.op, "ping", "only pings ran: {row:?}");
+    let mut byte = [0];
+    let count = tokio::time::timeout(IN_FLIGHT_WAIT, stream.read(&mut byte))
+        .await
+        .expect("daemon closes the empty connection")
+        .expect("read from the daemon");
+    assert_eq!(count, 0, "daemon must not reply to an empty connection");
+    harness.shutdown().await.expect("drain connection handlers");
+
+    let rows = read_segment_rows(&state);
+    assert!(!rows.is_empty(), "the readiness ping must write a row");
+    for row in rows {
+        assert_eq!(row.op, "ping", "only the readiness ping ran: {row:?}");
     }
 }
