@@ -61,9 +61,10 @@ namespaces enabled. Use standalone Claude Code and Hallouminate executables.
 Set `AGENT_BENCH_CLAUDE_BIN` or `AGENT_BENCH_HALLOUMINATE_BIN` if the PATH
 entry is a package-manager wrapper. Authenticate via `ANTHROPIC_API_KEY`
 or `CLAUDE_CODE_OAUTH_TOKEN`; the measurement cannot use host home files.
-The agent retains network access to the model service. The daemon can
-fetch its default retrieval model. Neither gets the host home or socket
-directories.
+The agent retains network access to the model service. The private daemons
+share a temporary retrieval-model cache for the sweep. Their startup can
+take up to ten minutes, and they do not exit when idle. Neither the agent
+nor the daemon gets the host home or socket directories.
 
 Clone each subject repo to `<checkout_root>/<name>`. Check out the pinned
 commit. Author the wiki in the checkout before measuring.
@@ -237,6 +238,8 @@ the same fingerprint and never overwrites an earlier transcript.
 Automated grades bind the complete session record and exact grading inputs.
 `bench-judge` and `bench-report` reject stale or legacy grades.
 After replacing a session, use `bench-judge --force` to regenerate grades.
+An interrupted forced regrade keeps completed replacements and untouched
+valid grades. A normal rerun grades any sessions still missing a valid grade.
 For a custom `--pass-threshold`, pass the same value to `bench-report`.
 
 ## Known confounds

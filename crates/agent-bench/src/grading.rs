@@ -23,6 +23,12 @@ pub struct Grading {
     threshold: u8,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaleGrades {
+    Reject,
+    Omit,
+}
+
 impl Grading {
     /// Load the pinned inputs for an existing session ledger.
     ///
@@ -120,28 +126,59 @@ impl Grading {
         path: &Path,
         sessions: &HashMap<TrialKey<'_>, &SessionRecord>,
     ) -> anyhow::Result<Vec<BoundGrade>> {
+        self.read_grades_with(path, sessions, StaleGrades::Reject)
+    }
+
+    /// Returns the existing grades that a forced regrade can retain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ledger cannot be read or has duplicate grades.
+    pub fn read_grades_for_regrade(
+        &self,
+        path: &Path,
+        sessions: &HashMap<TrialKey<'_>, &SessionRecord>,
+    ) -> anyhow::Result<Vec<BoundGrade>> {
+        self.read_grades_with(path, sessions, StaleGrades::Omit)
+    }
+
+    fn read_grades_with(
+        &self,
+        path: &Path,
+        sessions: &HashMap<TrialKey<'_>, &SessionRecord>,
+        stale: StaleGrades,
+    ) -> anyhow::Result<Vec<BoundGrade>> {
         let records: Vec<BoundGrade> =
             read_jsonl(path).context("reading bound grades; legacy grades must be regenerated")?;
         let mut seen = std::collections::HashSet::new();
-        for entry in &records {
+        let mut retained = Vec::new();
+        for entry in records {
             let key = grade_key(&entry.grade);
-            if !seen.insert(key) {
+            if !seen.insert((key.0.to_owned(), key.1, key.2)) {
                 bail!("duplicate grade for {key:?}");
             }
-            let session = sessions
-                .get(&key)
-                .with_context(|| format!("grade for {key:?} has no matching session"))?;
+            let Some(session) = sessions.get(&key) else {
+                ensure!(
+                    stale == StaleGrades::Omit,
+                    "grade for {key:?} has no matching session"
+                );
+                continue;
+            };
             let (session_hash, grading_hash) = self.identities(session, &self.prompt(session)?)?;
+            let reusable = entry.session_hash == session_hash
+                && entry.grading_hash == grading_hash
+                && session.exit_status == 0
+                && entry.grade.score <= 5
+                && entry.grade.pass == GradeRecord::passes(entry.grade.score, self.threshold);
             ensure!(
-                entry.session_hash == session_hash
-                    && entry.grading_hash == grading_hash
-                    && session.exit_status == 0
-                    && entry.grade.score <= 5
-                    && entry.grade.pass == GradeRecord::passes(entry.grade.score, self.threshold),
+                reusable || stale == StaleGrades::Omit,
                 "stale or invalid grade for {key:?}; regenerate the grades"
             );
+            if reusable {
+                retained.push(entry);
+            }
         }
-        Ok(records)
+        Ok(retained)
     }
 }
 

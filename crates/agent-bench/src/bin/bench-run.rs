@@ -82,12 +82,13 @@ fn main() -> anyhow::Result<()> {
     let checkouts = resolve_checkouts(&repo_root(), &manifest)?;
     let hallouminate = resolve_executable("AGENT_BENCH_HALLOUMINATE_BIN", "hallouminate")?;
     let agent_hash = blake3_file_hash(&bin)?;
-    let sandbox = Sandbox::new(hallouminate);
     let scratch = tempfile::tempdir_in("/tmp")?;
+    let sandbox = Sandbox::new(hallouminate, scratch.path())?;
+    let subjects = scratch.path().join("subjects");
     let mut views = HashMap::new();
     for repo in &manifest.subject_repos {
         let checkout = &checkouts[&repo.name];
-        let view = Views::prepare(scratch.path().join(&repo.name), checkout, &repo.commit)
+        let view = Views::prepare(subjects.join(&repo.name), checkout, &repo.commit)
             .with_context(|| format!("preparing isolated views for {:?}", repo.name))?;
         views.insert(repo.name.as_str(), view);
     }

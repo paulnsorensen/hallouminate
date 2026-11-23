@@ -12,7 +12,15 @@ use serde_json::{Value, json};
 const CORPUS: &str = "benchmark-wiki";
 const WORKSPACE: &str = "/workspace";
 const SOCKET: &str = "/run/bench/daemon.sock";
-const DAEMON_CONFIG: &str = r#"[[corpus]]
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(600);
+const MODEL_CACHE: &str = "/model-cache";
+const DAEMON_CONFIG: &str = r#"[daemon]
+idle_exit_secs = 0
+
+[embeddings]
+cache_dir = "/model-cache/fastembed"
+
+[[corpus]]
 name = "benchmark-wiki"
 paths = ["/knowledge/wiki"]
 "#;
@@ -23,6 +31,7 @@ const WIKI_MCP: &[u8] = include_bytes!("../../../../../eval/agent-bench/config/w
 pub(super) struct Sandbox {
     bwrap: PathBuf,
     hallouminate: PathBuf,
+    model_cache: PathBuf,
 }
 
 pub(super) struct Views {
@@ -33,11 +42,14 @@ pub(super) struct Views {
 }
 
 impl Sandbox {
-    pub(super) fn new(hallouminate: PathBuf) -> Self {
-        Self {
+    pub(super) fn new(hallouminate: PathBuf, scratch: &Path) -> anyhow::Result<Self> {
+        let model_cache = scratch.join("models");
+        fs::create_dir(&model_cache)?;
+        Ok(Self {
             bwrap: PathBuf::from("/usr/bin/bwrap"),
             hallouminate,
-        }
+            model_cache,
+        })
     }
 
     pub(super) fn fingerprint(&self) -> anyhow::Result<String> {
@@ -148,8 +160,14 @@ impl Sandbox {
         command
             .arg("--bind")
             .arg(views.root.join("wiki/socket"))
-            .arg("/run/bench");
+            .arg("/run/bench")
+            .arg("--bind")
+            .arg(&self.model_cache)
+            .arg(MODEL_CACHE);
         command.args([
+            "--setenv",
+            "HF_HOME",
+            MODEL_CACHE,
             "--setenv",
             "HALLOUMINATE_SOCKET",
             SOCKET,
@@ -171,12 +189,19 @@ impl Sandbox {
                 .spawn()
                 .context("starting private wiki daemon")?,
         );
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         while !views.socket().exists() {
-            if daemon.0.try_wait()?.is_some() || Instant::now() >= deadline {
+            if let Some(status) = daemon.0.try_wait()? {
                 bail!(
-                    "private wiki daemon did not start: {}",
-                    fs::read_to_string(log).unwrap_or_default()
+                    "private wiki daemon did not start ({status}): {}",
+                    fs::read_to_string(&log).unwrap_or_default()
+                );
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "private wiki daemon did not start within {} s: {}",
+                    DAEMON_START_TIMEOUT.as_secs(),
+                    fs::read_to_string(&log).unwrap_or_default()
                 );
             }
             std::thread::sleep(Duration::from_millis(50));

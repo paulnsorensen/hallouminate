@@ -87,6 +87,7 @@ assert not Path(".git").exists()
 assert not Path("untracked.txt").exists()
 assert not Path(".hallouminate").exists()
 assert not Path("/knowledge/wiki").exists()
+assert not Path("/model-cache").exists()
 assert list(Path("/home").iterdir()) == [Path("/home/bench")]
 try:
     Path("README.md").write_text("write test")
@@ -101,6 +102,15 @@ if servers:
     assert set(servers) == {"hallouminate"}
     assert os.environ["HALLOUMINATE_SOCKET"] == "/run/bench/daemon.sock"
     assert Path("/run/bench/daemon.sock").is_socket()
+    status = subprocess.run(
+        ["/opt/hallouminate", "daemon", "status"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout
+    assert status.startswith("running\n") and "  maintenance:" in status, status
+    assert "  idle_exit:" not in status, status
     answer = read_wiki(servers["hallouminate"])
 else:
     assert "HALLOUMINATE_SOCKET" not in os.environ
