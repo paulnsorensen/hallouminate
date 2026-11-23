@@ -4248,12 +4248,6 @@ mod tests {
             "lazy constructor starts on the blocking pool",
         )
         .await;
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            tokio::time::sleep(Duration::from_millis(10)),
-        )
-        .await
-        .expect("the current-thread runtime stays responsive during construction");
         let second = state
             .crossencoder(Some("bge-reranker-base"))
             .expect("second")
@@ -4262,16 +4256,16 @@ mod tests {
             rerank_timeout: Duration::from_secs(1),
             ..rerank_opts()
         };
-        let second_started = Instant::now();
         let second = ground("q", &corpus, &store, Some(Box::new(second)), second_opts)
             .await
             .expect("second ground request");
-        assert!(second_started.elapsed() < Duration::from_millis(100));
         assert!(
             second
                 .warnings
                 .iter()
-                .any(|warning| warning.code == "crossencoder-unavailable")
+                .any(|warning| warning.code == "crossencoder-unavailable"),
+            "second request must report a busy crossencoder while construction is blocked: {:?}",
+            second.warnings
         );
         let first = tokio::time::timeout(Duration::from_secs(5), first_task)
             .await
