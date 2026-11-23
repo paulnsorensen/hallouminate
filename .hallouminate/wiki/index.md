@@ -20,6 +20,7 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [operation-outcome-record-001](operation-outcome-record-001.md) — why operation outcomes and stage timing go to a dedicated local log, not to OpenTelemetry or the tracing log (#454, #456; accepted, not implemented).
 - [operation-outcome-record-002](operation-outcome-record-002.md) — why one call writes a daemon row and a client row joined by `request_id`.
 - [operation-outcome-record-003](operation-outcome-record-003.md) — why every MCP tool response carries the `request_id` and no timing block.
+- [daemon-version-skew](daemon-version-skew.md) — how `serve` compares build identities with a running daemon: restart only an older one within a channel, restart on any mismatch across nightly and release (#744).
 - [daemon-canonical-identity-003](daemon-canonical-identity-003.md) — store-lock owner diagnostics: what the `store.lock` metadata names, and why a second advisory guard proves it is current.
 - [debt-observed-test-isolation](debt-observed-test-isolation.md) — why the process-wide `debt::OBSERVED` static makes any Hard-recording test break concurrent maintenance-defer tests.
 - [design-rationale](design-rationale.md) — what hallouminate deliberately *is* and *isn't*, and why — the "why this design not that one" page.
@@ -39,12 +40,12 @@ and the per-session reports under `.cheese/` (corpus `cheese-local`).
 - [lancedb-adapter-notes](lancedb-adapter-notes.md) — how `lance.rs` uses the `lancedb` crate, why 0.38 to 0.40 failed to compile with default features before the 0.41 bump merged, the exhaustive `IndexType` match, the unverified first-create crash-recovery risk (#682), and the ranked backlog of unused lancedb features (scalar indexes, scan projection, explicit distance type).
 - [maintenance-compaction-index-deltas](maintenance-compaction-index-deltas.md) — why `maintain` merges index deltas before compaction: per-batch ANN deltas split every compaction bin, so Hard debt never drained (issue #463).
 - [mcp-surface](mcp-surface.md) — the ten MCP tools the LLM uses to author and search wikis, including `add_markdown`'s surgical edit modes and the multi-root read/write asymmetry.
-- [multi-format-ingestion](multi-format-ingestion.md) — the shipped Phase 1 per-format dispatch (markdown/text/RST/spreadsheet), why the wiki corpus stays markdown-only, and what (PDF/office/code) is still deferred.
+- [multi-format-ingestion](multi-format-ingestion.md) — the shipped per-format dispatch (markdown, text, RST, spreadsheet, PDF, JSON, JSONL), why the wiki corpus stays markdown-only, and what (office, code, OCR) is still deferred.
 - [not-found-suggestions](not-found-suggestions.md) — how an unknown-corpus error and a `read_markdown` path miss self-enrich with `strsim` closest-match hints so a caller recovers in zero extra round trips.
 - [office-prose-extraction](office-prose-extraction.md) — deferred/future-phase plan for .docx/.pptx/.odt prose extraction (not shipped today).
 - [ort-arena-retention](ort-arena-retention.md) — why session eviction never reclaimed embedder memory: upstream ONNX Runtime BFCArena retention; superseded by daemon idle-exit.
 - [ort-coreml-device-policy](ort-coreml-device-policy.md) — why every ONNX session sets `PreferCPU`: `ort` rc.15's default policy runs the embedder on CoreML on macOS (~21 GB); the placement test and the Renovate hold that guard it.
-- [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — deferred/future-phase plan for PDF and OCR ingestion (not shipped today).
+- [pdf-ocr-ingestion](pdf-ocr-ingestion.md) — shipped text-layer PDF extraction with `page:N` breadcrumbs and its failure policy; OCR for scanned pages stays deferred.
 - [racy-mtime-smudge](racy-mtime-smudge.md) — why stored file mtimes are deliberately smudged by one millisecond at the write seam rather than fixing the equality gates.
 - [release-ceremony](release-ceremony.md) — release-flow gotchas the scripts don't tell you, learned cutting real releases.
 - [search-reliability-loop-001](search-reliability-loop-001.md) — ADR-001: verify authored knowledge with retrieval probes frozen *before* drafting, and give durable external research its own corpus-local source page.
