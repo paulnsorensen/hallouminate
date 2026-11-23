@@ -88,7 +88,8 @@ jobs:
 
   windows-daemon:
     name: windows daemon (clippy + test)
-    runs-on: windows-latest
+    runs-on: windows-2022
+    timeout-minutes: 60
     env:
       CARGO_INCREMENTAL: "0"
     steps:
