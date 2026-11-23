@@ -1436,6 +1436,10 @@ fn parse(text: &str, source: Option<&Path>) -> Result<Config> {
             .unwrap_or_default();
         HallouminateError::Config(format!("parsing config{where_}: {e}"))
     })?;
+    cfg.storage.ground_dir = isolate_dev_ground_dir(
+        channel::BUILD_CHANNEL,
+        std::mem::take(&mut cfg.storage.ground_dir),
+    );
     normalize(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
@@ -1635,6 +1639,21 @@ fn default_ground_dir() -> String {
 fn ground_dir_for(channel: channel::BuildChannel) -> String {
     format!("~/.local/share/{}/ground", channel.app_dir())
 }
+/// Old config templates wrote the release ground directory explicitly. A dev
+/// build treats that value as unset so it never opens the release store.
+fn isolate_dev_ground_dir(channel: channel::BuildChannel, ground_dir: String) -> String {
+    match channel {
+        channel::BuildChannel::Release => ground_dir,
+        channel::BuildChannel::Dev => {
+            let release = ground_dir_for(channel::BuildChannel::Release);
+            if ground_dir == release || expand_tilde(&ground_dir) == expand_tilde(&release) {
+                ground_dir_for(channel::BuildChannel::Dev)
+            } else {
+                ground_dir
+            }
+        }
+    }
+}
 fn default_idle_exit_secs() -> u64 {
     900
 }
@@ -1828,7 +1847,10 @@ ground_dir = "~/.local/share/hallouminate/ground"
         assert_eq!(cfg.embeddings.cache_dir, "~/.cache/hallouminate/fastembed");
 
         assert_eq!(cfg.watch.debounce_ms, 500);
-        assert_eq!(cfg.storage.ground_dir, "~/.local/share/hallouminate/ground");
+        assert_eq!(
+            cfg.storage.ground_dir,
+            ground_dir_for(channel::BUILD_CHANNEL)
+        );
     }
 
     #[test]
@@ -4173,8 +4195,41 @@ path = "."
         .expect("explicit paths");
         assert_eq!(cfg.storage.ground_dir, "/explicit/ground");
         assert_eq!(cfg.embeddings.cache_dir, "/explicit/cache");
-        for channel in [channel::BuildChannel::Release, channel::BuildChannel::Dev] {
-            assert_ne!(cfg.storage.ground_dir, ground_dir_for(channel));
+    }
+
+    #[test]
+    fn old_template_ground_dir_follows_the_build_channel() {
+        let expanded = expand_tilde(&ground_dir_for(channel::BuildChannel::Release));
+        let expanded = expanded.to_string_lossy();
+        for written in [
+            ground_dir_for(channel::BuildChannel::Release),
+            expanded.into_owned(),
+        ] {
+            let cfg = parse(&format!("[storage]\nground_dir = \"{written}\"\n"), None)
+                .expect("old template ground_dir");
+            assert_eq!(
+                cfg.storage.ground_dir,
+                ground_dir_for(channel::BUILD_CHANNEL),
+                "written as {written}"
+            );
         }
+    }
+
+    #[test]
+    fn dev_build_redirects_only_the_release_ground_dir() {
+        let release = ground_dir_for(channel::BuildChannel::Release);
+        let dev = ground_dir_for(channel::BuildChannel::Dev);
+        assert_eq!(
+            isolate_dev_ground_dir(channel::BuildChannel::Dev, release.clone()),
+            dev
+        );
+        assert_eq!(
+            isolate_dev_ground_dir(channel::BuildChannel::Release, release.clone()),
+            release
+        );
+        assert_eq!(
+            isolate_dev_ground_dir(channel::BuildChannel::Dev, "/explicit/ground".into()),
+            "/explicit/ground"
+        );
     }
 }

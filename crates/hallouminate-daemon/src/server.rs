@@ -488,6 +488,9 @@ pub async fn serve(state: &DaemonState, socket_path: &Path) -> anyhow::Result<()
 /// so integration tests can exercise the timeout behavior without waiting
 /// out the real 30s default.
 ///
+/// Unlike `serve_with_config`, which exits quietly with `Ok` when another
+/// daemon holds the startup lock, this returns an error in that case.
+///
 /// The Tokio runtime must use the multi-thread scheduler because request
 /// handlers use `block_in_place` for synchronous index and storage work.
 pub async fn serve_with_idle_timeout(
@@ -785,13 +788,13 @@ fn idle_clock_for_response(
     }
 }
 
-fn lock_path_for(socket_path: &Path) -> PathBuf {
+pub(super) fn lock_path_for(socket_path: &Path) -> PathBuf {
     let mut s = socket_path.as_os_str().to_os_string();
     s.push(".lock");
     PathBuf::from(s)
 }
 
-enum InstanceLock {
+pub(super) enum InstanceLock {
     Acquired(std::fs::File),
     HeldByAnother,
 }
@@ -800,7 +803,7 @@ enum InstanceLock {
 /// The acquired file holds the lock; closing the fd releases it (POSIX). A
 /// second daemon on the same socket sees `EWOULDBLOCK` and gets
 /// `HeldByAnother`. Any other open or lock failure is an error.
-fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<InstanceLock> {
+pub(super) fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<InstanceLock> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 

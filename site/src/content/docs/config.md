@@ -169,6 +169,13 @@ All other builds are dev builds. Examples are `cargo build` or `cargo test`
 in a checkout or worktree, and `cargo install --path`. A release profile
 does not make a build a release build.
 
+Packagers: `cargo install --git`, `cargo install --path`, and distro or Nix
+builds from a git tarball are dev builds. Set `HALLOUMINATE_RELEASE_CHANNEL`
+at build time to make them release builds.
+
+`hallouminate --version` prints the channel after the version, for example
+`hallouminate 0.12.2 (stable)`. A dev build prints `(dev)`.
+
 A dev build replaces the `hallouminate` directory name with
 `hallouminate-dev` in these defaults:
 

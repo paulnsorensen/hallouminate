@@ -56,7 +56,7 @@ jobs:
         run: |
           set -euo pipefail
           want="${{ needs.resolve.outputs.version }}"
-          got="$(npx --yes hallouminate@latest --version | tail -n1 | awk '{print $NF}')"
+          got="$(npx --yes hallouminate@latest --version | tail -n1 | awk '{print $2}')"
           echo "release=$want  npx@latest=$got  ($(uname -sm))"
           if [ "$got" != "$want" ]; then
             echo "::error::npx hallouminate@latest reported '$got', expected release '$want'"

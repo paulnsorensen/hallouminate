@@ -15,9 +15,20 @@ pub enum BuildChannel {
     Dev,
 }
 
+const RELEASE_MARKER: Option<&str> = option_env!("HALLOUMINATE_RELEASE_CHANNEL");
+
 /// The channel of this binary, fixed at compile time.
-pub const BUILD_CHANNEL: BuildChannel =
-    BuildChannel::from_marker(option_env!("HALLOUMINATE_RELEASE_CHANNEL"));
+pub const BUILD_CHANNEL: BuildChannel = BuildChannel::from_marker(RELEASE_MARKER);
+
+/// The marker text of this binary, for example `stable` or `nightly`, or
+/// `dev` for a build without a marker. `hallouminate --version` prints it.
+pub const fn build_label() -> &'static str {
+    match RELEASE_MARKER {
+        Some(value) if !value.is_empty() => value,
+        Some(_) => "dev",
+        None => "dev",
+    }
+}
 
 impl BuildChannel {
     /// Returns [`BuildChannel::Release`] for a non-empty marker, else
@@ -53,6 +64,19 @@ impl BuildChannel {
         match self {
             Self::Release => "hallouminate",
             Self::Dev => "hallouminate-dev",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_label_is_dev_exactly_when_the_build_is_dev() {
+        match BUILD_CHANNEL {
+            BuildChannel::Release => assert_ne!(build_label(), "dev"),
+            BuildChannel::Dev => assert_eq!(build_label(), "dev"),
         }
     }
 }

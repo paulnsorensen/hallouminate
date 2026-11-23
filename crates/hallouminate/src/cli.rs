@@ -67,10 +67,21 @@ pub enum OutputArg {
 }
 
 #[derive(Debug, Parser)]
-#[command(version, about, long_about = None)]
+#[command(version = version_with_channel(), about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+}
+
+fn version_with_channel() -> &'static str {
+    static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VERSION.get_or_init(|| {
+        format!(
+            "{} ({})",
+            env!("CARGO_PKG_VERSION"),
+            hallouminate_config::channel::build_label()
+        )
+    })
 }
 
 impl Cli {
@@ -506,6 +517,18 @@ fn render_status_report(report: &hallouminate_daemon::StatusReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_output_names_the_build_channel() {
+        let error = Cli::try_parse_from(["hallouminate", "--version"])
+            .expect_err("--version exits through clap");
+        let expected = format!(
+            "hallouminate {} ({})\n",
+            env!("CARGO_PKG_VERSION"),
+            hallouminate_config::channel::build_label()
+        );
+        assert_eq!(error.to_string(), expected);
+    }
 
     #[test]
     fn parses_index_subcommand() {

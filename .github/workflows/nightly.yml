@@ -148,6 +148,22 @@ jobs:
         # Native build (host target == matrix.target on each pinned runner).
         run: cargo build --release --locked
 
+      - name: Guard release channel
+        shell: bash
+        # A binary built without HALLOUMINATE_RELEASE_CHANNEL reports `dev` and
+        # would move installed users to empty hallouminate-dev directories.
+        run: |
+          set -euo pipefail
+          version_line="$(target/release/hallouminate --version)"
+          echo "$version_line"
+          case "$version_line" in
+            *" (nightly)") ;;
+            *)
+              echo "::error::nightly binary reports '$version_line', expected the nightly channel"
+              exit 1
+              ;;
+          esac
+
       - name: Package
         shell: bash
         # Match the cargo-dist artifact shape the install shim expects:
