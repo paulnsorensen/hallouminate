@@ -1,12 +1,9 @@
 # Multi-format ingestion
 
-Hallouminate is **no longer markdown-only**. The indexer routes five format
-families — markdown, plain text, reStructuredText, spreadsheets, text-layer
-PDFs, and JSON or JSON Lines — each to its own handler, following the per-format-dispatch design this
-page previously argued for. The single most important nuance: **the wiki corpus
-you author into is still markdown-only**; multi-format applies to the non-wiki
-corpora (`repo:NAME:corpus` and explicit `[[corpus]]` entries). This page records
-what shipped, why, and what remains deferred.
+The indexer routes seven formats: Markdown, plain text, reStructuredText,
+spreadsheets, text-layer PDF, JSON, and JSON Lines. Each format has its
+own handler. The managed wiki corpus remains Markdown-only. Other corpora
+(`repo:NAME:corpus` and explicit `[[corpus]]` entries) can select the other formats.
 
 Full research evidence behind the crate/pattern choices lives in two on-disk
 artifacts:
@@ -87,9 +84,9 @@ new corpus kind. `RepoCorpusKind` still has only `Wiki` and (source) `Corpus` �
 there is **no `Code` variant** (`RepoCorpusKind::Code` finds nothing in the
 tree). The derived wiki corpus keeps `globs: ["**/*.md"]`
 (`crates/hallouminate-domain/src/repository.rs::repository_wiki_corpus`), so
-authored wikis stay markdown-only; the derived `repo:NAME:corpus` source corpus
-and user `[[corpus]]` entries are where text, RST, spreadsheet, PDF, and JSON files get
-indexed when their globs select those extensions.
+authored wikis stay Markdown-only. The repository source corpus
+(`repo:NAME:corpus`) and explicit `[[corpus]]` entries index text, RST,
+spreadsheet, PDF, JSON, and JSON Lines files when their globs select those extensions.
 This resolves the old "corpus wiring" open question.
 
 ## Dependencies added
