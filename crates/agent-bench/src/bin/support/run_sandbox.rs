@@ -110,15 +110,6 @@ impl Sandbox {
 
     pub(super) fn agent(&self, views: &Views, arm: Arm, binary: &Path) -> Command {
         let mut command = self.arm(views, arm);
-        // The agent must reach the configured model service. No host home or
-        // host socket directories are mounted into either measurement arm.
-        command.arg("--share-net");
-        for key in ["ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] {
-            if let Some(value) = std::env::var_os(key) {
-                // Put secrets in the environment, not in Bubblewrap's argv.
-                command.env(key, value);
-            }
-        }
         bind_read_only(&mut command, binary, "/opt/agent");
         command.args(["--", "/opt/agent"]);
         command

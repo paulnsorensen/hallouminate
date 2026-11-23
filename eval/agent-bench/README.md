@@ -56,15 +56,20 @@ pilot results.
 
 ### Preparing subject-repo checkouts
 
-Run the measurement on Linux with Bubblewrap at `/usr/bin/bwrap` and user
-namespaces enabled. Use standalone Claude Code and Hallouminate executables.
-Set `AGENT_BENCH_CLAUDE_BIN` or `AGENT_BENCH_HALLOUMINATE_BIN` if the PATH
-entry is a package-manager wrapper. Authenticate via `ANTHROPIC_API_KEY`
-or `CLAUDE_CODE_OAUTH_TOKEN`; the measurement cannot use host home files.
-The agent retains network access to the model service. The private daemons
-share a temporary retrieval-model cache for the sweep. Their startup can
-take up to ten minutes, and they do not exit when idle. Neither the agent
-nor the daemon gets the host home or socket directories.
+Live subject trials are blocked. The runner cannot isolate model-service
+credentials from subject tools, so it stops before starting an agent or
+writing results. This applies to both API keys and OAuth tokens.
+
+For offline integration tests, run `bench-run --offline-agent PATH` with a
+trusted local stand-in. Use Linux with Bubblewrap at `/usr/bin/bwrap` and
+user namespaces enabled. Set `AGENT_BENCH_HALLOUMINATE_BIN` to a standalone
+Hallouminate executable if the PATH entry is a package-manager wrapper.
+Neither subject arm has network access or model-service credentials.
+
+The private daemons can fetch the retrieval model into a temporary cache
+shared by the sweep. Their startup can take up to ten minutes, and they do
+not exit when idle. Neither the agent nor the daemon gets the host home or
+socket directories.
 
 Clone each subject repo to `<checkout_root>/<name>`. Check out the pinned
 commit. Author the wiki in the checkout before measuring.

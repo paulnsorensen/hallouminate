@@ -114,6 +114,8 @@ pub fn replace_jsonl<T: Serialize>(path: &Path, records: &[T]) -> anyhow::Result
 /// manifest misdescribes.
 pub fn verify_agent_cli_version(bin: &str, expected_version: &str) -> anyhow::Result<()> {
     let output = std::process::Command::new(bin)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .arg("--version")
         .output()
         .with_context(|| format!("running `{bin} --version`"))?;

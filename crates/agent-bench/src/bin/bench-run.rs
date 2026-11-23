@@ -1,8 +1,7 @@
 //! Session runner for the wiki-grounding benchmark pilot.
 //!
-//! Spawns `claude -p --output-format json` once per (question, arm,
-//! run_index) under the pinned per-arm MCP config, recording one
-//! `SessionRecord` per session to `<out-dir>/sessions.jsonl`.
+//! Runs an offline agent fixture once per (question, arm, run_index).
+//! Records one `SessionRecord` per session under the pinned MCP config.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -51,6 +50,9 @@ struct Cli {
     /// Directory for `sessions.jsonl` and `traces/`.
     #[arg(long)]
     out_dir: PathBuf,
+    /// Trusted local stand-in. Subject trials cannot use a model service.
+    #[arg(long, value_name = "PATH")]
+    offline_agent: Option<PathBuf>,
     /// Overwrite existing records instead of skipping them.
     #[arg(long)]
     force: bool,
@@ -74,7 +76,14 @@ fn main() -> anyhow::Result<()> {
         ArmSelector::Baseline => &[Arm::Baseline],
     };
 
-    let bin = resolve_executable("AGENT_BENCH_CLAUDE_BIN", "claude")?;
+    let Some(offline_agent) = cli.offline_agent else {
+        bail!(
+            "no isolated model authentication is available; use --offline-agent PATH for offline tests"
+        );
+    };
+    let bin = offline_agent
+        .canonicalize()
+        .context("resolving offline agent")?;
     verify_agent_cli_version(
         bin.to_str().context("agent executable path is not UTF-8")?,
         &manifest.claude_code_version,

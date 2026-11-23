@@ -147,7 +147,8 @@ impl Fixture {
     fn run(&self) -> Command {
         let mut command = self.command(env!("CARGO_BIN_EXE_bench-run"));
         command
-            .args(["--arm", "both", "--runs", "1"])
+            .args(["--arm", "both", "--runs", "1", "--offline-agent"])
+            .arg(&self.agent)
             .arg("--out-dir")
             .arg(&self.manifest.results_dir);
         command
@@ -217,12 +218,50 @@ fn agent_cli_version_mismatch_aborts_before_writing_results() {
 }
 
 #[test]
+fn unavailable_subject_auth_aborts_before_starting_either_arm() {
+    let fixture = Fixture::new();
+    let marker = fixture.dir.path().join("agent-started");
+    fs::write(
+        &fixture.agent,
+        format!("#!/bin/sh\n: > '{}'\nexit 3\n", marker.display()),
+    )
+    .unwrap();
+
+    fs::create_dir(&fixture.manifest.results_dir).unwrap();
+    fs::write(fixture.sessions(), b"existing sessions\n").unwrap();
+    fs::write(fixture.grades(), b"existing grades\n").unwrap();
+    for arm in ["wiki", "baseline", "both"] {
+        let output = fixture
+            .command(env!("CARGO_BIN_EXE_bench-run"))
+            .env("ANTHROPIC_API_KEY", "offline-fixture-only")
+            .env("CLAUDE_CODE_OAUTH_TOKEN", "offline-fixture-only")
+            .args(["--arm", arm, "--runs", "1", "--force", "--out-dir"])
+            .arg(&fixture.manifest.results_dir)
+            .output()
+            .unwrap();
+        assert_error(&output, "no isolated model authentication is available");
+        assert!(!marker.exists(), "started an agent for {arm}");
+        assert_eq!(
+            fs::read(fixture.sessions()).unwrap(),
+            b"existing sessions\n"
+        );
+        assert_eq!(fs::read(fixture.grades()).unwrap(), b"existing grades\n");
+        assert_eq!(
+            fs::read_dir(&fixture.manifest.results_dir).unwrap().count(),
+            2
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires Linux Bubblewrap and a standalone Hallouminate binary"]
 fn paired_run_uses_pinned_source_and_the_real_private_read_only_wiki() {
     let mut fixture = Fixture::new();
     let output = fixture
         .run()
         .env("HALLOUMINATE_SOCKET", "/run/host-wiki.sock")
+        .env("ANTHROPIC_API_KEY", "offline-fixture-only")
+        .env("CLAUDE_CODE_OAUTH_TOKEN", "offline-fixture-only")
         .output()
         .unwrap();
     assert_ok(&output);

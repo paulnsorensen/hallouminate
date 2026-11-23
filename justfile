@@ -80,11 +80,8 @@ bench-author repo budget manifest:
     just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
     just verify cargo run -q -p agent-bench --bin bench-author -- --manifest {{manifest}} --repo {{repo}} --budget-tokens {{budget}} --out-dir eval/agent-bench/wikis/{{repo}}
 
-# Paired session sweep across both arms. Cost-bearing: spends real model
-# tokens. Validates the given manifest/questions dataset first so no
-# measured run starts against a drifted dataset.
+# Live subject sweeps are blocked until model authentication can be isolated.
 bench-run manifest questions arm='both' runs='10':
-    @echo "bench-run: cost-bearing run — spends real model tokens"
     results_dir="$(just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{quote(manifest)}} --print-results-dir)" && \
       just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{quote(questions)}} --manifest {{quote(manifest)}} --check-freeze && \
       just verify cargo run -q -p agent-bench --bin bench-run -- --manifest {{quote(manifest)}} --questions {{quote(questions)}} --arm {{quote(arm)}} --runs {{quote(runs)}} --out-dir "$results_dir"
