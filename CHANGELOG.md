@@ -9,6 +9,14 @@ for each release window.
 
 ## [Unreleased](https://github.com/paulnsorensen/hallouminate/compare/v0.12.2...HEAD)
 
+### Changed
+
+- Dependencies: zip 9.6.0
+
+### Security
+
+- Dependencies: bump url to 2.5.9 and form_urlencoded to 1.2.3 for RUSTSEC-2026-0592 to stop a stack overflow in `Url::origin()` on nested `blob:` URLs
+
 ## [0.12.2](https://github.com/paulnsorensen/hallouminate/releases/tag/v0.12.2) - 2026-11-21
 
 ### Fixed
