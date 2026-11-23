@@ -1436,16 +1436,16 @@ fn parse(text: &str, source: Option<&Path>) -> Result<Config> {
             .unwrap_or_default();
         HallouminateError::Config(format!("parsing config{where_}: {e}"))
     })?;
-    cfg.storage.ground_dir = isolate_dev_ground_dir(
-        channel::BUILD_CHANNEL,
-        std::mem::take(&mut cfg.storage.ground_dir),
-    );
     normalize(&mut cfg)?;
     validate(&cfg)?;
     Ok(cfg)
 }
 
 fn normalize(cfg: &mut Config) -> Result<()> {
+    cfg.storage.ground_dir = isolate_dev_ground_dir(
+        channel::BUILD_CHANNEL,
+        std::mem::take(&mut cfg.storage.ground_dir),
+    );
     cfg.embeddings.model = canonical_model_name(&cfg.embeddings.model)?.to_string();
     Ok(())
 }
@@ -4213,6 +4213,27 @@ path = "."
                 "written as {written}"
             );
         }
+    }
+
+    #[test]
+    fn repo_layer_legacy_ground_dir_follows_the_build_channel() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo_root = canon(dir.path());
+        write_repo_config(
+            &repo_root,
+            "[storage]\nground_dir = \"~/.local/share/hallouminate/ground\"\n",
+        );
+
+        let (effective, layers) =
+            resolve_for_cwd(&Config::default(), &repo_root, None).expect("resolve legacy config");
+        assert_eq!(
+            layers.repo_path,
+            Some(repo_root.join(".hallouminate/config.toml"))
+        );
+        assert_eq!(
+            effective.storage.ground_dir,
+            ground_dir_for(channel::BUILD_CHANNEL)
+        );
     }
 
     #[test]
