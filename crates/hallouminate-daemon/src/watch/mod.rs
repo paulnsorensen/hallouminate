@@ -32,7 +32,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 #[cfg(test)]
 use notify::UpdatePathsError;
 use notify::{PathOp, RecursiveMode};
-use notify_debouncer_full::{DebounceEventResult, NoCache, new_debouncer_opt};
+use notify_debouncer_full::{
+    Config as DebouncerConfig, DebounceEventResult, NoCache, new_debouncer_opt,
+};
 
 use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{
@@ -469,6 +471,7 @@ impl From<&PathOp> for RecordedOp {
         match op {
             PathOp::Watch(path, config) => RecordedOp::Watch(path.clone(), config.recursive_mode()),
             PathOp::Unwatch(path) => RecordedOp::Unwatch(path.clone()),
+            unknown => panic!("unexpected native watch operation: {unknown:?}"),
         }
     }
 }
@@ -1106,9 +1109,12 @@ fn build_debouncer(
     let state_for_debouncer = state.clone();
     let pending_for_debouncer = pending;
     let wake_for_debouncer = wake;
+    let notify_config = notify::Config::default().with_event_kinds(notify::EventKindMask::ALL);
+    let config = DebouncerConfig::default()
+        .with_timeout(debounce)
+        .with_notify_config(notify_config);
     match new_debouncer_opt(
-        debounce,
-        None,
+        config,
         move |res: DebounceEventResult| {
             // The debouncer worker thread calls this on each debounced batch.
             match res {
@@ -1133,7 +1139,6 @@ fn build_debouncer(
             }
         },
         NoCache,
-        notify::Config::default(),
     ) {
         Ok(d) => Some(d),
         Err(e) => {
