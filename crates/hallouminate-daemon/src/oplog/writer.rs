@@ -182,6 +182,17 @@ impl OpLog {
     }
 
     fn create_lock(&self, path: &Path) -> io::Result<File> {
+        #[cfg(unix)]
+        let _directory_lock = {
+            let directory = File::open(&self.dir)?;
+            directory.lock()?;
+            match std::fs::symlink_metadata(path) {
+                Ok(_metadata) => return Self::open_existing_lock(path),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            directory
+        };
         let pending = tempfile::Builder::new()
             .prefix(".operations-lock-")
             .tempfile_in(&self.dir)?;
@@ -191,8 +202,10 @@ impl OpLog {
             pending
                 .as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            // The directory lock lets peers publish the initialized file with a plain rename.
+            pending.persist(path).map_err(|error| error.error)
         }
-        // Publish only after initialization so no peer sees a mode-000 lock.
+        #[cfg(not(unix))]
         match pending.persist_noclobber(path) {
             Ok(lock) => Ok(lock),
             Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {

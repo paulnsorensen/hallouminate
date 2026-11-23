@@ -263,6 +263,28 @@ fn operation_lock_preserves_existing_inode_and_mode() {
 }
 
 #[test]
+fn operation_lock_does_not_replace_dangling_symlink() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = traversable_log_dir(root.path());
+    seed_writable_segments(&dir);
+    let lock = dir.join("operations.lock");
+    let target = dir.join("absent");
+    std::os::unix::fs::symlink(&target, &lock).expect("create dangling lock symlink");
+
+    log_cli_status(root.path(), "022");
+
+    assert_eq!(
+        std::fs::read_link(&lock).expect("preserved symlink"),
+        target
+    );
+    assert!(!target.exists(), "do not create the symlink target");
+    assert!(
+        read_segment_rows(&dir).is_empty(),
+        "no append without a lock"
+    );
+}
+
+#[test]
 fn operation_lock_allows_concurrent_first_users_under_restrictive_umask() {
     let root = tempfile::tempdir().expect("tempdir");
     let dir = traversable_log_dir(root.path());
