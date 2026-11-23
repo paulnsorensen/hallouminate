@@ -183,7 +183,7 @@ pub fn safe_relative_path(raw: &str) -> Result<PathBuf, SandboxError> {
 fn validate_windows_relative_path(raw: &str) -> Result<(), SandboxError> {
     for component in raw.split(['/', '\\']) {
         for character in component.chars() {
-            if character.is_ascii_control() {
+            if ('\u{0}'..='\u{1f}').contains(&character) {
                 return Err(SandboxError::new(
                     "path contains a Windows control character",
                 ));
@@ -205,10 +205,9 @@ fn validate_windows_relative_path(raw: &str) -> Result<(), SandboxError> {
             return Err(SandboxError::new("path contains a Windows device name"));
         }
         for prefix in ["COM", "LPT"] {
-            let Some(suffix) = stem.strip_prefix(prefix) else {
-                continue;
-            };
-            if ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&suffix) {
+            if let Some(suffix) = stem.strip_prefix(prefix)
+                && ["1", "2", "3", "4", "5", "6", "7", "8", "9", "¹", "²", "³"].contains(&suffix)
+            {
                 return Err(SandboxError::new("path contains a Windows device name"));
             }
         }
@@ -834,12 +833,10 @@ fn normal_components(path: &Path) -> Result<Vec<OsString>, WriteError> {
     for component in path.components() {
         match component {
             Component::Normal(name) => out.push(name.to_os_string()),
-            Component::Prefix(_prefix) => {
-                return Err(invalid_path_error(
-                    "path must contain only normal file components",
-                ));
-            }
-            Component::RootDir | Component::CurDir | Component::ParentDir => {
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => {
                 return Err(invalid_path_error(
                     "path must contain only normal file components",
                 ));
@@ -1159,6 +1156,9 @@ const EISDIR: i32 = rustix::io::Errno::ISDIR.raw_os_error();
 #[cfg(unix)]
 const EINVAL: i32 = rustix::io::Errno::INVAL.raw_os_error();
 
+// Windows has no errno values. These POSIX-named constants hold the Win32
+// codes that cap-primitives maps to the same categories; see
+// cap-primitives `src/windows/fs/errors.rs`.
 #[cfg(windows)]
 const ELOOP: i32 = windows_sys::Win32::Foundation::ERROR_TOO_MANY_LINKS as i32;
 #[cfg(windows)]
@@ -1227,8 +1227,8 @@ fn classify_create_io_error(err: std::io::Error) -> WriteError {
 
 fn symlink_io_error() -> std::io::Error {
     // Construct a synthetic ELOOP-bearing error so callers that inspect
-    // `WriteError.source.raw_os_error()` see the same value the rustix-era
-    // code returned via `Errno::LOOP.into()`.
+    // `WriteError.source.raw_os_error()` see the same value on every
+    // platform: `Errno::LOOP` on Unix, `ERROR_TOO_MANY_LINKS` on Windows.
     std::io::Error::from_raw_os_error(ELOOP)
 }
 
@@ -1295,6 +1295,7 @@ mod tests {
             "dir/file.md",
             "COM10.md",
             "unicode/日本語.md",
+            "dir/file\u{7f}.md",
         ] {
             assert!(safe_relative_path(path).is_ok(), "rejected {path:?}");
         }

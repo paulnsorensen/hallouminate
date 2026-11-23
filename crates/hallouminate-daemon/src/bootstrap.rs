@@ -128,8 +128,19 @@ pub async fn ensure_daemon_running() -> anyhow::Result<()> {
 }
 
 async fn probe_running_daemon(socket: &Path) -> Option<(SkewVerdict, Option<String>)> {
-    connect_at(socket).await.ok()?;
-    Some(running_daemon_verdict(socket).await)
+    let Err(error) = connect_at(socket).await else {
+        return Some(running_daemon_verdict(socket).await);
+    };
+    // A saturated Windows daemon refuses with a busy pipe, not an absent one.
+    #[cfg(windows)]
+    if error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(super::transport::is_pipe_busy)
+    {
+        return Some((SkewVerdict::Adopt, None));
+    }
+    drop(error);
+    None
 }
 
 async fn wait_for_daemon_socket<Connect, ConnectFuture, Sleep, SleepFuture, Elapsed>(
@@ -172,7 +183,7 @@ where
 
 /// Pure predicate split out so tests can exercise both branches without
 /// mutating process env (unsafe on edition 2024).
-fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
+pub(super) fn has_explicit_socket_override(env_value: Option<&std::ffi::OsStr>) -> bool {
     env_value.is_some_and(|v| !v.is_empty())
 }
 

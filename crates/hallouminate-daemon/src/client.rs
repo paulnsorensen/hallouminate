@@ -98,7 +98,20 @@ pub fn daemon_client_unavailable(reason: impl std::fmt::Display) -> anyhow::Erro
 pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {
     // Probe the socket with a quick connect to confirm a daemon is alive,
     // surfacing the failure here instead of inside the first `call`.
-    LocalStream::connect(socket).await.with_context(|| {
+    probed(socket, LocalStream::connect(socket).await)
+}
+
+/// [`connect_at`] that retries a busy Windows pipe until `deadline`.
+#[cfg(windows)]
+pub(super) async fn connect_at_until(
+    socket: &Path,
+    deadline: tokio::time::Instant,
+) -> anyhow::Result<DaemonClient> {
+    probed(socket, LocalStream::connect_until(socket, deadline).await)
+}
+
+fn probed(socket: &Path, probe: std::io::Result<LocalStream>) -> anyhow::Result<DaemonClient> {
+    probe.with_context(|| {
         format!(
             "daemon unavailable: cannot connect to {} \
              (start it with `hallouminate daemon`)",
@@ -108,6 +121,20 @@ pub async fn connect_at(socket: &Path) -> anyhow::Result<DaemonClient> {
     Ok(DaemonClient {
         socket: socket.to_path_buf(),
     })
+}
+
+/// Types a failed connect: a busy Windows pipe means a live daemon with no
+/// free instance, so the caller can retry; any other failure means no daemon.
+fn connect_failure(socket: &Path, error: &std::io::Error) -> anyhow::Error {
+    #[cfg(windows)]
+    if super::transport::is_pipe_busy(error) {
+        return DaemonRpcError::retryable(format!(
+            "daemon at {} is busy; every pipe instance is in use — retry",
+            socket.display(),
+        ))
+        .into();
+    }
+    daemon_client_unavailable(format!("connect to {} failed: {error}", socket.display()))
 }
 
 impl DaemonClient {
@@ -128,9 +155,9 @@ impl DaemonClient {
             )
             .into());
         }
-        let mut stream = LocalStream::connect(&self.socket).await.map_err(|e| {
-            daemon_client_unavailable(format!("connect to {} failed: {e}", self.socket.display()))
-        })?;
+        let mut stream = LocalStream::connect(&self.socket)
+            .await
+            .map_err(|e| connect_failure(&self.socket, &e))?;
         // Wrap mid-call I/O errors with the same `daemon unavailable` hint
         // the initial connect uses. Without this, a daemon that dies after
         // the connect succeeds (write fails, read returns EOF, response
