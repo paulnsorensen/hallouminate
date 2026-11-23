@@ -253,9 +253,17 @@ pub(crate) struct RetiredRegistration {
     pub(crate) roots: Vec<PathBuf>,
     pub(crate) lock_keys: Vec<CorpusKey>,
     pub(crate) cfg: Arc<Config>,
+    pub(crate) failed_attempts: u32,
 }
 
 impl RetiredRegistration {
+    /// Whether the current cleanup attempt should log at `warn`: the first
+    /// failure, then one reminder every `REPEAT_FAILURE_REMINDER_EVERY`.
+    pub(crate) fn warns_on_failure(&self) -> bool {
+        self.failed_attempts
+            .is_multiple_of(REPEAT_FAILURE_REMINDER_EVERY)
+    }
+
     fn from_registration(id: &RegistrationId, registration: &Registration) -> Self {
         let mut roots: Vec<PathBuf> = registration
             .roots
@@ -274,6 +282,7 @@ impl RetiredRegistration {
             roots,
             lock_keys: registration.lock_keys.clone(),
             cfg: registration.cfg.clone(),
+            failed_attempts: 0,
         }
     }
 }
@@ -1985,6 +1994,7 @@ mod tests {
                 roots: vec![PathBuf::from("/gone")],
                 lock_keys: Vec::new(),
                 cfg: cfg.clone(),
+                failed_attempts: 0,
             });
         }
         let pending = registry.take_pending_cleanups();

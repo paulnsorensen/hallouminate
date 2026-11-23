@@ -478,6 +478,7 @@ async fn cleanup_retired_registration(
         },
     };
     let mut failed = Vec::new();
+    let loud = registration.warns_on_failure();
     for path in &registration.roots {
         let probe = path.clone();
         let root = match tokio::task::spawn_blocking(move || {
@@ -490,7 +491,11 @@ async fn cleanup_retired_registration(
             Ok(Some(root)) => root,
             Ok(None) => continue,
             Err(error) => {
-                tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                if loud {
+                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root check failed; will retry on next reconcile");
+                }
                 failed.push(path.clone());
                 continue;
             }
@@ -498,7 +503,11 @@ async fn cleanup_retired_registration(
         let resources = match state.resources_for(&registration.cfg).await {
             Ok(resources) => resources,
             Err(error) => {
-                tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+                if loud {
+                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root storage access failed; will retry on next reconcile");
+                }
                 failed.push(path.clone());
                 continue;
             }
@@ -508,7 +517,11 @@ async fn cleanup_retired_registration(
                 tracing::info!(target: "hallouminate::daemon", root = %path.display(), ground_dir = %registration.cfg.storage.ground_dir, "watcher: retired root rows deleted");
             }
             Err(error) => {
-                tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root cleanup failed; will retry on next reconcile");
+                if loud {
+                    tracing::warn!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root cleanup failed; will retry on next reconcile");
+                } else {
+                    tracing::debug!(target: "hallouminate::daemon", root = %path.display(), error = %error, "watcher: retired-root cleanup failed; will retry on next reconcile");
+                }
                 failed.push(path.clone());
             }
         }
@@ -518,6 +531,7 @@ async fn cleanup_retired_registration(
     }
     Some(registry::RetiredRegistration {
         roots: failed,
+        failed_attempts: registration.failed_attempts.saturating_add(1),
         ..registration
     })
 }
@@ -5884,15 +5898,17 @@ body
         let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
         let blocker = tmp.path().join("blocker");
         std::fs::write(&blocker, "not a directory").expect("write blocker file");
-        let mut broken = hallouminate_config::Config::default();
-        broken.embeddings.enabled = false;
-        broken.storage.ground_dir = blocker.join("ground").to_string_lossy().into_owned();
+        let mut broken_cfg = hallouminate_config::Config::default();
+        broken_cfg.embeddings.enabled = false;
+        broken_cfg.storage.ground_dir = blocker.join("ground").to_string_lossy().into_owned();
+        let broken = std::sync::Arc::new(broken_cfg);
         let retired = registry::RetiredRegistration {
             corpus: "gone".into(),
             root: tmp.path().join("gone"),
             roots: vec![tmp.path().join("gone")],
             lock_keys: Vec::new(),
-            cfg: std::sync::Arc::new(broken),
+            cfg: std::sync::Arc::clone(&broken),
+            failed_attempts: 0,
         };
 
         let failed = cleanup_retired_registration(&state, retired)
@@ -5902,6 +5918,42 @@ body
         state.watch_registry().park_failed_cleanup(failed);
 
         std::fs::remove_file(&blocker).expect("remove blocker");
+        let key = hallouminate_domain::common::CorpusKey::from_configured_root(
+            "gone",
+            tmp.path().join("gone").to_str().expect("utf8"),
+        );
+        let resources = state.resources_for(&broken).await.expect("resources");
+        resources
+            .store
+            .apply_batch(vec![hallouminate_domain::indexer::PreparedFile {
+                file_ref: "/tmp/gone.md".into(),
+                corpus_key: key.clone(),
+                mtime_ms: 1,
+                content_hash: "deadbeef".into(),
+                summary: "summary".into(),
+                keywords: vec![],
+                frontmatter: None,
+                indexed_at_ms: 1,
+                chunks: vec![hallouminate_domain::indexer::PreparedChunk {
+                    ord: 0,
+                    heading_path: vec!["H".into()],
+                    line_start: 1,
+                    line_end: 2,
+                    text: "body".into(),
+                    search_text: "body".into(),
+                    claim_marks: None,
+                    structure: None,
+                    overlap_bytes: 0,
+                }],
+            }])
+            .await
+            .expect("seed retired root rows");
+        let seeded = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(seeded.total_chunks, 1, "seed must create rows to delete");
         let mut pump = PumpState::test_default();
         let tracker = TaskTracker::new();
         let mut memo = ReloadFailureMemo::new();
@@ -5912,6 +5964,15 @@ body
         assert!(
             state.watch_registry().take_pending_cleanups().is_empty(),
             "the next tick must retry the parked cleanup and clear it once storage works"
+        );
+        let after = resources
+            .store
+            .corpus_chunk_stats(&key)
+            .await
+            .expect("stats");
+        assert_eq!(
+            after.total_chunks, 0,
+            "the retry must delete the retired root's rows"
         );
     }
 
