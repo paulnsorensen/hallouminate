@@ -14,9 +14,11 @@ use clap::Parser;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+use agent_bench::grading::{Grading, index_sessions};
+use agent_bench::provenance::grade_key;
 use agent_bench::{
-    Arm, ArmSummary, BenchReport, GradeRecord, PairedCi, Question, QuestionArmStat, QuestionRow,
-    QuestionSet, QuestionTag, SessionRecord, TokenUsage, load_json, read_jsonl,
+    Arm, ArmSummary, BenchReport, PairedCi, Question, QuestionArmStat, QuestionRow, QuestionTag,
+    SessionRecord, TokenUsage, read_jsonl,
 };
 
 #[derive(Debug, Parser)]
@@ -30,6 +32,12 @@ struct Cli {
     /// Path to the QuestionSet JSON file.
     #[arg(long)]
     questions: PathBuf,
+    /// Path to the provenance manifest used for the run and grading.
+    #[arg(long)]
+    manifest: PathBuf,
+    /// Pass threshold used for grading.
+    #[arg(long, default_value_t = 4)]
+    pass_threshold: u8,
     /// Directory to write report.json and report.md into.
     #[arg(long)]
     out_dir: PathBuf,
@@ -60,19 +68,21 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run(cli: &Cli) -> anyhow::Result<()> {
-    let question_set: QuestionSet = load_json(&cli.questions)?;
-    let questions_by_id: HashMap<&str, &Question> = question_set
+    let grading = Grading::load(
+        &cli.manifest,
+        &cli.questions,
+        &cli.sessions,
+        cli.pass_threshold,
+    )?;
+    let questions_by_id: HashMap<&str, &Question> = grading
         .questions
         .iter()
         .map(|q| (q.id.as_str(), q))
         .collect();
 
     let sessions: Vec<SessionRecord> = read_jsonl(&cli.sessions)?;
-    let sessions_by_key: HashMap<(String, Arm, u32), &SessionRecord> = sessions
-        .iter()
-        .map(|s| ((s.question_id.clone(), s.arm, s.run_index), s))
-        .collect();
-    let grades: Vec<GradeRecord> = read_jsonl(&cli.grades)?;
+    let sessions_by_key = index_sessions(&sessions)?;
+    let grades = grading.read_grades(&cli.grades, &sessions_by_key)?;
 
     // A session that failed to spawn, exited non-zero, or returned
     // unparseable JSON is recorded with a non-zero `exit_status` and
@@ -94,19 +104,9 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
     // error and aborts the report rather than being silently skipped.
     let mut per_question: BTreeMap<String, BTreeMap<Arm, Vec<(bool, TokenUsage)>>> =
         BTreeMap::new();
-    for grade in &grades {
-        let key = (grade.question_id.clone(), grade.arm, grade.run_index);
-        let session = sessions_by_key.get(&key).ok_or_else(|| {
-            anyhow::anyhow!(
-                "grade for question {:?} (arm {:?}, run {}) has no matching session",
-                grade.question_id,
-                grade.arm,
-                grade.run_index
-            )
-        })?;
-        if session.exit_status != 0 {
-            continue;
-        }
+    for entry in &grades {
+        let grade = &entry.grade;
+        let session = sessions_by_key[&grade_key(grade)];
         per_question
             .entry(grade.question_id.clone())
             .or_default()

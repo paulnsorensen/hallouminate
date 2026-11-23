@@ -115,7 +115,7 @@ bench-judge-calibrate manifest questions human_grades:
 bench-report manifest questions:
     results_dir="$(just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{quote(manifest)}} --print-results-dir)" && \
       just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{quote(questions)}} --manifest {{quote(manifest)}} --check-freeze && \
-      just verify cargo run -q -p agent-bench --bin bench-report -- --sessions "$results_dir/sessions.jsonl" --grades "$results_dir/grades.jsonl" --questions {{quote(questions)}} --out-dir "$results_dir" --seed 42
+      just verify cargo run -q -p agent-bench --bin bench-report -- --manifest {{quote(manifest)}} --sessions "$results_dir/sessions.jsonl" --grades "$results_dir/grades.jsonl" --questions {{quote(questions)}} --out-dir "$results_dir" --seed 42
 
 # Build every fuzz target on the nightly pinned in fuzz/rust-toolchain.toml.
 fuzz-build:

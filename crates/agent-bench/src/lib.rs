@@ -1,6 +1,8 @@
 //! Shared model types and IO helpers for the wiki-grounding benchmark pilot.
 
+pub mod grading;
 pub mod model;
+pub mod provenance;
 pub use model::*;
 
 use std::fs::File;

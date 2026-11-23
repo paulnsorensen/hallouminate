@@ -5,6 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use agent_bench::provenance::{RunMeta, fingerprint};
+
 use agent_bench::{
     Arm, GradeRecord, Manifest, ModelIds, PromptRef, Question, QuestionSet, QuestionTag,
     SessionRecord, TokenUsage,
@@ -32,24 +34,43 @@ fn write_manifest(dir: &Path, judge_model: &str) -> PathBuf {
             path: PathBuf::from(RUBRIC_RELATIVE_PATH),
             blake3: agent_bench::blake3_file_hash(&rubric_path).unwrap(),
         }],
-        question_set_hash: String::new(),
+        question_set_hash: agent_bench::blake3_file_hash(&dir.join("questions.json")).unwrap(),
         container_image_refs: Vec::new(),
         results_dir: dir.join("results"),
         checkout_root: dir.join("checkouts"),
     };
     let path = dir.join("manifest.toml");
     fs::write(&path, toml::to_string(&manifest).unwrap()).unwrap();
+    let fake = dir.join("fake-claude.sh");
+    if fake.is_file() {
+        bind_session_fixture(dir, &fake);
+    }
     path
 }
 
 /// Write an executable `#!/bin/sh` fake judge script.
 fn write_fake_judge(dir: &Path, name: &str, body: &str) -> PathBuf {
     let path = dir.join(name);
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    fs::write(&path, format!("#!/bin/sh\nif [ \"$1\" = --version ]; then echo \"${{FAKE_CLI_VERSION:-0.0.0-test}} (Claude Code)\"; exit 0; fi\n{body}\n")).unwrap();
     let mut perms = fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(&path, perms).unwrap();
+    if dir.join("manifest.toml").is_file() {
+        bind_session_fixture(dir, &path);
+    }
     path
+}
+
+fn bind_session_fixture(dir: &Path, fake: &Path) {
+    let manifest: Manifest = agent_bench::load_toml(&dir.join("manifest.toml")).unwrap();
+    let sessions = dir.join("sessions.jsonl");
+    RunMeta {
+        manifest_hash: fingerprint(&manifest).unwrap(),
+        measurement_hash: "synthetic-measurement".to_string(),
+        agent_hash: agent_bench::blake3_file_hash(fake).unwrap(),
+    }
+    .initialize(&sessions)
+    .unwrap();
 }
 
 fn write_question_set(dir: &Path, questions: &[Question]) -> PathBuf {

@@ -10,9 +10,12 @@ use std::process::Command;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
+use agent_bench::grading::{Grading, index_sessions};
+use agent_bench::provenance::{RunMeta, fingerprint, grade_key};
 use agent_bench::{
     Arm, BenchReport, GradeRecord, Question, QuestionSet, QuestionTag, SessionRecord, TokenUsage,
 };
+use agent_bench::{Manifest, ModelIds, PromptRef};
 
 fn bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bench-report"))
@@ -106,11 +109,55 @@ fn run_bench_report(
     confidence: f64,
 ) -> RunReport {
     let out_dir = dir.join(out_name);
+    let rubric = PathBuf::from("eval/agent-bench/prompts/judge-rubric.md");
+    let manifest = Manifest {
+        model_ids: ModelIds {
+            subject: "subject".into(),
+            judge: "judge".into(),
+        },
+        claude_code_version: "test".into(),
+        subject_repos: Vec::new(),
+        prompt_hashes: vec![PromptRef {
+            blake3: agent_bench::blake3_file_hash(&agent_bench::repo_root().join(&rubric)).unwrap(),
+            path: rubric,
+        }],
+        question_set_hash: agent_bench::blake3_file_hash(questions_path).unwrap(),
+        container_image_refs: Vec::new(),
+        results_dir: dir.to_owned(),
+        checkout_root: PathBuf::new(),
+    };
+    let manifest_path = dir.join("manifest.toml");
+    fs::write(&manifest_path, toml::to_string(&manifest).unwrap()).unwrap();
+    let meta = RunMeta {
+        manifest_hash: fingerprint(&manifest).unwrap(),
+        measurement_hash: "synthetic-measurement".into(),
+        agent_hash: "synthetic-judge".into(),
+    };
+    if !sessions_path.with_file_name("run-meta.json").exists() {
+        meta.initialize(sessions_path).unwrap();
+    }
+    let grading = Grading::load(&manifest_path, questions_path, sessions_path, 4).unwrap();
+    let sessions: Vec<SessionRecord> = agent_bench::read_jsonl(sessions_path).unwrap();
+    let index = index_sessions(&sessions).unwrap();
+    let grades: Vec<GradeRecord> = agent_bench::read_jsonl(grades_path).unwrap();
+    let mut bound = Vec::new();
+    for grade in grades {
+        let session = index[&grade_key(&grade)];
+        bound.push(
+            grading
+                .bind(grade, session, &grading.prompt(session).unwrap())
+                .unwrap(),
+        );
+    }
+    let bound_path = dir.join("bound-grades.jsonl");
+    agent_bench::replace_jsonl(&bound_path, &bound).unwrap();
     let output = Command::new(bin_path())
         .arg("--sessions")
         .arg(sessions_path)
+        .arg("--manifest")
+        .arg(manifest_path)
         .arg("--grades")
-        .arg(grades_path)
+        .arg(bound_path)
         .arg("--questions")
         .arg(questions_path)
         .arg("--out-dir")
@@ -815,9 +862,7 @@ fn failed_sessions_are_excluded_from_every_figure() {
         usage,
     );
 
-    // A 6th Wiki run that failed to exit cleanly, carrying a large, distinct
-    // usage and a passing grade. If `exit_status` were ignored, it would
-    // inflate `runs` to 6, `passes` to 3, and `usage` by `failed_usage`.
+    // This failed trial has no grade and must not contribute usage or runs.
     let failed_usage = TokenUsage {
         input_tokens: 9_999,
         output_tokens: 9_999,
@@ -829,7 +874,6 @@ fn failed_sessions_are_excluded_from_every_figure() {
         &failed_session("q1", Arm::Wiki, 5, failed_usage, 17),
     )
     .unwrap();
-    agent_bench::append_jsonl(&grades_path, &grade("q1", Arm::Wiki, 5, true)).unwrap();
 
     let run = run_bench_report(
         dir.path(),
