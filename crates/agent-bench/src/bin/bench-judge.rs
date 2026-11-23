@@ -97,6 +97,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .collect();
 
     for session in &sessions {
+        if session.exit_status != 0 {
+            continue;
+        }
         let key = (session.question_id.clone(), session.arm, session.run_index);
         if index.contains_key(&key) && !args.force {
             continue;
@@ -156,6 +159,11 @@ fn run(args: &Args) -> anyhow::Result<()> {
                 args.min_agreement
             );
         }
+    }
+
+    if records.is_empty() && !args.out.exists() {
+        std::fs::File::create_new(&args.out)
+            .with_context(|| format!("creating empty grade ledger {}", args.out.display()))?;
     }
 
     Ok(())

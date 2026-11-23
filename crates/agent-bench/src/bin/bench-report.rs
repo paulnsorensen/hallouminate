@@ -42,8 +42,16 @@ struct Cli {
     #[arg(long)]
     seed: u64,
     /// Confidence level for the paired bootstrap interval.
-    #[arg(long, default_value_t = 0.95)]
+    #[arg(long, default_value_t = 0.95, value_parser = parse_confidence)]
     confidence: f64,
+}
+
+fn parse_confidence(value: &str) -> Result<f64, String> {
+    let confidence = value.parse::<f64>().map_err(|err| err.to_string())?;
+    if !(0.0..=1.0).contains(&confidence) {
+        return Err("confidence must be between 0 and 1".to_string());
+    }
+    Ok(confidence)
 }
 
 fn main() -> anyhow::Result<()> {

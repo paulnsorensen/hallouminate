@@ -43,6 +43,7 @@ pub struct ConfigValidateArgs {
 /// `cmd_config_validate` to flag misspellings (`[[corpora]]`, `Storage`)
 /// that parse cleanly but produce a silently empty/wrong config.
 const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+    "inherit_global_corpora",
     "corpus",
     "repository",
     "search",
@@ -51,6 +52,7 @@ const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "watch",
     "storage",
     "daemon",
+    "security",
 ];
 
 /// Keys recognized inside a `[[repository]]` entry. Used by
@@ -81,12 +83,41 @@ const KNOWN_EMBEDDINGS_KEYS: &[&str] = &[
 const KNOWN_SEARCH_KEYS: &[&str] = &[
     "top_files_default",
     "chunks_per_file_default",
+    "limit_default",
     "crossencoder",
+    "rerank_timeout_ms",
+    "cold_wait_ms",
 ];
 const KNOWN_LOGGING_KEYS: &[&str] = &["max_file_bytes", "max_total_bytes"];
 const KNOWN_STORAGE_KEYS: &[&str] = &["ground_dir"];
-const KNOWN_DAEMON_KEYS: &[&str] = &["idle_exit_secs", "maintenance_interval_secs"];
-const KNOWN_WATCH_KEYS: &[&str] = &["debounce_ms", "failure_reminder_secs"];
+const KNOWN_DAEMON_KEYS: &[&str] = &[
+    "idle_exit_secs",
+    "maintenance_interval_secs",
+    "defer_bound_secs",
+    "debt_soft_fragments",
+    "debt_hard_fragments",
+    "debt_soft_stale_versions",
+    "debt_hard_stale_versions",
+    "hard_block_wait_secs",
+    "debt_soft_delay_ms",
+    "debt_cache_ttl_secs",
+    "paced_slice_budget",
+    "paced_slice_sleep_ms",
+    "churn_warn_at",
+    "churn_act_at",
+    "restart_intensity_cap",
+    "restart_intensity_window_secs",
+    "watchdog_stall_secs",
+    "boot_backoff_floor_secs",
+    "boot_backoff_cap_secs",
+];
+const KNOWN_SECURITY_KEYS: &[&str] = &["allow_repo_paths_outside_root"];
+const KNOWN_WATCH_KEYS: &[&str] = &[
+    "debounce_ms",
+    "failure_reminder_secs",
+    "reconcile_interval_secs",
+    "catch_up_concurrency",
+];
 
 pub fn cmd_config_init(args: ConfigInitArgs) -> anyhow::Result<()> {
     let target = args.path.unwrap_or_else(xdg_config_path);
@@ -112,11 +143,7 @@ pub fn cmd_config_show(args: ConfigShowArgs) -> anyhow::Result<()> {
     let cwd = resolve_cwd(args.cwd.as_deref())?;
     let (effective, layers) =
         hallouminate_config::resolve_for_cwd(&baseline, &cwd, Some(baseline_src.path.as_ref()))
-            .map_err(|e| {
-                // Repo-config discovery failure: format the same "baseline: ... / repo: not found"
-                // header before the error so `show` and `validate` produce a consistent failure mode.
-                anyhow!(format_no_repo_error(&baseline_src, &cwd, &e))
-            })?;
+            .map_err(|e| anyhow!(format_resolve_error(&baseline_src, &cwd, &e)))?;
     print_layered_header(&baseline_src, &layers);
     print_effective_summary(&effective)?;
     if let Some(advisory) = layers
@@ -182,7 +209,7 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     ) {
         Ok(out) => out,
         Err(e) => {
-            return Err(anyhow!(format_no_repo_error(&baseline_src, &cwd, &e)));
+            return Err(anyhow!(format_resolve_error(&baseline_src, &cwd, &e)));
         }
     };
 
@@ -198,6 +225,8 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
         .as_deref()
         .and_then(|p| unregistered_wiki_advisory(p, &effective));
     let root_advisories = missing_root_advisories(&effective);
+    let selection_advisories = selection_advisories(&effective)?;
+    let path_advisories = layers.path_warnings.clone();
 
     // Check unknown keys against every resolved layer's raw text, not just
     // the baseline — a repo-layer scalar key (e.g. `[embeddings] enable =
@@ -215,7 +244,10 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     }
     let warnings = collect_layered_warnings(&layer_sources, &effective);
 
-    let any_advisory = advisory.is_some() || !root_advisories.is_empty();
+    let any_advisory = advisory.is_some()
+        || !root_advisories.is_empty()
+        || !selection_advisories.is_empty()
+        || !path_advisories.is_empty();
     if any_advisory || !warnings.is_empty() {
         println!();
     }
@@ -224,6 +256,12 @@ pub fn cmd_config_validate(args: ConfigValidateArgs) -> anyhow::Result<()> {
     }
     for a in &root_advisories {
         println!("warning: {a}");
+    }
+    for a in &selection_advisories {
+        println!("warning: {a}");
+    }
+    for a in &path_advisories {
+        println!("warning: config-path-outside-repo: {a}");
     }
     for w in &warnings {
         println!("warning: {w}");
@@ -274,6 +312,20 @@ fn resolve_cwd(arg_cwd: Option<&Path>) -> anyhow::Result<PathBuf> {
 /// see the layer provenance regardless of whether the baseline came from
 /// XDG or `--config PATH`.
 fn print_layered_header(baseline: &BaselineSource, layers: &ResolvedLayers) {
+    println!("{}", baseline_header_line(baseline));
+    // `layers.xdg_path` is kept for compatibility with `ResolvedLayers`'s
+    // public shape; the header above already named it under the
+    // source-agnostic "baseline" label.
+    let _ = &layers.xdg_path;
+    match &layers.repo_path {
+        Some(p) => println!("repo: {} (loaded)", p.display()),
+        None => println!("repo: not found (baseline-only)"),
+    }
+}
+
+/// "baseline: <path> (loaded | not found, from XDG | --config)" line shared
+/// by the success header and the failure blocks.
+fn baseline_header_line(baseline: &BaselineSource) -> String {
     let status = if baseline.path.is_file() {
         "loaded"
     } else {
@@ -283,18 +335,10 @@ fn print_layered_header(baseline: &BaselineSource, layers: &ResolvedLayers) {
         BaselineOrigin::Xdg => "XDG",
         BaselineOrigin::ConfigFlag => "--config",
     };
-    println!(
+    format!(
         "baseline: {} ({status}, from {origin})",
-        baseline.path.display(),
-    );
-    // `layers.xdg_path` is kept for compatibility with `ResolvedLayers`'s
-    // public shape; the header above already named it under the
-    // source-agnostic "baseline" label.
-    let _ = &layers.xdg_path;
-    match &layers.repo_path {
-        Some(p) => println!("repo: {} (loaded)", p.display()),
-        None => println!("repo: not found (baseline-only)"),
-    }
+        baseline.path.display()
+    )
 }
 
 fn print_effective_summary(cfg: &Config) -> anyhow::Result<()> {
@@ -315,41 +359,72 @@ fn print_effective_summary(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the failure block for a `resolve_for_cwd` error. A repo config that
+/// exists but fails to load or merge is reported as such; only a failed
+/// discovery gets the "repo: not found" block.
+fn format_resolve_error(
+    baseline: &BaselineSource,
+    cwd: &Path,
+    underlying: &hallouminate_domain::common::HallouminateError,
+) -> String {
+    render_resolve_error(
+        baseline,
+        cwd,
+        hallouminate_config::discover_repo_config(cwd),
+        underlying,
+    )
+}
+
+fn render_resolve_error(
+    baseline: &BaselineSource,
+    cwd: &Path,
+    discovery: std::result::Result<Option<PathBuf>, hallouminate_domain::common::HallouminateError>,
+    underlying: &hallouminate_domain::common::HallouminateError,
+) -> String {
+    let repo_line = match discovery {
+        Ok(Some(repo_path)) => {
+            format!("repo: {} (found, failed to load)", repo_path.display())
+        }
+        Ok(None) => "repo: none (no git repository above cwd; baseline-only mode)".to_string(),
+        Err(_) => return format_no_repo_error(baseline, cwd, underlying),
+    };
+    format!(
+        "{}\n{repo_line}\nerror: {}",
+        baseline_header_line(baseline),
+        config_error_detail(underlying),
+    )
+}
+
 /// Build the "baseline: ... / repo: not found ..." block when `resolve_for_cwd`
-/// fails because discovery couldn't locate a `.hallouminate/config.toml`.
+/// fails because discovery stopped at a repo root without a
+/// `.hallouminate/config.toml`.
 fn format_no_repo_error(
     baseline: &BaselineSource,
     cwd: &Path,
     underlying: &hallouminate_domain::common::HallouminateError,
 ) -> String {
-    let mut out = String::new();
-    let status = if baseline.path.is_file() {
-        "loaded"
-    } else {
-        "not found"
-    };
-    let origin = match baseline.origin {
-        BaselineOrigin::Xdg => "XDG",
-        BaselineOrigin::ConfigFlag => "--config",
-    };
-    out.push_str(&format!(
-        "baseline: {} ({status}, from {origin})\n",
-        baseline.path.display(),
-    ));
+    let mut out = baseline_header_line(baseline);
+    out.push('\n');
     // Surface the underlying "walked from X (stopped at repo root Y)" wording
     // verbatim — it's the load-bearing diagnostic. Wrap the whole thing as the
     // "repo: not found (...)" line the user expects.
-    let detail = match underlying {
-        hallouminate_domain::common::HallouminateError::Config(msg) => msg.clone(),
-        other => other.to_string(),
-    };
-    out.push_str(&format!("repo: not found ({detail})\n"));
+    out.push_str(&format!(
+        "repo: not found ({})\n",
+        config_error_detail(underlying)
+    ));
     out.push_str(&format!(
         "error: hallouminate requires a .hallouminate/config.toml in the \
          working directory's repo (cwd: {})",
         cwd.display()
     ));
     out
+}
+
+fn config_error_detail(err: &hallouminate_domain::common::HallouminateError) -> String {
+    match err {
+        hallouminate_domain::common::HallouminateError::Config(msg) => msg.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// Single-layer wrapper kept for the existing unit tests' call shape.
@@ -388,6 +463,7 @@ fn key_warnings(raw: &str) -> Vec<String> {
             collect_scalar_table_warnings(&table, "storage", KNOWN_STORAGE_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "daemon", KNOWN_DAEMON_KEYS, &mut out);
             collect_scalar_table_warnings(&table, "watch", KNOWN_WATCH_KEYS, &mut out);
+            collect_scalar_table_warnings(&table, "security", KNOWN_SECURITY_KEYS, &mut out);
         }
         Ok(_) => out.push("config is not a TOML table".to_string()),
         Err(e) => out.push(format!("re-parse for key check failed: {e}")),
@@ -517,6 +593,25 @@ fn unregistered_wiki_advisory(repo_config_path: &Path, cfg: &Config) -> Option<S
     ))
 }
 
+/// Non-fatal advisory: effective corpora with an include/exclude glob
+/// pattern that matches zero files on disk (a likely typo). Needs filesystem
+/// access, so it stays a separate step rather than living inside the pure
+/// `collect_warnings`/`collect_layered_warnings` TOML-only checks. A corpus
+/// with no advisories (including a valid empty corpus) contributes nothing
+/// and never affects the exit code.
+fn selection_advisories(cfg: &Config) -> anyhow::Result<Vec<String>> {
+    let corpora = cfg
+        .effective_corpora()
+        .map_err(|e| anyhow!("derive effective corpora: {e}"))?;
+    let mut out = Vec::new();
+    for corpus in &corpora {
+        let warnings = hallouminate_domain::corpus::selection_warnings(corpus)
+            .map_err(|e| anyhow!("validate corpus {:?} selection rules: {e}", corpus.name))?;
+        out.extend(warnings.into_iter().map(|warning| warning.to_string()));
+    }
+    Ok(out)
+}
+
 /// Non-fatal advisory: effective corpora whose declared roots don't exist on
 /// disk. Surfaces the same condition `hallouminate index` skips-with-warning,
 /// so the problem is visible before index time (issue #101). One line per
@@ -588,6 +683,51 @@ mod tests {
                 "`{key}` is a Config section missing from KNOWN_TOP_LEVEL_KEYS, so `config validate` falsely warns on it"
             );
         }
+    }
+
+    #[test]
+    fn known_scalar_section_keys_match_config_fields() {
+        let mut cfg = Config::default();
+        cfg.watch.reconcile_interval_secs = Some(60);
+        cfg.watch.catch_up_concurrency = Some(2);
+        cfg.search.crossencoder = Some("jina-reranker-v1-turbo-en".to_string());
+        let value = toml::Value::try_from(cfg).expect("serialize config");
+        let table = value.as_table().expect("config serializes to a table");
+        let sections: &[(&str, &[&str])] = &[
+            ("embeddings", KNOWN_EMBEDDINGS_KEYS),
+            ("search", KNOWN_SEARCH_KEYS),
+            ("logging", KNOWN_LOGGING_KEYS),
+            ("storage", KNOWN_STORAGE_KEYS),
+            ("daemon", KNOWN_DAEMON_KEYS),
+            ("watch", KNOWN_WATCH_KEYS),
+        ];
+        for (section, known) in sections {
+            let Some(toml::Value::Table(fields)) = table.get(*section) else {
+                panic!("`[{section}]` must serialize as a table");
+            };
+            for key in fields.keys() {
+                assert!(
+                    known.contains(&key.as_str()),
+                    "`{section}.{key}` is a config field missing from its known-key list, so `config validate` falsely warns on it"
+                );
+            }
+            for key in *known {
+                assert!(
+                    fields.contains_key(*key),
+                    "`{section}.{key}` is in its known-key list but is not a config field"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collect_warnings_accepts_watch_reconcile_and_daemon_debt_keys() {
+        let raw = "[watch]\nreconcile_interval_secs = 30\n\n[daemon]\ndebt_soft_fragments = 1000\ndebt_hard_fragments = 3000\n";
+        let warnings = collect_warnings(Some(raw), &Config::default());
+        assert!(
+            warnings.iter().all(|w| !w.contains("unknown key")),
+            "valid [watch] and [daemon] keys must not be flagged: {warnings:?}"
+        );
     }
 
     #[test]
@@ -702,6 +842,82 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_malformed_glob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("wiki");
+        fs::create_dir(&root).expect("mkdir root");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"[\"]\n",
+                root.display()
+            ),
+        )
+        .expect("write config");
+        let cwd = canon(dir.path());
+        write_repo_config(&cwd, "");
+
+        let err = cmd_config_validate(ConfigValidateArgs {
+            config: Some(path),
+            cwd: Some(cwd),
+        })
+        .expect_err("malformed glob must fail validation");
+        assert!(format!("{err:#}").contains("selection rules"));
+    }
+
+    #[test]
+    fn validate_rejects_absolute_glob() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("wiki");
+        fs::create_dir(&root).expect("mkdir root");
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            format!(
+                "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"/absolute/**/*.md\"]\n",
+                root.display()
+            ),
+        )
+        .expect("write config");
+        let cwd = canon(dir.path());
+        write_repo_config(&cwd, "");
+
+        let err = cmd_config_validate(ConfigValidateArgs {
+            config: Some(path),
+            cwd: Some(cwd),
+        })
+        .expect_err("absolute glob must fail validation");
+        assert!(format!("{err:#}").contains("selection rules"));
+    }
+
+    #[test]
+    fn selection_advisories_reports_exact_zero_match_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("wiki");
+        fs::create_dir(&root).expect("mkdir root");
+        let cfg: Config = toml::from_str(&format!(
+            "[[corpus]]\nname = \"wiki\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\nexclude = [\"tmp/**\"]\n",
+            root.display()
+        ))
+        .expect("parse config");
+
+        assert_eq!(
+            selection_advisories(&cfg).expect("valid rules"),
+            vec![
+                format!(
+                    "corpus \"wiki\" root {}: include pattern \"**/*.md\" matched no files",
+                    canon(&root).display()
+                ),
+                format!(
+                    "corpus \"wiki\" root {}: exclude pattern \"tmp/**\" matched no files",
+                    canon(&root).display()
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn validate_accepts_config_with_one_corpus_and_no_warnings() {
         let dir = tempfile::tempdir().expect("tempdir");
         let xdg_path = dir.path().join("xdg.toml");
@@ -753,6 +969,68 @@ mod tests {
     }
 
     #[test]
+    fn show_and_validate_report_a_found_repo_config_that_fails_to_merge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = canon(dir.path());
+        std::fs::create_dir(cwd.join(".git")).expect("mkdir .git");
+        let xdg_path = cwd.join("xdg.toml");
+        fs::write(&xdg_path, "[daemon]\nidle_exit_secs = 600\n").expect("write XDG");
+        let repo_path = write_repo_config(
+            &cwd,
+            "inherit_global_corpora = false\n\n[[repository]]\nname = \"plant-planner\"\npath = \".\"\n\n[storage]\nground_dir = \".hallouminate/ground\"\n",
+        );
+        let header = format!("baseline: {} (loaded, from --config)", xdg_path.display());
+        let show_err = cmd_config_show(ConfigShowArgs {
+            config: Some(xdg_path.clone()),
+            cwd: Some(cwd.clone()),
+        })
+        .expect_err("repo ground_dir override must fail");
+        let validate_err = cmd_config_validate(ConfigValidateArgs {
+            config: Some(xdg_path),
+            cwd: Some(cwd),
+        })
+        .expect_err("repo ground_dir override must fail");
+        for err in [show_err, validate_err] {
+            let msg = format!("{err:#}");
+            assert!(msg.contains(&header), "{msg}");
+            assert!(
+                msg.contains(&format!(
+                    "repo: {} (found, failed to load)",
+                    repo_path.display()
+                )),
+                "{msg}"
+            );
+            assert!(msg.contains("storage.ground_dir is baseline-only"), "{msg}");
+            assert!(!msg.contains("repo: not found"), "{msg}");
+            assert!(
+                !msg.contains("requires a .hallouminate/config.toml"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_error_without_a_git_repository_reports_baseline_only_mode() {
+        let baseline = BaselineSource {
+            path: PathBuf::from("/etc/hallouminate/config.toml"),
+            origin: BaselineOrigin::Xdg,
+        };
+        let err =
+            hallouminate_domain::common::HallouminateError::Config("duplicate corpus name".into());
+        let out = render_resolve_error(&baseline, Path::new("/work"), Ok(None), &err);
+        assert!(
+            out.contains("repo: none (no git repository above cwd; baseline-only mode)"),
+            "{out}"
+        );
+        assert!(out.contains("error: duplicate corpus name"), "{out}");
+        assert!(!out.contains("repo: not found"), "{out}");
+        assert!(
+            !out.contains("requires a .hallouminate/config.toml"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn format_no_repo_error_surfaces_baseline_path_and_origin_for_xdg() {
         // The error block must name the actual baseline path and its
         // origin (`from XDG`) regardless of whether the file exists.
@@ -799,7 +1077,7 @@ mod tests {
         let cwd = canon(dir.path());
         let xdg_path = cwd.join("xdg.toml");
         fs::write(&xdg_path, "").expect("write empty XDG");
-        write_repo_config(&cwd, "[[corpus]]\nname = \"docs\"\npaths = [\"/x\"]\n");
+        write_repo_config(&cwd, "[[corpus]]\nname = \"docs\"\npaths = [\"x\"]\n");
         // Just exercise the path — the printlns go to stdout. We assert on
         // the Ok result + that the implementation accesses both layers.
         cmd_config_validate(ConfigValidateArgs {
@@ -864,7 +1142,7 @@ mod tests {
             "[[corpus]]\nname = \"global\"\npaths = [\"/global\"]\n",
         )
         .expect("write XDG with global corpus");
-        write_repo_config(&cwd, "[[corpus]]\nname = \"local\"\npaths = [\"/local\"]\n");
+        write_repo_config(&cwd, "[[corpus]]\nname = \"local\"\npaths = [\"local\"]\n");
 
         // Re-load the same way `show` does and assert the merged corpora.
         let baseline = hallouminate_config::load_xdg(Some(&xdg_path)).expect("load baseline");
@@ -879,6 +1157,39 @@ mod tests {
             cwd: Some(cwd),
         })
         .expect("show with merged layers");
+    }
+
+    #[test]
+    fn show_renders_local_corpus_policy_and_excludes_baseline_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = canon(dir.path());
+        let xdg_path = cwd.join("xdg.toml");
+        fs::write(
+            &xdg_path,
+            "[[corpus]]\nname = \"global\"\npaths = [\"/global\"]\n",
+        )
+        .expect("write XDG with global corpus");
+        write_repo_config(
+            &cwd,
+            "inherit_global_corpora = false\n[[corpus]]\nname = \"local\"\npaths = [\"local\"]\n",
+        );
+
+        let baseline = hallouminate_config::load_xdg(Some(&xdg_path)).expect("load baseline");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&baseline, &cwd, None).expect("resolve");
+        assert_eq!(
+            effective
+                .corpora
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["local"]
+        );
+        let rendered = render_config(&effective).expect("render effective config");
+        assert!(
+            rendered.contains("inherit_global_corpora = false"),
+            "{rendered}"
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use agent_bench::SessionRecord;
 /// - `FAKE_CLI_ARGV_LOG=<path>`: append the session's full argv to that
 ///   path, one invocation per line.
 /// - `FAKE_CLI_MODE=invalid-json`: print non-JSON stdout and exit 0.
-/// - `FAKE_CLI_MODE=fail`: exit 3 with no stdout.
+/// - `FAKE_CLI_MODE=fail`: print a diagnostic on stderr and exit 3.
 /// - otherwise: print `{"result": "$FAKE_CLI_ANSWER", "usage": {...}}` with
 ///   all four usage fields non-zero and distinct, so a two-field sum would
 ///   visibly undercount.
@@ -48,6 +48,7 @@ if [ "$mode" = "invalid-json" ]; then
   exit 0
 fi
 if [ "$mode" = "fail" ]; then
+  printf '%s\n' 'MCP startup failed' >&2
   exit 3
 fi
 cat <<JSON
@@ -526,6 +527,44 @@ fn invalid_json_response_is_recorded_as_an_error_with_nonzero_exit_status() {
         !records[0].answer_text.is_empty(),
         "an error record must carry a diagnostic, not a silent empty answer"
     );
+}
+
+#[test]
+fn failed_process_records_its_stderr_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake_cli = install_fake_cli(dir.path());
+    let questions_path = dir.path().join("questions.json");
+    write_questions(&questions_path, &["q1"]);
+    let hash = agent_bench::blake3_file_hash(&questions_path).unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    let out_dir = dir.path().join("out");
+    let checkout_root = dir.path().join("checkouts");
+    let commit = init_git_checkout(&checkout_root, "hallouminate");
+    write_manifest(&manifest_path, &hash, &out_dir, &checkout_root, &commit);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bench-run"))
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake_cli)
+        .env("FAKE_CLI_MODE", "fail")
+        .arg("--manifest")
+        .arg(&manifest_path)
+        .arg("--questions")
+        .arg(&questions_path)
+        .args(["--arm", "wiki", "--runs", "1", "--out-dir"])
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records: Vec<SessionRecord> =
+        agent_bench::read_jsonl(&out_dir.join("sessions.jsonl")).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].exit_status, 3);
+    assert_eq!(records[0].usage.total(), 0);
+    assert!(records[0].answer_text.contains("MCP startup failed"));
 }
 
 /// The manifest pins `model_ids.subject` and the README promises every run

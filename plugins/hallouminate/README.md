@@ -43,6 +43,40 @@ The `install` skill walks you from zero to a working wiki:
 8. **Index & verify** — indexes and proves it with a `ground` query.
 9. **Commit** — branches and commits the scaffolding with git.
 
+## Harvest local agent memory
+
+`wiki-harvest-memory` curates durable, repository-specific knowledge from local
+Claude Code or Codex memories into an existing wiki. It rejects secrets,
+personal and transient state, verifies candidates against the current repo, and
+requires a redacted user review before the first write.
+
+Invoke it explicitly with `/hallouminate:wiki-harvest-memory claude` in Claude
+Code or `$wiki-harvest-memory codex` in Codex; pass `both` to review both local
+stores. Claude's `disable-model-invocation` flag keeps the skill out of model
+context until invocation. Codex's `allow_implicit_invocation: false` policy
+prevents implicit invocation.
+
+## Session-start hook
+
+The pack ships a `SessionStart` hook in `hooks/hooks.json`. It runs
+`hallouminate index --background` in the session directory. The daemon queues
+the catch-up and the hook returns at once. The hook prints nothing and always
+exits 0, even when `hallouminate` or the daemon is missing.
+
+Claude Code loads `hooks/hooks.json` from the plugin root on its own. Codex
+loads it through `hooks` in `.codex-plugin/plugin.json`. Codex 0.160 lists
+`hooks` as stable and `plugin_hooks` as removed. Older builds may need the
+`plugin_hooks` flag (`codex features enable plugin_hooks`). Codex asks you to
+review and trust the hook before it first runs.
+
+The hook matcher is `startup|resume`, so it does not run on clear or compact.
+The hook starts the index command in the background and exits at once.
+
+To disable only this hook, use `/hooks` in Codex (or decline it in the trust
+review), or the plugin hook controls in Claude Code. `codex features disable
+hooks` disables all hooks, not only this one. You can also delete
+`hooks/hooks.json` from a local copy.
+
 ## Templates
 
 `templates/wiki-entry.md` is the formal shape of a wiki entry — optional
@@ -62,6 +96,7 @@ plugins/hallouminate/
 ├── plugin.json                    # Copilot CLI plugin manifest
 ├── gemini-extension.json          # Gemini CLI extension manifest
 ├── .mcp.json                      # shared declarative MCP registration
+├── hooks/hooks.json               # SessionStart hook (Claude Code, Codex)
 ├── skills/                        # install and wiki workflows
 ├── templates/                     # wiki-entry and roadmap templates
 └── README.md

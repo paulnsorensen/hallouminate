@@ -48,7 +48,7 @@ different crates:
 | --- | --- | --- |
 | Degraded signal (must fail the eval) | `ripgrep-unresolved`, `ripgrep-unparseable`, `ripgrep-failed`, `ripgrep-timeout` | `hallouminate-domain/src/search.rs:171,187,372,386` |
 | Rerank fallback (judged by `rerank_completion`) | `rerank-timeout`, `crossencoder-unavailable` | `hallouminate-domain/src/ground/orchestrate.rs:204`, `hallouminate-daemon/src/dispatch.rs:431` |
-| Advisory (must **not** fail the eval) | `code-repos-empty`, `cross-repo-union` | `hallouminate-domain/src/ground/format.rs:334,368`, `hallouminate-daemon/src/dispatch.rs:444` |
+| Advisory (must **not** fail the eval) | `code-repos-empty`, `cross-repo-union`, `index-coverage` | `hallouminate-domain/src/ground/format.rs:334,368`, `hallouminate-daemon/src/dispatch.rs` (`handle_ground`: cross-repo-union + #427 coverage-warning blocks) |
 
 The gate originally allowed only the two rerank codes and failed on everything
 else, so the two advisory codes would have aborted a run. They were inert only
@@ -109,4 +109,81 @@ write stubs is not enough — a test that execs a deliberately missing binary
 still forks first, and that fork is enough to trip a sibling. Take the guard
 before the write, not just before the exec.
 
-_Source: PR #314 and the eval re-baseline investigation · Updated: 2026-07-29 · Supersedes: —_
+## The baseline is hardware-sensitive and must be measured on CI
+
+`compare_against_baseline` allows an explicit 0.01 MRR tolerance
+(`MRR_TOLERANCE`) plus a zero-tolerance per-query top-chunk ratchet. Scores
+still sit on FP/SIMD-order-sensitive knife edges: identical code and
+embeddings gave MRR 0.75217 on a dev machine and 0.75584 on the
+ubuntu-24.04 runner (2026-09, PR #439), a 0.0037 spread the tolerance
+absorbs. An up-to-date `eval/baseline.json` therefore passes `just eval`
+locally, but the baseline itself must still be measured on CI — a locally
+measured baseline is not guaranteed to hold on CI's FP/SIMD ordering. Use
+the eval workflow's
+`workflow_dispatch` input `mode=measure`, which runs
+`just eval-measure-baseline` and uploads
+`.context/eval-baseline-measurement.json`. That artifact already has the
+baseline shape (single requested arm, no comparison, empty
+timeouts/failures/errors — see `validate_baseline_artifact`), so it can be
+committed as `eval/baseline.json` unchanged.
+
+CI does not run the Jina diagnostic (`just eval-measure`). Jina reranks are
+too slow for its 5s evaluation deadline, so the arm always failed on the
+runner's first query (`footnote-inversion`), and every CI measure run from
+2026-09 to 2026-11 was red. Measured locally on 2026-11-08 with a 60s
+diagnostic deadline in a release build, Jina took p50 10.2s, p95 16.6s, and
+max 23s per query. The debug test profile is slower. The daemon also loads
+the crossencoder lazily inside the first rerank, under the same deadline.
+Run `just eval-measure` locally when you need the Jina comparison. A local
+host can also miss the 5s deadline, so set
+`HALLOUMINATE_EVAL_RERANK_TIMEOUT_MS=60000` to give the Jina arm a longer
+deadline. The override does not change the baseline arm.
+
+## Absolute corpus roots once shifted the `outside-root-refused` top chunk
+
+Absolute corpus paths are another diagnostic variable. Keep the binary, model, content, and machine fixed when testing this variable.
+A September 2026 release-readiness experiment uses three fresh stores with identical frozen wiki content under different absolute roots.
+The `outside-root-refused` query changes its top chunk between the expected sandbox section and `corpus-walker.md`.
+A separate comparison of ripgrep 14.1 and 15.2 produces identical scores for this query.
+
+The cause is the lexical signal tie break.
+`chunk_id_for` hashes the absolute file reference and chunk ordinal.
+Before 2026-09-09, `ranked_by_term_count` ordered equal term counts by chunk ID, so the ripgrep and contains-term RRF ranks depended on the absolute root.
+It now orders equal counts by root-relative path, then `line_start`, then chunk ID (`crates/hallouminate-domain/src/search.rs`, `tie_break_key`).
+Five diagnostic runs across three absolute roots then produce identical per-signal ranks and fused scores.
+The `hallouminate::search` debug log `pre-fusion signal order` (`crates/hallouminate-domain/src/search.rs`, `signal_order_log`) prints the four pre-fusion lists; capture it at `DEBUG` to re-run this diagnosis against a copied fixture.
+
+Consequence: the committed baseline was measured under the old hash-dependent tie order, so `outside-root-refused` now lands at rank 2 deterministically (expected chunk: fts 2, vector 1, ripgrep absent, contains 6; `corpus-walker.md:19`: fts 8, vector 12, ripgrep 6, contains absent; fused gap 0.0005).
+The expected chunk is absent from the ripgrep list because the file's earlier lines consume the per-file `--max-count` cap — the documented per-file-versus-per-chunk limit in `search/ripgrep.rs`.
+Re-measure the baseline on CI (`mode=measure`) after the tie-break change lands. Do not edit the baseline locally.
+Do not infer hardware or dependency drift from a baseline mismatch alone.
+The earlier ADR-001 investigation concerns a different baseline divergence; its rejected path hypothesis does not exclude this later observation.
+
+Evidence: `.cheese/research/release-retrieval-dependencies/release-retrieval-dependencies.md`; local measurements `.context/cure-ranking-path-comparison.json` and `.context/cure-ranking-rg-comparison.json`.
+
+## lance major bumps reorder near-tie ranks; expect a re-baseline
+
+The Aug 2026 weekly failures (MRR 0.76682 → 0.75584) came from the
+lance 8 → 9 → 10 bumps (lancedb 0.31 → 0.33 → 0.37, #312/#371), not from a
+retrieval quality loss: Recall@5 was unchanged and 13 of 73 queries shifted
+rank, every shift ≤2 positions (`clean-shutdown-inflight-writes` moved 9→7).
+A separate 9 of 73 queries changed which chunk ranked top; that is the
+top_chunk_pass count below, not the rank-shift count. lance PR #6950
+(v9.0.0) rewrote the flat/unindexed KNN top-k heap and changed tie-break
+admission — exactly the path small corpora (<256 rows, no ANN index) use.
+lancedb query defaults were byte-identical across 0.33–0.37, so no query
+knob restores an old ordering. When a lance major bump trips the gate with
+this signature (recall stable, small rank shuffles), re-baseline rather than
+pin. Research artifact:
+`.cheese/research/lancedb-lance9-ranking-regression/`.
+
+The re-baseline also moved `top_chunk_pass` 36→34: it lost protection for
+`cli-mcp-same-transport`, `error-variants`, `tracing-target-namespacing`, and
+`workspace-root-discovery` (their top chunk regressed but the query still
+places the right chunk within top-5, so Recall@5 is unaffected), and gained
+it for `index-refresh-on-write` and `outside-root-refused`. A future
+re-baseline that drops `top_chunk_pass` further without a matching lance
+note is worth a second look.
+
+_Source: PR #314, PR #439 · Updated: 2026-09-01 · Supersedes: —_
+

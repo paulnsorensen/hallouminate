@@ -22,11 +22,13 @@ thin binary entry point.[^2]
 ## `crates/hallouminate-daemon/` — long-lived local RPC daemon
 
 The daemon crate owns the single-owner background process: request dispatch,
-lifecycle and supervision (watchdog, backoff, heartbeat), filesystem watching,
-the Unix-socket protocol, maintenance/backpressure, and per-request resource
-composition (`RequestResources`, `DaemonState`). It depends on the domain,
-adapters, and config crates. Interactive CLI subcommands and the MCP `serve`
-transport in the application crate become clients of this daemon.
+lifecycle and supervision (watchdog, backoff, heartbeat — see
+[supervisor-restart-ladder](supervisor-restart-ladder.md)), filesystem
+watching, the Unix-socket protocol, maintenance/backpressure, and
+per-request resource composition (`RequestResources`, `DaemonState`). It
+depends on the domain, adapters, and config crates. Interactive CLI
+subcommands and the MCP `serve` transport in the application crate become
+clients of this daemon.
 
 ## `crates/hallouminate-config/` — configuration layer
 
@@ -93,6 +95,20 @@ adapter-owned `MaintenanceOptions` with `std::time::Duration` and returns
 adapter-owned `MaintenanceStats`, so the application crate no longer depends
 on LanceDB. New adapter APIs should follow this pattern.[^8]
 
+The `arrow` seam is closed too, but for a different reason than the two
+above: it isn't hiding a vendor type from a consumer crate, it's collapsing a
+duplicate-dependency trap inside `hallouminate-adapters` itself.
+`hallouminate-adapters` used to declare `arrow` directly (pinned to major
+`58`) alongside `lancedb`, which vendors its own `arrow`. When Cargo resolved
+the two to different majors, `RecordBatch`/`RecordBatchReader` became
+distinct types across the crate boundary and the crate stopped compiling —
+this is what killed the arrow-v59 bump (#306). The fix sources `arrow` only
+via `lancedb::arrow::arrow`, the same re-export surface the direct dependency
+pointed at, so there is exactly one `arrow` in the tree by construction and
+arrow updates now arrive bundled with lancedb bumps. Any future adapter code
+touching Arrow types must import through `lancedb::arrow::arrow`, never add
+a direct `arrow` dependency back.[^10]
+
 ## Testing
 
 Unit tests live beside their modules. Integration tests are under
@@ -108,3 +124,4 @@ module per concern.[^9]
 [^7]: `crates/hallouminate-domain/src/corpus/chunker.rs:10-13`; `crates/hallouminate-daemon/src/state.rs:141-145`.
 [^8]: `crates/hallouminate-adapters/src/lance.rs:43-56,854`; `crates/hallouminate-daemon/src/maintenance.rs:368`; `crates/hallouminate/Cargo.toml`.
 [^9]: `crates/hallouminate/tests/it/main.rs:1-16`.
+[^10]: `crates/hallouminate-adapters/Cargo.toml:9-18`; `crates/hallouminate-adapters/src/lance.rs:9-20`; commit `1474379` (PR #356, closes #306).

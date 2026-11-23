@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::report::IndexReport;
 use hallouminate_domain::corpus::{FileEntry, TreeNode};
-use hallouminate_domain::ground::GroundResponse;
+use hallouminate_domain::ground::{GroundGroupBy, GroundMatch, GroundOutput, GroundResponse};
 
 pub use hallouminate_domain::corpus::{LineRange, Position};
 
@@ -48,6 +48,7 @@ pub struct DaemonRequest {
 /// `ReadMarkdown`, `Ground`) skip the write lane; mutating operations
 /// (`Index`, `AddMarkdown`, `DeleteMarkdown`) take the corpus lock and the
 /// write-lane permit in that order.
+/// `AddMarkdownBatch` delegates each item to `AddMarkdown` without an outer lock.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DaemonRequestPayload {
@@ -65,6 +66,11 @@ pub enum DaemonRequestPayload {
     ListTree(ListTreeRequest),
     /// Write a markdown file to a corpus root and refresh its index rows.
     AddMarkdown(AddMarkdownRequest),
+    /// Writes items in order without rollback or isolation between items.
+    AddMarkdownBatch {
+        corpus: String,
+        items: Vec<AddMarkdownItem>,
+    },
     /// Read verbatim markdown content from a corpus root.
     ReadMarkdown(ReadMarkdownRequest),
     /// Unlink a markdown file from a corpus root and prune its index rows.
@@ -94,6 +100,18 @@ pub struct GroundRequest {
     pub chunks_per_file: Option<usize>,
     pub limit: Option<usize>,
     pub snippet_chars: Option<usize>,
+    #[serde(default)]
+    pub footnote_mode: hallouminate_domain::footnotes::FootnoteMode,
+    /// Retrieval mode. Older clients omit it and get [`GroundMatch::Ranked`].
+    #[serde(default)]
+    pub match_mode: GroundMatch,
+    /// Unit returned within each file. Older clients omit it and get
+    /// [`GroundGroupBy::Chunk`].
+    #[serde(default)]
+    pub group_by: GroundGroupBy,
+    /// Response shape. Older clients omit it and get [`GroundOutput::Hits`].
+    #[serde(default)]
+    pub output: GroundOutput,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +123,11 @@ pub struct IndexRequest {
     /// that omit the field keep the lenient behavior.
     #[serde(default)]
     pub strict: bool,
+    /// Register the cwd's corpora and queue their catch-up, then return
+    /// before the catch-up finishes. Defaults to `false` so older clients
+    /// keep the synchronous run.
+    #[serde(default)]
+    pub background: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +162,38 @@ pub struct AddMarkdownRequest {
     /// substring.
     #[serde(default)]
     pub replace_match: Option<String>,
+}
+
+/// Carries one markdown mutation within a shared-corpus batch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AddMarkdownItem {
+    /// Identifies the file relative to the shared corpus root.
+    pub path: String,
+    /// Supplies the whole file or the selected edit fragment.
+    pub content: String,
+    /// Permits replacement of an existing file in whole-file mode.
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Selects the heading whose section receives the content.
+    #[serde(default)]
+    pub under_heading: Option<String>,
+    /// Selects where to insert content within the selected section.
+    #[serde(default)]
+    pub position: Position,
+    /// Selects an inclusive, one-based line range to replace.
+    #[serde(default)]
+    pub replace_lines: Option<LineRange>,
+    /// Selects a unique literal substring to replace.
+    #[serde(default)]
+    pub replace_match: Option<String>,
+}
+
+/// Carries each completed item handler's response in input order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AddMarkdownBatchResult {
+    /// Contains one success or error per input item, in input order.
+    pub results: Vec<DaemonResponse>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,11 +355,18 @@ pub struct CorpusStatsResult {
     pub total_chunks: u64,
     pub last_indexed_ms: Option<i64>,
     pub unindexed_files: u64,
+    /// Configured include/exclude glob patterns that matched zero files on
+    /// disk, rendered via `SelectionWarning::Display`. Always present (an
+    /// empty array means no dead rules) — unlike `BacklinksResult::warnings`,
+    /// this field is not omitted when empty, so callers can rely on its
+    /// presence to distinguish "checked, found none" from an older daemon.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// `Ping` reply payload (Curd C — cross-version daemon skew). Carries the
-/// daemon binary's `CARGO_PKG_VERSION` so the MCP `serve` bootstrap can detect
-/// version skew — a new client adopting a daemon spawned from an older release
+/// daemon binary's [`BUILD_IDENTITY`] so the MCP `serve` bootstrap can detect
+/// version skew — a new client adopting a daemon spawned from an older build
 /// — and self-heal by restarting the stale daemon. `flock` enforces one
 /// daemon, not one version, so without this a fresh MCP server would silently
 /// drive a mismatched daemon.
@@ -320,6 +382,25 @@ pub struct PongResult {
     pub version: String,
 }
 
+/// Identity of this binary's build, reported in [`PongResult::version`].
+///
+/// Equals the compile-time `HALLOUMINATE_BUILD_ID` when the build sets it, and
+/// `CARGO_PKG_VERSION` otherwise. Every nightly build keeps the same
+/// `CARGO_PKG_VERSION`, so the nightly workflow sets `HALLOUMINATE_BUILD_ID` to
+/// its npm version. Without it, a new nightly `serve` adopts a daemon from an
+/// older nightly as current.
+pub const BUILD_IDENTITY: &str = build_identity(
+    option_env!("HALLOUMINATE_BUILD_ID"),
+    env!("CARGO_PKG_VERSION"),
+);
+
+const fn build_identity(build_id: Option<&'static str>, pkg_version: &'static str) -> &'static str {
+    match build_id {
+        Some(id) if !id.is_empty() => id,
+        Some(_) | None => pkg_version,
+    }
+}
+
 /// `ListFiles` payload alias — daemon emits an array of [`FileEntry`].
 pub type ListFilesResult = Vec<FileEntry>;
 
@@ -327,6 +408,10 @@ pub type ListFilesResult = Vec<FileEntry>;
 pub struct ListTreeResult {
     pub corpus: String,
     pub root: TreeNode,
+    /// Non-fatal notes such as `index-registration-conflict`. Omitted when
+    /// empty, so replies from older daemons still decode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 /// `ListCorpora` payload alias — daemon emits an array of [`CorpusEntry`].
@@ -344,6 +429,12 @@ pub struct StatusReport {
     pub defer_count: u32,
     pub watcher: WatcherCounters,
     pub trips: TripState,
+    /// Count of watch registrations observed as degraded (native watching
+    /// never established or was lost), so their corpora fall back to
+    /// periodic reconciliation only. `#[serde(default)]` so payloads from
+    /// an older daemon build (with no such field) still deserialize.
+    #[serde(default)]
+    pub degraded_watch_roots: usize,
 }
 
 /// One of the five long-lived daemon loops a watchdog can monitor. Mirrors
@@ -371,6 +462,8 @@ pub enum TaskState {
 pub struct TaskStatus {
     pub task: TaskName,
     pub state: TaskState,
+    /// Lifetime restart count from `Supervisor::restart_count`.
+    pub restarts: u64,
 }
 
 /// Graduated maintenance debt level. Mirrors `debt::DebtLevel`.
@@ -480,5 +573,48 @@ mod tests {
                 .is_some_and(|m| m.starts_with("serialize response:")),
             "error message must name the serialize failure, got: {wire}"
         );
+    }
+
+    #[test]
+    fn ground_request_without_match_mode_defaults_to_ranked() {
+        let req: GroundRequest = serde_json::from_value(serde_json::json!({ "query": "q" }))
+            .expect("a request from an older client still deserializes");
+        assert_eq!(req.match_mode, GroundMatch::Ranked);
+
+        let req: GroundRequest =
+            serde_json::from_value(serde_json::json!({ "query": "q", "match_mode": "phrase" }))
+                .expect("phrase mode deserializes");
+        assert_eq!(req.match_mode, GroundMatch::Phrase);
+    }
+
+    #[test]
+    fn ground_request_without_group_by_or_output_defaults_to_chunk_hits() {
+        let req: GroundRequest = serde_json::from_value(serde_json::json!({ "query": "q" }))
+            .expect("a request from an older client still deserializes");
+        assert_eq!(req.group_by, GroundGroupBy::Chunk);
+        assert_eq!(req.output, GroundOutput::Hits);
+
+        let req: GroundRequest = serde_json::from_value(serde_json::json!({
+            "query": "q",
+            "group_by": "page",
+            "output": "counts"
+        }))
+        .expect("page grouping and counts output deserialize");
+        assert_eq!(req.group_by, GroundGroupBy::Page);
+        assert_eq!(req.output, GroundOutput::Counts);
+    }
+
+    #[test]
+    fn build_id_overrides_the_package_version() {
+        assert_eq!(
+            build_identity(Some("0.0.0-experimental.345.1"), "0.11.1"),
+            "0.0.0-experimental.345.1"
+        );
+    }
+
+    #[test]
+    fn missing_or_empty_build_id_falls_back_to_the_package_version() {
+        assert_eq!(build_identity(None, "0.11.1"), "0.11.1");
+        assert_eq!(build_identity(Some(""), "0.11.1"), "0.11.1");
     }
 }

@@ -1,9 +1,11 @@
 ---
-status: draft
-last_verified: 2026-07-24
+status: reviewed
+last_verified: 2026-10-06
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
+  - https://github.com/paulnsorensen/hallouminate/pull/290
+  - https://github.com/paulnsorensen/hallouminate/issues/589
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055379
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055531
   - https://github.com/paulnsorensen/hallouminate/issues/288#issuecomment-5067055759
@@ -12,11 +14,11 @@ sources:
 ---
 # Ground search quality ADRs
 
-These five decisions define the proposed issue #288 design; PR #290 implements the retrieval/display and evaluation portions while retaining proposed status for future ranking policy.[^spec]
+These five decisions define the issue #288 design. PR #290 shipped the retrieval/display, worktree-identity, schema-migration, and evaluation portions (ADR-001/002/003, and the ADR-004 eval gate); the ADR-004 reranker default stayed opt-in and the ADR-005 LLM-context layer remains deferred to #284.[^spec]
 
 ## ADR-001 — Index search_text, display text
 
-Status: proposed.
+Status: shipped in #290 (schema v4).
 
 Decision: Preserve text as the rendering authority under its current preparation contract. Build deterministic search_text from heading breadcrumb + file summary + footnote-stripped body, and use it for embedding, FTS, and FM.[^spec]
 
@@ -28,7 +30,7 @@ Consequences: schema v4 and every search index rebuild. “Verbatim” means unc
 
 ## ADR-002 — Key corpora by name plus canonical root
 
-Status: proposed.
+Status: shipped in #290 (`CorpusKey`, `crates/hallouminate-domain/src/common.rs:45`).
 
 Decision: Introduce an identity equivalent to CorpusKey { name, canonical_root }, canonicalized via canonicalize_or_passthrough(expand_tilde(..)); persist root and apply name-plus-root predicates to every store operation.[^spec]
 
@@ -36,11 +38,11 @@ Evidence: #215 made deletes root-safe, yet name-only search still combines sibli
 
 Rejected: git-common-directory identity merges branches; name-only identity preserves duplicates; main-checkout resolution discards worktree-local semantics; post-search dedup may hide conflicts and choose the wrong version.
 
-Consequences: worktrees own distinct rows; storage grows until #286. Deliberate multi-root corpora union root-scoped queries with per-hit provenance.
+Consequences: worktrees own distinct rows; storage grew until retired-root GC shipped in #304 (tracked by #286). Deliberate multi-root corpora union root-scoped queries with per-hit provenance.
 
 ## ADR-003 — Rebuild older derived schemas automatically
 
-Status: proposed; amends the current fail-loud stale-schema convention.
+Status: shipped in #290; amends the prior fail-loud stale-schema convention. Extended to per-request `[storage].ground_dir` override stores by #589. Since #612, a repo layer cannot override `storage.ground_dir` (it is baseline-only), so in practice every request uses the boot `ground_dir`. A request can still open a second store handle on that directory when its resource key misses (see the per-request path below).
 
 Decision: Version < 4 logs, recreates the derived chunks table, and runs catch-up indexing; = 4 opens normally; > 4 remains fatal.[^spec]
 
@@ -50,9 +52,20 @@ Rejected: manual reindex creates avoidable broken-start states; fail-on-older wa
 
 Consequences: first open may spend minutes re-embedding large corpora; migration must be observable and preserve the existing newer-schema failure.
 
+### Amendment (#589) — boot rebuilds inline, request stores refill through catch-up
+
+Stale-schema recovery for a ground store has two paths, and only boot reindexes inline.[^589]
+
+- **Boot** (`DaemonState::open_with_owner` → `check_ground_dir`, `open_boot_store`): a store older than the build moves to `<ground>.bak-v<N>`, and every effective corpus reindexes before the daemon serves and before the watchdog arms. A failed move leaves the stale store in place and fails boot. A failed open or reindex removes the partial store, keeps the backup, and fails boot; the next start opens a fresh store, and boot `catch_up_index` refills it.
+- **Per request** (`resources_for_with_initializer`, a request whose resource key `{ground_dir, model, quantized, enabled}` misses the boot key; #612 made `storage.ground_dir` baseline-only, so a repo config reaches this path only through a different `[embeddings]` model, `quantized`, or `enabled` value): validation runs first, then embedder and tokenizer init, so an init failure leaves the stale store in place. Then the stale store moves aside, a fresh empty store opens with no in-request reindex, and the request calls `watch_registry().mark_reconcile_due_all()`. The watcher's admitted catch-up (`catch_up_corpus`: debt gate, corpus lock, write lane) refills the store, so the first request can return partial results with an `index-coverage` warning.
+
+Why the request path does not reindex: a multi-minute rebuild inside a request stalls the watcher pump heartbeat past `watchdog_stall_secs` (default 300 s, then a process abort). It also holds the single write-lane permit when `add_markdown` or `delete_markdown` triggers it, and it bypasses debt backpressure.
+
+Supporting rules: a per-ground-dir lock (`ground_dir_locks`) serializes check, move, and open, because two `ResourceKey`s with different embedding settings can name one dir. Boot and each per-request store open prune `<ground>.bak-v<N>` backups older than `STALE_BACKUP_MAX_AGE` (about 30 days).
+
 ## ADR-004 — Let evaluation choose the reranker default
 
-Status: proposed; thresholds are provisional and agent-introduced.
+Status: eval gate shipped in #290; default remains opt-in — the first complete run selected `none-qualified`. Thresholds are agent-introduced. **The selection thresholds below are superseded** by [search-reliability-loop-002](search-reliability-loop-002.md), which split the two concerns: `just eval` enforces the committed production fusion baseline with no crossencoder, and `just eval-measure` reports a quality delta against the documented opt-in candidate but *never selects or enables* one. Nothing in the tree auto-flips the default any more, so read the thresholds below as the rationale for gating rather than as live mechanism.
 
 Decision: Choose the cheapest supported candidate with absolute MRR gain >= 0.05 and added p50 <= 500 ms; if none qualifies, remain opt-in.[^spec]
 
@@ -64,7 +77,7 @@ Consequences: a failed flip is a valid result; scheduled evaluation gates regres
 
 ## ADR-005 — Deterministic context now, LLM context later
 
-Status: proposed.
+Status: deterministic prepend shipped in #290; credentialed LLM context deferred to #284.
 
 Decision: Prepend heading breadcrumb and file summary to the stripped body, and require authored sections to open self-contained. Defer credentialed 50–100-token LLM context to #284.[^spec]
 
@@ -93,5 +106,6 @@ Implementation note: the diagnostic keeps rerank completion separate from z-scor
 [^filesystem]: [design-rationale](design-rationale.md), “Filesystem is the source of truth; LanceDB is derived.”
 [^eval]: eval/README.md:75-85; [ground-search-evaluation](ground-search-evaluation.md).
 [^implementation]: crates/hallouminate/tests/eval_ground_recall.rs:582-646,1124-1147; crates/hallouminate-domain/src/ground/orchestrate.rs:155-174; crates/hallouminate-daemon/src/dispatch.rs:385-417.
+[^589]: [Issue #589](https://github.com/paulnsorensen/hallouminate/issues/589); `crates/hallouminate-daemon/src/state.rs` (`check_ground_dir`, `open_boot_store`, `resources_for_with_initializer`); `plugins/hallouminate/skills/wiki-reindex/SKILL.md` § Auto-heal.
 
-_Source: issue #288 plus research comments 1–4 and Anthropic's Introducing Contextual Retrieval · Updated: 2026-07-24 · Supersedes: —_
+_Source: issue #288 plus research comments 1–4, PR #290 (landed), issue #589 fix, and Anthropic's Introducing Contextual Retrieval · Updated: 2026-10-06 · Supersedes: the 2026-07-25 draft that marked ADR-001/002/003/005 "proposed"; the implicit "boot-only" scope of ADR-003_

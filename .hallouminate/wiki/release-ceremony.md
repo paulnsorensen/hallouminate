@@ -29,4 +29,26 @@ A `permissions:` block on a job that `uses:` a reusable workflow REPLACES the wo
 
 `idle_exit_removes_socket_and_lockfile_and_refuses_new_connections` could fail on macOS with `WouldBlock` re-flocking the single-instance lockfile: the test relocked immediately after the serve future returned, racing the async drop of the lock-holding fd. Fixed in [PR #210](https://github.com/paulnsorensen/hallouminate/pull/210) ([issue #207](https://github.com/paulnsorensen/hallouminate/issues/207)) with a bounded 2s retry that only retries `EWOULDBLOCK`. If it reappears, the panic line is tests/daemon.rs ~1790.
 
+## A failed Release run half-publishes the version
+
+A `v*` tag starts three workflows, and they do not wait for each other. `publish-crates.yml` and `release-skills.yml` publish to crates.io and `skills-v<ver>`. `release.yml` builds the binaries, then creates the GitHub Release and calls npm. If one dist build fails, the GitHub Release and npm do not publish. crates.io and skills can still publish, but each workflow can also fail on its own. After a failed tag, check every channel before you decide which version to cut next: `gh release view v<ver>`, `gh release view skills-v<ver>`, the crates.io `max_version`, and `npm view hallouminate dist-tags.latest --prefer-online`.
+
+Choose the recovery from the cause:
+
+- **Transient failure** (runner capacity, an internal GitHub error): rerun the failed Release jobs with `gh run rerun <run-id> --failed`. A rerun uses the original tag ref, so it completes the same version without a tag move or a second crates.io publish.
+- **Failure that needs a code or config change:** the tag's own files drive the run, so a rerun fails the same way. A crates.io version cannot be reused, and a published tag must not move. Cut a new patch version.
+
+This happened twice on 2026-11-21. v0.12.0 and v0.12.1 exist on crates.io and as skills releases, with no GitHub Release or npm package. v0.12.2 is the first complete 0.12 release.
+
+Prove a release.yml change on a PR before you tag. release.yml runs on `pull_request`, but dist builds only `plan` there. On a throwaway branch, set `pr-run-mode = "upload"` in `[dist]`, and limit `targets` if you need to. A PR run has `publishing: false`, so it builds the artifacts for the configured `targets` and publishes nothing. Revert the harness before merge. PR #780 used this method (run 44938778934).
+
+A PR run does not test the publish path. The `host`, `custom-publish-npm`, and `announce` jobs skip, and the plan step runs `dist plan`, not the tag path `dist host --steps=create --tag=<tag>`. A green PR run therefore proves the builds, not the GitHub Release, the npm publish, or the announcement.
+
+## macOS dist build needs two pins
+
+- **Runner.** dist 0.32 defaults `aarch64-apple-darwin` to `macos-14`, which GitHub no longer supports. The job ends in 1 s with "The configuration 'macos-14-arm64-us-default' is not supported". `dist-workspace.toml` pins `aarch64-apple-darwin = "macos-latest"`, the runner that nightly.yml uses (PR #777).
+- **Clang runtime.** The prebuilt onnxruntime in `ort-sys` uses Objective-C `@available`, which calls `___isPlatformVersionAtLeast`. Rust std defines that symbol, but the `dist` profile's `lto = "thin"` drops it (rust-lang/rust#164915). rustc links with `-nodefaultlibs`, so clang does not add its runtime. The link then fails with "Undefined symbols … ___isPlatformVersionAtLeast". The "Expose Xcode compiler runtime" step in release.yml appends `-Clink-arg=<…>/libclang_rt.osx.a` to `RUSTFLAGS` (PR #780).
+  - Use `RUSTFLAGS`, not `CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS`. dist sets `RUSTFLAGS` from the environment, and that overrides the target-specific variable.
+  - nightly.yml does not need this, because the `release` profile has no LTO. A green nightly therefore does not prove that the dist build links.
+
 Related: [[daemon-and-cli]], [[worktree-dev-gotchas]]

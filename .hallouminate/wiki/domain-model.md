@@ -1,23 +1,27 @@
 ---
-status: draft
-last_verified: 2026-07-24
+status: reviewed
+last_verified: 2026-08-09
 confidence: high
 sources:
   - https://github.com/paulnsorensen/hallouminate/issues/288
+  - https://github.com/paulnsorensen/hallouminate/pull/290
+  - https://github.com/paulnsorensen/hallouminate/pull/320
 ---
 # Domain model
 
-Issue #288 proposes derived `search_text`, worktree-specific `CorpusKey`, and automatic older-schema rebuilds. They are not shipped in the source state described here.[^spec]
+The domain model separates display text, retrieval text, parsed chunk structure, and root-scoped corpus identity. Schema 5 persists optional Markdown structure.[^structure]
+
+PR #290 introduces `search_text`, `CorpusKey`, and older-schema rebuilds in schema 4. PR #575 adds structure metadata and advances the schema to 5.[^spec][^structure]
 
 ## Status matrix
 
-| Concern | Shipped baseline | Proposed |
+| Concern | Prior baseline | Current behavior |
 |---|---|---|
 | Search/display text | Prepared display `text` feeds rendering and search; claim comments are stripped, footnotes retained | Preserve display behavior; add search-only `search_text` |
 | Corpus identity | Bare name with paths carried separately | Pair name with canonical root |
 | Delete scope | #215 restricts deletion to active roots | Keep safety; apply pair identity everywhere |
 | Search scope | Sibling-worktree rows may coexist | Read only the requesting root |
-| Schema mismatch | Older schema fails stale | `< 4` rebuilds; `> 4` remains fatal |
+| Schema mismatch | Older schema fails stale | `< 5` rebuilds; `> 5` remains fatal |
 | Source of truth | Filesystem Markdown | Unchanged; Lance remains derived |[^spec][^filesystem]
 
 ## Display `text`
@@ -48,9 +52,23 @@ Source bindings are `PreparedChunk` (`crates/hallouminate-domain/src/indexer/chu
 
 LLM-generated context is excluded; #284 may layer it on later while deterministic context remains the credential-free floor.[^f001]
 
+## Parsed chunk structure
+
+`ChunkStructure` carries parsed Markdown document structure through `PreparedChunk` and `SearchHit`. Lance stores it as optional JSON in a nullable UTF-8 `structure` column.[^structure]
+
+- `title` contains the first nonempty parsed H1, if present. The parser does not invent a title from the filename.
+- `headings` contains active parsed heading levels and text. Levels remain distinct from the existing display breadcrumb.
+- `generated_navigation` identifies generated-marker content, including heading-only chunks in generated-only documents.
+- Non-Markdown formats use `None`. Authored index prose keeps normal per-chunk treatment; the filename alone does not classify navigation.
+
+Malformed stored structure JSON produces a warning and `None`; it does not discard search hits. Valid structure remains intact, and SQL null stays neutral.
+The warning includes only the error category, line, and column. It excludes payload values. Missing required schema columns still fail.[^structure]
+
+This metadata supports [bounded structural ranking](ground-signal-fusion-adrs.md). It does not change display text, retrieval text, phrase semantics, or the public response shape.[^structure]
+
 ## `CorpusKey`
 
-The proposed semantic identity is:
+The semantic identity, shipped in #290 at `crates/hallouminate-domain/src/common.rs:45`, is:
 
 ```rust
 struct CorpusKey {
@@ -59,7 +77,7 @@ struct CorpusKey {
 }
 ```
 
-The exact Rust name is discretionary. Root resolution uses `canonicalize_or_passthrough(expand_tilde(configured_root))` consistently across scanning, planning, writes, and queries.[^spec]
+Root resolution uses `canonicalize_or_passthrough(expand_tilde(configured_root))` consistently across scanning, planning, writes, and queries.[^spec]
 
 ### Propagation
 
@@ -74,17 +92,17 @@ The current walker returns only `(FileRef, Mtime)` and planning deduplicates by 
 - Same name plus different root means different identity.
 - One worktree cannot list, search, touch, delete, replace, or count another's rows merely because names match.
 - Root canonicalization policy is identical at every seam.
-- Isolation does not clean retired roots; #286 owns garbage collection.[^f003]
+- Isolation does not clean retired roots; retired-root garbage collection shipped separately in #304 (`distinct_roots` / `delete_root`), tracked by #286.[^f003]
 
 ## Schema-version semantics
 
-`Meta.schema_version` is the bound marker in `crates/hallouminate-adapters/src/lance.rs:107-124`. Version 4 represents chunks with `search_text`, `root`, and rebuilt search indexes.[^spec]
+`Meta.schema_version` records the derived-store format. Version 5 adds nullable chunk-structure JSON to the existing `search_text`, `root`, and search indexes.[^structure]
 
 | Stored version | Required open behavior |
 |---|---|
-| `< 4` | Log, recreate the derived table, then run existing catch-up indexing |
-| `= 4` | Open normally |
-| `> 4` | Fail with the existing fatal newer-schema error |
+| `< 5` | Log, recreate the derived table, then run existing catch-up indexing |
+| `= 5` | Open normally |
+| `> 5` | Fail with the existing fatal newer-schema error |
 
 ### Migration invariants
 
@@ -112,6 +130,32 @@ The approved `search-reliability-loop` spec adds four proposed terms without cla
 
 The same approved design extends `SearchHit` with stored `search_text`, feeds that representation to the crossencoder, and continues building public Ground snippets from display `text`. This aligns every ranking stage on retrieval text without changing the Ground wire response.[^loop]
 
+## Daemon identity and ownership
+
+<certain> These terms define the canonical-daemon design, **shipped in PR #320** (issues #277, #318, #319). The ADRs behind them are [daemon-canonical-identity-001](daemon-canonical-identity-001.md), [-002](daemon-canonical-identity-002.md), and [-003](daemon-canonical-identity-003.md).
+
+**Canonical daemon socket** — The sole environment-independent default transport address for one OS user.
+_Avoid_: primary socket, fallback socket
+_Code_: `daemon_socket_path`, `canonical_socket_path`; `crates/hallouminate-daemon/src/socket.rs:11-23,48-53`
+
+**Store lock owner** — The process whose open file description holds the exclusive `flock`; PID, socket, and version metadata only describe that holder.
+_Avoid_: lock metadata owner
+_Code_: `StoreLockOwner`; `crates/hallouminate-adapters/src/lance.rs:38-61,742-764`
+
+
+
+## Worktree-index-provisioning terms
+
+<certain> These terms come from the approved `worktree-index-provisioning` spec (issue #427, parts 1 and 3; 2026-08-30). PR #430 (`4c41f6c`) implemented them. ADRs: [worktree-index-provisioning-adr](worktree-index-provisioning-adr.md).
+
+**WatchRegistry** — A registry in the daemon. The registry owns runtime corpus discovery and reconciliation. The registry continues while the daemon operates. `handle_ground` registers each resolved corpus through `register_runtime_corpora`. A catch-up pass for a new registration runs in `spawn_registration_catch_up`. The pump stays active in degraded mode when the native debouncer cannot start (`mark_degraded`).
+_Avoid_: Provisioner, index scheduler, background indexer
+_Code_: `WatchRegistry`, `crates/hallouminate-daemon/src/watch/registry.rs`; `register_runtime_corpora`, `spawn_registration_catch_up`, `crates/hallouminate-daemon/src/watch/mod.rs`
+
+**Content key** — The identity of one group of shared content rows in the `chunks` table. Schema 7 (#612) replaced per-root chunk rows with a split store. The `chunks` table holds content rows keyed by `content_key` and has no corpus or root column. The `root_files` table maps each `(corpus, root, file_ref)` to a content key. The key is a blake3 hash of the file `content_hash`, the file name, the derivation fingerprint (model, quantization, embeddings mode, schema version), and the prepared chunks. A worktree with byte-identical files writes map rows only and embeds nothing. The store embeds only content keys that have no stored rows. Orphan collection deletes content rows that no map row references.
+_Avoid_: donor, cache entry. The donor term described the schema 6 vector copy, which #612 removed.
+_Code_: `ContentKey::derive`, `crates/hallouminate-domain/src/indexer/content_key.rs:73`; `chunks_schema` and `root_files_schema`, `crates/hallouminate-adapters/src/lance.rs:280-324`; `LanceStore::prepare_batch` and `commit_batch`, same file lines 1763-1813; `delete_orphan_content`, same file line 2303
+
 ## Excluded concepts
 
 LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), confidence-gated reranking (#287), rendered-footnote changes, public response-shape expansion, and any database-first source-of-truth model are outside this proposal.[^spec]
@@ -125,4 +169,8 @@ LLM context (#284), full stale-page correction (#285), orphan cleanup (#286), co
 
 [^loop]: [Search reliability loop ADRs](search-reliability-loop-001.md), [production evaluation](search-reliability-loop-002.md), and [reranker representation](search-reliability-loop-003.md).
 
-_Source: issue #288 entity bindings and the approved search-reliability-loop spec · Updated: 2026-07-24 · Supersedes: —_
+_Source: issue #288 entity bindings, PR #290 (landed), the approved search-reliability-loop spec, and PR #320 (landed) · Updated: 2026-08-09 · Supersedes: the 2026-07-25 draft that framed `search_text` / `CorpusKey` / schema-v4 as unshipped_
+
+[^structure]: [PR #575](https://github.com/paulnsorensen/hallouminate/pull/575); `crates/hallouminate-domain/src/indexer/chunk.rs:7-92`; `crates/hallouminate-domain/src/indexer/format.rs:46-181`; `crates/hallouminate-adapters/src/lance.rs:151-158,943-996`.
+
+_Source: landed PR #575 · Updated: 2026-10-04 · Supersedes: schema 4 as the current store format; existing rebuild and source-of-truth rules remain unchanged._

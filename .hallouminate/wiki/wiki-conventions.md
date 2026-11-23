@@ -77,6 +77,15 @@ This is intentional — it forces a look at current state before
 clobbering, so concurrent authors don't silently lose each other's
 edits.
 
+`overwrite: true` is the blunt instrument, and it is rarely the right one.
+For a targeted change, use one of `add_markdown`'s surgical edit modes —
+`under_heading` (+ `position`), `replace_lines`, or `replace_match` — where
+`content` is the fragment rather than the whole file. Details in
+[mcp-surface](mcp-surface.md). The reason to prefer them is not keystrokes:
+a whole-file rewrite silently discards any edit that landed between your
+`read_markdown` and your write, whereas `replace_match` fails loudly if the
+text it was told to replace is no longer uniquely there.
+
 ## Where this wiki lives
 
 `.hallouminate/wiki/` inside this repo. Indexed as the
@@ -141,6 +150,33 @@ it contains markdown).
 - `[subdir/](./subdir/index.md)` for child directories.
 - Relative paths only — the wiki should survive moves of the whole
   directory.
+
+### `[[wikilinks]]` are the machine-readable link form
+
+Markdown links above are for humans reading the file. `[[target]]` is the
+form hallouminate itself understands: it is the *only* syntax the
+`backlinks` tool scans for, and the only one `add_markdown`'s wikilink lint
+checks. A page linked exclusively with `[stem](./stem.md)` has no
+backlinks as far as the tool is concerned. Use a wikilink whenever you want
+the connection to be discoverable from the other end; keep the markdown
+form where you also want a clickable link on a rendered site.
+
+The resolver (`resolve_slug`, `crates/hallouminate-domain/src/corpus/validate.rs`)
+normalizes both sides: lowercase, forward slashes, `.md` stripped. A target
+matches a page by full corpus-relative path *or* by bare filename stem, so
+`[[guides/setup]]` and `[[setup]]` both reach `guides/setup.md`. `[[target|alias]]`
+resolves on the target. Wikilinks inside fenced code blocks are ignored, so
+you can write an example without minting a link.
+
+Two failure shapes are worth designing around:
+
+- **Ambiguous bare stems.** If two pages anywhere in the tree share a
+  filename stem, a bare `[[stem]]` resolves to neither — the lint flags it
+  and `backlinks` refuses to count it. Prefer globally unique file stems;
+  when you can't, write the full path form.
+- **Advisory, not blocking.** An unresolvable wikilink produces a warning
+  in the `add_markdown` response and the write lands anyway. Nothing fails
+  later, so nothing will remind you — read the warnings when you write.
 
 ## What belongs here vs `.cheese/`
 

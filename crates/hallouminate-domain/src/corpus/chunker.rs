@@ -1,6 +1,6 @@
 use super::collect_heading_text;
 use pulldown_cmark::{Event, HeadingLevel, OffsetIter, Parser, Tag};
-use text_splitter::{ChunkConfig, MarkdownSplitter};
+use text_splitter::{ChunkConfig, MarkdownSplitter, TextSplitter};
 
 use crate::common::{HallouminateError, Result};
 use crate::embeddings::canonical_model_name;
@@ -103,6 +103,147 @@ impl<S: ChunkSizer> MarkdownChunker<S> {
 pub fn chunk_markdown<S: ChunkSizer>(text: &str, sizer: S) -> Vec<Chunk> {
     // Need a generous default budget since the sizer might be Characters.
     MarkdownChunker::new(sizer, 1500).chunk(text)
+}
+
+/// Token-budgeted reStructuredText chunker.
+///
+/// RST is not markdown, so the markdown splitter's structure rules don't apply:
+/// splitting uses `text_splitter::TextSplitter` (plain budget windows). A
+/// parallel side-pass recognises RST section adornments to attach heading
+/// breadcrumbs, mirroring [`MarkdownChunker`]'s citation enrichment.
+pub struct RstChunker<S: ChunkSizer> {
+    splitter: TextSplitter<S>,
+}
+
+impl<S: ChunkSizer> RstChunker<S> {
+    pub fn new(sizer: S, budget_tokens: usize) -> Self {
+        let config: ChunkConfig<S> = ChunkConfig::new(budget_tokens).with_sizer(sizer);
+        Self {
+            splitter: TextSplitter::new(config),
+        }
+    }
+
+    /// Split `text` into budget-bounded chunks, each annotated with its RST
+    /// section breadcrumb and line range.
+    pub fn chunk(&self, text: &str) -> Vec<Chunk> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let line_starts = build_line_starts(text);
+        let breadcrumbs = build_rst_breadcrumbs(text);
+        let mut out: Vec<Chunk> = Vec::new();
+        for (byte_off, slice) in self.splitter.chunk_indices(text) {
+            if slice.is_empty() {
+                continue;
+            }
+            let heading_path = heading_path_at(byte_off, &breadcrumbs);
+            let line_start = byte_to_line(byte_off, &line_starts);
+            let end_byte = byte_off + slice.len();
+            let line_end = if end_byte == 0 {
+                line_start
+            } else {
+                byte_to_line(end_byte - 1, &line_starts)
+            };
+            out.push(Chunk {
+                ord: out.len(),
+                heading_path,
+                line_start,
+                line_end,
+                text: slice.to_string(),
+            });
+        }
+        out
+    }
+}
+
+impl<S: ChunkSizer + Send + Sync> CorpusChunker for RstChunker<S> {
+    fn chunk_text(&self, text: &str) -> Vec<Chunk> {
+        self.chunk(text)
+    }
+}
+
+// ── RST section breadcrumbs ─────────────────────────────────────
+
+/// If `line` is an RST adornment — a run of a single ASCII-punctuation
+/// character such as `=====` or `-----` — return that character. Trailing
+/// whitespace is tolerated; leading whitespace disqualifies it.
+fn rst_adornment_char(line: &str) -> Option<char> {
+    if line.starts_with(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    let trimmed = line.trim_end();
+    let first = trimmed.chars().next()?;
+    if !first.is_ascii_punctuation() {
+        return None;
+    }
+    if trimmed.chars().all(|c| c == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// Build section breadcrumbs for an RST document.
+///
+/// A section is a title line immediately followed by an underline adornment at
+/// least as long as the title, optionally preceded by a matching overline. RST
+/// assigns heading levels by the order in which distinct adornment *styles*
+/// (character + whether overlined) first appear: the first style seen is H1,
+/// the next new style H2, and so on. Levels at or beyond [`MAX_HEADING_LEVEL`]
+/// are ignored, matching the markdown H4+ cutoff.
+fn build_rst_breadcrumbs(text: &str) -> Vec<Breadcrumb> {
+    let mut out: Vec<Breadcrumb> = vec![Breadcrumb {
+        byte_offset: 0,
+        path: Vec::new(),
+    }];
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut line_offsets: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut off = 0usize;
+    for line in &lines {
+        line_offsets.push(off);
+        off += line.len() + 1;
+    }
+    // Distinct adornment styles in first-seen order; index == heading level.
+    let mut styles: Vec<(char, bool)> = Vec::new();
+    let mut stack: [Option<String>; MAX_HEADING_LEVEL] = Default::default();
+    for k in 1..lines.len() {
+        let Some(under_char) = rst_adornment_char(lines[k]) else {
+            continue;
+        };
+        let title = lines[k - 1];
+        let title_text = title.trim();
+        // The line above must be real title text, not blank and not itself an
+        // adornment (an overline is handled when its underline is reached).
+        if title_text.is_empty() || rst_adornment_char(title).is_some() {
+            continue;
+        }
+        // The underline must be at least as wide as the title text.
+        if lines[k].trim_end().chars().count() < title_text.chars().count() {
+            continue;
+        }
+        let has_overline = k >= 2 && rst_adornment_char(lines[k - 2]) == Some(under_char);
+        let style = (under_char, has_overline);
+        let level = match styles.iter().position(|s| *s == style) {
+            Some(idx) => idx,
+            None => {
+                styles.push(style);
+                styles.len() - 1
+            }
+        };
+        if level >= MAX_HEADING_LEVEL {
+            continue;
+        }
+        for slot in &mut stack[level..] {
+            *slot = None;
+        }
+        stack[level] = Some(title_text.to_string());
+        let path: Vec<String> = stack.iter().flatten().cloned().collect();
+        out.push(Breadcrumb {
+            byte_offset: line_offsets[k - 1],
+            path,
+        });
+    }
+    out
 }
 
 /// Load a Hugging Face tokenizer for the given model and wrap it as a sizer
@@ -342,5 +483,51 @@ mod tests {
         let err = load_tokenizer("clip-vit-b32").expect_err("unsupported must error locally");
         let msg = err.to_string();
         assert!(msg.contains("unsupported embedding model"), "{msg}");
+    }
+
+    fn small_rst_chunker() -> RstChunker<Characters> {
+        RstChunker::new(Characters, 2000)
+    }
+
+    #[test]
+    fn rst_breadcrumbs_track_underline_sections_in_order() {
+        let text = "Top\n===\n\nintro\n\nSub\n---\n\nbody\n";
+        let crumbs = build_rst_breadcrumbs(text);
+        // initial empty + two sections
+        assert_eq!(crumbs.len(), 3);
+        assert!(crumbs[0].path.is_empty());
+        assert_eq!(crumbs[1].path, vec!["Top".to_string()]);
+        assert_eq!(crumbs[2].path, vec!["Top".to_string(), "Sub".to_string()]);
+    }
+
+    #[test]
+    fn rst_breadcrumbs_treat_overline_style_as_distinct_level() {
+        // Overlined `=` is a different style from underline-only `=`, so it
+        // opens its own level rather than colliding: Top (overlined) is H1 and
+        // Sub (underline-only) is H2.
+        let text = "===\nTop\n===\n\nSub\n===\n\nbody\n";
+        let crumbs = build_rst_breadcrumbs(text);
+        let last = crumbs.last().unwrap();
+        assert_eq!(last.path, vec!["Top".to_string(), "Sub".to_string()]);
+    }
+
+    #[test]
+    fn rst_breadcrumbs_ignore_underline_shorter_than_title() {
+        let text = "Title\n==\n\nbody\n";
+        let crumbs = build_rst_breadcrumbs(text);
+        assert_eq!(crumbs.len(), 1, "no section detected: {crumbs:?}");
+    }
+
+    #[test]
+    fn rst_chunker_attaches_section_breadcrumb() {
+        let text = "Overview\n========\n\nThe melange flows.\n";
+        let chunks = small_rst_chunker().chunk(text);
+        assert!(!chunks.is_empty());
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.heading_path == vec!["Overview".to_string()]),
+            "every chunk under the section: {chunks:?}"
+        );
     }
 }

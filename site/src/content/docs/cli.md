@@ -1,0 +1,135 @@
+---
+title: "CLI reference"
+---
+
+`hallouminate` is a single binary. The CLI, the MCP server, and the daemon are
+all the same executable; CLI subcommands dial the daemon over a Unix domain
+socket (see [Architecture](/hallouminate/architecture/)).
+
+| Command | Purpose |
+|---|---|
+| `hallouminate serve` | Run the stdio MCP server (auto-spawns the daemon if down). |
+| `hallouminate index [--corpus NAME]` | Bulk (re)index one corpus, or every configured corpus. |
+| `hallouminate ground "<query>" [flags]` | Semantic search from the CLI. |
+| `hallouminate daemon <run\|stop\|restart\|status>` | Manage the long-lived daemon. |
+| `hallouminate config <init\|show\|validate\|download>` | Inspect or scaffold config. |
+| `hallouminate hook <install\|uninstall>` | Manage the per-repo discovery hook. |
+
+`hallouminate --version` prints the version; `hallouminate --help` and
+`hallouminate <command> --help` print usage for any subcommand.
+
+## `serve`
+
+```sh
+hallouminate serve
+```
+
+Starts the stdio MCP server an agent connects to. It is stateless beyond its
+tool router, and every MCP request supplies its own absolute checkout `cwd`.
+The server does not reuse the process startup directory. If no daemon is
+running, `serve` spawns one.
+
+## Selecting a repository
+
+`index` and `ground` use the process current directory for repo-layer
+discovery. Run these commands from the target checkout; a daemon startup
+directory does not select the repository for later requests. `config show` and
+`config validate` accept `--cwd PATH` to select the directory explicitly.
+
+## Migrating MCP clients
+
+Add the active checkout to every MCP request, including `list_corpora`:
+
+```json
+{"name":"list_corpora","arguments":{"cwd":"/workspaces/project"}}
+{"name":"ground","arguments":{"cwd":"/workspaces/project","query":"release process"}}
+```
+
+Keep document paths relative to the corpus root. Keep `globs` relative to each
+configured root, such as `guides/**/*.md`, instead of using absolute patterns.
+
+## `index`
+
+```sh
+hallouminate index               # rebuild every configured corpus
+hallouminate index --corpus repo:hallouminate:wiki
+```
+
+Use this when files were touched outside hallouminate. Writes that go through
+`add_markdown` already auto-reindex just the changed file.
+
+## `ground`
+
+```sh
+hallouminate ground "how does the daemon work"
+hallouminate ground "socket protocol" --corpus repo:hallouminate:wiki --format json-pretty
+```
+
+| Flag | Effect |
+|---|---|
+| `--corpus NAME` | Corpus to search (defaults to the wiki for the current repo). |
+| `--format outline\|json\|json-pretty` | Output shape. `outline` (default) is a ripgrep-style digest. |
+| `--full` | Return full chunk bodies instead of snippets. |
+| `--top-files N` | Number of files to roll up. |
+| `--chunks-per-file N` | Chunks to include per file. |
+| `--limit N` | Hard cap on returned chunks. |
+| `--snippet-chars N` | Snippet length when not using `--full`. |
+| `--match ranked\|phrase` | Retrieval mode. `phrase` uses bounded, case-insensitive literal matching of the whole query. Each whitespace run counts as one space, so a phrase across a line break matches. |
+| `--group-by chunk\|page` | Unit returned within each file. `page` returns one entry for each PDF page with its matched chunk count. |
+| `--output hits\|counts` | Response shape. `counts` needs `--match phrase` and returns matched chunks and distinct pages for each file, with no snippets. |
+
+Phrase results can omit matches because of `--limit`, `--chunks-per-file`,
+`--top-files`, or the 10,000-match scan cap. A `phrase-truncated` warning
+reports these limits. Do not infer absence or uniqueness from truncated results.
+
+For a count, use `--match phrase --output counts`. Counts ignore `--limit`,
+`--chunks-per-file`, and `--top-files`. The scan cap applies, and the output
+lists at most 2,000 files with a `counts-truncated` warning when more match.
+With `--group-by page`, `--chunks-per-file` caps pages, not chunks.
+
+```sh
+hallouminate ground "abatement" --match phrase --output counts
+hallouminate ground "abatement" --match phrase --group-by page --chunks-per-file 50
+```
+
+## `daemon`
+
+```sh
+hallouminate daemon run        # run in the foreground
+hallouminate daemon status     # is one running?
+hallouminate daemon stop
+hallouminate daemon restart
+```
+
+The daemon is the single owner of the LanceDB ground directory. Restart it
+after editing the **baseline** config; repo-layer edits take effect on the
+next request without a restart. `--config PATH` overrides the baseline config
+path.
+
+## `config`
+
+```sh
+hallouminate config init       # scaffold the XDG baseline config
+hallouminate config show       # print the effective merged config for this cwd
+hallouminate config validate   # parse + flag unknown top-level keys
+hallouminate config download   # pre-fetch the configured embedding model
+```
+
+See [Configuration](/hallouminate/config/).
+
+## `hook`
+
+```sh
+hallouminate hook install [--repo PATH]
+hallouminate hook uninstall [--repo PATH]
+```
+
+Installs or removes a per-repo discovery hook. `--repo PATH` targets a repo
+other than the current directory.
+
+## Socket override
+
+`--socket PATH` on `index`, `ground`, and the other client subcommands points
+at a specific daemon socket. Otherwise the socket is resolved from
+`HALLOUMINATE_SOCKET`, then the per-user cache socket — see
+[Architecture](/hallouminate/architecture/#socket-location).

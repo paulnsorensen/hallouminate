@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 pub struct DaemonHarness {
     socket: PathBuf,
     cwd: PathBuf,
+    state: DaemonState,
     _tmp: tempfile::TempDir,
     handle: Option<JoinHandle<anyhow::Result<()>>>,
     shutdown: Option<oneshot::Sender<()>>,
@@ -54,15 +55,18 @@ impl DaemonHarness {
         let state = DaemonState::open(cfg, None).await.expect("open state");
         let (tx, rx) = oneshot::channel();
         let socket_clone = socket.clone();
-        let handle = tokio::spawn(async move {
-            let server = serve_with_idle_timeout(&state, &socket_clone, idle_timeout);
-            tokio::pin!(server);
-            tokio::select! {
-                res = &mut server => res,
-                _ = rx => {
-                    state.shutdown_token().cancel();
-                    server.await
-                },
+        let handle = tokio::spawn({
+            let state = state.clone();
+            async move {
+                let server = serve_with_idle_timeout(&state, &socket_clone, idle_timeout);
+                tokio::pin!(server);
+                tokio::select! {
+                    res = &mut server => res,
+                    _ = rx => {
+                        state.shutdown_token().cancel();
+                        server.await
+                    },
+                }
             }
         });
         // Wait for a successful Ping round-trip, not just socket-path
@@ -91,6 +95,7 @@ impl DaemonHarness {
         DaemonHarness {
             socket,
             cwd,
+            state,
             _tmp: tmp,
             handle: Some(handle),
             shutdown: Some(tx),
@@ -123,6 +128,12 @@ impl DaemonHarness {
 
     pub fn socket(&self) -> &Path {
         &self.socket
+    }
+
+    /// Handle to the served daemon state, for tests that hold its write lane
+    /// to stall background work.
+    pub fn state(&self) -> &DaemonState {
+        &self.state
     }
 
     /// Path of the harness tempdir, which contains an empty

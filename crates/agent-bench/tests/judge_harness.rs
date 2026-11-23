@@ -264,6 +264,44 @@ fn unparseable_judge_reply_is_a_hard_error_naming_the_value_and_writes_nothing()
 }
 
 #[test]
+fn failed_session_does_not_invoke_the_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions_path =
+        write_question_set(dir.path(), &[sample_question("q1", QuestionTag::Greppable)]);
+    let mut failed = sample_session("q1", Arm::Wiki, 0, "MCP startup failed");
+    failed.exit_status = 3;
+    let sessions_path = write_sessions(dir.path(), &[failed]);
+    let out_path = dir.path().join("grades.jsonl");
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        "if [ \"$1\" = --version ]; then echo '0.0.0-test (Claude Code)'; exit 0; fi\nexit 99",
+    );
+
+    let output = Command::new(bin_path())
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+        .arg("--sessions")
+        .arg(sessions_path)
+        .arg("--questions")
+        .arg(questions_path)
+        .arg("--out")
+        .arg(&out_path)
+        .arg("--manifest")
+        .arg(manifest_path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let grades: Vec<GradeRecord> = agent_bench::read_jsonl(&out_path).unwrap();
+    assert!(grades.is_empty());
+}
+
+#[test]
 fn pass_derives_from_threshold_and_differs_across_thresholds() {
     let dir = tempfile::tempdir().unwrap();
     let questions = [

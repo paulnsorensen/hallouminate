@@ -384,10 +384,15 @@ fn run_session(
         .output();
     let wall_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let (stdout, mut exit_status) = match spawned {
-        Ok(output) => (output.stdout, output.status.code().unwrap_or(-1)),
+    let (stdout, stderr, mut exit_status) = match spawned {
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }) => (stdout, stderr, status.code().unwrap_or(-1)),
         Err(err) => (
             format!("bench-run: failed to spawn agent {:?}: {err}", agent.bin).into_bytes(),
+            Vec::new(),
             -1,
         ),
     };
@@ -418,10 +423,14 @@ fn run_session(
             }
         }
     } else {
-        (
-            String::from_utf8_lossy(&stdout).into_owned(),
-            TokenUsage::default(),
-        )
+        let mut diagnostic = String::from_utf8_lossy(&stdout).into_owned();
+        if !stderr.is_empty() {
+            if !diagnostic.is_empty() && !diagnostic.ends_with('\n') {
+                diagnostic.push('\n');
+            }
+            diagnostic.push_str(&String::from_utf8_lossy(&stderr));
+        }
+        (diagnostic, TokenUsage::default())
     };
 
     Ok(SessionRecord {

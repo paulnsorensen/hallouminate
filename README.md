@@ -36,7 +36,7 @@ design.
 
 **[Install](#install)** · **[First run](#first-run)** ·
 **[Full documentation](https://cheeselord.dev/hallouminate/)** ·
-**[How it compares](https://cheeselord.dev/hallouminate/comparison.html)**
+**[How it compares](https://cheeselord.dev/hallouminate/comparison/)**
 
 ## Install
 
@@ -90,6 +90,13 @@ the harness-native route:
 | **Gemini CLI** | From a checkout: `gemini extensions install ./plugins/hallouminate --consent`. From an extracted release archive: `gemini extensions install ./hallouminate-skills-<version>/plugins/hallouminate --consent`. | Inline in `gemini-extension.json`; bundled skills are auto-discovered |
 | **opencode** | Copy `plugins/hallouminate/skills/` to `~/.config/opencode/skills/` | Add `{ "mcp": { "hallouminate": { "type": "local", "command": ["hallouminate", "serve"] } } }` to `opencode.json` |
 
+
+To curate local Claude Code or Codex memories into the current repo wiki, invoke
+`/hallouminate:wiki-harvest-memory claude` in Claude Code or
+`$wiki-harvest-memory codex` in Codex. The skill cannot run implicitly; Claude
+Code also keeps it out of model context until invocation. It presents a redacted
+candidate review, then writes only the facts the user approves.
+
 ### Without the plugin: skills + MCP by hand
 
 The plugin is a convenience wrapper — both halves can be wired manually:
@@ -135,12 +142,18 @@ cargo run -- config show                 # print the effective merged config
 
 ## MCP
 
-`hallouminate serve` starts a stdio MCP server. Tools:
+`hallouminate serve` starts a stdio MCP server. Every tool call takes a
+required `cwd` argument: the absolute path of the directory the request
+applies to. Pass your own active checkout — in a git worktree, the harness's
+original working directory is often a different checkout from the one you
+are working in, and passing the stale one silently reads and writes the
+wrong worktree. Tools:
 
 - `ground` — semantic search.
 - `index` — bulk (re)build a corpus index.
 - `corpus_stats` — index health for one corpus: indexed file count, total
-  chunk rows, newest index timestamp, and unindexed-file count.
+  chunk rows, newest index timestamp, unindexed-file count, and zero-match
+  include/exclude warnings.
 - `list_corpora` — list every configured corpus.
 - `list_files` — flat list of relative paths in a corpus.
 - `list_tree` — the same files grouped into a directory tree, for
@@ -151,8 +164,12 @@ cargo run -- config show                 # print the effective merged config
   blocks, heading-level jumps) without blocking or rewriting the content.
 - `read_markdown` — verbatim UTF-8 file contents. Use before overwriting.
 - `delete_markdown` — unlink the file and prune its rows from the index.
-- `get_footnote` — resolve a single citation: the footnote target for a
-  page's `#footnote_number`.
+- `backlinks` — corpus-relative paths of every page that links to a given
+  page via a `[[wikilink]]`.
+
+Document paths (`path` on `add_markdown`, `read_markdown`, `delete_markdown`,
+`backlinks`) are corpus-relative. Absolute paths and `..` traversal are
+rejected.
 
 Markdown content is stored verbatim — hallouminate imposes no schema.
 Convention for LLM wiki authors: one topic per file, first line `# Title`,
@@ -170,13 +187,40 @@ The config lives at `$XDG_CONFIG_HOME/hallouminate/config.toml`
 - `hallouminate config download` — pre-fetch the configured embedding model
   so the first `index` doesn't pay the download cost.
 
+Corpus globs select which supported documents are indexed. The indexer handles
+Markdown, plain text, reStructuredText, CSV, xlsx/xls/ods spreadsheets, and
+text-layer PDFs. PDF chunks carry `page:N` breadcrumbs; image-only pages require
+OCR and are skipped with a warning. For example:
+
+```toml
+[[corpus]]
+name = "project-docs"
+paths = ["~/Dev/project/docs"]
+globs = ["**/*.md", "**/*.pdf"]
+```
+
+Include and exclude patterns match paths relative to each configured corpus
+root. For example, `docs/**/*.md` selects root-level `docs/`, not `libs/docs/`.
+Use `**/docs/**/*.md` to select both. The most-specific root owns files when
+roots overlap. A single-file root matches patterns against its file name.
+Absolute patterns are errors; no legacy matching or automatic rewrite exists.
+
+`config validate` and `corpus_stats` report patterns with zero matches as
+advisory warnings. Each warning names the corpus, root, rule kind, and pattern.
+A valid empty corpus still succeeds. These warnings do not certify index freshness.
+
 ## Cross-repo union search
 
-`ground` (and the read/list tools) resolve corpora relative to the caller's
-working directory:
+`ground` (and the read/list tools) resolve corpora relative to the directory
+passed as `cwd`:
 
-- **Inside a repo** — the request defaults to that repo's `repo:<name>:wiki`.
-- **Above all repos** (e.g. `cd ~/Dev`) — a `ground` call with **no explicit
+- **Inside a repo** — a `ground` call with **no explicit `corpus`** searches
+  the _union_ of that repo's own `repo:<name>:wiki` with every other
+  config-declared corpus — baseline-registered `[[repository]]` wikis,
+  user-declared `[[corpus]]` entries, and each repository's
+  `repo:<name>:corpus` source corpus when configured — fused as one ranking.
+  The repo's own pages win score ties and keep reserved `top_files` slots.
+- **Above all repos** (e.g. `cwd: ~/Dev`) — a `ground` call with **no explicit
   `corpus`** searches the _union_ of every effective corpus: discovered sub-repo
   wikis + baseline-registered `[[repository]]` wikis, plus user-declared
   `[[corpus]]` entries and each repository's `repo:<name>:corpus` source corpus
@@ -186,7 +230,7 @@ working directory:
 
 The downward walk is bounded: it honours `.gitignore`, skips hidden
 directories (except `.hallouminate` itself), caps its depth, and never scans
-above the working directory. Walk-discovered wikis are deduped against the
+above the `cwd` directory. Walk-discovered wikis are deduped against the
 baseline by resolved path; a discovered local config that collides with a
 baseline repository of the same name wins, with a `cross-repo-union` warning
 on the response rather than a silent shadow.
@@ -206,8 +250,9 @@ thin clients that talk to it over a Unix domain socket.
   start by hand.
 - **Socket resolution order** — `HALLOUMINATE_SOCKET` (explicit full-path
   override; setting it also disables auto-spawn — the caller owns the daemon
-  lifecycle), else `$XDG_RUNTIME_DIR/hallouminate/daemon.sock`, else
-  `~/.cache/hallouminate/daemon.sock`.
+  lifecycle), else `<account-home>/.cache/hallouminate/daemon.sock`. The
+  account home comes from the OS user record, not `$HOME` or
+  `$XDG_RUNTIME_DIR`.
 - **Lifecycle** — `hallouminate daemon status` / `stop` / `restart`; bare
   `hallouminate daemon` runs it in the foreground. Only one instance per
   socket can run (`flock`-guarded).

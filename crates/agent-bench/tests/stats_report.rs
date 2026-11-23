@@ -1083,3 +1083,33 @@ fn resamples_zero_is_rejected_at_parse_time() {
         "stderr must name the invalid --resamples value: {stderr}"
     );
 }
+
+#[test]
+fn invalid_confidence_is_rejected_before_reading_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("missing.json");
+    let out_dir = dir.path().join("out");
+    for value in ["NaN", "inf", "-0.1", "1.1"] {
+        let output = Command::new(bin_path())
+            .arg("--sessions")
+            .arg(&input)
+            .arg("--grades")
+            .arg(&input)
+            .arg("--questions")
+            .arg(&input)
+            .arg("--out-dir")
+            .arg(&out_dir)
+            .arg("--seed")
+            .arg("1")
+            .arg(format!("--confidence={value}"))
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "confidence {value}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--confidence") && stderr.contains(value),
+            "{stderr}"
+        );
+        assert!(!out_dir.exists());
+    }
+}
