@@ -223,6 +223,65 @@ fn pass_at_k_and_pass_pow_k_match_hand_computed_values() {
 }
 
 #[test]
+fn correct_answer_cost_counts_only_passing_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions = [
+        sample_question("q1", QuestionTag::Greppable),
+        sample_question("q2", QuestionTag::WikiOnly),
+    ];
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions_path = dir.path().join("sessions.jsonl");
+    let grades_path = dir.path().join("grades.jsonl");
+    for (id, index, pass, tokens) in [
+        ("q1", 0, true, 100),
+        ("q1", 1, false, 300),
+        ("q2", 0, true, 200),
+        ("q2", 1, true, 300),
+    ] {
+        let usage = TokenUsage {
+            input_tokens: tokens - 90,
+            output_tokens: 20,
+            cache_read_input_tokens: 30,
+            cache_creation_input_tokens: 40,
+        };
+        agent_bench::append_jsonl(&sessions_path, &session(id, Arm::Wiki, index, usage)).unwrap();
+        agent_bench::append_jsonl(&grades_path, &grade(id, Arm::Wiki, index, pass)).unwrap();
+    }
+
+    let run = run_bench_report(
+        dir.path(),
+        "out",
+        &sessions_path,
+        &grades_path,
+        &questions_path,
+        50,
+        1,
+        0.95,
+    );
+    let [q1, q2] = run.report.per_question.as_slice() else {
+        panic!("expected exactly two question rows");
+    };
+    let q1 = &q1.per_arm[&Arm::Wiki];
+    let q2 = &q2.per_arm[&Arm::Wiki];
+    assert_eq!(q1.tokens_to_correct_answer, Some(100.0));
+    assert_eq!(q1.usage.total(), 400);
+    assert_eq!(q2.tokens_to_correct_answer, Some(250.0));
+
+    assert_eq!(run.report.per_arm.len(), 3);
+    for summary in &run.report.per_arm {
+        assert_eq!(summary.arm, Arm::Wiki);
+        let (cost, total) = match summary.tag {
+            None => (200.0, 900),
+            Some(QuestionTag::Greppable) => (100.0, 400),
+            Some(QuestionTag::WikiOnly) => (250.0, 500),
+            Some(QuestionTag::Abstention) => panic!("unexpected abstention summary"),
+        };
+        assert_eq!(summary.tokens_to_correct_answer, Some(cost));
+        assert_eq!(summary.usage.total(), total);
+    }
+}
+
+#[test]
 fn pass_at_k_range_is_restricted_to_the_shared_min_n_across_questions() {
     let dir = tempfile::tempdir().unwrap();
     let questions = [

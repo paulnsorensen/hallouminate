@@ -219,8 +219,9 @@ fn every_required_bench_recipe_param_is_used_by_its_body() {
                 continue;
             }
             let interpolation = format!("{{{{{param}}}}}");
+            let quoted = format!("{{{{quote({param})}}}}");
             assert!(
-                body.contains(&interpolation),
+                body.contains(&interpolation) || body.contains(&quoted),
                 "recipe `{name}` requires parameter `{param}` but its body never \
                  uses {interpolation} — drop the parameter or wire it in: {body}"
             );

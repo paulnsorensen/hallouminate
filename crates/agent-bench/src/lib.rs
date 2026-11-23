@@ -69,6 +69,39 @@ pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Atomically replace a JSON Lines ledger with the supplied records.
+///
+/// # Errors
+///
+/// Returns an error if serialization, flushing, syncing, or replacement fails.
+pub fn replace_jsonl<T: Serialize>(path: &Path, records: &[T]) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("staging JSONL for {}", path.display()))?;
+    {
+        let mut writer = BufWriter::new(temp.as_file_mut());
+        for record in records {
+            serde_json::to_writer(&mut writer, record)
+                .with_context(|| format!("writing JSONL for {}", path.display()))?;
+            writer
+                .write_all(b"\n")
+                .with_context(|| format!("writing JSONL for {}", path.display()))?;
+        }
+        writer
+            .flush()
+            .with_context(|| format!("flushing JSONL for {}", path.display()))?;
+    }
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("syncing JSONL for {}", path.display()))?;
+    temp.persist(path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
 /// Verify the agent CLI at `bin` reports the version the manifest pins.
 ///
 /// `manifest.claude_code_version` is recorded provenance; recording it
@@ -108,4 +141,46 @@ pub fn repo_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("crates/agent-bench has a workspace root two levels up")
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_jsonl, replace_jsonl};
+    use serde::{Serialize, Serializer};
+    use std::path::Path;
+
+    enum CheckpointRecord<'a> {
+        Complete(u8),
+        Interrupted(&'a Path),
+    }
+
+    impl Serialize for CheckpointRecord<'_> {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            match self {
+                Self::Complete(value) => serializer.serialize_u8(*value),
+                Self::Interrupted(path) => {
+                    assert_eq!(read_jsonl::<u8>(path).unwrap(), [1, 2]);
+                    Err(serde::ser::Error::custom("interrupted serialization"))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_checkpoint_leaves_the_last_complete_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = dir.path().join("ledger.jsonl");
+        replace_jsonl(&ledger, &[1u8, 2]).unwrap();
+
+        let records = [
+            CheckpointRecord::Complete(3),
+            CheckpointRecord::Interrupted(&ledger),
+        ];
+        let error = replace_jsonl(&ledger, &records).unwrap_err();
+        assert_eq!(error.root_cause().to_string(), "interrupted serialization");
+        assert_eq!(read_jsonl::<u8>(&ledger).unwrap(), [1, 2]);
+
+        replace_jsonl(&ledger, &[3u8, 4]).unwrap();
+        assert_eq!(read_jsonl::<u8>(&ledger).unwrap(), [3, 4]);
+    }
 }

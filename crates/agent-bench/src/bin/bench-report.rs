@@ -129,12 +129,15 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 
         let mut row_per_arm = BTreeMap::new();
         for (&arm, runs) in by_arm {
-            let stat = question_arm_stat(runs);
-            groups.entry((arm, None)).or_default().add(&stat);
+            let (stat, passing_tokens) = question_arm_stat(runs);
+            groups
+                .entry((arm, None))
+                .or_default()
+                .add(&stat, passing_tokens);
             groups
                 .entry((arm, Some(question.tag)))
                 .or_default()
-                .add(&stat);
+                .add(&stat, passing_tokens);
             row_per_arm.insert(arm, stat);
         }
 
@@ -156,11 +159,7 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
             pass_at_k: aggregate_pass_at_k(&group.pairs),
             pass_pow_k: aggregate_pass_pow_k(&group.pairs),
             usage: group.usage,
-            tokens_to_correct_answer: if group.passes > 0 {
-                Some(group.usage.total() as f64 / group.passes as f64)
-            } else {
-                None
-            },
+            tokens_to_correct_answer: mean_passing_tokens(group.passing_tokens, group.passes),
         })
         .collect();
 
@@ -215,14 +214,16 @@ fn run(cli: &Cli) -> anyhow::Result<()> {
 struct GroupAgg {
     pairs: Vec<(usize, usize)>,
     usage: TokenUsage,
+    passing_tokens: u64,
     passes: usize,
     runs: usize,
 }
 
 impl GroupAgg {
-    fn add(&mut self, stat: &QuestionArmStat) {
+    fn add(&mut self, stat: &QuestionArmStat, passing_tokens: u64) {
         self.pairs.push((stat.runs, stat.passes));
         self.usage += stat.usage;
+        self.passing_tokens += passing_tokens;
         self.passes += stat.passes;
         self.runs += stat.runs;
     }
@@ -241,24 +242,31 @@ fn count_failed_sessions(sessions: &[SessionRecord]) -> BTreeMap<Arm, usize> {
     failed
 }
 
-fn question_arm_stat(runs: &[(bool, TokenUsage)]) -> QuestionArmStat {
-    let passes = runs.iter().filter(|(p, _)| *p).count();
-    let usage: TokenUsage = runs.iter().map(|(_, u)| *u).sum();
-    QuestionArmStat {
+fn question_arm_stat(runs: &[(bool, TokenUsage)]) -> (QuestionArmStat, u64) {
+    let mut passes = 0;
+    let mut usage = TokenUsage::default();
+    let mut passing_tokens = 0;
+    for &(pass, tokens) in runs {
+        usage += tokens;
+        if pass {
+            passes += 1;
+            passing_tokens += tokens.total();
+        }
+    }
+    let stat = QuestionArmStat {
         runs: runs.len(),
         passes,
         usage,
-        // A question with zero correct runs in this arm has no defined
-        // "tokens spent per correct answer" — represented as `None`, not 0
-        // or silently omitted, so the hardest (never-solved) questions
-        // stay visible in the report rather than dropping out of the
-        // average.
-        tokens_to_correct_answer: if passes > 0 {
-            Some(usage.total() as f64 / passes as f64)
-        } else {
-            None
-        },
+        tokens_to_correct_answer: mean_passing_tokens(passing_tokens, passes),
+    };
+    (stat, passing_tokens)
+}
+
+fn mean_passing_tokens(passing_tokens: u64, passes: usize) -> Option<f64> {
+    if passes == 0 {
+        return None;
     }
+    Some(passing_tokens as f64 / passes as f64)
 }
 
 /// Unbiased pass@k estimator (Chen et al. 2021, "Evaluating Large Language

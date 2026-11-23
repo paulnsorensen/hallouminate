@@ -85,18 +85,18 @@ bench-author repo budget manifest:
 # measured run starts against a drifted dataset.
 bench-run manifest questions arm='both' runs='10':
     @echo "bench-run: cost-bearing run — spends real model tokens"
-    just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
-    just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
-    just verify cargo run -q -p agent-bench --bin bench-run -- --manifest {{manifest}} --questions {{questions}} --arm {{arm}} --runs {{runs}} --out-dir eval/agent-bench/results
+    results_dir="$(just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{quote(manifest)}} --print-results-dir)" && \
+      just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{quote(questions)}} --manifest {{quote(manifest)}} --check-freeze && \
+      just verify cargo run -q -p agent-bench --bin bench-run -- --manifest {{quote(manifest)}} --questions {{quote(questions)}} --arm {{quote(arm)}} --runs {{quote(runs)}} --out-dir "$results_dir"
 
 # Grade sessions against the question set. Cost-bearing: spends real judge
 # tokens. Validates the given manifest/questions dataset first so grading
 # never runs against a drifted dataset.
 bench-judge manifest questions:
     @echo "bench-judge: cost-bearing run — spends real judge tokens"
-    just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
-    just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
-    just verify cargo run -q -p agent-bench --bin bench-judge -- --manifest {{manifest}} --sessions eval/agent-bench/results/sessions.jsonl --questions {{questions}} --out eval/agent-bench/results/grades.jsonl
+    results_dir="$(just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{quote(manifest)}} --print-results-dir)" && \
+      just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{quote(questions)}} --manifest {{quote(manifest)}} --check-freeze && \
+      just verify cargo run -q -p agent-bench --bin bench-judge -- --manifest {{quote(manifest)}} --sessions "$results_dir/sessions.jsonl" --questions {{quote(questions)}} --out "$results_dir/grades.jsonl"
 
 # Calibrate the automated judge against a human-labelled grades.jsonl.
 # Cost-bearing: spends real judge tokens. Validates the given
@@ -104,18 +104,18 @@ bench-judge manifest questions:
 # drifted dataset.
 bench-judge-calibrate manifest questions human_grades:
     @echo "bench-judge-calibrate: cost-bearing run — spends real judge tokens"
-    just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
-    just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
-    just verify cargo run -q -p agent-bench --bin bench-judge -- --manifest {{manifest}} --sessions eval/agent-bench/results/sessions.jsonl --questions {{questions}} --out eval/agent-bench/results/grades.jsonl --calibrate {{human_grades}}
+    results_dir="$(just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{quote(manifest)}} --print-results-dir)" && \
+      just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{quote(questions)}} --manifest {{quote(manifest)}} --check-freeze && \
+      just verify cargo run -q -p agent-bench --bin bench-judge -- --manifest {{quote(manifest)}} --sessions "$results_dir/sessions.jsonl" --questions {{quote(questions)}} --out "$results_dir/grades.jsonl" --calibrate {{quote(human_grades)}}
 
 # Aggregate sessions and grades into report.json/report.md. Not
 # cost-bearing: reads already-recorded records, spends no model tokens.
 # Still freeze-checks the dataset first: reporting against a drifted
 # question set is as wrong as running against one.
 bench-report manifest questions:
-    just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{manifest}}
-    just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{questions}} --manifest {{manifest}} --check-freeze
-    just verify cargo run -q -p agent-bench --bin bench-report -- --sessions eval/agent-bench/results/sessions.jsonl --grades eval/agent-bench/results/grades.jsonl --questions {{questions}} --out-dir eval/agent-bench/results --seed 42
+    results_dir="$(just verify cargo run -q -p agent-bench --bin bench-validate-manifest -- --manifest {{quote(manifest)}} --print-results-dir)" && \
+      just verify cargo run -q -p agent-bench --bin bench-validate-questions -- --questions {{quote(questions)}} --manifest {{quote(manifest)}} --check-freeze && \
+      just verify cargo run -q -p agent-bench --bin bench-report -- --sessions "$results_dir/sessions.jsonl" --grades "$results_dir/grades.jsonl" --questions {{quote(questions)}} --out-dir "$results_dir" --seed 42
 
 # Build every fuzz target on the nightly pinned in fuzz/rust-toolchain.toml.
 fuzz-build:

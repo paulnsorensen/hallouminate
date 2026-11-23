@@ -79,12 +79,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
     verify_rubric_hash(&manifest, &rubric)?;
     let judge_model = manifest.model_ids.judge.as_str();
 
-    // Resumable ledger: load any existing grades, key them by the
-    // (question_id, arm, run_index) triple, then rewrite the whole file in
-    // place after every judged session (skip or overwrite). Mirrors
-    // bench-run.rs's sessions.jsonl ledger, so a plain re-run neither
-    // duplicates records (which would double `n`/`c` and the reported
-    // token usage) nor loses progress to a mid-run crash.
+    // Key the ledger by (question_id, arm, run_index) to prevent duplicates.
+    // Checkpoint each new or replaced grade without exposing a partial ledger.
     let mut records: Vec<GradeRecord> = if args.out.exists() {
         agent_bench::read_jsonl(&args.out)?
     } else {
@@ -140,7 +136,7 @@ fn run(args: &Args) -> anyhow::Result<()> {
             index.insert(key, records.len());
             records.push(grade);
         }
-        rewrite_grades_jsonl(&args.out, &records)?;
+        agent_bench::replace_jsonl(&args.out, &records)?;
     }
 
     if let Some(human_path) = &args.calibrate {
@@ -166,20 +162,6 @@ fn run(args: &Args) -> anyhow::Result<()> {
             .with_context(|| format!("creating empty grade ledger {}", args.out.display()))?;
     }
 
-    Ok(())
-}
-
-/// Rewrite `grades.jsonl` from scratch to reflect `records`. Simpler and
-/// safer than patching individual lines in place, and cheap at pilot scale
-/// (questions x arms x runs). Mirrors bench-run.rs's
-/// `rewrite_sessions_jsonl`.
-fn rewrite_grades_jsonl(path: &Path, records: &[GradeRecord]) -> anyhow::Result<()> {
-    if path.exists() {
-        std::fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
-    }
-    for record in records {
-        agent_bench::append_jsonl(path, record)?;
-    }
     Ok(())
 }
 

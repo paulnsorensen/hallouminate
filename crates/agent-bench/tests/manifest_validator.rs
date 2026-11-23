@@ -84,6 +84,42 @@ fn committed_example_manifest_validates_clean() {
 }
 
 #[test]
+fn prints_the_results_directory_only_if_the_manifest_passes_validation() {
+    let root = workspace_root();
+    let example = fs::read_to_string(root.join("eval/agent-bench/manifest.example.toml")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("manifest.toml");
+    for (results_dir, valid) in [
+        ("eval/agent-bench/custom results", true),
+        ("eval/agent-bench/../results", false),
+    ] {
+        fs::write(
+            &manifest_path,
+            example.replace("eval/agent-bench/results", results_dir),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_bench-validate-manifest"))
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--print-results-dir")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        if valid {
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap().trim_end(),
+                root.join(results_dir).to_str().unwrap()
+            );
+        } else {
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("must not contain '..'"));
+        }
+    }
+}
+
+#[test]
 fn short_sha_reports_rule_and_repo() {
     let dir = tempfile::tempdir().unwrap();
     let question_hash = "c".repeat(64);

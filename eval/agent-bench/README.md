@@ -223,7 +223,9 @@ Every run is reproducible from its manifest (`agent_bench::Manifest`):
 - `question_set_hash` — blake3 hash of the frozen question set.
 - `container_image_refs` — digests of every container image the run executed
   in.
-- `results_dir` — where this run's raw session and grade records live.
+- `results_dir` — the directory for session records, grades, and reports.
+  The sweep, judge, calibration, and report recipes use this path relative to
+  the benchmark repository root.
 
 Raw traces (`SessionRecord.transcript_path`, one full transcript per run) are
 retained under `results_dir` for every run, not just failures, so a

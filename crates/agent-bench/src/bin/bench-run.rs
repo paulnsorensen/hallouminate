@@ -15,8 +15,8 @@ use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use agent_bench::{
-    Arm, Manifest, Question, QuestionSet, SessionRecord, TokenUsage, append_jsonl,
-    blake3_file_hash, load_json, load_toml, read_jsonl, repo_root, verify_agent_cli_version,
+    Arm, Manifest, Question, QuestionSet, SessionRecord, TokenUsage, blake3_file_hash, load_json,
+    load_toml, read_jsonl, replace_jsonl, repo_root, verify_agent_cli_version,
 };
 
 /// Directory (relative to the repository root, not the process cwd) holding
@@ -114,12 +114,8 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("canonicalizing out-dir {}", cli.out_dir.display()))?;
     let sessions_path = out_dir.join("sessions.jsonl");
 
-    // Resumable ledger: load any existing records, key them by the
-    // (question_id, arm, run_index) triple, then rewrite the whole file in
-    // place after every session (skip or overwrite). This keeps
-    // `sessions.jsonl` duplicate-free under both plain re-runs and
-    // `--force`, and checkpoints progress so a mid-run crash still leaves a
-    // resumable ledger.
+    // Key the ledger by (question_id, arm, run_index) to prevent duplicates.
+    // Checkpoint each new or replaced record without exposing a partial ledger.
     let mut records: Vec<SessionRecord> = if sessions_path.exists() {
         read_jsonl(&sessions_path)?
     } else {
@@ -194,7 +190,7 @@ fn main() -> anyhow::Result<()> {
                     index.insert(key, records.len());
                     records.push(record);
                 }
-                rewrite_sessions_jsonl(&sessions_path, &records)?;
+                replace_jsonl(&sessions_path, &records)?;
             }
         }
     }
@@ -444,17 +440,4 @@ fn run_session(
         wall_ms,
         exit_status,
     })
-}
-
-/// Rewrite `sessions.jsonl` from scratch to reflect `records`. Simpler and
-/// safer than patching individual lines in place, and cheap at pilot scale
-/// (questions × arms × runs).
-fn rewrite_sessions_jsonl(path: &Path, records: &[SessionRecord]) -> anyhow::Result<()> {
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("removing stale {}", path.display()))?;
-    }
-    for record in records {
-        append_jsonl(path, record)?;
-    }
-    Ok(())
 }
