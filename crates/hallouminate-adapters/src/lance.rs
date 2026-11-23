@@ -1086,7 +1086,7 @@ pub struct LanceStore {
     embedder_available: AtomicBool,
 }
 
-/// How long [`acquire_store_lock`] retries a contended `flock` before giving
+/// How long [`acquire_store_lock`] retries a contended store lock before giving
 /// up. Sized to absorb the deferred-`fput` release window (sub-second, see the
 /// fn doc) while staying far below any genuine second-daemon lifetime, so real
 /// single-ownership violations still fail closed.
@@ -1180,9 +1180,9 @@ fn contended_store_lock_owner(ground_dir: &Path) -> Option<StoreLockOwner> {
     }
 }
 
-/// Take a non-blocking exclusive `flock` on `store.lock` inside the ground
-/// dir, binding single ownership to the store rather than to any daemon
-/// socket path.
+/// Take a non-blocking exclusive std `File::try_lock` (`flock` on Unix,
+/// `LockFileEx` on Windows) on `store.lock` inside the ground dir, binding
+/// single ownership to the store rather than to any daemon socket path.
 ///
 /// The daemon's per-socket lock is not enough (#204): socket resolution is
 /// environment-dependent (`XDG_RUNTIME_DIR` present vs the `~/.cache`
@@ -1191,6 +1191,10 @@ fn contended_store_lock_owner(ground_dir: &Path) -> Option<StoreLockOwner> {
 /// maintenance/write commits deleted data files the other's manifest still
 /// referenced. Locking here covers every open path (daemon boot baseline,
 /// per-request `resources_for` builds, and any future direct open).
+///
+/// Owner metadata lives in `store.lock` itself on Unix. On Windows the lock is
+/// a mandatory byte-range lock, so the metadata lives in the separate
+/// `store.lock.owner.json` file.
 ///
 /// A single non-blocking attempt is not enough: when *this* process closes a
 /// store and immediately reopens the same ground dir, the kernel releases the
