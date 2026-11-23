@@ -16,6 +16,7 @@ use tokio::io::AsyncBufReadExt;
 use super::daemon::{DaemonHarness, read_segment_rows};
 
 pub struct Fixture {
+    // Bind this guard before moving out the harness. The harness must drop first.
     pub _tmp: tempfile::TempDir,
     pub corpus_root: PathBuf,
     pub harness: DaemonHarness,

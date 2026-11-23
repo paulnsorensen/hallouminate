@@ -115,7 +115,7 @@ fn assert_subset(row: &OperationRecord, allowed: &[&str]) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ground_stages() {
-    let Fixture { harness, .. } = fixture_with("").await;
+    let Fixture { _tmp, harness, .. } = fixture_with("").await;
     run(
         &harness,
         DaemonRequestPayload::AddMarkdown(add_markdown(
@@ -135,7 +135,7 @@ async fn ground_stages() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_markdown_stages_single() {
-    let Fixture { harness, .. } = fixture_with("").await;
+    let Fixture { _tmp, harness, .. } = fixture_with("").await;
     let row = run(
         &harness,
         DaemonRequestPayload::AddMarkdown(add_markdown("single.md", "# Single\n\nBody.\n")),
@@ -150,7 +150,7 @@ async fn add_markdown_stages_single() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn add_markdown_stages_batch() {
-    let Fixture { harness, .. } = fixture_with("").await;
+    let Fixture { _tmp, harness, .. } = fixture_with("").await;
     let row = run(
         &harness,
         DaemonRequestPayload::AddMarkdownBatch {
@@ -171,7 +171,7 @@ async fn add_markdown_stages_batch() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn other_operation_stages_list_files() {
-    let Fixture { harness, .. } = fixture_with("").await;
+    let Fixture { _tmp, harness, .. } = fixture_with("").await;
     let row = run(
         &harness,
         DaemonRequestPayload::ListFiles(ListFilesRequest {
@@ -186,7 +186,7 @@ async fn other_operation_stages_list_files() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn other_operation_stages_ping_and_shutdown() {
-    let Fixture { harness, .. } = fixture_with("").await;
+    let Fixture { _tmp, harness, .. } = fixture_with("").await;
     let ping = run(&harness, DaemonRequestPayload::Ping).await;
     assert_eq!(ping.op, "ping");
     assert_eq!(stage_names(&ping), BTreeSet::from(["operation"]));
@@ -201,9 +201,9 @@ async fn other_operation_stages_ping_and_shutdown() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stage_entries_absent_when_not_run() {
     let Fixture {
+        _tmp,
         harness,
         corpus_root,
-        ..
     } = fixture_with("[search]\ncold_wait_ms = 0\n").await;
     let whole = run(
         &harness,
@@ -272,7 +272,7 @@ async fn stage_entries_sum_repeated_runs() {
         "[daemon]\nmaintenance_interval_secs = 0\ndebt_soft_delay_ms = {}\n",
         SOFT_DELAY_MS as u64
     );
-    let Fixture { harness, .. } = fixture_with(&extra).await;
+    let Fixture { _tmp, harness, .. } = fixture_with(&extra).await;
     harness.state().force_hard_debt_for_tests();
 
     let single = run(

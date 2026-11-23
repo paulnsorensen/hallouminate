@@ -393,7 +393,7 @@ fn assert_request_id_shape(id: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_row_carries_common_fields() {
-    let Fixture { harness, .. } = fixture().await;
+    let Fixture { _tmp, harness, .. } = fixture().await;
     let id = RequestId::generate();
     let response = send(
         &harness,
@@ -444,10 +444,11 @@ async fn daemon_row_carries_common_fields() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_outcome_ok() {
     let Fixture {
+        _tmp,
         harness,
         corpus_root,
-        ..
     } = fixture().await;
+    assert!(corpus_root.is_dir(), "fixture must keep the corpus alive");
     let id = RequestId::generate();
     let response = send(
         &harness,
@@ -461,7 +462,7 @@ async fn daemon_outcome_ok() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_outcome_invalid_params() {
-    let Fixture { harness, .. } = fixture().await;
+    let Fixture { _tmp, harness, .. } = fixture().await;
     let id = RequestId::generate();
     let response = send(
         &harness,
@@ -480,7 +481,7 @@ async fn daemon_outcome_invalid_params() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_outcome_internal() {
-    let Fixture { harness, .. } = fixture().await;
+    let Fixture { _tmp, harness, .. } = fixture().await;
     harness.state().write_lane().close();
     let id = RequestId::generate();
     let response = send(
@@ -501,7 +502,7 @@ async fn daemon_outcome_internal() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_outcome_retryable() {
-    let Fixture { harness, .. } =
+    let Fixture { _tmp, harness, .. } =
         fixture_with("\n[daemon]\nhard_block_wait_secs = 0\nmaintenance_interval_secs = 3600\n")
             .await;
     harness.state().force_hard_debt_for_tests();
@@ -536,7 +537,9 @@ async fn wait_for_dispatch(harness: &DaemonHarness, before: u64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn daemon_outcome_cancelled_shutdown() {
-    let Fixture { mut harness, .. } = fixture().await;
+    let Fixture {
+        _tmp, mut harness, ..
+    } = fixture().await;
     let lane = harness.state().write_lane();
     let permits = u32::try_from(lane.available_permits()).expect("permit count");
     let held = lane.acquire_many_owned(permits).await.expect("hold lane");
@@ -558,7 +561,7 @@ async fn daemon_outcome_cancelled_shutdown() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn request_without_id_gets_generated_id() {
-    let Fixture { harness, .. } = fixture().await;
+    let Fixture { _tmp, harness, .. } = fixture().await;
     for path in ["one.md", "two.md"] {
         let response = send(&harness, add_markdown(&harness, path, "# Page\n")).await;
         assert_eq!(error_kind(&response), None, "{response:?}");
@@ -597,7 +600,7 @@ async fn row_write_failure_keeps_operation_result() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn row_values_are_well_formed() {
-    let Fixture { harness, .. } = fixture().await;
+    let Fixture { _tmp, harness, .. } = fixture().await;
     let id = RequestId::generate();
     send(
         &harness,
@@ -634,9 +637,9 @@ async fn row_values_are_well_formed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn warnings_are_counted_and_coded() {
     let Fixture {
+        _tmp,
         harness,
         corpus_root: outside_root,
-        ..
     } = fixture().await;
     let lint = RequestId::generate();
     let body = "# Notes\n\nSee [the spec]() for details.\n\n```mermaid\n```\n";
@@ -745,7 +748,7 @@ fn outcome_classified_from_row_alone() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rows_hold_no_query_text_or_content() {
-    let Fixture { harness, .. } = fixture().await;
+    let Fixture { _tmp, harness, .. } = fixture().await;
     let content = "# Secret\n\nmarmalade-sentinel-content and [broken]()\n";
     let write = RequestId::generate();
     send(
