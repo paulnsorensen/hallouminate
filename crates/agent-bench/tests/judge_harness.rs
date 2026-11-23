@@ -832,6 +832,101 @@ fn rerun_without_force_skips_and_with_force_overwrites() {
 }
 
 #[test]
+fn interrupted_force_preserves_valid_grades_and_resume_rejects_stale_grades() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions_path =
+        write_question_set(dir.path(), &[sample_question("q1", QuestionTag::Greppable)]);
+    let mut sessions = [
+        sample_session("q1", Arm::Wiki, 0, "first checkpoint answer"),
+        sample_session("q1", Arm::Wiki, 1, "second checkpoint answer"),
+        sample_session("q1", Arm::Wiki, 2, "third checkpoint answer"),
+    ];
+    let sessions_path = write_sessions(dir.path(), &sessions);
+    let out_path = dir.path().join("grades.jsonl");
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        r#"prompt=$(cat)
+case "$JUDGE_MODE:$prompt" in
+    initial:*) printf '%s\n' '{"result":"SCORE: 4\nRATIONALE: original"}' ;;
+    interrupt:*"first checkpoint answer"*) printf '%s\n' '{"result":"SCORE: 5\nRATIONALE: replacement"}' ;;
+    interrupt:*"second checkpoint answer"*) printf '%s\n' '{"result":"RATIONALE: no score"}' ;;
+    resume:*"changed checkpoint answer"*) printf '%s\n' '{"result":"SCORE: 3\nRATIONALE: regenerated"}' ;;
+    *) exit 99 ;;
+esac"#,
+    );
+    let command = |mode: &str| {
+        let mut cmd = Command::new(bin_path());
+        cmd.env("AGENT_BENCH_CLAUDE_BIN", &fake)
+            .env("JUDGE_MODE", mode)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .arg("--sessions")
+            .arg(&sessions_path)
+            .arg("--questions")
+            .arg(&questions_path)
+            .arg("--out")
+            .arg(&out_path)
+            .arg("--manifest")
+            .arg(&manifest_path);
+        cmd
+    };
+    let grades = || -> Vec<serde_json::Value> { agent_bench::read_jsonl(&out_path).unwrap() };
+    let initial = command("initial").output().unwrap();
+    assert!(initial.status.success(), "{:?}", initial.stderr);
+    let original = grades();
+    assert_eq!(original.len(), 3);
+
+    let interrupted = command("interrupt").arg("--force").output().unwrap();
+    let error = String::from_utf8_lossy(&interrupted.stderr);
+    assert!(
+        !interrupted.status.success() && error.contains("judge reply had no SCORE:"),
+        "{error}"
+    );
+    let checkpoint = grades();
+    assert_eq!(checkpoint.len(), 3, "force must not drop untouched grades");
+    assert_eq!(checkpoint[0]["run_index"], 0);
+    assert_eq!(checkpoint[0]["score"], 5);
+    assert_eq!(checkpoint[0]["judge_rationale"], "replacement");
+    assert_eq!(&checkpoint[1..], &original[1..]);
+
+    let resumed = command("no-calls").output().unwrap();
+    assert!(resumed.status.success(), "{:?}", resumed.stderr);
+    assert_eq!(grades(), checkpoint);
+
+    sessions[1].answer_text = "changed checkpoint answer".into();
+    agent_bench::replace_jsonl(&sessions_path, &sessions).unwrap();
+    let stale = command("no-calls").output().unwrap();
+    let error = String::from_utf8_lossy(&stale.stderr);
+    assert!(
+        !stale.status.success() && error.contains("stale or invalid grade"),
+        "{error}"
+    );
+    assert_eq!(grades(), checkpoint);
+
+    let interrupted = command("interrupt").arg("--force").output().unwrap();
+    let error = String::from_utf8_lossy(&interrupted.stderr);
+    assert!(
+        !interrupted.status.success() && error.contains("exited with exit status: 99"),
+        "{error}"
+    );
+    assert_eq!(grades(), [checkpoint[0].clone(), checkpoint[2].clone()]);
+
+    let resumed = command("resume").output().unwrap();
+    assert!(resumed.status.success(), "{:?}", resumed.stderr);
+    let final_grades = grades();
+    assert_eq!(final_grades.len(), 3);
+    assert_eq!(
+        &final_grades[..2],
+        &[checkpoint[0].clone(), checkpoint[2].clone()]
+    );
+    assert_eq!(final_grades[2]["run_index"], 1);
+    assert_eq!(final_grades[2]["score"], 3);
+    assert_eq!(final_grades[2]["judge_rationale"], "regenerated");
+}
+
+#[test]
 fn arm_blindness_survives_a_realistic_unsanitized_wiki_answer() {
     let dir = tempfile::tempdir().unwrap();
     let capture_path = dir.path().join("captured_prompt.txt");

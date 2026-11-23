@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 
 def exchange(process, method, params=None, request_id=None):
@@ -75,6 +76,12 @@ if model == "pinned-judge":
     sys.exit(0)
 
 assert model == "pinned-subject", args
+subprocess.run(
+    ["/bin/sh", "-eu", "-c",
+     'test -z "${ANTHROPIC_API_KEY+x}" && test -z "${CLAUDE_CODE_OAUTH_TOKEN+x}"'],
+    check=True,
+    timeout=5,
+)
 prompt = args[args.index("-p") + 1]
 if prompt == "emit invalid JSON":
     print("not JSON")
@@ -88,6 +95,7 @@ assert not Path(".git").exists()
 assert not Path("untracked.txt").exists()
 assert not Path(".hallouminate").exists()
 assert not Path("/knowledge/wiki").exists()
+assert not Path("/model-cache").exists()
 assert list(Path("/home").iterdir()) == [Path("/home/bench")]
 try:
     Path("README.md").write_text("write test")
@@ -99,9 +107,18 @@ else:
 config = Path(args[args.index("--mcp-config") + 1])
 servers = json.loads(config.read_text())["mcpServers"]
 if servers:
+    time.sleep(2.2)
     assert set(servers) == {"hallouminate"}
     assert os.environ["HALLOUMINATE_SOCKET"] == "/run/bench/daemon.sock"
     assert Path("/run/bench/daemon.sock").is_socket()
+    status = subprocess.run(
+        ["/opt/hallouminate", "daemon", "status"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    ).stdout
+    assert status.startswith("running\n"), status
     answer = read_wiki(servers["hallouminate"])
 else:
     assert "HALLOUMINATE_SOCKET" not in os.environ

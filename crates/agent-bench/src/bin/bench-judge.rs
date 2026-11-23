@@ -81,10 +81,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
     )?;
     let sessions: Vec<SessionRecord> = agent_bench::read_jsonl(&args.sessions)?;
     let sessions_by_key = index_sessions(&sessions)?;
-    let mut records = if !args.force && args.out.try_exists()? {
-        grading.read_grades(&args.out, &sessions_by_key)?
-    } else {
+    let mut records = if !args.out.try_exists()? {
         Vec::new()
+    } else if args.force {
+        grading.read_grades_for_regrade(&args.out, &sessions_by_key)?
+    } else {
+        grading.read_grades(&args.out, &sessions_by_key)?
     };
     let mut index = HashMap::new();
     for (i, entry) in records.iter().enumerate() {
@@ -109,7 +111,8 @@ fn run(args: &Args) -> anyhow::Result<()> {
         }
         let (id, arm, run_index) = session_key(session);
         let key = (id.to_owned(), arm, run_index);
-        if index.contains_key(&key) {
+        let position = index.get(&key).copied();
+        if position.is_some() && !args.force {
             continue;
         }
         let prompt = grading.prompt(session)?;
@@ -134,8 +137,12 @@ fn run(args: &Args) -> anyhow::Result<()> {
         .with_context(|| format!("grading question {:?}", session.question_id))?;
 
         let grade = grading.bind(grade, session, &prompt)?;
-        index.insert(key, records.len());
-        records.push(grade);
+        if let Some(position) = position {
+            records[position] = grade;
+        } else {
+            index.insert(key, records.len());
+            records.push(grade);
+        }
         agent_bench::replace_jsonl(&args.out, &records)?;
     }
 
