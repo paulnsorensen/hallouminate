@@ -1180,6 +1180,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failure_diagnostics_escape_control_characters() {
+        let (capture, _guard) = crate::test_support::EventCapture::install();
+        let response = DaemonResponse::invalid_params("first\r\nsecond\tline");
+        log_error_response(Some("list_files"), &response);
+        let events = daemon_events(&capture);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let logged = events[0].fields.get("message").expect("message field");
+        assert_eq!(logged, r"request failed: first\r\nsecond\tline");
+        assert_eq!(
+            invalid_request_message(Some(response)),
+            "first\r\nsecond\tline"
+        );
+    }
+
     #[tokio::test]
     async fn truncated_request_at_eof_gets_structured_error() {
         let message = invalid_request_message(exchange_request(br#"{"cwd":"#.to_vec()).await);

@@ -12,11 +12,13 @@ use super::ipc::{DaemonResponse, ErrorKind};
 /// values, for example the serde error of a malformed request. `Retryable`
 /// responses log at INFO; they are backpressure signals with fixed text.
 /// Request bodies are never logged as such.
+/// The log escapes control characters without changing the response.
 pub(crate) fn log_error_response(op: Option<&'static str>, response: &DaemonResponse) {
     let (kind, message) = match response {
         DaemonResponse::Ok { .. } => return,
         DaemonResponse::Err { kind, message } => (kind, message),
     };
+    let message = message.escape_debug();
     match kind {
         ErrorKind::Internal => tracing::error!(
             target: "hallouminate::daemon",
