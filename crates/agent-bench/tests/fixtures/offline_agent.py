@@ -68,6 +68,7 @@ if args == ["--version"]:
 
 assert "--strict-mcp-config" in args, args
 assert args[args.index("--setting-sources") + 1] == "", args
+assert "--safe-mode" not in args, args
 model = args[args.index("--model") + 1]
 if model == "pinned-judge":
     assert "## Candidate answer" in sys.stdin.read()

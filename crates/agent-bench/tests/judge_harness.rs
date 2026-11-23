@@ -407,7 +407,7 @@ fn pass_derives_from_threshold_and_differs_across_thresholds() {
 }
 
 #[test]
-fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
+fn calibration_reports_hand_computed_agreement_and_gates_on_kappa() {
     let dir = tempfile::tempdir().unwrap();
     let questions = [
         sample_question("q1", QuestionTag::Greppable),
@@ -458,7 +458,9 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
     // exact agreement = 1/4 = 0.25, pass-threshold agreement = 3/4 = 0.75,
     // kappa = 0.5.
 
-    // Failing case: default --min-agreement 0.80 > 0.75 observed.
+    // Failing case: default --min-kappa 0.60 > 0.50 observed. Note the raw
+    // pass-threshold agreement here is 0.75, so the gate is demonstrably
+    // reading kappa and not that number.
     fs::remove_file(&counter_path).ok();
     let failing_out = dir.path().join("grades-fail.jsonl");
     let failing = Command::new(bin_path())
@@ -490,8 +492,13 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
         "{failing_stdout}"
     );
     assert!(failing_stdout.contains("kappa: 0.5000"), "{failing_stdout}");
+    let failing_stderr = String::from_utf8_lossy(&failing.stderr);
+    assert!(
+        failing_stderr.contains("kappa 0.5000") && failing_stderr.contains("--min-kappa"),
+        "the gate must fail on kappa, naming it: {failing_stderr}"
+    );
 
-    // Passing case: lower --min-agreement below the observed 0.75.
+    // Passing case: lower --min-kappa below the observed 0.50.
     fs::remove_file(&counter_path).ok();
     let passing_out = dir.path().join("grades-pass.jsonl");
     let passing = Command::new(bin_path())
@@ -509,8 +516,8 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
             "4",
             "--calibrate",
             human_path.to_str().unwrap(),
-            "--min-agreement",
-            "0.70",
+            "--min-kappa",
+            "0.40",
         ])
         .output()
         .unwrap();
@@ -519,6 +526,235 @@ fn calibration_reports_hand_computed_agreement_and_gates_on_min_agreement() {
         "bench-judge failed: {}",
         String::from_utf8_lossy(&passing.stderr)
     );
+}
+
+#[test]
+fn calibration_accepts_exact_cutoff_and_rejects_higher_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions_path =
+        write_question_set(dir.path(), &[sample_question("q1", QuestionTag::Greppable)]);
+    let mut sessions = Vec::new();
+    let mut human_grades = Vec::new();
+    // 24 both pass, 9 both fail, 1 human only, 6 judge only: kappa = 420/700.
+    for (count, answer, human_score) in [
+        (24, "fixture judge-pass", 5),
+        (9, "fixture judge-fail", 0),
+        (1, "fixture judge-fail", 5),
+        (6, "fixture judge-pass", 0),
+    ] {
+        for _ in 0..count {
+            let run = u32::try_from(sessions.len()).unwrap();
+            sessions.push(sample_session("q1", Arm::Wiki, run, answer));
+            human_grades.push(
+                GradeRecord::grade("q1".into(), Arm::Wiki, run, human_score, 4, "human".into())
+                    .unwrap(),
+            );
+        }
+    }
+    let sessions_path = write_sessions(dir.path(), &sessions);
+    let human_path = write_grades(dir.path(), "human-grades.jsonl", &human_grades);
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        r#"case "$(cat)" in
+    *"fixture judge-pass"*) score=5 ;;
+    *"fixture judge-fail"*) score=0 ;;
+    *) exit 99 ;;
+esac
+printf '{"result":"SCORE: %s\\nRATIONALE: fixture"}\n' "$score""#,
+    );
+    let run = || {
+        let mut command = Command::new(bin_path());
+        command
+            .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+            .env_remove("ANTHROPIC_API_KEY")
+            .env_remove("CLAUDE_CODE_OAUTH_TOKEN")
+            .arg("--sessions")
+            .arg(&sessions_path)
+            .arg("--questions")
+            .arg(&questions_path)
+            .arg("--out")
+            .arg(dir.path().join("grades.jsonl"))
+            .arg("--manifest")
+            .arg(&manifest_path)
+            .arg("--calibrate")
+            .arg(&human_path);
+        command
+    };
+
+    let at_cutoff = run().output().unwrap();
+    assert!(
+        at_cutoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&at_cutoff.stderr)
+    );
+    assert!(String::from_utf8_lossy(&at_cutoff.stdout).contains("kappa: 0.6000"));
+
+    let below_cutoff = run()
+        .arg("--min-kappa=0.6000000000000001")
+        .output()
+        .unwrap();
+    let error = String::from_utf8_lossy(&below_cutoff.stderr);
+    assert!(
+        !below_cutoff.status.success() && error.contains("is below --min-kappa"),
+        "{error}"
+    );
+}
+
+/// The regime the raw-agreement gate certified wrongly: every labelled item
+/// passes under both raters, so a judge indistinguishable from a constant
+/// "pass" scored 1.00 raw agreement. Chance-corrected agreement is undefined
+/// there, and an undefined statistic must not read as a passing one.
+#[test]
+fn calibration_on_an_all_pass_labelled_subset_refuses_to_certify() {
+    let dir = tempfile::tempdir().unwrap();
+    let questions = [
+        sample_question("q1", QuestionTag::Greppable),
+        sample_question("q2", QuestionTag::Greppable),
+    ];
+    let questions_path = write_question_set(dir.path(), &questions);
+    let sessions = [
+        sample_session("q1", Arm::Wiki, 0, "answer 1"),
+        sample_session("q2", Arm::Wiki, 0, "answer 2"),
+    ];
+    let sessions_path = write_sessions(dir.path(), &sessions);
+
+    // A judge that says "pass" to everything.
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        "cat > /dev/null\nprintf '%s\\n' '{\"result\":\"SCORE: 5\\nRATIONALE: r\"}'",
+    );
+
+    let human_grades = vec![
+        GradeRecord::grade("q1".to_string(), Arm::Wiki, 0, 5, 4, "human r1".to_string()).unwrap(),
+        GradeRecord::grade("q2".to_string(), Arm::Wiki, 0, 5, 4, "human r2".to_string()).unwrap(),
+    ];
+    let human_path = write_grades(dir.path(), "human-grades.jsonl", &human_grades);
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+
+    let output = Command::new(bin_path())
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+        .args([
+            "--sessions",
+            sessions_path.to_str().unwrap(),
+            "--questions",
+            questions_path.to_str().unwrap(),
+            "--out",
+            dir.path().join("grades.jsonl").to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+            "--pass-threshold",
+            "4",
+            "--calibrate",
+            human_path.to_str().unwrap(),
+            // Raw pass-threshold agreement is 1.00 here; no min-kappa this
+            // low may rescue an undefined kappa.
+            "--min-kappa",
+            "0.0",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "a labelled subset with no variance must not certify a judge"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("pass_threshold_agreement: 1.0000"),
+        "raw agreement must still be reported: {stdout}"
+    );
+    assert!(
+        stdout.contains("kappa: undefined"),
+        "kappa must report as undefined, not as a number: {stdout}"
+    );
+}
+
+/// `bench-judge` records `manifest.claude_code_version` as provenance the
+/// same way the runner and author binaries do, so it must verify it too --
+/// grading under a drifted CLI certifies a fact nothing checked.
+#[test]
+fn judge_agent_cli_version_mismatch_aborts_before_grading_anything() {
+    let dir = tempfile::tempdir().unwrap();
+    let question = sample_question("q1", QuestionTag::Greppable);
+    let questions_path = write_question_set(dir.path(), std::slice::from_ref(&question));
+    let session = sample_session("q1", Arm::Wiki, 0, "an answer");
+    let sessions_path = write_sessions(dir.path(), std::slice::from_ref(&session));
+    let out_path = dir.path().join("grades.jsonl");
+    let manifest_path = write_manifest(dir.path(), "pinned-judge-model");
+
+    let sentinel = dir.path().join("sentinel");
+    let fake = write_fake_judge(
+        dir.path(),
+        "fake-claude.sh",
+        &format!(
+            "cat > /dev/null\ntouch {sentinel:?}\nprintf '%s\\n' '{{\"result\":\"SCORE: 5\\nRATIONALE: r\"}}'",
+            sentinel = sentinel
+        ),
+    );
+
+    let output = Command::new(bin_path())
+        .env("AGENT_BENCH_CLAUDE_BIN", &fake)
+        .env("FAKE_CLI_VERSION", "9.9.9")
+        .args([
+            "--sessions",
+            sessions_path.to_str().unwrap(),
+            "--questions",
+            questions_path.to_str().unwrap(),
+            "--out",
+            out_path.to_str().unwrap(),
+            "--manifest",
+            manifest_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "grading under a drifted agent CLI must abort"
+    );
+    assert!(
+        !sentinel.exists(),
+        "fake judge ran despite the version drift — the abort must precede any grading"
+    );
+    assert!(
+        !out_path.exists(),
+        "no grades file may be written under a drifted agent CLI"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("0.0.0-test") && stderr.contains("9.9.9"),
+        "stderr must name both the pinned and the actual version: {stderr}"
+    );
+}
+
+#[test]
+fn calibration_rejects_nonfinite_min_kappa_before_grading() {
+    let dir = tempfile::tempdir().unwrap();
+    for threshold in ["NaN", "inf", "-inf"] {
+        let out = dir.path().join("grades.jsonl");
+        let output = Command::new(bin_path())
+            .arg("--sessions")
+            .arg(dir.path().join("missing-sessions.jsonl"))
+            .arg("--questions")
+            .arg(dir.path().join("missing-questions.json"))
+            .arg("--out")
+            .arg(&out)
+            .arg("--manifest")
+            .arg(dir.path().join("missing-manifest.toml"))
+            .arg("--calibrate")
+            .arg(dir.path().join("missing-labels.jsonl"))
+            .arg(format!("--min-kappa={threshold}"))
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "accepted {threshold}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("minimum kappa must be finite"), "{stderr}");
+        assert!(!out.exists());
+    }
 }
 
 #[test]

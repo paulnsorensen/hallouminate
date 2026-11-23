@@ -38,17 +38,30 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     pass_threshold: u8,
     /// Optional path to a human-labelled grades.jsonl; enables calibration
-    /// reporting and the `--min-agreement` gate.
+    /// reporting and the `--min-kappa` gate.
     #[arg(long)]
     calibrate: Option<PathBuf>,
-    /// Minimum pass-threshold agreement with the human labels required to
-    /// exit zero in calibration mode.
-    #[arg(long, default_value_t = 0.80)]
-    min_agreement: f64,
+    /// Minimum Cohen's kappa against the human labels required to exit zero
+    /// in calibration mode. This is a chance-corrected statistic and is NOT
+    /// comparable to a raw-agreement number: on a pass-heavy labelled
+    /// subset, a judge that returns "pass" unconditionally scores ~0.90 raw
+    /// agreement while kappa = 0, because raw agreement never subtracts out
+    /// the agreement expected by chance under class skew. 0.60 is Landis &
+    /// Koch's "substantial agreement" threshold.
+    #[arg(long, default_value_t = 0.60, value_parser = parse_min_kappa)]
+    min_kappa: f64,
     /// Overwrite existing grades instead of skipping already-graded
     /// (question, arm, run_index) triples.
     #[arg(long)]
     force: bool,
+}
+
+fn parse_min_kappa(value: &str) -> Result<f64, String> {
+    let value = value.parse::<f64>().map_err(|err| err.to_string())?;
+    if !value.is_finite() {
+        return Err("minimum kappa must be finite".to_owned());
+    }
+    Ok(value)
 }
 
 fn main() {
@@ -142,13 +155,25 @@ fn run(args: &Args) -> anyhow::Result<()> {
             "pass_threshold_agreement: {:.4}",
             report.pass_threshold_agreement
         );
-        println!("kappa: {:.4}", report.kappa);
-        if report.pass_threshold_agreement < args.min_agreement {
-            anyhow::bail!(
-                "pass-threshold agreement {:.4} is below --min-agreement {:.4}",
-                report.pass_threshold_agreement,
-                args.min_agreement
-            );
+        match report.kappa {
+            Some(kappa) => {
+                println!("kappa: {kappa:.4}");
+                if kappa < args.min_kappa {
+                    anyhow::bail!(
+                        "kappa {kappa:.4} is below --min-kappa {:.4}",
+                        args.min_kappa
+                    );
+                }
+            }
+            None => {
+                println!("kappa: undefined (degenerate labelled subset)");
+                anyhow::bail!(
+                    "kappa is undefined: the labelled subset has no variance (every item \
+                     passes, or every item fails, under both raters) so agreement cannot be \
+                     distinguished from chance \u{2014} the subset needs items on both sides \
+                     of the pass threshold"
+                );
+            }
         }
     }
 
@@ -263,7 +288,7 @@ fn parse_judge_reply(text: &str) -> anyhow::Result<(u8, String)> {
 struct CalibrationReport {
     exact_agreement: f64,
     pass_threshold_agreement: f64,
-    kappa: f64,
+    kappa: Option<f64>,
 }
 
 /// Compare judge grades to human grades on their labelled overlap (matched
@@ -318,13 +343,17 @@ fn calibrate(
     }
 
     let po = pass_agree_count as f64 / n;
-    let p_judge_yes = judge_pass_count as f64 / n;
-    let p_human_yes = human_pass_count as f64 / n;
-    let pe = p_judge_yes * p_human_yes + (1.0 - p_judge_yes) * (1.0 - p_human_yes);
-    let kappa = if (1.0 - pe).abs() < f64::EPSILON {
-        1.0
+    // Scale expected agreement by the square of the trial count.
+    let trials = pairs.len() as i128;
+    let judge_pass = judge_pass_count as i128;
+    let human_pass = human_pass_count as i128;
+    let expected = judge_pass * human_pass + (trials - judge_pass) * (trials - human_pass);
+    let denominator = trials * trials - expected;
+    let kappa = if denominator == 0 {
+        None
     } else {
-        (po - pe) / (1.0 - pe)
+        let numerator = pass_agree_count as i128 * trials - expected;
+        Some(numerator as f64 / denominator as f64)
     };
 
     Ok(CalibrationReport {
@@ -393,7 +422,15 @@ mod tests {
         let report = calibrate(&judge_grades, &human_grades, 4).unwrap();
         assert!((report.exact_agreement - 0.25).abs() < 1e-9);
         assert!((report.pass_threshold_agreement - 0.75).abs() < 1e-9);
-        assert!((report.kappa - 0.5).abs() < 1e-9);
+        assert!((report.kappa.unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn calibrate_preserves_negative_kappa() {
+        let judge_grades = vec![grade("q1", 5), grade("q2", 0)];
+        let human_grades = vec![grade("q1", 0), grade("q2", 5)];
+        let report = calibrate(&judge_grades, &human_grades, 4).unwrap();
+        assert_eq!(report.kappa, Some(-1.0));
     }
 
     #[test]
@@ -402,5 +439,14 @@ mod tests {
         let human_grades = vec![grade("q-not-graded", 5)];
         let err = calibrate(&judge_grades, &human_grades, 4).unwrap_err();
         assert!(err.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn calibrate_returns_none_for_degenerate_labelled_subset() {
+        for score in [0, 5] {
+            let judge_grades = vec![grade("q1", score), grade("q2", score)];
+            let report = calibrate(&judge_grades, &judge_grades, 4).unwrap();
+            assert_eq!(report.kappa, None);
+        }
     }
 }

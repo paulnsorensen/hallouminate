@@ -192,9 +192,14 @@ gold answer and `rubric_notes` (`agent_bench::Question`):
 `pass` is derived from `score >= threshold` (`agent_bench::GradeRecord::grade`,
 `GradeRecord::passes`). Judging is arm-blind: the judge sees the question and
 the answer text, never which arm produced it. A human-graded subset is used
-to calibrate the automated judge, and agreement between human and automated
-grades is reported at the pass threshold (fraction of the calibration subset
-where the automated `pass` bool matches the human `pass` bool).
+to calibrate the automated judge. Exact-score agreement and pass-threshold
+agreement are both reported, but the gate (`--min-kappa`, default 0.60) is on
+Cohen's kappa. The threshold must be finite. Class skew can inflate raw
+agreement. If a judge always says "pass", its raw agreement equals the
+pass rate, but its kappa is zero when the labels vary.
+A labelled subset with no variance (every item passes, or every item fails,
+under both raters) leaves kappa undefined and fails calibration — such a
+subset cannot certify a judge at all.
 
 ## Pinning and reproduction
 
