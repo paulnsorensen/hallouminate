@@ -1325,6 +1325,41 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_over_existing_directory_is_invalid_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes.md")).unwrap();
+        for overwrite in [true, false] {
+            let Err(error) =
+                atomic_write_no_follow(tmp.path(), Path::new("notes.md"), b"data", overwrite)
+            else {
+                panic!("write over a directory succeeded with overwrite={overwrite}");
+            };
+            assert_eq!(
+                error.kind,
+                WriteErrorKind::InvalidPath,
+                "overwrite={overwrite}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_follow_open_of_symlink_is_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("real.md"), "# Real").unwrap();
+        symlink(tmp.path().join("real.md"), tmp.path().join("link.md")).unwrap();
+        let Err(error) = open_existing_file_no_follow(tmp.path(), Path::new("link.md")) else {
+            panic!("open followed a symlink");
+        };
+        assert_eq!(error.kind, WriteErrorKind::Symlink);
+        let Err(error) = read_no_follow(tmp.path(), Path::new("link.md")) else {
+            panic!("read followed a symlink");
+        };
+        assert_eq!(error.kind, WriteErrorKind::Symlink);
+    }
+
     fn cfg(name: &str, paths: Vec<&str>) -> CorpusConfig {
         CorpusConfig {
             name: name.to_string(),

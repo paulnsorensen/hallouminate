@@ -72,3 +72,24 @@ test("launcher preserves arguments and child exit status", () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("AC-13 package version and release runners", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
+  const cargo = fs.readFileSync(path.join(__dirname, "../../Cargo.toml"), "utf8");
+  const workspaceVersion = cargo.match(/^version = "([^"]+)"/m)[1];
+  assert.equal(pkg.version, workspaceVersion);
+  const dist = fs.readFileSync(path.join(__dirname, "../../dist-workspace.toml"), "utf8");
+  assert.match(dist, /^aarch64-apple-darwin = "macos-latest"$/m);
+  assert.match(dist, /^x86_64-pc-windows-msvc = "windows-2022"$/m);
+});
+
+test("AC-20 Windows CI runners and timeout", () => {
+  const ci = fs.readFileSync(path.join(__dirname, "../../.github/workflows/ci.yml"), "utf8");
+  const jobBody = (name) => ci.match(new RegExp(`^  ${name}:\\n((?:    .*\\n|\\n)+)`, "m"))[1];
+  const windowsJob = jobBody("windows");
+  assert.match(windowsJob, /^    runs-on: windows-2022$/m);
+  assert.match(windowsJob, /^    timeout-minutes: 60$/m);
+  assert.match(jobBody("npm-installer"), /os: \[[^\]]*windows-2022[^\]]*\]/);
+  assert.match(jobBody("verification-lease"), /os: \[[^\]]*windows-2022[^\]]*\]/);
+  assert.equal(ci.includes("windows-latest"), false);
+});
