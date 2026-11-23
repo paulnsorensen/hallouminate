@@ -1019,11 +1019,22 @@ fn write_new_file(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), Writ
     }
     let cap_file = parent
         .open_with(name, &opts)
-        .map_err(classify_create_io_error)?;
+        .map_err(|error| classify_new_file_error(parent, name, error))?;
     let mut file = cap_file.into_std();
     write_and_sync(&mut file, content)?;
     drop(file);
     fsync_dir(parent)
+}
+
+/// Classifies a failed `create_new` open. Windows reports an existing
+/// directory as access denied where Unix reports `EEXIST`, so an existing
+/// entry behind `PermissionDenied` maps to `Exists` on both platforms.
+fn classify_new_file_error(parent: &Dir, name: &OsStr, error: std::io::Error) -> WriteError {
+    if error.kind() == std::io::ErrorKind::PermissionDenied && parent.symlink_metadata(name).is_ok()
+    {
+        return WriteError::new(WriteErrorKind::Exists, error);
+    }
+    classify_create_io_error(error)
 }
 
 fn atomic_replace(parent: &Dir, name: &OsStr, content: &[u8]) -> Result<(), WriteError> {
@@ -1323,25 +1334,6 @@ mod tests {
         ] {
             let error = classify_create_io_error(std::io::Error::from_raw_os_error(code as i32));
             assert_eq!(error.kind, WriteErrorKind::InvalidPath);
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_write_over_existing_directory_is_invalid_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("notes.md")).unwrap();
-        for overwrite in [true, false] {
-            let Err(error) =
-                atomic_write_no_follow(tmp.path(), Path::new("notes.md"), b"data", overwrite)
-            else {
-                panic!("write over a directory succeeded with overwrite={overwrite}");
-            };
-            assert_eq!(
-                error.kind,
-                WriteErrorKind::InvalidPath,
-                "overwrite={overwrite}"
-            );
         }
     }
 
@@ -2144,6 +2136,32 @@ mod tests {
         assert!(matches!(err.kind, WriteErrorKind::InvalidPath), "{err:?}");
     }
 
+    #[test]
+    fn atomic_write_no_follow_over_existing_directory_reports_unix_kinds() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("notes.md")).unwrap();
+        let Err(error) = atomic_write_no_follow(tmp.path(), Path::new("notes.md"), b"x", false)
+        else {
+            panic!("create_new over a directory succeeded");
+        };
+        match error.kind {
+            WriteErrorKind::Exists => {}
+            WriteErrorKind::Symlink | WriteErrorKind::InvalidPath | WriteErrorKind::Io => {
+                panic!("overwrite=false: {error:?}")
+            }
+        }
+        let Err(error) = atomic_write_no_follow(tmp.path(), Path::new("notes.md"), b"x", true)
+        else {
+            panic!("replace over a directory succeeded");
+        };
+        match error.kind {
+            WriteErrorKind::InvalidPath => {}
+            WriteErrorKind::Exists | WriteErrorKind::Symlink | WriteErrorKind::Io => {
+                panic!("overwrite=true: {error:?}")
+            }
+        }
+        assert!(tmp.path().join("notes.md").is_dir());
+    }
     #[test]
     fn atomic_write_no_follow_rejects_regular_file_as_intermediate_dir_component() {
         // If a normal file sits where the writer expects a directory,
