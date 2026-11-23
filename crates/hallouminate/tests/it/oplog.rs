@@ -1,6 +1,7 @@
 //! Operations log: the writer (segment naming, cross-process appends, the
 //! daemon-only size cap) and the `daemon_op` rows of a served daemon.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -100,6 +101,111 @@ fn current_segment(dir: &Path, before: NaiveDate, after: NaiveDate) -> PathBuf {
         }
     }
     panic!("no segment for {before} or {after} in {dir:?}");
+}
+
+fn command_under_umask(mask: &str, program: &str) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.args([
+        "-c",
+        "umask \"$1\" && shift && exec \"$@\"",
+        "oplog-test",
+        mask,
+        program,
+    ]);
+    command
+}
+
+fn mode(path: &Path) -> u32 {
+    std::fs::metadata(path)
+        .expect("file metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+fn traversable_log_dir(root: &Path) -> PathBuf {
+    let dir = root.join("state/hallouminate");
+    let status = command_under_umask("022", "/bin/mkdir")
+        .arg("-p")
+        .arg(&dir)
+        .status()
+        .expect("create log directory");
+    assert!(status.success(), "mkdir failed: {status}");
+    assert_eq!(mode(&dir), 0o755);
+    dir
+}
+
+fn log_cli_status(root: &Path, mask: &str) {
+    let output = command_under_umask(mask, env!("CARGO_BIN_EXE_hallouminate"))
+        .args(["daemon", "status"])
+        .current_dir(root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("HALLOUMINATE_SOCKET", root.join("daemon.sock"))
+        .output()
+        .expect("run daemon status");
+    assert!(
+        output.status.success(),
+        "daemon status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"not running\n");
+}
+
+#[test]
+fn new_operation_log_mode_respects_umask() {
+    for (mask, expected_mode) in [("022", 0o600), ("222", 0o400)] {
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = traversable_log_dir(root.path());
+        let before = Utc::now().date_naive();
+        log_cli_status(root.path(), mask);
+
+        let segment = current_segment(&dir, before, Utc::now().date_naive());
+        let actual_mode = mode(&segment);
+        assert_eq!(
+            actual_mode, expected_mode,
+            "umask {mask}: got {actual_mode:04o}, expected {expected_mode:04o}"
+        );
+        let rows = read_rows(&segment);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].op, "status");
+        assert_eq!(mode(&dir), 0o755);
+    }
+}
+
+#[test]
+fn append_preserves_existing_operation_log_mode() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = traversable_log_dir(root.path());
+    let today = Utc::now().date_naive();
+    let tomorrow = today.succ_opt().expect("next date");
+    let segments = [
+        dir.join(segment_name(today)),
+        dir.join(segment_name(tomorrow)),
+    ];
+    let status = command_under_umask("022", "/usr/bin/touch")
+        .args(&segments)
+        .status()
+        .expect("create existing segments");
+    assert!(status.success(), "touch failed: {status}");
+    for segment in &segments {
+        assert_eq!(mode(segment), 0o644);
+    }
+
+    log_cli_status(root.path(), "022");
+
+    let mut written = 0;
+    for segment in &segments {
+        assert_eq!(mode(segment), 0o644);
+        if std::fs::metadata(segment).expect("segment metadata").len() > 0 {
+            let rows = read_rows(segment);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].op, "status");
+            written += 1;
+        }
+    }
+    assert_eq!(written, 1);
+    assert_eq!(mode(&dir), 0o755);
 }
 
 #[test]

@@ -155,11 +155,14 @@ impl OpLog {
         let mut line = serde_json::to_vec(record)?;
         line.push(b'\n');
         std::fs::create_dir_all(&self.dir)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
         file.lock()?;
         recover_unterminated_row(&mut file)?;
         file.write_all(&line)
