@@ -48,3 +48,54 @@
 - 2026-08-23 · wiki-harvest-hallouminate-20260823 · merged · mcp-surface.md · read_markdown now defaults corpus to wiki-for-cwd and gained line_numbers/footnotes params; get_footnote removed in 0.7.0 (#384, eleven→ten tools), replaced by footnotes:"only"; not-found enrichment cross-linked
 - 2026-08-23 · wiki-harvest-hallouminate-20260823 · merged · index.md · tool count eleven→ten, multi-format gloss refreshed to shipped Phase 1, added not-found-suggestions entry
 
+
+- 2026-08-30 · wiki-harvest-hallouminate-20260830 · new-adr · supervisor-restart-ladder.md · documented the shared `Ladder<A>` evaluator and its separate churn and supervisor configurations; corrected the crash-loop sequence, distinguished the direct watchdog path, and recorded why restarts do not change heartbeats (#407/#408/#409, closing #387)
+- 2026-08-30 · wiki-harvest-hallouminate-20260830 · fixed-stale · blocking-inference-offload.md · every citation still pointed at the pre-#273 `crates/hallouminate/src/daemon/` layout; repointed to `hallouminate-daemon`/`hallouminate-adapters` with corrected line numbers (functions moved, e.g. `run_embedding_blocking` 626→816, real `apply_batch` 939-1009→1168)
+- 2026-08-30 · wiki-harvest-hallouminate-20260830 · merged · architecture.md, daemon-and-cli.md, index.md · cross-links to the new supervisor-restart-ladder page
+
+
+
+- 2026-09-05 · aed65466a6521ab0 · merged · mcp-surface.md · Required active-checkout cwd replaces startup directory routing.
+- 2026-09-05 · aed65466a6521ab0 · merged · corpus-walker.md · Root-relative patterns, ownership, and independent selection warnings.
+- 2026-09-05 · aed65466a6521ab0 · merged · worktree-dev-gotchas.md · Mise shims override the pinned verification toolchain.
+
+
+
+- 2026-09-23 · a04b1c4258c1a688 · merged · supervisor-restart-ladder.md · Record source-backed shutdown and actor-framework rejections from landed PRs #524 and #526.
+- 2026-09-23 · a04b1c4258c1a688 · merged · daemon-and-cli.md · Record the OS-service rejection and inference idle policy from landed PRs #525 and #527.
+
+
+
+- 2026-10-01 · ff7f2b737f3afff6 · merged · mcp-surface.md, not-found-suggestions.md, ground-signal-fusion-adrs.md · Record landed PR #561 batch contracts, bounded retrieval recovery, citation hints, and diagnostic counters. Nine frozen retrieval probes pass after one bounded heading repair.
+
+
+
+- 2026-10-04 · fe76bd3da1e3c731 · merged · domain-model.md, ground-signal-fusion-adrs.md · Record landed PR #575: bounded heading and authored-content ranking, visible navigation, schema 5, and safe optional-metadata decoding. All six frozen retrieval probes pass; the daemon still reports queued reconciliation.
+
+
+- 2026-10-06 · 08d6bc9aa8b975ae · merged · ground-search-quality-adrs.md · #589: ADR-003 amendment — boot rebuilds stale stores inline; per-request override stores move aside and refill through admitted catch-up; ground_dir_locks; per-open backup prune.
+
+
+
+
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · sources/llm-wiki-facts-layer-landscape-research.md · source page for the 2026-10-05 facts-layer landscape `/briesearch` report (no end-to-end LLM-wiki facts standard).
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · facts-layer-landscape.md · four layers, schema-first vs schema-emergent extraction, existing hallouminate constructs, 2026-10-05 tooling snapshot, and gaps; evidence only.
+- 2026-10-21 · 2d0458886448d862 · new-page · sources/rdf-store-vs-inline-facts-research.md · source page for the 2026-10-18 deep `/briesearch` report on RDF or graph stores vs inline fact demarcation.
+- 2026-10-21 · 2d0458886448d862 · new-page · facts-layer-store-evidence.md · query-language, graph-RAG, agent-memory, prompt-format, and long-context evidence; labelled inference only, no decision.
+- 2026-10-21 · 29c3ea50f7289f79 · new-page · facts-layer-open-forks.md · forks Q1-Q4 recorded as open with options and evidence pointers; proposed order Q2, Q3, Q1, Q4 is unconfirmed.
+- 2026-10-21 · 29c3ea50f7289f79 · merged · index.md · three facts-layer topic entries added to the curated topic list.
+- 2026-10-21 · 29c3ea50f7289f79 · skipped-near-duplicate · claim-provenance-marks.md · Q4 relates to supersession marks, but no decision exists, so the page stays unchanged and the forks page links to it.
+- All 16 frozen retrieval probes pass on the first write: 7 exact probes at rank 1, 9 natural or central-claim probes within the top 3.
+
+
+
+
+- 2026-11-01 · 898a746602dd9471 · new-page · sources/facts-layer-extraction-supersession-research.md · source page for the 2026-11-01 follow-up deep `/briesearch` report on extraction, supersession, inline retrieval, and prior art.
+- 2026-11-01 · 898a746602dd9471 · new-page · facts-layer-extraction-evidence.md · fork Q1 evidence: closed-ontology triple F1 on 2026 models, open-extraction relation sprawl, EDC canonicalization trade-off; evidence only.
+- 2026-11-01 · 898a746602dd9471 · new-page · facts-layer-supersession-evidence.md · forks Q3/Q4 evidence: statement-model change mechanisms and STALE results on 2026 models; evidence only.
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-store-evidence.md · new section on fact text inside embedded chunks (metadata-prefix study, contextual retrieval, local embed-text facts).
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-landscape.md · memory-product update behavior (Mem0 add-only, Graphiti, Basic Memory) and new coverage gaps.
+- 2026-11-01 · 898a746602dd9471 · merged · facts-layer-open-forks.md · one new evidence line per fork; all four forks stay open.
+- 2026-11-01 · 898a746602dd9471 · merged · index.md · two facts-layer evidence entries added to the curated topic list.
+- All 11 frozen retrieval probes pass on the first write: 3 exact probes at rank 1, 8 natural or central-claim probes within the top 3.
+

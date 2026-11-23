@@ -531,4 +531,17 @@ mod tests {
             MatchError::NotFound
         );
     }
+
+    // ── T20: list item holding only a link reference definition ──────────────
+    #[test]
+    fn t20_reference_definition_list_item_does_not_panic() {
+        // WHY: the section_edit fuzz target found this input. pulldown-cmark
+        // 0.13.4 left an empty tight paragraph here, and its offset iterator
+        // panicked on it.
+        let doc = "* [x]:u\n\t  \n---";
+        assert_eq!(
+            splice_under_heading(doc, "x", Position::Append, "y").unwrap_err(),
+            SectionError::NotFound
+        );
+    }
 }

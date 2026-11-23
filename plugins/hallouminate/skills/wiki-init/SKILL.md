@@ -9,6 +9,11 @@ Turn what's in the user's head into a structured, searchable wiki. The hard part
 **elicitation** — experts can't introspect tacit knowledge on demand, so you ask
 about *behavior in concrete situations* and extract the model from their answers.
 
+Every hallouminate MCP tool call takes a required `cwd`: the absolute path of
+your own active checkout. In a git worktree, this can differ from the
+harness's original directory. Pass the wrong one and you silently read or
+write another worktree's wiki.
+
 **Agent topology (required):**
 
 - **Root = opus-tier** (the strongest model the harness offers). Runs the interview,
@@ -86,7 +91,7 @@ your working notes), separating *what was said* from *how it'll be written*.
   the two ingest-ledger conventions so `wiki-ingest` reads and writes one shape:
   - **`log.md`** — an append-only ingest journal at the corpus root under a stable
     `## Log` heading. `wiki-ingest` appends one row per decision via
-    an `add_markdown` append (`corpus`, `path: "log.md"`, `under_heading: "Log"`, `position: "append"`, `content: <row>`); it is **never**
+    an `add_markdown` append (`corpus`, `path: "log.md"`, `under_heading: "Log"`, `position: "append"`, `content: <row>`, `cwd`); it is **never**
     rewritten and **never** a routing/merge target.
   - **`sha256sum` source-hash ledger** — `wiki-ingest`'s Layer-1 dedup hashes each
     normalized source (`sha256sum`, first 16 hex chars) and records the id in `log.md`;
@@ -100,7 +105,7 @@ your working notes), separating *what was said* from *how it'll be written*.
   never linked or copied.
   Later skills (`wiki-ingest`) read all of this to stay consistent.
 - Pick the corpus: `repo:{name}:wiki` for the repo, or ask if ambiguous
-  (`list_corpora`). Confirm the page list with the user before fanning out.
+  (`list_corpora { cwd }`). Confirm the page list with the user before fanning out.
 
 ## Phase 3 — Fan out drafts (haiku, parallel)
 
@@ -115,7 +120,8 @@ Spawn one haiku sub-agent per planned page, **in a single message**, each with:
 > cite code as `path:line` where the slots name files. Link only corpus-relative
 > targets — if a slot names a local doc that should be linked, do not link it;
 > flag it in your return for the root to copy into the corpus. Add the provenance footer.
-> Then call `add_markdown { corpus, path, content, overwrite: false }` — the target
+> Then call `add_markdown { corpus, path, content, overwrite: false, cwd }` —
+> pass your own active checkout directory as `cwd`. The target
 > corpus must be single-root (`add_markdown` rejects multi-root corpora);
 > `repo:{name}:wiki` is single-root. Return the path written and any lint `warnings`
 > from the response. Do NOT interview the user.
@@ -137,7 +143,7 @@ automatically on write.
   markers — the daemon owns the link list between them).
 - **Scaffold an empty `log.md`** at the corpus root so `wiki-ingest` has a ledger to
   append to from its first run: `add_markdown { corpus, path: "log.md",
-  content: "# Ingest Log\n\n## Log\n", overwrite: false }`. It stays append-only thereafter.
+  content: "# Ingest Log\n\n## Log\n", overwrite: false, cwd }`. It stays append-only thereafter.
 - Report the page list to the user and name the gaps the interview didn't reach
   (hand-off candidates for a later `wiki-init` continuation or `wiki-ingest`).
 

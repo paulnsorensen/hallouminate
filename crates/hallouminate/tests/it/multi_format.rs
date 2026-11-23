@@ -1,12 +1,12 @@
-//! Phase 1 multi-format ingestion acceptance tests.
+//! Multi-format ingestion acceptance tests.
 //!
 //! Exercises the format-dispatch pipeline end to end through `index_corpus`:
-//! plain text, CSV, xlsx, and ods all index and ground; unsupported and
+//! plain text, CSV, xlsx, ods, and PDF all index and ground; unsupported and
 //! corrupt in-scope files are skipped (logged) without aborting the run; and a
 //! representative markdown fixture indexes byte-identically to the pre-dispatch
 //! pipeline (golden-snapshot regression).
 //!
-//! Spreadsheet fixtures are generated in-process (no committed binaries):
+//! Binary fixtures are generated in-process (no committed binaries):
 //! rust_xlsxwriter writes a real .xlsx; .ods is a hand-built ZIP. No pure-Rust
 //! .xls writer exists, so the .xls path is covered by a detection/routing unit
 //! test instead of a generated binary.
@@ -17,10 +17,11 @@ use std::path::{Path, PathBuf};
 
 use hallouminate_adapters::LanceStore;
 use hallouminate_domain::common::{CorpusConfig, FileRef, Mtime};
+use hallouminate_domain::ground::{GroundGroupBy, GroundMatch, GroundOpts, GroundOutput, ground};
 use hallouminate_domain::indexer::{
-    Format, HandlerRegistry, PrepareCtx, detect_format, index_corpus,
+    Format, HandlerRegistry, PrepareCtx, SkipReason, detect_format, index_corpus,
 };
-use hallouminate_domain::search::search_fused;
+use hallouminate_domain::search::{search_fused, search_phrase};
 use text_splitter::Characters;
 
 use crate::common::LANCE_WRITE_LOCK;
@@ -326,6 +327,14 @@ async fn unsupported_extension_is_skipped_and_rest_of_corpus_indexes() {
         stats.files_skipped_empty, 0,
         "an unsupported type must not be miscounted as truncate-to-empty"
     );
+    let [skipped] = stats.skipped_unreadable.as_slice() else {
+        panic!(
+            "the skip must name one file: {:?}",
+            stats.skipped_unreadable
+        );
+    };
+    assert!(skipped.file.as_path().ends_with("photo.png"), "{skipped:?}");
+    assert_eq!(skipped.reason, SkipReason::UnsupportedFormat);
 
     let hits = search_fused(
         &store,
@@ -440,7 +449,7 @@ async fn bulk_reindex_retains_last_good_rows_when_file_becomes_unreadable() {
 // ── Detection / routing unit checks ────────────────────────────────────────
 
 #[test]
-fn detect_format_keys_on_extension_for_every_phase1_type() {
+fn detect_format_keys_on_extension_for_every_supported_type() {
     let cases: &[(&str, Format)] = &[
         ("a.md", Format::Markdown),
         ("a.markdown", Format::Markdown),
@@ -454,8 +463,10 @@ fn detect_format_keys_on_extension_for_every_phase1_type() {
         ("a.xlsx", Format::Spreadsheet),
         ("a.xls", Format::Spreadsheet),
         ("a.ods", Format::Spreadsheet),
+        ("a.pdf", Format::Pdf),
         ("A.MD", Format::Markdown), // case-insensitive extension
         ("A.CSV", Format::Spreadsheet),
+        ("A.PDF", Format::Pdf),
     ];
     for (name, want) in cases {
         let got = detect_format(Path::new(name), b"irrelevant content");
@@ -830,4 +841,805 @@ fn detect_format_extensionless_xlsx_bytes_sniff_as_spreadsheet() {
         Some(Format::Spreadsheet),
         "a real OOXML container must sniff as Spreadsheet via magic bytes"
     );
+}
+
+// ── PDF ────────────────────────────────────────────────────────────────────
+
+fn pdf_fixture(pages: &[Option<&str>]) -> Vec<u8> {
+    let mut page_ids = Vec::with_capacity(pages.len());
+    for index in 0..pages.len() {
+        page_ids.push(4 + index * 2);
+    }
+
+    let mut kids = String::new();
+    for page_id in &page_ids {
+        use std::fmt::Write as _;
+        write!(kids, "{page_id} 0 R ").unwrap();
+    }
+
+    let mut objects = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        format!("<< /Type /Pages /Kids [{kids}] /Count {} >>", pages.len()).into_bytes(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    for (index, text) in pages.iter().enumerate() {
+        let page_id = page_ids[index];
+        let content_id = page_id + 1;
+        objects.push(
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+            )
+            .into_bytes(),
+        );
+        let stream = match text {
+            Some(text) => format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET"),
+            None => String::new(),
+        };
+        objects.push(
+            format!(
+                "<< /Length {} >>\nstream\n{stream}\nendstream",
+                stream.len()
+            )
+            .into_bytes(),
+        );
+    }
+
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0];
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        writeln!(&mut pdf, "{} 0 obj", index + 1).unwrap();
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = pdf.len();
+    write!(&mut pdf, "xref\n0 {}\n0000000000 65535 f \n", offsets.len()).unwrap();
+    for offset in offsets.iter().skip(1) {
+        writeln!(&mut pdf, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        &mut pdf,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+        offsets.len()
+    )
+    .unwrap();
+    pdf
+}
+
+fn corrupt_second_media_box(pdf: &mut [u8]) {
+    const MEDIA_BOX: &[u8] = b"/MediaBox";
+    let first = pdf
+        .windows(MEDIA_BOX.len())
+        .position(|window| window == MEDIA_BOX)
+        .expect("PDF fixture has a first MediaBox");
+    let second = first
+        + MEDIA_BOX.len()
+        + pdf[first + MEDIA_BOX.len()..]
+            .windows(MEDIA_BOX.len())
+            .position(|window| window == MEDIA_BOX)
+            .expect("PDF fixture has a second MediaBox");
+    // Keep the object length unchanged so the generated xref offsets stay valid.
+    pdf[second..second + MEDIA_BOX.len()].copy_from_slice(b"/MediaFoo");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_indexes_text_pages_with_page_breadcrumbs_and_skips_empty_pages() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let bytes = pdf_fixture(&[
+        Some("The first page contains the amberquasar protocol."),
+        Some("The second page contains the cobaltnebula procedure."),
+        None,
+    ]);
+    fs::write(corpus_dir.path().join("guide.pdf"), bytes).unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index text-layer PDF");
+
+    assert_eq!(stats.files_upserted, 1, "the PDF is indexed once");
+    assert_eq!(stats.files_skipped_unreadable, 0);
+    assert_eq!(
+        stats.chunks_inserted, 2,
+        "only the two text-bearing pages produce chunks"
+    );
+
+    for (query, page) in [("amberquasar", "page:1"), ("cobaltnebula", "page:2")] {
+        let hits = search_fused(
+            &store,
+            &corpus.primary_corpus_key().expect("corpus root"),
+            query,
+            &corpus.globs,
+            5,
+        )
+        .await
+        .expect("search PDF")
+        .hits;
+        let hit = hits
+            .iter()
+            .find(|hit| hit.file_ref.ends_with("guide.pdf"))
+            .expect("PDF page must be retrievable");
+        assert_eq!(hit.heading_path, vec![page.to_string()]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn phrase_mode_matches_phrases_wrapped_across_source_lines() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("wrapped.md"),
+        "# Siting notes\n\nTSMC fully owns its Arizona factories, which currently make chips for\nseveral customers.\n\n## Ownership models\n\nThe overseas plants follow different models. Some sites are joint\nventures with customers, and the company is the majority shareholder\nof both plants in Japan and Germany.\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("wrapped.txt"),
+        "Ownership notes for the overseas plants.\r\n\r\nA later agreement made the company a minority partner in a third\r\nfab, with the partner funding the rest.\r\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("wrapped.pdf"),
+        pdf_fixture(&[
+            Some("Cover page of the plant report."),
+            Some("The plant says it has commenced) Tj 0 -14 Td (production this year."),
+        ]),
+    )
+    .unwrap();
+
+    let corpus = corpus(
+        corpus_dir.path(),
+        "docs",
+        &["**/*.md", "**/*.txt", "**/*.pdf"],
+    );
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index wrapped fixtures");
+    assert_eq!(stats.files_upserted, 3);
+
+    let key = corpus.primary_corpus_key().expect("corpus root");
+    for (phrase, file) in [
+        ("majority shareholder of both plants", "wrapped.md"),
+        ("Some sites are joint ventures", "wrapped.md"),
+        ("minority partner in a third fab", "wrapped.txt"),
+        ("it has commenced production", "wrapped.pdf"),
+    ] {
+        let found = search_phrase(&store, &key, phrase, 50)
+            .await
+            .unwrap_or_else(|e| panic!("phrase {phrase:?} must not error: {e}"));
+        let mut matched = None;
+        for candidate in &found.hits {
+            if candidate.file_ref.ends_with(file) {
+                matched = Some(candidate);
+                break;
+            }
+        }
+        let Some(hit) = matched else {
+            panic!(
+                "phrase {phrase:?} must match {file}; hits: {:?}",
+                found.hits
+            );
+        };
+        assert!(
+            !hit.search_text
+                .to_lowercase()
+                .contains(&phrase.to_lowercase()),
+            "fixture must wrap {phrase:?} in {file}: {:?}",
+            hit.search_text
+        );
+        assert_eq!(hit.score, 1.0, "{phrase:?} occurs once in {file}");
+    }
+
+    let found = search_phrase(&store, &key, "majority shareholders of both", 50)
+        .await
+        .expect("phrase search");
+    assert!(
+        found.hits.is_empty(),
+        "a non-whitespace difference must still miss: {:?}",
+        found.hits
+    );
+}
+
+#[test]
+fn detect_format_extensionless_pdf_bytes_sniff_as_pdf() {
+    let bytes = pdf_fixture(&[Some("A text-layer PDF.")]);
+    let detected = detect_format(Path::new("document_without_extension"), &bytes);
+
+    assert_eq!(
+        detected,
+        Some(Format::Pdf),
+        "PDF magic bytes must route extensionless input to the PDF handler"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_preserves_page_order_and_local_line_ranges_across_empty_pages() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let bytes = pdf_fixture(&[
+        Some("alpha page first line.\nalpha page second line contains firstlinemarker."),
+        None,
+        Some("gamma page first line.\ngamma page second line contains linenumbermarker."),
+    ]);
+    fs::write(corpus_dir.path().join("multiline.pdf"), bytes).unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index multiline text-layer PDF");
+
+    let first_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "firstlinemarker",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search first PDF page")
+    .hits;
+    let first = first_hits
+        .iter()
+        .find(|hit| hit.file_ref.ends_with("multiline.pdf"))
+        .expect("the first PDF page must be retrievable");
+    assert_eq!(first.heading_path, vec!["page:1".to_string()]);
+    assert_eq!(
+        (first.line_start, first.line_end),
+        (3, 3),
+        "the first marker is on extracted-text line 3"
+    );
+
+    let third_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "linenumbermarker",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search third PDF page")
+    .hits;
+    let third = third_hits
+        .iter()
+        .find(|hit| hit.file_ref.ends_with("multiline.pdf"))
+        .expect("the third PDF page must be retrievable after an empty page");
+    assert_eq!(third.heading_path, vec!["page:3".to_string()]);
+    assert_eq!(
+        (third.line_start, third.line_end),
+        (3, 3),
+        "the third-page marker keeps the same page-local extracted-text line"
+    );
+}
+
+/// Text of `count` numbered words, `w000 w001 ...`, so that every pair of
+/// adjacent words is a unique phrase.
+fn numbered_words(count: usize) -> String {
+    let mut words = Vec::with_capacity(count);
+    for index in 0..count {
+        words.push(format!("w{index:03}"));
+    }
+    words.join(" ")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_overlap_matches_every_cross_boundary_phrase_exactly_once() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let words = numbered_words(120);
+    let bytes = pdf_fixture(&[Some("Intro page."), Some(&words)]);
+    fs::write(corpus_dir.path().join("numbered.pdf"), bytes).unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf"]);
+    let store = open_store(store_dir.path()).await;
+    // The 600-character page splits several times, and the overlap of one
+    // eighth of the chunk holds each 9-character word pair.
+    const CHUNK_CHARS: usize = 200;
+    let registry = HandlerRegistry::new(Characters, CHUNK_CHARS);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index numbered PDF");
+    assert!(
+        stats.chunks_inserted >= 4,
+        "page 2 must split into several chunks, got {} chunks",
+        stats.chunks_inserted
+    );
+
+    let key = corpus.primary_corpus_key().expect("corpus root");
+    for index in 0..119 {
+        let phrase = format!("w{index:03} w{:03}", index + 1);
+        let found = search_phrase(&store, &key, &phrase, 50)
+            .await
+            .expect("phrase search");
+        let mut matches = Vec::new();
+        for hit in &found.hits {
+            matches.push((hit.heading_path.clone(), hit.score));
+        }
+        assert_eq!(
+            matches,
+            vec![(vec!["page:2".to_string()], 1.0)],
+            "{phrase:?} must match exactly one chunk once"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pdf_page_grouping_and_counts_report_distinct_pages() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let mut clauses = Vec::new();
+    for index in 0..30 {
+        clauses.push(format!("clause w{index:03} abatement"));
+    }
+    let dense = clauses.join(". ");
+    let bytes = pdf_fixture(&[
+        Some("Intro page."),
+        Some(&dense),
+        Some("A single abatement clause."),
+    ]);
+    fs::write(corpus_dir.path().join("agreement.pdf"), bytes).unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 200);
+    index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index agreement PDF");
+
+    let uncapped = GroundOpts {
+        top_files: 10,
+        chunks_per_file: 1_000,
+        limit: 1_000,
+        match_mode: GroundMatch::Phrase,
+        ..GroundOpts::default()
+    };
+    let chunked = ground("abatement", &corpus, &store, None, uncapped)
+        .await
+        .expect("chunk ground");
+    let doc = chunked.docs.values().next().expect("agreement matched");
+    let chunk_total = doc.chunks.len();
+    assert!(
+        chunk_total >= 3,
+        "page 2 must contribute several chunks, got {chunk_total}"
+    );
+
+    let paged = ground(
+        "abatement",
+        &corpus,
+        &store,
+        None,
+        GroundOpts {
+            group_by: GroundGroupBy::Page,
+            ..uncapped
+        },
+    )
+    .await
+    .expect("page ground");
+    let doc = paged.docs.values().next().expect("agreement matched");
+    let mut pages = Vec::new();
+    for chunk in &doc.chunks {
+        pages.push((chunk.heading_path.join(" > "), chunk.chunk_count));
+    }
+    pages.sort();
+    assert_eq!(
+        pages,
+        vec![
+            ("page:2".to_string(), Some(chunk_total - 1)),
+            ("page:3".to_string(), Some(1)),
+        ]
+    );
+    for warning in &paged.warnings {
+        assert_ne!(warning.code, "phrase-truncated", "{}", warning.message);
+    }
+
+    let counted = ground(
+        "abatement",
+        &corpus,
+        &store,
+        None,
+        GroundOpts {
+            top_files: 1,
+            chunks_per_file: 1,
+            limit: 1,
+            match_mode: GroundMatch::Phrase,
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        },
+    )
+    .await
+    .expect("counts ground");
+    let doc = counted.docs.values().next().expect("agreement counted");
+    let Some(coverage) = doc.coverage else {
+        panic!("counts output must carry coverage");
+    };
+    assert_eq!((coverage.chunks, coverage.pages), (chunk_total, Some(2)));
+    assert!(doc.chunks.is_empty(), "counts output carries no snippets");
+    assert!(
+        counted.warnings.is_empty(),
+        "complete counts ignore the hit caps: {:?}",
+        counted.warnings
+    );
+
+    let ranked_counts = ground(
+        "abatement",
+        &corpus,
+        &store,
+        None,
+        GroundOpts {
+            output: GroundOutput::Counts,
+            ..GroundOpts::default()
+        },
+    )
+    .await;
+    assert!(
+        ranked_counts.is_err(),
+        "counts output in ranked mode must be rejected"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_later_pdf_page_skips_entire_file_without_blocking_valid_sibling() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    let mut malformed = pdf_fixture(&[
+        Some("The first page contains laterpagefailuremarker."),
+        Some("The second page is missing required metadata."),
+    ]);
+    corrupt_second_media_box(&mut malformed);
+    fs::write(corpus_dir.path().join("later-page-broken.pdf"), malformed).unwrap();
+    fs::write(
+        corpus_dir.path().join("notes.txt"),
+        "The valid sibling contains the steadfastpdf marker.\n",
+    )
+    .unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf", "**/*.txt"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("a later-page decoder panic must not abort corpus indexing");
+
+    assert_eq!(
+        stats.files_upserted, 1,
+        "the malformed PDF must contribute no indexed file"
+    );
+    assert_eq!(
+        stats.files_skipped_unreadable, 1,
+        "the malformed PDF must be reported as unreadable"
+    );
+    assert_eq!(
+        stats.chunks_inserted, 1,
+        "only the valid sibling contributes a row"
+    );
+
+    let bad_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "laterpagefailuremarker",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search malformed PDF marker")
+    .hits;
+    assert_eq!(
+        bad_hits
+            .iter()
+            .filter(|hit| hit.file_ref.ends_with("later-page-broken.pdf"))
+            .count(),
+        0,
+        "a later-page decoder failure must discard earlier pages"
+    );
+
+    let valid_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "steadfastpdf",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search valid sibling")
+    .hits;
+    assert_eq!(
+        valid_hits
+            .iter()
+            .filter(|hit| hit.file_ref.ends_with("notes.txt"))
+            .count(),
+        1,
+        "the valid sibling remains retrievable"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_and_empty_pdfs_skip_without_blocking_valid_siblings() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(corpus_dir.path().join("broken.pdf"), b"%PDF-1.4\nnot a PDF").unwrap();
+    fs::write(
+        corpus_dir.path().join("empty.pdf"),
+        pdf_fixture(&[None, None]),
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("notes.txt"),
+        "The valid sibling contains the steadfastpdf marker.\n",
+    )
+    .unwrap();
+
+    for name in ["broken.pdf", "empty.pdf"] {
+        let bytes = fs::read(corpus_dir.path().join(name)).unwrap();
+        let detected = detect_format(Path::new(name), &bytes);
+        assert_eq!(
+            detected,
+            Some(Format::Pdf),
+            "{name} must route through the PDF handler before it is rejected"
+        );
+    }
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.pdf", "**/*.txt"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("bad PDFs must not abort corpus indexing");
+
+    assert_eq!(
+        stats.files_upserted, 1,
+        "only the valid text file is indexed"
+    );
+    assert_eq!(
+        stats.files_skipped_unreadable, 2,
+        "corrupt and wholly empty PDFs are both reported as unreadable"
+    );
+    assert_eq!(stats.files_skipped_empty, 0);
+    let mut named = Vec::new();
+    for skipped in &stats.skipped_unreadable {
+        let SkipReason::ExtractionFailed(error) = &skipped.reason else {
+            panic!("a bad PDF is an extraction failure: {skipped:?}");
+        };
+        assert!(!error.is_empty(), "{skipped:?}");
+        assert!(
+            !error.contains(&skipped.file.as_path().display().to_string()),
+            "the stored error must not repeat the path: {error}"
+        );
+        let Some(name) = skipped.file.as_path().file_name() else {
+            panic!("skipped file has a name: {skipped:?}");
+        };
+        named.push(name.to_string_lossy().into_owned());
+    }
+    named.sort();
+    assert_eq!(named, vec!["broken.pdf", "empty.pdf"]);
+    let hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "steadfastpdf",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search valid sibling")
+    .hits;
+    assert_eq!(
+        hits.iter()
+            .filter(|hit| hit.file_ref.ends_with("notes.txt"))
+            .count(),
+        1,
+        "the valid sibling remains retrievable"
+    );
+}
+
+#[test]
+fn json_and_jsonl_extensions_are_case_insensitive() {
+    assert_eq!(
+        detect_format(Path::new("payload.JSON"), br#"{"field":"value"}"#),
+        Some(Format::Json)
+    );
+    assert_eq!(
+        detect_format(Path::new("events.JsOnL"), br#"{"event":"created"}"#),
+        Some(Format::Jsonl)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_and_jsonl_index_search_and_preserve_metadata() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("payload.json"),
+        "{\n  \"account_name\": \"amberaccount\",\n  \"status\": \"active\"\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("events.jsonl"),
+        "\n{\"event_name\":\"createdevent\",\"value\":1}\n\n{\"event_name\":\"updatedevent\",\"value\":2}\n",
+    )
+    .unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.json", "**/*.jsonl"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("index JSON and JSONL");
+    assert_eq!(stats.files_upserted, 2);
+    assert_eq!(stats.chunks_inserted, 3);
+
+    let json_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "amberaccount",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search JSON")
+    .hits;
+    let mut json_hit = None;
+    for hit in &json_hits {
+        if hit.file_ref.ends_with("payload.json") {
+            json_hit = Some(hit);
+            break;
+        }
+    }
+    let Some(json_hit) = json_hit else {
+        panic!("JSON value must be retrievable");
+    };
+    assert!(json_hit.text.contains("account_name"));
+    assert_eq!((json_hit.line_start, json_hit.line_end), (1, 4));
+
+    let jsonl_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "updatedevent",
+        &corpus.globs,
+        5,
+    )
+    .await
+    .expect("search JSONL")
+    .hits;
+    let mut jsonl_hit = None;
+    for hit in &jsonl_hits {
+        if hit.file_ref.ends_with("events.jsonl") {
+            jsonl_hit = Some(hit);
+            break;
+        }
+    }
+    let Some(jsonl_hit) = jsonl_hit else {
+        panic!("JSONL value must be retrievable");
+    };
+    assert!(jsonl_hit.text.contains("event_name"));
+    assert_eq!(jsonl_hit.heading_path, vec!["jsonl:row-2".to_string()]);
+    assert_eq!((jsonl_hit.line_start, jsonl_hit.line_end), (4, 4));
+    assert!(
+        !jsonl_hit.search_text.contains("createdevent"),
+        "a JSONL row must not inherit another row's search terms"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_json_skips_file_and_valid_sibling_remains_searchable() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("broken.json"),
+        "{\"event\":\"badjsonmarker\"",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("valid.json"),
+        "{\"event\":\"validjsonsibling\"}\n",
+    )
+    .unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.json"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 1500);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("malformed JSON must not abort siblings");
+    assert_eq!(stats.files_upserted, 1);
+    assert_eq!(stats.files_skipped_unreadable, 1);
+
+    let valid_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "validjsonsibling",
+        &corpus.globs,
+        10,
+    )
+    .await
+    .expect("search valid JSON sibling")
+    .hits;
+    let mut valid_sibling_found = false;
+    for hit in &valid_hits {
+        if hit.file_ref.ends_with("valid.json") {
+            valid_sibling_found = true;
+            break;
+        }
+    }
+    assert!(
+        valid_sibling_found,
+        "the valid JSON sibling remains searchable"
+    );
+
+    let bad_hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "badjsonmarker",
+        &corpus.globs,
+        10,
+    )
+    .await
+    .expect("search malformed JSON marker")
+    .hits;
+    for hit in &bad_hits {
+        assert!(
+            !hit.file_ref.ends_with("broken.json"),
+            "malformed JSON must not be searchable"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_jsonl_skips_file_and_oversized_records_keep_row_metadata() {
+    let _guard = LANCE_WRITE_LOCK.lock().await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let corpus_dir = tempfile::tempdir().unwrap();
+    fs::write(
+        corpus_dir.path().join("broken.jsonl"),
+        "{\"ok\":true}\n{malformed json}\n",
+    )
+    .unwrap();
+    fs::write(
+        corpus_dir.path().join("valid.jsonl"),
+        "\n{\"event\":\"oversizedevent\",\"payload\":\"longvalue-longvalue-longvalue-longvalue\"}\n",
+    )
+    .unwrap();
+
+    let corpus = corpus(corpus_dir.path(), "docs", &["**/*.jsonl"]);
+    let store = open_store(store_dir.path()).await;
+    let registry = HandlerRegistry::new(Characters, 20);
+    let stats = index_corpus(&corpus, &store, &registry)
+        .await
+        .expect("malformed JSONL must not abort siblings");
+    assert_eq!(stats.files_upserted, 1);
+    assert_eq!(stats.files_skipped_unreadable, 1);
+    assert!(stats.chunks_inserted > 1, "oversized record must split");
+
+    let hits = search_fused(
+        &store,
+        &corpus.primary_corpus_key().expect("corpus root"),
+        "oversizedevent",
+        &corpus.globs,
+        10,
+    )
+    .await
+    .expect("search oversized JSONL record")
+    .hits;
+    let mut row_hit_count = 0;
+    for hit in &hits {
+        if !hit.file_ref.ends_with("valid.jsonl") {
+            continue;
+        }
+        row_hit_count += 1;
+        assert_eq!(hit.heading_path, vec!["jsonl:row-1".to_string()]);
+        assert_eq!((hit.line_start, hit.line_end), (2, 2));
+    }
+    assert!(row_hit_count > 0, "valid JSONL record must be searchable");
 }

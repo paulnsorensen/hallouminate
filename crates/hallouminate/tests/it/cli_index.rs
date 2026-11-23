@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use hallouminate::cli::{IndexArgs, IndexReport, cmd_index, run_index};
+use hallouminate::cli::{IndexArgs, IndexReport, cmd_index, run_index, run_index_background};
 use hallouminate_adapters::LanceStore;
 use hallouminate_config::Config;
 use hallouminate_daemon::{
@@ -80,11 +80,11 @@ async fn cmd_index_indexes_fixture_corpus_end_to_end() {
     })
     .await
     .expect("first index run");
+    // Stop and await the daemon before reopening its exclusively owned store.
+    harness.shutdown().await.expect("daemon shutdown");
 
     // Re-open the LanceStore at the same ground dir the daemon used and
-    // assert chunks landed. (Reading the store directly is safe here
-    // because the daemon doesn't hold an exclusive lock — it just owns
-    // mutations. Listing rows is a read.)
+    // assert chunks landed after ownership ends.
     let store = LanceStore::open_or_create(&ground_dir, MODEL, false, true, None)
         .await
         .expect("reopen ground dir");
@@ -133,6 +133,103 @@ async fn run_index_fails_loudly_when_daemon_unreachable() {
         msg.matches("daemon unavailable").count(),
         1,
         "`daemon unavailable` prefix must appear exactly once (no double-wrap): {msg}"
+    );
+}
+
+/// AC-8: `index --background` hands the catch-up to the daemon and returns
+/// once the daemon acknowledges. The test holds every write-lane permit, so
+/// the catch-up cannot finish; the command must still return, exit Ok, and
+/// decode as an acknowledged queued reply naming the corpus. The registration
+/// persists, so a second call queues nothing new.
+#[tokio::test]
+async fn index_background_returns_after_daemon_queues_catch_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let corpus_root = dir.path().join("corpus");
+    fs::create_dir_all(&corpus_root).unwrap();
+    seed_fixtures(&corpus_root);
+    let config_path = dir.path().join("config.toml");
+    write_config(
+        &config_path,
+        &corpus_root,
+        &dir.path().join("ground"),
+        &dir.path().join("cache"),
+    );
+    let harness = DaemonHarness::spawn(load_config(&config_path)).await;
+    let lane = harness.state().write_lane();
+    let held = lane
+        .clone()
+        .acquire_many_owned(
+            u32::try_from(lane.available_permits()).expect("permit count fits in u32"),
+        )
+        .await
+        .expect("hold the whole write lane");
+    let args = IndexArgs {
+        socket: Some(harness.socket().to_path_buf()),
+        background: true,
+        ..Default::default()
+    };
+
+    let first = run_index_background(args.clone())
+        .await
+        .expect("background index request");
+    assert!(first.acknowledged, "the daemon must acknowledge the queue");
+    assert!(
+        first.queued.iter().any(|name| name == "fixtures"),
+        "the daemon must queue the fixtures corpus: {:?}",
+        first.queued
+    );
+    assert_eq!(
+        lane.available_permits(),
+        0,
+        "the catch-up stays stalled while the test holds the lane"
+    );
+
+    let second = run_index_background(args.clone())
+        .await
+        .expect("second background request");
+    assert!(
+        !second.queued.iter().any(|name| name == "fixtures"),
+        "a registered corpus must not queue again: {:?}",
+        second.queued
+    );
+    cmd_index(args).await.expect("cmd_index exits Ok");
+    drop(held);
+}
+
+#[tokio::test]
+async fn index_background_rejects_paths_from_before_dialing_daemon() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let list = dir.path().join("paths.txt");
+    fs::write(&list, "/tmp/a\n").unwrap();
+    let err = run_index_background(IndexArgs {
+        socket: Some("/nonexistent/absent.sock".into()),
+        background: true,
+        paths_from: Some(list),
+        ..Default::default()
+    })
+    .await
+    .expect_err("--paths-from with --background must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--paths-from") && msg.contains("not supported"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+async fn index_background_rejects_strict_before_dialing_daemon() {
+    let err = run_index_background(IndexArgs {
+        socket: Some("/nonexistent/absent.sock".into()),
+        background: true,
+        strict: true,
+        ..Default::default()
+    })
+    .await
+    .expect_err("--strict with --background must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--strict") && msg.contains("--background"),
+        "{msg}"
     );
 }
 
@@ -204,6 +301,7 @@ path = "."
                 corpus: Some("repo:rcd-test:wiki".into()),
                 paths_from: None,
                 strict: false,
+                background: false,
             }),
         })
         .await

@@ -22,11 +22,13 @@ thin binary entry point.[^2]
 ## `crates/hallouminate-daemon/` — long-lived local RPC daemon
 
 The daemon crate owns the single-owner background process: request dispatch,
-lifecycle and supervision (watchdog, backoff, heartbeat), filesystem watching,
-the Unix-socket protocol, maintenance/backpressure, and per-request resource
-composition (`RequestResources`, `DaemonState`). It depends on the domain,
-adapters, and config crates. Interactive CLI subcommands and the MCP `serve`
-transport in the application crate become clients of this daemon.
+lifecycle and supervision (watchdog, backoff, heartbeat — see
+[supervisor-restart-ladder](supervisor-restart-ladder.md)), filesystem
+watching, the Unix-socket protocol, maintenance/backpressure, and
+per-request resource composition (`RequestResources`, `DaemonState`). It
+depends on the domain, adapters, and config crates. Interactive CLI
+subcommands and the MCP `serve` transport in the application crate become
+clients of this daemon.
 
 ## `crates/hallouminate-config/` — configuration layer
 

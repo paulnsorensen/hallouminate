@@ -17,6 +17,7 @@ strsim.workspace = true
 # the corpus root capability and is the symlink-safe replacement for the
 # rustix `openat`/`mkdirat`/`unlinkat`/etc. surface in `sandbox.rs`.
 cap-std = "4"
+cap-tempfile.workspace = true
 rustix.workspace = true
 # Concurrency fan-out for ground_union's per-corpus-root searches (efficiency
 # finding: sequential awaits made wall time the sum over roots, not the max).
@@ -37,7 +38,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # classes content words ("call", "side", "use") as stopwords.
 stop-words = { version = "0.10", default-features = false, features = ["nltk"] }
 unicode-segmentation = "1"
-text-splitter = { version = "0.32", features = ["markdown", "tokenizers"] }
+text-splitter = { version = "0.33", features = ["markdown", "tokenizers"] }
 # Kept in lockstep with text-splitter's `tokenizers` requirement (now ^0.23):
 # text-splitter's `ChunkSizer for Tokenizer` impl targets a specific tokenizers
 # major, so this direct dep MUST match text-splitter or the `ChunkSizer` impl no
@@ -51,9 +52,10 @@ tokenizers = { version = "0.23", features = ["http"] }
 # (OOXML xlsx + ODF ods, both ZIP containers), reader-cfb (OLE2 xls), and
 # reader-txt (plain-text detection). Without cfb/txt those formats fall through
 # to ArbitraryBinaryData and the magic-byte fallback silently fails.
-calamine = "0.36"
+calamine = "0.38"
 csv = "1.4"
 file-format = { version = "0.29", features = ["reader-zip", "reader-cfb", "reader-txt"] }
+pdf-extract = "0.12"
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

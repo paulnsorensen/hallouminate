@@ -25,8 +25,28 @@ hallouminate serve
 ```
 
 Starts the stdio MCP server an agent connects to. It is stateless beyond its
-tool router and a startup-captured working directory — every tool call dials
-the daemon. If no daemon is running, `serve` spawns one.
+tool router, and every MCP request supplies its own absolute checkout `cwd`.
+The server does not reuse the process startup directory. If no daemon is
+running, `serve` spawns one.
+
+## Selecting a repository
+
+`index` and `ground` use the process current directory for repo-layer
+discovery. Run these commands from the target checkout; a daemon startup
+directory does not select the repository for later requests. `config show` and
+`config validate` accept `--cwd PATH` to select the directory explicitly.
+
+## Migrating MCP clients
+
+Add the active checkout to every MCP request, including `list_corpora`:
+
+```json
+{"name":"list_corpora","arguments":{"cwd":"/workspaces/project"}}
+{"name":"ground","arguments":{"cwd":"/workspaces/project","query":"release process"}}
+```
+
+Keep document paths relative to the corpus root. Keep `globs` relative to each
+configured root, such as `guides/**/*.md`, instead of using absolute patterns.
 
 ## `index`
 
@@ -54,6 +74,23 @@ hallouminate ground "socket protocol" --corpus repo:hallouminate:wiki --format j
 | `--chunks-per-file N` | Chunks to include per file. |
 | `--limit N` | Hard cap on returned chunks. |
 | `--snippet-chars N` | Snippet length when not using `--full`. |
+| `--match ranked\|phrase` | Retrieval mode. `phrase` uses bounded, case-insensitive literal matching of the whole query. Each whitespace run counts as one space, so a phrase across a line break matches. |
+| `--group-by chunk\|page` | Unit returned within each file. `page` returns one entry for each PDF page with its matched chunk count. |
+| `--output hits\|counts` | Response shape. `counts` needs `--match phrase` and returns matched chunks and distinct pages for each file, with no snippets. |
+
+Phrase results can omit matches because of `--limit`, `--chunks-per-file`,
+`--top-files`, or the 10,000-match scan cap. A `phrase-truncated` warning
+reports these limits. Do not infer absence or uniqueness from truncated results.
+
+For a count, use `--match phrase --output counts`. Counts ignore `--limit`,
+`--chunks-per-file`, and `--top-files`. The scan cap applies, and the output
+lists at most 2,000 files with a `counts-truncated` warning when more match.
+With `--group-by page`, `--chunks-per-file` caps pages, not chunks.
+
+```sh
+hallouminate ground "abatement" --match phrase --output counts
+hallouminate ground "abatement" --match phrase --group-by page --chunks-per-file 50
+```
 
 ## `daemon`
 
@@ -94,5 +131,5 @@ other than the current directory.
 
 `--socket PATH` on `index`, `ground`, and the other client subcommands points
 at a specific daemon socket. Otherwise the socket is resolved from
-`HALLOUMINATE_SOCKET`, then `$XDG_RUNTIME_DIR`, then the cache dir — see
+`HALLOUMINATE_SOCKET`, then the per-user cache socket — see
 [Architecture](/hallouminate/architecture/#socket-location).

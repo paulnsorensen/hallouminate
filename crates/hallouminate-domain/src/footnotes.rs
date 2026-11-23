@@ -6,10 +6,10 @@
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Controls how footnote definitions and inline markers appear in a response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FootnoteMode {
     /// Verbatim — current behavior. Footnotes pass through unchanged.
@@ -106,12 +106,8 @@ fn exclude_footnotes(content: &str) -> String {
 
     for (event, range) in make_parser(content) {
         match event {
-            Event::FootnoteReference(_) => {
-                remove.push(range);
-            }
-            Event::Start(Tag::FootnoteDefinition(_)) => {
-                def_start = Some(range.start);
-            }
+            Event::FootnoteReference(_) => remove.push(range),
+            Event::Start(Tag::FootnoteDefinition(_)) => def_start = Some(range.start),
             Event::End(TagEnd::FootnoteDefinition) => {
                 if let Some(start) = def_start.take() {
                     remove.push(start..range.end);
@@ -124,8 +120,7 @@ fn exclude_footnotes(content: &str) -> String {
     if remove.is_empty() {
         return content.to_string();
     }
-
-    remove.sort_by_key(|r| r.start);
+    remove.sort_by_key(|range| range.start);
     apply_deletions(content, &remove)
 }
 
@@ -565,5 +560,19 @@ mod tests {
         let out = apply_footnote_mode(md, FootnoteMode::Exclude);
         assert!(!out.contains("[^"), "definition removed");
         assert!(out.contains("[with bracket"), "regular [ preserved");
+    }
+
+    #[test]
+    fn apply_exclude_preserves_body_after_inline_marker() {
+        let md = "Claim[^citation] remains true.\n\n[^citation]: source\n\nAfter.";
+        let out = apply_footnote_mode(md, FootnoteMode::Exclude);
+        assert!(out.contains("Claim remains true."));
+        assert!(out.contains("After."));
+    }
+
+    #[test]
+    fn apply_exclude_preserves_literal_marker_in_code() {
+        let md = "`[^literal]`";
+        assert_eq!(apply_footnote_mode(md, FootnoteMode::Exclude), md);
     }
 }

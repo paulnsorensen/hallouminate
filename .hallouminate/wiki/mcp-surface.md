@@ -1,30 +1,67 @@
 # MCP surface
 
-`hallouminate serve` starts a stdio MCP server. The server is stateless
-beyond its tool router and a startup-captured `cwd`; every tool call
-dials the local daemon over a Unix domain socket. Since commit
-`87a7213`, `serve` auto-spawns the daemon if no instance is up.
+`hallouminate serve` starts a stdio MCP server. The server stores its tool
+router, not a startup directory. Every tool call requires an absolute `cwd`
+for the caller's active checkout. The server validates and canonicalizes
+that directory before configuration lookup or daemon work.[^workspace-cwd]
+
+MCP roots, the startup directory, and a mutable session directory cannot
+replace `cwd`. Invalid directories produce invalid-parameter errors.
+Never pass the harness's original directory when work moves to another checkout.
+Each request carries its own directory to the local daemon.
+Since commit `87a7213`, `serve` auto-spawns the daemon if no instance is up.
+
+Document arguments use corpus-relative paths. Absolute provenance paths identify
+results but are not valid document arguments. Absolute paths and parent
+traversal remain rejected.[^workspace-path]
 
 ## Default corpus
 
-Tool calls that omit `corpus` default to the wiki for the repository
-containing the daemon's cwd — `repo:<NAME>:wiki` for the deepest
-`[[repository]]` whose `path` is an ancestor of cwd. When cwd doesn't
-sit under any configured repo, the daemon falls back to the existing
-single-corpus / ambiguity error and the caller must name a corpus
-explicitly. This applies to every read-side tool — `ground`, `list_files`,
-`list_tree`, `corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown`,
-which now defaults `corpus` to wiki-for-cwd like its peers. Only the mutating
-tools (`add_markdown`, `delete_markdown`) still require an explicit `corpus`,
-to prevent an accidental write to the wrong wiki.
+`ground` and the other read tools resolve an omitted `corpus` differently.
+Do not describe them as one rule.
+
+**`ground` unions.** With no `corpus`, `handle_ground`
+(`crates/hallouminate-daemon/src/dispatch.rs`, `let union = req.corpus.is_none()`)
+searches every effective corpus — the repo's own wiki, every `[[corpus]]`
+entry, every `[[repository]]` wiki, and `repo:<name>:corpus` source corpora
+when configured. The wiki for the repository containing `cwd` becomes
+`priority_corpus`; `ground_union` reserves the first result slots for it
+(`RESERVED_LOCAL_SLOTS`, PR #425) and ranks the rest by fused score. Each hit
+carries `provenance.corpus`, and the response adds a `cross-repo-union`
+advisory warning. Passing an explicit `corpus` pins the search to that one
+corpus. This union default shipped in #117/#426; `cwd` feeds
+`priority_corpus`, not scope.
+
+**Other read tools default to wiki-for-cwd.** `list_files`, `list_tree`,
+`corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown` resolve an
+omitted `corpus` to `repo:<NAME>:wiki` for the deepest `[[repository]]`
+whose `path` is an ancestor of cwd. When cwd doesn't sit under any
+configured repo, the daemon falls back to the single-corpus / ambiguity
+error and the caller must name a corpus explicitly.
+
+**Mutating tools require `corpus`.** `add_markdown` and `delete_markdown`
+never default, to prevent an accidental write to the wrong wiki.
+
+Gotcha (2026-09, review of PR #492/#493): `SERVER_INSTRUCTIONS` in
+`crates/hallouminate/src/mcp/tools.rs` told every connected agent that
+`ground` defaults to wiki-for-cwd while the `ground` tool description in
+the same file and the daemon both unioned. Agents omitted `corpus`, expected
+local scope, got cross-repo hits, and filed them as "wrong wiki results".
+That text mismatch — not scoping or ranking — was the mechanism. The fix
+lands in PR #493. If `ground` still surfaces the wrong repo first, tune
+`RESERVED_LOCAL_SLOTS` or use the `inherit_global_corpora = false` repo
+opt-out from PR #492 (see [config-layering](config-layering.md)); do not
+reintroduce a wiki-for-cwd scope default for `ground`.
 
 ## Tools
+
+Every tool requires `cwd`, in addition to the arguments listed below.
 
 ### `list_corpora`
 
 Returns every corpus the daemon knows about — explicit `[[corpus]]`
 entries plus derived `repo:NAME:wiki` and `repo:NAME:corpus` corpora
-from `[[repository]]` declarations. No params. Use this first to learn
+from `[[repository]]` declarations. Requires `cwd`. Use this first to learn
 what's available.
 
 ### `list_files`
@@ -47,7 +84,8 @@ reading every `index.md` first.
 Semantic search. Embeds the query with the configured embeddings model
 (default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from LanceDB,
 rolls up per-file with breadcrumb context. Params: `query` (required),
-`corpus` (defaults to wiki-for-cwd), `top_files`, `chunks_per_file`,
+`corpus` (omit to union every effective corpus with wiki-for-cwd ranked
+first; see Default corpus), `top_files`, `chunks_per_file`,
 `limit`, `snippet_chars`, `footnotes`. Returns a ripgrep-style outline in
 `content` and the full structured response in `structuredContent.docs`.
 
@@ -58,9 +96,37 @@ retrieval already runs on footnote-stripped `search_text`, so `exclude` does
 not change which chunks come back, only what you are shown; `only` is the
 cheap way to pull a page's citation targets without reading the page.
 
+#### Phrase mode matches the chunk body only
+
+`ground` phrase mode (`match: "phrase"`) counts a literal phrase only in the
+chunk body. The body is the chunk's own text without footnote definitions.
+The breadcrumb and the file summary are not part of the body.[^phrase-body]
+
+- **Ranking.** `search_phrase` scores each chunk by the occurrences of the
+  lowercased, whitespace-collapsed phrase in its body. A chunk with zero body
+  occurrences is dropped. A phrase that only the file summary holds therefore
+  does not match every chunk of that file.[^phrase-body]
+- **Scan filter.** `retrieve_phrase` in
+  `crates/hallouminate-adapters/src/lance.rs` first filters on `search_text`.
+  It then also requires the phrase in the body column `text`, or a `[^`
+  footnote marker in `text`. The marker case keeps rows whose body match
+  needs footnote removal (`tax[^1] abatement`).[^phrase-body]
+- **Scan cap.** Summary-only and breadcrumb-only rows no longer use up
+  `MAX_PHRASE_SCAN_ROWS` (10,000). The `phrase-truncated` cap warning reports
+  *scanned chunks*, not matches.[^phrase-body]
+- **Headings with inline markup.** The breadcrumb holds the heading as plain
+  text, but the body holds the raw heading line. A heading such as
+  `## Tax **Abatement**` no longer matches the phrase `tax abatement` through
+  the breadcrumb.[^phrase-body]
+
+Why: before #586, a phrase in the file summary or breadcrumb matched every
+chunk of the file. Those rows filled the scan cap and pushed real body
+matches out of the result. Use ranked `ground` when the words can occur only
+in a heading path or summary.
+
 ### `add_markdown`
 
-Atomic-write a markdown file to the corpus' first configured root, then
+Atomic-write a markdown file to the corpus's single configured root, then
 refresh just that file's LanceDB rows. For `repo:*:wiki` corpora, also
 walks ancestor directories from the corpus root down to the new file's
 parent and rebuilds the link list inside each `index.md` between
@@ -120,6 +186,30 @@ The dedicated `get_footnote` tool was **removed in 0.7.0** (breaking); its job
 is now `read_markdown` with `footnotes: "only"`, which returns just the
 definition lines. This shrank the surface from eleven tools to ten.
 
+### Markdown batches
+
+The existing `read_markdown` and `add_markdown` tools also accept an `items` array containing 1–20 items.
+Each batch shares one absolute `cwd` and one corpus selection.
+Writes require `corpus`; reads retain the wiki-for-cwd default.
+Do not mix singular fields with `items`, or place checkout and corpus selectors inside items.
+Results preserve input order and contain each item's index, path, and result or error.[^batches]
+
+Read items retain independent `line_numbers` and `footnotes` settings.
+The MCP adapter sends separate sequential read RPCs to avoid the aggregate 4 MiB response limit.
+Write batches use one daemon request.
+The daemon runs existing write handlers sequentially, without an outer mutation lock.
+Each handler retains its existing path checks and mutation guards.[^batches]
+
+Batch writes are not transactions.
+An item failure does not stop later items or undo earlier writes.
+The daemon does not isolate the batch from other clients.
+Envelope, item-count, selector, and request-frame checks occur before writes.
+A serialized write batch, including its newline, must not exceed the 4 MiB IPC frame limit.
+Larger requests fail before any write, even when they contain no more than 20 items.
+A malformed successful item response becomes an item-local uncertainty error; other known outcomes remain available.
+Transport failures, malformed response envelopes, and incorrect result counts can leave batch completion uncertain.
+Inspect affected files before retrying; the client does not replay writes automatically.[^batches]
+
 ### `delete_markdown`
 
 Unlink a file from the corpus' first root and prune its rows from the
@@ -140,7 +230,10 @@ Index health for one corpus: indexed file count, total chunk rows, the newest
 index timestamp (`last_indexed_ms`, null when never indexed), and how many
 on-disk files matching the corpus globs are not yet indexed. Param: `corpus`
 (defaults to wiki-for-cwd, same resolution as `list_files`). `structuredContent`
-is `{ corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files }`.
+is `{ corpus, indexed_files, total_chunks, last_indexed_ms, unindexed_files, warnings }`.
+The `warnings` array reports zero-match include and exclude patterns per root.
+Human text renders the same advisories. An empty array means no advisories apply.
+Selection warnings do not certify index freshness.[^selection]
 
 ### `backlinks`
 
@@ -165,6 +258,24 @@ case-insensitively with `.md` stripped, `[[target|alias]]` matches on the
 target, and links inside fenced code blocks are ignored so an example in a
 doc isn't mistaken for a real link. A file the scan cannot read produces a
 `warnings` entry and a partial result rather than an error.
+
+## Wiki-query recovery from incomplete index reconciliation
+
+Wiki-query recovery remains bounded when index reconciliation is incomplete.
+Ground outline warnings appear immediately after the query summary, before document snippets.
+Warning-free outlines and structured responses retain their existing shape.
+Ripgrep diagnostics explain candidate-pool drops and truncation without changing ranking.[^retrieval]
+
+The wiki-query workflow distinguishes incomplete retrieval from missing knowledge.
+Keep the original `cwd` and corpus throughout recovery.
+When evidence is insufficient, allow at most one corpus statistics call per sub-question.
+Allow at most one identical Ground retry only when file coverage is complete.
+If evidence remains insufficient, use at most one tree listing and five fallback page reads.
+This fallback also applies after a permitted retry leaves insufficient evidence.
+Reuse a tree already supplied by the root; do not request it again.
+Count fallback pages, not batch calls. Normal citation verification reads are outside this recovery budget.
+Do not poll, index, write, or broaden the corpus during this recovery.
+Retain any unresolved reconciliation warning in the answer.[^retrieval]
 
 ## Error mapping
 
@@ -218,3 +329,13 @@ Keep one root if you can. Everything above is the cost of not doing so.
 Tool calls return `-32603` with the message "daemon unavailable: …".
 The MCP server does NOT fall back to opening a local LanceDB handle —
 that's exactly the multi-process race the daemon exists to prevent.
+
+[^workspace-cwd]: crates/hallouminate/src/mcp/tools.rs::validate_cwd and HallouminateTools::tool_setup; https://github.com/paulnsorensen/hallouminate/issues/453
+[^workspace-path]: crates/hallouminate-domain/src/corpus/sandbox.rs; crates/hallouminate/src/mcp/tools.rs::SERVER_INSTRUCTIONS
+[^selection]: crates/hallouminate-daemon/src/dispatch.rs::handle_corpus_stats; crates/hallouminate/src/mcp/tools.rs::corpus_stats
+
+[^batches]: crates/hallouminate/src/mcp/tools.rs::add_markdown_batch and ::read_markdown_batch; crates/hallouminate-daemon/src/dispatch.rs::handle_add_markdown_batch; crates/hallouminate-daemon/src/client.rs::DaemonClient::call_raw and ::call_raw_with_timeout
+[^retrieval]: crates/hallouminate-domain/src/ground/format.rs::render_outline; crates/hallouminate-domain/src/search.rs::search_fused; plugins/hallouminate/skills/wiki-query/SKILL.md
+[^phrase-body]: crates/hallouminate-domain/src/search/phrase.rs::search_phrase_in and ::body_occurrence_count; crates/hallouminate-adapters/src/lance.rs::retrieve_phrase_with and test retrieve_phrase_scans_body_text_not_summary_only_rows; PR #586
+
+_Source: PR #561, issue #453, and PR #586 · Updated: 2026-10-16 · Supersedes: singular-only markdown call documentation, first-root write wording, and phrase matching on breadcrumb or summary text_

@@ -3,17 +3,17 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "packageManager": "pnpm@11.23.0",
+  "packageManager": "pnpm@12.21.0",
   "scripts": {
     "docs:dev": "astro dev",
     "docs:build": "astro build",
     "docs:preview": "astro preview"
   },
   "devDependencies": {
-    "@astrojs/starlight": "^0.41.3",
-    "@cheeselord/design": "^0.5.0",
+    "@astrojs/starlight": "^0.42.0",
+    "@cheeselord/design": "^0.6.0",
     "astro": "^7.1.0",
     "sharp": "^0.35.3",
-    "typescript": "^5.8.3"
+    "typescript": "^7.0.0"
   }
 }

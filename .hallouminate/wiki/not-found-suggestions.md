@@ -43,6 +43,18 @@ things:
   the top `READ_MISS_SUGGESTION_CAP` (3). This catches a file that lives in a
   different directory than the caller guessed.
 
+## Citation-suffix recovery
+
+Markdown read misses recognize a terminal `.md:LINE` or `.md:START-END` citation suffix.
+Line numbers must be positive, and ranges must be ordered.
+An existing, permitted filename containing the colon suffix still wins ordinary lookup.[^citation]
+
+After a genuine miss, the daemon validates the bare markdown path with the existing read-path policy.
+Only an existing permitted file produces a citation correction and a `line_numbers: true` hint.
+The hint never reads file contents or changes the requested read into an implicit successful read.
+Traversal, excluded paths, and symlink targets do not receive this correction.
+Path comparisons suppress duplicate suggestions, including equivalent repeated separators.[^citation]
+
 ## Why strsim, and why it added no build cost
 
 `strsim = "0.11"` is a direct dependency
@@ -63,3 +75,8 @@ never floods the error with a huge corpus's full file list.
 
 - [mcp-surface](mcp-surface.md) — the `read_markdown` / corpus resolution tools these errors come from, and the JSON-RPC error mapping.
 - [config-layering](config-layering.md) — where the configured-corpus set that `pick_corpus` lists is assembled.
+
+
+[^citation]: crates/hallouminate-daemon/src/dispatch.rs::enrich_read_not_found and ::read_miss_closest_matches; crates/hallouminate/tests/it/daemon.rs citation-suffix regressions
+
+_Source: PR #561 · Updated: 2026-10-01 · Supersedes: —_

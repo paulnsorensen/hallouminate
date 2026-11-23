@@ -7,6 +7,7 @@ mod ground;
 mod hook;
 mod index;
 mod init_repo;
+mod wiki;
 
 pub use config::{
     ConfigDownloadArgs, ConfigInitArgs, ConfigShowArgs, ConfigValidateArgs, cmd_config_download,
@@ -15,8 +16,11 @@ pub use config::{
 pub use ground::{GroundArgs, cmd_ground, run_ground};
 pub use hallouminate_daemon::{CorpusReport, IndexReport};
 pub use hook::{HookArgs, cmd_hook_install, cmd_hook_uninstall};
-pub use index::{AD_HOC_CORPUS_NAME, IndexArgs, cmd_index, run_index, select_corpora};
+pub use index::{
+    AD_HOC_CORPUS_NAME, IndexArgs, cmd_index, run_index, run_index_background, select_corpora,
+};
 pub use init_repo::{InitRepoArgs, cmd_init_repo};
+pub use wiki::{WikiStatusArgs, cmd_wiki_status};
 
 /// CLI surface for output format selection. Mirrors `domain::ground::Format`
 /// but kept in the app layer to keep `ValueEnum` (a clap dep) out of the
@@ -27,6 +31,39 @@ pub enum FormatArg {
     Outline,
     Json,
     JsonPretty,
+}
+
+/// CLI surface for `ground` retrieval mode. Mirrors
+/// `domain::ground::GroundMatch` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum MatchArg {
+    /// Hybrid BM25, vector, and literal retrieval.
+    #[default]
+    Ranked,
+    /// Case-insensitive literal substring match of the whole query.
+    Phrase,
+}
+
+/// CLI surface for `ground` grouping. Mirrors
+/// `domain::ground::GroundGroupBy` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum GroupByArg {
+    /// One entry per matched chunk.
+    #[default]
+    Chunk,
+    /// One entry per PDF page, with its matched chunk count.
+    Page,
+}
+
+/// CLI surface for the `ground` response shape. Mirrors
+/// `domain::ground::GroundOutput` for the same reason as [`FormatArg`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum OutputArg {
+    /// Ranked chunks with snippets.
+    #[default]
+    Hits,
+    /// Matched chunk and page counts per file, with no snippets.
+    Counts,
 }
 
 #[derive(Debug, Parser)]
@@ -73,6 +110,13 @@ pub enum Command {
     /// MCP-aware clients (Claude Desktop, Claude Code, etc.). The process
     /// runs until stdin closes.
     Serve,
+    /// Inspect the repository's hallouminate wiki. `wiki status` lists wiki and
+    /// corpus files with uncommitted git changes (worktree modifications not yet
+    /// staged, plus untracked files). Read-only; runs only inside a git repo.
+    Wiki {
+        #[command(subcommand)]
+        action: WikiAction,
+    },
     /// Manage the local daemon: single owner of the LanceDB ground directory,
     /// repository registry, and per-corpus mutation locks. CLI and MCP
     /// clients talk to it over a Unix domain socket. Bare `daemon` runs it in
@@ -163,6 +207,10 @@ pub struct IndexCli {
     /// still index).
     #[arg(long)]
     pub strict: bool,
+    /// Queue the catch-up on the daemon and exit once it acknowledges,
+    /// without waiting for indexing to finish. Cannot combine with `--strict`.
+    #[arg(long)]
+    pub background: bool,
 }
 
 impl From<IndexCli> for IndexArgs {
@@ -173,6 +221,7 @@ impl From<IndexCli> for IndexArgs {
             config: cli.config,
             socket: cli.socket,
             strict: cli.strict,
+            background: cli.background,
         }
     }
 }
@@ -200,6 +249,21 @@ pub struct GroundCli {
     pub chunks_per_file: Option<usize>,
     #[arg(long, value_name = "N")]
     pub limit: Option<usize>,
+    /// Retrieval mode. `phrase` returns every chunk that contains QUERY as a
+    /// case-insensitive literal substring, ranked by occurrence count. Each
+    /// whitespace run counts as one space, so line breaks do not block a match.
+    #[arg(long = "match", value_enum, default_value_t = MatchArg::Ranked)]
+    pub match_mode: MatchArg,
+    /// Unit returned within each file. `page` returns one entry per PDF page
+    /// with its matched chunk count; `--chunks-per-file` then caps pages.
+    #[arg(long, value_enum, default_value_t = GroupByArg::Chunk)]
+    pub group_by: GroupByArg,
+    /// Response shape. `counts` needs `--match phrase` and returns matched
+    /// chunk and page counts for each matched file, with no snippets and no
+    /// `--top-files`, `--chunks-per-file`, or `--limit` caps. It lists at most
+    /// 2,000 files and warns when more match.
+    #[arg(long, value_enum, default_value_t = OutputArg::Hits)]
+    pub output: OutputArg,
     /// Accepted for backward compatibility; same caveat as `hallouminate
     /// index --config`. The daemon owns config resolution (XDG baseline
     /// at startup + repo-layer discovery per request), so this flag is
@@ -215,7 +279,7 @@ pub struct GroundCli {
 
 impl From<GroundCli> for GroundArgs {
     fn from(cli: GroundCli) -> Self {
-        use hallouminate_domain::ground::Format;
+        use hallouminate_domain::ground::{Format, GroundGroupBy, GroundMatch, GroundOutput};
         let format = if cli.full {
             Format::JsonPretty
         } else {
@@ -225,6 +289,18 @@ impl From<GroundCli> for GroundArgs {
                 FormatArg::JsonPretty => Format::JsonPretty,
             }
         };
+        let match_mode = match cli.match_mode {
+            MatchArg::Ranked => GroundMatch::Ranked,
+            MatchArg::Phrase => GroundMatch::Phrase,
+        };
+        let group_by = match cli.group_by {
+            GroupByArg::Chunk => GroundGroupBy::Chunk,
+            GroupByArg::Page => GroundGroupBy::Page,
+        };
+        let output = match cli.output {
+            OutputArg::Hits => GroundOutput::Hits,
+            OutputArg::Counts => GroundOutput::Counts,
+        };
         Self {
             query: cli.query,
             corpus: cli.corpus,
@@ -233,6 +309,9 @@ impl From<GroundCli> for GroundArgs {
             top_files: cli.top_files,
             chunks_per_file: cli.chunks_per_file,
             limit: cli.limit,
+            match_mode,
+            group_by,
+            output,
             config: cli.config,
             socket: cli.socket,
         }
@@ -248,6 +327,25 @@ pub enum HookAction {
     Uninstall {
         #[arg(long, value_name = "PATH")]
         repo: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WikiAction {
+    /// List wiki and corpus files with uncommitted git changes (worktree
+    /// modifications not yet staged, plus untracked files). Staged-only changes
+    /// are excluded. Roots are read from the repo's `.hallouminate/config.toml`.
+    Status {
+        /// Baseline config override (`--config PATH`).
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        /// Working directory for repo-config discovery and git detection
+        /// (defaults to current dir).
+        #[arg(long, value_name = "PATH")]
+        cwd: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of the grouped text view.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -290,6 +388,11 @@ pub async fn dispatch(cli: Cli, startup: hallouminate_config::Config) -> anyhow:
             HookAction::Uninstall { repo } => cmd_hook_uninstall(HookArgs { repo }),
         },
         Command::InitRepo(args) => cmd_init_repo(args.into()),
+        Command::Wiki { action } => match action {
+            WikiAction::Status { config, cwd, json } => {
+                cmd_wiki_status(WikiStatusArgs { config, cwd, json })
+            }
+        },
         Command::Config { action } => match action {
             ConfigAction::Init { force, path } => cmd_config_init(ConfigInitArgs { force, path }),
             ConfigAction::Show { config, cwd } => cmd_config_show(ConfigShowArgs { config, cwd }),
@@ -379,6 +482,13 @@ fn render_status_report(report: &hallouminate_daemon::StatusReport) -> String {
         "watcher: events={} reindexes={} noop_reindexes={}",
         report.watcher.events, report.watcher.reindexes, report.watcher.noop_reindexes,
     );
+    if report.degraded_watch_roots > 0 {
+        let _ = writeln!(
+            out,
+            "watcher: {} registration(s) degraded \u{2014} periodic reconciliation only",
+            report.degraded_watch_roots,
+        );
+    }
     match &report.trips {
         TripState::None => out.push_str("last ladder trip: none\n"),
         TripState::Tripped { action, at_secs } => {
@@ -492,16 +602,38 @@ mod tests {
             "2",
             "--limit",
             "20",
+            "--match",
+            "phrase",
+            "--group-by",
+            "page",
+            "--output",
+            "counts",
         ])
         .expect("parse ground with flags");
         match cli.command {
             Command::Ground(args) => {
+                assert_eq!(args.match_mode, MatchArg::Phrase);
+                assert_eq!(args.group_by, GroupByArg::Page);
+                assert_eq!(args.output, OutputArg::Counts);
                 assert_eq!(args.query, "tokio");
                 assert_eq!(args.corpus.as_deref(), Some("docs"));
                 assert_eq!(args.format, FormatArg::JsonPretty);
                 assert_eq!(args.top_files, Some(5));
                 assert_eq!(args.chunks_per_file, Some(2));
                 assert_eq!(args.limit, Some(20));
+                let mapped = GroundArgs::from(args);
+                assert_eq!(
+                    mapped.match_mode,
+                    hallouminate_domain::ground::GroundMatch::Phrase
+                );
+                assert_eq!(
+                    mapped.group_by,
+                    hallouminate_domain::ground::GroundGroupBy::Page
+                );
+                assert_eq!(
+                    mapped.output,
+                    hallouminate_domain::ground::GroundOutput::Counts
+                );
             }
             _ => panic!("wrong variant"),
         }
@@ -803,6 +935,7 @@ mod tests {
                 action: LadderAction::RestartTask(TaskName::WatcherPump),
                 at_secs: 321,
             },
+            degraded_watch_roots: 0,
         };
         let rendered = render_status_report(&report);
         let lines: Vec<&str> = rendered.lines().collect();
@@ -822,6 +955,37 @@ mod tests {
     }
 
     #[test]
+    fn daemon_status_render_reports_degraded_watch_roots_when_present() {
+        // WHY: a degraded native watcher must not look healthy on
+        // `daemon status` -- the acceptance criterion is one explicit line
+        // naming the fallback to periodic reconciliation, absent when the
+        // count is zero (covered by the empty-report test below).
+        use hallouminate_daemon::{DebtLevel, StatusReport, TripState, WatcherCounters};
+        let report = StatusReport {
+            per_task: Vec::new(),
+            debt: DebtLevel::Ok,
+            defer_count: 0,
+            watcher: WatcherCounters::default(),
+            trips: TripState::None,
+            degraded_watch_roots: 2,
+        };
+        let rendered = render_status_report(&report);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "running",
+                "tasks: none reported",
+                "debt: ok",
+                "deferred maintenance passes: 0",
+                "watcher: events=0 reindexes=0 noop_reindexes=0",
+                "watcher: 2 registration(s) degraded — periodic reconciliation only",
+                "last ladder trip: none",
+            ],
+        );
+    }
+
+    #[test]
     fn daemon_status_render_handles_empty_tasks_and_no_trip() {
         // WHY: until wiring W1 plumbs the heartbeat registry, per_task is
         // empty and no trip has been recorded — the renderer must say so
@@ -834,6 +998,7 @@ mod tests {
             defer_count: 0,
             watcher: WatcherCounters::default(),
             trips: TripState::None,
+            degraded_watch_roots: 0,
         };
         let rendered = render_status_report(&report);
         let lines: Vec<&str> = rendered.lines().collect();

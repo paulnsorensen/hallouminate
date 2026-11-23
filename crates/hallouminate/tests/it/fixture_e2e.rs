@@ -261,6 +261,10 @@ async fn fixture_corpus_handles_file_deletion_via_index_corpus() {
         .await
         .expect("second index after delete");
 
+    store
+        .delete_orphan_content()
+        .await
+        .expect("collect orphans");
     let after = store.count_rows().await.unwrap();
     assert!(
         after < initial,
@@ -399,6 +403,10 @@ async fn truncate_to_empty_via_index_corpus_evicts_stale_rows() {
         "truncated file must still be counted as skipped-empty"
     );
 
+    store
+        .delete_orphan_content()
+        .await
+        .expect("collect orphans");
     let rows_after = store.count_rows().await.unwrap();
     assert_eq!(
         rows_after, 0,
@@ -474,7 +482,7 @@ async fn prepare_file_io_errors_propagate_out_of_index_corpus() {
     let p = plan(disk, db);
     fs::remove_file(&real).unwrap();
 
-    let err = apply(p, &store, &registry, &corpus, DEFAULT_BATCH_SIZE, None)
+    let err = apply(p, &store, &registry, &corpus, DEFAULT_BATCH_SIZE, &[])
         .await
         .expect_err("missing file must surface as Err, not silent skip");
     let msg = err.to_string();

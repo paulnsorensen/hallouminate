@@ -20,6 +20,23 @@ This repository lease prevents same-project duplication only. Host-wide
 admission control and cgroups or equivalent resource isolation are the
 execution environment's responsibility.
 
+## Agent command hygiene
+
+Run each compiler-heavy Cargo command as `just verify cargo ...` (see above).
+Raw `cargo build`, `cargo test`, and `cargo clippy` are never correct here.
+Read and search repository files with harness code-intelligence or file tools.
+Do not use shell readers such as `grep`, `cat`, `tail`, `sed`, or `awk` for this.
+Use absolute paths in shell commands. Do not use `cd`.
+Issue independent tool calls together in one turn.
+When you brief a sub-agent, repeat the Cargo and file-reading rules in the brief.
+
+## Fuzzing
+
+`fuzz/` holds cargo-fuzz targets in their own workspace on a pinned nightly.
+`just fuzz-build` builds them under the verification lease, and `just fuzz
+<target> <seconds>` fuzzes one target. See `fuzz/README.md` for crash
+reproduction and nightly bumps.
+
 ## Keep the wiki current after each land
 
 This repo dogfoods its own wiki at `.hallouminate/wiki/` (corpus
