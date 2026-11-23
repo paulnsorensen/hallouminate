@@ -1505,6 +1505,116 @@ ground_dir = "{g}"
     );
 }
 
+async fn ping_until_ready(socket: &Path, cwd: &Path) -> DaemonClient {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Ok(client) = connect_at(socket).await
+            && client
+                .call_raw(DaemonRequest {
+                    cwd: cwd.to_path_buf(),
+                    payload: DaemonRequestPayload::Ping,
+                })
+                .await
+                .is_ok()
+        {
+            return client;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "winning daemon never served {}",
+            socket.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_daemon_starts_leave_one_owner_and_losers_exit_cleanly() {
+    const DAEMONS: usize = 4;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = seed_cwd(tmp.path());
+    let socket = tmp.path().join("daemon.sock");
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[embeddings]\nenabled = false\ncache_dir = {cache:?}\n\n[storage]\nground_dir = {ground:?}\n",
+            cache = tmp.path().join("cache").display().to_string(),
+            ground = tmp.path().join("ground").display().to_string(),
+        ),
+    )
+    .expect("write config");
+
+    let mut daemons = tokio::task::JoinSet::new();
+    for _ in 0..DAEMONS {
+        let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hallouminate"))
+            .arg("daemon")
+            .arg("--config")
+            .arg(&config)
+            .current_dir(&cwd)
+            .env("HALLOUMINATE_SOCKET", &socket)
+            .env("XDG_STATE_HOME", tmp.path().join("state"))
+            .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn daemon");
+        daemons.spawn(child.wait_with_output());
+    }
+
+    let mut losers = Vec::new();
+    for _ in 1..DAEMONS {
+        let output = timeout(Duration::from_secs(60), daemons.join_next())
+            .await
+            .expect("every losing daemon must exit promptly")
+            .expect("a daemon task remains")
+            .expect("join daemon task")
+            .expect("wait for daemon");
+        losers.push(output);
+    }
+    for output in &losers {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "a losing daemon must exit 0, got {:?}; stderr: {stderr}",
+            output.status
+        );
+        assert!(
+            !stderr.to_lowercase().contains("error"),
+            "a losing daemon must print no error text, got: {stderr}"
+        );
+    }
+
+    let client = ping_until_ready(&socket, &cwd).await;
+    let stopping = client
+        .call_raw(DaemonRequest {
+            cwd: cwd.clone(),
+            payload: DaemonRequestPayload::Shutdown,
+        })
+        .await
+        .expect("shutdown transport ok");
+    match stopping {
+        DaemonResponse::Ok { result } => {
+            assert_eq!(result, serde_json::Value::String("stopping".to_string()));
+        }
+        other => panic!("shutdown must ack `stopping`, got {other:?}"),
+    }
+    let winner = timeout(Duration::from_secs(60), daemons.join_next())
+        .await
+        .expect("the winning daemon must exit after shutdown")
+        .expect("the winning daemon task remains")
+        .expect("join daemon task")
+        .expect("wait for daemon");
+    assert!(
+        winner.status.success(),
+        "the winning daemon must exit 0 after shutdown, got {:?}; stderr: {}",
+        winner.status,
+        String::from_utf8_lossy(&winner.stderr)
+    );
+}
+
 // ─── Curd 1: graceful shutdown ───────────────────────────────────────────
 
 /// Build a tempdir with an empty `.hallouminate/config.toml` so daemon

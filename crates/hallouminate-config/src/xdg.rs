@@ -14,6 +14,16 @@ pub fn xdg_path(env_var: &str, fallback_base: &str, subpath: &[&str]) -> PathBuf
     xdg_path_from(std::env::var_os(env_var).as_deref(), fallback_base, subpath)
 }
 
+/// Resolve the state directory of this build channel: `$XDG_STATE_HOME`, or
+/// `~/.local/state`, joined with [`crate::channel::BuildChannel::app_dir`].
+pub fn state_dir() -> PathBuf {
+    xdg_path(
+        "XDG_STATE_HOME",
+        "~/.local/state",
+        &[crate::channel::BUILD_CHANNEL.app_dir()],
+    )
+}
+
 /// Pure resolver split out so tests can exercise both branches without
 /// mutating process env (unsafe on edition 2024) or relying on the
 /// developer's local shell environment.
@@ -32,6 +42,16 @@ pub fn xdg_path_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_dir_ends_with_the_channel_app_dir() {
+        assert_eq!(
+            state_dir().file_name(),
+            Some(std::ffi::OsStr::new(
+                crate::channel::BUILD_CHANNEL.app_dir()
+            ))
+        );
+    }
 
     #[test]
     fn honors_env_var_when_set() {

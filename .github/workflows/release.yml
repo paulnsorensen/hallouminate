@@ -112,6 +112,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      # Release marker: keeps the installed default data, cache, state, and
+      # socket paths. Builds without it use hallouminate-dev directories.
+      HALLOUMINATE_RELEASE_CHANNEL: stable
     steps:
       - name: enable windows longpaths
         run: |
@@ -182,6 +185,25 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Guard release channel
+        shell: bash
+        # A binary built without HALLOUMINATE_RELEASE_CHANNEL reports `dev` and
+        # would move installed users to empty hallouminate-dev directories.
+        run: |
+          set -euo pipefail
+          archive="$(ls target/distrib/hallouminate-*.tar.xz | head -n 1)"
+          work="$(mktemp -d)"
+          tar -xJf "$archive" -C "$work"
+          bin="$(find "$work" -type f -name hallouminate | head -n 1)"
+          version_line="$("$bin" --version)"
+          echo "$version_line"
+          case "$version_line" in
+            *" (stable)") ;;
+            *)
+              echo "::error::release binary reports '$version_line', expected the stable channel"
+              exit 1
+              ;;
+          esac
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
