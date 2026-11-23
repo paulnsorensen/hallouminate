@@ -5723,7 +5723,7 @@ body
                 .watched_paths()
                 .expect("read native watches")
                 .iter()
-                .all(|(path, _mode)| path != &root)
+                .all(|watch| watch.path != root)
         })
         .await;
 
@@ -5759,7 +5759,7 @@ body
             .watched_paths()
             .expect("read native watches");
         assert!(
-            native_paths.iter().any(|(path, _mode)| path == &sibling),
+            native_paths.iter().any(|watch| watch.path == sibling),
             "install the watch that follows the removed root in the reconcile batch"
         );
         assert!(!registered(&state, "cheese"), "retire the missing root");

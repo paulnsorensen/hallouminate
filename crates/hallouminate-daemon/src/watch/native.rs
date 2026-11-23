@@ -1,8 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use notify::{
     Config, ErrorKind, EventHandler, PathOp, RecommendedWatcher, RecursiveMode, Result,
-    UpdatePathsError, WatchPathConfig, Watcher, WatcherKind,
+    UpdatePathsError, WatchPathConfig, WatchedPath, Watcher, WatcherKind,
 };
 
 pub(super) struct NativeWatcher(RecommendedWatcher);
@@ -47,7 +47,7 @@ impl Watcher for NativeWatcher {
         self.0.configure(config)
     }
 
-    fn watched_paths(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {
+    fn watched_paths(&self) -> Result<Vec<WatchedPath>> {
         self.0.watched_paths()
     }
 
