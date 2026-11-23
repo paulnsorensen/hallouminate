@@ -485,14 +485,13 @@ async fn prepare_socket_dir(socket_path: &Path) -> anyhow::Result<()> {
                 })?;
         }
         // Rewrite the DACL only for a directory that the daemon created or
-        // that is the default location. A directory that an explicit
-        // `HALLOUMINATE_SOCKET` names is the user's; the endpoint marker and
-        // pipe carry their own owner-only DACLs.
+        // that holds the default socket path. Any other existing directory
+        // belongs to the caller; the endpoint marker and pipe carry their
+        // own owner-only DACLs.
         #[cfg(windows)]
         if !parent_existed
-            || !super::bootstrap::has_explicit_socket_override(
-                std::env::var_os("HALLOUMINATE_SOCKET").as_deref(),
-            )
+            || super::socket::default_windows_socket_path()
+                .is_ok_and(|default_path| default_path == socket_path)
         {
             crate::windows_security::restrict_path(parent).map_err(|e| {
                 anyhow::anyhow!(
