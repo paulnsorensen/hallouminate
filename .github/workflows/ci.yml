@@ -159,7 +159,7 @@ jobs:
           version: v0.19.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Install nextest
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           # Pin the exact nextest version for reproducible CI installs; bump
           # deliberately (Dependabot tracks the action SHA, not this string).
@@ -207,7 +207,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "0.13.7"
+          version: "0.13.8"
           enable-cache: false
       - name: Install BDD tooling
         run: uv sync --locked

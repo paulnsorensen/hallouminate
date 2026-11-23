@@ -190,11 +190,49 @@ def watched_fact(app: Application, client: Mcp) -> None:
     pytest.fail(f"external edit did not become searchable: {latest}")
 
 
+def _assert_indexed_facts(
+    app: Application, client: Mcp, facts: dict[str, str | None],
+) -> None:
+    root = (app.repo / ".hallouminate/wiki").resolve()
+    transient_messages = {
+        f"{CORPUS}: root {root}; recovery state {state}; {reason}"
+        for state in ("queued", "in-flight")
+        for reason in ("reconciliation not complete", "reconciliation pending")
+    }
+    deadline = time.monotonic() + 5
+    while True:
+        pending = None
+        for fact, snippet in facts.items():
+            result = tool_result(client.call(
+                app, "ground", corpus=CORPUS, query=fact, **{"match": "phrase"},
+            ))
+            hits = [
+                (doc["corpus"], doc["path"], [chunk["snippet"] for chunk in doc["chunks"]])
+                for doc in result["docs"].values()
+            ]
+            # Check the index result before waiting for the watcher.
+            expected = [] if snippet is None else [(CORPUS, PATH, [snippet])]
+            assert hits == expected, result
+
+            warnings = result["warnings"]
+            if warnings:
+                assert len(warnings) == 1, result
+                (warning,) = warnings
+                assert warning["code"] == "index-reconciliation", result
+                assert warning["message"] in transient_messages, result
+                pending = warning
+
+        if pending is None:
+            return
+        assert time.monotonic() < deadline, f"Watcher did not settle: {pending}"
+        time.sleep(0.05)
+
+
 @when("I change an external page and index the wiki again")
 def external_update(app: Application, client: Mcp) -> None:
     external_page(app).write_text(OLD)
     reindex(app, client)
-    assert found(app, client, "cobaltbeacon") == [PATH]
+    _assert_indexed_facts(app, client, {"cobaltbeacon": "# Answer The answer is cobaltbeacon."})
     external_page(app).write_text(NEW)
     reindex(app, client)
 
@@ -202,15 +240,17 @@ def external_update(app: Application, client: Mcp) -> None:
 @then("search finds the new fact and not the old fact")
 def new_fact_only(app: Application, client: Mcp) -> None:
     assert read(app, client) == NEW
-    assert found(app, client, "amberbeacon") == [PATH]
-    assert found(app, client, "cobaltbeacon") == []
+    _assert_indexed_facts(app, client, {
+        "amberbeacon": "# Answer The answer is amberbeacon.",
+        "cobaltbeacon": None,
+    })
 
 
 @when("I remove an external page and index the wiki again")
 def external_delete(app: Application, client: Mcp) -> None:
     external_page(app).write_text(OLD)
     reindex(app, client)
-    assert found(app, client, "cobaltbeacon") == [PATH]
+    _assert_indexed_facts(app, client, {"cobaltbeacon": "# Answer The answer is cobaltbeacon."})
     external_page(app).unlink()
     reindex(app, client)
 
@@ -219,7 +259,7 @@ def external_delete(app: Application, client: Mcp) -> None:
 def external_absent(app: Application, client: Mcp) -> None:
     files = tool_result(client.call(app, "list_files", corpus=CORPUS))
     assert PATH not in [entry["path"] for entry in files["files"]], files
-    assert found(app, client, "cobaltbeacon") == []
+    _assert_indexed_facts(app, client, {"cobaltbeacon": None})
     response = client.call(app, "read_markdown", corpus=CORPUS, path=PATH)
     assert response["error"]["code"] == -32602, response
 
@@ -254,7 +294,9 @@ def overwrite(app: Application, client: Mcp) -> None:
 
 @then("the replacement is readable and only its fact is searchable")
 def replaced(app: Application, client: Mcp) -> None:
-    new_fact_only(app, client)
+    assert read(app, client) == NEW
+    assert found(app, client, "amberbeacon") == [PATH]
+    assert found(app, client, "cobaltbeacon") == []
 
 
 @when("I append guidance under one heading")

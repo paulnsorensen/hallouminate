@@ -27,7 +27,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tracing-appender = "0.2"
 file-rotate = "0.8"
 directories = "6"
-url = "2"
 chrono.workspace = true
 schemars.workspace = true
 rmcp = { version = "3.0", features = ["server", "macros", "transport-io", "schemars"] }
