@@ -268,6 +268,13 @@ struct LogFile {
 }
 
 fn list_log_files(dir: &Path) -> io::Result<Vec<LogFile>> {
+    list_log_files_with(dir, |_| {})
+}
+
+fn list_log_files_with(
+    dir: &Path,
+    mut before_stat: impl FnMut(&LogFamily),
+) -> io::Result<Vec<LogFile>> {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -278,7 +285,9 @@ fn list_log_files(dir: &Path) -> io::Result<Vec<LogFile>> {
         let Some((family, kind)) = parse_log_name(name) else {
             continue;
         };
-        let metadata = match entry.metadata() {
+        before_stat(&family);
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
@@ -287,7 +296,7 @@ fn list_log_files(dir: &Path) -> io::Result<Vec<LogFile>> {
             continue;
         }
         files.push(LogFile {
-            path: entry.path(),
+            path,
             family,
             kind,
             bytes: metadata.len(),
@@ -429,7 +438,12 @@ fn prune(
     config: &hallouminate_config::LoggingConfig,
 ) -> io::Result<()> {
     let budget = config.max_total_bytes.saturating_sub(config.max_file_bytes);
-    let mut files = list_log_files(dir)?;
+    let mut owners = BTreeMap::new();
+    let mut files = list_log_files_with(dir, |family| {
+        if own != Some(family) {
+            claim_owner(dir, family, &mut owners);
+        }
+    })?;
     let mut total: u64 = 0;
     for file in &files {
         total = total.saturating_add(file.bytes);
@@ -439,11 +453,10 @@ fn prune(
             .cmp(&b.modified)
             .then_with(|| a.path.cmp(&b.path))
     });
-    let mut owners = BTreeMap::new();
     let mut first_error = None;
     let mut remaining = Vec::new();
     for file in files {
-        if total <= budget || !is_removable(dir, own, &file, &mut owners) {
+        if total <= budget || !is_removable(own, &file, &owners) {
             remaining.push(file);
             continue;
         }
@@ -482,7 +495,7 @@ fn prune_startup_extras(
     }
     let mut dead = Vec::new();
     for (family, modified) in newest {
-        if owner_is_dead(dir, &family, owners) {
+        if owner_is_dead(&family, owners) {
             dead.push((modified, family));
         }
     }
@@ -498,7 +511,7 @@ fn prune_startup_extras(
         }
     }
     for family in list_lock_families(dir)? {
-        owner_is_dead(dir, &family, owners);
+        claim_owner(dir, &family, owners);
     }
     Ok(())
 }
@@ -522,10 +535,9 @@ fn list_lock_families(dir: &Path) -> io::Result<Vec<LogFamily>> {
 }
 
 fn is_removable(
-    dir: &Path,
     own: Option<&LogFamily>,
     file: &LogFile,
-    owners: &mut BTreeMap<LogFamily, Owner>,
+    owners: &BTreeMap<LogFamily, Owner>,
 ) -> bool {
     if own == Some(&file.family) {
         return match file.kind {
@@ -533,26 +545,25 @@ fn is_removable(
             LogFileKind::Archive(_) => true,
         };
     }
-    owner_is_dead(dir, &file.family, owners)
+    owner_is_dead(&file.family, owners)
 }
 
-/// Claim a family's lock once per pass. A claimed lock stays held, and its
-/// file is removed, when `owners` drops.
-fn owner_is_dead(dir: &Path, family: &LogFamily, owners: &mut BTreeMap<LogFamily, Owner>) -> bool {
-    let owner = match owners.entry(family.clone()) {
-        Entry::Occupied(entry) => entry.into_mut(),
-        Entry::Vacant(entry) => {
-            let owner = match FamilyLock::try_claim(dir, family) {
-                Ok(Claim::Acquired(lock)) => Owner::Claimed { _lock: lock },
-                Ok(Claim::Held) => Owner::Live,
-                Err(_) => Owner::Live,
-            };
-            entry.insert(owner)
-        }
-    };
-    match owner {
-        Owner::Claimed { _lock: _ } => true,
-        Owner::Live => false,
+/// Claim a lock before reading file metadata. Keep live families out of
+/// this pass and hold each claimed lock until all removals finish.
+fn claim_owner(dir: &Path, family: &LogFamily, owners: &mut BTreeMap<LogFamily, Owner>) {
+    if let Entry::Vacant(entry) = owners.entry(family.clone()) {
+        let owner = match FamilyLock::try_claim(dir, family) {
+            Ok(Claim::Acquired(lock)) => Owner::Claimed { _lock: lock },
+            Ok(Claim::Held) | Err(_) => Owner::Live,
+        };
+        entry.insert(owner);
+    }
+}
+
+fn owner_is_dead(family: &LogFamily, owners: &BTreeMap<LogFamily, Owner>) -> bool {
+    match owners.get(family) {
+        Some(Owner::Claimed { _lock: _ }) => true,
+        Some(Owner::Live) | None => false,
     }
 }
 
@@ -611,6 +622,9 @@ impl Write for LogSink {
             }
             Slot::Closed => return Err(io::Error::other("log file is closed")),
         };
+        if u64::try_from(buf.len()).unwrap_or(u64::MAX) > self.config.max_file_bytes {
+            return write_stderr(buf);
+        }
         let record = active.write_record(&self.dir, &self.config, buf);
         if let Err(error) = record {
             report_once("write log file", &error);
@@ -705,11 +719,11 @@ impl ActiveLog {
             report_once("reopen log file", &error);
             return Err(error);
         }
-        self.file.write_all(buf)?;
-        self.len = self.len.saturating_add(incoming);
         if rotated && let Err(error) = prune(dir, Some(&self.family), config) {
             report_once("prune log files", &error);
         }
+        self.file.write_all(buf)?;
+        self.len = self.len.saturating_add(incoming);
         Ok(())
     }
 
@@ -866,6 +880,61 @@ mod tests {
             }
         }
         Ok((paths.len(), lines))
+    }
+
+    #[test]
+    fn rotation_retains_a_full_archive_and_active_file_at_the_budget() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 128,
+        };
+        let (writer, guard) = log_writer(dir.path(), LogRole::Cli, 1, &config)?;
+        let mut writer = writer.make_writer();
+        let first = "a".repeat(63);
+        let second = "b".repeat(63);
+        writer.write_all(format!("{first}\n").as_bytes())?;
+        writer.write_all(format!("{second}\n").as_bytes())?;
+        drop(writer);
+        drop(guard);
+        assert_eq!(family_lines(dir.path(), "cli-1")?, (2, vec![first, second]));
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_record_does_not_enter_the_log_or_close_the_sink() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = LoggingConfig {
+            max_file_bytes: 64,
+            max_total_bytes: 128,
+        };
+        let (writer, guard) = log_writer(dir.path(), LogRole::Cli, 1, &config)?;
+        let mut writer = writer.make_writer();
+        writer.write_all(b"before\n")?;
+        writer.write_all(format!("{}\n", "x".repeat(64)).as_bytes())?;
+        writer.write_all(b"after\n")?;
+        drop(writer);
+        drop(guard);
+        let (files, lines) = family_lines(dir.path(), "cli-1")?;
+        assert_eq!(files, 1);
+        assert_eq!(lines, ["before", "after"]);
+        Ok(())
+    }
+
+    #[test]
+    fn log_scan_reads_fresh_metadata_after_the_family_claim() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("cli-1.log");
+        std::fs::write(&path, b"old")?;
+        let mut owners = BTreeMap::new();
+        let files = list_log_files_with(dir.path(), |family| {
+            claim_owner(dir.path(), family, &mut owners);
+            assert!(owner_is_dead(family, &owners));
+            std::fs::write(&path, b"replacement").expect("write replacement log");
+        })?;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].bytes, 11);
+        Ok(())
     }
 
     #[test]
