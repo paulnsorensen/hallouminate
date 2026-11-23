@@ -93,3 +93,14 @@ test("AC-20 Windows CI runners and timeout", () => {
   assert.match(jobBody("verification-lease"), /os: \[[^\]]*windows-2022[^\]]*\]/);
   assert.equal(ci.includes("windows-latest"), false);
 });
+
+test("AC-20 required build gate depends on every gated job", () => {
+  const ci = fs.readFileSync(path.join(__dirname, "../../.github/workflows/ci.yml"), "utf8");
+  const gate = ci.match(/^  build-test:\n((?:    .*\n|\n)+)/m)[1];
+  const needs = gate.match(/^    needs: \[([^\]]*)\]$/m)[1].split(",").map((name) => name.trim()).sort();
+  assert.deepEqual(needs, ["build-test-matrix", "npm-installer", "verification-lease", "windows"]);
+  assert.match(gate, /^    if: always\(\)$/m);
+  assert.match(gate, /contains\(needs\.\*\.result, 'failure'\)/);
+  assert.match(gate, /contains\(needs\.\*\.result, 'cancelled'\)/);
+  assert.match(gate, /contains\(needs\.\*\.result, 'skipped'\)/);
+});
