@@ -39,7 +39,11 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1336,16 +1340,19 @@ async fn check_ground_dir(cfg: &Config, ground_dir: &Path) -> anyhow::Result<Opt
             .await
             .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
     }
-    let stage = migration_stage(&ground_dir.canonicalize()?);
-    if path_exists_no_follow(&stage)? {
-        anyhow::bail!(
-            "interrupted store migration at {}; recover it before opening {}",
-            stage.display(),
-            ground_dir.display()
+    let ground_dir = ground_dir.canonicalize()?;
+    if let Some(migration) = verify_published_migration(&ground_dir)?
+        && let Err(error) = cleanup_published_migration(&migration)
+    {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            ground_dir = %ground_dir.display(),
+            error = %error,
+            "published store backup cleanup deferred",
         );
     }
     match LanceStore::validate_existing_metadata(
-        ground_dir,
+        &ground_dir,
         &cfg.embeddings.model,
         cfg.embeddings.quantized,
         cfg.embeddings.enabled,
@@ -1542,6 +1549,129 @@ fn migration_stage(ground_dir: &Path) -> PathBuf {
     ground_dir.join(".migration-stage")
 }
 
+// Keep proof outside stage until its final rmdir succeeds, including after a restart.
+fn migration_marker(ground_dir: &Path) -> PathBuf {
+    ground_dir.join(".migration-published")
+}
+
+struct PublishedMigration {
+    stage: PathBuf,
+    previous: PathBuf,
+    marker: PathBuf,
+    backup: PathBuf,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DirectoryIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MigrationProof {
+    version: u32,
+    stage: DirectoryIdentity,
+    next: DirectoryIdentity,
+    previous: Option<DirectoryIdentity>,
+}
+
+fn directory_identity(path: &Path) -> anyhow::Result<DirectoryIdentity> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        anyhow::bail!("migration path is not a real directory: {}", path.display());
+    }
+    Ok(DirectoryIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+fn migration_proof(marker: &Path) -> anyhow::Result<MigrationProof> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(marker)?;
+    if !file.metadata()?.is_file() {
+        anyhow::bail!("migration proof is not a real file: {}", marker.display());
+    }
+    let mut contents = Vec::new();
+    file.take(513).read_to_end(&mut contents)?;
+    if contents.len() > 512 {
+        anyhow::bail!("migration proof is too large: {}", marker.display());
+    }
+    serde_json::from_slice(&contents).map_err(|error| {
+        anyhow::anyhow!("malformed migration proof at {}: {error}", marker.display())
+    })
+}
+
+fn verify_published_migration(ground_dir: &Path) -> anyhow::Result<Option<PublishedMigration>> {
+    let stage = migration_stage(ground_dir);
+    let marker = migration_marker(ground_dir);
+    if !path_exists_no_follow(&marker)? {
+        if path_exists_no_follow(&stage)? {
+            anyhow::bail!(
+                "interrupted store migration at {}; recover it before opening {}",
+                stage.display(),
+                ground_dir.display()
+            );
+        }
+        return Ok(None);
+    }
+    let proof = migration_proof(&marker)?;
+    let (_, backup) = resolved_store_paths(ground_dir, proof.version)?;
+    if directory_identity(&backup)? != proof.next {
+        anyhow::bail!("migration backup identity changed: {}", backup.display());
+    }
+    let previous = stage.join("previous");
+    if path_exists_no_follow(&stage)? {
+        if directory_identity(&stage)? != proof.stage {
+            anyhow::bail!("migration stage identity changed: {}", stage.display());
+        }
+        if path_exists_no_follow(&stage.join("next"))? {
+            anyhow::bail!(
+                "migration still has staged next directory: {}",
+                stage.display()
+            );
+        }
+        for entry in std::fs::read_dir(&stage)? {
+            let entry = entry?;
+            if entry.file_name() != "previous" {
+                anyhow::bail!("unknown migration stage entry: {}", entry.path().display());
+            }
+        }
+        if path_exists_no_follow(&previous)?
+            && Some(directory_identity(&previous)?) != proof.previous
+        {
+            anyhow::bail!(
+                "migration prior backup identity changed: {}",
+                previous.display()
+            );
+        }
+    }
+    Ok(Some(PublishedMigration {
+        stage,
+        previous,
+        marker,
+        backup,
+    }))
+}
+
+fn cleanup_published_migration(migration: &PublishedMigration) -> anyhow::Result<()> {
+    if path_exists_no_follow(&migration.stage)? {
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        reject_live_directory(&migration.stage, &cwd)?;
+        if path_exists_no_follow(&migration.previous)? {
+            reject_live_directory(&migration.previous, &cwd)?;
+            std::fs::remove_dir_all(&migration.previous)?;
+        }
+        std::fs::remove_dir(&migration.stage)?;
+    }
+    std::fs::remove_file(&migration.marker)?;
+    Ok(())
+}
+
 fn reject_live_directory(path: &Path, cwd: &Path) -> anyhow::Result<()> {
     if cwd.starts_with(path) {
         anyhow::bail!(
@@ -1588,6 +1718,7 @@ async fn move_stale_store(
         store_lock.validate_path(&path)?;
         let (ground_dir, backup) = resolved_store_paths(&path, found_version)?;
         let stage = migration_stage(&ground_dir);
+        let marker = migration_marker(&ground_dir);
         let cwd = std::env::current_dir()?.canonicalize()?;
         reject_live_directory(&ground_dir, &cwd)?;
         match std::fs::symlink_metadata(&backup) {
@@ -1603,19 +1734,20 @@ async fn move_stale_store(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        if path_exists_no_follow(&stage)? {
+        if path_exists_no_follow(&stage)? || path_exists_no_follow(&marker)? {
             anyhow::bail!(
                 "interrupted store migration at {}; recover it before opening {}",
                 stage.display(),
                 ground_dir.display()
             );
         }
-        std::fs::create_dir(&stage)?;
+        std::fs::DirBuilder::new().mode(0o700).create(&stage)?;
         let next = stage.join("next");
         let previous = stage.join("previous");
         let mut moves = Vec::new();
+        let mut marker_created = false;
         let result = (|| -> anyhow::Result<()> {
-            std::fs::create_dir(&next)?;
+            std::fs::DirBuilder::new().mode(0o700).create(&next)?;
             for name in ["chunks.lance", "root_files.lance", "meta.toml"] {
                 let source = ground_dir.join(name);
                 match std::fs::symlink_metadata(&source) {
@@ -1636,10 +1768,32 @@ async fn move_stale_store(
                 }
             }
             std::fs::File::open(&next)?.set_modified(SystemTime::now())?;
-            if path_exists_no_follow(&backup)? {
+            let stage_identity = directory_identity(&stage)?;
+            let next_identity = directory_identity(&next)?;
+            let previous_identity = if path_exists_no_follow(&backup)? {
+                let prior = directory_identity(&backup)?;
                 std::fs::rename(&backup, &previous)?;
                 moves.push((backup.clone(), previous.clone()));
-            }
+                Some(prior)
+            } else {
+                None
+            };
+            let mut proof = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&marker)?;
+            marker_created = true;
+            serde_json::to_writer(
+                &mut proof,
+                &MigrationProof {
+                    version: found_version,
+                    stage: stage_identity,
+                    next: next_identity,
+                    previous: previous_identity,
+                },
+            )?;
+            proof.sync_all()?;
             std::fs::rename(&next, &backup)?;
             moves.push((next.clone(), backup.clone()));
             store_lock.validate_path(&path)?;
@@ -1648,12 +1802,18 @@ async fn move_stale_store(
         if let Err(error) = result {
             match rollback_store_moves(&moves) {
                 Ok(()) => {
-                    if let Err(cleanup) = std::fs::remove_dir_all(&stage) {
-                        return Err(anyhow::anyhow!(
+                    if marker_created {
+                        std::fs::remove_file(&marker)?;
+                    }
+                    if path_exists_no_follow(&next)? {
+                        std::fs::remove_dir(&next)?;
+                    }
+                    std::fs::remove_dir(&stage).map_err(|cleanup| {
+                        anyhow::anyhow!(
                             "store move failed: {error}; restored data, but stage {} remains: {cleanup}",
                             stage.display()
-                        ));
-                    }
+                        )
+                    })?;
                     return Err(error);
                 }
                 Err(rollback) => {
@@ -1666,11 +1826,14 @@ async fn move_stale_store(
                 }
             }
         }
-        if let Err(error) = std::fs::remove_dir_all(&stage) {
-            anyhow::bail!(
-                "backup published at {}, but old backup cleanup failed at {}: {error}",
-                backup.display(),
-                stage.display()
+        let migration = verify_published_migration(&ground_dir)?
+            .ok_or_else(|| anyhow::anyhow!("published migration proof disappeared"))?;
+        if let Err(error) = cleanup_published_migration(&migration) {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                backup = %migration.backup.display(),
+                error = %error,
+                "published store backup cleanup deferred",
             );
         }
         Ok(backup)
@@ -1695,6 +1858,13 @@ async fn prune_stale_backups(
     max_age: Duration,
 ) -> anyhow::Result<()> {
     let ground_dir = ground_dir.canonicalize()?;
+    let marker = migration_marker(&ground_dir);
+    let protected_backup = if path_exists_no_follow(&marker)? {
+        let proof = migration_proof(&marker)?;
+        Some(resolved_store_paths(&ground_dir, proof.version)?.1)
+    } else {
+        None
+    };
     let parent = ground_dir
         .parent()
         .ok_or_else(|| anyhow::anyhow!("ground store has no parent"))?;
@@ -1723,6 +1893,9 @@ async fn prune_stale_backups(
             continue;
         }
         let path = entry.path();
+        if protected_backup.as_deref() == Some(path.as_path()) {
+            continue;
+        }
         if reject_live_directory(&path, &cwd).is_err() {
             continue;
         }
@@ -3165,7 +3338,10 @@ mod tests {
 
         let owner = StoreLockOwner::for_process();
         let store_lock = LanceStore::lock(&ground_dir, &owner).await.expect("lock");
-        std::fs::write(ground_dir.join("meta.toml"), "stale").expect("meta");
+        let meta = ground_dir.join("meta.toml");
+        std::fs::write(&meta, "stale").expect("meta");
+        std::fs::set_permissions(&meta, std::fs::Permissions::from_mode(0o644))
+            .expect("readable stale metadata");
 
         let old_mtime = SystemTime::now() - Duration::from_secs(60 * 24 * 60 * 60);
         let dir = ground_dir.clone();
@@ -3179,6 +3355,17 @@ mod tests {
             .expect("move");
 
         let bak = tmp.path().join("ground.bak-v1");
+        assert_eq!(
+            std::fs::metadata(&bak).expect("backup metadata").mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(bak.join("meta.toml"))
+                .expect("stale metadata")
+                .mode()
+                & 0o777,
+            0o644
+        );
         prune_stale_backups(&ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE)
             .await
             .expect("prune");
@@ -3187,6 +3374,82 @@ mod tests {
             bak.exists(),
             "backup just moved aside must survive its own boot's prune, \
              even though the source dir's mtime was 60d old",
+        );
+    }
+
+    #[tokio::test]
+    async fn published_migration_proof_limits_cleanup_and_protects_backup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ground = tmp.path().join("ground");
+        let stage = migration_stage(&ground);
+        let next = stage.join("next");
+        let previous = stage.join("previous");
+        let backup = tmp.path().join("ground.bak-v1");
+        std::fs::create_dir(&ground).expect("ground");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&stage)
+            .expect("stage");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&next)
+            .expect("next");
+        std::fs::create_dir(&previous).expect("previous");
+        std::fs::write(previous.join("sentinel"), "prior").expect("prior data");
+        std::fs::write(next.join("meta.toml"), "stale").expect("staged data");
+        let proof = MigrationProof {
+            version: 1,
+            stage: directory_identity(&stage).expect("stage identity"),
+            next: directory_identity(&next).expect("next identity"),
+            previous: Some(directory_identity(&previous).expect("prior identity")),
+        };
+        std::fs::write(
+            migration_marker(&ground),
+            serde_json::to_vec(&proof).expect("serialize proof"),
+        )
+        .expect("proof");
+        std::fs::rename(&next, &backup).expect("publish");
+
+        let unknown = stage.join("unknown");
+        std::fs::write(&unknown, "keep").expect("unknown entry");
+        let error = verify_published_migration(&ground)
+            .err()
+            .expect("unknown stage entry must refuse recovery");
+        assert!(error.to_string().contains("unknown migration stage entry"));
+        assert_eq!(
+            std::fs::read_to_string(&unknown).expect("unknown data"),
+            "keep"
+        );
+        assert_eq!(
+            std::fs::read_to_string(previous.join("sentinel")).expect("prior data"),
+            "prior"
+        );
+        std::fs::remove_file(&unknown).expect("remove test entry");
+
+        prune_stale_backups(
+            &ground,
+            SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("prune");
+        assert!(
+            backup.join("meta.toml").exists(),
+            "proof must protect exact backup"
+        );
+
+        let migration = verify_published_migration(&ground)
+            .expect("verify publication")
+            .expect("published migration");
+        cleanup_published_migration(&migration).expect("cleanup");
+        assert!(!stage.exists(), "stage must be removed");
+        assert!(
+            !migration_marker(&ground).exists(),
+            "proof must be removed last"
+        );
+        assert_eq!(
+            std::fs::read_to_string(backup.join("meta.toml")).expect("backup"),
+            "stale"
         );
     }
 
