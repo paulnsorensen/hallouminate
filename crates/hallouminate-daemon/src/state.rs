@@ -39,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -1335,6 +1336,14 @@ async fn check_ground_dir(cfg: &Config, ground_dir: &Path) -> anyhow::Result<Opt
             .await
             .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
     }
+    let stage = migration_stage(&ground_dir.canonicalize()?);
+    if path_exists_no_follow(&stage)? {
+        anyhow::bail!(
+            "interrupted store migration at {}; recover it before opening {}",
+            stage.display(),
+            ground_dir.display()
+        );
+    }
     match LanceStore::validate_existing_metadata(
         ground_dir,
         &cfg.embeddings.model,
@@ -1375,8 +1384,9 @@ async fn open_ground_store(
 
 /// Open the boot ground store. A stale store moves aside, and every
 /// effective corpus of `cfg` reindexes into the fresh store before boot
-/// continues. A failed move leaves the stale store in place. A failed open
-/// or rebuild removes the partial store; the backup stays.
+/// continues. A failed move restores moved data when possible and leaves
+/// staging for recovery otherwise. A failed open or rebuild removes the
+/// partial store; the backup stays.
 async fn open_boot_store(
     cfg: &Config,
     ground_dir: &Path,
@@ -1466,18 +1476,17 @@ async fn remove_partial_store(
     let path = ground_dir.to_path_buf();
     let cleanup = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         store_lock.validate_path(&path)?;
-        for entry in std::fs::read_dir(&path)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == std::ffi::OsStr::new("store.lock")
-                || name == std::ffi::OsStr::new("store.lock.diagnostics")
-            {
-                continue;
-            }
-            if entry.file_type()?.is_dir() {
-                std::fs::remove_dir_all(entry.path())?;
+        for name in ["chunks.lance", "root_files.lance", "meta.toml"] {
+            let entry = path.join(name);
+            let metadata = match std::fs::symlink_metadata(&entry) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(&entry)?;
             } else {
-                std::fs::remove_file(entry.path())?;
+                std::fs::remove_file(&entry)?;
             }
         }
         Ok(())
@@ -1490,8 +1499,10 @@ async fn remove_partial_store(
             target: "hallouminate::daemon",
             ground_dir = %ground_dir.display(),
             error = %error,
-            "rebuild failed; removed partial ground data. Backup preserved at {}.bak-v{found}",
-            ground_dir.display(),
+            "rebuild failed; removed partial ground data. Backup preserved at {}",
+            resolved_store_paths(ground_dir, found)
+                .map(|(_, backup)| backup.display().to_string())
+                .unwrap_or_else(|_| "unknown resolved path".to_owned()),
         ),
         Err(remove_error) => tracing::error!(
             target: "hallouminate::daemon",
@@ -1516,65 +1527,158 @@ async fn prune_stale_backups_logged(ground_dir: &Path) {
     }
 }
 
-/// Exchanges a stale store while the active pathname keeps the owned lock inode.
+fn resolved_store_paths(ground_dir: &Path, version: u32) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let ground_dir = ground_dir.canonicalize()?;
+    let mut name = ground_dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("ground store cannot be a filesystem root"))?
+        .to_os_string();
+    name.push(format!(".bak-v{version}"));
+    let backup = ground_dir.with_file_name(name);
+    Ok((ground_dir, backup))
+}
+
+fn migration_stage(ground_dir: &Path) -> PathBuf {
+    ground_dir.join(".migration-stage")
+}
+
+fn reject_live_directory(path: &Path, cwd: &Path) -> anyhow::Result<()> {
+    if cwd.starts_with(path) {
+        anyhow::bail!(
+            "refusing to move daemon working directory or ancestor {} (cwd {})",
+            path.display(),
+            cwd.display()
+        );
+    }
+    Ok(())
+}
+
+fn path_exists_no_follow(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn rollback_store_moves(moves: &[(PathBuf, PathBuf)]) -> anyhow::Result<()> {
+    for (source, destination) in moves.iter().rev() {
+        if path_exists_no_follow(source)? {
+            anyhow::bail!("rollback destination already exists: {}", source.display());
+        }
+        std::fs::rename(destination, source).map_err(|error| {
+            anyhow::anyhow!(
+                "restore {} from {}: {error}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Move only managed store entries. The active directory and owned lock inodes stay in place.
 async fn move_stale_store(
     ground_dir: &Path,
     found_version: u32,
     store_lock: StoreLockGuard,
 ) -> anyhow::Result<()> {
     let path = ground_dir.to_path_buf();
-    let bak = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
+    let backup = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
         store_lock.validate_path(&path)?;
-        let ground_dir = path.canonicalize()?;
-        let bak = ground_dir.with_file_name(format!(
-            "{}.bak-v{found_version}",
-            ground_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("ground"),
-        ));
-        if bak.exists() {
-            std::fs::remove_dir_all(&bak)?;
-        }
-        std::fs::create_dir(&bak)?;
-        let prepared = (|| -> std::io::Result<()> {
-            for name in ["store.lock", "store.lock.diagnostics"] {
-                std::fs::hard_link(ground_dir.join(name), bak.join(name))?;
+        let (ground_dir, backup) = resolved_store_paths(&path, found_version)?;
+        let stage = migration_stage(&ground_dir);
+        let cwd = std::env::current_dir()?.canonicalize()?;
+        reject_live_directory(&ground_dir, &cwd)?;
+        match std::fs::symlink_metadata(&backup) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("refusing symlink backup {}", backup.display());
+                }
+                reject_live_directory(&backup.canonicalize()?, &cwd)?;
+                if !metadata.is_dir() {
+                    anyhow::bail!("backup path is not a directory: {}", backup.display());
+                }
             }
-            std::fs::File::open(&ground_dir)?.set_modified(SystemTime::now())?;
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if path_exists_no_follow(&stage)? {
+            anyhow::bail!(
+                "interrupted store migration at {}; recover it before opening {}",
+                stage.display(),
+                ground_dir.display()
+            );
+        }
+        std::fs::create_dir(&stage)?;
+        let next = stage.join("next");
+        let previous = stage.join("previous");
+        let mut moves = Vec::new();
+        let result = (|| -> anyhow::Result<()> {
+            std::fs::create_dir(&next)?;
+            for name in ["chunks.lance", "root_files.lance", "meta.toml"] {
+                let source = ground_dir.join(name);
+                match std::fs::symlink_metadata(&source) {
+                    Ok(metadata) => {
+                        if metadata.file_type().is_symlink() {
+                            anyhow::bail!("refusing symlink store entry {}", source.display());
+                        }
+                        let destination = next.join(name);
+                        std::fs::rename(&source, &destination)?;
+                        moves.push((source, destination));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if name == "meta.toml" {
+                            anyhow::bail!("stale store metadata disappeared: {}", source.display());
+                        }
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            std::fs::File::open(&next)?.set_modified(SystemTime::now())?;
+            if path_exists_no_follow(&backup)? {
+                std::fs::rename(&backup, &previous)?;
+                moves.push((backup.clone(), previous.clone()));
+            }
+            std::fs::rename(&next, &backup)?;
+            moves.push((next.clone(), backup.clone()));
+            store_lock.validate_path(&path)?;
             Ok(())
         })();
-        if let Err(error) = prepared {
-            let _ = std::fs::remove_dir_all(&bak);
-            return Err(error.into());
-        }
-        if let Err(error) = rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            &ground_dir,
-            rustix::fs::CWD,
-            &bak,
-            rustix::fs::RenameFlags::EXCHANGE,
-        ) {
-            let _ = std::fs::remove_dir_all(&bak);
-            return Err(anyhow::anyhow!("exchange stale ground store: {error}"));
-        }
-        store_lock.validate_path(&path)?;
-        for name in ["store.lock", "store.lock.diagnostics"] {
-            if let Err(error) = std::fs::remove_file(bak.join(name)) {
-                tracing::warn!(
-                    target: "hallouminate::daemon",
-                    backup = %bak.display(),
-                    %error,
-                    "could not detach backup lock link",
-                );
+        if let Err(error) = result {
+            match rollback_store_moves(&moves) {
+                Ok(()) => {
+                    if let Err(cleanup) = std::fs::remove_dir_all(&stage) {
+                        return Err(anyhow::anyhow!(
+                            "store move failed: {error}; restored data, but stage {} remains: {cleanup}",
+                            stage.display()
+                        ));
+                    }
+                    return Err(error);
+                }
+                Err(rollback) => {
+                    anyhow::bail!(
+                        "store move failed: {error}; rollback failed: {rollback}; recover active {}, backup {}, and stage {}",
+                        ground_dir.display(),
+                        backup.display(),
+                        stage.display()
+                    );
+                }
             }
         }
-        Ok(bak)
+        if let Err(error) = std::fs::remove_dir_all(&stage) {
+            anyhow::bail!(
+                "backup published at {}, but old backup cleanup failed at {}: {error}",
+                backup.display(),
+                stage.display()
+            );
+        }
+        Ok(backup)
     })
     .await??;
     tracing::info!(
         target: "hallouminate::daemon",
-        backup = %bak.display(),
+        backup = %backup.display(),
         "moved stale ground store aside; recoverable until pruned",
     );
     Ok(())
@@ -1590,17 +1694,16 @@ async fn prune_stale_backups(
     now: SystemTime,
     max_age: Duration,
 ) -> anyhow::Result<()> {
+    let ground_dir = ground_dir.canonicalize()?;
     let parent = ground_dir
         .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let prefix = format!(
-        "{}.bak-v",
-        ground_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("ground"),
-    );
+        .ok_or_else(|| anyhow::anyhow!("ground store has no parent"))?;
+    let mut prefix = ground_dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("ground store has no name"))?
+        .to_os_string();
+    prefix.push(".bak-v");
+    let cwd = std::env::current_dir()?.canonicalize()?;
     let mut entries = match tokio::fs::read_dir(parent).await {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1608,13 +1711,19 @@ async fn prune_stale_backups(
     };
     while let Some(entry) = entries.next_entry().await? {
         let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
+        let Some(suffix) = file_name.as_bytes().strip_prefix(prefix.as_bytes()) else {
             continue;
         };
-        let Some(suffix) = name.strip_prefix(&prefix) else {
+        if suffix.is_empty() || !suffix.iter().all(u8::is_ascii_digit) {
             continue;
-        };
-        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        }
+        let name = file_name.to_string_lossy();
+        let file_type = entry.file_type().await?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        if reject_live_directory(&path, &cwd).is_err() {
             continue;
         }
         let metadata = match entry.metadata().await {
@@ -1648,7 +1757,6 @@ async fn prune_stale_backups(
         if age < max_age {
             continue;
         }
-        let path = entry.path();
         if let Err(e) = tokio::fs::remove_dir_all(&path).await {
             tracing::warn!(
                 target: "hallouminate::daemon",
@@ -3006,6 +3114,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prune_stale_backups_does_not_follow_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ground_dir = tmp.path().join("ground");
+        let target = tmp.path().join("target");
+        tokio::fs::create_dir(&ground_dir)
+            .await
+            .expect("ground dir");
+        tokio::fs::create_dir(&target).await.expect("target dir");
+        tokio::fs::write(target.join("sentinel"), "keep")
+            .await
+            .expect("sentinel");
+        let configured_dir = tmp.path().join("configured");
+        std::os::unix::fs::symlink(&ground_dir, &configured_dir).expect("configured symlink");
+        let backup = tmp.path().join("ground.bak-v1");
+        tokio::fs::create_dir(&backup)
+            .await
+            .expect("expired backup");
+        let link = tmp.path().join("ground.bak-v2");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink backup");
+        prune_stale_backups(
+            &configured_dir,
+            SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60),
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("prune");
+        assert!(!backup.exists(), "expired physical backup must be removed");
+        assert!(link.is_symlink(), "symlink backup must remain");
+        assert_eq!(
+            tokio::fs::read_to_string(target.join("sentinel"))
+                .await
+                .expect("target data"),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
     async fn move_stale_store_stamps_backup_mtime_to_now() {
         // `rename(2)` preserves the source dir's mtime, so a store idle >30d
         // would already look prunable the instant it's moved aside — the
@@ -3020,6 +3165,7 @@ mod tests {
 
         let owner = StoreLockOwner::for_process();
         let store_lock = LanceStore::lock(&ground_dir, &owner).await.expect("lock");
+        std::fs::write(ground_dir.join("meta.toml"), "stale").expect("meta");
 
         let old_mtime = SystemTime::now() - Duration::from_secs(60 * 24 * 60 * 60);
         let dir = ground_dir.clone();

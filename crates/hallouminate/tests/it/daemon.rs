@@ -5596,6 +5596,109 @@ async fn stale_rebuild_overwrites_prior_backup() {
     );
 }
 
+#[tokio::test]
+async fn stale_rebuild_refuses_working_directory_without_moving_data() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus = tmp.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    let unrelated = ground.join("unrelated.txt");
+    std::fs::write(&unrelated, "keep").expect("unrelated data");
+    let lock = ground.join("store.lock");
+    std::fs::write(&lock, "").expect("legacy lock");
+    let inode = std::fs::metadata(&lock).expect("lock metadata").ino();
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\n\n[storage]\nground_dir = \".\"\n\n[embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+            corpus.display()
+        ),
+    )
+    .expect("config");
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hallouminate"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(&config)
+        .current_dir(&ground)
+        .env("HALLOUMINATE_SOCKET", tmp.path().join("daemon.sock"))
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+        .kill_on_drop(true)
+        .output();
+    let output = timeout(Duration::from_secs(10), child)
+        .await
+        .expect("daemon must refuse promptly")
+        .expect("daemon output");
+    assert!(!output.status.success(), "daemon must refuse cwd store");
+    assert_eq!(read_schema_version(&ground), stale);
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).expect("unrelated data"),
+        "keep"
+    );
+    assert_eq!(
+        std::fs::metadata(&lock).expect("lock metadata").ino(),
+        inode
+    );
+    assert!(
+        !ground
+            .with_file_name(format!("ground.bak-v{stale}"))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn failed_store_move_preserves_prior_backup_and_active_data() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus = tmp.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    std::fs::create_dir(ground.join("chunks.lance")).expect("managed chunks");
+    let target = tmp.path().join("target");
+    std::fs::write(&target, "do not follow").expect("target");
+    std::os::unix::fs::symlink(&target, ground.join("root_files.lance"))
+        .expect("blocking managed symlink");
+    let unrelated = ground.join("unrelated.txt");
+    std::fs::write(&unrelated, "keep").expect("unrelated data");
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    std::fs::create_dir(&backup).expect("prior backup");
+    std::fs::write(backup.join("sentinel"), "prior").expect("sentinel");
+    let lock = ground.join("store.lock");
+    std::fs::write(&lock, "").expect("legacy lock");
+    let inode = std::fs::metadata(&lock).expect("lock metadata").ino();
+    let error = DaemonState::open(cfg_with_corpus(&ground, &corpus), None)
+        .await
+        .expect_err("unsafe managed entry must stop migration");
+    assert!(error.to_string().contains("symlink"), "{error:#}");
+    assert_eq!(read_schema_version(&ground), stale);
+    assert!(ground.join("chunks.lance").is_dir());
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).expect("unrelated data"),
+        "keep"
+    );
+    assert_eq!(
+        std::fs::read_to_string(backup.join("sentinel")).expect("prior"),
+        "prior"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("target"),
+        "do not follow"
+    );
+    assert_eq!(
+        std::fs::metadata(&lock).expect("lock metadata").ino(),
+        inode
+    );
+    assert!(!ground.join(".migration-stage").exists());
+}
+
 // T6: rebuild failure — Err returned, backup preserved
 #[tokio::test]
 async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
