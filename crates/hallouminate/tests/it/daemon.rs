@@ -5416,6 +5416,204 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     );
 }
 
+struct MigrationKillWriter {
+    output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    stop_at: &'static str,
+}
+
+impl std::io::Write for MigrationKillWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut output = self.output.lock().expect("migration log lock");
+        output.extend_from_slice(bytes);
+        if String::from_utf8_lossy(&output).contains(self.stop_at) {
+            std::process::exit(73);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn interrupted_boot_config(ground: &Path, first: &Path, later: &Path) -> Config {
+    let mut cfg = cfg_with_corpus(ground, first);
+    cfg.corpora[0].name = "first".into();
+    let mut second = cfg.corpora[0].clone();
+    second.name = "later".into();
+    second.paths = vec![later.to_string_lossy().into_owned()];
+    cfg.corpora.push(second);
+    cfg
+}
+
+#[tokio::test]
+async fn migration_kill_child() {
+    let Ok(ground) = std::env::var("HALLOUMINATE_TEST_KILL_MIGRATION_GROUND") else {
+        return;
+    };
+    let stop_at = match std::env::var("HALLOUMINATE_TEST_KILL_MIGRATION_AT")
+        .expect("kill boundary")
+        .as_str()
+    {
+        "publication" => "moved stale ground store aside",
+        "first_corpus" => "rebuild: reindexed",
+        other => panic!("unknown kill boundary: {other}"),
+    };
+    let ground = PathBuf::from(ground);
+    let parent = ground.parent().expect("ground parent");
+    let cfg = interrupted_boot_config(&ground, &parent.join("first"), &parent.join("later"));
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let writer_output = std::sync::Arc::clone(&output);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || MigrationKillWriter {
+            output: std::sync::Arc::clone(&writer_output),
+            stop_at,
+        })
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    DaemonState::open(cfg, None)
+        .await
+        .expect("interrupted boot must reach the selected boundary");
+    panic!("boot returned before kill boundary: {stop_at}");
+}
+
+async fn kill_migration_boot(ground: &Path, stop_at: &str) {
+    let binary = std::env::current_exe().expect("integration test binary");
+    let child = tokio::process::Command::new(binary)
+        .arg("--exact")
+        .arg("daemon::migration_kill_child")
+        .arg("--nocapture")
+        .current_dir(ground.parent().expect("fixture parent"))
+        .kill_on_drop(true)
+        .env("HALLOUMINATE_TEST_KILL_MIGRATION_GROUND", ground)
+        .env("HALLOUMINATE_TEST_KILL_MIGRATION_AT", stop_at)
+        .output();
+    let output = timeout(Duration::from_secs(30), child)
+        .await
+        .expect("migration child timeout")
+        .expect("migration child output");
+    assert_eq!(
+        output.status.code(),
+        Some(73),
+        "child did not stop at {stop_at}: status={:?}; stdout={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn interrupted_boot_recovers(stop_at: &str, interrupt_twice: bool) {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    let later = tmp.path().join("later");
+    std::fs::create_dir(&first).expect("first corpus");
+    std::fs::create_dir(&later).expect("later corpus");
+    std::fs::write(first.join("first.md"), "# First\n\nfirst-unique-needle\n")
+        .expect("first source");
+    std::fs::write(
+        later.join("later.md"),
+        "# Later\n\nobscure-arcology-token\n",
+    )
+    .expect("later source");
+    let current = hallouminate_adapters::default_schema_version_pub();
+    let stale = current - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, stop_at).await;
+
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let inode = std::fs::metadata(&backup).expect("published backup").ino();
+    assert_eq!(read_schema_version(&backup), stale);
+    match stop_at {
+        "publication" => assert!(
+            !ground.join("meta.toml").exists(),
+            "publication must precede active metadata"
+        ),
+        "first_corpus" => assert_eq!(
+            read_schema_version(&ground),
+            current,
+            "first corpus must follow active metadata"
+        ),
+        other => panic!("unknown kill boundary: {other}"),
+    }
+
+    if interrupt_twice {
+        let aged = std::time::SystemTime::now() - Duration::from_secs(60 * 86_400);
+        std::fs::File::open(&backup)
+            .expect("backup for age test")
+            .set_modified(aged)
+            .expect("age backup before interrupted restart");
+        kill_migration_boot(&ground, "first_corpus").await;
+        assert_eq!(
+            std::fs::metadata(&backup)
+                .expect("backup after second kill")
+                .ino(),
+            inode,
+            "interrupted recovery must not move the backup again"
+        );
+        assert_eq!(read_schema_version(&backup), stale);
+        std::fs::File::open(&backup)
+            .expect("backup for completed recovery")
+            .set_modified(std::time::SystemTime::now())
+            .expect("renew backup age after incomplete restart");
+    }
+
+    let cfg = interrupted_boot_config(&ground, &first, &later);
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("resume boot before serving");
+    let key = CorpusKey::from_configured_root("later", later.to_str().expect("later path"));
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "obscure-arcology-token", 10)
+        .await
+        .expect("query rebuilt Lance store");
+    let chunk_id = signals.fts.first().unwrap_or_else(|| {
+        panic!(
+            "later document must be searchable when DaemonState::open returns; stop_at={stop_at}"
+        )
+    });
+    let hit = signals.hits.get(chunk_id).expect("later Markdown hit");
+    assert!(
+        hit.file_ref.ends_with("/later.md"),
+        "wrong result: {}",
+        hit.file_ref
+    );
+    assert_eq!(
+        hit.structure
+            .as_ref()
+            .and_then(|structure| structure.title.as_deref()),
+        Some("Later")
+    );
+    assert_eq!(
+        std::fs::metadata(&backup)
+            .expect("backup after recovery")
+            .ino(),
+        inode,
+        "successful recovery must not publish the backup twice"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_boot_before_metadata_recovers_search() {
+    interrupted_boot_recovers("publication", false).await;
+}
+
+#[tokio::test]
+async fn interrupted_boot_after_metadata_recovers_search() {
+    interrupted_boot_recovers("first_corpus", false).await;
+}
+
+#[tokio::test]
+async fn interrupted_boot_twice_retains_backup_and_recovers_search() {
+    interrupted_boot_recovers("first_corpus", true).await;
+}
+
 // T2: downgrade stays fatal + original store untouched
 #[tokio::test]
 async fn downgrade_store_is_fatal_and_original_untouched() {

@@ -957,10 +957,16 @@ impl DaemonState {
                 %expected,
                 "ground store schema v{found} < expected v{expected}; moving it aside for catch-up",
             );
-            move_stale_store(&ground_dir, found, store_lock.clone()).await?;
+            move_stale_store(
+                &ground_dir,
+                found,
+                store_lock.clone(),
+                MigrationPurpose::Request,
+            )
+            .await?;
         }
         let store = open_ground_store(cfg, &ground_dir, embedder, store_lock).await?;
-        if stale.is_some() {
+        if stale.is_some() || path_exists_no_follow(&pending_boot_marker(&ground_dir))? {
             self.watch_registry().mark_reconcile_due_all();
         }
         prune_stale_backups_logged(&ground_dir).await;
@@ -1341,7 +1347,13 @@ async fn check_ground_dir(cfg: &Config, ground_dir: &Path) -> anyhow::Result<Opt
             .map_err(|e| anyhow::anyhow!("create ground dir parent: {e}"))?;
     }
     let ground_dir = ground_dir.canonicalize()?;
-    if let Some(migration) = verify_published_migration(&ground_dir)?
+    let migration = verify_published_migration(&ground_dir)?;
+    let pending_boot = match &migration {
+        Some(migration) => migration.marker == pending_boot_marker(&ground_dir),
+        None => false,
+    };
+    if let Some(migration) = migration
+        && !pending_boot
         && let Err(error) = cleanup_published_migration(&migration)
     {
         tracing::warn!(
@@ -1358,6 +1370,14 @@ async fn check_ground_dir(cfg: &Config, ground_dir: &Path) -> anyhow::Result<Opt
         cfg.embeddings.enabled,
     ) {
         Ok(()) => Ok(None),
+        Err(HallouminateError::StoreSchemaStale {
+            found: _,
+            expected: _,
+            ground_dir: _,
+        }) if pending_boot => anyhow::bail!(
+            "pending boot rebuild conflicts with stale active metadata at {}",
+            ground_dir.display()
+        ),
         Err(HallouminateError::StoreSchemaStale {
             found,
             expected,
@@ -1402,17 +1422,33 @@ async fn open_boot_store(
     tokenizer: &Tokenizer,
     store_lock: StoreLockGuard,
 ) -> anyhow::Result<LanceStore> {
-    let Some(StaleStore { found, expected }) = stale else {
-        return open_ground_store(cfg, ground_dir, embedder, store_lock).await;
+    let pending = verify_published_migration(ground_dir)?;
+    let (found, resumed) = match pending {
+        Some(migration) if migration.marker == pending_boot_marker(ground_dir) => {
+            let proof = migration_proof(&migration.marker)?;
+            (proof.version, true)
+        }
+        Some(_) | None => {
+            let Some(StaleStore { found, expected }) = stale else {
+                return open_ground_store(cfg, ground_dir, embedder, store_lock).await;
+            };
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                ground_dir = %ground_dir.display(),
+                %found,
+                %expected,
+                "ground store schema v{found} < expected v{expected}; rebuilding from source",
+            );
+            move_stale_store(
+                ground_dir,
+                found,
+                store_lock.clone(),
+                MigrationPurpose::Boot,
+            )
+            .await?;
+            (found, false)
+        }
     };
-    tracing::warn!(
-        target: "hallouminate::daemon",
-        ground_dir = %ground_dir.display(),
-        %found,
-        %expected,
-        "ground store schema v{found} < expected v{expected}; rebuilding from source",
-    );
-    move_stale_store(ground_dir, found, store_lock.clone()).await?;
     let result = match open_ground_store(cfg, ground_dir, embedder, store_lock.clone()).await {
         Ok(store) => reindex_effective_corpora(cfg, ground_dir, &store, tokenizer)
             .await
@@ -1420,9 +1456,23 @@ async fn open_boot_store(
         Err(error) => Err(error),
     };
     match result {
-        Ok(store) => Ok(store),
+        Ok(store) => {
+            acknowledge_boot_rebuild(ground_dir)?;
+            Ok(store)
+        }
         Err(error) => {
-            remove_partial_store(ground_dir, found, &error, store_lock.clone()).await;
+            let cleanup = remove_partial_store(ground_dir, found, &error, store_lock.clone()).await;
+            if !resumed
+                && cleanup.is_ok()
+                && let Err(ack_error) = acknowledge_boot_rebuild(ground_dir)
+            {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    ground_dir = %ground_dir.display(),
+                    error = %ack_error,
+                    "failed to finish original boot rebuild cleanup",
+                );
+            }
             Err(error)
         }
     }
@@ -1479,7 +1529,7 @@ async fn remove_partial_store(
     found: u32,
     error: &anyhow::Error,
     store_lock: StoreLockGuard,
-) {
+) -> anyhow::Result<()> {
     let path = ground_dir.to_path_buf();
     let cleanup = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         store_lock.validate_path(&path)?;
@@ -1501,7 +1551,7 @@ async fn remove_partial_store(
     .await
     .map_err(anyhow::Error::from)
     .and_then(|result| result);
-    match cleanup {
+    match &cleanup {
         Ok(()) => tracing::warn!(
             target: "hallouminate::daemon",
             ground_dir = %ground_dir.display(),
@@ -1519,6 +1569,7 @@ async fn remove_partial_store(
             "rebuild failed; could not remove partial ground data",
         ),
     }
+    cleanup
 }
 
 /// Prune old backups next to `ground_dir`. A stuck backup dir must never
@@ -1552,6 +1603,15 @@ fn migration_stage(ground_dir: &Path) -> PathBuf {
 // Keep proof outside stage until its final rmdir succeeds, including after a restart.
 fn migration_marker(ground_dir: &Path) -> PathBuf {
     ground_dir.join(".migration-published")
+}
+
+fn pending_boot_marker(ground_dir: &Path) -> PathBuf {
+    ground_dir.join(".migration-rebuild")
+}
+
+enum MigrationPurpose {
+    Boot,
+    Request,
 }
 
 struct PublishedMigration {
@@ -1608,8 +1668,14 @@ fn migration_proof(marker: &Path) -> anyhow::Result<MigrationProof> {
 
 fn verify_published_migration(ground_dir: &Path) -> anyhow::Result<Option<PublishedMigration>> {
     let stage = migration_stage(ground_dir);
-    let marker = migration_marker(ground_dir);
-    if !path_exists_no_follow(&marker)? {
+    let cleanup_marker = migration_marker(ground_dir);
+    let boot_marker = pending_boot_marker(ground_dir);
+    let cleanup_exists = path_exists_no_follow(&cleanup_marker)?;
+    let boot_exists = path_exists_no_follow(&boot_marker)?;
+    if cleanup_exists && boot_exists {
+        anyhow::bail!("ambiguous migration receipts in {}", ground_dir.display());
+    }
+    if !cleanup_exists && !boot_exists {
         if path_exists_no_follow(&stage)? {
             anyhow::bail!(
                 "interrupted store migration at {}; recover it before opening {}",
@@ -1619,6 +1685,11 @@ fn verify_published_migration(ground_dir: &Path) -> anyhow::Result<Option<Publis
         }
         return Ok(None);
     }
+    let marker = if boot_exists {
+        boot_marker
+    } else {
+        cleanup_marker
+    };
     let proof = migration_proof(&marker)?;
     let (_, backup) = resolved_store_paths(ground_dir, proof.version)?;
     if directory_identity(&backup)? != proof.next {
@@ -1659,6 +1730,10 @@ fn verify_published_migration(ground_dir: &Path) -> anyhow::Result<Option<Publis
 }
 
 fn cleanup_published_migration(migration: &PublishedMigration) -> anyhow::Result<()> {
+    let ground_dir = migration.stage.parent().expect("stage has parent");
+    if migration.marker != migration_marker(ground_dir) {
+        anyhow::bail!("boot rebuild is incomplete at {}", ground_dir.display());
+    }
     if path_exists_no_follow(&migration.stage)? {
         let cwd = std::env::current_dir()?.canonicalize()?;
         reject_live_directory(&migration.stage, &cwd)?;
@@ -1669,6 +1744,29 @@ fn cleanup_published_migration(migration: &PublishedMigration) -> anyhow::Result
         std::fs::remove_dir(&migration.stage)?;
     }
     std::fs::remove_file(&migration.marker)?;
+    Ok(())
+}
+
+fn acknowledge_boot_rebuild(ground_dir: &Path) -> anyhow::Result<()> {
+    let migration = verify_published_migration(ground_dir)?
+        .ok_or_else(|| anyhow::anyhow!("pending boot rebuild receipt disappeared"))?;
+    if migration.marker != pending_boot_marker(ground_dir) {
+        anyhow::bail!(
+            "pending boot rebuild receipt changed at {}",
+            ground_dir.display()
+        );
+    }
+    std::fs::rename(&migration.marker, migration_marker(ground_dir))?;
+    let migration = verify_published_migration(ground_dir)?
+        .ok_or_else(|| anyhow::anyhow!("published migration receipt disappeared"))?;
+    if let Err(error) = cleanup_published_migration(&migration) {
+        tracing::warn!(
+            target: "hallouminate::daemon",
+            backup = %migration.backup.display(),
+            error = %error,
+            "published store backup cleanup deferred",
+        );
+    }
     Ok(())
 }
 
@@ -1712,13 +1810,17 @@ async fn move_stale_store(
     ground_dir: &Path,
     found_version: u32,
     store_lock: StoreLockGuard,
+    purpose: MigrationPurpose,
 ) -> anyhow::Result<()> {
     let path = ground_dir.to_path_buf();
     let backup = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
         store_lock.validate_path(&path)?;
         let (ground_dir, backup) = resolved_store_paths(&path, found_version)?;
         let stage = migration_stage(&ground_dir);
-        let marker = migration_marker(&ground_dir);
+        let marker = match purpose {
+            MigrationPurpose::Boot => pending_boot_marker(&ground_dir),
+            MigrationPurpose::Request => migration_marker(&ground_dir),
+        };
         let cwd = std::env::current_dir()?.canonicalize()?;
         reject_live_directory(&ground_dir, &cwd)?;
         match std::fs::symlink_metadata(&backup) {
@@ -1734,7 +1836,10 @@ async fn move_stale_store(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        if path_exists_no_follow(&stage)? || path_exists_no_follow(&marker)? {
+        if path_exists_no_follow(&stage)?
+            || path_exists_no_follow(&migration_marker(&ground_dir))?
+            || path_exists_no_follow(&pending_boot_marker(&ground_dir))?
+        {
             anyhow::bail!(
                 "interrupted store migration at {}; recover it before opening {}",
                 stage.display(),
@@ -1828,7 +1933,9 @@ async fn move_stale_store(
         }
         let migration = verify_published_migration(&ground_dir)?
             .ok_or_else(|| anyhow::anyhow!("published migration proof disappeared"))?;
-        if let Err(error) = cleanup_published_migration(&migration) {
+        if let MigrationPurpose::Request = purpose
+            && let Err(error) = cleanup_published_migration(&migration)
+        {
             tracing::warn!(
                 target: "hallouminate::daemon",
                 backup = %migration.backup.display(),
@@ -1858,13 +1965,8 @@ async fn prune_stale_backups(
     max_age: Duration,
 ) -> anyhow::Result<()> {
     let ground_dir = ground_dir.canonicalize()?;
-    let marker = migration_marker(&ground_dir);
-    let protected_backup = if path_exists_no_follow(&marker)? {
-        let proof = migration_proof(&marker)?;
-        Some(resolved_store_paths(&ground_dir, proof.version)?.1)
-    } else {
-        None
-    };
+    let protected_backup =
+        verify_published_migration(&ground_dir)?.map(|migration| migration.backup);
     let parent = ground_dir
         .parent()
         .ok_or_else(|| anyhow::anyhow!("ground store has no parent"))?;
@@ -3350,7 +3452,7 @@ mod tests {
             .expect("join")
             .expect("backdate ground dir mtime");
 
-        move_stale_store(&ground_dir, 1, store_lock)
+        move_stale_store(&ground_dir, 1, store_lock, MigrationPurpose::Request)
             .await
             .expect("move");
 
@@ -3375,6 +3477,42 @@ mod tests {
             "backup just moved aside must survive its own boot's prune, \
              even though the source dir's mtime was 60d old",
         );
+    }
+
+    #[tokio::test]
+    async fn pending_boot_rebuild_protects_aged_backup() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let ground = tmp.path().join("ground");
+        let source = tmp.path().join("corpus");
+        std::fs::create_dir(&source).expect("corpus");
+        let mut cfg = Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = ground.to_string_lossy().into_owned();
+        cfg.corpora = vec![CorpusConfig {
+            name: "docs".into(),
+            paths: vec![source.to_string_lossy().into_owned()],
+            globs: vec!["**/*.md".into()],
+            exclude: vec![],
+            global: false,
+        }];
+        let _seeded = seed_stale_store(&ground, &cfg).await;
+        let owner = StoreLockOwner::for_process();
+        let lock = LanceStore::lock(&ground, &owner).await.expect("lock");
+        let version = hallouminate_adapters::default_schema_version_pub() - 1;
+        move_stale_store(&ground, version, lock, MigrationPurpose::Boot)
+            .await
+            .expect("publish backup");
+        let backup = ground.with_file_name(format!("ground.bak-v{version}"));
+        let identity = directory_identity(&backup).expect("published backup identity");
+        let aged = SystemTime::now() - STALE_BACKUP_MAX_AGE - Duration::from_secs(86_400);
+        std::fs::File::open(&backup)
+            .expect("backup")
+            .set_modified(aged)
+            .expect("age");
+        prune_stale_backups(&ground, SystemTime::now(), STALE_BACKUP_MAX_AGE)
+            .await
+            .expect("prune while rebuild pending");
+        assert!(directory_identity(&backup).expect("pending backup") == identity);
     }
 
     #[tokio::test]
