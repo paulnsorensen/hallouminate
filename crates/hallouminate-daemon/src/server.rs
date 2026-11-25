@@ -720,11 +720,20 @@ async fn handle_connection(
     #[cfg(unix)]
     let peer_identity = peer_credential_uid(&stream);
     #[cfg(unix)]
-    let daemon_identity = rustix::process::geteuid().as_raw();
+    let daemon_identity = Some(rustix::process::geteuid().as_raw());
     #[cfg(windows)]
     let peer_identity = stream.peer_user().ok();
     #[cfg(windows)]
-    let daemon_identity = crate::windows_security::current_user_sid()?.clone();
+    let daemon_identity = crate::windows_security::current_user_sid()
+        .inspect_err(|error| {
+            tracing::warn!(
+                target: "hallouminate::daemon",
+                error = %error,
+                "daemon account lookup failed; refusing mutating requests on this connection",
+            );
+        })
+        .ok()
+        .cloned();
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = ipc_lines(read_half);
     let frame = match tokio::time::timeout(idle_timeout, lines.next()).await {
@@ -879,24 +888,27 @@ fn acquire_single_instance(lock_path: &Path) -> anyhow::Result<std::fs::File> {
 /// [`serve_on_listener`]/[`prepare_socket_dir`]),
 /// so this only matters if those perms are loosened after boot on a shared
 /// machine. Read-only requests (Ping/Ground/List*/Backlinks/ReadMarkdown/
-/// CorpusStats) are unrestricted. `peer_identity: None` (credential lookup
-/// unsupported or failed) fails closed for mutating requests rather than
-/// silently allowing them.
+/// CorpusStats) are unrestricted. A `None` identity (peer credential or
+/// daemon account lookup unsupported or failed) fails closed for mutating
+/// requests rather than silently allowing them.
 fn authorize_peer<T: std::fmt::Display + PartialEq>(
     peer_identity: Option<T>,
-    daemon_identity: T,
+    daemon_identity: Option<T>,
     payload: &super::ipc::DaemonRequestPayload,
 ) -> Option<DaemonResponse> {
     if !is_mutating_payload(payload) {
         return None;
     }
-    match peer_identity {
-        Some(identity) if identity == daemon_identity => None,
-        Some(identity) => Some(DaemonResponse::invalid_params(format!(
-            "peer identity {identity} is not authorized for mutating requests (daemon identity {daemon_identity})"
+    match (peer_identity, daemon_identity) {
+        (Some(identity), Some(daemon)) if identity == daemon => None,
+        (Some(identity), Some(daemon)) => Some(DaemonResponse::invalid_params(format!(
+            "peer identity {identity} is not authorized for mutating requests (daemon identity {daemon})"
         ))),
-        None => Some(DaemonResponse::invalid_params(
+        (None, Some(_)) => Some(DaemonResponse::invalid_params(
             "peer credentials unavailable; refusing mutating request",
+        )),
+        (_, None) => Some(DaemonResponse::invalid_params(
+            "daemon identity unavailable; refusing mutating request",
         )),
     }
 }
@@ -1341,7 +1353,7 @@ mod tests {
         use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
         let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
         assert!(
-            authorize_peer(Some(501), 501, &payload).is_none(),
+            authorize_peer(Some(501), Some(501), &payload).is_none(),
             "same-uid peer must be authorized for a mutating request"
         );
     }
@@ -1350,7 +1362,7 @@ mod tests {
     fn authorize_peer_rejects_different_uid_mutating_request() {
         use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
         let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
-        let response = authorize_peer(Some(999), 501, &payload)
+        let response = authorize_peer(Some(999), Some(501), &payload)
             .expect("different-uid peer must be rejected for a mutating request");
         match response {
             DaemonResponse::Err { kind, message } => {
@@ -1436,7 +1448,7 @@ mod tests {
     fn authorize_peer_allows_different_uid_read_only_request() {
         use super::super::ipc::DaemonRequestPayload;
         assert!(
-            authorize_peer(Some(999), 501, &DaemonRequestPayload::Ping).is_none(),
+            authorize_peer(Some(999), Some(501), &DaemonRequestPayload::Ping).is_none(),
             "read-only requests must stay unrestricted regardless of peer uid"
         );
     }
@@ -1446,9 +1458,26 @@ mod tests {
         use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
         let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
         assert!(
-            authorize_peer(None, 501, &payload).is_some(),
+            authorize_peer(None, Some(501), &payload).is_some(),
             "unresolvable peer credentials must fail closed for a mutating request"
         );
+    }
+
+    #[test]
+    fn authorize_peer_without_daemon_identity_refuses_only_mutating_requests() {
+        use super::super::ipc::{AddMarkdownRequest, DaemonRequestPayload};
+        assert!(
+            authorize_peer(Some(501), None, &DaemonRequestPayload::Ping).is_none(),
+            "a failed daemon account lookup must not block read-only requests"
+        );
+        let payload = DaemonRequestPayload::AddMarkdown(AddMarkdownRequest::default());
+        let response = authorize_peer(Some(501), None, &payload)
+            .expect("a failed daemon account lookup must fail closed for a mutating request");
+        let DaemonResponse::Err { kind, message } = response else {
+            panic!("mutating request without a daemon identity succeeded");
+        };
+        assert_eq!(kind, super::super::ipc::ErrorKind::InvalidParams);
+        assert!(message.contains("daemon identity unavailable"), "{message}");
     }
 
     /// Acquire a lock we expect to have just been released, tolerating the
@@ -1551,9 +1580,9 @@ mod tests {
             items: Vec::new(),
         };
         assert_eq!(idle_clock_for(&payload), IdleClock::Restart);
-        assert!(authorize_peer(Some(501), 501, &payload).is_none());
+        assert!(authorize_peer(Some(501), Some(501), &payload).is_none());
         for uid in [None, Some(999)] {
-            let response = authorize_peer(uid, 501, &payload).expect("unauthorized");
+            let response = authorize_peer(uid, Some(501), &payload).expect("unauthorized");
             let DaemonResponse::Err { kind, message } = response else {
                 panic!("unauthorized batch succeeded");
             };
