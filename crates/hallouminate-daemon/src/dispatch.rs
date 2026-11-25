@@ -871,9 +871,7 @@ fn ground_failure_response(
         HallouminateError::Search(_) => ("search", true),
     };
     if echoes_query {
-        DaemonResponse::internal(format!(
-            "ground failed ({class} error); the daemon log has the cause"
-        ))
+        DaemonResponse::internal(format!("ground failed ({class} error)"))
     } else {
         DaemonResponse::internal(format!("ground failed ({class} error): {error}"))
     }
@@ -4827,7 +4825,22 @@ mod tests {
             expected: 2,
             ground_dir: std::path::PathBuf::from("/stale/ground"),
         };
-        let search = HallouminateError::Search("rg: secret-query-text".to_string());
+        let private_cause = "rg: secret-query-text";
+        let redacted = [
+            (HallouminateError::Embed(private_cause.to_string()), "embed"),
+            (
+                HallouminateError::Config(private_cause.to_string()),
+                "config",
+            ),
+            (
+                HallouminateError::Indexer(private_cause.to_string()),
+                "indexer",
+            ),
+            (
+                HallouminateError::Search(private_cause.to_string()),
+                "search",
+            ),
+        ];
 
         let stale_message = match ground_failure_response(&stale) {
             DaemonResponse::Err { kind, message } => {
@@ -4836,21 +4849,21 @@ mod tests {
             }
             DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
         };
-        let search_message = match ground_failure_response(&search) {
-            DaemonResponse::Err { kind, message } => {
-                assert_eq!(kind, ErrorKind::Internal);
-                message
-            }
-            DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
-        };
+        for (error, class) in redacted {
+            let message = match ground_failure_response(&error) {
+                DaemonResponse::Err { kind, message } => {
+                    assert_eq!(kind, ErrorKind::Internal);
+                    message
+                }
+                DaemonResponse::Ok { .. } => panic!("ground failure must be an error response"),
+            };
+            assert_eq!(message, format!("ground failed ({class} error)"));
+            assert!(!message.contains(private_cause), "{message}");
+        }
 
         assert_eq!(
             stale_message,
             format!("ground failed (store schema error): {stale}")
-        );
-        assert_eq!(
-            search_message,
-            "ground failed (search error); the daemon log has the cause"
         );
         let events = capture.events_for("hallouminate::daemon");
         assert!(events.is_empty(), "{events:?}");

@@ -1188,10 +1188,7 @@ mod tests {
             panic!("the store must reject the non-UTF-8 root");
         };
         assert_eq!(kind, super::super::ipc::ErrorKind::Internal);
-        assert_eq!(
-            message,
-            "ground failed (indexer error); the daemon log has the cause"
-        );
+        assert_eq!(message, "ground failed (indexer error)");
 
         let logs = capture.rendered();
         let mut failures = Vec::new();
