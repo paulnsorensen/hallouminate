@@ -596,7 +596,7 @@ async fn cleanup_retired_registration(
         let root = match checked {
             Ok(Ok(Some(root))) => root,
             Ok(Ok(None)) => {
-                if registration.detached.is_some() {
+                if registration.detached.is_some() || registration.ordinary_owner.is_some() {
                     registration.waiting_roots.push(retired.clone());
                 }
                 continue;
@@ -634,6 +634,14 @@ async fn cleanup_retired_registration(
         {
             return None;
         }
+        if (registration.detached.is_some() || registration.ordinary_owner.is_some())
+            && state
+                .watch_registry()
+                .live_claims_retired_root(&registration.cfg, path)
+        {
+            registration.waiting_roots.push(retired.clone());
+            continue;
+        }
         match resources.store.delete_root(&root).await {
             Ok(_) => {
                 tracing::info!(target: "hallouminate::daemon", root = %path.display(), ground_dir = %registration.cfg.storage.ground_dir, "watcher: retired root rows deleted");
@@ -648,7 +656,10 @@ async fn cleanup_retired_registration(
             }
         }
     }
-    if failed.is_empty() && registration.detached.is_none() {
+    if failed.is_empty()
+        && registration.detached.is_none()
+        && (registration.ordinary_owner.is_none() || registration.waiting_roots.is_empty())
+    {
         return None;
     }
     let failed_attempts = if failed.is_empty() {
@@ -8824,13 +8835,16 @@ body
             "third real observation retires old registration"
         );
         assert_eq!(jobs.len(), 1, "ordinary job admitted");
-        if let Pr786OrdinaryTiming::Parked = timing {
-            symlink(&repo, &repo).expect("ELOOP ancestor");
-            let failed = cleanup_retired_registration(&state, jobs.remove(0))
-                .await
-                .expect("ELOOP must park old job");
-            state.watch_registry().park_failed_cleanup(failed);
-            std::fs::remove_file(&repo).expect("remove ELOOP ancestor");
+        match timing {
+            Pr786OrdinaryTiming::Admitted => {}
+            Pr786OrdinaryTiming::Parked => {
+                symlink(&repo, &repo).expect("ELOOP ancestor");
+                let failed = cleanup_retired_registration(&state, jobs.remove(0))
+                    .await
+                    .expect("ELOOP must park old job");
+                state.watch_registry().park_failed_cleanup(failed);
+                std::fs::remove_file(&repo).expect("remove ELOOP ancestor");
+            }
         }
         create_repo("pr786ordinarynew");
         let (effective, _) =
@@ -8852,8 +8866,11 @@ body
             registered(&state, "ordinary"),
             "successor has only two absent observations"
         );
-        if let Pr786OrdinaryTiming::Parked = timing {
-            jobs = state.watch_registry().take_pending_cleanups();
+        match timing {
+            Pr786OrdinaryTiming::Admitted => {}
+            Pr786OrdinaryTiming::Parked => {
+                jobs = state.watch_registry().take_pending_cleanups();
+            }
         }
         for job in jobs {
             spawn_retired_cleanup(&state, &tracker, job);
@@ -8888,6 +8905,370 @@ body
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pr_786_parked_ordinary_cleanup_preserves_exact_successor_rows() {
         pr_786_ordinary_successor_survives_old_cleanup(Pr786OrdinaryTiming::Parked).await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum Pr786OrdinaryPairTiming {
+        NoSuccessor,
+        Admitted,
+        Parked,
+    }
+
+    #[cfg(unix)]
+    async fn pr_786_ordinary_pair_cleanup(timing: Pr786OrdinaryPairTiming) {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let a_parent = base.join("a-parent");
+        let a = a_parent.join("a");
+        let b = base.join("b");
+        let c = base.join("c");
+        let a_held = base.join("a-held");
+        let b_held = base.join("b-held");
+        let repo = base.join("repo");
+        let repo_held = base.join("repo-held");
+        for path in [&a, &b, &repo] {
+            std::fs::create_dir_all(path).expect("fixture directory");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&a, repo.join("a")).expect("a alias");
+        symlink(&b, repo.join("b")).expect("b alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"ordinary_pair\"\npaths = [\"a\", \"b\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let a_note = a.join("a.md");
+        let b_note = b.join("b.md");
+        std::fs::write(&a_note, "# A\n\npr786ordinaryreturna\n").expect("a note");
+        std::fs::write(&b_note, "# B\n\npr786ordinaryreturnb\n").expect("b note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![
+            a.display().to_string(),
+            b.display().to_string(),
+            c.display().to_string(),
+        ];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("ordinary_pair".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("initial index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register pair");
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        let a_query = corpus("ordinary_pair", a.to_str().expect("utf8"), &["**/*.md"]);
+        let b_query = corpus("ordinary_pair", b.to_str().expect("utf8"), &["**/*.md"]);
+        let a_key = a_query.corpus_keys().remove(0);
+        let b_key = b_query.corpus_keys().remove(0);
+        assert_eq!(store.list_files(&a_key).await.expect("a rows").len(), 1);
+        assert_eq!(store.list_files(&b_key).await.expect("b rows").len(), 1);
+
+        std::fs::rename(&repo, &repo_held).expect("hide checkout");
+        std::fs::rename(&a_parent, &a_held).expect("hide a");
+        std::fs::rename(&b, &b_held).expect("hide b");
+        let tracker = TaskTracker::new();
+        let mut jobs = Vec::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let observations = collect_root_observations(&state);
+            jobs.extend(
+                state
+                    .watch_registry()
+                    .record_absent_roots(&observations, MISSING_ROOT_RETIRE_TICKS),
+            );
+        }
+        assert_eq!(
+            jobs.len(),
+            1,
+            "ordinary group admitted after three real misses"
+        );
+        assert_eq!(jobs[0].roots, vec![a.clone(), b.clone()]);
+        match timing {
+            Pr786OrdinaryPairTiming::NoSuccessor => {}
+            Pr786OrdinaryPairTiming::Admitted => {}
+            Pr786OrdinaryPairTiming::Parked => {
+                symlink(&a_parent, &a_parent).expect("ELOOP at old a ancestor");
+                let failed = cleanup_retired_registration(&state, jobs.remove(0))
+                    .await
+                    .expect("ELOOP must park old ordinary job");
+                state.watch_registry().park_failed_cleanup(failed);
+                std::fs::remove_file(&a_parent).expect("remove ELOOP");
+            }
+        }
+        match timing {
+            Pr786OrdinaryPairTiming::NoSuccessor => {}
+            Pr786OrdinaryPairTiming::Admitted | Pr786OrdinaryPairTiming::Parked => {
+                std::fs::rename(&a_held, &a_parent).expect("restore a");
+                std::fs::rename(&repo_held, &repo).expect("restore checkout");
+                std::fs::create_dir(&c).expect("new c root");
+                symlink(&c, repo.join("c")).expect("new c alias");
+                let c_note = c.join("c.md");
+                std::fs::write(&a_note, "# A\n\npr786ordinarysuccessora\n")
+                    .expect("fresh a marker");
+                std::fs::write(&c_note, "# C\n\npr786ordinarysuccessorc\n")
+                    .expect("fresh c marker");
+                std::fs::write(
+                    &config_path,
+                    "[[corpus]]\nname = \"ordinary_pair\"\npaths = [\"a\", \"c\"]\nglobs = [\"**/*.md\"]\n",
+                )
+                .expect("partial config");
+                reload_repo_layer(
+                    &state,
+                    &config_path,
+                    &tracker,
+                    &mut ReloadFailureMemo::new(),
+                );
+                let (effective, _) = hallouminate_config::resolve_for_cwd(&cfg, &repo, None)
+                    .expect("resolve partial repo");
+                assert_eq!(effective.corpora.len(), 1);
+                assert_eq!(effective.corpora[0].paths.len(), 2);
+                let roots = watch_roots_for(&effective.corpora[0]);
+                assert!(state.watch_registry().is_registered_unchanged(
+                    &registry::ConfigSource::RepoLayer(config_path.clone()),
+                    &effective.corpora[0],
+                    &std::sync::Arc::new(effective.clone()),
+                    &roots,
+                ));
+                let result = crate::dispatch::dispatch(
+                    &state,
+                    DaemonRequest {
+                        cwd: repo.clone(),
+                        payload: DaemonRequestPayload::Index(IndexRequest {
+                            corpus: Some("ordinary_pair".into()),
+                            paths_from: None,
+                            strict: false,
+                            background: false,
+                        }),
+                    },
+                )
+                .await;
+                let DaemonResponse::Ok { .. } = result else {
+                    panic!("partial index must succeed: {result:?}");
+                };
+                let c_query = corpus("ordinary_pair", c.to_str().expect("utf8"), &["**/*.md"]);
+                let c_key = c_query.corpus_keys().remove(0);
+                assert_eq!(
+                    store.list_files(&a_key).await.expect("fresh a rows").len(),
+                    1
+                );
+                assert_eq!(
+                    store.list_files(&c_key).await.expect("fresh c rows").len(),
+                    1
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &a_query,
+                        "pr786ordinarysuccessora",
+                        &a_note
+                    )
+                    .await
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &c_query,
+                        "pr786ordinarysuccessorc",
+                        &c_note
+                    )
+                    .await
+                );
+                std::fs::rename(&a_parent, &a_held).expect("hide fresh a without deleting bytes");
+                let jobs = match timing {
+                    Pr786OrdinaryPairTiming::NoSuccessor => {
+                        panic!("successor branch requires successor")
+                    }
+                    Pr786OrdinaryPairTiming::Admitted => jobs,
+                    Pr786OrdinaryPairTiming::Parked => {
+                        state.watch_registry().take_pending_cleanups()
+                    }
+                };
+                for job in jobs {
+                    spawn_retired_cleanup(&state, &tracker, job);
+                }
+                tracker.close();
+                tracker.wait().await;
+                assert_eq!(
+                    store
+                        .list_files(&a_key)
+                        .await
+                        .expect("protected a rows")
+                        .len(),
+                    1,
+                    "old ordinary cleanup must not erase canonical a rows"
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &a_query,
+                        "pr786ordinarysuccessora",
+                        &a_note
+                    )
+                    .await
+                );
+                assert_eq!(
+                    store
+                        .list_files(&b_key)
+                        .await
+                        .expect("retired b rows")
+                        .len(),
+                    0
+                );
+                assert!(
+                    !pr_786_followup_index_contains(
+                        &state,
+                        &b_query,
+                        "pr786ordinaryreturnb",
+                        &b_note
+                    )
+                    .await
+                );
+                assert_eq!(
+                    store.list_files(&c_key).await.expect("live c rows").len(),
+                    1
+                );
+                assert!(
+                    pr_786_followup_index_contains(
+                        &state,
+                        &c_query,
+                        "pr786ordinarysuccessorc",
+                        &c_note
+                    )
+                    .await
+                );
+                assert_eq!(
+                    std::fs::read_to_string(a_held.join("a/a.md")).expect("a source bytes"),
+                    "# A\n\npr786ordinarysuccessora\n"
+                );
+                return;
+            }
+        }
+        std::fs::rename(&a_held, &a_parent).expect("a returns before final probe");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("returned a rows")
+                .len(),
+            1
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &a_query, "pr786ordinaryreturna", &a_note).await
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("retired b rows")
+                .len(),
+            0
+        );
+        assert!(
+            !pr_786_followup_index_contains(&state, &b_query, "pr786ordinaryreturnb", &b_note)
+                .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(&a_note).expect("returned a bytes"),
+            "# A\n\npr786ordinaryreturna\n"
+        );
+
+        std::fs::rename(&a_parent, &a_held).expect("a absent again");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+            retire_missing_registrations(&state, &tracker);
+            assert_eq!(
+                store
+                    .list_files(&a_key)
+                    .await
+                    .expect("a before threshold")
+                    .len(),
+                1
+            );
+            assert!(
+                pr_786_followup_index_contains(&state, &a_query, "pr786ordinaryreturna", &a_note)
+                    .await
+            );
+        }
+        retire_missing_registrations(&state, &tracker);
+        for job in state.watch_registry().take_pending_cleanups() {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("retired returned a rows")
+                .len(),
+            0,
+            "third fresh absence must delete the returned ordinary root"
+        );
+        assert!(
+            !pr_786_followup_index_contains(&state, &a_query, "pr786ordinaryreturna", &a_note)
+                .await
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("b stays retired")
+                .len(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_held.join("a/a.md")).expect("held a bytes"),
+            "# A\n\npr786ordinaryreturna\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_returned_ordinary_root_retires_after_fresh_absence_sequence() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::NoSuccessor).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_admitted_ordinary_partial_successor_preserves_a_rows() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::Admitted).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_parked_ordinary_partial_successor_preserves_a_rows() {
+        pr_786_ordinary_pair_cleanup(Pr786OrdinaryPairTiming::Parked).await;
     }
 
     #[cfg(unix)]
@@ -9418,6 +9799,323 @@ body
             pr_786_followup_index_contains(&state, &query, "pr786newindex", &note).await,
             "old cleanup must not delete exact successor rows before its own third observation"
         );
+    }
+
+    #[cfg(unix)]
+    async fn pr_786_partial_successor_survives_old_group_cleanup(timing: Pr786OldJobTiming) {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let external = base.join("external");
+        let a = external.join("a");
+        let b = external.join("b");
+        let a_held = external.join("a-held");
+        let b_held = external.join("b-held");
+        let repo = base.join("repo");
+        for path in [&external, &a, &b, &repo] {
+            std::fs::create_dir(path).expect("fixture directory");
+        }
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&external, repo.join("external")).expect("external alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        let old_config = "[[corpus]]\nname = \"pair\"\npaths = [\"external/a\", \"external/b\"]\nglobs = [\"**/*.md\"]\n";
+        let successor_name = match timing {
+            Pr786OldJobTiming::Queued => "pair",
+            Pr786OldJobTiming::Admitted => "replacement",
+        };
+        let new_config = format!(
+            "[[corpus]]\nname = \"{successor_name}\"\npaths = [\"external/a\"]\nglobs = [\"**/*.md\"]\n"
+        );
+        std::fs::write(&config_path, old_config).expect("old config");
+        let a_note = a.join("a.md");
+        let b_note = b.join("b.md");
+        std::fs::write(&a_note, "# A\n\npr786partialold\n").expect("old a note");
+        std::fs::write(&b_note, "# B\n\npr786partialb\n").expect("b note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![external.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let index = |name: &str| DaemonRequest {
+            cwd: repo.clone(),
+            payload: DaemonRequestPayload::Index(IndexRequest {
+                corpus: Some(name.into()),
+                paths_from: None,
+                strict: false,
+                background: false,
+            }),
+        };
+        let result = crate::dispatch::dispatch(&state, index("pair")).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("old index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve old repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register old pair");
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        let old_a_key = corpus("pair", a.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        let b_key = corpus("pair", b.to_str().expect("utf8"), &["**/*.md"])
+            .corpus_keys()
+            .remove(0);
+        assert_eq!(
+            store
+                .list_files(&old_a_key)
+                .await
+                .expect("old a files")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.list_files(&b_key).await.expect("old b files").len(),
+            1
+        );
+
+        let tracker = TaskTracker::new();
+        std::fs::remove_dir_all(&repo).expect("remove old checkout");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        std::fs::rename(&a, &a_held).expect("hold a bytes");
+        std::fs::rename(&b, &b_held).expect("hold b bytes");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert!(state.watch_registry().detached_probes().is_empty());
+        std::fs::rename(&a_held, &a).expect("restore a bytes");
+        std::fs::rename(&b_held, &b).expect("restore b bytes");
+        let jobs = state.watch_registry().take_pending_cleanups();
+        assert_eq!(jobs.len(), 1, "both absent roots queue one old group");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        let detached = state.watch_registry().detached_probes();
+        assert_eq!(detached.len(), 1, "returned old roots rearm");
+        assert_eq!(detached[0].1.len(), 2, "both old roots rearm");
+        let tracker = TaskTracker::new();
+        let mut admitted = Vec::new();
+        std::fs::rename(&a, &a_held).expect("hide rearmed a");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        match timing {
+            Pr786OldJobTiming::Queued => {}
+            Pr786OldJobTiming::Admitted => {
+                admitted = state.watch_registry().take_pending_cleanups();
+                assert_eq!(admitted.len(), 1, "old a job admitted before partial owner");
+                assert_eq!(admitted[0].roots, vec![a.clone()]);
+            }
+        }
+        std::fs::rename(&a_held, &a).expect("restore old a bytes");
+        std::fs::create_dir(&repo).expect("restore same checkout");
+        std::fs::create_dir(repo.join(".git")).expect("restore git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("restore config dir");
+        symlink(&external, repo.join("external")).expect("restore alias");
+        std::fs::write(&config_path, &new_config).expect("partial config");
+        reload_repo_layer(
+            &state,
+            &config_path,
+            &tracker,
+            &mut ReloadFailureMemo::new(),
+        );
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve partial repo");
+        assert_eq!(effective.corpora.len(), 1);
+        assert_eq!(effective.corpora[0].paths.len(), 1);
+        let roots = watch_roots_for(&effective.corpora[0]);
+        assert!(state.watch_registry().is_registered_unchanged(
+            &registry::ConfigSource::RepoLayer(config_path.clone()),
+            &effective.corpora[0],
+            &std::sync::Arc::new(effective.clone()),
+            &roots,
+        ));
+        std::fs::write(&a_note, "# A\n\npr786partialnew\n").expect("new a marker");
+        let result = crate::dispatch::dispatch(&state, index(successor_name)).await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("partial index must succeed: {result:?}");
+        };
+        let query = corpus(successor_name, a.to_str().expect("utf8"), &["**/*.md"]);
+        let a_key = query.corpus_keys().remove(0);
+        assert_eq!(
+            store.list_files(&a_key).await.expect("new a files").len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&a_key)
+                .await
+                .expect("new a chunks")
+                .total_chunks
+                > 0
+        );
+        assert!(pr_786_followup_index_contains(&state, &query, "pr786partialnew", &a_note).await);
+
+        std::fs::rename(&a, &a_held).expect("hide a without deleting bytes");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+            retire_missing_registrations(&state, &tracker);
+        }
+        assert_eq!(
+            state.watch_registry().snapshot_roots().len(),
+            1,
+            "partial successor has only two missing observations",
+        );
+        match timing {
+            Pr786OldJobTiming::Queued => {
+                admitted = state.watch_registry().take_pending_cleanups();
+                assert_eq!(admitted.len(), 1, "old a job stayed queued across reload");
+                assert_eq!(admitted[0].roots, vec![a.clone()]);
+            }
+            Pr786OldJobTiming::Admitted => {}
+        }
+        for job in admitted {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("protected a file map")
+                .len(),
+            1,
+            "old group cannot delete the partial successor's canonical a file map"
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&a_key)
+                .await
+                .expect("protected a chunks")
+                .total_chunks
+                > 0
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &query, "pr786partialnew", &a_note).await,
+            "old group cannot erase production-visible partial successor content"
+        );
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("live b file map")
+                .len(),
+            1
+        );
+        assert!(
+            pr_786_followup_index_contains(
+                &state,
+                &corpus("pair", b.to_str().expect("utf8"), &["**/*.md"]),
+                "pr786partialb",
+                &b_note,
+            )
+            .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_held.join("a.md")).expect("a bytes"),
+            "# A\n\npr786partialnew\n"
+        );
+        std::fs::rename(&b, &b_held).expect("hide unowned b bytes");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS - 1 {
+            retire_missing_registrations(&state, &tracker);
+            assert_eq!(
+                store
+                    .list_files(&b_key)
+                    .await
+                    .expect("b rows before own threshold")
+                    .len(),
+                1
+            );
+        }
+        retire_missing_registrations(&state, &tracker);
+        let jobs = state.watch_registry().take_pending_cleanups();
+        let mut b_job_found = false;
+        for job in &jobs {
+            if job.roots.contains(&b) {
+                b_job_found = true;
+            }
+        }
+        assert!(b_job_found, "unowned b queues after its own third miss");
+        for job in jobs {
+            spawn_retired_cleanup(&state, &tracker, job);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&b_key)
+                .await
+                .expect("retired b file map")
+                .len(),
+            0
+        );
+        assert!(
+            !pr_786_followup_index_contains(
+                &state,
+                &corpus("pair", b.to_str().expect("utf8"), &["**/*.md"]),
+                "pr786partialb",
+                &b_note,
+            )
+            .await
+        );
+        assert_eq!(
+            std::fs::read_to_string(b_held.join("b.md")).expect("b bytes"),
+            "# B\n\npr786partialb\n"
+        );
+
+        std::fs::remove_dir_all(&repo).expect("retire partial owner");
+        let tracker = TaskTracker::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            retire_missing_registrations(&state, &tracker);
+        }
+        tracker.close();
+        tracker.wait().await;
+        assert_eq!(
+            store
+                .list_files(&a_key)
+                .await
+                .expect("retired a file map")
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .list_files(&old_a_key)
+                .await
+                .expect("original a file map")
+                .len(),
+            0
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_held.join("a.md")).expect("a bytes after retirement"),
+            "# A\n\npr786partialnew\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_queued_partial_successor_preserves_canonical_a_rows() {
+        pr_786_partial_successor_survives_old_group_cleanup(Pr786OldJobTiming::Queued).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_admitted_partial_successor_other_corpus_preserves_canonical_a_rows() {
+        pr_786_partial_successor_survives_old_group_cleanup(Pr786OldJobTiming::Admitted).await;
     }
 
     #[cfg(unix)]

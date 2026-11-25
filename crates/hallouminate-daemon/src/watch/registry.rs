@@ -1331,23 +1331,12 @@ impl WatchRegistry {
     /// Returns failed cleanup to the FIFO without retaining an execution permit.
     pub(crate) fn park_failed_cleanup(&self, mut registration: RetiredRegistration) {
         registration._permit = None;
-        if let Some(owner) = &registration.ordinary_owner {
-            let guard = self.lock();
-            if !owner.load(Ordering::SeqCst)
-                || !guard
-                    .detached
-                    .iter()
-                    .any(|entry| Arc::ptr_eq(&entry.token, owner))
-            {
-                return;
-            }
-            self.pending_cleanups
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push_back(PendingCleanup::Retired(registration));
-            return;
-        }
-        let Some(token) = registration.detached.as_ref().cloned() else {
+        let Some(token) = registration
+            .detached
+            .as_ref()
+            .or(registration.ordinary_owner.as_ref())
+            .cloned()
+        else {
             self.pending_cleanups
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1492,6 +1481,22 @@ impl WatchRegistry {
         probes
     }
 
+    /// Whether a live registration owns this exact physical root in the same store.
+    pub(crate) fn live_claims_retired_root(&self, cfg: &Config, root: &Path) -> bool {
+        let guard = self.lock();
+        for (id, registration) in &guard.regs {
+            if registration.cfg.storage.ground_dir != cfg.storage.ground_dir {
+                continue;
+            }
+            for saved in registration.saved_roots(id) {
+                if saved == root {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(crate) fn detached_probes(&self) -> Vec<(Arc<()>, Vec<PathBuf>)> {
         let guard = self.lock();
         let mut probes = Vec::new();
@@ -1510,6 +1515,12 @@ impl WatchRegistry {
     ) {
         let mut guard = self.lock();
         let mut ready = Vec::new();
+        let mut claims = HashSet::new();
+        for (id, registration) in &guard.regs {
+            for root in registration.saved_roots(id) {
+                claims.insert((registration.cfg.storage.ground_dir.clone(), root));
+            }
+        }
         for detached in &mut guard.detached {
             let Some(DetachedRootObservation { absences, .. }) = observations
                 .iter()
@@ -1535,10 +1546,12 @@ impl WatchRegistry {
                 }
             } else {
                 for (root, ticks) in &mut detached.rearmed_ticks {
-                    let absent = absences
-                        .iter()
-                        .find(|(path, _)| path == root)
-                        .is_some_and(|(_, absent)| *absent);
+                    let absent = !claims
+                        .contains(&(detached.cfg.storage.ground_dir.clone(), root.clone()))
+                        && absences
+                            .iter()
+                            .find(|(path, _)| path == root)
+                            .is_some_and(|(_, absent)| *absent);
                     if absent {
                         *ticks = ticks.saturating_add(1);
                     } else {
@@ -2210,6 +2223,27 @@ mod tests {
         assert_eq!(outcome1, RegisterOutcome::New);
         assert_eq!(outcome2, RegisterOutcome::AlreadyRegistered);
         assert_eq!(registry.snapshot_roots().len(), 1);
+    }
+
+    #[test]
+    fn retired_root_claim_requires_same_path_and_ground_store() {
+        let registry = WatchRegistry::new();
+        let mut current = Config::default();
+        current.storage.ground_dir = "/ground-b".into();
+        assert_eq!(
+            registry.register(
+                ConfigSource::Baseline,
+                corpus("current"),
+                Arc::new(current.clone()),
+                vec![root("/target", corpus("current"))],
+            ),
+            RegisterOutcome::New
+        );
+        let mut retired = current.clone();
+        retired.storage.ground_dir = "/ground-a".into();
+        assert!(!registry.live_claims_retired_root(&retired, Path::new("/target")));
+        assert!(!registry.live_claims_retired_root(&current, Path::new("/other")));
+        assert!(registry.live_claims_retired_root(&current, Path::new("/target")));
     }
 
     fn detached_registry_at_cap() -> (WatchRegistry, Arc<Config>, Vec<WatchRoot>) {
