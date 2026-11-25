@@ -24,13 +24,14 @@ Do not describe them as one rule.
 (`crates/hallouminate-daemon/src/dispatch.rs`, `let union = req.corpus.is_none()`)
 searches every effective corpus — the repo's own wiki, every `[[corpus]]`
 entry, every `[[repository]]` wiki, and `repo:<name>:corpus` source corpora
-when configured. The wiki for the repository containing `cwd` becomes
-`priority_corpus`; `ground_union` reserves the first result slots for it
-(`RESERVED_LOCAL_SLOTS`, PR #425) and ranks the rest by fused score. Each hit
-carries `provenance.corpus`, and the response adds a `cross-repo-union`
-advisory warning. Passing an explicit `corpus` pins the search to that one
-corpus. This union default shipped in #117/#426; `cwd` feeds
-`priority_corpus`, not scope.
+when configured. The wiki for the repository containing `cwd` is the
+`priority_corpus`. For hit output, equal scores favor this wiki when
+selecting files. The `top_files` cutoff keeps up to two of its scored
+files if other corpora would crowd them out. This reserve applies to
+selection, not first place in the rendered results.[^union-selection]
+Each hit carries `provenance.corpus`. The response adds a
+`cross-repo-union` advisory warning. An explicit `corpus` restricts the
+search to that corpus. The union default shipped in #117/#426.
 
 **Other read tools default to wiki-for-cwd.** `list_files`, `list_tree`,
 `corpus_stats`, `backlinks`, and (since 0.7.0) `read_markdown` resolve an
@@ -48,10 +49,9 @@ Gotcha (2026-09, review of PR #492/#493): `SERVER_INSTRUCTIONS` in
 the same file and the daemon both unioned. Agents omitted `corpus`, expected
 local scope, got cross-repo hits, and filed them as "wrong wiki results".
 That text mismatch — not scoping or ranking — was the mechanism. The fix
-lands in PR #493. If `ground` still surfaces the wrong repo first, tune
-`RESERVED_LOCAL_SLOTS` or use the `inherit_global_corpora = false` repo
-opt-out from PR #492 (see [config-layering](config-layering.md)); do not
-reintroduce a wiki-for-cwd scope default for `ground`.
+lands in PR #493. To search one corpus, pass `corpus` explicitly.
+To skip inherited global corpora, set `inherit_global_corpora = false`
+(see [config-layering](config-layering.md) and PR #492).
 
 ## Tools
 
@@ -84,9 +84,9 @@ reading every `index.md` first.
 Semantic search. Embeds the query with the configured embeddings model
 (default `snowflake/snowflake-arctic-embed-s`), retrieves top chunks from LanceDB,
 rolls up per-file with breadcrumb context. Params: `query` (required),
-`corpus` (omit to union every effective corpus with wiki-for-cwd ranked
-first; see Default corpus), `top_files`, `chunks_per_file`,
-`limit`, `snippet_chars`, `footnotes`. Returns a ripgrep-style outline in
+`corpus` (omit to search the union; see Default corpus), `top_files`,
+`chunks_per_file`, `limit`, `snippet_chars`, `footnotes`. Returns a
+ripgrep-style outline in
 `content` and the full structured response in `structuredContent.docs`.
 
 `footnotes` (`include` default / `exclude` / `only`, defined at
@@ -336,6 +336,7 @@ that's exactly the multi-process race the daemon exists to prevent.
 
 [^batches]: crates/hallouminate/src/mcp/tools.rs::add_markdown_batch and ::read_markdown_batch; crates/hallouminate-daemon/src/dispatch.rs::handle_add_markdown_batch; crates/hallouminate-daemon/src/client.rs::DaemonClient::call_raw and ::call_raw_with_timeout
 [^retrieval]: crates/hallouminate-domain/src/ground/format.rs::render_outline; crates/hallouminate-domain/src/search.rs::search_fused; plugins/hallouminate/skills/wiki-query/SKILL.md
+[^union-selection]: crates/hallouminate-domain/src/ground/orchestrate.rs:352-365,566-575,630-697; crates/hallouminate-domain/src/ground/format.rs:100-113
 [^phrase-body]: crates/hallouminate-domain/src/search/phrase.rs::search_phrase_in and ::body_occurrence_count; crates/hallouminate-adapters/src/lance.rs::retrieve_phrase_with and test retrieve_phrase_scans_body_text_not_summary_only_rows; PR #586
 
 _Source: PR #561, issue #453, and PR #586 · Updated: 2026-10-16 · Supersedes: singular-only markdown call documentation, first-root write wording, and phrase matching on breadcrumb or summary text_
