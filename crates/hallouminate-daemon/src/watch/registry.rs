@@ -94,6 +94,34 @@ fn registration_equivalent(
         && !cfg_binding_differs(&existing.cfg, cfg)
 }
 
+fn detached_matches(
+    detached: &DetachedRegistration,
+    id: &RegistrationId,
+    cfg: &Config,
+    roots: &[WatchRoot],
+) -> bool {
+    if detached.retired.corpus != id.corpus_key.name
+        || detached.retired.root != id.corpus_key.canonical_root
+        || cfg_binding_differs(&detached.retired.cfg, cfg)
+        || detached.retired.roots.len() != roots.len()
+    {
+        return false;
+    }
+    for (saved, root) in detached.retired.roots.iter().zip(roots) {
+        if root.resolution != RootResolution::Resolved {
+            return false;
+        }
+        let actual = root
+            .canonical_file_root
+            .as_ref()
+            .unwrap_or(&root.canonical_watched);
+        if saved != actual {
+            return false;
+        }
+    }
+    true
+}
+
 fn stabilize_unresolved_roots(guard: &Inner, corpus: &CorpusConfig, roots: &mut [WatchRoot]) {
     for (index, root) in roots.iter_mut().enumerate() {
         if root.resolution != RootResolution::Unresolved {
@@ -263,6 +291,7 @@ struct Registration {
     /// Consecutive reconcile ticks that found this registration's root
     /// absent; `record_absent_roots` resets it when the root reappears.
     absent_ticks: u32,
+    checkout_absent_ticks: u32,
     /// Consecutive identical reconcile failures `repeats_last_error` has
     /// suppressed; resets at each reminder.
     error_repeats: u32,
@@ -352,6 +381,15 @@ impl RetiredRegistration {
         retired_count: &Arc<AtomicUsize>,
         permit: OwnedSemaphorePermit,
     ) -> Self {
+        Self::from_registration_with_permit(id, registration, retired_count, Some(permit))
+    }
+
+    fn from_registration_with_permit(
+        id: &RegistrationId,
+        registration: &Registration,
+        retired_count: &Arc<AtomicUsize>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Self {
         let roots = registration.saved_roots(id);
         Self {
             corpus: id.corpus_key.name.clone(),
@@ -360,13 +398,20 @@ impl RetiredRegistration {
             lock_keys: registration.lock_keys.clone(),
             cfg: registration.cfg.clone(),
             failed_attempts: 0,
-            _permit: Some(permit),
+            _permit: permit,
             _ticket: match &id.source {
                 ConfigSource::Baseline => None,
                 ConfigSource::RepoLayer(_) => Some(RetirementTicket::new(retired_count)),
             },
         }
     }
+}
+
+struct DetachedRegistration {
+    source: ConfigSource,
+    binding: Arc<()>,
+    retired: RetiredRegistration,
+    absent_ticks: u32,
 }
 
 enum PendingCleanup {
@@ -385,6 +430,7 @@ pub(crate) struct RootProbe {
 #[derive(Clone, Copy)]
 pub(crate) enum RootPresence {
     Absent,
+    CheckoutAbsent,
     Present,
 }
 
@@ -412,6 +458,7 @@ struct Inner {
     regs: HashMap<RegistrationId, Registration>,
     queue: VecDeque<RegistrationId>,
     active: Vec<ActiveGroup>,
+    detached: Vec<DetachedRegistration>,
     retry_sources: HashSet<PathBuf>,
     /// Bumped on every mutation that already notifies `changed`, plus every
     /// `refresh_roots` re-key. Lets the pump's per-iteration reconcile skip
@@ -465,6 +512,7 @@ impl WatchRegistry {
                 regs: HashMap::new(),
                 queue: VecDeque::new(),
                 active: Vec::new(),
+                detached: Vec::new(),
                 retry_sources: HashSet::new(),
                 generation: 0,
             }),
@@ -539,6 +587,7 @@ impl WatchRegistry {
                 reconciled_once: true,
                 retry_on_tick: false,
                 absent_ticks: 0,
+                checkout_absent_ticks: 0,
                 error_repeats: 0,
             },
         );
@@ -607,7 +656,11 @@ impl WatchRegistry {
             let replaces_runtime = guard.regs.contains_key(&id)
                 || obsolete
                     .iter()
-                    .any(|existing| matches!(existing.source, ConfigSource::RepoLayer(_)));
+                    .any(|existing| matches!(existing.source, ConfigSource::RepoLayer(_)))
+                || guard
+                    .detached
+                    .iter()
+                    .any(|detached| detached_matches(detached, &id, &cfg, &roots));
             if runtime_count + self.retired_runtime.load(Ordering::SeqCst)
                 >= MAX_RUNTIME_REGISTRATIONS
                 && !replaces_runtime
@@ -639,6 +692,13 @@ impl WatchRegistry {
         };
         release_admission(&mut guard, &id);
         guard.queue.retain(|queued| queued != &id);
+        if let Some(index) = guard
+            .detached
+            .iter()
+            .position(|detached| detached_matches(detached, &id, &cfg, &roots))
+        {
+            guard.detached.remove(index);
+        }
         guard.regs.insert(
             id.clone(),
             Registration {
@@ -656,6 +716,7 @@ impl WatchRegistry {
                 reconciled_once: false,
                 retry_on_tick: false,
                 absent_ticks: 0,
+                checkout_absent_ticks: 0,
                 error_repeats: 0,
             },
         );
@@ -768,6 +829,8 @@ impl WatchRegistry {
             };
             registration.roots = roots;
             registration.binding = Arc::new(());
+            registration.absent_ticks = 0;
+            registration.checkout_absent_ticks = 0;
             if registration.catch_up == CatchUpState::InFlight {
                 registration.catch_up = CatchUpState::Queued;
                 release_admission(&mut guard, &old_id);
@@ -787,6 +850,8 @@ impl WatchRegistry {
             {
                 registration.roots = roots.clone();
                 registration.binding = Arc::new(());
+                registration.absent_ticks = 0;
+                registration.checkout_absent_ticks = 0;
             }
         }
     }
@@ -865,11 +930,23 @@ impl WatchRegistry {
                     .keys()
                     .filter(|id| matches!(id.source, ConfigSource::RepoLayer(_)))
                     .count();
-                let added = candidate_ids
-                    .iter()
-                    .filter(|id| !guard.regs.contains_key(*id))
-                    .count();
-                live + self.retired_runtime.load(Ordering::SeqCst) + added
+                let mut added = 0;
+                let mut reusable = HashSet::new();
+                let mut seen = HashSet::new();
+                for (id, _, roots) in &candidates {
+                    if !seen.insert(id.clone()) || guard.regs.contains_key(id) {
+                        continue;
+                    }
+                    added += 1;
+                    for (index, detached) in guard.detached.iter().enumerate() {
+                        if !reusable.contains(&index) && detached_matches(detached, id, &cfg, roots)
+                        {
+                            reusable.insert(index);
+                            break;
+                        }
+                    }
+                }
+                live + self.retired_runtime.load(Ordering::SeqCst) + added - reusable.len()
                     > MAX_RUNTIME_REGISTRATIONS
             }
         };
@@ -915,7 +992,13 @@ impl WatchRegistry {
             }
         }
         for (id, corpus, roots) in candidates {
-            if over_limit && !guard.regs.contains_key(&id) {
+            if over_limit
+                && !guard.regs.contains_key(&id)
+                && !guard
+                    .detached
+                    .iter()
+                    .any(|detached| detached_matches(detached, &id, &cfg, &roots))
+            {
                 continue;
             }
             if guard
@@ -947,6 +1030,13 @@ impl WatchRegistry {
                 release_admission(&mut guard, &id);
             }
             guard.queue.retain(|queued| queued != &id);
+            if let Some(index) = guard
+                .detached
+                .iter()
+                .position(|detached| detached_matches(detached, &id, &cfg, &roots))
+            {
+                guard.detached.remove(index);
+            }
             guard.regs.insert(
                 id.clone(),
                 Registration {
@@ -964,6 +1054,7 @@ impl WatchRegistry {
                     reconciled_once: false,
                     retry_on_tick: false,
                     absent_ticks: 0,
+                    checkout_absent_ticks: 0,
                     error_repeats: 0,
                 },
             );
@@ -986,6 +1077,11 @@ impl WatchRegistry {
             guard.retry_sources.iter().cloned().collect();
         for id in guard.regs.keys() {
             if let ConfigSource::RepoLayer(path) = &id.source {
+                paths.insert(path.clone());
+            }
+        }
+        for detached in &guard.detached {
+            if let ConfigSource::RepoLayer(path) = &detached.source {
                 paths.insert(path.clone());
             }
         }
@@ -1197,6 +1293,51 @@ impl WatchRegistry {
         probes
     }
 
+    pub(crate) fn detached_probes(&self) -> Vec<(Arc<()>, Vec<PathBuf>)> {
+        let guard = self.lock();
+        let mut probes = Vec::new();
+        for detached in &guard.detached {
+            probes.push((detached.binding.clone(), detached.retired.roots.clone()));
+        }
+        probes
+    }
+
+    pub(crate) fn record_detached_absence(&self, observations: &[(Arc<()>, bool)], threshold: u32) {
+        let mut guard = self.lock();
+        let mut expired = Vec::new();
+        for (index, detached) in guard.detached.iter_mut().enumerate() {
+            let Some((_, absent)) = observations
+                .iter()
+                .find(|(binding, _)| Arc::ptr_eq(binding, &detached.binding))
+            else {
+                continue;
+            };
+            if *absent {
+                detached.absent_ticks = detached.absent_ticks.saturating_add(1);
+            } else {
+                detached.absent_ticks = 0;
+            }
+            if detached.absent_ticks >= threshold {
+                expired.push(index);
+            }
+        }
+        if expired.is_empty() {
+            return;
+        }
+        let mut pending = self
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for index in expired.into_iter().rev() {
+            let detached = guard.detached.remove(index);
+            pending.push_back(PendingCleanup::Retired(detached.retired));
+        }
+        guard.generation += 1;
+        drop(pending);
+        drop(guard);
+        self.signal_changed();
+    }
+
     /// Applies only observations whose binding still matches the registration.
     /// A stale or missing observation neither ages nor revives a replacement.
     pub(crate) fn record_absent_roots(
@@ -1206,6 +1347,7 @@ impl WatchRegistry {
     ) -> Vec<RetiredRegistration> {
         let mut guard = self.lock();
         let mut expired = Vec::new();
+        let mut detached = Vec::new();
         let mut revived = Vec::new();
         for (id, reg) in &mut guard.regs {
             let Some(observed) = observations.get(id) else {
@@ -1217,6 +1359,7 @@ impl WatchRegistry {
             match observed.presence {
                 RootPresence::Present => {
                     reg.absent_ticks = 0;
+                    reg.checkout_absent_ticks = 0;
                     if reg.retirement_missing {
                         reg.retirement_due = false;
                         reg.retirement_missing = false;
@@ -1225,25 +1368,66 @@ impl WatchRegistry {
                     }
                     continue;
                 }
-                RootPresence::Absent => {}
+                RootPresence::Absent => {
+                    reg.checkout_absent_ticks = 0;
+                }
+                RootPresence::CheckoutAbsent => {
+                    reg.absent_ticks = 0;
+                    if reg.retirement_missing {
+                        reg.retirement_due = false;
+                        reg.retirement_missing = false;
+                        reg.catch_up = CatchUpState::Queued;
+                        revived.push(id.clone());
+                    }
+                }
             }
             if reg.retirement_due {
                 continue;
             }
-            reg.absent_ticks = reg.absent_ticks.saturating_add(1);
-            if reg.absent_ticks >= threshold {
-                expired.push(id.clone());
+            match observed.presence {
+                RootPresence::Absent => {
+                    reg.absent_ticks = reg.absent_ticks.saturating_add(1);
+                    if reg.absent_ticks >= threshold {
+                        expired.push(id.clone());
+                    }
+                }
+                RootPresence::CheckoutAbsent => {
+                    reg.checkout_absent_ticks = reg.checkout_absent_ticks.saturating_add(1);
+                    if reg.checkout_absent_ticks >= threshold {
+                        detached.push(id.clone());
+                    }
+                }
+                RootPresence::Present => {}
             }
         }
         for id in &revived {
             self.cancel_deferred(id);
             guard.queue.push_back(id.clone());
         }
-        if expired.is_empty() && revived.is_empty() {
+        if expired.is_empty() && detached.is_empty() && revived.is_empty() {
             return Vec::new();
         }
         let mut retired = Vec::new();
         let mut expired_ids = HashSet::new();
+        for id in detached {
+            let Some(registration) = guard.regs.remove(&id) else {
+                continue;
+            };
+            let retired = RetiredRegistration::from_registration_with_permit(
+                &id,
+                &registration,
+                &self.retired_runtime,
+                None,
+            );
+            guard.detached.push(DetachedRegistration {
+                source: id.source.clone(),
+                binding: registration.binding,
+                retired,
+                absent_ticks: 0,
+            });
+            release_admission(&mut guard, &id);
+            expired_ids.insert(id);
+        }
         for id in expired {
             if let Some(cleanup) =
                 self.retire_or_defer(&mut guard, &id, RetirementCause::MissingRoot)
@@ -1737,6 +1921,164 @@ mod tests {
         assert_eq!(outcome1, RegisterOutcome::New);
         assert_eq!(outcome2, RegisterOutcome::AlreadyRegistered);
         assert_eq!(registry.snapshot_roots().len(), 1);
+    }
+
+    fn detached_registry_at_cap() -> (WatchRegistry, Arc<Config>, Vec<WatchRoot>) {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let source = ConfigSource::RepoLayer(PathBuf::from("/old/.hallouminate/config.toml"));
+        let selected = corpus("wiki");
+        let mut file_root = root("/parent", selected.clone());
+        file_root.canonical_file_root = Some(PathBuf::from("/parent/file.md"));
+        file_root.mode = notify::RecursiveMode::NonRecursive;
+        let roots = vec![root("/target", selected.clone()), file_root];
+        assert_eq!(
+            registry.register(source.clone(), selected, cfg.clone(), roots.clone()),
+            RegisterOutcome::New
+        );
+        for index in 0..MAX_RUNTIME_REGISTRATIONS - 1 {
+            assert_eq!(
+                registry.register(
+                    ConfigSource::RepoLayer(PathBuf::from(format!(
+                        "/other-{index}/.hallouminate/config.toml"
+                    ))),
+                    corpus(&format!("other-{index}")),
+                    cfg.clone(),
+                    vec![],
+                ),
+                RegisterOutcome::New
+            );
+        }
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id.source == source)
+            .expect("old source probe");
+        let id = probe.id.clone();
+        let observations = HashMap::from([(
+            id,
+            RootObservation {
+                probe,
+                presence: RootPresence::CheckoutAbsent,
+            },
+        )]);
+        for _ in 0..3 {
+            assert!(registry.record_absent_roots(&observations, 3).is_empty());
+        }
+        assert_eq!(registry.detached_probes().len(), 1);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS - 1);
+        assert!(
+            registry
+                .repo_layer_sources()
+                .iter()
+                .any(|path| path == Path::new("/old/.hallouminate/config.toml"))
+        );
+        (registry, cfg, roots)
+    }
+
+    #[test]
+    fn detached_slot_reuses_only_exact_full_storage_binding_at_cap() {
+        let (registry, cfg, roots) = detached_registry_at_cap();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
+        let mut partial = roots.clone();
+        partial[1] = root("/parent", corpus("wiki"));
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), partial),
+            RegisterOutcome::LimitReached
+        );
+        let mut changed = (*cfg).clone();
+        changed.storage.ground_dir = "/different-ground".into();
+        assert_eq!(
+            registry.register(
+                source.clone(),
+                corpus("wiki"),
+                Arc::new(changed),
+                roots.clone()
+            ),
+            RegisterOutcome::LimitReached
+        );
+        assert_eq!(registry.detached_probes().len(), 1);
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg, roots),
+            RegisterOutcome::New
+        );
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert!(
+            !registry
+                .repo_layer_sources()
+                .iter()
+                .any(|path| path == Path::new("/old/.hallouminate/config.toml"))
+        );
+    }
+
+    #[test]
+    fn detached_slot_reloads_exact_match_even_with_unmatched_overflow() {
+        let (registry, cfg, roots) = detached_registry_at_cap();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
+        assert!(
+            registry
+                .replace_source(
+                    source.clone(),
+                    vec![corpus("wiki"), corpus("overflow")],
+                    cfg.clone(),
+                    |corpus| {
+                        if corpus.name == "wiki" {
+                            roots.clone()
+                        } else {
+                            vec![root("/overflow", corpus.clone())]
+                        }
+                    },
+                )
+                .is_err()
+        );
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert!(registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &roots));
+        assert!(!registry.is_registered_unchanged(
+            &source,
+            &corpus("overflow"),
+            &cfg,
+            &[root("/overflow", corpus("overflow"))]
+        ));
+    }
+
+    #[test]
+    fn detached_obligations_with_same_id_keep_distinct_storage() {
+        let registry = WatchRegistry::new();
+        let source = ConfigSource::RepoLayer(PathBuf::from("/repo/.hallouminate/config.toml"));
+        let roots = vec![root("/target", corpus("wiki"))];
+        for ground in ["/ground-a", "/ground-b"] {
+            let mut cfg = Config::default();
+            cfg.storage.ground_dir = ground.into();
+            assert_eq!(
+                registry.register(source.clone(), corpus("wiki"), Arc::new(cfg), roots.clone()),
+                RegisterOutcome::New
+            );
+            let probe = registry.root_probes().pop().expect("active probe");
+            let observations = HashMap::from([(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::CheckoutAbsent,
+                },
+            )]);
+            for _ in 0..3 {
+                assert!(registry.record_absent_roots(&observations, 3).is_empty());
+            }
+        }
+        let guard = registry.lock();
+        assert_eq!(guard.detached.len(), 2);
+        let mut grounds = Vec::new();
+        for detached in &guard.detached {
+            grounds.push(detached.retired.cfg.storage.ground_dir.clone());
+        }
+        grounds.sort();
+        assert_eq!(grounds, ["/ground-a", "/ground-b"]);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -3385,6 +3727,50 @@ mod tests {
                 .iter()
                 .any(|probe| probe.id == deferred)
         );
+    }
+
+    #[test]
+    fn deferred_missing_root_revives_when_checkout_moves_but_saved_root_lives() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        for index in 0..=MAX_PENDING_CLEANUPS {
+            let name = format!("c{index}");
+            registry.register(
+                ConfigSource::RepoLayer(PathBuf::from(format!(
+                    "/repo-{index}/.hallouminate/config.toml"
+                ))),
+                corpus(&name),
+                cfg.clone(),
+                vec![],
+            );
+        }
+        let mut absent = HashMap::new();
+        for probe in registry.root_probes() {
+            absent.insert(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::Absent,
+                },
+            );
+        }
+        let retired = registry.record_absent_roots(&absent, 1);
+        let probes = registry.root_probes();
+        assert_eq!(probes.len(), 1);
+        let probe = probes.into_iter().next().expect("deferred probe");
+        let id = probe.id.clone();
+        let checkout = HashMap::from([(
+            id.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::CheckoutAbsent,
+            },
+        )]);
+        assert!(registry.record_absent_roots(&checkout, 3).is_empty());
+        drop(retired);
+        assert!(registry.take_pending_cleanups().is_empty());
+        assert_eq!(registry.catch_up_state(&id), Some(CatchUpState::Queued));
+        assert_eq!(registry.root_probes().len(), 1);
     }
 
     #[test]

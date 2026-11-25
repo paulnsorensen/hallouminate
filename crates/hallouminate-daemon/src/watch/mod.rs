@@ -447,6 +447,11 @@ fn collect_root_observations(
             && probe.saved_roots.iter().all(|root| confirmed_absent(root))
         {
             registry::RootPresence::Absent
+        } else if retirable
+            && checkout_confirmed_absent(&probe.id.source)
+            && roots.iter().all(|root| confirmed_absent(root))
+        {
+            registry::RootPresence::CheckoutAbsent
         } else {
             registry::RootPresence::Present
         };
@@ -471,6 +476,37 @@ fn retire_missing_registrations(state: &DaemonState, tracker: &TaskTracker) {
         );
         spawn_retired_cleanup(state, tracker, registration);
     }
+    let detached = registry.detached_probes();
+    let mut observations = Vec::new();
+    for (binding, roots) in detached {
+        observations.push((binding, roots.iter().all(|root| confirmed_absent(root))));
+    }
+    registry.record_detached_absence(&observations, MISSING_ROOT_RETIRE_TICKS);
+}
+
+fn checkout_confirmed_absent(source: &ConfigSource) -> bool {
+    let ConfigSource::RepoLayer(config_path) = source else {
+        return false;
+    };
+    if config_path
+        .file_name()
+        .is_none_or(|name| name != "config.toml")
+    {
+        return false;
+    }
+    let Some(config_dir) = config_path.parent() else {
+        return false;
+    };
+    if config_dir
+        .file_name()
+        .is_none_or(|name| name != ".hallouminate")
+    {
+        return false;
+    }
+    let Some(repo) = config_dir.parent() else {
+        return false;
+    };
+    confirmed_absent(repo)
 }
 
 /// Whether `path` is confirmed absent. A failed existence check is not
@@ -7609,6 +7645,284 @@ body
                 .total_chunks
                 > 0,
             "unrelated live chunk rows remain"
+        );
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr_786_relocated_repo_replaces_stale_alias_owner() {
+        use crate::ipc::{
+            DaemonRequest, DaemonRequestPayload, DaemonResponse, ErrorKind, GroundResult,
+            IndexRequest,
+        };
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let target = base.join("target");
+        let old_repo = base.join("old-repo");
+        let control_repo = base.join("control-repo");
+        let new_repo = base.join("new-repo");
+        std::fs::create_dir(&target).expect("external target");
+        let note = target.join("note.md");
+        std::fs::write(&note, "# Note\n\npr786relocatedoriginal\n").expect("target note");
+        for repo in [&old_repo, &control_repo] {
+            std::fs::create_dir(repo).expect("repo");
+            std::fs::create_dir(repo.join(".git")).expect("git boundary");
+            std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+            symlink(&target, repo.join("alias")).expect("alias");
+            std::fs::write(
+                repo.join(".hallouminate/config.toml"),
+                "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n",
+            )
+            .expect("config");
+        }
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.search.cold_wait_ms = 0;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg, None).await.expect("open");
+        let index = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: old_repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("alias".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = index else {
+            panic!("initial real index must succeed: {index:?}");
+        };
+        let request = |cwd: PathBuf, query: &'static str| DaemonRequest {
+            cwd,
+            payload: DaemonRequestPayload::Ground(
+                serde_json::from_value(serde_json::json!({
+                    "query": query,
+                    "corpus": "alias",
+                    "match": "phrase",
+                }))
+                .expect("ground request"),
+            ),
+        };
+        let original =
+            crate::dispatch::dispatch(&state, request(old_repo.clone(), "pr786relocatedoriginal"))
+                .await;
+        let DaemonResponse::Ok { result } = original else {
+            panic!("old repo must find indexed note: {original:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("ground result");
+        assert_eq!(result.response.docs.len(), 1, "indexed note only");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&note.to_string_lossy().into_owned()),
+            "old repo Ground must return the external target through Lance: {:?}",
+            result.response.docs
+        );
+        let conflict = crate::dispatch::dispatch(
+            &state,
+            request(control_repo.clone(), "pr786relocatedoriginal"),
+        )
+        .await;
+        let DaemonResponse::Err { kind, message } = conflict else {
+            panic!("two live source bindings must conflict: {conflict:?}");
+        };
+        assert_eq!(kind, ErrorKind::InvalidParams);
+        assert!(
+            message.contains("incompatible watcher registration"),
+            "live source must fail for the binding conflict: {message}"
+        );
+
+        std::fs::rename(&old_repo, &new_repo).expect("move entire repo");
+        let old_config = old_repo.join(".hallouminate/config.toml");
+        let new_config = new_repo.join(".hallouminate/config.toml");
+        assert!(!old_config.exists(), "old config moved with repo");
+        assert!(new_config.exists(), "new config moved with repo");
+        assert!(target.exists(), "external target remains live");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(
+            &state,
+            &mut pump,
+            &tracker,
+            &mut memo,
+            MISSING_ROOT_RETIRE_TICKS,
+        );
+        assert!(
+            state.watch_registry().snapshot_roots().is_empty(),
+            "departed checkout must leave active ownership before new admission"
+        );
+        assert!(
+            pump.roots.is_empty(),
+            "departed checkout must leave native desired roots before new admission"
+        );
+
+        let relocated =
+            crate::dispatch::dispatch(&state, request(new_repo.clone(), "pr786relocatedoriginal"))
+                .await;
+        let DaemonResponse::Ok { result } = relocated else {
+            panic!("relocated repo Ground must reuse live indexed note: {relocated:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("relocated ground");
+        assert_eq!(result.response.docs.len(), 1, "relocated indexed note only");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&note.to_string_lossy().into_owned()),
+            "relocated Ground must return the indexed external target: {:?}",
+            result.response.docs
+        );
+        let owners = state.watch_registry().snapshot_roots();
+        assert_eq!(owners.len(), 1, "relocated source alone owns the target");
+        assert_eq!(owners[0].0.source, ConfigSource::RepoLayer(new_config));
+        assert_eq!(owners[0].0.corpus_key.canonical_root, target);
+
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        std::fs::write(&note, "# Note\n\npr786relocatededited\n").expect("edit target note");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let edited =
+            crate::dispatch::dispatch(&state, request(new_repo, "pr786relocatededited")).await;
+        let DaemonResponse::Ok { result } = edited else {
+            panic!("relocated event content must be searchable: {edited:?}");
+        };
+        let result: GroundResult = serde_json::from_value(result).expect("edited ground");
+        assert!(
+            result
+                .response
+                .docs
+                .contains_key(&note.to_string_lossy().into_owned()),
+            "relocated owner must route the target edit into Lance: {:?}",
+            result.response.docs
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr_786_departed_checkout_keeps_rows_until_saved_target_disappears() {
+        use crate::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, IndexRequest};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let target = base.join("target");
+        let repo = base.join("repo");
+        std::fs::create_dir(&target).expect("target");
+        std::fs::create_dir(&repo).expect("repo");
+        std::fs::create_dir(repo.join(".git")).expect("git");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        symlink(&target, repo.join("alias")).expect("alias");
+        std::fs::write(
+            repo.join(".hallouminate/config.toml"),
+            "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        std::fs::write(target.join("note.md"), "# Note\n\npr786departedcheckout\n").expect("note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let result = crate::dispatch::dispatch(
+            &state,
+            DaemonRequest {
+                cwd: repo.clone(),
+                payload: DaemonRequestPayload::Index(IndexRequest {
+                    corpus: Some("alias".into()),
+                    paths_from: None,
+                    strict: false,
+                    background: false,
+                }),
+            },
+        )
+        .await;
+        let DaemonResponse::Ok { .. } = result else {
+            panic!("index must succeed: {result:?}");
+        };
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(
+            &state,
+            Some(&repo.join(".hallouminate/config.toml")),
+            &effective.corpora,
+            &effective,
+        )
+        .expect("register root");
+        let key = state.watch_registry().snapshot_roots()[0]
+            .0
+            .corpus_key
+            .clone();
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(store.list_files(&key).await.expect("files").len(), 1);
+
+        std::fs::remove_dir_all(&repo).expect("remove checkout");
+        let mut pump = PumpState::test_default();
+        let mut memo = ReloadFailureMemo::new();
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(state.watch_registry().snapshot_roots().is_empty());
+        assert_eq!(state.watch_registry().detached_probes().len(), 1);
+        assert_eq!(
+            store.list_files(&key).await.expect("retained files").len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("retained chunks")
+                .total_chunks
+                > 0
+        );
+
+        std::fs::remove_dir_all(&target).expect("remove saved target");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(state.watch_registry().detached_probes().is_empty());
+        assert!(
+            store
+                .list_files(&key)
+                .await
+                .expect("cleaned files")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&key)
+                .await
+                .expect("cleaned chunks")
+                .total_chunks,
+            0
         );
     }
 }
