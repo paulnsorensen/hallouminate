@@ -243,6 +243,7 @@ struct Registration {
     lock_keys: Vec<CorpusKey>,
     cfg: Arc<Config>,
     roots: Vec<WatchRoot>,
+    binding: Arc<()>,
     retirement_due: bool,
     retirement_missing: bool,
     observation: Observation,
@@ -366,13 +367,22 @@ enum PendingCleanup {
     Deferred(RegistrationId),
 }
 
-/// One registration's identity, corpus, and the root paths whose absence
-/// can retire it. `WatchRegistry::root_probes` copies these out so the
-/// caller checks the filesystem without the registry lock.
+/// One registration's binding and corpus for an unlocked absence check.
 pub(crate) struct RootProbe {
     pub(crate) id: RegistrationId,
     pub(crate) corpus: CorpusConfig,
-    pub(crate) roots: Vec<PathBuf>,
+    binding: Arc<()>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RootPresence {
+    Absent,
+    Present,
+}
+
+pub(crate) struct RootObservation {
+    pub(crate) probe: RootProbe,
+    pub(crate) presence: RootPresence,
 }
 
 /// One admitted catch-up: a leader plus every compatible registration that
@@ -511,6 +521,7 @@ impl WatchRegistry {
                 corpus,
                 cfg,
                 roots,
+                binding: Arc::new(()),
                 retirement_due: false,
                 retirement_missing: false,
                 observation: Observation::Watched,
@@ -627,6 +638,7 @@ impl WatchRegistry {
                 corpus,
                 cfg,
                 roots,
+                binding: Arc::new(()),
                 retirement_due: false,
                 retirement_missing: false,
                 observation,
@@ -747,6 +759,7 @@ impl WatchRegistry {
                 continue;
             };
             registration.roots = roots;
+            registration.binding = Arc::new(());
             if registration.catch_up == CatchUpState::InFlight {
                 registration.catch_up = CatchUpState::Queued;
                 release_admission(&mut guard, &old_id);
@@ -765,6 +778,7 @@ impl WatchRegistry {
                 && registration.roots != *roots
             {
                 registration.roots = roots.clone();
+                registration.binding = Arc::new(());
             }
         }
     }
@@ -859,22 +873,6 @@ impl WatchRegistry {
             .collect();
         let mut retired = Vec::new();
         if over_limit {
-            for (id, corpus, roots) in &candidates {
-                if guard.regs.get(id).is_some_and(|existing| {
-                    existing.retirement_due
-                        && registration_equivalent(existing, corpus, &cfg, roots)
-                }) {
-                    self.cancel_deferred(id);
-                    let existing = guard.regs.get_mut(id).expect("checked above");
-                    existing.lock_keys = corpus_lock_keys(corpus);
-                    existing.corpus = corpus.clone();
-                    existing.cfg = cfg.clone();
-                    existing.retirement_due = false;
-                    existing.retirement_missing = false;
-                    existing.catch_up = CatchUpState::Queued;
-                    guard.queue.push_back(id.clone());
-                }
-            }
             let mut pending = self
                 .pending_cleanups
                 .lock()
@@ -895,27 +893,23 @@ impl WatchRegistry {
             {
                 guard.retry_sources.insert(path.clone());
             }
-            guard.generation += 1;
-            drop(pending);
-            drop(guard);
-            self.signal_changed();
-            self.settled.notify_waiters();
-            return Err(
-                "runtime watcher registration limit reached; retaining source for retry".into(),
-            );
-        }
-        for id in &removed {
-            if let Some(cleanup) =
-                self.retire_or_defer(&mut guard, id, RetirementCause::ConfigRemoval)
-            {
-                retired.push(cleanup);
+        } else {
+            for id in &removed {
+                if let Some(cleanup) =
+                    self.retire_or_defer(&mut guard, id, RetirementCause::ConfigRemoval)
+                {
+                    retired.push(cleanup);
+                }
+            }
+            guard.queue.retain(|id| !removed.contains(id));
+            if let ConfigSource::RepoLayer(path) = &source {
+                guard.retry_sources.remove(path);
             }
         }
-        guard.queue.retain(|id| !removed.contains(id));
-        if let ConfigSource::RepoLayer(path) = &source {
-            guard.retry_sources.remove(path);
-        }
         for (id, corpus, roots) in candidates {
+            if over_limit && !guard.regs.contains_key(&id) {
+                continue;
+            }
             if guard
                 .regs
                 .get(&id)
@@ -952,6 +946,7 @@ impl WatchRegistry {
                     corpus,
                     cfg: cfg.clone(),
                     roots,
+                    binding: Arc::new(()),
                     retirement_due: false,
                     retirement_missing: false,
                     observation: Observation::Watched,
@@ -970,7 +965,11 @@ impl WatchRegistry {
         drop(guard);
         self.signal_changed();
         self.settled.notify_waiters();
-        Ok(retired)
+        if over_limit {
+            Err("runtime watcher registration limit reached; retaining source for retry".into())
+        } else {
+            Ok(retired)
+        }
     }
 
     pub(crate) fn repo_layer_sources(&self) -> Vec<PathBuf> {
@@ -1171,9 +1170,8 @@ impl WatchRegistry {
         admitted
     }
 
-    /// Every registration with its corpus and the root paths that
-    /// `record_absent_roots` judges absence by: the identity root plus each
-    /// watch root's declared file or watched directory.
+    /// Copies each registration's binding and corpus for an unlocked probe.
+    /// The caller expands declared paths after releasing the registry lock.
     pub(crate) fn root_probes(&self) -> Vec<RootProbe> {
         let guard = self.lock();
         let mut probes = Vec::new();
@@ -1181,45 +1179,44 @@ impl WatchRegistry {
             if reg.retirement_due && !reg.retirement_missing {
                 continue;
             }
-            let mut roots = vec![id.corpus_key.canonical_root.clone()];
-            for root in &reg.roots {
-                let path = match &root.canonical_file_root {
-                    Some(file) => file.clone(),
-                    None => root.canonical_watched.clone(),
-                };
-                roots.push(path);
-            }
             probes.push(RootProbe {
                 id: id.clone(),
                 corpus: reg.corpus.clone(),
-                roots,
+                binding: reg.binding.clone(),
             });
         }
         probes
     }
 
-    /// Records one reconcile tick of root absence. Each registration in
-    /// `absent` advances its consecutive-absence count; every other
-    /// registration resets it. A registration whose count reaches
-    /// `threshold` is removed, and its data returns for retired-root cleanup.
+    /// Applies only observations whose binding still matches the registration.
+    /// A stale or missing observation neither ages nor revives a replacement.
     pub(crate) fn record_absent_roots(
         &self,
-        absent: &HashSet<RegistrationId>,
+        observations: &HashMap<RegistrationId, RootObservation>,
         threshold: u32,
     ) -> Vec<RetiredRegistration> {
         let mut guard = self.lock();
         let mut expired = Vec::new();
         let mut revived = Vec::new();
         for (id, reg) in &mut guard.regs {
-            if !absent.contains(id) {
-                reg.absent_ticks = 0;
-                if reg.retirement_missing {
-                    reg.retirement_due = false;
-                    reg.retirement_missing = false;
-                    reg.catch_up = CatchUpState::Queued;
-                    revived.push(id.clone());
-                }
+            let Some(observed) = observations.get(id) else {
                 continue;
+            };
+            if !Arc::ptr_eq(&reg.binding, &observed.probe.binding) {
+                continue;
+            }
+            match observed.presence {
+                RootPresence::Present => {
+                    reg.absent_ticks = 0;
+                    if reg.retirement_missing {
+                        reg.retirement_due = false;
+                        reg.retirement_missing = false;
+                        reg.catch_up = CatchUpState::Queued;
+                        revived.push(id.clone());
+                    }
+                    continue;
+                }
+                RootPresence::Absent => {}
             }
             if reg.retirement_due {
                 continue;
@@ -2680,11 +2677,34 @@ mod tests {
         let registry = WatchRegistry::new();
         let a = register_baseline(&registry, "a");
         let b = register_baseline(&registry, "b");
-        let only_a = HashSet::from([a.clone()]);
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id == a)
+            .expect("a probe");
+        let only_a = HashMap::from([(
+            a.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let present_probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id == a)
+            .expect("present probe");
+        let present_a = HashMap::from([(
+            a.clone(),
+            RootObservation {
+                probe: present_probe,
+                presence: RootPresence::Present,
+            },
+        )]);
 
         assert!(registry.record_absent_roots(&only_a, 3).is_empty());
         assert!(registry.record_absent_roots(&only_a, 3).is_empty());
-        assert!(registry.record_absent_roots(&HashSet::new(), 3).is_empty());
+        assert!(registry.record_absent_roots(&present_a, 3).is_empty());
         assert!(registry.record_absent_roots(&only_a, 3).is_empty());
         assert!(registry.record_absent_roots(&only_a, 3).is_empty());
         assert!(
@@ -2702,6 +2722,52 @@ mod tests {
         assert_eq!(registry.catch_up_state(&a), None);
         assert!(registry.generation() > generation);
         assert_ne!(registry.begin_next_catch_up(2), Some(a));
+    }
+
+    #[test]
+    fn pr_786_retirement_followup_stale_probe_does_not_age_replacement() {
+        let registry = WatchRegistry::new();
+        let id = register_baseline(&registry, "wiki");
+        let old_probe = registry.root_probes();
+        let replacement = corpus("wiki");
+        assert_eq!(
+            registry.register(
+                ConfigSource::Baseline,
+                replacement.clone(),
+                Arc::new(Config::default()),
+                vec![
+                    root("/wiki", replacement.clone()),
+                    root("/new", replacement)
+                ],
+            ),
+            RegisterOutcome::New
+        );
+        let stale = HashMap::from([(
+            old_probe[0].id.clone(),
+            RootObservation {
+                probe: old_probe.into_iter().next().expect("old probe"),
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let current_probe = registry
+            .root_probes()
+            .into_iter()
+            .next()
+            .expect("current probe");
+        let current = HashMap::from([(
+            current_probe.id.clone(),
+            RootObservation {
+                probe: current_probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        assert!(registry.record_absent_roots(&stale, 3).is_empty());
+        assert!(registry.record_absent_roots(&current, 3).is_empty());
+        assert!(registry.record_absent_roots(&current, 3).is_empty());
+        assert!(
+            registry.observation(&id).is_some(),
+            "replacement needs its own three ticks"
+        );
     }
 
     #[test]
@@ -3245,11 +3311,19 @@ mod tests {
     fn missing_root_retirement_defers_excess_without_dropping_registrations() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
-        let mut absent = HashSet::new();
         for index in 0..=MAX_PENDING_CLEANUPS {
             let name = format!("c{index}");
             registry.register(ConfigSource::Baseline, corpus(&name), cfg.clone(), vec![]);
-            absent.insert(baseline_id(&name));
+        }
+        let mut absent = HashMap::new();
+        for probe in registry.root_probes() {
+            absent.insert(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::Absent,
+                },
+            );
         }
         let retired = registry.record_absent_roots(&absent, 1);
         assert_eq!(retired.len(), MAX_PENDING_CLEANUPS);
@@ -3268,17 +3342,32 @@ mod tests {
     fn deferred_missing_root_revives_before_cleanup_admission() {
         let registry = WatchRegistry::new();
         let cfg = Arc::new(Config::default());
-        let mut absent = HashSet::new();
         for index in 0..=MAX_PENDING_CLEANUPS {
             let name = format!("c{index}");
             registry.register(ConfigSource::Baseline, corpus(&name), cfg.clone(), vec![]);
-            absent.insert(baseline_id(&name));
+        }
+        let mut absent = HashMap::new();
+        for probe in registry.root_probes() {
+            absent.insert(
+                probe.id.clone(),
+                RootObservation {
+                    probe,
+                    presence: RootPresence::Absent,
+                },
+            );
         }
         let retired = registry.record_absent_roots(&absent, 1);
         let probes = registry.root_probes();
         assert_eq!(probes.len(), 1, "only one missing root should wait");
         let deferred = probes[0].id.clone();
-        assert!(registry.record_absent_roots(&HashSet::new(), 1).is_empty());
+        let present = HashMap::from([(
+            deferred.clone(),
+            RootObservation {
+                probe: probes.into_iter().next().expect("deferred probe"),
+                presence: RootPresence::Present,
+            },
+        )]);
+        assert!(registry.record_absent_roots(&present, 1).is_empty());
         drop(retired);
         assert!(registry.take_pending_cleanups().is_empty());
         assert!(

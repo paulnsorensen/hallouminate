@@ -333,7 +333,9 @@ fn reload_repo_layer(
                 error,
                 "watcher: repo-layer reload failed; retaining registrations for retry"
             );
-            state.watch_registry().forget_retry_source(path);
+            if confirmed_absent(path) {
+                state.watch_registry().forget_retry_source(path);
+            }
             return;
         }
     };
@@ -344,7 +346,6 @@ fn reload_repo_layer(
                 error,
                 "watcher: repo-layer validation failed; retaining registrations for retry"
             );
-            state.watch_registry().forget_retry_source(path);
             return;
         }
     };
@@ -355,7 +356,6 @@ fn reload_repo_layer(
                 error,
                 "watcher: repo-layer corpus validation failed; retaining registrations for retry"
             );
-            state.watch_registry().forget_retry_source(path);
             return;
         }
     };
@@ -419,10 +419,12 @@ fn run_reconcile_tick(
 /// baseline root stays registered while absent, so a later directory
 /// creation still installs its watch. A root that exists, or whose
 /// existence check fails, never counts as absent.
-fn retire_missing_registrations(state: &DaemonState, tracker: &TaskTracker) {
+fn collect_root_observations(
+    state: &DaemonState,
+) -> HashMap<registry::RegistrationId, registry::RootObservation> {
     let registry = state.watch_registry();
     let declared = state.baseline().effective_corpora().ok();
-    let mut absent = HashSet::new();
+    let mut observations = HashMap::new();
     for probe in registry.root_probes() {
         let retirable = match &probe.id.source {
             ConfigSource::RepoLayer(config_path) => confirmed_absent(config_path),
@@ -433,11 +435,30 @@ fn retire_missing_registrations(state: &DaemonState, tracker: &TaskTracker) {
                 None => false,
             },
         };
-        if retirable && probe.roots.iter().all(|root| confirmed_absent(root)) {
-            absent.insert(probe.id);
+        let mut roots = Vec::new();
+        for raw in &probe.corpus.paths {
+            roots.push(expand_tilde(raw));
         }
+        if roots.is_empty() {
+            roots.push(probe.id.corpus_key.canonical_root.clone());
+        }
+        let presence = if retirable && roots.iter().all(|root| confirmed_absent(root)) {
+            registry::RootPresence::Absent
+        } else {
+            registry::RootPresence::Present
+        };
+        observations.insert(
+            probe.id.clone(),
+            registry::RootObservation { probe, presence },
+        );
     }
-    for registration in registry.record_absent_roots(&absent, MISSING_ROOT_RETIRE_TICKS) {
+    observations
+}
+
+fn retire_missing_registrations(state: &DaemonState, tracker: &TaskTracker) {
+    let registry = state.watch_registry();
+    let observations = collect_root_observations(state);
+    for registration in registry.record_absent_roots(&observations, MISSING_ROOT_RETIRE_TICKS) {
         tracing::info!(
             target: "hallouminate::daemon",
             corpus = %registration.corpus,
@@ -775,7 +796,15 @@ impl PumpState {
         registry.refresh_roots(watch_roots_for);
         let snapshot = registry.snapshot_roots();
         let desired = Self::desired_watches(&snapshot);
-        self.roots = snapshot.iter().map(|(_, r)| r.clone()).collect();
+        self.roots = snapshot
+            .iter()
+            .filter(|(_, root)| {
+                root.canonical_file_root.is_some()
+                    || root.watched == root.canonical_watched
+                    || !confirmed_absent(&root.watched)
+            })
+            .map(|(_, root)| root.clone())
+            .collect();
         let ops = self.build_reconcile_ops(registry, &snapshot, &desired, retry);
         self.apply_reconcile_ops(registry, &snapshot, ops);
         Self::admit_next_catch_up(registry, state, tracker);
@@ -6288,7 +6317,11 @@ body
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
-        let physical = tmp.path().join("physical");
+        let physical = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("physical");
         let root = physical.join("watched");
         std::fs::create_dir_all(&root).expect("create physical root");
         std::fs::write(root.join("note.md"), "# Note\n\nbody\n").expect("write watched note");
@@ -6357,7 +6390,11 @@ body
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let (state, _repo, _root) = repo_layer_fixture(tmp.path()).await;
-        let old_physical = tmp.path().join("old-physical");
+        let old_physical = tmp
+            .path()
+            .canonicalize()
+            .expect("canonical tempdir")
+            .join("old-physical");
         let old_root = old_physical.join("watched");
         let new_physical = tmp.path().join("new-physical");
         std::fs::create_dir_all(&old_root).expect("create old root");
@@ -6832,5 +6869,564 @@ body
             1,
             "five events on one symlinked file must warn once per window"
         );
+    }
+    async fn pr_786_followup_index_contains(
+        state: &DaemonState,
+        corpus: &CorpusConfig,
+        marker: &str,
+        file: &Path,
+    ) -> bool {
+        use hallouminate_domain::ground::GroundMatch;
+        use hallouminate_domain::ground::{GroundOpts, ground_union};
+
+        let response = ground_union(
+            marker,
+            std::slice::from_ref(corpus),
+            state.store().as_ref(),
+            None,
+            GroundOpts {
+                match_mode: GroundMatch::Phrase,
+                ..GroundOpts::default()
+            },
+            None,
+        )
+        .await
+        .expect("Lance phrase query");
+        response
+            .docs
+            .contains_key(&file.to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn pr_786_retirement_followup_real_probe_replacement_needs_own_ticks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let old_root = base.join("old");
+        let new_root = base.join("new");
+        std::fs::create_dir(&old_root).expect("old root");
+        std::fs::create_dir(&new_root).expect("new root");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let source = ConfigSource::RepoLayer(base.join("missing-config.toml"));
+        let original = corpus("wiki", old_root.to_str().expect("utf8"), &["**/*.md"]);
+        assert_eq!(
+            state.watch_registry().register(
+                source.clone(),
+                original.clone(),
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for(&original)
+            ),
+            registry::RegisterOutcome::New
+        );
+        let id = state.watch_registry().snapshot_roots()[0].0.clone();
+        std::fs::remove_dir(&old_root).expect("remove old root");
+        let stale = collect_root_observations(&state);
+        let mut replacement = original;
+        replacement
+            .paths
+            .push(new_root.to_string_lossy().into_owned());
+        assert_eq!(
+            state.watch_registry().register(
+                source,
+                replacement.clone(),
+                std::sync::Arc::new(cfg),
+                watch_roots_for(&replacement)
+            ),
+            registry::RegisterOutcome::New
+        );
+        assert!(
+            state
+                .watch_registry()
+                .record_absent_roots(&stale, 3)
+                .is_empty()
+        );
+        assert!(
+            state.watch_registry().observation(&id).is_some(),
+            "old real probe cannot retire replacement"
+        );
+        std::fs::remove_dir(&new_root).expect("remove new root");
+        for _ in 0..2 {
+            let current = collect_root_observations(&state);
+            assert!(
+                state
+                    .watch_registry()
+                    .record_absent_roots(&current, 3)
+                    .is_empty()
+            );
+            assert!(
+                state.watch_registry().observation(&id).is_some(),
+                "replacement has fewer than three eligible ticks"
+            );
+        }
+        let current = collect_root_observations(&state);
+        let retired = state.watch_registry().record_absent_roots(&current, 3);
+        assert_eq!(retired.len(), 1, "third replacement tick retires it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_retirement_followup_retargeted_alias_survives_third_tick() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let old_root = repo.join("old");
+        let new_root = repo.join("new");
+        std::fs::create_dir_all(&repo).expect("repo");
+        std::fs::create_dir_all(&old_root).expect("old root");
+        std::fs::create_dir_all(&new_root).expect("new root");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let alias = repo.join("alias");
+        symlink(&old_root, &alias).expect("alias old root");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register");
+        assert!(registered(&state, "alias"), "declared alias must register");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        std::fs::remove_file(&config_path).expect("remove config");
+        std::fs::remove_file(&alias).expect("unlink alias");
+        std::fs::remove_dir_all(&old_root).expect("remove old root");
+        for tick in 0..2 {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+            assert!(
+                registered(&state, "alias"),
+                "registration remains before third tick: {tick}"
+            );
+        }
+        symlink(&new_root, &alias).expect("retarget alias");
+        let tracker = TaskTracker::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        assert!(
+            registered(&state, "alias"),
+            "live declared alias resets absence"
+        );
+        assert!(
+            pump.roots
+                .iter()
+                .any(|root| root.canonical_watched == new_root),
+            "pump targets the new physical root"
+        );
+        let note = new_root.join("retargeted.md");
+        std::fs::write(&note, "# Retargeted\n\npr786retargetedalive\n").expect("write new note");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let selected = corpus("alias", alias.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            pr_786_followup_index_contains(&state, &selected, "pr786retargetedalive", &note).await,
+            "retargeted file follows the live event route"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_followup_existing_corpus_updates_at_capacity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let docs = repo.join("docs");
+        std::fs::create_dir_all(&docs).expect("create docs");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"existing\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("initial config");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("initial registration");
+        for number in 0..255 {
+            let selected = corpus(
+                &format!("synthetic-{number}"),
+                base.join(format!("synthetic-{number}"))
+                    .to_str()
+                    .expect("utf8"),
+                &["**/*.md"],
+            );
+            assert_eq!(
+                state.watch_registry().register(
+                    ConfigSource::RepoLayer(base.join(format!("other-{number}.toml"))),
+                    selected,
+                    std::sync::Arc::new(cfg.clone()),
+                    vec![],
+                ),
+                registry::RegisterOutcome::New
+            );
+        }
+        let added = repo.join("extra");
+        std::fs::create_dir(&added).expect("create extra");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"extra\"\npaths = [\"extra\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("temporarily remove existing while over capacity");
+        let defer_tracker = TaskTracker::new();
+        let mut defer_memo = ReloadFailureMemo::new();
+        reload_repo_layer(&state, &config_path, &defer_tracker, &mut defer_memo);
+        assert!(
+            !registered(&state, "existing"),
+            "old binding is deferred for retirement"
+        );
+        defer_tracker.close();
+        defer_tracker.wait().await;
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"existing\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\", \"**/*.txt\"]\n[[corpus]]\nname = \"extra\"\npaths = [\"extra\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("valid edit");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(
+            !registered(&state, "extra"),
+            "new ID must wait for capacity"
+        );
+        let note = docs.join("updated.txt");
+        std::fs::write(&note, "# Updated\n\npr786followupcapacity\n").expect("write text");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let updated = corpus(
+            "existing",
+            docs.to_str().expect("utf8"),
+            &["**/*.md", "**/*.txt"],
+        );
+        assert!(
+            pr_786_followup_index_contains(&state, &updated, "pr786followupcapacity", &note).await,
+            "existing ID must apply its valid glob edit through the live event path"
+        );
+        let removed = state
+            .watch_registry()
+            .replace_source(
+                ConfigSource::RepoLayer(base.join("other-0.toml")),
+                vec![],
+                std::sync::Arc::new(cfg.clone()),
+                watch_roots_for,
+            )
+            .expect("retire one synthetic ID");
+        assert_eq!(removed.len(), 1, "one runtime slot must retire");
+        for registration in removed {
+            assert!(
+                cleanup_retired_registration(&state, registration)
+                    .await
+                    .is_none(),
+                "the synthetic root has no rows to retain"
+            );
+        }
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(
+            registered(&state, "extra"),
+            "retry must admit the deferred ID"
+        );
+        let extra_note = added.join("new.md");
+        std::fs::write(&extra_note, "# New\n\npr786followupadmitted\n").expect("write extra note");
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![extra_note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let extra = corpus("extra", added.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            pr_786_followup_index_contains(&state, &extra, "pr786followupadmitted", &extra_note)
+                .await,
+            "the admitted ID must receive live events"
+        );
+        tracker.close();
+        tracker.wait().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_retirement_followup_invalid_retry_source_recovers() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let docs = repo.join("docs");
+        std::fs::create_dir_all(&docs).expect("docs");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let config_path = repo.join(".hallouminate/config.toml");
+        let valid =
+            "[[corpus]]\nname = \"retry-only\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n";
+        std::fs::write(&config_path, valid).expect("config");
+        let note = docs.join("note.md");
+        std::fs::write(&note, "# Note\n\npr786retryonlyrecovered\n").expect("note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        for number in 0..256 {
+            let selected = corpus(
+                &format!("synthetic-{number}"),
+                base.join(format!("synthetic-{number}"))
+                    .to_str()
+                    .expect("utf8"),
+                &["**/*.md"],
+            );
+            assert_eq!(
+                state.watch_registry().register(
+                    ConfigSource::RepoLayer(base.join(format!("other-{number}.toml"))),
+                    selected,
+                    std::sync::Arc::new(cfg.clone()),
+                    vec![],
+                ),
+                registry::RegisterOutcome::New
+            );
+        }
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reload_repo_layer(&state, &config_path, &tracker, &mut memo);
+        assert!(!registered(&state, "retry-only"));
+        assert!(
+            state
+                .watch_registry()
+                .repo_layer_sources()
+                .contains(&config_path)
+        );
+        std::fs::write(&config_path, "[[corpus]\n").expect("invalid config");
+        let mut pump = PumpState::test_default();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        assert!(
+            state
+                .watch_registry()
+                .repo_layer_sources()
+                .contains(&config_path),
+            "invalid config must not lose retry-only source"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            std::fs::remove_file(&config_path).expect("remove malformed config");
+            symlink(&config_path, &config_path).expect("create ELOOP config path");
+            reload_repo_layer(&state, &config_path, &tracker, &mut memo);
+            assert!(
+                state
+                    .watch_registry()
+                    .repo_layer_sources()
+                    .contains(&config_path),
+                "indeterminate config stat must retain retry-only source"
+            );
+            std::fs::remove_file(&config_path).expect("remove ELOOP symlink");
+        }
+        let gone_config = repo.join(".hallouminate/gone.toml");
+        let gone_root = base.join("gone");
+        let gone = corpus("gone", gone_root.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            state
+                .watch_registry()
+                .replace_source(
+                    ConfigSource::RepoLayer(gone_config.clone()),
+                    vec![gone],
+                    std::sync::Arc::new(cfg.clone()),
+                    watch_roots_for,
+                )
+                .is_err(),
+            "at-capacity source enters the bounded retry queue"
+        );
+        assert!(
+            state
+                .watch_registry()
+                .repo_layer_sources()
+                .contains(&gone_config)
+        );
+        reload_repo_layer(&state, &gone_config, &tracker, &mut memo);
+        let sources = state.watch_registry().repo_layer_sources();
+        assert!(
+            !sources.contains(&gone_config),
+            "confirmed-deleted config leaves retry queue"
+        );
+        reload_repo_layer(&state, &gone_config, &tracker, &mut memo);
+        assert_eq!(
+            state.watch_registry().repo_layer_sources().len(),
+            sources.len(),
+            "deleted source cannot grow retry queue"
+        );
+        std::fs::write(&config_path, valid).expect("restore config");
+        let retired = state
+            .watch_registry()
+            .replace_source(
+                ConfigSource::RepoLayer(base.join("other-0.toml")),
+                vec![],
+                std::sync::Arc::new(cfg),
+                watch_roots_for,
+            )
+            .expect("open one slot");
+        assert_eq!(retired.len(), 1);
+        drop(retired);
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        for _ in 0..4 {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(
+            registered(&state, "retry-only"),
+            "periodic reload alone admits retry-only source"
+        );
+        let selected = corpus("retry-only", docs.to_str().expect("utf8"), &["**/*.md"]);
+        assert!(
+            pr_786_followup_index_contains(&state, &selected, "pr786retryonlyrecovered", &note)
+                .await,
+            "periodic catch-up indexes existing note"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_followup_missing_alias_yields_live_events_to_outer_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let docs = repo.join("docs");
+        let nested = docs.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let alias = repo.join("alias");
+        symlink(&nested, &alias).expect("create alias");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"outer\"\npaths = [\"docs\"]\nglobs = [\"**/*.md\"]\n[[corpus]]\nname = \"inner\"\npaths = [\"alias\"]\nglobs = [\"**/*.txt\"]\n",
+        )
+        .expect("config");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register both roots");
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(registered(&state, "inner"));
+        std::fs::remove_file(&alias).expect("remove only alias");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        assert!(
+            registered(&state, "inner"),
+            "logical alias registration survives"
+        );
+        let outer = corpus("outer", docs.to_str().expect("utf8"), &["**/*.md"]);
+        let note = nested.join("note.md");
+        std::fs::write(&note, "# Note\n\npr786followupouter\n").expect("write note");
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            pr_786_followup_index_contains(&state, &outer, "pr786followupouter", &note).await,
+            "missing alias must not steal the outer root's live event"
+        );
+        symlink(&nested, &alias).expect("recreate alias");
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let tracker = TaskTracker::new();
+        let second = nested.join("second.md");
+        std::fs::write(&second, "# Second\n\npr786followuprejected\n").expect("write second");
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![second.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            !pr_786_followup_index_contains(&state, &outer, "pr786followuprejected", &second).await,
+            "live nested alias must reject Markdown without outer fallback"
+        );
+        let inner = corpus("inner", alias.to_str().expect("utf8"), &["**/*.txt"]);
+        let text = nested.join("owned.txt");
+        std::fs::write(&text, "# Owned\n\npr786followupinner\n").expect("write text");
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![text.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        assert!(
+            pr_786_followup_index_contains(&state, &inner, "pr786followupinner", &text).await,
+            "live nested alias must own accepted text events"
+        );
+        tracker.close();
+        tracker.wait().await;
     }
 }
