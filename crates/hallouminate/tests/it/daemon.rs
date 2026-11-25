@@ -5457,11 +5457,15 @@ async fn migration_kill_child() {
     {
         "publication" => "moved stale ground store aside",
         "first_corpus" => "rebuild: reindexed",
+        "file_map" => "file map committed before search indexes",
         other => panic!("unknown kill boundary: {other}"),
     };
     let ground = PathBuf::from(ground);
     let parent = ground.parent().expect("ground parent");
-    let cfg = interrupted_boot_config(&ground, &parent.join("first"), &parent.join("later"));
+    let mut cfg = interrupted_boot_config(&ground, &parent.join("first"), &parent.join("later"));
+    if stop_at == "file_map" {
+        cfg.corpora.truncate(1);
+    }
     let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let writer_output = std::sync::Arc::clone(&output);
     let subscriber = tracing_subscriber::fmt()
@@ -5471,7 +5475,7 @@ async fn migration_kill_child() {
         })
         .with_ansi(false)
         .without_time()
-        .with_max_level(tracing::Level::INFO)
+        .with_max_level(tracing::Level::DEBUG)
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
     DaemonState::open(cfg, None)
@@ -6673,4 +6677,190 @@ model = "BAAI/bge-small-en-v1.5"
     // warm, shallow, deep, and the four index.md files (root, a, a/b, a/b/c).
     assert_eq!(stats.indexed_files, 7);
     assert_eq!(stats.unindexed_files, 0);
+}
+
+#[tokio::test]
+async fn interrupted_boot_after_file_map_restores_ranked_search_without_new_content() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    std::fs::create_dir(&first).expect("first corpus");
+    std::fs::write(first.join("first.md"), "# First\n\nfirst-unique-needle\n")
+        .expect("first source");
+    let current = hallouminate_adapters::default_schema_version_pub();
+    let stale = current - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, "file_map").await;
+
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let inode = std::fs::metadata(&backup).expect("published backup").ino();
+    let mut cfg = interrupted_boot_config(&ground, &first, &tmp.path().join("later"));
+    cfg.corpora.truncate(1);
+    cfg.daemon.maintenance_interval_secs = 0;
+    let key = CorpusKey::from_configured_root("first", first.to_str().expect("first path"));
+    let interrupted = LanceStore::open_or_create(
+        &ground,
+        &cfg.embeddings.model,
+        cfg.embeddings.quantized,
+        cfg.embeddings.enabled,
+        None,
+    )
+    .await
+    .expect("inspect interrupted store");
+    assert_eq!(interrupted.count_rows().await.expect("content rows"), 1);
+    let mapped = interrupted.list_files(&key).await.expect("file mapping");
+    assert_eq!(mapped.len(), 1);
+    assert!(mapped[0].file_ref.ends_with("/first.md"));
+    assert!(
+        interrupted
+            .retrieve_signals(&key, "first-unique-needle", 10)
+            .await
+            .expect("ranked retrieval before recovery")
+            .fts
+            .is_empty(),
+        "interrupted store must not have an FTS index"
+    );
+    drop(interrupted);
+
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("resume boot before serving");
+    assert_eq!(state.store().count_rows().await.expect("recovered rows"), 1);
+    assert_eq!(
+        state
+            .store()
+            .list_files(&key)
+            .await
+            .expect("recovered mapping"),
+        mapped,
+        "unchanged recovery must retain the original file map"
+    );
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "first-unique-needle", 10)
+        .await
+        .expect("ranked retrieval after recovery");
+    let chunk_id = signals
+        .fts
+        .first()
+        .expect("FTS hit after unchanged recovery");
+    let hit = signals.hits.get(chunk_id).expect("mapped Markdown hit");
+    assert!(hit.file_ref.ends_with("/first.md"));
+    assert_eq!(
+        hit.structure
+            .as_ref()
+            .and_then(|structure| structure.title.as_deref()),
+        Some("First")
+    );
+    assert_eq!(
+        std::fs::metadata(&backup)
+            .expect("backup after recovery")
+            .ino(),
+        inode
+    );
+}
+
+#[tokio::test]
+async fn interrupted_empty_boot_recovers_without_search_indexes() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    std::fs::create_dir(&first).expect("empty corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, "publication").await;
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let inode = std::fs::metadata(&backup).expect("published backup").ino();
+
+    let mut cfg = cfg_with_corpus(&ground, &first);
+    cfg.daemon.maintenance_interval_secs = 0;
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("empty pending rebuild must complete");
+    assert_eq!(state.store().count_rows().await.expect("empty rows"), 0);
+    let key = CorpusKey::from_configured_root("docs", first.to_str().expect("first path"));
+    assert!(
+        state
+            .store()
+            .retrieve_signals(&key, "absent", 10)
+            .await
+            .expect("empty ranked retrieval")
+            .fts
+            .is_empty()
+    );
+    assert!(!ground.join(".migration-rebuild").exists());
+    assert_eq!(std::fs::metadata(&backup).expect("backup").ino(), inode);
+}
+
+#[tokio::test]
+async fn failed_required_index_finalization_keeps_pending_backup_for_retry() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("private migration fixture");
+    let ground = tmp.path().join("ground");
+    let first = tmp.path().join("first");
+    std::fs::create_dir(&first).expect("first corpus");
+    std::fs::write(first.join("first.md"), "# First\n\nfirst-unique-needle\n")
+        .expect("first source");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    kill_migration_boot(&ground, "file_map").await;
+
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    let aged = std::time::SystemTime::now() - Duration::from_secs(60 * 86_400);
+    std::fs::File::open(&backup)
+        .expect("backup for age test")
+        .set_modified(aged)
+        .expect("age backup before failed recovery");
+    let backup_metadata = std::fs::metadata(&backup).expect("published backup");
+    let pending = ground.join(".migration-rebuild");
+    let receipt = std::fs::read(&pending).expect("pending receipt");
+    let collision = ground.join("chunks.lance/_indices");
+    assert!(!collision.exists(), "interrupted store must lack indexes");
+    std::fs::write(&collision, "block required index creation")
+        .expect("create real index path collision");
+
+    let mut cfg = interrupted_boot_config(&ground, &first, &tmp.path().join("later"));
+    cfg.corpora.truncate(1);
+    cfg.daemon.maintenance_interval_secs = 0;
+    let error = DaemonState::open(cfg.clone(), None)
+        .await
+        .expect_err("required index failure must reject boot");
+    assert!(
+        format!("{error:#}").contains("rebuild: finalize search indexes"),
+        "wrong recovery failure: {error:#}"
+    );
+    assert_eq!(std::fs::read(&pending).expect("pending receipt"), receipt);
+    let retained = std::fs::metadata(&backup).expect("retained backup");
+    assert_eq!(retained.ino(), backup_metadata.ino());
+    assert_eq!(
+        retained.modified().expect("retained age"),
+        backup_metadata.modified().expect("initial age")
+    );
+    assert_eq!(read_schema_version(&backup), stale);
+    std::fs::File::open(&backup)
+        .expect("backup for completed recovery")
+        .set_modified(std::time::SystemTime::now())
+        .expect("renew backup age before retry");
+
+    let state = DaemonState::open(cfg, None)
+        .await
+        .expect("retry rebuild after partial reset");
+    let key = CorpusKey::from_configured_root("first", first.to_str().expect("first path"));
+    let signals = state
+        .store()
+        .retrieve_signals(&key, "first-unique-needle", 10)
+        .await
+        .expect("ranked retrieval after retry");
+    assert!(!signals.fts.is_empty(), "retry must restore FTS");
+    assert_eq!(
+        std::fs::metadata(&backup)
+            .expect("backup after retry")
+            .ino(),
+        backup_metadata.ino()
+    );
 }

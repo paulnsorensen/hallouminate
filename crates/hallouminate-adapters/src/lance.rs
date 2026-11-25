@@ -1872,6 +1872,11 @@ impl LanceStore {
                 .await?;
         }
         self.write_file_map(&batch, &keys).await?;
+        tracing::debug!(
+            target: "hallouminate::lance",
+            corpus = %corpus_key.name,
+            "file map committed before search indexes"
+        );
         self.refresh_file_indexes(&corpus_key).await?;
         if !new_content.is_empty() {
             self.refresh_indexes(&corpus_key).await?;
@@ -2056,6 +2061,19 @@ impl LanceStore {
             return Err(map_lance_err(e));
         }
         Ok(())
+    }
+
+    /// Completes required search indexes for a nonempty boot rebuild.
+    /// Call this before publishing the store to concurrent users.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the row count or a required index build fails.
+    pub async fn finalize_nonempty_search_indexes(&self) -> Result<()> {
+        if self.count_rows().await? == 0 {
+            return Ok(());
+        }
+        self.ensure_search_indexes().await
     }
 
     /// Refreshes the content table's indexes after rows were added.
