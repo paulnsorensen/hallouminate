@@ -13,7 +13,7 @@ use std::time::Duration;
 use super::transport::LocalStream;
 
 use super::bootstrap::ensure_daemon_running;
-use super::client::connect_at;
+use super::client::{connect_at, daemon_busy};
 use super::ipc::{DaemonRequest, DaemonRequestPayload, DaemonResponse, StatusReport};
 use super::socket::daemon_socket_path;
 
@@ -35,15 +35,18 @@ pub enum DaemonStatus {
 /// failures (no socket, stale socket with no listener, silent or timed-out
 /// peer) map to `NotRunning`; a daemon that answers but returns an error or
 /// an unparseable payload is a real fault and surfaces as `Err` — it IS
-/// running, so reporting `NotRunning` would be a lie.
+/// running, so reporting `NotRunning` would be a lie. A busy Windows pipe
+/// also surfaces as `Err` for the same reason.
 pub async fn status() -> anyhow::Result<DaemonStatus> {
     let socket = daemon_socket_path()?;
     status_at(&socket).await
 }
 
 async fn status_at(socket: &Path) -> anyhow::Result<DaemonStatus> {
-    let Ok(client) = connect_at(socket).await else {
-        return Ok(DaemonStatus::NotRunning);
+    let client = match connect_at(socket).await {
+        Ok(client) => client,
+        Err(error) if daemon_busy(&error) => return Err(error),
+        Err(_) => return Ok(DaemonStatus::NotRunning),
     };
     match client
         .call_raw_with_timeout(
@@ -63,6 +66,7 @@ async fn status_at(socket: &Path) -> anyhow::Result<DaemonStatus> {
         Ok(DaemonResponse::Err { kind, message }) => {
             anyhow::bail!("daemon status request failed ({kind:?}): {message}")
         }
+        Err(error) if daemon_busy(&error) => Err(error),
         Err(_) => Ok(DaemonStatus::NotRunning),
     }
 }
@@ -330,6 +334,31 @@ mod tests {
             elapsed >= STOP_TIMEOUT,
             "stop_at gave up after {elapsed:?}, before the deadline"
         );
+        drop(held);
+        drop(server);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn status_reports_busy_pipe_as_error_not_stopped() {
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("daemon.sock");
+        std::fs::write(&socket, "ef".repeat(32)).expect("write endpoint marker");
+        let name = crate::transport::pipe_name(&socket).expect("pipe name");
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .create(&name)
+            .expect("create single-instance pipe");
+        let held = ClientOptions::new().open(&name).expect("occupy pipe");
+        server.connect().await.expect("accept occupying client");
+
+        let error = status_at(&socket)
+            .await
+            .expect_err("a busy daemon is running, so status must not report NotRunning");
+        assert!(daemon_busy(&error), "unexpected error: {error:#}");
         drop(held);
         drop(server);
     }
