@@ -106,19 +106,22 @@ fn detached_matches(
     {
         return false;
     }
-    for (saved, root) in detached.saved_roots.iter().zip(roots) {
+    let mut actual_roots = Vec::new();
+    for root in roots {
         if root.resolution != RootResolution::Resolved {
             return false;
         }
-        let actual = root
-            .canonical_file_root
-            .as_ref()
-            .unwrap_or(&root.canonical_watched);
-        if saved != actual {
-            return false;
-        }
+        actual_roots.push(
+            root.canonical_file_root
+                .as_ref()
+                .unwrap_or(&root.canonical_watched)
+                .clone(),
+        );
     }
-    true
+    let mut saved_roots = detached.saved_roots.clone();
+    saved_roots.sort();
+    actual_roots.sort();
+    saved_roots == actual_roots
 }
 
 fn reclaim_matching_detached(
@@ -128,11 +131,15 @@ fn reclaim_matching_detached(
     cfg: &Config,
     roots: &[WatchRoot],
 ) {
-    if let Some(index) = guard
-        .detached
-        .iter()
-        .position(|detached| detached_matches(detached, id, cfg, roots))
-    {
+    let matching = |detached: &DetachedRegistration| detached_matches(detached, id, cfg, roots);
+    let ticketed = match &id.source {
+        ConfigSource::RepoLayer(_) => guard
+            .detached
+            .iter()
+            .position(|detached| detached._ticket.is_some() && matching(detached)),
+        ConfigSource::Baseline => None,
+    };
+    if let Some(index) = ticketed.or_else(|| guard.detached.iter().position(matching)) {
         let detached = guard.detached.remove(index);
         detached.token.store(false, Ordering::SeqCst);
         pending
@@ -450,11 +457,18 @@ fn attach_ordinary_owner(
     registration: &Registration,
     retired: &mut RetiredRegistration,
 ) {
+    let mut independent_dirs = HashSet::new();
+    for root in &registration.roots {
+        if root.resolution == RootResolution::Resolved && root.canonical_file_root.is_none() {
+            independent_dirs.insert(root.canonical_watched.clone());
+        }
+    }
     let token = Arc::new(AtomicBool::new(true));
     guard.detached.push(DetachedRegistration {
         id: id.clone(),
         cfg: registration.cfg.clone(),
         saved_roots: retired.roots.clone(),
+        independent_dirs,
         binding: registration.binding.clone(),
         token: token.clone(),
         _ticket: retired._ticket.take(),
@@ -462,6 +476,7 @@ fn attach_ordinary_owner(
         waiting_roots: Vec::new(),
         ready_roots: Vec::new(),
         absent_ticks: 0,
+        rearmed_ticks: HashMap::new(),
         queued: false,
     });
     retired.ordinary_owner = Some(token);
@@ -472,6 +487,7 @@ struct DetachedRegistration {
     id: RegistrationId,
     cfg: Arc<Config>,
     saved_roots: Vec<PathBuf>,
+    independent_dirs: HashSet<PathBuf>,
     binding: Arc<()>,
     token: Arc<AtomicBool>,
     _ticket: Option<RetirementTicket>,
@@ -479,6 +495,7 @@ struct DetachedRegistration {
     waiting_roots: Vec<PathBuf>,
     ready_roots: Vec<PathBuf>,
     absent_ticks: u32,
+    rearmed_ticks: HashMap<PathBuf, u32>,
     queued: bool,
 }
 
@@ -494,6 +511,11 @@ pub(crate) struct RootProbe {
     pub(crate) corpus: CorpusConfig,
     binding: Arc<()>,
     pub(crate) saved_roots: Vec<PathBuf>,
+}
+
+pub(crate) struct DetachedRootObservation {
+    pub(crate) binding: Arc<()>,
+    pub(crate) absences: Vec<(PathBuf, bool)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1342,6 +1364,11 @@ impl WatchRegistry {
         };
         let detached = &mut guard.detached[index];
         if !registration.waiting_roots.is_empty() {
+            for root in &registration.waiting_roots {
+                if detached.independent_dirs.contains(root) {
+                    detached.rearmed_ticks.insert(root.clone(), 0);
+                }
+            }
             detached
                 .waiting_roots
                 .append(&mut registration.waiting_roots);
@@ -1476,31 +1503,89 @@ impl WatchRegistry {
         probes
     }
 
-    pub(crate) fn record_detached_absence(&self, observations: &[(Arc<()>, bool)], threshold: u32) {
+    pub(crate) fn record_detached_absence(
+        &self,
+        observations: &[DetachedRootObservation],
+        threshold: u32,
+    ) {
         let mut guard = self.lock();
         let mut ready = Vec::new();
         for detached in &mut guard.detached {
-            let Some((_, absent)) = observations
+            let Some(DetachedRootObservation { absences, .. }) = observations
                 .iter()
-                .find(|(binding, _)| Arc::ptr_eq(binding, &detached.binding))
+                .find(|observation| Arc::ptr_eq(&observation.binding, &detached.binding))
             else {
                 continue;
             };
-            if *absent {
-                detached.absent_ticks = detached.absent_ticks.saturating_add(1);
+            let mut eligible = Vec::new();
+            if detached.rearmed_ticks.is_empty() {
+                let absent = detached.waiting_roots.iter().all(|root| {
+                    absences
+                        .iter()
+                        .any(|(path, absent)| path == root && *absent)
+                });
+                if absent {
+                    detached.absent_ticks = detached.absent_ticks.saturating_add(1);
+                } else {
+                    detached.absent_ticks = 0;
+                }
+                if detached.absent_ticks >= threshold {
+                    detached.absent_ticks = 0;
+                    eligible.append(&mut detached.waiting_roots);
+                }
             } else {
-                detached.absent_ticks = 0;
+                for (root, ticks) in &mut detached.rearmed_ticks {
+                    let absent = absences
+                        .iter()
+                        .find(|(path, _)| path == root)
+                        .is_some_and(|(_, absent)| *absent);
+                    if absent {
+                        *ticks = ticks.saturating_add(1);
+                    } else {
+                        *ticks = 0;
+                    }
+                }
+                let all_absent = detached.waiting_roots.iter().all(|root| {
+                    absences
+                        .iter()
+                        .any(|(path, absent)| path == root && *absent)
+                });
+                if all_absent {
+                    detached.absent_ticks = detached.absent_ticks.saturating_add(1);
+                } else {
+                    detached.absent_ticks = 0;
+                }
+                let group_ready = detached.absent_ticks >= threshold;
+                if group_ready {
+                    detached.absent_ticks = 0;
+                }
+                detached.waiting_roots.retain(|root| {
+                    let ready = if detached.independent_dirs.contains(root) {
+                        detached
+                            .rearmed_ticks
+                            .get(root)
+                            .is_some_and(|ticks| *ticks >= threshold)
+                    } else {
+                        group_ready
+                    };
+                    if ready {
+                        eligible.push(root.clone());
+                    }
+                    !ready
+                });
+                for root in &eligible {
+                    detached.rearmed_ticks.remove(root);
+                }
             }
-            if detached.absent_ticks >= threshold {
-                detached.absent_ticks = 0;
+            if !eligible.is_empty() {
                 if let Some(retired) = detached.retired.as_mut() {
-                    retired.roots.append(&mut detached.waiting_roots);
+                    retired.roots.append(&mut eligible);
                     if !detached.queued {
                         detached.queued = true;
                         ready.push(detached.token.clone());
                     }
                 } else {
-                    detached.ready_roots.append(&mut detached.waiting_roots);
+                    detached.ready_roots.append(&mut eligible);
                 }
             }
         }
@@ -1604,12 +1689,20 @@ impl WatchRegistry {
             let saved_roots = retired.roots.clone();
             let ticket = retired._ticket.take();
             retired.roots.clear();
+            let mut independent_dirs = HashSet::new();
+            for root in &registration.roots {
+                if root.resolution == RootResolution::Resolved && root.canonical_file_root.is_none()
+                {
+                    independent_dirs.insert(root.canonical_watched.clone());
+                }
+            }
             let token = Arc::new(AtomicBool::new(true));
             retired.detached = Some(token.clone());
             guard.detached.push(DetachedRegistration {
                 id: id.clone(),
                 cfg: retired.cfg.clone(),
                 saved_roots: saved_roots.clone(),
+                independent_dirs,
                 binding: registration.binding,
                 token,
                 _ticket: ticket,
@@ -1617,6 +1710,7 @@ impl WatchRegistry {
                 waiting_roots: saved_roots,
                 ready_roots: Vec::new(),
                 absent_ticks: 0,
+                rearmed_ticks: HashMap::new(),
                 queued: false,
             });
             release_admission(&mut guard, &id);
@@ -2332,11 +2426,50 @@ mod tests {
     }
 
     #[test]
-    fn pr_786_detached_slot_rejects_permuted_secondary_roots_at_cap() {
+    fn pr_786_register_reclaims_permuted_secondary_roots_at_cap() {
         let (registry, cfg, roots) = detached_registry_at_cap();
         let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
         let mut permuted = roots.clone();
         permuted.swap(1, 2);
+        let mut duplicated = permuted.clone();
+        duplicated[1] = duplicated[2].clone();
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), duplicated),
+            RegisterOutcome::LimitReached,
+            "duplicate keys cannot replace a missing physical root"
+        );
+        let mut unresolved = permuted.clone();
+        unresolved[1].resolution = RootResolution::Unresolved;
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), unresolved),
+            RegisterOutcome::LimitReached,
+        );
+        let mut changed_file = permuted.clone();
+        changed_file[2] = root("/parent", corpus("wiki"));
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), changed_file),
+            RegisterOutcome::LimitReached,
+            "the watched parent cannot replace the exact file key"
+        );
+        let mut changed_primary = permuted.clone();
+        changed_primary[0] = root("/new-primary", corpus("wiki"));
+        assert_eq!(
+            registry.register(source.clone(), corpus("wiki"), cfg.clone(), changed_primary),
+            RegisterOutcome::LimitReached,
+        );
+        let mut changed_cfg = (*cfg).clone();
+        changed_cfg.embeddings.model = "different-model".into();
+        assert_eq!(
+            registry.register(
+                source.clone(),
+                corpus("wiki"),
+                Arc::new(changed_cfg),
+                permuted.clone()
+            ),
+            RegisterOutcome::LimitReached,
+        );
+        assert_eq!(registry.detached_probes().len(), 1);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
         assert_eq!(
             registry.register(
                 source.clone(),
@@ -2344,37 +2477,29 @@ mod tests {
                 cfg.clone(),
                 permuted.clone()
             ),
-            RegisterOutcome::LimitReached,
-            "secondary root order remains part of the exact detached binding"
-        );
-        assert_eq!(registry.detached_probes().len(), 1);
-        assert_eq!(
-            registry.register(source, corpus("wiki"), cfg, roots),
             RegisterOutcome::New,
-            "the saved order reuses the detached slot"
+            "the same physical roots reuse the detached ticket at cap"
         );
+        assert!(registry.detached_probes().is_empty());
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert!(registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &permuted));
+        assert!(!registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &roots));
+    }
 
+    #[test]
+    fn pr_786_reload_reclaims_permuted_secondary_roots_at_cap() {
         let (registry, cfg, roots) = detached_registry_at_cap();
         let source = ConfigSource::RepoLayer(PathBuf::from("/reload/.hallouminate/config.toml"));
         let mut permuted = roots.clone();
         permuted.swap(1, 2);
-        let error = registry
+        registry
             .replace_source(source.clone(), vec![corpus("wiki")], cfg.clone(), |_| {
                 permuted.clone()
             })
-            .expect_err("permuted reload must exceed the detached-slot limit");
-        assert_eq!(
-            error,
-            "runtime watcher registration limit reached; retaining source for retry"
-        );
-        assert_eq!(registry.detached_probes().len(), 1);
-        registry
-            .replace_source(source.clone(), vec![corpus("wiki")], cfg.clone(), |_| {
-                roots.clone()
-            })
-            .expect("saved-order reload reuses the detached slot");
+            .expect("permuted reload reuses the detached ticket at cap");
         assert!(registry.detached_probes().is_empty());
-        assert!(registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &roots));
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert!(registry.is_registered_unchanged(&source, &corpus("wiki"), &cfg, &permuted));
     }
 
     #[test]
@@ -2449,7 +2574,13 @@ mod tests {
         let (registry, cfg, roots) = detached_registry_at_cap();
         let (binding, saved) = registry.detached_probes().pop().expect("detached roots");
         for _ in 0..3 {
-            registry.record_detached_absence(&[(binding.clone(), true)], 3);
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: saved.iter().cloned().map(|root| (root, true)).collect(),
+                }],
+                3,
+            );
         }
         let mut old = registry.take_pending_cleanups().pop().expect("old cleanup");
         old.roots = vec![saved[1].clone()];
@@ -2465,7 +2596,13 @@ mod tests {
         let (binding, waiting) = registry.detached_probes().pop().expect("waiting root");
         assert_eq!(waiting, vec![saved[0].clone()]);
         for _ in 0..3 {
-            registry.record_detached_absence(&[(binding.clone(), true)], 3);
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: waiting.iter().cloned().map(|root| (root, true)).collect(),
+                }],
+                3,
+            );
         }
         failed.roots.clear();
         registry.park_failed_cleanup(failed);
@@ -2490,6 +2627,89 @@ mod tests {
         );
         registry.park_failed_cleanup(ready);
         assert!(registry.take_pending_cleanups().is_empty());
+    }
+
+    #[test]
+    fn pr_786_rearmed_directory_counts_once_and_does_not_release_file() {
+        let (registry, _cfg, _roots) = detached_registry_at_cap();
+        let (binding, saved) = registry.detached_probes().pop().expect("detached roots");
+        for _ in 0..3 {
+            let absences = saved.iter().cloned().map(|root| (root, true)).collect();
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences,
+                }],
+                3,
+            );
+        }
+        let mut old = registry
+            .take_pending_cleanups()
+            .pop()
+            .expect("initial cleanup");
+        old.roots.clear();
+        old.waiting_roots = vec![
+            saved[0].clone(),
+            saved[0].clone(),
+            saved[1].clone(),
+            saved[2].clone(),
+        ];
+        registry.park_failed_cleanup(old);
+        let (binding, waiting) = registry.detached_probes().pop().expect("rearmed roots");
+        assert_eq!(waiting.len(), 4);
+        let absent_target = vec![
+            (saved[0].clone(), true),
+            (saved[1].clone(), false),
+            (saved[2].clone(), false),
+        ];
+        for _ in 0..2 {
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: absent_target.clone(),
+                }],
+                3,
+            );
+        }
+        assert!(registry.take_pending_cleanups().is_empty());
+        let present_target = vec![
+            (saved[0].clone(), false),
+            (saved[1].clone(), false),
+            (saved[2].clone(), false),
+        ];
+        registry.record_detached_absence(
+            &[DetachedRootObservation {
+                binding: binding.clone(),
+                absences: present_target,
+            }],
+            3,
+        );
+        for _ in 0..2 {
+            registry.record_detached_absence(
+                &[DetachedRootObservation {
+                    binding: binding.clone(),
+                    absences: absent_target.clone(),
+                }],
+                3,
+            );
+        }
+        assert!(registry.take_pending_cleanups().is_empty());
+        registry.record_detached_absence(
+            &[DetachedRootObservation {
+                binding,
+                absences: absent_target,
+            }],
+            3,
+        );
+        let ready = registry.take_pending_cleanups();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].roots, vec![saved[0].clone(), saved[0].clone()]);
+        let (_, waiting) = registry
+            .detached_probes()
+            .pop()
+            .expect("other roots remain");
+        assert_eq!(waiting, vec![saved[1].clone(), saved[2].clone()]);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
     }
 
     #[test]
