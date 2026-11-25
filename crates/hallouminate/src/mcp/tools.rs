@@ -424,10 +424,8 @@ async fn daemon_for_tool() -> Result<DaemonClient, ErrorData> {
     // ADR-002 reverses the old "do NOT auto-start the daemon from MCP" non-goal:
     // with idle-exit (ADR-001) a mid-session exit would strand every later tool
     // call, so client_for(None) self-heals by respawning the daemon once on
-    // connect failure.
-    client_for(None)
-        .await
-        .map_err(|e| internal_error(format!("{e:#}")))
+    // connect failure. A busy daemon keeps its retryable type for the caller.
+    client_for(None).await.map_err(map_daemon_err)
 }
 
 /// Translate a daemon RPC error into the MCP transport's `ErrorData` shape.
