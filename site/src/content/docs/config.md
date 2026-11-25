@@ -63,10 +63,11 @@ so the wiki lands at `<repo>/.hallouminate/wiki` and is searchable as
 
 ## Logging
 
-The active process log is
-`$XDG_STATE_HOME/hallouminate/hallouminate.log` (default
-`~/.local/state/hallouminate/hallouminate.log`). Size rotation creates
-numbered archives `hallouminate.log.1`, `.2`, and so on, with `.1` newest.
+The active process log uses the build channel's app directory:
+`$XDG_STATE_HOME/hallouminate/hallouminate.log` for release builds and
+`$XDG_STATE_HOME/hallouminate-dev/hallouminate.log` for dev builds.
+When `XDG_STATE_HOME` is unset, the base is `~/.local/state`.
+Size rotation creates numbered archives `hallouminate.log.1`, `.2`, and so on, with `.1` newest.
 
 ```toml
 [logging]
@@ -193,13 +194,13 @@ These items do not change:
   `$XDG_CONFIG_HOME/hallouminate/config.toml`.
 - Both builds share the model cache, `~/.cache/hallouminate/fastembed`.
   Model files are immutable downloads and have no store schema.
-- Explicit settings always win. These are `[storage].ground_dir`,
-  `[embeddings].cache_dir`, and `HALLOUMINATE_SOCKET`. A baseline that sets
-  `ground_dir` gives both builds the same store.
-- `XDG_STATE_HOME` still sets the base of the state directory. A dev build
-  adds `hallouminate-dev` below it.
-- The active process log stays at
-  `$XDG_STATE_HOME/hallouminate/hallouminate.log` for both builds.
+- Explicit `[embeddings].cache_dir` and `HALLOUMINATE_SOCKET` settings win.
+  An intentional custom `[storage].ground_dir` also stays unchanged.
+  A dev build remaps the legacy built-in release `ground_dir` default to its
+  dev directory, whether the path uses `~` or an expanded home directory.
+- `XDG_STATE_HOME` sets only the state directory base. The build channel
+  selects `hallouminate` or `hallouminate-dev` below that base, including
+  the active process log.
 
 The first dev build on a host starts with an empty store. Run
 `hallouminate index` to fill it.
@@ -209,5 +210,6 @@ The first dev build on a host starts with an empty store. Run
 A Unix socket path must fit in `sockaddr_un.sun_path`, including the
 trailing NUL. The limit is 108 bytes on Linux and 104 bytes on macOS. The
 daemon and its clients check the resolved socket path before they use it.
-A path that is too long stops the command with an error that names
-`HALLOUMINATE_SOCKET` and the limit.
+A path that is too long stops the command with an error that names its
+source and the limit. An explicit `--socket` path error names `--socket`;
+an environment override error names `HALLOUMINATE_SOCKET`.

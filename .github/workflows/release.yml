@@ -187,14 +187,37 @@ jobs:
           echo "dist ran successfully"
       - name: Guard release channel
         shell: bash
+        env:
+          HALLOUMINATE_GUARD_TARGET: ${{ join(matrix.targets, ' ') }}
         # A binary built without HALLOUMINATE_RELEASE_CHANNEL reports `dev` and
         # would move installed users to empty hallouminate-dev directories.
         run: |
           set -euo pipefail
-          archive="$(ls target/distrib/hallouminate-*.tar.xz | head -n 1)"
+          target="$HALLOUMINATE_GUARD_TARGET"
+          if [[ ! "$target" =~ ^[[:alnum:]_]+(-[[:alnum:]_]+){2,3}$ ]]; then
+            echo "::error::expected exactly one target triple, got '$target'" >&2
+            exit 1
+          fi
+          archive="target/distrib/hallouminate-$target.tar.xz"
+          if [[ ! -f "$archive" ]]; then
+            echo "::error::expected archive '$archive'" >&2
+            exit 1
+          fi
           work="$(mktemp -d)"
-          tar -xJf "$archive" -C "$work"
-          bin="$(find "$work" -type f -name hallouminate | head -n 1)"
+          trap 'rm -rf "$work"' EXIT
+          mkdir "$work/unpack"
+          tar -xJf "$archive" -C "$work/unpack"
+          find "$work/unpack" -type f -name hallouminate -print0 > "$work/bins"
+          bin=''
+          bin_count=0
+          while IFS= read -r -d '' candidate; do
+            bin="$candidate"
+            ((bin_count += 1))
+          done < "$work/bins"
+          if (( bin_count != 1 )); then
+            echo "::error::expected one hallouminate binary in '$archive', found $bin_count" >&2
+            exit 1
+          fi
           version_line="$("$bin" --version)"
           echo "$version_line"
           case "$version_line" in

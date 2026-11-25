@@ -13,12 +13,13 @@ const SOCKET_ENV: &str = "HALLOUMINATE_SOCKET";
 
 /// Bytes in `sockaddr_un.sun_path`, including the trailing NUL: 108 on
 /// Linux and 104 on macOS.
-const SUN_PATH_CAPACITY: usize =
+pub(crate) const SUN_PATH_CAPACITY: usize =
     std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
 
 #[derive(Debug, Clone, Copy)]
-enum SocketSource {
+pub(crate) enum SocketSource {
     Override,
+    ExplicitFlag,
     Default,
 }
 
@@ -55,21 +56,31 @@ fn resolve_socket_path(
     )
 }
 
-fn checked_socket_path(path: PathBuf, source: SocketSource) -> io::Result<PathBuf> {
+pub(crate) fn checked_socket_path(path: PathBuf, source: SocketSource) -> io::Result<PathBuf> {
     let length = path.as_os_str().as_bytes().len();
     if length < SUN_PATH_CAPACITY {
         return Ok(path);
     }
     let max = SUN_PATH_CAPACITY - 1;
-    let subject = match source {
-        SocketSource::Override => format!("{SOCKET_ENV} path"),
-        SocketSource::Default => "default daemon socket path".to_string(),
+    let (subject, hint) = match source {
+        SocketSource::Override => (
+            format!("{SOCKET_ENV} path"),
+            format!("set {SOCKET_ENV} to a shorter path"),
+        ),
+        SocketSource::ExplicitFlag => (
+            "--socket path".to_string(),
+            "pass a shorter path with --socket".to_string(),
+        ),
+        SocketSource::Default => (
+            "default daemon socket path".to_string(),
+            format!("set {SOCKET_ENV} to a shorter path"),
+        ),
     };
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
             "{subject} {} is {length} bytes; a Unix socket path must be at most {max} bytes \
-             ({SUN_PATH_CAPACITY} with the trailing NUL); set {SOCKET_ENV} to a shorter path",
+             ({SUN_PATH_CAPACITY} with the trailing NUL); {hint}",
             path.display()
         ),
     ))

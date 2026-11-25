@@ -58,7 +58,7 @@ use super::pressure::NoPressureSignal;
 use super::pressure::PsiProbe;
 
 use hallouminate_adapters::{
-    EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, StoreLockOwner,
+    EmbedBatch, Embedder, FastembedCrossencoder, LanceStore, StoreLockGuard, StoreLockOwner,
 };
 use hallouminate_config::Config;
 use hallouminate_domain::common::{CorpusConfig, CorpusKey, HallouminateError, expand_tilde};
@@ -564,6 +564,7 @@ impl DaemonState {
         store_lock_owner: StoreLockOwner,
     ) -> anyhow::Result<Self> {
         let ground_dir = expand_tilde(&cfg.storage.ground_dir);
+        let store_lock = LanceStore::lock(&ground_dir, &store_lock_owner).await?;
         let stale = check_ground_dir(&cfg, &ground_dir).await?;
 
         // Model construction and ONNX session setup are synchronous and
@@ -597,15 +598,8 @@ impl DaemonState {
         // Metadata validation happened before model ownership moved into the
         // store, so stale-schema recovery reuses this single ONNX session.
         // Boot rebuilds a stale store inline, before the watchdog arms.
-        let store = open_boot_store(
-            &cfg,
-            &ground_dir,
-            stale,
-            embedder,
-            &tokenizer,
-            store_lock_owner.clone(),
-        )
-        .await?;
+        let store =
+            open_boot_store(&cfg, &ground_dir, stale, embedder, &tokenizer, store_lock).await?;
         prune_stale_backups_logged(&ground_dir).await;
         // Keep model construction lazy. The rerank blocking-pool task owns
         // construction and the per-model slot for the configured deadline.
@@ -914,6 +908,26 @@ impl DaemonState {
 
         let ground_dir = key.ground_dir.clone();
         let _ground = self.inner.ground_dir_locks.lock(ground_dir.as_path()).await;
+        {
+            let resources = self.inner.resources.lock().await;
+            for active in resources.keys() {
+                if active.ground_dir == ground_dir {
+                    return Err(anyhow::anyhow!(
+                        "embedding store mismatch: store has \
+                         (model {:?}, quantized {}, embeddings_enabled {}), requested \
+                         (model {:?}, quantized {}, embeddings_enabled {}); \
+                         use a different ground dir or matching embedding settings",
+                        active.model,
+                        active.quantized,
+                        active.enabled,
+                        key.model,
+                        key.quantized,
+                        key.enabled,
+                    ));
+                }
+            }
+        }
+        let store_lock = LanceStore::lock(&ground_dir, &self.inner.store_lock_owner).await?;
         let stale = check_ground_dir(cfg, &ground_dir).await?;
         let cache_dir = expand_tilde(&cfg.embeddings.cache_dir);
         let embedder = if cfg.embeddings.enabled {
@@ -938,15 +952,9 @@ impl DaemonState {
                 %expected,
                 "ground store schema v{found} < expected v{expected}; moving it aside for catch-up",
             );
-            move_stale_store(&ground_dir, found).await?;
+            move_stale_store(&ground_dir, found, store_lock.clone()).await?;
         }
-        let store = open_ground_store(
-            cfg,
-            &ground_dir,
-            embedder,
-            self.inner.store_lock_owner.clone(),
-        )
-        .await?;
+        let store = open_ground_store(cfg, &ground_dir, embedder, store_lock).await?;
         if stale.is_some() {
             self.watch_registry().mark_reconcile_due_all();
         }
@@ -1351,15 +1359,15 @@ async fn open_ground_store(
     cfg: &Config,
     ground_dir: &Path,
     embedder: Option<Box<dyn EmbedBatch>>,
-    store_lock_owner: StoreLockOwner,
+    store_lock: StoreLockGuard,
 ) -> anyhow::Result<LanceStore> {
-    LanceStore::open_or_create_with_owner(
+    LanceStore::open_or_create_locked(
         ground_dir,
         &cfg.embeddings.model,
         cfg.embeddings.quantized,
         cfg.embeddings.enabled,
         embedder,
-        store_lock_owner,
+        store_lock,
     )
     .await
     .map_err(|e| anyhow::anyhow!("open ground dir {}: {e}", ground_dir.display()))
@@ -1375,10 +1383,10 @@ async fn open_boot_store(
     stale: Option<StaleStore>,
     embedder: Option<Box<dyn EmbedBatch>>,
     tokenizer: &Tokenizer,
-    store_lock_owner: StoreLockOwner,
+    store_lock: StoreLockGuard,
 ) -> anyhow::Result<LanceStore> {
     let Some(StaleStore { found, expected }) = stale else {
-        return open_ground_store(cfg, ground_dir, embedder, store_lock_owner).await;
+        return open_ground_store(cfg, ground_dir, embedder, store_lock).await;
     };
     tracing::warn!(
         target: "hallouminate::daemon",
@@ -1387,8 +1395,8 @@ async fn open_boot_store(
         %expected,
         "ground store schema v{found} < expected v{expected}; rebuilding from source",
     );
-    move_stale_store(ground_dir, found).await?;
-    let result = match open_ground_store(cfg, ground_dir, embedder, store_lock_owner).await {
+    move_stale_store(ground_dir, found, store_lock.clone()).await?;
+    let result = match open_ground_store(cfg, ground_dir, embedder, store_lock.clone()).await {
         Ok(store) => reindex_effective_corpora(cfg, ground_dir, &store, tokenizer)
             .await
             .map(|()| store),
@@ -1397,7 +1405,7 @@ async fn open_boot_store(
     match result {
         Ok(store) => Ok(store),
         Err(error) => {
-            remove_partial_store(ground_dir, found, &error).await;
+            remove_partial_store(ground_dir, found, &error, store_lock.clone()).await;
             Err(error)
         }
     }
@@ -1448,18 +1456,41 @@ async fn reindex_effective_corpora(
     Ok(())
 }
 
-/// Remove the partial store that a failed boot rebuild left. The next open
-/// creates an empty store, and the watcher's catch-up refills it from source.
-async fn remove_partial_store(ground_dir: &Path, found: u32, error: &anyhow::Error) {
-    if !ground_dir.exists() {
-        return;
-    }
-    match tokio::fs::remove_dir_all(ground_dir).await {
+/// Removes failed rebuild data without unlinking the owned lock inodes.
+async fn remove_partial_store(
+    ground_dir: &Path,
+    found: u32,
+    error: &anyhow::Error,
+    store_lock: StoreLockGuard,
+) {
+    let path = ground_dir.to_path_buf();
+    let cleanup = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        store_lock.validate_path(&path)?;
+        for entry in std::fs::read_dir(&path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == std::ffi::OsStr::new("store.lock")
+                || name == std::ffi::OsStr::new("store.lock.diagnostics")
+            {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())?;
+            } else {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    match cleanup {
         Ok(()) => tracing::warn!(
             target: "hallouminate::daemon",
             ground_dir = %ground_dir.display(),
             error = %error,
-            "rebuild failed; removed partial ground dir. Backup preserved at {}.bak-v{found}",
+            "rebuild failed; removed partial ground data. Backup preserved at {}.bak-v{found}",
             ground_dir.display(),
         ),
         Err(remove_error) => tracing::error!(
@@ -1467,7 +1498,7 @@ async fn remove_partial_store(ground_dir: &Path, found: u32, error: &anyhow::Err
             ground_dir = %ground_dir.display(),
             error = %error,
             remove_error = %remove_error,
-            "rebuild failed; could not remove partial ground dir",
+            "rebuild failed; could not remove partial ground data",
         ),
     }
 }
@@ -1485,28 +1516,60 @@ async fn prune_stale_backups_logged(ground_dir: &Path) {
     }
 }
 
-/// Move the stale ground store aside atomically so a fresh store can be
-/// created in its place. The backup is named `<ground>.bak-v{found_version}`.
-/// A pre-existing backup from a prior failed rebuild is overwritten.
-async fn move_stale_store(ground_dir: &Path, found_version: u32) -> anyhow::Result<()> {
-    let bak = ground_dir.with_file_name(format!(
-        "{}.bak-v{found_version}",
-        ground_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("ground"),
-    ));
-    if bak.exists() {
-        tokio::fs::remove_dir_all(&bak).await?;
-    }
-    tokio::fs::rename(ground_dir, &bak).await?;
-    // `rename(2)` preserves the source dir's mtime, so without this the
-    // freshly-moved backup can already look >30d old and get pruned on the
-    // same boot that created it. Stamp it to "now" so age is measured from
-    // when it was set aside, not from the original store's last write.
-    let stamp_target = bak.clone();
-    tokio::task::spawn_blocking(move || {
-        std::fs::File::open(&stamp_target)?.set_modified(SystemTime::now())
+/// Exchanges a stale store while the active pathname keeps the owned lock inode.
+async fn move_stale_store(
+    ground_dir: &Path,
+    found_version: u32,
+    store_lock: StoreLockGuard,
+) -> anyhow::Result<()> {
+    let path = ground_dir.to_path_buf();
+    let bak = tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
+        store_lock.validate_path(&path)?;
+        let ground_dir = path.canonicalize()?;
+        let bak = ground_dir.with_file_name(format!(
+            "{}.bak-v{found_version}",
+            ground_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("ground"),
+        ));
+        if bak.exists() {
+            std::fs::remove_dir_all(&bak)?;
+        }
+        std::fs::create_dir(&bak)?;
+        let prepared = (|| -> std::io::Result<()> {
+            for name in ["store.lock", "store.lock.diagnostics"] {
+                std::fs::hard_link(ground_dir.join(name), bak.join(name))?;
+            }
+            std::fs::File::open(&ground_dir)?.set_modified(SystemTime::now())?;
+            Ok(())
+        })();
+        if let Err(error) = prepared {
+            let _ = std::fs::remove_dir_all(&bak);
+            return Err(error.into());
+        }
+        if let Err(error) = rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            &ground_dir,
+            rustix::fs::CWD,
+            &bak,
+            rustix::fs::RenameFlags::EXCHANGE,
+        ) {
+            let _ = std::fs::remove_dir_all(&bak);
+            return Err(anyhow::anyhow!("exchange stale ground store: {error}"));
+        }
+        store_lock.validate_path(&path)?;
+        for name in ["store.lock", "store.lock.diagnostics"] {
+            if let Err(error) = std::fs::remove_file(bak.join(name)) {
+                tracing::warn!(
+                    target: "hallouminate::daemon",
+                    backup = %bak.display(),
+                    %error,
+                    "could not detach backup lock link",
+                );
+            }
+        }
+        Ok(bak)
     })
     .await??;
     tracing::info!(
@@ -2955,6 +3018,9 @@ mod tests {
             .await
             .expect("create ground dir");
 
+        let owner = StoreLockOwner::for_process();
+        let store_lock = LanceStore::lock(&ground_dir, &owner).await.expect("lock");
+
         let old_mtime = SystemTime::now() - Duration::from_secs(60 * 24 * 60 * 60);
         let dir = ground_dir.clone();
         tokio::task::spawn_blocking(move || std::fs::File::open(&dir)?.set_modified(old_mtime))
@@ -2962,7 +3028,9 @@ mod tests {
             .expect("join")
             .expect("backdate ground dir mtime");
 
-        move_stale_store(&ground_dir, 1).await.expect("move");
+        move_stale_store(&ground_dir, 1, store_lock)
+            .await
+            .expect("move");
 
         let bak = tmp.path().join("ground.bak-v1");
         prune_stale_backups(&ground_dir, SystemTime::now(), STALE_BACKUP_MAX_AGE)

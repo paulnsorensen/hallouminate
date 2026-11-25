@@ -1078,7 +1078,7 @@ pub struct LanceStore {
     /// Exclusive store lock plus its diagnostic freshness guard, held for this
     /// store's lifetime. Dropping the guard before the store lock means a
     /// contender either observes current metadata or omits it.
-    _dir_lock: StoreLocks,
+    _dir_lock: StoreLockGuard,
     /// Owns query/passage embedding when embeddings are enabled. The shared
     /// synchronous mutex is acquired only on Tokio's blocking pool, keeping
     /// model access serial without blocking either runtime flavor's workers.
@@ -1099,6 +1099,35 @@ const STORE_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 struct StoreLocks {
     _diagnostics_lock: std::fs::File,
     _store_lock: std::fs::File,
+}
+
+/// Shared ownership of the legacy store lock across validation and store open.
+#[derive(Clone)]
+pub struct StoreLockGuard {
+    locks: Arc<StoreLocks>,
+    ground_dir: PathBuf,
+}
+
+impl StoreLockGuard {
+    /// Confirms that the active pathname still names this guard's lock inode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is missing or ownership changed.
+    pub fn validate_path(&self, ground_dir: &Path) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = ground_dir.canonicalize()?;
+        let active = std::fs::metadata(path.join(STORE_LOCK_FILENAME))?;
+        let owned = self.locks._store_lock.metadata()?;
+        if path != self.ground_dir || active.dev() != owned.dev() || active.ino() != owned.ino() {
+            return Err(HallouminateError::Config(format!(
+                "ground store lock no longer owns {}",
+                ground_dir.display()
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// One non-blocking `flock` attempt on `store.lock`. `Ok(None)` means the lock
@@ -1162,16 +1191,11 @@ fn try_acquire_store_lock(ground_dir: &Path, owner: &StoreLockOwner) -> Result<O
 /// diagnostics guard. A raw holder or a release/acquisition transition leaves
 /// the guard available, so stale bytes never become a false owner report.
 fn contended_store_lock_owner(ground_dir: &Path) -> Option<StoreLockOwner> {
-    use std::os::unix::fs::OpenOptionsExt;
-
     use rustix::fs::{FlockOperation, flock};
 
     let diagnostics_lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
         .open(ground_dir.join(STORE_LOCK_DIAGNOSTICS_FILENAME))
         .ok()?;
     match flock(&diagnostics_lock, FlockOperation::NonBlockingLockExclusive) {
@@ -1327,10 +1351,48 @@ impl LanceStore {
         embedder: Option<Box<dyn EmbedBatch>>,
         owner: StoreLockOwner,
     ) -> Result<Self> {
+        let lock = Self::lock(ground_dir, &owner).await?;
+        Self::open_or_create_locked(
+            ground_dir,
+            model_name,
+            quantized,
+            embeddings_enabled,
+            embedder,
+            lock,
+        )
+        .await
+    }
+
+    /// Acquires the store lock before metadata validation or migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be created or the lock is held.
+    pub async fn lock(ground_dir: &Path, owner: &StoreLockOwner) -> Result<StoreLockGuard> {
         std::fs::create_dir_all(ground_dir)?;
+        let locks = acquire_store_lock(ground_dir, owner).await?;
+        Ok(StoreLockGuard {
+            locks: Arc::new(locks),
+            ground_dir: ground_dir.canonicalize()?,
+        })
+    }
+
+    /// Opens a store using ownership acquired before metadata validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ownership changed, metadata is invalid, or the store cannot open.
+    pub async fn open_or_create_locked(
+        ground_dir: &Path,
+        model_name: &str,
+        quantized: bool,
+        embeddings_enabled: bool,
+        embedder: Option<Box<dyn EmbedBatch>>,
+        lock: StoreLockGuard,
+    ) -> Result<Self> {
+        lock.validate_path(ground_dir)?;
         let meta_path = ground_dir.join(META_FILENAME);
         meta_check_or_init(&meta_path, model_name, quantized, embeddings_enabled)?;
-        let dir_lock = acquire_store_lock(ground_dir, &owner).await?;
         let uri = ground_dir.to_str().ok_or_else(|| {
             HallouminateError::Config(format!("non-utf8 ground dir: {}", ground_dir.display()))
         })?;
@@ -1370,7 +1432,7 @@ impl LanceStore {
             embeddings_enabled,
             indexes_ensured: AtomicBool::new(false),
             text_index_present: AtomicBool::new(false),
-            _dir_lock: dir_lock,
+            _dir_lock: lock,
             embedder: Arc::new(std::sync::Mutex::new(embedder)),
             embedder_available: AtomicBool::new(embedder_available),
         })
