@@ -5238,9 +5238,97 @@ fn read_schema_version(ground_dir: &Path) -> u32 {
     m.schema_version
 }
 
+#[tokio::test]
+async fn stale_store_refuses_legacy_lock_before_moving_data() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ground = tmp.path().join("ground");
+    let corpus_root = tmp.path().join("corpus");
+    std::fs::create_dir_all(&corpus_root).expect("mkdir corpus");
+    let stale = hallouminate_adapters::default_schema_version_pub() - 1;
+    write_stale_meta(&ground, stale);
+    let marker = ground.join("owned-data");
+    std::fs::write(&marker, "live owner data").expect("seed owned data");
+    let backup = ground.with_file_name(format!("ground.bak-v{stale}"));
+    std::fs::create_dir_all(&backup).expect("mkdir prior backup");
+    std::fs::write(backup.join("sentinel"), "prior backup").expect("seed backup");
+    let lock_path = ground.join("store.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .expect("open legacy lock");
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .expect("hold legacy lock");
+    let inode = std::fs::metadata(&lock_path).expect("lock metadata").ino();
+
+    let first_socket = tmp.path().join("old-daemon.sock");
+    let second_socket = tmp.path().join("new-daemon.sock");
+    let _first_listener =
+        std::os::unix::net::UnixListener::bind(&first_socket).expect("old daemon socket");
+    let config = tmp.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[[corpus]]\nname = \"docs\"\npaths = [\"{}\"]\nglobs = [\"**/*.md\"]\n\n[storage]\nground_dir = \"{}\"\n\n[embeddings]\nenabled = false\nmodel = \"BAAI/bge-small-en-v1.5\"\n",
+            corpus_root.display(), ground.display()
+        ),
+    )
+    .expect("daemon config");
+    let cwd = seed_cwd(tmp.path());
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_hallouminate"))
+        .arg("daemon")
+        .arg("--config")
+        .arg(&config)
+        .current_dir(&cwd)
+        .env("HALLOUMINATE_SOCKET", &second_socket)
+        .env("XDG_STATE_HOME", tmp.path().join("state"))
+        .env("XDG_CONFIG_HOME", tmp.path().join("xdg-config"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn second daemon");
+    let output = timeout(Duration::from_secs(10), child.wait_with_output()).await;
+    assert_eq!(
+        std::fs::metadata(&lock_path).expect("active lock").ino(),
+        inode
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("active data"),
+        "live owner data"
+    );
+    assert_eq!(read_schema_version(&ground), stale);
+    assert_eq!(
+        std::fs::read_to_string(backup.join("sentinel")).expect("prior backup"),
+        "prior backup"
+    );
+    assert!(!ground.join("store.lock.diagnostics").exists());
+    let output = output
+        .expect("second daemon must refuse promptly")
+        .expect("wait for second daemon");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "second daemon must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains("locked by another hallouminate process"),
+        "lock refusal must identify the owner: {stderr}"
+    );
+    assert!(first_socket.exists());
+    assert!(!second_socket.exists());
+}
+
 // T1: stale store auto-rebuilds
 #[tokio::test]
 async fn stale_store_auto_rebuilds_on_daemon_open() {
+    use std::os::unix::fs::MetadataExt;
+
     // Setup: ground dir with a stale meta.toml (expected - 1) + a seeded wiki
     // file. DaemonState::open must return Ok, moving the stale store aside and
     // reindexing from source.
@@ -5256,6 +5344,12 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     let stale = current - 1;
     write_stale_meta(&ground, stale);
 
+    let lock_path = ground.join("store.lock");
+    std::fs::write(&lock_path, "").expect("legacy lock inode");
+    let lock_inode = std::fs::metadata(&lock_path)
+        .expect("legacy lock metadata")
+        .ino();
+
     let cfg = cfg_with_corpus(&ground, &corpus_root);
     // DaemonState::open must succeed (no crash).
     let state = DaemonState::open(cfg, None)
@@ -5267,6 +5361,28 @@ async fn stale_store_auto_rebuilds_on_daemon_open() {
     assert!(
         bak.exists(),
         "backup ground.bak-v{stale} must exist after rebuild"
+    );
+    assert_eq!(
+        std::fs::metadata(&lock_path)
+            .expect("active lock metadata")
+            .ino(),
+        lock_inode,
+        "the active store must retain the legacy lock inode"
+    );
+    assert!(!bak.join("store.lock").exists());
+    assert!(!bak.join("store.lock.diagnostics").exists());
+    let contender = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("active lock path");
+    assert_eq!(
+        rustix::fs::flock(
+            &contender,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive
+        ),
+        Err(rustix::io::Errno::WOULDBLOCK),
+        "a legacy daemon must still see the active store as locked"
     );
     // The backup must contain the original stale meta.toml so the store is
     // recoverable (spec criterion 4: stale store is recoverable at .bak-v{N}).
@@ -5523,7 +5639,7 @@ async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
         logs.contains_event(
             tracing::Level::WARN,
             &[
-                "rebuild failed; removed partial ground dir",
+                "rebuild failed; removed partial ground data",
                 "Backup preserved",
             ]
         ),
@@ -5540,9 +5656,16 @@ async fn stale_v3_daemon_startup_failure_warns_and_preserves_backup() {
         "stale store backup must be preserved after failed rebuild"
     );
     assert_eq!(read_schema_version(&backup), 3);
-    assert!(
-        !ground.exists(),
-        "partial fresh ground dir must be removed on rebuild failure"
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(&ground).expect("active guard directory") {
+        let entry = entry.expect("guard entry");
+        names.push(entry.file_name().to_str().expect("guard name").to_owned());
+    }
+    names.sort();
+    assert_eq!(
+        names,
+        ["store.lock", "store.lock.diagnostics"],
+        "failed rebuild must leave only the shared lock guards"
     );
 }
 

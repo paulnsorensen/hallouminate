@@ -63,8 +63,10 @@ so the wiki lands at `<repo>/.hallouminate/wiki` and is searchable as
 
 ## Logging
 
-Each process writes its own log file in `$XDG_STATE_HOME/hallouminate/`
-(default `~/.local/state/hallouminate/`). Only one process writes each file:
+Each process uses its own log file in the build channel's state directory.
+Release builds use `$XDG_STATE_HOME/hallouminate/`. Dev builds use
+`$XDG_STATE_HOME/hallouminate-dev/`. If `XDG_STATE_HOME` is unset, the base
+is `~/.local/state`. Only one process writes each file:
 
 | Process | Log file |
 |---|---|
@@ -73,7 +75,7 @@ Each process writes its own log file in `$XDG_STATE_HOME/hallouminate/`
 | Any other CLI command | `cli-<pid>.log`, created only when the command logs |
 
 A file rotates before a record would take it past `max_file_bytes`. Archives
-are `<name>.log.1`, `.2`, and so on, with the highest number newest.
+are `<name>.log.1`, `.2`, and so on. The highest number is the newest.
 
 ```toml
 [logging]
@@ -161,8 +163,8 @@ hallouminate config download
 |---|---|
 | Baseline config | `$XDG_CONFIG_HOME/hallouminate/config.toml` |
 | Repo-layer config | `<repo>/.hallouminate/config.toml` |
-| Process logs | `$XDG_STATE_HOME/hallouminate/` (state-dir fallback): `daemon.log`, `serve-<pid>.log`, `cli-<pid>.log` |
-| Rotated process logs | `<name>.log.1`, `.2`, and so on, highest newest |
+| Process logs | `$XDG_STATE_HOME/hallouminate/`: `daemon.log`, `serve-<pid>.log`, `cli-<pid>.log` |
+| Rotated process logs | `<name>.log.1`, `.2`, and so on. The highest number is the newest. |
 | Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` |
 | Model cache | `~/.cache/hallouminate/fastembed` |
 | Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` |
@@ -205,6 +207,7 @@ A dev build replaces the `hallouminate` directory name with
 |---|---|---|
 | Ground (LanceDB) directory | `~/.local/share/hallouminate/ground` | `~/.local/share/hallouminate-dev/ground` |
 | Daemon socket | `<account-home>/.cache/hallouminate/daemon.sock` | `<account-home>/.cache/hallouminate-dev/daemon.sock` |
+| Process log directory | `$XDG_STATE_HOME/hallouminate/` | `$XDG_STATE_HOME/hallouminate-dev/` |
 | Daemon bootstrap log | `$XDG_STATE_HOME/hallouminate/daemon-bootstrap.log` | `$XDG_STATE_HOME/hallouminate-dev/daemon-bootstrap.log` |
 
 The watchdog trip file is next to the socket, so it also moves.
@@ -215,13 +218,13 @@ These items do not change:
   `$XDG_CONFIG_HOME/hallouminate/config.toml`.
 - Both builds share the model cache, `~/.cache/hallouminate/fastembed`.
   Model files are immutable downloads and have no store schema.
-- Explicit settings always win. These are `[storage].ground_dir`,
-  `[embeddings].cache_dir`, and `HALLOUMINATE_SOCKET`. A baseline that sets
-  `ground_dir` gives both builds the same store.
-- `XDG_STATE_HOME` still sets the base of the state directory. A dev build
-  adds `hallouminate-dev` below it.
-- The active process log stays at
-  `$XDG_STATE_HOME/hallouminate/hallouminate.log` for both builds.
+- Explicit `[embeddings].cache_dir` and `HALLOUMINATE_SOCKET` settings win.
+  An intentional custom `[storage].ground_dir` also stays unchanged.
+  A dev build remaps the legacy built-in release `ground_dir` default to its
+  dev directory, whether the path uses `~` or an expanded home directory.
+- `XDG_STATE_HOME` sets the state directory base. The build channel selects
+  `hallouminate` or `hallouminate-dev` below it for the process logs and
+  the daemon bootstrap log.
 
 The first dev build on a host starts with an empty store. Run
 `hallouminate index` to fill it.
@@ -231,5 +234,6 @@ The first dev build on a host starts with an empty store. Run
 A Unix socket path must fit in `sockaddr_un.sun_path`, including the
 trailing NUL. The limit is 108 bytes on Linux and 104 bytes on macOS. The
 daemon and its clients check the resolved socket path before they use it.
-A path that is too long stops the command with an error that names
-`HALLOUMINATE_SOCKET` and the limit.
+A path that is too long stops the command with an error that names its
+source and the limit. An explicit `--socket` path error names `--socket`;
+an environment override error names `HALLOUMINATE_SOCKET`.
