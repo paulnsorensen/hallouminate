@@ -140,7 +140,11 @@ fn reclaim_matching_detached(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|item| match item {
                 PendingCleanup::Detached(token) => !Arc::ptr_eq(token, &detached.token),
-                PendingCleanup::Retired(_) | PendingCleanup::Deferred(_) => true,
+                PendingCleanup::Retired(registration) => !registration
+                    .ordinary_owner
+                    .as_ref()
+                    .is_some_and(|token| Arc::ptr_eq(token, &detached.token)),
+                PendingCleanup::Deferred(_) => true,
             });
     }
 }
@@ -389,6 +393,8 @@ pub(crate) struct RetiredRegistration {
     pub(crate) cfg: Arc<Config>,
     pub(crate) failed_attempts: u32,
     pub(crate) detached: Option<Arc<AtomicBool>>,
+    pub(crate) ordinary_owner: Option<Arc<AtomicBool>>,
+    pub(crate) log_missing_root: bool,
     pub(crate) waiting_roots: Vec<PathBuf>,
     pub(crate) _permit: Option<OwnedSemaphorePermit>,
     pub(crate) _ticket: Option<RetirementTicket>,
@@ -426,6 +432,8 @@ impl RetiredRegistration {
             cfg: registration.cfg.clone(),
             failed_attempts: 0,
             detached: None,
+            ordinary_owner: None,
+            log_missing_root: false,
             waiting_roots: Vec::new(),
             _permit: permit,
             _ticket: match &id.source {
@@ -434,6 +442,30 @@ impl RetiredRegistration {
             },
         }
     }
+}
+
+fn attach_ordinary_owner(
+    guard: &mut Inner,
+    id: &RegistrationId,
+    registration: &Registration,
+    retired: &mut RetiredRegistration,
+) {
+    let token = Arc::new(AtomicBool::new(true));
+    guard.detached.push(DetachedRegistration {
+        id: id.clone(),
+        cfg: registration.cfg.clone(),
+        saved_roots: retired.roots.clone(),
+        binding: registration.binding.clone(),
+        token: token.clone(),
+        _ticket: retired._ticket.take(),
+        retired: None,
+        waiting_roots: Vec::new(),
+        ready_roots: Vec::new(),
+        absent_ticks: 0,
+        queued: false,
+    });
+    retired.ordinary_owner = Some(token);
+    retired.log_missing_root = true;
 }
 
 struct DetachedRegistration {
@@ -694,10 +726,9 @@ impl WatchRegistry {
                 || obsolete
                     .iter()
                     .any(|existing| matches!(existing.source, ConfigSource::RepoLayer(_)))
-                || guard
-                    .detached
-                    .iter()
-                    .any(|detached| detached_matches(detached, &id, &cfg, &roots));
+                || guard.detached.iter().any(|detached| {
+                    detached._ticket.is_some() && detached_matches(detached, &id, &cfg, &roots)
+                });
             if runtime_count + self.retired_runtime.load(Ordering::SeqCst)
                 >= MAX_RUNTIME_REGISTRATIONS
                 && !replaces_runtime
@@ -1001,7 +1032,9 @@ impl WatchRegistry {
                     }
                     added += 1;
                     for (index, detached) in guard.detached.iter().enumerate() {
-                        if !reusable.contains(&index) && detached_matches(detached, id, &cfg, roots)
+                        if !reusable.contains(&index)
+                            && detached._ticket.is_some()
+                            && detached_matches(detached, id, &cfg, roots)
                         {
                             reusable.insert(index);
                             break;
@@ -1056,10 +1089,9 @@ impl WatchRegistry {
         for (id, corpus, roots) in candidates {
             if over_limit
                 && !guard.regs.contains_key(&id)
-                && !guard
-                    .detached
-                    .iter()
-                    .any(|detached| detached_matches(detached, &id, &cfg, &roots))
+                && !guard.detached.iter().any(|detached| {
+                    detached._ticket.is_some() && detached_matches(detached, &id, &cfg, &roots)
+                })
             {
                 continue;
             }
@@ -1252,12 +1284,16 @@ impl WatchRegistry {
         {
             let registration = guard.regs.remove(id)?;
             release_admission(guard, id);
-            return Some(RetiredRegistration::from_registration(
+            let mut retired = RetiredRegistration::from_registration(
                 id,
                 &registration,
                 &self.retired_runtime,
                 permit,
-            ));
+            );
+            if cause == RetirementCause::MissingRoot {
+                attach_ordinary_owner(guard, id, &registration, &mut retired);
+            }
+            return Some(retired);
         }
         if let Some(registration) = guard.regs.get_mut(id) {
             registration.retirement_missing = cause == RetirementCause::MissingRoot;
@@ -1273,6 +1309,22 @@ impl WatchRegistry {
     /// Returns failed cleanup to the FIFO without retaining an execution permit.
     pub(crate) fn park_failed_cleanup(&self, mut registration: RetiredRegistration) {
         registration._permit = None;
+        if let Some(owner) = &registration.ordinary_owner {
+            let guard = self.lock();
+            if !owner.load(Ordering::SeqCst)
+                || !guard
+                    .detached
+                    .iter()
+                    .any(|entry| Arc::ptr_eq(&entry.token, owner))
+            {
+                return;
+            }
+            self.pending_cleanups
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(PendingCleanup::Retired(registration));
+            return;
+        }
         let Some(token) = registration.detached.as_ref().cloned() else {
             self.pending_cleanups
                 .lock()
@@ -1309,6 +1361,18 @@ impl WatchRegistry {
             guard.detached.remove(index);
         } else {
             detached.retired = Some(registration);
+        }
+    }
+
+    /// Releases the retained ownership slot after an ordinary cleanup finishes.
+    pub(crate) fn finish_ordinary_cleanup(&self, owner: &Arc<AtomicBool>) {
+        let mut guard = self.lock();
+        if let Some(index) = guard
+            .detached
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.token, owner))
+        {
+            guard.detached.remove(index);
         }
     }
 
@@ -1355,12 +1419,16 @@ impl WatchRegistry {
                     }
                     let registration = guard.regs.remove(&id).expect("checked above");
                     release_admission(&mut guard, &id);
-                    admitted.push(RetiredRegistration::from_registration(
+                    let mut retired = RetiredRegistration::from_registration(
                         &id,
                         &registration,
                         &self.retired_runtime,
                         permit,
-                    ));
+                    );
+                    if registration.retirement_missing {
+                        attach_ordinary_owner(&mut guard, &id, &registration, &mut retired);
+                    }
+                    admitted.push(retired);
                     removed.insert(id);
                 }
             }
@@ -2146,6 +2214,124 @@ mod tests {
     }
 
     #[test]
+    fn ticketless_baseline_retirement_cannot_credit_a_runtime_slot() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let selected = corpus("wiki");
+        let roots = vec![root("/target", selected.clone())];
+        registry.seed_baseline(selected.clone(), cfg.clone(), roots.clone());
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id.source == ConfigSource::Baseline)
+            .expect("baseline probe");
+        let observations = HashMap::from([(
+            probe.id.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let mut retired = Vec::new();
+        for _ in 0..3 {
+            retired.extend(registry.record_absent_roots(&observations, 3));
+        }
+        assert_eq!(retired.len(), 1);
+        assert!(retired[0]._ticket.is_none());
+        for index in 0..MAX_RUNTIME_REGISTRATIONS {
+            assert_eq!(
+                registry.register(
+                    ConfigSource::RepoLayer(PathBuf::from(format!("/other-{index}/config.toml"))),
+                    corpus(&format!("other-{index}")),
+                    cfg.clone(),
+                    vec![],
+                ),
+                RegisterOutcome::New
+            );
+        }
+        let source = ConfigSource::RepoLayer(PathBuf::from("/new/config.toml"));
+        assert_eq!(
+            registry.register(source.clone(), selected.clone(), cfg.clone(), roots.clone()),
+            RegisterOutcome::LimitReached,
+            "a Baseline owner cannot transfer a runtime slot"
+        );
+        assert!(
+            registry
+                .replace_source(source, vec![selected], cfg, |_| roots.clone())
+                .is_err()
+        );
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert!(
+            retired[0]
+                .ordinary_owner
+                .as_ref()
+                .expect("baseline owner")
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn ordinary_runtime_retirement_transfers_exact_slot_at_cap() {
+        let registry = WatchRegistry::new();
+        let cfg = Arc::new(Config::default());
+        let selected = corpus("wiki");
+        let roots = vec![root("/target", selected.clone())];
+        let source = ConfigSource::RepoLayer(PathBuf::from("/old/config.toml"));
+        assert_eq!(
+            registry.register(source.clone(), selected.clone(), cfg.clone(), roots.clone()),
+            RegisterOutcome::New
+        );
+        for index in 0..MAX_RUNTIME_REGISTRATIONS - 1 {
+            assert_eq!(
+                registry.register(
+                    ConfigSource::RepoLayer(PathBuf::from(format!("/other-{index}/config.toml"))),
+                    corpus(&format!("other-{index}")),
+                    cfg.clone(),
+                    vec![],
+                ),
+                RegisterOutcome::New
+            );
+        }
+        let probe = registry
+            .root_probes()
+            .into_iter()
+            .find(|probe| probe.id.source == source)
+            .expect("runtime probe");
+        let observations = HashMap::from([(
+            probe.id.clone(),
+            RootObservation {
+                probe,
+                presence: RootPresence::Absent,
+            },
+        )]);
+        let mut retired = Vec::new();
+        for _ in 0..3 {
+            retired.extend(registry.record_absent_roots(&observations, 3));
+        }
+        assert_eq!(retired.len(), 1);
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            registry.register(
+                ConfigSource::RepoLayer(PathBuf::from("/new/config.toml")),
+                selected,
+                cfg,
+                roots,
+            ),
+            RegisterOutcome::New,
+        );
+        assert_eq!(registry.retired_runtime.load(Ordering::SeqCst), 0);
+        assert_eq!(registry.lock().regs.len(), MAX_RUNTIME_REGISTRATIONS);
+        assert!(
+            !retired[0]
+                .ordinary_owner
+                .as_ref()
+                .expect("runtime owner")
+                .load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
     fn pr_786_detached_slot_rejects_permuted_secondary_roots_at_cap() {
         let (registry, cfg, roots) = detached_registry_at_cap();
         let source = ConfigSource::RepoLayer(PathBuf::from("/new/.hallouminate/config.toml"));
@@ -2917,6 +3103,8 @@ mod tests {
                 cfg: cfg.clone(),
                 failed_attempts: 0,
                 detached: None,
+                ordinary_owner: None,
+                log_missing_root: false,
                 waiting_roots: Vec::new(),
                 _permit: None,
                 _ticket: None,
