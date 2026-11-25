@@ -1514,6 +1514,10 @@ async fn reindex_effective_corpora(
             "rebuild: reindexed",
         );
     }
+    store
+        .finalize_nonempty_search_indexes()
+        .await
+        .map_err(|e| anyhow::anyhow!("rebuild: finalize search indexes: {e}"))?;
     tracing::info!(
         target: "hallouminate::daemon",
         ground_dir = %ground_dir.display(),
