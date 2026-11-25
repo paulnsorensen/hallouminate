@@ -442,7 +442,10 @@ fn collect_root_observations(
         if roots.is_empty() {
             roots.push(probe.id.corpus_key.canonical_root.clone());
         }
-        let presence = if retirable && roots.iter().all(|root| confirmed_absent(root)) {
+        let presence = if retirable
+            && roots.iter().all(|root| confirmed_absent(root))
+            && probe.saved_roots.iter().all(|root| confirmed_absent(root))
+        {
             registry::RootPresence::Absent
         } else {
             registry::RootPresence::Present
@@ -7428,5 +7431,184 @@ body
         );
         tracker.close();
         tracker.wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pr_786_missing_alias_retains_saved_root_until_target_disappears() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path().canonicalize().expect("canonical tempdir");
+        let repo = base.join("repo");
+        let target = base.join("target");
+        let live = repo.join("live");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::create_dir_all(&live).expect("live");
+        std::fs::create_dir(repo.join(".git")).expect("git boundary");
+        std::fs::create_dir(repo.join(".hallouminate")).expect("config dir");
+        let alias = repo.join("alias");
+        symlink(&target, &alias).expect("alias target");
+        let config_path = repo.join(".hallouminate/config.toml");
+        std::fs::write(
+            &config_path,
+            "[[corpus]]\nname = \"alias\"\npaths = [\"alias\"]\nglobs = [\"**/*.md\"]\n[[corpus]]\nname = \"live\"\npaths = [\"live\"]\nglobs = [\"**/*.md\"]\n",
+        )
+        .expect("config");
+        let note = target.join("retired.md");
+        let live_note = live.join("retained.md");
+        std::fs::write(&note, "# Retired\n\npr786aliasthenphysical\n").expect("target note");
+        std::fs::write(&live_note, "# Retained\n\npr786unrelatedlive\n").expect("live note");
+        let mut cfg = hallouminate_config::Config::default();
+        cfg.embeddings.enabled = false;
+        cfg.security.allow_repo_paths_outside_root = vec![target.display().to_string()];
+        cfg.daemon.maintenance_interval_secs = 0;
+        cfg.storage.ground_dir = base.join("ground").to_string_lossy().into_owned();
+        let state = DaemonState::open(cfg.clone(), None).await.expect("open");
+        let (effective, _) =
+            hallouminate_config::resolve_for_cwd(&cfg, &repo, None).expect("resolve repo");
+        register_runtime_corpora(&state, Some(&config_path), &effective.corpora, &effective)
+            .expect("register roots");
+        let alias_key = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "alias")
+            .expect("alias registration")
+            .0
+            .corpus_key;
+        let live_key = state
+            .watch_registry()
+            .snapshot_roots()
+            .into_iter()
+            .find(|(id, _)| id.corpus_key.name == "live")
+            .expect("live registration")
+            .0
+            .corpus_key;
+        assert_eq!(alias_key.canonical_root, target);
+        let mut pump = PumpState::test_default();
+        let tracker = TaskTracker::new();
+        let mut memo = ReloadFailureMemo::new();
+        reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+        tracker.close();
+        tracker.wait().await;
+        let mut failures = disabled_coalescer();
+        let mut churn = disabled_churn();
+        process_change_batch(
+            &state,
+            &pump.roots,
+            vec![note.clone(), live_note.clone()],
+            &mut failures,
+            &mut churn,
+        )
+        .await;
+        let store = state
+            .resources_for(&effective)
+            .await
+            .expect("resources")
+            .store
+            .clone();
+        assert_eq!(
+            store
+                .list_files(&alias_key)
+                .await
+                .expect("alias files")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.list_files(&live_key).await.expect("live files").len(),
+            1
+        );
+        assert!(
+            pr_786_followup_index_contains(
+                &state,
+                &effective.corpora[0],
+                "pr786aliasthenphysical",
+                &note
+            )
+            .await,
+            "target content must have real Lance chunk rows"
+        );
+        assert!(
+            pr_786_followup_index_contains(
+                &state,
+                &effective.corpora[1],
+                "pr786unrelatedlive",
+                &live_note
+            )
+            .await,
+            "live content must have real Lance chunk rows"
+        );
+
+        std::fs::remove_file(&config_path).expect("remove config");
+        std::fs::remove_file(&alias).expect("remove alias");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert_eq!(
+            store
+                .list_files(&alias_key)
+                .await
+                .expect("live target files")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .list_files(&live_key)
+                .await
+                .expect("unrelated files")
+                .len(),
+            1
+        );
+        assert!(
+            !pump.roots.iter().any(|root| root.corpus.name == "alias"),
+            "missing alias must not own event routing"
+        );
+
+        std::fs::remove_dir_all(&target).expect("remove saved target");
+        for _ in 0..MISSING_ROOT_RETIRE_TICKS {
+            let tracker = TaskTracker::new();
+            reconcile_ticks(&state, &mut pump, &tracker, &mut memo, 1);
+            tracker.close();
+            tracker.wait().await;
+        }
+        assert!(
+            store
+                .list_files(&alias_key)
+                .await
+                .expect("retired file map")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .corpus_chunk_stats(&alias_key)
+                .await
+                .expect("retired chunks")
+                .total_chunks,
+            0,
+            "retirement deletes saved-root chunk rows"
+        );
+        assert_eq!(
+            store
+                .list_files(&live_key)
+                .await
+                .expect("live file map")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .corpus_chunk_stats(&live_key)
+                .await
+                .expect("live chunks")
+                .total_chunks
+                > 0,
+            "unrelated live chunk rows remain"
+        );
     }
 }

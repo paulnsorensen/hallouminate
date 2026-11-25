@@ -268,6 +268,22 @@ struct Registration {
     error_repeats: u32,
 }
 
+impl Registration {
+    fn saved_roots(&self, id: &RegistrationId) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        for root in &self.roots {
+            match &root.canonical_file_root {
+                Some(file) => roots.push(file.clone()),
+                None => roots.push(root.canonical_watched.clone()),
+            }
+        }
+        if roots.is_empty() {
+            roots.push(id.corpus_key.canonical_root.clone());
+        }
+        roots
+    }
+}
+
 /// Identical reconcile failures between repeated `warn` reminders.
 const REPEAT_FAILURE_REMINDER_EVERY: u32 = 60;
 
@@ -336,16 +352,7 @@ impl RetiredRegistration {
         retired_count: &Arc<AtomicUsize>,
         permit: OwnedSemaphorePermit,
     ) -> Self {
-        let mut roots = Vec::new();
-        for root in &registration.roots {
-            match &root.canonical_file_root {
-                Some(file) => roots.push(file.clone()),
-                None => roots.push(root.canonical_watched.clone()),
-            }
-        }
-        if roots.is_empty() {
-            roots.push(id.corpus_key.canonical_root.clone());
-        }
+        let roots = registration.saved_roots(id);
         Self {
             corpus: id.corpus_key.name.clone(),
             root: id.corpus_key.canonical_root.clone(),
@@ -372,6 +379,7 @@ pub(crate) struct RootProbe {
     pub(crate) id: RegistrationId,
     pub(crate) corpus: CorpusConfig,
     binding: Arc<()>,
+    pub(crate) saved_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy)]
@@ -1182,6 +1190,7 @@ impl WatchRegistry {
             probes.push(RootProbe {
                 id: id.clone(),
                 corpus: reg.corpus.clone(),
+                saved_roots: reg.saved_roots(id),
                 binding: reg.binding.clone(),
             });
         }
